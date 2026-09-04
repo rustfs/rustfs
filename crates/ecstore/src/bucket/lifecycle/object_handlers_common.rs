@@ -20,6 +20,7 @@ const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
 const EVENT_LIFECYCLE_CLEANUP_SKIPPED: &str = "lifecycle_cleanup_skipped";
 const EVENT_LIFECYCLE_CLEANUP_FAILED: &str = "lifecycle_cleanup_failed";
 
+use crate::bucket::lifecycle::bucket_lifecycle_audit::emit_noncurrent_expiration_event;
 use crate::bucket::lifecycle::lifecycle;
 use crate::bucket::lifecycle::replication_sink::{self, ReplicationObjectBridge};
 use crate::object_api::ObjectOptions;
@@ -98,6 +99,12 @@ pub async fn delete_object_versions(
             // version so it does not sit resident until TTL (ODC-26).
             if let Some(target) = to_del.get(i) {
                 crate::object_api::notify_object_mutation(bucket, &target.object_name).await;
+                // Announce the version this batch actually removed. Cache
+                // eviction and replication scheduling keep their existing
+                // order and admission; the event is derived from the committed
+                // result, and a send failure never rolls back a delete that
+                // already happened (backlog#2202).
+                emit_noncurrent_expiration_event(bucket, target, deleted_obj, false);
             }
             if deleted_obj.replication_state.is_none() {
                 continue;

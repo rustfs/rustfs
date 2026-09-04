@@ -61,12 +61,13 @@ pub(crate) const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 pub(crate) const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
 pub(crate) const EVENT_LIFECYCLE_TIER_DELETE_JOURNAL: &str = "lifecycle_tier_delete_journal";
 
-// Keep one background pass small enough that a slow remote tier cannot hold
-// the shared recovery worker for minutes. Subsequent passes resume from the
-// returned marker, so this bounds latency without reducing eventual coverage.
+// Keep one page small enough that slow remote tiers remain bounded by per-entry
+// deadlines and worker concurrency. A production pass may consume multiple
+// successful pages while its wall-clock budget remains.
 pub const DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT: usize = 8;
 const TIER_DELETE_JOURNAL_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 const TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
+const TIER_DELETE_JOURNAL_RECOVERY_PASS_BUDGET: Duration = Duration::from_secs(240);
 const TIER_DELETE_REMOTE_DEADLINE: Duration = Duration::from_secs(30);
 const TIER_DELETE_JOURNAL_ENTRY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(90);
 const TIER_DELETE_JOURNAL_RECOVERY_CONCURRENCY: usize = 4;
@@ -93,8 +94,126 @@ pub(crate) const TIER_DELETE_JOURNAL_LEGACY_PREFIX: &str = TIER_DELETE_JOURNAL_N
 pub(crate) const TIER_DELETE_JOURNAL_V6_PREFIX: &str = TIER_DELETE_JOURNAL_V6_NAMESPACE.prefix;
 pub(crate) const TIER_DELETE_DISPATCH_MANIFEST_PREFIX: &str = "ilm/tier-delete-dispatch-manifests/";
 const TIER_DELETE_DISPATCH_MANIFEST_VERSION: u8 = 1;
+// RUSTFS_COMPAT_TODO(backlog-2133-tier-delete-chunk-parent): retain the v1 single-manifest reader and fail-closed root sentinel while supported rollback releases do not understand chunk parents. Remove after every supported rollback release validates the parent/child protocol and no retained v1 manifest remains.
+const TIER_DELETE_DISPATCH_PARENT_VERSION: u8 = 1;
+const TIER_DELETE_DISPATCH_PARENT_RECORD_TYPE: &str = "chunked_parent";
+const TIER_DELETE_DISPATCH_CHUNK_PATH: &str = "chunks";
 pub(crate) const MAX_TIER_DELETE_DISPATCH_MANIFEST_SIZE: usize = 32 * 1024 * 1024;
 const MAX_TIER_DELETE_DISPATCH_JOURNALS: usize = 200_000;
+
+#[cfg(all(test, feature = "test-util"))]
+static TIER_DELETE_DISPATCH_BATCH_LIMIT_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn tier_delete_dispatch_batch_limit() -> usize {
+    #[cfg(all(test, feature = "test-util"))]
+    {
+        let configured = TIER_DELETE_DISPATCH_BATCH_LIMIT_FOR_TEST.load(Ordering::Acquire);
+        if configured != 0 {
+            return configured;
+        }
+    }
+    MAX_TIER_DELETE_DISPATCH_JOURNALS
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) struct TierDeleteDispatchBatchLimitGuard;
+
+#[cfg(all(test, feature = "test-util"))]
+impl TierDeleteDispatchBatchLimitGuard {
+    pub(crate) fn install(limit: usize) -> Self {
+        assert!(limit > 0 && limit <= MAX_TIER_DELETE_DISPATCH_JOURNALS);
+        TIER_DELETE_DISPATCH_BATCH_LIMIT_FOR_TEST
+            .compare_exchange(0, limit, Ordering::AcqRel, Ordering::Acquire)
+            .expect("tier delete dispatch batch limit test override must be exclusive");
+        Self
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for TierDeleteDispatchBatchLimitGuard {
+    fn drop(&mut self) {
+        TIER_DELETE_DISPATCH_BATCH_LIMIT_FOR_TEST.store(0, Ordering::Release);
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TierDeleteChunkTestStage {
+    ParentPersisted,
+    ChildManifestPersisted,
+    ParentBound,
+    DispatchAuthorized,
+    LocalReplayCompleted,
+    ChildCompleted,
+    ParentProgressed,
+    FinalLocalDeletionCompleted,
+    ParentCompleted,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+struct TierDeleteChunkTestBarrierState {
+    stage: TierDeleteChunkTestStage,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) struct TierDeleteChunkTestBarrier {
+    state: Arc<TierDeleteChunkTestBarrierState>,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+static TIER_DELETE_CHUNK_TEST_BARRIER: OnceLock<Mutex<Option<Arc<TierDeleteChunkTestBarrierState>>>> = OnceLock::new();
+
+#[cfg(all(test, feature = "test-util"))]
+impl TierDeleteChunkTestBarrier {
+    pub(crate) fn install(stage: TierDeleteChunkTestStage) -> Self {
+        let state = Arc::new(TierDeleteChunkTestBarrierState {
+            stage,
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = TIER_DELETE_CHUNK_TEST_BARRIER
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("tier delete chunk test barrier should not poison");
+        assert!(slot.is_none(), "tier delete chunk test barrier must not already be installed");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        self.state.arrived.notified().await;
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for TierDeleteChunkTestBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        if let Some(slot) = TIER_DELETE_CHUNK_TEST_BARRIER.get() {
+            let mut slot = slot.lock().expect("tier delete chunk test barrier should not poison");
+            if slot.as_ref().is_some_and(|current| Arc::ptr_eq(current, &self.state)) {
+                *slot = None;
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) async fn tier_delete_chunk_test_pause(stage: TierDeleteChunkTestStage) {
+    let state = TIER_DELETE_CHUNK_TEST_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("tier delete chunk test barrier should not poison")
+        .as_ref()
+        .filter(|state| state.stage == stage)
+        .cloned();
+    if let Some(state) = state {
+        state.arrived.notify_one();
+        state.release.notified().await;
+    }
+}
 
 fn valid_tier_delete_topology_generation(generation: &str) -> bool {
     generation.len() == 64 && generation.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -145,18 +264,104 @@ impl TierDeleteDispatchManifest {
         {
             return Err(Error::other("tier delete dispatch manifest is invalid"));
         }
+        let expected_journal_prefix = format!("{TIER_DELETE_JOURNAL_V6_PREFIX}{}/", self.operation_id.simple());
         if !self.journal_names.windows(2).all(|pair| pair[0] < pair[1])
-            || self.journal_names.iter().any(|name| {
-                let expected_prefix = format!("{TIER_DELETE_JOURNAL_V6_PREFIX}{}/", self.operation_id.simple());
-                !name.starts_with(&expected_prefix) || !name.ends_with(".json")
-            })
+            || self
+                .journal_names
+                .iter()
+                .any(|name| !name.starts_with(&expected_journal_prefix) || !name.ends_with(".json"))
             || tier_delete_dispatch_journal_set_digest(&self.journal_names) != self.journal_set_sha256
-            || tier_delete_dispatch_manifest_object_name(&self.bucket, self.bucket_incarnation, &self.prefix) != object_name
+            || !tier_delete_dispatch_manifest_path_matches(self, object_name)
         {
             return Err(Error::other("tier delete dispatch manifest binding is invalid"));
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TierDeleteDispatchParentState {
+    Active,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct TierDeleteDispatchChunkBinding {
+    sequence: u64,
+    operation_id: uuid::Uuid,
+    manifest_object: String,
+    journal_set_sha256: String,
+    journal_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct TierDeleteDispatchParent {
+    version: u8,
+    record_type: String,
+    operation_id: uuid::Uuid,
+    bucket: String,
+    bucket_incarnation: uuid::Uuid,
+    prefix: String,
+    topology_generation: String,
+    revision: u64,
+    next_chunk_sequence: u64,
+    completed_journal_count: u64,
+    active_chunk: Option<TierDeleteDispatchChunkBinding>,
+    state: TierDeleteDispatchParentState,
+}
+
+impl TierDeleteDispatchParent {
+    fn validate(&self, object_name: &str) -> Result<()> {
+        let max_journal_count = u64::try_from(MAX_TIER_DELETE_DISPATCH_JOURNALS)
+            .map_err(|_| Error::other("tier delete dispatch journal limit is not representable"))?;
+        if self.version != TIER_DELETE_DISPATCH_PARENT_VERSION
+            || self.record_type != TIER_DELETE_DISPATCH_PARENT_RECORD_TYPE
+            || self.operation_id.is_nil()
+            || self.bucket.is_empty()
+            || self.bucket_incarnation.is_nil()
+            || !valid_tier_delete_topology_generation(&self.topology_generation)
+            || tier_delete_dispatch_manifest_object_name(&self.bucket, self.bucket_incarnation, &self.prefix) != object_name
+            || (self.state == TierDeleteDispatchParentState::Completed && self.active_chunk.is_some())
+            || self.next_chunk_sequence > self.revision
+            || self.completed_journal_count < self.next_chunk_sequence
+            || ((self.next_chunk_sequence == 0) != (self.completed_journal_count == 0))
+        {
+            return Err(Error::other("tier delete dispatch parent binding is invalid"));
+        }
+        if let Some(chunk) = &self.active_chunk
+            && (self.state != TierDeleteDispatchParentState::Active
+                || chunk.sequence != self.next_chunk_sequence
+                || chunk.operation_id.is_nil()
+                || chunk.journal_count == 0
+                || chunk.journal_count > max_journal_count
+                || chunk.manifest_object
+                    != tier_delete_dispatch_chunk_manifest_object_name(
+                        &self.bucket,
+                        self.bucket_incarnation,
+                        &self.prefix,
+                        chunk.operation_id,
+                    )
+                || !rustfs_utils::crypto::is_sha256_checksum(&chunk.journal_set_sha256))
+        {
+            return Err(Error::other("tier delete dispatch parent chunk binding is invalid"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TierDeleteDispatchParentAdvance {
+    parent_manifest_object: String,
+    parent_operation_id: uuid::Uuid,
+    chunk: TierDeleteDispatchChunkBinding,
+}
+
+enum TierDeleteDispatchRecord {
+    Manifest(TierDeleteDispatchManifest),
+    Parent(TierDeleteDispatchParent),
 }
 
 fn tier_delete_dispatch_journal_set_digest(names: &[String]) -> String {
@@ -168,17 +373,44 @@ fn tier_delete_dispatch_journal_set_digest(names: &[String]) -> String {
     rustfs_utils::crypto::hex(hasher.finalize().as_slice())
 }
 
-fn tier_delete_dispatch_manifest_object_name(bucket: &str, incarnation: uuid::Uuid, prefix: &str) -> String {
+fn tier_delete_dispatch_manifest_digest(bucket: &str, incarnation: uuid::Uuid, prefix: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bucket.as_bytes());
     hasher.update([0]);
     hasher.update(incarnation.as_bytes());
     hasher.update([0]);
     hasher.update(prefix.as_bytes());
+    rustfs_utils::crypto::hex(hasher.finalize().as_slice())
+}
+
+fn tier_delete_dispatch_manifest_object_name(bucket: &str, incarnation: uuid::Uuid, prefix: &str) -> String {
     format!(
         "{TIER_DELETE_DISPATCH_MANIFEST_PREFIX}{}.json",
-        rustfs_utils::crypto::hex(hasher.finalize().as_slice())
+        tier_delete_dispatch_manifest_digest(bucket, incarnation, prefix)
     )
+}
+
+fn tier_delete_dispatch_chunk_manifest_object_name(
+    bucket: &str,
+    incarnation: uuid::Uuid,
+    prefix: &str,
+    operation_id: uuid::Uuid,
+) -> String {
+    format!(
+        "{TIER_DELETE_DISPATCH_MANIFEST_PREFIX}{TIER_DELETE_DISPATCH_CHUNK_PATH}/{}/{}.json",
+        tier_delete_dispatch_manifest_digest(bucket, incarnation, prefix),
+        operation_id.simple()
+    )
+}
+
+fn tier_delete_dispatch_manifest_path_matches(manifest: &TierDeleteDispatchManifest, object_name: &str) -> bool {
+    let parent_digest = tier_delete_dispatch_manifest_digest(&manifest.bucket, manifest.bucket_incarnation, &manifest.prefix);
+    object_name == format!("{TIER_DELETE_DISPATCH_MANIFEST_PREFIX}{parent_digest}.json")
+        || object_name
+            == format!(
+                "{TIER_DELETE_DISPATCH_MANIFEST_PREFIX}{TIER_DELETE_DISPATCH_CHUNK_PATH}/{parent_digest}/{}.json",
+                manifest.operation_id.simple()
+            )
 }
 
 fn tier_delete_dispatch_operation_lock_name(manifest_object: &str) -> String {
@@ -216,6 +448,15 @@ fn encode_tier_delete_dispatch_manifest(manifest: &TierDeleteDispatchManifest) -
     Ok(data)
 }
 
+fn encode_tier_delete_dispatch_parent(parent: &TierDeleteDispatchParent) -> Result<Vec<u8>> {
+    let data =
+        serde_json::to_vec(parent).map_err(|err| Error::other_with_context("encode tier delete dispatch parent failed", err))?;
+    if data.len() > MAX_TIER_DELETE_DISPATCH_MANIFEST_SIZE {
+        return Err(Error::other("tier delete dispatch parent is too large"));
+    }
+    Ok(data)
+}
+
 fn decode_tier_delete_dispatch_manifest(data: &[u8], object_name: &str) -> Result<TierDeleteDispatchManifest> {
     if data.len() > MAX_TIER_DELETE_DISPATCH_MANIFEST_SIZE {
         return Err(Error::other("tier delete dispatch manifest is too large"));
@@ -226,28 +467,94 @@ fn decode_tier_delete_dispatch_manifest(data: &[u8], object_name: &str) -> Resul
     Ok(manifest)
 }
 
+fn decode_tier_delete_dispatch_record(data: &[u8], object_name: &str) -> Result<TierDeleteDispatchRecord> {
+    if data.len() > MAX_TIER_DELETE_DISPATCH_MANIFEST_SIZE {
+        return Err(Error::other("tier delete dispatch record is too large"));
+    }
+    match decode_tier_delete_dispatch_manifest(data, object_name) {
+        Ok(manifest) => Ok(TierDeleteDispatchRecord::Manifest(manifest)),
+        Err(manifest_error) => {
+            let parent: TierDeleteDispatchParent = serde_json::from_slice(data).map_err(|parent_error| {
+                Error::other_with_context(
+                    "decode tier delete dispatch record failed",
+                    format!("manifest: {manifest_error}; parent: {parent_error}"),
+                )
+            })?;
+            parent.validate(object_name)?;
+            Ok(TierDeleteDispatchRecord::Parent(parent))
+        }
+    }
+}
+
+pub(crate) enum TierDeleteDispatchDurableRecord {
+    Manifest {
+        operation_id: uuid::Uuid,
+        identity_sha256: String,
+        state: TierDeleteDispatchManifestState,
+    },
+    Parent {
+        operation_id: uuid::Uuid,
+        identity_sha256: String,
+        revision: u64,
+        next_chunk_sequence: u64,
+        completed_journal_count: u64,
+        active_chunk_identity_sha256: Option<String>,
+        completed: bool,
+    },
+}
+
 pub(crate) fn validate_tier_delete_dispatch_manifest_record(
     object_name: &str,
     data: &[u8],
-) -> Result<(uuid::Uuid, String, TierDeleteDispatchManifestState)> {
-    let manifest = decode_tier_delete_dispatch_manifest(data, object_name)?;
-    let identity = serde_json::to_vec(&(
-        manifest.version,
-        manifest.operation_id,
-        &manifest.bucket,
-        manifest.bucket_incarnation,
-        &manifest.prefix,
-        &manifest.journal_names,
-        &manifest.journal_set_sha256,
-        manifest.journal_count,
-        &manifest.topology_generation,
-    ))
-    .map_err(Error::other)?;
-    Ok((
-        manifest.operation_id,
-        rustfs_utils::crypto::hex_sha256(&identity, ToOwned::to_owned),
-        manifest.state,
-    ))
+) -> Result<TierDeleteDispatchDurableRecord> {
+    match decode_tier_delete_dispatch_record(data, object_name)? {
+        TierDeleteDispatchRecord::Manifest(manifest) => {
+            let identity = serde_json::to_vec(&(
+                manifest.version,
+                manifest.operation_id,
+                &manifest.bucket,
+                manifest.bucket_incarnation,
+                &manifest.prefix,
+                &manifest.journal_names,
+                &manifest.journal_set_sha256,
+                manifest.journal_count,
+                &manifest.topology_generation,
+            ))
+            .map_err(Error::other)?;
+            Ok(TierDeleteDispatchDurableRecord::Manifest {
+                operation_id: manifest.operation_id,
+                identity_sha256: rustfs_utils::crypto::hex_sha256(&identity, ToOwned::to_owned),
+                state: manifest.state,
+            })
+        }
+        TierDeleteDispatchRecord::Parent(parent) => {
+            let identity = serde_json::to_vec(&(
+                parent.version,
+                &parent.record_type,
+                parent.operation_id,
+                &parent.bucket,
+                parent.bucket_incarnation,
+                &parent.prefix,
+                &parent.topology_generation,
+            ))
+            .map_err(Error::other)?;
+            let active_chunk_identity_sha256 = parent
+                .active_chunk
+                .as_ref()
+                .map(|chunk| serde_json::to_vec(chunk).map(|data| rustfs_utils::crypto::hex_sha256(&data, ToOwned::to_owned)))
+                .transpose()
+                .map_err(Error::other)?;
+            Ok(TierDeleteDispatchDurableRecord::Parent {
+                operation_id: parent.operation_id,
+                identity_sha256: rustfs_utils::crypto::hex_sha256(&identity, ToOwned::to_owned),
+                revision: parent.revision,
+                next_chunk_sequence: parent.next_chunk_sequence,
+                completed_journal_count: parent.completed_journal_count,
+                active_chunk_identity_sha256,
+                completed: parent.state == TierDeleteDispatchParentState::Completed,
+            })
+        }
+    }
 }
 
 /// Return the fleet generation durably bound to a v6 manifest or journal.
@@ -255,7 +562,12 @@ pub(crate) fn validate_tier_delete_dispatch_manifest_record(
 /// cleanup compatibility behavior.
 pub(crate) fn durable_ilm_v6_topology_generation(object_name: &str, data: &[u8]) -> Result<Option<String>> {
     if object_name.starts_with(TIER_DELETE_DISPATCH_MANIFEST_PREFIX) {
-        return decode_tier_delete_dispatch_manifest(data, object_name).map(|manifest| Some(manifest.topology_generation));
+        return decode_tier_delete_dispatch_record(data, object_name).map(|record| {
+            Some(match record {
+                TierDeleteDispatchRecord::Manifest(manifest) => manifest.topology_generation,
+                TierDeleteDispatchRecord::Parent(parent) => parent.topology_generation,
+            })
+        });
     }
     if object_name.starts_with(TIER_DELETE_JOURNAL_V6_PREFIX) {
         let entry = decode_tier_delete_journal_entry(data)?;
@@ -302,10 +614,12 @@ pub(crate) fn test_tier_delete_dispatch_manifest_record(
 }
 
 struct DispatchedJournalPermit {
+    manifest_object: String,
     manifest: TierDeleteDispatchManifest,
     authorized_etag: String,
     entries: Vec<Jentry>,
     fleet_proof: TierDeleteJournalFleetProofToken,
+    parent_advance: Option<TierDeleteDispatchParentAdvance>,
 }
 
 struct TierDeleteDispatchAuthorizationInner {
@@ -423,30 +737,67 @@ pub(crate) struct PreparedTierDeleteDispatch {
     predecessor_replay_required: bool,
 }
 
+pub(crate) enum TierDeleteChunkParentInspection {
+    NoParent,
+    LegacyManifest,
+    Ready(String),
+    Resume(Box<PreparedTierDeleteDispatch>),
+    RetryRequired,
+}
+
 pub(crate) struct ActiveTierDeleteDispatch {
+    manifest_object: String,
     manifest: TierDeleteDispatchManifest,
     authorized_etag: String,
     entries: Arc<[Jentry]>,
     authorization: TierDeleteDispatchAuthorization,
     predecessor_replay_required: bool,
+    parent_advance: Option<TierDeleteDispatchParentAdvance>,
 }
 
 impl PreparedTierDeleteDispatch {
+    pub(crate) fn entries(&self) -> Result<&[Jentry]> {
+        self.permit
+            .as_ref()
+            .map(|permit| permit.entries.as_slice())
+            .ok_or_else(|| Error::other("tier delete dispatch permit was already consumed"))
+    }
+
+    pub(crate) fn require_exact_predecessor_replay(&mut self) {
+        self.predecessor_replay_required = true;
+    }
+
     pub(crate) fn consume(mut self, bucket: &str, incarnation: uuid::Uuid, prefix: &str) -> Result<ActiveTierDeleteDispatch> {
         let permit = self
             .permit
             .take()
             .ok_or_else(|| Error::other("tier delete dispatch permit was already consumed"))?;
-        let manifest_object = tier_delete_dispatch_manifest_object_name(bucket, incarnation, prefix);
         if permit.manifest.state != TierDeleteDispatchManifestState::DispatchAuthorized
             || permit.manifest.bucket != bucket
             || permit.manifest.bucket_incarnation != incarnation
             || permit.manifest.prefix != prefix
-            || permit.entries.iter().map(tier_delete_journal_object_name).collect::<Vec<_>>() != permit.manifest.journal_names
+            || permit.manifest.validate(&permit.manifest_object).is_err()
+            || permit.entries.len() != permit.manifest.journal_names.len()
+            || !permit
+                .entries
+                .iter()
+                .zip(&permit.manifest.journal_names)
+                .all(|(entry, name)| tier_delete_journal_object_name(entry) == name.as_str())
             || !tier_delete_journal_fleet_proof_matches(&permit.fleet_proof)
             || tier_delete_journal_topology_generation(&permit.fleet_proof) != permit.manifest.topology_generation
+            || permit.parent_advance.as_ref().is_some_and(|parent| {
+                parent.chunk.manifest_object != permit.manifest_object
+                    || parent.chunk.operation_id != permit.manifest.operation_id
+                    || parent.chunk.journal_set_sha256 != permit.manifest.journal_set_sha256
+                    || parent.chunk.journal_count != permit.manifest.journal_count
+            })
         {
             return Err(Error::other("tier delete dispatch permit validation failed"));
+        }
+        if permit.parent_advance.is_none()
+            && permit.manifest_object != tier_delete_dispatch_manifest_object_name(bucket, incarnation, prefix)
+        {
+            return Err(Error::other("unbound tier delete child dispatch cannot authorize local mutation"));
         }
         let entries = Arc::<[Jentry]>::from(permit.entries);
         let journal_entry_indexes = permit
@@ -458,7 +809,7 @@ impl PreparedTierDeleteDispatch {
             .map(|(index, name)| (name, index))
             .collect();
         let authorization = TierDeleteDispatchAuthorization(Arc::new(TierDeleteDispatchAuthorizationInner {
-            manifest_object,
+            manifest_object: permit.manifest_object.clone(),
             operation_id: permit.manifest.operation_id,
             bucket: permit.manifest.bucket.clone(),
             bucket_incarnation: permit.manifest.bucket_incarnation,
@@ -471,11 +822,13 @@ impl PreparedTierDeleteDispatch {
             mutation_started: AtomicBool::new(false),
         }));
         Ok(ActiveTierDeleteDispatch {
+            manifest_object: permit.manifest_object,
             manifest: permit.manifest,
             authorized_etag: permit.authorized_etag,
             entries,
             authorization,
             predecessor_replay_required: self.predecessor_replay_required,
+            parent_advance: permit.parent_advance,
         })
     }
 }
@@ -491,6 +844,10 @@ impl ActiveTierDeleteDispatch {
 
     pub(crate) fn predecessor_replay_required(&self) -> bool {
         self.predecessor_replay_required
+    }
+
+    pub(crate) fn is_chunked(&self) -> bool {
+        self.parent_advance.is_some()
     }
 }
 
@@ -729,7 +1086,7 @@ fn validate_version_state(
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TierDeleteJournalRecoveryStats {
     pub scanned: usize,
     pub deleted: usize,
@@ -738,7 +1095,7 @@ pub struct TierDeleteJournalRecoveryStats {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TierDeleteDispatchManifestRecoveryStats {
     pub scanned: usize,
     pub advanced: usize,
@@ -747,6 +1104,18 @@ pub struct TierDeleteDispatchManifestRecoveryStats {
     pub failed: usize,
     pub next_marker: Option<String>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TierDeleteJournalRecoveryPassStats {
+    pub manifest_pages: usize,
+    pub journal_pages: usize,
+    pub manifest_errors: usize,
+    pub journal_errors: usize,
+    pub deadline_exhausted: bool,
+    pub canceled: bool,
+    pub manifests: TierDeleteDispatchManifestRecoveryStats,
+    pub journals: TierDeleteJournalRecoveryStats,
 }
 
 pub(crate) fn tier_delete_journal_object_name(je: &Jentry) -> String {
@@ -823,6 +1192,22 @@ async fn read_tier_delete_dispatch_manifest(
                 .etag
                 .ok_or_else(|| Error::other("tier delete dispatch manifest has no entity tag"))?;
             Ok(Some((decode_tier_delete_dispatch_manifest(&data, object_name)?, etag)))
+        }
+        Err(Error::ConfigNotFound) | Err(Error::FileNotFound) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+async fn read_tier_delete_dispatch_record(
+    api: Arc<ECStore>,
+    object_name: &str,
+) -> Result<Option<(TierDeleteDispatchRecord, String)>> {
+    match config_boundary::read_config_with_metadata(api, object_name, &ObjectOptions::default()).await {
+        Ok((data, metadata)) => {
+            let etag = metadata
+                .etag
+                .ok_or_else(|| Error::other("tier delete dispatch record has no entity tag"))?;
+            Ok(Some((decode_tier_delete_dispatch_record(&data, object_name)?, etag)))
         }
         Err(Error::ConfigNotFound) | Err(Error::FileNotFound) => Ok(None),
         Err(err) => Err(err),
@@ -1638,6 +2023,15 @@ async fn record_tier_delete_dispatch_manifest_progress_fenced(
     record_durable_config_progress_fenced(api, name, &encode_tier_delete_dispatch_manifest(manifest)?, fences_current).await
 }
 
+async fn record_tier_delete_dispatch_parent_progress_fenced(
+    api: Arc<ECStore>,
+    name: &str,
+    parent: &TierDeleteDispatchParent,
+    fences_current: &impl Fn() -> bool,
+) -> Result<()> {
+    record_durable_config_progress_fenced(api, name, &encode_tier_delete_dispatch_parent(parent)?, fences_current).await
+}
+
 async fn delete_durable_config_if_match(
     api: Arc<ECStore>,
     name: &str,
@@ -1835,7 +2229,7 @@ fn bind_dispatch_entries(
     topology_generation: &str,
 ) -> Result<Vec<Jentry>> {
     let mut entries = entries;
-    entries.sort_by_key(|entry| tier_delete_journal_v6_object_name(entry, operation_id));
+    entries.sort_by_cached_key(|entry| tier_delete_journal_v6_object_name(entry, operation_id));
     let mut bound = Vec::with_capacity(entries.len());
     let mut last_name: Option<String> = None;
     for mut entry in entries {
@@ -1887,20 +2281,24 @@ fn tier_delete_dispatch_desired_names(entries: &[Jentry], operation_id: uuid::Uu
     Ok(names)
 }
 
-fn validate_bound_journal(manifest: &TierDeleteDispatchManifest, name: &str, entry: &Jentry) -> Result<()> {
+fn validate_bound_journal(
+    manifest: &TierDeleteDispatchManifest,
+    manifest_object: &str,
+    name: &str,
+    entry: &Jentry,
+) -> Result<()> {
+    // Callers pass a manifest already validated at its decode/create boundary.
+    // Keep this member check O(1); rehashing the whole manifest here would be
+    // quadratic across a maximum-sized batch.
+    let dispatch_matches = entry.dispatch.as_ref().is_some_and(|binding| {
+        binding.operation_id == manifest.operation_id
+            && binding.manifest_object == manifest_object
+            && binding.journal_set_sha256 == manifest.journal_set_sha256
+            && binding.topology_generation == manifest.topology_generation
+    });
     if entry.persisted_version != TIER_DELETE_JOURNAL_SOLE_OWNER_VERSION
         || tier_delete_journal_object_name(entry) != name
-        || entry.dispatch.as_ref()
-            != Some(&TierDeleteDispatchBinding {
-                operation_id: manifest.operation_id,
-                manifest_object: tier_delete_dispatch_manifest_object_name(
-                    &manifest.bucket,
-                    manifest.bucket_incarnation,
-                    &manifest.prefix,
-                ),
-                journal_set_sha256: manifest.journal_set_sha256.clone(),
-                topology_generation: manifest.topology_generation.clone(),
-            })
+        || !dispatch_matches
     {
         return Err(Error::other("tier delete journal does not match its dispatch manifest"));
     }
@@ -1909,6 +2307,7 @@ fn validate_bound_journal(manifest: &TierDeleteDispatchManifest, name: &str, ent
 
 async fn load_complete_dispatch_journal_set(
     api: Arc<ECStore>,
+    manifest_object: &str,
     manifest: &TierDeleteDispatchManifest,
     allowed_states: &[TierDeleteJournalState],
     fences_current: &impl Fn() -> bool,
@@ -1920,7 +2319,7 @@ async fn load_complete_dispatch_journal_set(
             let (entry, _) = read_tier_delete_journal_with_etag(api.clone(), &name)
                 .await?
                 .ok_or_else(|| Error::other("tier delete dispatch manifest references a missing journal"))?;
-            validate_bound_journal(manifest, &name, &entry)?;
+            validate_bound_journal(manifest, manifest_object, &name, &entry)?;
             if !allowed_states.contains(&entry.state) {
                 return Err(Error::other("tier delete dispatch journal has an invalid state"));
             }
@@ -1949,6 +2348,7 @@ async fn load_complete_dispatch_journal_set(
 
 async fn persist_prepared_dispatch_journal(
     api: Arc<ECStore>,
+    manifest_object: &str,
     manifest: &TierDeleteDispatchManifest,
     entry: &Jentry,
     fences_current: &impl Fn() -> bool,
@@ -1956,7 +2356,7 @@ async fn persist_prepared_dispatch_journal(
     let name = tier_delete_journal_object_name(entry);
     for _ in 0..4 {
         if let Some((current, _)) = read_tier_delete_journal_with_etag(api.clone(), &name).await? {
-            validate_bound_journal(manifest, &name, &current)?;
+            validate_bound_journal(manifest, manifest_object, &name, &current)?;
             if !same_tier_delete_journal_identity(&current, entry) {
                 return Err(Error::other("tier delete journal key is occupied by another cleanup identity"));
             }
@@ -1978,6 +2378,7 @@ async fn persist_prepared_dispatch_journal(
 
 async fn dispatch_prepared_journal(
     api: Arc<ECStore>,
+    manifest_object: &str,
     manifest: &TierDeleteDispatchManifest,
     expected: &Jentry,
     fences_current: &impl Fn() -> bool,
@@ -1987,7 +2388,7 @@ async fn dispatch_prepared_journal(
         let (mut current, etag) = read_tier_delete_journal_with_etag(api.clone(), &name)
             .await?
             .ok_or_else(|| Error::other("prepared tier delete journal disappeared before dispatch"))?;
-        validate_bound_journal(manifest, &name, &current)?;
+        validate_bound_journal(manifest, manifest_object, &name, &current)?;
         if !same_tier_delete_journal_identity(&current, expected) {
             return Err(Error::other("prepared tier delete journal changed identity before dispatch"));
         }
@@ -2023,6 +2424,7 @@ fn ensure_tier_delete_dispatch_member_scan_fence(fences_current: &impl Fn() -> b
 
 async fn validate_staged_dispatch_journal_set(
     api: Arc<ECStore>,
+    manifest_object: &str,
     manifest: &TierDeleteDispatchManifest,
     fences_current: &impl Fn() -> bool,
 ) -> Result<()> {
@@ -2046,7 +2448,7 @@ async fn validate_staged_dispatch_journal_set(
                 let Some((entry, _)) = observed else {
                     return Ok(());
                 };
-                validate_bound_journal(manifest, &name, &entry)?;
+                validate_bound_journal(manifest, manifest_object, &name, &entry)?;
                 if !matches!(entry.state, TierDeleteJournalState::Prepared | TierDeleteJournalState::Dispatched) {
                     return Err(Error::other("an uncommitted tier delete dispatch contains a committed journal"));
                 }
@@ -2090,6 +2492,7 @@ async fn validate_staged_dispatch_journal_set(
 
 async fn delete_staged_dispatch_journal_set<F>(
     api: Arc<ECStore>,
+    manifest_object: &str,
     manifest: &TierDeleteDispatchManifest,
     fences_current: &F,
 ) -> Result<()>
@@ -2099,7 +2502,7 @@ where
     // Validate the complete immutable set before deleting its first member so
     // a corrupt binding or impossible Committed state quarantines the whole
     // operation rather than producing a partial rollback.
-    validate_staged_dispatch_journal_set(api.clone(), manifest, fences_current).await?;
+    validate_staged_dispatch_journal_set(api.clone(), manifest_object, manifest, fences_current).await?;
 
     // The validation barrier above must drain before this stream is created.
     // Once deletion starts, stop admitting useful work after the first error
@@ -2123,7 +2526,7 @@ where
                 let Some((entry, etag)) = read_tier_delete_journal_with_etag(api.clone(), &name).await? else {
                     return Ok(());
                 };
-                validate_bound_journal(manifest, &name, &entry)?;
+                validate_bound_journal(manifest, manifest_object, &name, &entry)?;
                 if !matches!(entry.state, TierDeleteJournalState::Prepared | TierDeleteJournalState::Dispatched) {
                     return Err(Error::other("an uncommitted tier delete dispatch contains a committed journal"));
                 }
@@ -2206,19 +2609,18 @@ where
 
 async fn seal_and_rollback_preparing_dispatch(
     api: Arc<ECStore>,
+    manifest_name: &str,
     expected: &TierDeleteDispatchManifest,
     fleet_proof: &TierDeleteJournalFleetProofToken,
     bucket_fence: &crate::object_api::NamespaceLockFence,
     operation_guard: &rustfs_lock::NamespaceLockGuard,
 ) -> Result<()> {
-    let manifest_name =
-        tier_delete_dispatch_manifest_object_name(&expected.bucket, expected.bucket_incarnation, &expected.prefix);
     let fences_current =
         || dispatch_write_fences_current(bucket_fence, operation_guard, fleet_proof, &expected.topology_generation);
     if !fences_current() {
         return Err(Error::other("tier delete dispatch rollback fence changed"));
     }
-    let Some((mut current, etag)) = read_tier_delete_dispatch_manifest(api.clone(), &manifest_name).await? else {
+    let Some((mut current, etag)) = read_tier_delete_dispatch_manifest(api.clone(), manifest_name).await? else {
         return Ok(());
     };
     if current.operation_id != expected.operation_id
@@ -2235,26 +2637,26 @@ async fn seal_and_rollback_preparing_dispatch(
     }
     save_config_if_match_fenced(
         api.clone(),
-        &manifest_name,
+        manifest_name,
         encode_tier_delete_dispatch_manifest(&current)?,
         &etag,
         &fences_current,
     )
     .await?;
-    let (mut sealed, sealed_etag) = read_tier_delete_dispatch_manifest(api.clone(), &manifest_name)
+    let (mut sealed, sealed_etag) = read_tier_delete_dispatch_manifest(api.clone(), manifest_name)
         .await?
         .ok_or_else(|| Error::other("sealed tier delete dispatch manifest disappeared"))?;
     if sealed.operation_id != expected.operation_id || sealed.state != TierDeleteDispatchManifestState::Aborting {
         return Err(Error::other("tier delete dispatch rollback seal changed"));
     }
-    delete_staged_dispatch_journal_set(api.clone(), &sealed, &fences_current).await?;
+    delete_staged_dispatch_journal_set(api.clone(), manifest_name, &sealed, &fences_current).await?;
     sealed.state = TierDeleteDispatchManifestState::Aborted;
     if !fences_current() {
         return Err(Error::other("tier delete dispatch rollback fence changed"));
     }
     save_config_if_match_fenced(
         api,
-        &manifest_name,
+        manifest_name,
         encode_tier_delete_dispatch_manifest(&sealed)?,
         &sealed_etag,
         &fences_current,
@@ -2269,6 +2671,19 @@ async fn authorized_dispatch_permit(
     bucket_fence: &crate::object_api::NamespaceLockFence,
     operation_guard: &rustfs_lock::NamespaceLockGuard,
 ) -> Result<PreparedTierDeleteDispatch> {
+    authorized_dispatch_permit_with_parent(api, manifest_name, fleet_proof, bucket_fence, operation_guard, None, None).await
+}
+
+async fn authorized_dispatch_permit_with_parent(
+    api: Arc<ECStore>,
+    manifest_name: &str,
+    fleet_proof: TierDeleteJournalFleetProofToken,
+    bucket_fence: &crate::object_api::NamespaceLockFence,
+    operation_guard: &rustfs_lock::NamespaceLockGuard,
+    parent_operation_guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    parent_advance: Option<TierDeleteDispatchParentAdvance>,
+) -> Result<PreparedTierDeleteDispatch> {
+    let is_chunked = parent_advance.is_some();
     let (manifest, authorized_etag) = read_tier_delete_dispatch_manifest(api.clone(), manifest_name)
         .await?
         .ok_or_else(|| Error::other("authorized tier delete dispatch manifest disappeared"))?;
@@ -2279,11 +2694,14 @@ async fn authorized_dispatch_permit(
         return Err(Error::other("tier delete dispatch authorization is stale or unconfirmed"));
     }
     let entries = {
-        let fences_current =
-            || dispatch_write_fences_current(bucket_fence, operation_guard, &fleet_proof, &manifest.topology_generation);
+        let fences_current = || {
+            dispatch_write_fences_current(bucket_fence, operation_guard, &fleet_proof, &manifest.topology_generation)
+                && parent_operation_guard.is_none_or(|guard| !guard.is_lock_lost())
+        };
         record_tier_delete_dispatch_manifest_progress_fenced(api.clone(), manifest_name, &manifest, &fences_current).await?;
         load_complete_dispatch_journal_set(
             api,
+            manifest_name,
             &manifest,
             &[TierDeleteJournalState::Dispatched, TierDeleteJournalState::Committed],
             &fences_current,
@@ -2292,13 +2710,442 @@ async fn authorized_dispatch_permit(
     };
     Ok(PreparedTierDeleteDispatch {
         permit: Some(DispatchedJournalPermit {
+            manifest_object: manifest_name.to_string(),
             manifest,
             authorized_etag,
             entries,
             fleet_proof,
+            parent_advance,
         }),
-        predecessor_replay_required: false,
+        predecessor_replay_required: is_chunked,
     })
+}
+
+fn tier_delete_dispatch_child_matches_parent(
+    parent: &TierDeleteDispatchParent,
+    binding: &TierDeleteDispatchChunkBinding,
+    child: &TierDeleteDispatchManifest,
+) -> bool {
+    // Every caller supplies a child decoded against `binding.manifest_object`,
+    // which already verifies the path, sorted member set, and full digest.
+    // Keep the parent comparison O(1) for a maximum-sized child.
+    child.operation_id == binding.operation_id
+        && child.bucket == parent.bucket
+        && child.bucket_incarnation == parent.bucket_incarnation
+        && child.prefix == parent.prefix
+        && child.topology_generation == parent.topology_generation
+        && child.journal_set_sha256 == binding.journal_set_sha256
+        && child.journal_count == binding.journal_count
+}
+
+fn tier_delete_dispatch_parent_fences_current(
+    bucket_fence: &crate::object_api::NamespaceLockFence,
+    operation_guard: &rustfs_lock::NamespaceLockGuard,
+    fleet_proof: &TierDeleteJournalFleetProofToken,
+    parent: &TierDeleteDispatchParent,
+) -> bool {
+    dispatch_write_fences_current(bucket_fence, operation_guard, fleet_proof, &parent.topology_generation)
+}
+
+async fn cas_tier_delete_dispatch_parent(
+    api: Arc<ECStore>,
+    object_name: &str,
+    expected: &TierDeleteDispatchParent,
+    expected_etag: &str,
+    next: &TierDeleteDispatchParent,
+    fences_current: &impl Fn() -> bool,
+) -> Result<(TierDeleteDispatchParent, String)> {
+    expected.validate(object_name)?;
+    next.validate(object_name)?;
+    if expected.operation_id != next.operation_id || !fences_current() {
+        return Err(Error::other("tier delete dispatch parent fence changed before progress"));
+    }
+    let write = save_config_if_match_fenced(
+        api.clone(),
+        object_name,
+        encode_tier_delete_dispatch_parent(next)?,
+        expected_etag,
+        fences_current,
+    )
+    .await;
+    if write.as_ref().is_err_and(is_decommission_checkpoint_targets_incomplete) {
+        return Err(write.expect_err("decommission checkpoint result should remain an error"));
+    }
+    let observed = read_tier_delete_dispatch_record(api, object_name).await?;
+    if !fences_current() {
+        return Err(Error::other("tier delete dispatch parent fence changed during progress"));
+    }
+    match observed {
+        Some((TierDeleteDispatchRecord::Parent(observed), etag)) if observed == *next => Ok((observed, etag)),
+        _ => match write {
+            Ok(()) | Err(Error::PreconditionFailed) => Err(Error::other("tier delete dispatch parent changed during progress")),
+            Err(err) => Err(err),
+        },
+    }
+}
+
+async fn tier_delete_dispatch_chunk_journal_namespace_empty(api: Arc<ECStore>, operation_id: uuid::Uuid) -> Result<bool> {
+    let prefix = format!("{TIER_DELETE_JOURNAL_V6_PREFIX}{}/", operation_id.simple());
+    let list = api
+        .list_objects_v2(RUSTFS_META_BUCKET, &prefix, None, None, 1, false, None, false)
+        .await?;
+    Ok(list.objects.is_empty())
+}
+
+pub(crate) async fn inspect_tier_delete_chunk_parent(
+    api: Arc<ECStore>,
+    bucket: &str,
+    bucket_incarnation: uuid::Uuid,
+    prefix: &str,
+    bucket_fence: &crate::object_api::NamespaceLockFence,
+) -> Result<TierDeleteChunkParentInspection> {
+    let parent_name = tier_delete_dispatch_manifest_object_name(bucket, bucket_incarnation, prefix);
+    let Some((record, _)) = read_tier_delete_dispatch_record(api.clone(), &parent_name).await? else {
+        return Ok(TierDeleteChunkParentInspection::NoParent);
+    };
+    let TierDeleteDispatchRecord::Parent(observed_parent) = record else {
+        return Ok(TierDeleteChunkParentInspection::LegacyManifest);
+    };
+    let fleet_proof = acquire_tier_delete_journal_fleet_proof()
+        .ok_or_else(|| Error::other("tier delete chunk parent fleet capability is unavailable"))?;
+    if observed_parent.bucket != bucket
+        || observed_parent.bucket_incarnation != bucket_incarnation
+        || observed_parent.prefix != prefix
+        || tier_delete_journal_topology_generation(&fleet_proof) != observed_parent.topology_generation
+    {
+        return Err(Error::other("an incompatible tier delete chunk parent already owns this prefix"));
+    }
+    // Lock order: caller-held bucket lifecycle WRITE -> parent operation ->
+    // child operation (only while reconstructing an Authorized child permit).
+    let parent_lock = api
+        .new_ns_lock(RUSTFS_META_BUCKET, &tier_delete_dispatch_operation_lock_name(&parent_name))
+        .await?;
+    let parent_guard = parent_lock
+        .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+        .await?;
+    let (parent, parent_etag) = match read_tier_delete_dispatch_record(api.clone(), &parent_name).await? {
+        Some((TierDeleteDispatchRecord::Parent(parent), etag)) => (parent, etag),
+        Some((TierDeleteDispatchRecord::Manifest(_), _)) => {
+            return Err(Error::other("tier delete chunk parent was replaced by a legacy manifest"));
+        }
+        None => return Ok(TierDeleteChunkParentInspection::RetryRequired),
+    };
+    if parent != observed_parent
+        || !tier_delete_dispatch_parent_fences_current(bucket_fence, &parent_guard, &fleet_proof, &parent)
+    {
+        return Err(Error::other("tier delete chunk parent changed during inspection"));
+    }
+    {
+        let fences_current = || tier_delete_dispatch_parent_fences_current(bucket_fence, &parent_guard, &fleet_proof, &parent);
+        record_tier_delete_dispatch_parent_progress_fenced(api.clone(), &parent_name, &parent, &fences_current).await?;
+    }
+    if parent.state == TierDeleteDispatchParentState::Completed {
+        return Ok(TierDeleteChunkParentInspection::RetryRequired);
+    }
+    let Some(binding) = parent.active_chunk.clone() else {
+        return Ok(TierDeleteChunkParentInspection::Ready(parent.topology_generation.clone()));
+    };
+    let fences_current = || tier_delete_dispatch_parent_fences_current(bucket_fence, &parent_guard, &fleet_proof, &parent);
+    let child = read_tier_delete_dispatch_manifest(api.clone(), &binding.manifest_object).await?;
+    let Some((child, _)) = child else {
+        if !tier_delete_dispatch_chunk_journal_namespace_empty(api.clone(), binding.operation_id).await? {
+            return Err(Error::other("tier delete chunk parent references a missing child with retained journals"));
+        }
+        let mut next = parent.clone();
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| Error::other("tier delete chunk parent revision overflow"))?;
+        next.active_chunk = None;
+        cas_tier_delete_dispatch_parent(api, &parent_name, &parent, &parent_etag, &next, &fences_current).await?;
+        return Ok(TierDeleteChunkParentInspection::RetryRequired);
+    };
+    if !tier_delete_dispatch_child_matches_parent(&parent, &binding, &child) {
+        return Err(Error::other("tier delete chunk parent child binding changed"));
+    }
+    match child.state {
+        TierDeleteDispatchManifestState::DispatchAuthorized => {
+            let child_lock = api
+                .new_ns_lock(RUSTFS_META_BUCKET, &tier_delete_dispatch_operation_lock_name(&binding.manifest_object))
+                .await?;
+            let child_guard = child_lock.get_write_lock(crate::set_disk::get_lock_acquire_timeout()).await?;
+            let advance = TierDeleteDispatchParentAdvance {
+                parent_manifest_object: parent_name,
+                parent_operation_id: parent.operation_id,
+                chunk: binding,
+            };
+            let child_manifest_object = advance.chunk.manifest_object.clone();
+            let prepared = authorized_dispatch_permit_with_parent(
+                api,
+                &child_manifest_object,
+                fleet_proof,
+                bucket_fence,
+                &child_guard,
+                Some(&parent_guard),
+                Some(advance),
+            )
+            .await?;
+            Ok(TierDeleteChunkParentInspection::Resume(Box::new(prepared)))
+        }
+        TierDeleteDispatchManifestState::Completed => {
+            let mut next = parent.clone();
+            next.revision = next
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| Error::other("tier delete chunk parent revision overflow"))?;
+            next.next_chunk_sequence = next
+                .next_chunk_sequence
+                .checked_add(1)
+                .ok_or_else(|| Error::other("tier delete chunk parent sequence overflow"))?;
+            next.completed_journal_count = next
+                .completed_journal_count
+                .checked_add(binding.journal_count)
+                .ok_or_else(|| Error::other("tier delete chunk parent journal count overflow"))?;
+            next.active_chunk = None;
+            cas_tier_delete_dispatch_parent(api, &parent_name, &parent, &parent_etag, &next, &fences_current).await?;
+            Ok(TierDeleteChunkParentInspection::RetryRequired)
+        }
+        TierDeleteDispatchManifestState::Preparing
+        | TierDeleteDispatchManifestState::Aborting
+        | TierDeleteDispatchManifestState::Aborted => Ok(TierDeleteChunkParentInspection::RetryRequired),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_tier_delete_chunk_dispatch(
+    api: Arc<ECStore>,
+    bucket: &str,
+    bucket_incarnation: uuid::Uuid,
+    prefix: &str,
+    entries: Vec<Jentry>,
+    create_parent_if_missing: bool,
+    fleet_proof: TierDeleteJournalFleetProofToken,
+    bucket_fence: &crate::object_api::NamespaceLockFence,
+) -> Result<PreparedTierDeleteDispatch> {
+    if entries.is_empty()
+        || entries.len() > tier_delete_dispatch_batch_limit()
+        || bucket_incarnation.is_nil()
+        || bucket_fence.is_lock_lost()
+        || !tier_delete_journal_fleet_proof_matches(&fleet_proof)
+    {
+        return Err(Error::other("tier delete chunk dispatch input is invalid or stale"));
+    }
+    let topology_generation = tier_delete_journal_topology_generation(&fleet_proof);
+    let parent_name = tier_delete_dispatch_manifest_object_name(bucket, bucket_incarnation, prefix);
+    // Lock order: caller-held bucket lifecycle WRITE -> parent operation ->
+    // newly created child operation. Completion releases the child lock before
+    // reacquiring the parent lock, so no child -> parent nesting exists.
+    let parent_lock = api
+        .new_ns_lock(RUSTFS_META_BUCKET, &tier_delete_dispatch_operation_lock_name(&parent_name))
+        .await?;
+    let parent_guard = parent_lock
+        .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+        .await?;
+    let (parent, parent_etag) = loop {
+        let observed = read_tier_delete_dispatch_record(api.clone(), &parent_name).await?;
+        match observed {
+            Some((TierDeleteDispatchRecord::Parent(parent), etag)) => break (parent, etag),
+            Some((TierDeleteDispatchRecord::Manifest(_), _)) => {
+                return Err(Error::other("a legacy tier delete dispatch already owns this prefix"));
+            }
+            None if !create_parent_if_missing => {
+                return Err(Error::other("tier delete chunk parent disappeared before batch creation"));
+            }
+            None => {
+                let parent = TierDeleteDispatchParent {
+                    version: TIER_DELETE_DISPATCH_PARENT_VERSION,
+                    record_type: TIER_DELETE_DISPATCH_PARENT_RECORD_TYPE.to_string(),
+                    operation_id: uuid::Uuid::new_v4(),
+                    bucket: bucket.to_string(),
+                    bucket_incarnation,
+                    prefix: prefix.to_string(),
+                    topology_generation: topology_generation.clone(),
+                    revision: 0,
+                    next_chunk_sequence: 0,
+                    completed_journal_count: 0,
+                    active_chunk: None,
+                    state: TierDeleteDispatchParentState::Active,
+                };
+                parent.validate(&parent_name)?;
+                let fences_current =
+                    || tier_delete_dispatch_parent_fences_current(bucket_fence, &parent_guard, &fleet_proof, &parent);
+                match save_config_if_none_fenced(
+                    api.clone(),
+                    &parent_name,
+                    encode_tier_delete_dispatch_parent(&parent)?,
+                    &fences_current,
+                )
+                .await
+                {
+                    Ok(()) | Err(Error::PreconditionFailed) => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+    };
+    if parent.bucket != bucket
+        || parent.bucket_incarnation != bucket_incarnation
+        || parent.prefix != prefix
+        || parent.topology_generation != topology_generation
+        || parent.state != TierDeleteDispatchParentState::Active
+        || parent.active_chunk.is_some()
+    {
+        return Err(Error::other("tier delete chunk parent is not ready for a successor batch"));
+    }
+    #[cfg(all(test, feature = "test-util"))]
+    tier_delete_chunk_test_pause(TierDeleteChunkTestStage::ParentPersisted).await;
+    let child_operation_id = uuid::Uuid::new_v4();
+    let journal_names = tier_delete_dispatch_desired_names(&entries, child_operation_id)?;
+    let journal_set_sha256 = tier_delete_dispatch_journal_set_digest(&journal_names);
+    let child_name = tier_delete_dispatch_chunk_manifest_object_name(bucket, bucket_incarnation, prefix, child_operation_id);
+    let child = TierDeleteDispatchManifest {
+        version: TIER_DELETE_DISPATCH_MANIFEST_VERSION,
+        operation_id: child_operation_id,
+        bucket: bucket.to_string(),
+        bucket_incarnation,
+        prefix: prefix.to_string(),
+        journal_count: journal_names
+            .len()
+            .try_into()
+            .map_err(|_| Error::other("tier delete chunk journal count is not representable"))?,
+        journal_names,
+        journal_set_sha256: journal_set_sha256.clone(),
+        topology_generation,
+        state: TierDeleteDispatchManifestState::Preparing,
+    };
+    let child_lock = api
+        .new_ns_lock(RUSTFS_META_BUCKET, &tier_delete_dispatch_operation_lock_name(&child_name))
+        .await?;
+    let child_guard = child_lock.get_write_lock(crate::set_disk::get_lock_acquire_timeout()).await?;
+    let (child_etag, binding) = {
+        let write_fences_current = || {
+            tier_delete_dispatch_parent_fences_current(bucket_fence, &parent_guard, &fleet_proof, &parent)
+                && !child_guard.is_lock_lost()
+        };
+        match save_config_if_none_fenced(
+            api.clone(),
+            &child_name,
+            encode_tier_delete_dispatch_manifest(&child)?,
+            &write_fences_current,
+        )
+        .await
+        {
+            Ok(()) | Err(Error::PreconditionFailed) => {}
+            Err(err) => return Err(err),
+        }
+        let (observed_child, child_etag) = read_tier_delete_dispatch_manifest(api.clone(), &child_name)
+            .await?
+            .ok_or_else(|| Error::other("tier delete chunk manifest disappeared after creation"))?;
+        if observed_child != child || !write_fences_current() {
+            return Err(Error::other("tier delete chunk manifest changed during creation"));
+        }
+        #[cfg(all(test, feature = "test-util"))]
+        tier_delete_chunk_test_pause(TierDeleteChunkTestStage::ChildManifestPersisted).await;
+        let binding = TierDeleteDispatchChunkBinding {
+            sequence: parent.next_chunk_sequence,
+            operation_id: child_operation_id,
+            manifest_object: child_name.clone(),
+            journal_set_sha256,
+            journal_count: child.journal_count,
+        };
+        let mut bound_parent = parent.clone();
+        bound_parent.revision = bound_parent
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| Error::other("tier delete chunk parent revision overflow"))?;
+        bound_parent.active_chunk = Some(binding.clone());
+        if let Err(err) = cas_tier_delete_dispatch_parent(
+            api.clone(),
+            &parent_name,
+            &parent,
+            &parent_etag,
+            &bound_parent,
+            &write_fences_current,
+        )
+        .await
+        {
+            let _ =
+                seal_and_rollback_preparing_dispatch(api, &child_name, &child, &fleet_proof, bucket_fence, &child_guard).await;
+            return Err(err);
+        }
+        (child_etag, binding)
+    };
+    #[cfg(all(test, feature = "test-util"))]
+    tier_delete_chunk_test_pause(TierDeleteChunkTestStage::ParentBound).await;
+    let parent_advance = TierDeleteDispatchParentAdvance {
+        parent_manifest_object: parent_name,
+        parent_operation_id: parent.operation_id,
+        chunk: binding,
+    };
+    let prepared = finish_preparing_tier_delete_dispatch(
+        api,
+        &child_name,
+        child,
+        child_etag,
+        entries,
+        fleet_proof,
+        bucket_fence,
+        &child_guard,
+        Some(&parent_guard),
+        Some(parent_advance),
+    )
+    .await?;
+    #[cfg(all(test, feature = "test-util"))]
+    tier_delete_chunk_test_pause(TierDeleteChunkTestStage::DispatchAuthorized).await;
+    Ok(prepared)
+}
+
+pub(crate) async fn complete_tier_delete_chunk_parent(
+    api: Arc<ECStore>,
+    bucket: &str,
+    bucket_incarnation: uuid::Uuid,
+    prefix: &str,
+    bucket_fence: &crate::object_api::NamespaceLockFence,
+    fleet_proof: &TierDeleteJournalFleetProofToken,
+) -> Result<bool> {
+    let parent_name = tier_delete_dispatch_manifest_object_name(bucket, bucket_incarnation, prefix);
+    let Some((record, _)) = read_tier_delete_dispatch_record(api.clone(), &parent_name).await? else {
+        return Ok(false);
+    };
+    if matches!(record, TierDeleteDispatchRecord::Manifest(_)) {
+        return Ok(false);
+    }
+    let parent_lock = api
+        .new_ns_lock(RUSTFS_META_BUCKET, &tier_delete_dispatch_operation_lock_name(&parent_name))
+        .await?;
+    let parent_guard = parent_lock
+        .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+        .await?;
+    let (parent, etag) = match read_tier_delete_dispatch_record(api.clone(), &parent_name).await? {
+        Some((TierDeleteDispatchRecord::Parent(parent), etag)) => (parent, etag),
+        _ => return Err(Error::other("tier delete chunk parent changed before final completion")),
+    };
+    if parent.bucket != bucket
+        || parent.bucket_incarnation != bucket_incarnation
+        || parent.prefix != prefix
+        || parent.active_chunk.is_some()
+        || tier_delete_journal_topology_generation(fleet_proof) != parent.topology_generation
+    {
+        return Err(Error::other("tier delete chunk parent is not ready for final completion"));
+    }
+    if !tier_delete_dispatch_parent_fences_current(bucket_fence, &parent_guard, fleet_proof, &parent) {
+        return Err(Error::other("tier delete chunk parent completion fence changed"));
+    }
+    if parent.state == TierDeleteDispatchParentState::Completed {
+        return Ok(true);
+    }
+    let fences_current = || tier_delete_dispatch_parent_fences_current(bucket_fence, &parent_guard, fleet_proof, &parent);
+    record_tier_delete_dispatch_parent_progress_fenced(api.clone(), &parent_name, &parent, &fences_current).await?;
+    let mut completed = parent.clone();
+    completed.revision = completed
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| Error::other("tier delete chunk parent revision overflow"))?;
+    completed.state = TierDeleteDispatchParentState::Completed;
+    cas_tier_delete_dispatch_parent(api, &parent_name, &parent, &etag, &completed, &fences_current).await?;
+    #[cfg(all(test, feature = "test-util"))]
+    tier_delete_chunk_test_pause(TierDeleteChunkTestStage::ParentCompleted).await;
+    Ok(true)
 }
 
 pub(crate) async fn prepare_tier_delete_dispatch(
@@ -2318,10 +3165,34 @@ pub(crate) async fn prepare_tier_delete_dispatch(
         entries,
         fleet_proof,
         bucket_fence,
+        true,
     ))
     .await
 }
 
+pub(crate) async fn resume_tier_delete_dispatch(
+    api: Arc<ECStore>,
+    bucket: &str,
+    bucket_incarnation: uuid::Uuid,
+    prefix: &str,
+    entries: Vec<Jentry>,
+    fleet_proof: TierDeleteJournalFleetProofToken,
+    bucket_fence: &crate::object_api::NamespaceLockFence,
+) -> Result<PreparedTierDeleteDispatch> {
+    Box::pin(prepare_tier_delete_dispatch_inner(
+        api,
+        bucket,
+        bucket_incarnation,
+        prefix,
+        entries,
+        fleet_proof,
+        bucket_fence,
+        false,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn prepare_tier_delete_dispatch_inner(
     api: Arc<ECStore>,
     bucket: &str,
@@ -2330,6 +3201,7 @@ async fn prepare_tier_delete_dispatch_inner(
     entries: Vec<Jentry>,
     fleet_proof: TierDeleteJournalFleetProofToken,
     bucket_fence: &crate::object_api::NamespaceLockFence,
+    create_if_missing: bool,
 ) -> Result<PreparedTierDeleteDispatch> {
     if bucket_incarnation.is_nil() || bucket_fence.is_lock_lost() || !tier_delete_journal_fleet_proof_matches(&fleet_proof) {
         return Err(Error::other("tier delete journal v6 fleet capability is unavailable"));
@@ -2344,7 +3216,7 @@ async fn prepare_tier_delete_dispatch_inner(
         .await?;
     ensure_dispatch_lock_current(bucket_fence, &operation_guard)?;
 
-    let (mut manifest, manifest_etag) = loop {
+    let (manifest, manifest_etag) = loop {
         ensure_dispatch_lock_current(bucket_fence, &operation_guard)?;
         match read_tier_delete_dispatch_manifest(api.clone(), &manifest_name).await? {
             Some((existing, etag)) => {
@@ -2388,26 +3260,17 @@ async fn prepare_tier_delete_dispatch_inner(
                         return Err(Error::other("a tier delete dispatch rollback is still in progress"));
                     }
                     TierDeleteDispatchManifestState::Aborted => {
-                        for name in &existing.journal_names {
-                            if read_tier_delete_journal_with_etag(api.clone(), name).await?.is_some() {
-                                return Err(Error::other("an aborted tier delete dispatch still owns journal records"));
-                            }
-                        }
-                        let data = encode_tier_delete_dispatch_manifest(&existing)?;
-                        let fences_current = || {
-                            !bucket_fence.is_lock_lost()
-                                && !operation_guard.is_lock_lost()
-                                && tier_delete_journal_fleet_proof_matches(&fleet_proof)
-                                && tier_delete_journal_topology_generation(&fleet_proof) == existing.topology_generation
-                        };
-                        match delete_durable_config_if_match(api.clone(), &manifest_name, &data, &etag, &fences_current).await {
-                            Ok(()) | Err(Error::ConfigNotFound) | Err(Error::PreconditionFailed) => continue,
-                            Err(err) => return Err(err),
-                        }
+                        schedule_aborted_tier_delete_dispatch_cleanup(api.clone(), manifest_name.clone());
+                        return Err(Error::other("an aborted tier delete dispatch is awaiting bounded recovery cleanup"));
                     }
                 }
             }
             None => {
+                if !create_if_missing {
+                    return Err(Error::other(
+                        "legacy tier delete dispatch disappeared; retry to establish a chunk parent if still required",
+                    ));
+                }
                 let operation_id = uuid::Uuid::new_v4();
                 let desired_names = tier_delete_dispatch_desired_names(&entries, operation_id)?;
                 let desired_digest = tier_delete_dispatch_journal_set_digest(&desired_names);
@@ -2440,18 +3303,48 @@ async fn prepare_tier_delete_dispatch_inner(
         }
     };
 
+    finish_preparing_tier_delete_dispatch(
+        api,
+        &manifest_name,
+        manifest,
+        manifest_etag,
+        entries,
+        fleet_proof,
+        bucket_fence,
+        &operation_guard,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_preparing_tier_delete_dispatch(
+    api: Arc<ECStore>,
+    manifest_name: &str,
+    mut manifest: TierDeleteDispatchManifest,
+    manifest_etag: String,
+    entries: Vec<Jentry>,
+    fleet_proof: TierDeleteJournalFleetProofToken,
+    bucket_fence: &crate::object_api::NamespaceLockFence,
+    operation_guard: &rustfs_lock::NamespaceLockGuard,
+    parent_operation_guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    parent_advance: Option<TierDeleteDispatchParentAdvance>,
+) -> Result<PreparedTierDeleteDispatch> {
     let bound = bind_dispatch_entries(
         entries,
         manifest.operation_id,
-        &manifest_name,
+        manifest_name,
         &manifest.journal_set_sha256,
         &manifest.topology_generation,
     )?;
     let attempt = async {
-        let fences_current =
-            || dispatch_write_fences_current(bucket_fence, &operation_guard, &fleet_proof, &manifest.topology_generation);
+        let fences_current = || {
+            dispatch_write_fences_current(bucket_fence, operation_guard, &fleet_proof, &manifest.topology_generation)
+                && parent_operation_guard.is_none_or(|guard| !guard.is_lock_lost())
+        };
         let manifest_ref = &manifest;
-        let operation_guard_ref = &operation_guard;
+        let operation_guard_ref = operation_guard;
         let prepare_stopped = Arc::new(AtomicBool::new(false));
         let mut prepare_writes = futures::stream::iter((0..bound.len()).map(|index| {
             let api = api.clone();
@@ -2465,7 +3358,7 @@ async fn prepare_tier_delete_dispatch_inner(
                     return Ok(());
                 }
                 let result = match ensure_dispatch_lock_current(bucket_fence, operation_guard) {
-                    Ok(()) => persist_prepared_dispatch_journal(api, manifest, &entry, fences_current).await,
+                    Ok(()) => persist_prepared_dispatch_journal(api, manifest_name, manifest, &entry, fences_current).await,
                     Err(err) => Err(err),
                 };
                 if result.is_err() {
@@ -2505,7 +3398,7 @@ async fn prepare_tier_delete_dispatch_inner(
                     return Ok(());
                 }
                 let result = match ensure_dispatch_lock_current(bucket_fence, operation_guard) {
-                    Ok(()) => dispatch_prepared_journal(api, manifest, &entry, fences_current)
+                    Ok(()) => dispatch_prepared_journal(api, manifest_name, manifest, &entry, fences_current)
                         .await
                         .map(|_| ()),
                     Err(err) => Err(err),
@@ -2529,7 +3422,7 @@ async fn prepare_tier_delete_dispatch_inner(
         if let Some(err) = dispatch_error {
             return Err(err);
         }
-        ensure_dispatch_lock_current(bucket_fence, &operation_guard)?;
+        ensure_dispatch_lock_current(bucket_fence, operation_guard)?;
         if !tier_delete_journal_fleet_proof_matches(&fleet_proof)
             || tier_delete_journal_topology_generation(&fleet_proof) != manifest.topology_generation
         {
@@ -2537,7 +3430,7 @@ async fn prepare_tier_delete_dispatch_inner(
         }
         manifest.state = TierDeleteDispatchManifestState::DispatchAuthorized;
         let authorized_data = encode_tier_delete_dispatch_manifest(&manifest)?;
-        match save_config_if_match_fenced(api.clone(), &manifest_name, authorized_data, &manifest_etag, &fences_current).await {
+        match save_config_if_match_fenced(api.clone(), manifest_name, authorized_data, &manifest_etag, &fences_current).await {
             Ok(()) => {}
             Err(Error::PreconditionFailed) => {
                 return Err(Error::other("tier delete dispatch manifest changed before authorization"));
@@ -2547,7 +3440,7 @@ async fn prepare_tier_delete_dispatch_inner(
                 // The write may have reached quorum even if the client saw a
                 // timeout. Only a strong read confirming Authorized permits
                 // mutation; every other outcome is retained for recovery.
-                match read_tier_delete_dispatch_manifest(api.clone(), &manifest_name).await {
+                match read_tier_delete_dispatch_manifest(api.clone(), manifest_name).await {
                     Ok(Some((observed, _)))
                         if observed.operation_id == manifest.operation_id
                             && observed.state == TierDeleteDispatchManifestState::DispatchAuthorized => {}
@@ -2560,7 +3453,7 @@ async fn prepare_tier_delete_dispatch_inner(
     .await;
 
     if let Err(err) = attempt {
-        let authorized = read_tier_delete_dispatch_manifest(api.clone(), &manifest_name)
+        let authorized = read_tier_delete_dispatch_manifest(api.clone(), manifest_name)
             .await
             .ok()
             .flatten()
@@ -2569,8 +3462,15 @@ async fn prepare_tier_delete_dispatch_inner(
                     && current.state == TierDeleteDispatchManifestState::DispatchAuthorized
             });
         if !authorized
-            && let Err(rollback_err) =
-                seal_and_rollback_preparing_dispatch(api.clone(), &manifest, &fleet_proof, bucket_fence, &operation_guard).await
+            && let Err(rollback_err) = seal_and_rollback_preparing_dispatch(
+                api.clone(),
+                manifest_name,
+                &manifest,
+                &fleet_proof,
+                bucket_fence,
+                operation_guard,
+            )
+            .await
         {
             warn!(
                 event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
@@ -2586,8 +3486,17 @@ async fn prepare_tier_delete_dispatch_inner(
 
     // Re-read the exact Authorized manifest and every bound journal before
     // constructing the private one-shot permit.
-    ensure_dispatch_lock_current(bucket_fence, &operation_guard)?;
-    authorized_dispatch_permit(api, &manifest_name, fleet_proof, bucket_fence, &operation_guard).await
+    ensure_dispatch_lock_current(bucket_fence, operation_guard)?;
+    authorized_dispatch_permit_with_parent(
+        api,
+        manifest_name,
+        fleet_proof,
+        bucket_fence,
+        operation_guard,
+        parent_operation_guard,
+        parent_advance,
+    )
+    .await
 }
 
 async fn commit_dispatched_journal(
@@ -2606,7 +3515,7 @@ async fn commit_dispatched_journal(
         let (mut current, etag) = read_tier_delete_journal_with_etag(api.clone(), &name)
             .await?
             .ok_or_else(|| Error::other("dispatched tier delete journal disappeared before commit"))?;
-        validate_bound_journal(manifest, &name, &current)?;
+        validate_bound_journal(manifest, &authorization.0.manifest_object, &name, &current)?;
         if !same_tier_delete_journal_identity(&current, expected) {
             return Err(Error::other("dispatched tier delete journal changed identity before commit"));
         }
@@ -2635,6 +3544,75 @@ async fn commit_dispatched_journal(
     Err(Error::other("tier delete journal changed repeatedly during commit"))
 }
 
+async fn advance_tier_delete_chunk_parent(
+    api: Arc<ECStore>,
+    active: &ActiveTierDeleteDispatch,
+    bucket_fence: &crate::object_api::NamespaceLockFence,
+) -> Result<()> {
+    let Some(advance) = active.parent_advance.as_ref() else {
+        return Ok(());
+    };
+    let parent_lock = api
+        .new_ns_lock(
+            RUSTFS_META_BUCKET,
+            &tier_delete_dispatch_operation_lock_name(&advance.parent_manifest_object),
+        )
+        .await?;
+    let parent_guard = parent_lock
+        .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+        .await?;
+    let (parent, parent_etag) = match read_tier_delete_dispatch_record(api.clone(), &advance.parent_manifest_object).await? {
+        Some((TierDeleteDispatchRecord::Parent(parent), etag)) => (parent, etag),
+        _ => return Err(Error::other("tier delete chunk parent disappeared before batch progress")),
+    };
+    if parent.operation_id != advance.parent_operation_id
+        || parent.state != TierDeleteDispatchParentState::Active
+        || parent.active_chunk.as_ref() != Some(&advance.chunk)
+        || parent.bucket != active.manifest.bucket
+        || parent.bucket_incarnation != active.manifest.bucket_incarnation
+        || parent.prefix != active.manifest.prefix
+        || parent.topology_generation != active.manifest.topology_generation
+    {
+        return Err(Error::other("tier delete chunk parent changed before batch progress"));
+    }
+    let (child, _) = read_tier_delete_dispatch_manifest(api.clone(), &advance.chunk.manifest_object)
+        .await?
+        .ok_or_else(|| Error::other("completed tier delete child manifest disappeared before parent progress"))?;
+    if child.state != TierDeleteDispatchManifestState::Completed
+        || !tier_delete_dispatch_child_matches_parent(&parent, &advance.chunk, &child)
+    {
+        return Err(Error::other("tier delete child is not durably completed before parent progress"));
+    }
+    let fences_current = || {
+        !bucket_fence.is_lock_lost()
+            && !parent_guard.is_lock_lost()
+            && active
+                .authorization
+                .ensure_current(&active.manifest.bucket, active.manifest.bucket_incarnation, &active.manifest.prefix)
+                .is_ok()
+    };
+    record_tier_delete_dispatch_parent_progress_fenced(api.clone(), &advance.parent_manifest_object, &parent, &fences_current)
+        .await?;
+    let mut next = parent.clone();
+    next.revision = next
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| Error::other("tier delete chunk parent revision overflow"))?;
+    next.next_chunk_sequence = next
+        .next_chunk_sequence
+        .checked_add(1)
+        .ok_or_else(|| Error::other("tier delete chunk parent sequence overflow"))?;
+    next.completed_journal_count = next
+        .completed_journal_count
+        .checked_add(advance.chunk.journal_count)
+        .ok_or_else(|| Error::other("tier delete chunk parent journal count overflow"))?;
+    next.active_chunk = None;
+    cas_tier_delete_dispatch_parent(api, &advance.parent_manifest_object, &parent, &parent_etag, &next, &fences_current).await?;
+    #[cfg(all(test, feature = "test-util"))]
+    tier_delete_chunk_test_pause(TierDeleteChunkTestStage::ParentProgressed).await;
+    Ok(())
+}
+
 pub(crate) async fn complete_tier_delete_dispatch(
     api: Arc<ECStore>,
     active: &ActiveTierDeleteDispatch,
@@ -2646,112 +3624,126 @@ pub(crate) async fn complete_tier_delete_dispatch(
     if !active.authorization.mutation_started() {
         return Err(Error::other("tier delete dispatch cannot commit before its local mutation starts"));
     }
-    let manifest_name = tier_delete_dispatch_manifest_object_name(
-        &active.manifest.bucket,
-        active.manifest.bucket_incarnation,
-        &active.manifest.prefix,
-    );
-    let operation_lock = api
-        .new_ns_lock(RUSTFS_META_BUCKET, &tier_delete_dispatch_operation_lock_name(&manifest_name))
-        .await?;
-    let operation_guard = operation_lock
-        .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
-        .await?;
-    let fences_current = || {
-        !bucket_fence.is_lock_lost()
-            && !operation_guard.is_lock_lost()
-            && active
-                .authorization
-                .ensure_current(&active.manifest.bucket, active.manifest.bucket_incarnation, &active.manifest.prefix)
-                .is_ok()
-    };
-    ensure_durable_write_fence(&fences_current, "before tier delete dispatch completion")?;
-    let make_commit = |index: usize| {
-        let api = api.clone();
-        let fences_current = &fences_current;
-        async move {
-            active.authorization.ensure_current(
-                &active.manifest.bucket,
-                active.manifest.bucket_incarnation,
-                &active.manifest.prefix,
-            )?;
-            commit_dispatched_journal(api, &active.manifest, &active.entries[index], &active.authorization, fences_current)
-                .await
-                .map(|entry| (index, entry))
-        }
-    };
-    let mut next = 0;
-    let mut commits = futures::stream::FuturesUnordered::new();
-    while next < active.entries.len() && commits.len() < TIER_DELETE_DISPATCH_CAS_CONCURRENCY {
-        commits.push(make_commit(next));
-        next += 1;
-    }
-    let mut committed_entries = vec![None; active.entries.len()];
-    let mut first_error = None;
-    while let Some(result) = commits.next().await {
-        match result {
-            Ok((index, entry)) => committed_entries[index] = Some(entry),
-            Err(err) if first_error.is_none() => first_error = Some(err),
-            Err(_) => {}
-        }
-        // A failed member CAS leaves the Authorized manifest and every
-        // already-committed member recoverable. Stop admitting tail work, but
-        // drain the bounded in-flight set before releasing the operation lock.
-        if first_error.is_none() && next < active.entries.len() {
+    // The caller holds bucket lifecycle WRITE. Scope the child operation lock
+    // so it is released before `advance_tier_delete_chunk_parent` takes the
+    // parent operation lock.
+    {
+        let manifest_name = active.manifest_object.clone();
+        let operation_lock = api
+            .new_ns_lock(RUSTFS_META_BUCKET, &tier_delete_dispatch_operation_lock_name(&manifest_name))
+            .await?;
+        let operation_guard = operation_lock
+            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+            .await?;
+        let fences_current = || {
+            !bucket_fence.is_lock_lost()
+                && !operation_guard.is_lock_lost()
+                && active
+                    .authorization
+                    .ensure_current(&active.manifest.bucket, active.manifest.bucket_incarnation, &active.manifest.prefix)
+                    .is_ok()
+        };
+        ensure_durable_write_fence(&fences_current, "before tier delete dispatch completion")?;
+        let make_commit = |index: usize| {
+            let api = api.clone();
+            let fences_current = &fences_current;
+            async move {
+                active.authorization.ensure_current(
+                    &active.manifest.bucket,
+                    active.manifest.bucket_incarnation,
+                    &active.manifest.prefix,
+                )?;
+                commit_dispatched_journal(api, &active.manifest, &active.entries[index], &active.authorization, fences_current)
+                    .await
+                    .map(|entry| (index, entry))
+            }
+        };
+        let mut next = 0;
+        let mut commits = futures::stream::FuturesUnordered::new();
+        while next < active.entries.len() && commits.len() < TIER_DELETE_DISPATCH_CAS_CONCURRENCY {
             commits.push(make_commit(next));
             next += 1;
         }
-    }
-    if let Some(err) = first_error {
-        return Err(err);
-    }
-    let committed_entries = committed_entries
-        .into_iter()
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| Error::other("tier delete dispatch completion omitted a journal"))?;
+        let mut committed_entries = vec![None; active.entries.len()];
+        let mut first_error = None;
+        while let Some(result) = commits.next().await {
+            match result {
+                Ok((index, entry)) => committed_entries[index] = Some(entry),
+                Err(err) if first_error.is_none() => first_error = Some(err),
+                Err(_) => {}
+            }
+            // A failed member CAS leaves the Authorized manifest and every
+            // already-committed member recoverable. Stop admitting tail work,
+            // but drain the bounded in-flight set before releasing the operation lock.
+            if first_error.is_none() && next < active.entries.len() {
+                commits.push(make_commit(next));
+                next += 1;
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        let committed_entries = committed_entries
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| Error::other("tier delete dispatch completion omitted a journal"))?;
 
-    active
-        .authorization
-        .ensure_current(&active.manifest.bucket, active.manifest.bucket_incarnation, &active.manifest.prefix)?;
-    let (mut current, etag) = read_tier_delete_dispatch_manifest(api.clone(), &manifest_name)
-        .await?
-        .ok_or_else(|| Error::other("authorized tier delete dispatch manifest disappeared before completion"))?;
-    if current.operation_id != active.manifest.operation_id
-        || current.journal_set_sha256 != active.manifest.journal_set_sha256
-        || current.state != TierDeleteDispatchManifestState::DispatchAuthorized
-        || (etag != active.authorized_etag && current != active.manifest)
-    {
-        return Err(Error::other("tier delete dispatch manifest changed before completion"));
-    }
-    current.state = TierDeleteDispatchManifestState::Completed;
-    active
-        .authorization
-        .ensure_current(&active.manifest.bucket, active.manifest.bucket_incarnation, &active.manifest.prefix)?;
-    let completion = save_config_if_match_fenced(
-        api.clone(),
-        &manifest_name,
-        encode_tier_delete_dispatch_manifest(&current)?,
-        &etag,
-        &fences_current,
-    )
-    .await;
-    active
-        .authorization
-        .ensure_current(&active.manifest.bucket, active.manifest.bucket_incarnation, &active.manifest.prefix)?;
-    completion?;
+        active.authorization.ensure_current(
+            &active.manifest.bucket,
+            active.manifest.bucket_incarnation,
+            &active.manifest.prefix,
+        )?;
+        let (mut current, etag) = read_tier_delete_dispatch_manifest(api.clone(), &manifest_name)
+            .await?
+            .ok_or_else(|| Error::other("authorized tier delete dispatch manifest disappeared before completion"))?;
+        if current.operation_id != active.manifest.operation_id
+            || current.journal_set_sha256 != active.manifest.journal_set_sha256
+            || current.state != TierDeleteDispatchManifestState::DispatchAuthorized
+            || (etag != active.authorized_etag && current != active.manifest)
+        {
+            return Err(Error::other("tier delete dispatch manifest changed before completion"));
+        }
+        current.state = TierDeleteDispatchManifestState::Completed;
+        active.authorization.ensure_current(
+            &active.manifest.bucket,
+            active.manifest.bucket_incarnation,
+            &active.manifest.prefix,
+        )?;
+        let completion = save_config_if_match_fenced(
+            api.clone(),
+            &manifest_name,
+            encode_tier_delete_dispatch_manifest(&current)?,
+            &etag,
+            &fences_current,
+        )
+        .await;
+        active.authorization.ensure_current(
+            &active.manifest.bucket,
+            active.manifest.bucket_incarnation,
+            &active.manifest.prefix,
+        )?;
+        completion?;
 
-    for entry in committed_entries {
-        if let Err(err) = enqueue_committed_tier_delete_journal_entry(&entry).await {
-            debug!(
-                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                operation_id = %current.operation_id,
-                error = ?err,
-                "Committed tier delete dispatch will be picked up by periodic recovery"
-            );
+        #[cfg(all(test, feature = "test-util"))]
+        if active.is_chunked() {
+            tier_delete_chunk_test_pause(TierDeleteChunkTestStage::ChildCompleted).await;
+        }
+
+        for entry in committed_entries {
+            if let Err(err) = enqueue_committed_tier_delete_journal_entry(&entry).await {
+                debug!(
+                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    operation_id = %current.operation_id,
+                    error = ?err,
+                    "Committed tier delete dispatch will be picked up by periodic recovery"
+                );
+            }
         }
     }
+
+    advance_tier_delete_chunk_parent(api, active, bucket_fence).await?;
 
     Ok(())
 }
@@ -3352,8 +4344,12 @@ async fn load_manifest_for_journal(
     let (manifest, _) = read_tier_delete_dispatch_manifest(api, &binding.manifest_object)
         .await?
         .ok_or_else(|| Error::other("tier delete dispatch manifest is missing"))?;
-    validate_bound_journal(&manifest, journal_name, journal)?;
-    if manifest.journal_names.binary_search(&journal_name.to_string()).is_err() {
+    validate_bound_journal(&manifest, &binding.manifest_object, journal_name, journal)?;
+    if manifest
+        .journal_names
+        .binary_search_by(|name| name.as_str().cmp(journal_name))
+        .is_err()
+    {
         return Err(Error::other("tier delete dispatch manifest does not contain its journal"));
     }
     Ok(manifest)
@@ -3596,6 +4592,138 @@ enum TierDeleteDispatchManifestRecoveryOutcome {
     Retained,
 }
 
+fn parent_recovery_fences_current(
+    bucket_guard: &rustfs_lock::NamespaceLockGuard,
+    operation_guard: &rustfs_lock::NamespaceLockGuard,
+    fleet_proof: &TierDeleteJournalFleetProofToken,
+    parent: &TierDeleteDispatchParent,
+    cancel_token: Option<&CancellationToken>,
+) -> bool {
+    cancel_token.is_none_or(|token| !token.is_cancelled())
+        && !bucket_guard.is_lock_lost()
+        && !operation_guard.is_lock_lost()
+        && tier_delete_journal_fleet_proof_matches(fleet_proof)
+        && tier_delete_journal_topology_generation(fleet_proof) == parent.topology_generation
+}
+
+async fn delete_tier_delete_dispatch_parent_if_match_confirmed(
+    api: Arc<ECStore>,
+    parent_name: &str,
+    parent: &TierDeleteDispatchParent,
+    etag: &str,
+    fences_current: &impl Fn() -> bool,
+) -> Result<()> {
+    let data = encode_tier_delete_dispatch_parent(parent)?;
+    let delete = delete_durable_config_if_match(api.clone(), parent_name, &data, etag, fences_current).await;
+    let observed = read_tier_delete_dispatch_record(api.clone(), parent_name).await?;
+    if !fences_current() {
+        return Err(Error::other("tier delete dispatch parent recovery fence changed during deletion"));
+    }
+    match observed {
+        None => Ok(()),
+        Some((TierDeleteDispatchRecord::Parent(observed), _)) => {
+            let observed_data = encode_tier_delete_dispatch_parent(&observed)?;
+            if api
+                .durable_ilm_terminal_receipt_covers_active_source(parent_name, &observed_data)
+                .await?
+            {
+                Ok(())
+            } else {
+                Err(Error::other_with_context(
+                    "tier delete dispatch parent changed during deletion",
+                    format!("observed {:?}, delete result {:?}", observed.state, delete.as_ref().err()),
+                ))
+            }
+        }
+        Some((TierDeleteDispatchRecord::Manifest(_), _)) => {
+            Err(Error::other("tier delete dispatch parent was replaced during deletion"))
+        }
+    }
+}
+
+async fn process_tier_delete_dispatch_parent(
+    api: Arc<ECStore>,
+    parent_name: &str,
+    observed_before_lock: &TierDeleteDispatchParent,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<TierDeleteDispatchManifestRecoveryOutcome> {
+    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained);
+    }
+    let fleet_proof = acquire_tier_delete_journal_fleet_proof()
+        .ok_or_else(|| Error::other("tier delete chunk parent fleet capability is unavailable"))?;
+    if tier_delete_journal_topology_generation(&fleet_proof) != observed_before_lock.topology_generation {
+        return Err(Error::other("tier delete chunk parent topology generation changed"));
+    }
+    // Background lock order matches the request path: bucket lifecycle WRITE
+    // precedes the parent operation lock. This path never takes a child lock.
+    let bucket_guard = api.acquire_bucket_lifecycle_write_lock(&observed_before_lock.bucket).await?;
+    let operation_lock = api
+        .new_ns_lock(RUSTFS_META_BUCKET, &tier_delete_dispatch_operation_lock_name(parent_name))
+        .await?;
+    let operation_guard = operation_lock
+        .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+        .await?;
+    let (parent, etag) = match read_tier_delete_dispatch_record(api.clone(), parent_name).await? {
+        Some((TierDeleteDispatchRecord::Parent(parent), etag)) => (parent, etag),
+        Some((TierDeleteDispatchRecord::Manifest(_), _)) => {
+            return Err(Error::other("tier delete chunk parent was replaced by a legacy manifest"));
+        }
+        None => return Err(Error::ConfigNotFound),
+    };
+    if parent.operation_id != observed_before_lock.operation_id
+        || parent.bucket != observed_before_lock.bucket
+        || !parent_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &parent, cancel_token)
+    {
+        return Err(Error::other("tier delete chunk parent recovery fence changed"));
+    }
+    let fences_current = || parent_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &parent, cancel_token);
+    record_tier_delete_dispatch_parent_progress_fenced(api.clone(), parent_name, &parent, &fences_current).await?;
+    if parent.state == TierDeleteDispatchParentState::Completed {
+        delete_tier_delete_dispatch_parent_if_match_confirmed(api, parent_name, &parent, &etag, &fences_current).await?;
+        return Ok(TierDeleteDispatchManifestRecoveryOutcome::Deleted);
+    }
+    let Some(binding) = parent.active_chunk.clone() else {
+        return Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained);
+    };
+    let child = read_tier_delete_dispatch_manifest(api.clone(), &binding.manifest_object).await?;
+    let Some((child, _)) = child else {
+        if !tier_delete_dispatch_chunk_journal_namespace_empty(api.clone(), binding.operation_id).await? {
+            return Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained);
+        }
+        let mut next = parent.clone();
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| Error::other("tier delete chunk parent revision overflow"))?;
+        next.active_chunk = None;
+        cas_tier_delete_dispatch_parent(api, parent_name, &parent, &etag, &next, &fences_current).await?;
+        return Ok(TierDeleteDispatchManifestRecoveryOutcome::Advanced);
+    };
+    if !tier_delete_dispatch_child_matches_parent(&parent, &binding, &child) {
+        return Err(Error::other("tier delete chunk parent child binding changed during recovery"));
+    }
+    if child.state != TierDeleteDispatchManifestState::Completed {
+        return Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained);
+    }
+    let mut next = parent.clone();
+    next.revision = next
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| Error::other("tier delete chunk parent revision overflow"))?;
+    next.next_chunk_sequence = next
+        .next_chunk_sequence
+        .checked_add(1)
+        .ok_or_else(|| Error::other("tier delete chunk parent sequence overflow"))?;
+    next.completed_journal_count = next
+        .completed_journal_count
+        .checked_add(binding.journal_count)
+        .ok_or_else(|| Error::other("tier delete chunk parent journal count overflow"))?;
+    next.active_chunk = None;
+    cas_tier_delete_dispatch_parent(api, parent_name, &parent, &etag, &next, &fences_current).await?;
+    Ok(TierDeleteDispatchManifestRecoveryOutcome::Advanced)
+}
+
 fn manifest_recovery_fences_current(
     bucket_guard: &rustfs_lock::NamespaceLockGuard,
     operation_guard: &rustfs_lock::NamespaceLockGuard,
@@ -3688,8 +4816,52 @@ async fn delete_tier_delete_dispatch_manifest_if_match_confirmed(
     }
 }
 
+/// Child manifests share the dispatch-record namespace with the legacy/root
+/// manifest and are therefore returned by the same recovery listing.  A child
+/// that is still bound by an active chunk parent must remain available until
+/// the parent records the child completion and advances its sequence/count.
+/// The bucket lifecycle WRITE lock held by the caller serializes this check
+/// with request-side parent inspection/progress, so no parent lock nesting is
+/// needed here.
+async fn child_dispatch_manifest_is_bound_to_active_parent(
+    api: Arc<ECStore>,
+    manifest_name: &str,
+    manifest: &TierDeleteDispatchManifest,
+) -> Result<bool> {
+    let parent_name = tier_delete_dispatch_manifest_object_name(&manifest.bucket, manifest.bucket_incarnation, &manifest.prefix);
+    if parent_name == manifest_name {
+        return Ok(false);
+    }
+    let Some((record, _)) = read_tier_delete_dispatch_record(api, &parent_name).await? else {
+        return Ok(false);
+    };
+    let TierDeleteDispatchRecord::Parent(parent) = record else {
+        return Err(Error::other("tier delete child exists beside a legacy root manifest"));
+    };
+    if parent.bucket != manifest.bucket
+        || parent.bucket_incarnation != manifest.bucket_incarnation
+        || parent.prefix != manifest.prefix
+        || parent.topology_generation != manifest.topology_generation
+    {
+        return Err(Error::other("tier delete child parent identity changed during recovery"));
+    }
+    let Some(binding) = parent.active_chunk.as_ref() else {
+        return Ok(false);
+    };
+    if binding.manifest_object != manifest_name {
+        return Ok(false);
+    }
+    if parent.state != TierDeleteDispatchParentState::Active
+        || !tier_delete_dispatch_child_matches_parent(&parent, binding, manifest)
+    {
+        return Err(Error::other("tier delete child binding is inconsistent during recovery"));
+    }
+    Ok(true)
+}
+
 async fn authorized_dispatch_all_committed(
     api: Arc<ECStore>,
+    manifest_object: &str,
     manifest: &TierDeleteDispatchManifest,
     fences_current: &impl Fn() -> bool,
 ) -> Result<bool> {
@@ -3712,7 +4884,7 @@ async fn authorized_dispatch_all_committed(
                 ensure_tier_delete_dispatch_member_scan_fence(fences_current)?;
                 let (entry, _) = observed
                     .ok_or_else(|| Error::other("authorized tier delete dispatch manifest references a missing journal"))?;
-                validate_bound_journal(manifest, &name, &entry)?;
+                validate_bound_journal(manifest, manifest_object, &name, &entry)?;
                 #[cfg(all(test, feature = "test-util"))]
                 tier_delete_dispatch_authorized_progress_test_observed();
                 record_tier_delete_journal_progress_fenced(api, &name, &entry, fences_current).await?;
@@ -3766,6 +4938,7 @@ async fn authorized_dispatch_all_committed(
 
 async fn completed_dispatch_has_present_journal(
     api: Arc<ECStore>,
+    manifest_object: &str,
     manifest: &TierDeleteDispatchManifest,
     fences_current: &impl Fn() -> bool,
 ) -> Result<bool> {
@@ -3790,7 +4963,7 @@ async fn completed_dispatch_has_present_journal(
                     let Some((entry, _)) = observed else {
                         return Ok(None);
                     };
-                    validate_bound_journal(manifest, &name, &entry)?;
+                    validate_bound_journal(manifest, manifest_object, &name, &entry)?;
                     if entry.state != TierDeleteJournalState::Committed {
                         return Err(Error::other("completed tier delete dispatch contains an uncommitted journal"));
                     }
@@ -3859,6 +5032,8 @@ async fn process_tier_delete_dispatch_manifest(
         }
         return Err(Error::other("tier delete dispatch manifest recovery fence changed"));
     }
+    let child_bound_to_active_parent =
+        child_dispatch_manifest_is_bound_to_active_parent(api.clone(), manifest_name, &current).await?;
     {
         let fences_current =
             || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token);
@@ -3897,7 +5072,7 @@ async fn process_tier_delete_dispatch_manifest(
         {
             let fences_current =
                 || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token);
-            delete_staged_dispatch_journal_set(api.clone(), &current, &fences_current).await?;
+            delete_staged_dispatch_journal_set(api.clone(), manifest_name, &current, &fences_current).await?;
         }
         if current.state == TierDeleteDispatchManifestState::Aborting {
             let next = {
@@ -3921,7 +5096,7 @@ async fn process_tier_delete_dispatch_manifest(
             }
             return Err(Error::other("tier delete dispatch manifest recovery fence changed"));
         }
-        validate_staged_dispatch_journal_set(api.clone(), &current, &|| {
+        validate_staged_dispatch_journal_set(api.clone(), manifest_name, &current, &|| {
             manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token)
         })
         .await?;
@@ -3934,7 +5109,7 @@ async fn process_tier_delete_dispatch_manifest(
     if current.state == TierDeleteDispatchManifestState::DispatchAuthorized {
         let fences_current =
             || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token);
-        if !authorized_dispatch_all_committed(api.clone(), &current, &fences_current).await? {
+        if !authorized_dispatch_all_committed(api.clone(), manifest_name, &current, &fences_current).await? {
             return Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained);
         }
         let next = {
@@ -3961,7 +5136,14 @@ async fn process_tier_delete_dispatch_manifest(
     }
     let fences_current =
         || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token);
-    if completed_dispatch_has_present_journal(api.clone(), &current, &fences_current).await? {
+    if completed_dispatch_has_present_journal(api.clone(), manifest_name, &current, &fences_current).await? {
+        return Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained);
+    }
+    if child_bound_to_active_parent {
+        // The parent must observe the completed child and durably add its
+        // journal count before the child record can be removed.  Otherwise a
+        // concurrent child recovery could erase the only evidence needed to
+        // advance the parent's sequence.
         return Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained);
     }
     if !manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token) {
@@ -4073,8 +5255,8 @@ async fn recover_tier_delete_dispatch_manifest_object(
             return TierDeleteDispatchManifestScanOutcome::Failed;
         }
     };
-    let manifest = match decode_tier_delete_dispatch_manifest(&data, &object_name) {
-        Ok(manifest) => manifest,
+    let record = match decode_tier_delete_dispatch_record(&data, &object_name) {
+        Ok(record) => record,
         Err(err) => {
             warn!(
                 event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
@@ -4082,10 +5264,14 @@ async fn recover_tier_delete_dispatch_manifest_object(
                 subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                 manifest_object = %object_name,
                 error = ?err,
-                "Invalid tier delete dispatch manifest is quarantined"
+                "Invalid tier delete dispatch record is quarantined"
             );
             return TierDeleteDispatchManifestScanOutcome::Failed;
         }
+    };
+    let operation_id = match &record {
+        TierDeleteDispatchRecord::Manifest(manifest) => manifest.operation_id,
+        TierDeleteDispatchRecord::Parent(parent) => parent.operation_id,
     };
     match api
         .durable_ilm_terminal_receipt_covers_active_source(&object_name, &data)
@@ -4104,14 +5290,25 @@ async fn recover_tier_delete_dispatch_manifest_object(
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                 manifest_object = %object_name,
-                operation_id = %manifest.operation_id,
+                operation_id = %operation_id,
                 error = ?err,
                 "Tier delete dispatch terminal source proof will retry later"
             );
             return TierDeleteDispatchManifestScanOutcome::Failed;
         }
     }
-    let result = process_tier_delete_dispatch_manifest(api, &object_name, &manifest, cancel_token.as_ref()).await;
+    let state = match &record {
+        TierDeleteDispatchRecord::Manifest(manifest) => format!("{:?}", manifest.state),
+        TierDeleteDispatchRecord::Parent(parent) => format!("parent::{:?}", parent.state),
+    };
+    let result = match &record {
+        TierDeleteDispatchRecord::Manifest(manifest) => {
+            process_tier_delete_dispatch_manifest(api, &object_name, manifest, cancel_token.as_ref()).await
+        }
+        TierDeleteDispatchRecord::Parent(parent) => {
+            process_tier_delete_dispatch_parent(api, &object_name, parent, cancel_token.as_ref()).await
+        }
+    };
     if cancel_token.as_ref().is_some_and(CancellationToken::is_cancelled) {
         // Cancellation is cooperative: every admitted mutation above has
         // already returned while the operation/fleet guards and registry
@@ -4130,8 +5327,8 @@ async fn recover_tier_delete_dispatch_manifest_object(
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                 manifest_object = %object_name,
-                operation_id = %manifest.operation_id,
-                state = ?manifest.state,
+                operation_id = %operation_id,
+                state = %state,
                 error = ?err,
                 "Tier delete dispatch manifest recovery will retry later"
             );
@@ -4191,6 +5388,15 @@ async fn schedule_tier_delete_dispatch_manifest_recovery(
             TierDeleteDispatchManifestScanOutcome::Failed
         }
     }
+}
+
+fn schedule_aborted_tier_delete_dispatch_cleanup(api: Arc<ECStore>, manifest_name: String) {
+    api.ctx.wake_tier_delete_journal_recovery();
+    tokio::spawn(async move {
+        let _ =
+            schedule_tier_delete_dispatch_manifest_recovery(api, manifest_name, TIER_DELETE_DISPATCH_MANIFEST_RECOVERY_TIMEOUT)
+                .await;
+    });
 }
 
 #[cfg(all(test, feature = "test-util"))]
@@ -4467,6 +5673,201 @@ pub async fn recover_tier_delete_journal_entries(
     Ok(stats)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TierDeleteJournalRecoveryPageStep {
+    stop_queue: bool,
+    made_progress: bool,
+}
+
+fn remaining_recovery_pass_budget(
+    deadline: tokio::time::Instant,
+    stats: &mut TierDeleteJournalRecoveryPassStats,
+) -> Option<Duration> {
+    match deadline.checked_duration_since(tokio::time::Instant::now()) {
+        Some(remaining) if !remaining.is_zero() => Some(remaining),
+        _ => {
+            stats.deadline_exhausted = true;
+            None
+        }
+    }
+}
+
+fn accumulate_dispatch_manifest_recovery_stats(
+    total: &mut TierDeleteDispatchManifestRecoveryStats,
+    page: TierDeleteDispatchManifestRecoveryStats,
+) {
+    total.scanned += page.scanned;
+    total.advanced += page.advanced;
+    total.deleted += page.deleted;
+    total.retained += page.retained;
+    total.failed += page.failed;
+    total.next_marker = page.next_marker;
+    total.truncated = page.truncated;
+}
+
+fn accumulate_tier_delete_journal_recovery_stats(
+    total: &mut TierDeleteJournalRecoveryStats,
+    page: TierDeleteJournalRecoveryStats,
+) {
+    total.scanned += page.scanned;
+    total.deleted += page.deleted;
+    total.failed += page.failed;
+    total.next_marker = page.next_marker;
+    total.truncated = page.truncated;
+}
+
+async fn recover_tier_delete_dispatch_manifest_pass_page(
+    api: Arc<ECStore>,
+    cancel_token: &CancellationToken,
+    marker: &mut Option<String>,
+    deadline: tokio::time::Instant,
+    stats: &mut TierDeleteJournalRecoveryPassStats,
+) -> Option<TierDeleteJournalRecoveryPageStep> {
+    if cancel_token.is_cancelled() {
+        stats.canceled = true;
+        return None;
+    }
+    let remaining = remaining_recovery_pass_budget(deadline, stats)?;
+    let page_marker = marker.clone();
+    let recovery = recover_tier_delete_dispatch_manifests(api, DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT, page_marker.clone());
+    let page =
+        await_tier_delete_journal_recovery(cancel_token, remaining.min(TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT), recovery).await;
+    let Some(page) = page else {
+        stats.canceled = true;
+        return None;
+    };
+    match page {
+        Ok(page) => {
+            stats.manifest_pages += 1;
+            let made_progress = page.advanced > 0 || page.deleted > 0;
+            let stop_queue = !page.truncated || !made_progress;
+            *marker = page.next_marker.clone();
+            accumulate_dispatch_manifest_recovery_stats(&mut stats.manifests, page);
+            Some(TierDeleteJournalRecoveryPageStep {
+                stop_queue,
+                made_progress,
+            })
+        }
+        Err(err) => {
+            stats.manifest_errors += 1;
+            warn!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                next_marker = ?page_marker,
+                error = ?err,
+                "Failed to recover tier delete dispatch manifest page"
+            );
+            Some(TierDeleteJournalRecoveryPageStep {
+                stop_queue: true,
+                made_progress: false,
+            })
+        }
+    }
+}
+
+async fn recover_tier_delete_journal_pass_page(
+    api: Arc<ECStore>,
+    cancel_token: &CancellationToken,
+    marker: &mut Option<String>,
+    deadline: tokio::time::Instant,
+    stats: &mut TierDeleteJournalRecoveryPassStats,
+) -> Option<TierDeleteJournalRecoveryPageStep> {
+    if cancel_token.is_cancelled() {
+        stats.canceled = true;
+        return None;
+    }
+    let remaining = remaining_recovery_pass_budget(deadline, stats)?;
+    let page_marker = marker.clone();
+    let recovery = recover_tier_delete_journal_entries(api, DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT, page_marker.clone());
+    let page =
+        await_tier_delete_journal_recovery(cancel_token, remaining.min(TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT), recovery).await;
+    let Some(page) = page else {
+        stats.canceled = true;
+        return None;
+    };
+    match page {
+        Ok(page) => {
+            stats.journal_pages += 1;
+            let made_progress = page.deleted > 0;
+            let stop_queue = !page.truncated || !made_progress;
+            *marker = page.next_marker.clone();
+            accumulate_tier_delete_journal_recovery_stats(&mut stats.journals, page);
+            Some(TierDeleteJournalRecoveryPageStep {
+                stop_queue,
+                made_progress,
+            })
+        }
+        Err(err) => {
+            stats.journal_errors += 1;
+            warn!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                next_marker = ?page_marker,
+                error = ?err,
+                "Failed to recover tier delete journal page"
+            );
+            Some(TierDeleteJournalRecoveryPageStep {
+                stop_queue: true,
+                made_progress: false,
+            })
+        }
+    }
+}
+
+async fn recover_tier_delete_journal_pass(
+    api: Arc<ECStore>,
+    cancel_token: &CancellationToken,
+    manifest_marker: &mut Option<String>,
+    journal_marker: &mut Option<String>,
+    budget: Duration,
+) -> TierDeleteJournalRecoveryPassStats {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut stats = TierDeleteJournalRecoveryPassStats::default();
+    let mut manifest_stopped = false;
+    let mut journal_stopped = false;
+
+    while !manifest_stopped || !journal_stopped {
+        let mut made_progress = false;
+        if !manifest_stopped {
+            let Some(step) =
+                recover_tier_delete_dispatch_manifest_pass_page(api.clone(), cancel_token, manifest_marker, deadline, &mut stats)
+                    .await
+            else {
+                return stats;
+            };
+            manifest_stopped = step.stop_queue;
+            made_progress |= step.made_progress;
+        }
+        if !journal_stopped {
+            let Some(step) =
+                recover_tier_delete_journal_pass_page(api.clone(), cancel_token, journal_marker, deadline, &mut stats).await
+            else {
+                return stats;
+            };
+            journal_stopped = step.stop_queue;
+            made_progress |= step.made_progress;
+        }
+        if !made_progress {
+            break;
+        }
+    }
+
+    stats
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) async fn recover_test_tier_delete_journal_pass_with_budget(
+    api: Arc<ECStore>,
+    cancel_token: &CancellationToken,
+    manifest_marker: &mut Option<String>,
+    journal_marker: &mut Option<String>,
+    budget: Duration,
+) -> TierDeleteJournalRecoveryPassStats {
+    recover_tier_delete_journal_pass(api, cancel_token, manifest_marker, journal_marker, budget).await
+}
+
 pub async fn run_tier_delete_journal_recovery_loop(api: Arc<ECStore>, cancel_token: CancellationToken) {
     let mut interval = tokio::time::interval(TIER_DELETE_JOURNAL_RECOVERY_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -4474,92 +5875,47 @@ pub async fn run_tier_delete_journal_recovery_loop(api: Arc<ECStore>, cancel_tok
     let mut manifest_marker: Option<String> = None;
 
     loop {
-        #[cfg(test)]
         tokio::select! {
             biased;
             _ = cancel_token.cancelled() => return,
             _ = interval.tick() => {},
             _ = api.ctx.wait_for_tier_delete_journal_recovery() => {},
         }
-        #[cfg(not(test))]
-        tokio::select! {
-            biased;
-            _ = cancel_token.cancelled() => return,
-            _ = interval.tick() => {},
-        }
 
-        let manifest_recovery = recover_tier_delete_dispatch_manifests(
+        let stats = recover_tier_delete_journal_pass(
             api.clone(),
-            DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT,
-            manifest_marker.clone(),
+            &cancel_token,
+            &mut manifest_marker,
+            &mut marker,
+            TIER_DELETE_JOURNAL_RECOVERY_PASS_BUDGET,
+        )
+        .await;
+        if stats.canceled {
+            return;
+        }
+        debug!(
+            event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            manifest_pages = stats.manifest_pages,
+            manifest_scanned = stats.manifests.scanned,
+            manifest_advanced = stats.manifests.advanced,
+            manifest_deleted = stats.manifests.deleted,
+            manifest_retained = stats.manifests.retained,
+            manifest_failed = stats.manifests.failed,
+            manifest_errors = stats.manifest_errors,
+            manifest_truncated = stats.manifests.truncated,
+            manifest_next_marker = ?manifest_marker,
+            journal_pages = stats.journal_pages,
+            journal_scanned = stats.journals.scanned,
+            journal_deleted = stats.journals.deleted,
+            journal_failed = stats.journals.failed,
+            journal_errors = stats.journal_errors,
+            journal_truncated = stats.journals.truncated,
+            journal_next_marker = ?marker,
+            deadline_exhausted = stats.deadline_exhausted,
+            "Recovered tier delete journal pass"
         );
-        let Some(manifest_result) =
-            await_tier_delete_journal_recovery(&cancel_token, TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT, manifest_recovery).await
-        else {
-            return;
-        };
-        match manifest_result {
-            Ok(stats) => {
-                manifest_marker = stats.next_marker;
-                debug!(
-                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    scanned = stats.scanned,
-                    advanced = stats.advanced,
-                    deleted = stats.deleted,
-                    retained = stats.retained,
-                    failed = stats.failed,
-                    truncated = stats.truncated,
-                    next_marker = ?manifest_marker,
-                    "Reconciled tier delete dispatch manifests"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    next_marker = ?manifest_marker,
-                    error = ?err,
-                    "Failed to recover tier delete dispatch manifests"
-                );
-            }
-        }
-
-        let recovery =
-            recover_tier_delete_journal_entries(api.clone(), DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT, marker.clone());
-        let Some(result) =
-            await_tier_delete_journal_recovery(&cancel_token, TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT, recovery).await
-        else {
-            return;
-        };
-        match result {
-            Ok(stats) => {
-                marker = stats.next_marker;
-                debug!(
-                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    scanned = stats.scanned,
-                    deleted = stats.deleted,
-                    failed = stats.failed,
-                    truncated = stats.truncated,
-                    next_marker = ?marker,
-                    "Recovered tier delete journal tasks"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    next_marker = ?marker,
-                    error = ?err,
-                    "Failed to recover tier delete journal tasks"
-                );
-            }
-        }
     }
 }
 
@@ -4586,11 +5942,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
+        TIER_DELETE_DISPATCH_MANIFEST_VERSION, TIER_DELETE_DISPATCH_PARENT_RECORD_TYPE, TIER_DELETE_DISPATCH_PARENT_VERSION,
         TIER_DELETE_JOURNAL_EXACT_VERSION, TIER_DELETE_JOURNAL_LEGACY_PREFIX, TIER_DELETE_JOURNAL_SOLE_OWNER_VERSION,
         TIER_DELETE_JOURNAL_STATE_VERSION, TIER_DELETE_JOURNAL_TRANSACTION_VERSION, TIER_DELETE_JOURNAL_V6_PREFIX,
-        await_tier_delete_journal_recovery, decode_tier_delete_journal_entry, encode_tier_delete_journal_entry,
-        object_info_references_tier_delete, record_tier_delete_journal_backend_identity, same_tier_delete_authorization_identity,
-        same_tier_delete_journal_identity, tier_delete_journal_object_name, tier_delete_source_matches_dispatch_scope,
+        TierDeleteDispatchChunkBinding, TierDeleteDispatchManifest, TierDeleteDispatchManifestState, TierDeleteDispatchParent,
+        TierDeleteDispatchParentState, TierDeleteDispatchRecord, await_tier_delete_journal_recovery,
+        decode_tier_delete_dispatch_record, decode_tier_delete_journal_entry, encode_tier_delete_dispatch_manifest,
+        encode_tier_delete_dispatch_parent, encode_tier_delete_journal_entry, object_info_references_tier_delete,
+        record_tier_delete_journal_backend_identity, same_tier_delete_authorization_identity, same_tier_delete_journal_identity,
+        tier_delete_dispatch_child_matches_parent, tier_delete_dispatch_chunk_manifest_object_name,
+        tier_delete_dispatch_journal_set_digest, tier_delete_dispatch_manifest_object_name, tier_delete_journal_object_name,
+        tier_delete_source_matches_dispatch_scope,
     };
     use crate::bucket::lifecycle::tier_sweeper::{
         Jentry, TierDeleteDispatchBinding, TierDeleteJournalState, TierDeleteSourceIdentity,
@@ -4613,6 +5975,118 @@ mod tests {
             source: None,
             dispatch: None,
         }
+    }
+
+    #[test]
+    fn chunk_parent_and_child_preserve_the_legacy_fail_closed_fence() {
+        let legacy_v1_manifest_path_accepts = |data: &[u8], object_name: &str| {
+            serde_json::from_slice::<TierDeleteDispatchManifest>(data).is_ok_and(|manifest| {
+                tier_delete_dispatch_manifest_object_name(&manifest.bucket, manifest.bucket_incarnation, &manifest.prefix)
+                    == object_name
+            })
+        };
+        let bucket = "chunked-bucket";
+        let incarnation = uuid::Uuid::new_v4();
+        let prefix = "large/";
+        let parent_name = tier_delete_dispatch_manifest_object_name(bucket, incarnation, prefix);
+        let parent = TierDeleteDispatchParent {
+            version: TIER_DELETE_DISPATCH_PARENT_VERSION,
+            record_type: TIER_DELETE_DISPATCH_PARENT_RECORD_TYPE.to_string(),
+            operation_id: uuid::Uuid::new_v4(),
+            bucket: bucket.to_string(),
+            bucket_incarnation: incarnation,
+            prefix: prefix.to_string(),
+            topology_generation: "a".repeat(64),
+            revision: 0,
+            next_chunk_sequence: 0,
+            completed_journal_count: 0,
+            active_chunk: None,
+            state: TierDeleteDispatchParentState::Active,
+        };
+        let parent_data = encode_tier_delete_dispatch_parent(&parent).expect("chunk parent should encode");
+        assert!(
+            serde_json::from_slice::<TierDeleteDispatchManifest>(&parent_data).is_err(),
+            "the legacy v1 manifest codec must reject a chunk-parent root sentinel"
+        );
+        assert!(matches!(
+            decode_tier_delete_dispatch_record(&parent_data, &parent_name).expect("current codec should accept the parent"),
+            TierDeleteDispatchRecord::Parent(_)
+        ));
+        assert!(
+            decode_tier_delete_dispatch_record(&parent_data, &format!("{parent_name}.other")).is_err(),
+            "a chunk parent must remain bound to the deterministic legacy root"
+        );
+        let mut impossible_progress = parent.clone();
+        impossible_progress.revision = 2;
+        impossible_progress.next_chunk_sequence = 2;
+        impossible_progress.completed_journal_count = 1;
+        let impossible_progress_data =
+            encode_tier_delete_dispatch_parent(&impossible_progress).expect("invalid test parent should still serialize");
+        assert!(
+            decode_tier_delete_dispatch_record(&impossible_progress_data, &parent_name).is_err(),
+            "a parent cannot complete fewer journals than its completed child count"
+        );
+
+        let child_operation_id = uuid::Uuid::new_v4();
+        let child_name = tier_delete_dispatch_chunk_manifest_object_name(bucket, incarnation, prefix, child_operation_id);
+        let journal_names = vec![format!(
+            "{TIER_DELETE_JOURNAL_V6_PREFIX}{}/{}.json",
+            child_operation_id.simple(),
+            "b".repeat(64)
+        )];
+        let journal_set_sha256 = tier_delete_dispatch_journal_set_digest(&journal_names);
+        let child = TierDeleteDispatchManifest {
+            version: TIER_DELETE_DISPATCH_MANIFEST_VERSION,
+            operation_id: child_operation_id,
+            bucket: bucket.to_string(),
+            bucket_incarnation: incarnation,
+            prefix: prefix.to_string(),
+            journal_count: 1,
+            journal_names,
+            journal_set_sha256: journal_set_sha256.clone(),
+            topology_generation: "a".repeat(64),
+            state: TierDeleteDispatchManifestState::Completed,
+        };
+        let child_data = encode_tier_delete_dispatch_manifest(&child).expect("chunk child should encode");
+        assert_ne!(child_name, parent_name);
+        assert!(
+            legacy_v1_manifest_path_accepts(&child_data, &parent_name),
+            "the unchanged child payload must remain byte-compatible at the legacy root"
+        );
+        assert!(
+            !legacy_v1_manifest_path_accepts(&child_data, &child_name),
+            "the legacy root-only path validator must reject an operation-scoped child"
+        );
+        assert!(matches!(
+            decode_tier_delete_dispatch_record(&child_data, &child_name).expect("current codec should accept the child"),
+            TierDeleteDispatchRecord::Manifest(_)
+        ));
+        let wrong_child_name = tier_delete_dispatch_chunk_manifest_object_name(bucket, incarnation, prefix, uuid::Uuid::new_v4());
+        assert!(
+            decode_tier_delete_dispatch_record(&child_data, &wrong_child_name).is_err(),
+            "a child manifest must remain bound to its exact operation-scoped path"
+        );
+
+        let binding = TierDeleteDispatchChunkBinding {
+            sequence: 0,
+            operation_id: child_operation_id,
+            manifest_object: child_name,
+            journal_set_sha256,
+            journal_count: 1,
+        };
+        let mut bound_parent = parent;
+        bound_parent.revision = 1;
+        bound_parent.active_chunk = Some(binding.clone());
+        bound_parent
+            .validate(&parent_name)
+            .expect("the exact child binding should produce a valid active parent");
+        assert!(tier_delete_dispatch_child_matches_parent(&bound_parent, &binding, &child));
+        let mut mismatched_child = child;
+        mismatched_child.topology_generation = "c".repeat(64);
+        assert!(
+            !tier_delete_dispatch_child_matches_parent(&bound_parent, &binding, &mismatched_child),
+            "a valid child path and payload cannot bypass the exact parent topology binding"
+        );
     }
 
     fn bound_v6_journal_entry(state: TierDeleteJournalState) -> Jentry {

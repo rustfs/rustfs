@@ -48,7 +48,7 @@ pub use internode_data_transport::build_internode_data_transport_from_env;
 pub(crate) use peer_rest_client::TierConfigReloadOutcome;
 pub use peer_rest_client::{
     KMS_SIGNAL_SUBSYSTEM, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, SERVICE_SIGNAL_REFRESH_CONFIG,
-    SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerPeerActivity, ScannerPublicationLease,
+    SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerPeerActivity, ScannerPeerDirtyUsageSnapshot, ScannerPublicationLease,
 };
 pub(crate) use peer_s3_client::heal_bucket_local_on_disks;
 pub use peer_s3_client::{

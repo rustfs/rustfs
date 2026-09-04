@@ -253,6 +253,13 @@ pub mod bucket {
         };
     }
 
+    pub mod sealed_credentials {
+        pub use crate::bucket::sealed_credentials::{
+            CredentialSealer, SEALED_CREDENTIAL_VERSION, SealScope, SealedCredential, SealedCredentialError,
+            SealedCredentialStore, credential_sealer, install_credential_sealer, seal_secret, unseal_secret,
+        };
+    }
+
     pub mod replication {
         pub use crate::bucket::replication::replication_pool::{
             DurableMrfBacklogSummary, DurableMrfBucketBacklog, DurableMrfTargetBacklog, MrfBacklogObservabilitySummary,
@@ -526,8 +533,8 @@ pub mod rpc {
     pub use crate::cluster::rpc::{
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
         PeerRestClient, PeerS3Client, S3PeerSys, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
-        ScannerBucketListing, ScannerPeerActivity, ScannerPublicationLease, TONIC_RPC_PREFIX, TonicInterceptor,
-        build_put_file_auth_trailer, check_and_record_signed_rpc_nonce, decode_heal_bucket_rpc_options,
+        ScannerBucketListing, ScannerPeerActivity, ScannerPeerDirtyUsageSnapshot, ScannerPublicationLease, TONIC_RPC_PREFIX,
+        TonicInterceptor, build_put_file_auth_trailer, check_and_record_signed_rpc_nonce, decode_heal_bucket_rpc_options,
         encode_heal_bucket_rpc_options, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
         gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
         normalize_tonic_rpc_audience, set_tonic_canonical_body_digest, sign_ns_scanner_capability,

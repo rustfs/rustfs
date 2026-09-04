@@ -30,7 +30,7 @@ These are approved-target invariants. A protocol's explicitly labeled current ex
 | Remote PUT is in flight or its response is unknown | Transition transaction | Only cleanup of its own canonical candidate, subject to the transaction recovery predicate | Durable transaction identity plus a known remote-version state; the approved target also requires expiry and durable takeover of the creator fence |
 | Local transition commit is complete | Exact transitioned version in `xl.meta` | No | Current recovery finds the transaction's logical bucket/object/version and checks `TRANSITION_COMPLETE` plus the same remote object, tier, and remote version. It does not compare the recorded data directory, modification time, size, or ETag; the approved target adds that full source comparison |
 | An ordinary delete removes that transitioned version | Hidden `xl.meta` free-version | Yes | Metadata quorum atomically removes the visible version and preserves its exact tier tuple in the free-version |
-| A recursive prefix/delete-all operation cannot preserve per-object markers | v6 journal bound to an immutable dispatch manifest | Yes, but only after manifest completion and all-pool absence proof | `DispatchAuthorized`, local destructive mutation, every journal `Committed`, then manifest `Completed` |
+| A recursive prefix/delete-all operation cannot preserve per-object markers | v6 journal bound to an immutable single dispatch manifest or a chunk-parent-bound child manifest | Yes, but only after child/manifest completion and all-pool absence proof | `DispatchAuthorized`, exact local destructive mutation, every journal `Committed`, then child/manifest `Completed`; a chunk parent advances only after that child completion |
 | Tier configuration mutation, manual job, or decommission receipt | Intent/admission/copy proof only | No | These records gate configuration, scheduling, or migration; they never become remote-object cleanup owners |
 
 An old journal and a free-version can coexist during compatibility recovery. That coexistence is evidence of multiple possible owners, not permission to choose one: the journal path must retain its record until the version-specific recovery rule proves which owner is authoritative.
@@ -50,11 +50,12 @@ All keys below are objects in the internal metadata bucket. The table gives the 
 | Manual worker result | `rustfs-manual-transition-worker-result-v1` | `ilm/manual-transition/results/<job shards>/<job-id>/<task-key>.json` | The worker persists it after an actual result; no current GC owner | Immutable job/task key and outcome/reason | Append-only create with `If-None-Match: *` and maximum parity |
 | Legacy tier-delete journal | Versions 1 through 5 | `ilm/tier-delete-journal/<identity-digest>.json` | The deleting path creates it; version-specific journal recovery cleans it | Remote tuple; v2 adds backend identity, v3 exact version, v4 version state, v5 stable source and transaction state | v5 state changes use ETag CAS; v3/v4 recovery rereads and conditionally cleans. Initial legacy-compatible writes can still be unconditional |
 | Sole-owner tier-delete journal | Version 6 | `ilm/tier-delete-journal-v6/<operation-id>/<identity-digest>.json` | The manifest coordinator creates/dispatches it; the journal worker deletes the remote object and cleans the record | Exact remote/source/backend identity plus manifest/operation/topology binding; mutable state `Prepared`/`Dispatched`/`Committed` | Create-only and fenced ETag CAS. Record cleanup writes a terminal receipt first only while a decommission run is active; ordinary recovery without one conditionally deletes the exact ETag directly |
-| Tier-delete dispatch manifest | Version 1 | `ilm/tier-delete-dispatch-manifests/<scope-digest>.json` | The prefix-delete coordinator creates it; manifest recovery is its only rollback/completion owner | Immutable operation, bucket/incarnation/prefix, sorted journal set/count/digest, topology generation; mutable manifest state | Create-only and fenced ETag CAS; lost authorization response requires exact strong readback |
+| Tier-delete dispatch manifest | Version 1 | Single dispatch: `ilm/tier-delete-dispatch-manifests/<scope-digest>.json`; chunk child: `ilm/tier-delete-dispatch-manifests/chunks/<scope-digest>/<operation-id>.json` | The prefix-delete coordinator creates it; manifest recovery is its only rollback/completion owner | Immutable operation, bucket/incarnation/prefix, sorted journal set/count/digest, topology generation; mutable manifest state | Create-only and fenced ETag CAS; lost authorization response requires exact strong readback. A child cannot authorize local mutation without the exact active parent binding |
+| Tier-delete chunk parent | Version 1 with `record_type = "chunked_parent"` | `ilm/tier-delete-dispatch-manifests/<scope-digest>.json` | The over-limit prefix-delete coordinator creates and advances it; parent recovery advances completed children and removes the terminal parent | Immutable operation, bucket/incarnation/prefix/topology; mutable monotonic revision, next child sequence, completed journal count, one optional exact child binding, and `Active`/`Completed` state | Create-only and fenced ETag CAS. The parent binds a `Preparing` child before it can become `DispatchAuthorized`; final `Completed` follows an error-free, non-truncated empty-candidate rescan and local prefix deletion |
 | Decommission durable-namespace receipt | `v2` | `decommission/ilm-receipts/<run-token>/<source-path>/<id-kind>/<id>.json` | The decommission coordinator writes target/source proof and is the only cleanup owner for that run | Source path, namespace and record identity, monotonic checkpoint, optional terminal checkpoint, optional v6 topology generation | Create-only then ETag CAS merge; checksum envelope; maximum parity |
 | Decommission expected-receipt manifest | `v1` | `decommission/ilm-manifests/<run-token>.json` | The source-pool decommission coordinator creates and cleans it | Run token plus exact sorted receipt-path count/digest | Create-only, exact readback, and verification before pool removal |
 
-`durable_namespace.rs` registers exactly the two tier-journal namespaces, dispatch manifest, transaction, and four manual-job namespaces. A path beginning with `ilm/` that is not in that registry is an error during decommission rather than an ignorable object.
+`durable_namespace.rs` registers exactly the two tier-journal namespaces, the dispatch-record namespace shared by single manifests, chunk children, and chunk parents, the transaction namespace, and four manual-job namespaces. A path beginning with `ilm/` that is not in that registry is an error during decommission rather than an ignorable object.
 
 ## Durable fences and write primitives
 
@@ -89,8 +90,8 @@ Lock ordering is part of the recovery contract. Callers acquire only the locks n
 | Path | Current acquisition order | Operations allowed while held | Operations forbidden while held |
 |---|---|---|---|
 | Tier edit/remove/clear | Tier-config namespace WRITE lock; dedicated owned `admin_updates` serialization mutex; short `TierConfigMgr` state locks only while accessing manager/runtime state | The dedicated `admin_updates` guard intentionally spans awaited backend validation/probes, peer Prepare/Commit/Abort RPC, reference scans, config CAS, and candidate publication in the current protocol | Ordinary manager `RwLock` and runtime-state `Mutex` guards must not cross awaited network I/O; that rule does not prohibit the dedicated `admin_updates` guard from spanning those awaits. Remote object DELETE is never part of mutation |
-| v6 manifest prepare | Caller already holds the bucket-lifecycle WRITE fence; caller acquires a bucket-metadata transaction READ guard covering the Object Lock and bucket-incarnation snapshot and keeps it through local mutation; exact tier-generation leases; fleet/topology proof; synthetic manifest-operation WRITE lock | Build and write the immutable journal set and manifest, validate exact set/digest, then authorize local dispatch while both caller-held bucket guards and all leases remain current | Remote tier DELETE; per-object worker cleanup; releasing the metadata guard or a required lease before the authorized local mutation completes |
-| v6 manifest recovery | Fleet/topology proof; bucket-lifecycle WRITE lock; synthetic manifest-operation WRITE lock | Read/write manifest and journal metadata, verify exact set/digest, authorize, converge, or roll back local records | Remote tier DELETE; per-object worker cleanup; rollback after authorization |
+| v6 manifest prepare | Caller already holds the bucket-lifecycle WRITE fence; caller acquires a bucket-metadata transaction READ guard covering the Object Lock and bucket-incarnation snapshot and keeps it through local mutation; exact tier-generation leases; fleet/topology proof; for a single dispatch, synthetic manifest-operation WRITE; for a child, parent-operation WRITE then child-operation WRITE | Build and write one immutable bounded journal set and manifest, validate exact set/digest, then authorize local dispatch while both caller-held bucket guards and all leases remain current. A parent binding is durable before child authorization | Remote tier DELETE; per-object worker cleanup; releasing the metadata guard or a required lease before the authorized local mutation completes; child-to-parent nested lock acquisition |
+| v6 manifest/parent recovery | Fleet/topology proof; bucket-lifecycle WRITE lock; then exactly one synthetic manifest- or parent-operation WRITE lock | Read/write manifest, parent, and journal metadata; verify exact set/digest/binding; converge or roll back child records; advance a parent only after child completion | Remote tier DELETE; per-object worker cleanup; rollback after authorization; taking a child lock while holding a parent lock in background recovery |
 | v5 journal destructive recovery | Synthetic per-journal recovery lock; bucket-lifecycle READ lock; exact tier-generation lease; all physical object READ locks in stable pool/set order | Authoritative source/free-version scan; fenced state CAS; for an eligible terminal state, one bounded remote DELETE; conditional record cleanup | Any delete when a lock or lease is lost; publishing local metadata; selecting an arbitrary backend/version |
 | v6 journal destructive recovery | Synthetic per-journal recovery lock; fleet/topology proof; bucket-lifecycle READ lock; exact tier-generation lease; all physical object READ locks in stable pool/set order | Immutable manifest/topology validation, authoritative source/free-version scan, fenced state CAS, and, for an eligible terminal state, one bounded remote DELETE followed by record cleanup | Any delete when a lock, lease, or fleet proof is lost; publishing local metadata; selecting an arbitrary backend/version |
 | Free-version cleanup | Bucket-lifecycle READ lock; exact tier-generation lease; all physical object WRITE locks in stable pool/set order | Exact all-pool scan; bounded remote DELETE; local marker removal; post-delete rescan | Deleting before the free-version is the sole owner or after any fence changes |
@@ -242,7 +243,9 @@ The lease interval is 60 seconds. CAS behavior is phase-specific: cancellation t
 | v5 | Adds stable source identity and transaction state. Recovery proves source/free-version presence across physical sets before deciding abort, retain, or commit |
 | v6 | Sole-owner record bound to immutable operation/manifest/topology. It is the only new journal format for destructive prefix dispatch |
 
-The v1 manifest binds a bucket incarnation and prefix to an operation UUID, topology generation, and sorted journal names/count/digest. Its legal edges are:
+For a complete source set at or below 200,000 journals, the byte-compatible v1 single manifest remains at the deterministic scope-digest root. For a larger source set, that same root instead contains a strict `chunked_parent` sentinel, and each bounded child uses the unchanged v1 manifest payload at `chunks/<scope-digest>/<operation-id>.json`. A pre-chunking reader rejects the parent schema and the non-root child path, so it cannot start a competing single dispatch while chunking is active.
+
+A v1 single/child manifest binds a bucket incarnation and prefix to an operation UUID, topology generation, and sorted journal names/count/digest. Its legal edges are:
 
 ```text
 Preparing -> DispatchAuthorized -> Completed
@@ -250,6 +253,16 @@ Preparing -> DispatchAuthorized -> Completed
 ```
 
 The journal edge is `Prepared -> Dispatched -> Committed`. A manifest coordinator owns the whole `Prepared` set and is the only actor that may roll it back or complete the manifest. A per-journal worker cannot remove one prepared member.
+
+The chunk parent stores only monotonic O(1) progress and binds at most one child:
+
+```text
+Active(no child) -> Active(bound Preparing child)
+Active(bound Completed child) -> Active(no child, next sequence/count)
+Active(no child, final empty rescan and local delete complete) -> Completed
+```
+
+Child creation is ordered `Preparing` child create, parent binding CAS, journal preparation/dispatch, then child `DispatchAuthorized`. One request exactly replays one bounded child under source-object locks, commits every child journal, marks the child `Completed`, advances the parent, and returns retry-required. A successor request rescans from the prefix start; no listing cursor crosses bucket-lock lifetimes. New or changed source identities are therefore admitted only by a fresh child. Final success requires an error-free, non-truncated scan with no v6 candidate, local prefix deletion under the same bucket fence, and the parent `Completed` CAS.
 
 ### Journal recovery decisions
 
@@ -278,11 +291,24 @@ The journal edge is `Prepared -> Dispatched -> Committed`. A manifest coordinato
 | `Completed` | Journal workers own member cleanup; coordinator owns final manifest cleanup | Wait for all member records to disappear, then conditionally delete manifest | Journal workers are the remote-delete owners |
 | Missing member, set/digest mismatch, wrong incarnation/topology, corrupt state, scan ambiguity, or cancellation | No actor acquires new destructive authority | Retain | Fail closed; an authorized operation never rolls back |
 
-Manifest preparation is bounded by 200,000 journals and a 32 MiB record. Journal recovery scans bounded batches with per-entry timeouts and limited concurrency. Those are work bounds, not retention bounds: v1/v2 quarantine and unresolved v6 operations can remain indefinitely.
+### Chunk-parent recovery decisions
+
+| Parent/child state and evidence | Unique current owner | Current recovery decision | Authority |
+|---|---|---|---|
+| Active parent with no child | A later prefix-delete retry under bucket WRITE | Retain the parent and rescan from the prefix start | No local or remote deletion |
+| Active parent with exact bound `Preparing`/`Aborting`/`Aborted` child | Child manifest coordinator | Retain parent while child recovery rolls back and removes the child | Never authorize or advance that child |
+| Active parent with exact bound `DispatchAuthorized` child | The bound child permit or journal recovery | Resume exact-source replay on request; otherwise retain until all journals become `Committed` and the child becomes `Completed` | Only the exact parent-bound child may authorize local replay |
+| Active parent with exact bound `Completed` child | Parent coordinator | CAS the next sequence/count and clear the binding | Parent progress only; remote DELETE remains owned by committed child journals |
+| Bound child missing and its exact operation journal namespace is non-empty or unreadable | No actor can prove safe abandonment | Retain and fail closed | Never clear the binding |
+| Bound child missing and its exact operation journal namespace is proven empty | Parent coordinator | CAS-clear the stale binding and retry from the prefix start | No deletion; the fresh scan reconstructs any remaining source work |
+| Completed parent with no active child | Parent recovery | Record terminal decommission evidence when applicable, then conditionally delete the exact parent ETag | Metadata cleanup only |
+| Parent identity, child binding, topology, incarnation, sequence/count, CAS generation, or fence mismatches | No actor acquires progress authority | Retain | Fail closed |
+
+Single and child manifest preparation is bounded by 200,000 journals and a 32 MiB record. On the first unique candidate beyond the bound, the physical walks are cancelled and only the retained exact batch can proceed; cancellation fallout is not absence proof. The parent never accumulates child names, and exact local replay uses bounded concurrency. Journal and manifest recovery retain their existing bounded pages, per-entry timeouts, and concurrency. These are work bounds, not retention bounds: v1/v2 quarantine and unresolved v6 operations can remain indefinitely.
 
 ### Approved target and open design
 
-- New destructive prefix paths use only v6 plus a manifest. No new v1-v5 sole-owner records may be created.
+- New destructive prefix paths use only v6 plus either one byte-compatible manifest or one parent-bound sequence of byte-compatible child manifests. No new v1-v5 sole-owner records may be created.
 - Preserve the two-phase authorization barrier: all prepared records, durable barrier, all dispatched records, durable `DispatchAuthorized`, local mutation, journals committed, durable `Completed`, then remote DELETE.
 - Do not downgrade every v6-aware recovery worker while v6 records remain. v5-and-older readers reject and retain v6 records; older nodes may continue producing fallback free-versions until the fleet is homogeneous.
 - **Open:** bounded age/count policy and operator disposition for quarantined v1/v2, incomplete manifests, and repeatedly failing exact deletes. Capacity rejection and recovery throughput must not be “fixed” by weakening ownership proof.
@@ -301,17 +327,97 @@ Recursive prefix/delete-all is the exception because physical directory removal 
 
 - Every code path that removes or overwrites transitioned metadata either atomically leaves an exact free-version owner or enters an already-authorized v6 dispatch.
 - If both a journal and free-version are observable, recovery preserves the remote object until version-specific authority and all-pool absence prove a single owner.
-- Missing `transition-version-state` remains unknown. Compatibility work must not synthesize known-disabled or exact semantics merely from an empty stored version ID.
+- Missing `transitioned-version-state` remains unknown. Compatibility work must not synthesize known-disabled or exact semantics merely from an empty stored version ID.
 
-How historical objects without RustFS transition-version-state can be upgraded safely is an **open design**. It requires a read/repair rule with rollback behavior before destructive cleanup may consume those records.
+The following single-record protocol approves how historical objects without RustFS `transitioned-version-state` can be upgraded. It does not approve a bulk scanner or allow destructive cleanup to consume an unproven record.
+
+## Legacy transitioned-version-state reconciliation
+
+### Current
+
+An absent `transitioned-version-state` key decodes as `TransitionVersionState::Unknown`. The current GET and free-version cleanup paths reject that state rather than interpreting an empty remote version as unversioned. There is no admin route that repairs this field in `xl.meta`. The existing transition-transaction reconcile route operates on expired `UploadOutcomeUnknown` transaction records and can exact-delete their canonical candidates; it is a separate protocol and must not be reused for metadata reconciliation.
+
+An explicitly persisted `unknown`, a malformed state, conflicting RustFS/MinIO compatibility keys, an invalid or nil version identifier, and a partial transition tuple are not legacy absence. They remain invalid or ambiguous and fail closed.
+
+### Approved single-record control surface
+
+The approved target is one synchronous, exact logical-version operation. It does not list a bucket or prefix and does not create a durable job:
+
+```text
+GET  /rustfs/admin/v3/ilm/transition/state/reconcile?bucket=<bucket>&object=<object>&versionId=<local-version-id>
+POST /rustfs/admin/v3/ilm/transition/state/reconcile?bucket=<bucket>&object=<object>&versionId=<local-version-id>
+```
+
+`versionId` is required; the literal `null` is the explicit selector for a locally unversioned object, while an omitted or empty selector is invalid. GET requires `admin:ListTier`. It performs an authoritative all-pool metadata read and a bounded server-side live backend probe, but it never writes metadata or mutates the remote tier. Its response includes the canonical immutable source tuple, every original per-set missing-state representation, the proposed target tuple when one is provable, an opaque reconciliation digest over all three, fleet/topology and tier-generation readiness, and whether POST is ready to attempt migration. GET never labels an unmodified legacy record `migrated`.
+
+POST requires `admin:SetTier`. Its body contains `confirm: true`, the complete source and target tuples, every original per-set representation, and their reconciliation digest returned by a recent GET. The server does not trust a client-supplied state or external assertion: it rereads the object, requires every immutable source field to match exactly after canonicalization, repeats the bounded live probe, and derives the target state itself. For the mutable state/version/destination fields, each set must equal either its original missing-state representation bound by the digest or the exact newly proven target; this is the only accepted partial-retry shape. A missing confirmation, any other stale tuple or digest, or a widened selector is rejected before any write.
+
+The expected tuple binds all evidence whose change could redirect the repair:
+
+- bucket name and incarnation; exact object name, local version ID, data directory, modification time, size, and ETag;
+- transition completion status, tier name, canonical remote object name, raw remote-version key presence/value, and raw state-key presence/value under both compatibility prefixes;
+- tier-config generation and the `transition-tier-destination-id` binding, including backend type, endpoint/bucket/prefix identity, and the credential-independent backend fingerprint;
+- topology generation and the generation/digest of every authoritative `xl.meta` copy found across pools and sets.
+
+The only allowed state derivations are:
+
+| Live proof | Persisted state | Persisted remote version | Remote request meaning |
+|---|---|---|---|
+| Provider proves versioning disabled and the candidate is present | `KnownDisabled` | Absent/empty | Send no `versionId` |
+| Provider proves suspended-version null semantics and the exact candidate is present | `SuspendedNull` | Literal `null` | Send the provider's null-version form |
+| Provider proves one exact, nonempty, non-`null` opaque version | `Exact` | That exact opaque identifier | Send that exact `versionId` |
+
+Missing, multiple, changing, or unsupported probe results do not select a state. In particular, a preexisting empty remote-version field is not evidence for `KnownDisabled`, and a client may not nominate `Exact` or `SuspendedNull`.
+
+The POST may write only the derived `transitioned-version-state`, its corresponding `transitioned-versionID` value when the proven model requires one, and the exact `transition-tier-destination-id` binding under both compatibility prefixes in the matching `xl.meta` version. It does not issue remote GET beyond the proof probe, remote PUT, remote DELETE, local object DELETE, free-version cleanup, transaction/journal cleanup, tier-config mutation, restore, or source-payload rewrite. Reconciliation establishes metadata meaning; a later ordinary owner may perform cleanup under its own destructive protocol.
+
+### Outcome contract
+
+POST returns exactly one of the following outcomes and whether it changed bytes. GET uses the same diagnostic names for non-applicable cases, returns `ready-to-migrate` when a missing state is provable, and returns `migrated` only when strong readback shows the record was already explicit and converged:
+
+| Outcome | Meaning and permitted effect |
+|---|---|
+| `migrated` | All authoritative copies already contain, or were monotonically advanced to, the same proven state and destination identity. Only this outcome makes the record eligible for later ordinary read/delete semantics. |
+| `retained-ambiguous` | The tuple is structurally legacy-compatible, but the live probe is missing, multiple, changing, unsupported, or otherwise cannot prove exactly one state. No metadata or remote object is changed. |
+| `corrupt` | Explicit `Unknown`, malformed/contradictory compatibility keys, nil/invalid identifiers, partial transition metadata, or authoritative copies outside the one allowed `{original missing representation, exact proven target}` retry subset were observed. No backend probe is required after corruption is established, and nothing is changed. |
+| `backend-unavailable` | The bound tier generation/destination cannot be acquired, the bounded probe fails, or a metadata quorum/strong readback needed to complete the operation is unavailable. Any already-persisted monotonic subset is retained for an idempotent retry; it is never rolled back. |
+
+HTTP failure detail may distinguish a stale expected tuple, lost fence, timeout, or unavailable quorum, but it must preserve one of these machine-readable outcomes. Logs and audit events include request identity, object identity, tier, generations, outcome, and whether bytes changed; they never include credentials or raw credential-derived configuration.
+
+### Fence, write, and retry order
+
+The approved POST executes the following order. A step that cannot be proven stops the operation without remote mutation:
+
+1. Authenticate `admin:SetTier`, validate the exact single-record selector, `confirm: true`, expected tuple, and digest.
+2. Prove every required node advertises the reconciliation format and destination-identity capability; capture the fleet and topology generation. Unknown or unsupported nodes block the writer.
+3. Acquire the bucket-lifecycle WRITE fence and validate the bucket incarnation.
+4. Acquire the exact tier-config generation lease bound to the expected destination identity.
+5. Acquire exact object-version WRITE locks for every owning physical pool/set in stable pool/set order.
+6. Perform an authoritative all-pool read, reject duplicate/conflicting ownership, validate every compatibility key, and require each set to match the immutable source tuple plus either its digest-bound original missing-state representation or the exact proposed target.
+7. Run one bounded, cancellation-aware live probe through the leased backend. No client or cached probe result is authority.
+8. Before writing, revalidate the fleet/topology generation, bucket incarnation and lifecycle fence, tier lease/destination identity, physical owner set, and complete metadata tuple.
+9. Write the same derived state and destination identity to each authoritative set with that set's metadata quorum and conditional generation. A timeout or response loss is resolved only by a strong read of that exact set.
+10. Strongly reread every authoritative set and revalidate the full tuple, state, destination identity, and topology before returning `migrated`. Release locks and leases in reverse order.
+
+Cross-pool and cross-set partial success is monotonic. The only legal repair edge is `missing state -> one proven {state, remote version, destination identity}`. A retry may accept an already-written subset only when every known copy equals the newly proven target, every remaining copy equals its original missing-state representation captured by the reconciliation digest, and all immutable source fields still match; it then fills only the missing copies. This exact target-plus-original subset is neither stale nor corrupt. The retry never clears a known state, rewrites it to another state, changes destination identity, or rolls a successful set back to missing/`Unknown`. Any other divergent value produces `corrupt`; an unavailable set/readback produces `backend-unavailable`, and destructive cleanup remains blocked until a later strong all-pool read proves complete convergence.
+
+GET takes the same fleet/topology snapshot and authoritative all-pool read but no write locks that imply mutation authority. Because GET is advisory, POST always repeats every fence, read, and live proof rather than promoting the GET result.
+
+### Mixed-version and future batch work
+
+The writer gate requires every node that can serve, rewrite, heal, decommission, or recover the affected `xl.meta` to preserve the explicit state and destination identity. A rolling fleet with an unknown/unsupported node is inspect-only. Downgrade is blocked while reconciled records could be rewritten by readers that erase or misinterpret those fields. Cross-pool movement must either copy the proven tuple unchanged or block reconciliation; a first-match lookup is never sufficient.
+
+Explicit `Unknown`, corruption, and ambiguity remain fail closed for reads that cannot prove non-destructive semantics and for every destructive path. A migrated record becomes ordinary explicit metadata, but reconciliation itself never transfers remote DELETE ownership.
+
+A bucket/prefix/fleet batch reconcile is still an **open design**. It requires a separate durable job identity, create-only admission, lease/CAS checkpoint, bounded pages, per-record expected tuples and outcomes, cancellation/restart semantics, retention, fleet rollout negotiation, and status counters. Implementations must not approximate that protocol by adding a list selector or background loop to the synchronous route.
 
 ## Durable namespace receipts during decommission
 
 ### Current contract
 
-Decommission cannot treat durable ILM objects as ordinary configuration blobs. `validate_durable_ilm_record` validates namespace, size, schema/checksum, identity, and a protocol-specific checkpoint, and most protocol branches recompute the canonical path. Its transition-transaction branch currently inherits the weaker final-component parser: mismatched shard directories, extra components, and uppercase hex can pass when the final UUID and record contents agree. Exact transition-path validation is therefore an approved target, not a current decommission guarantee. Checkpoint successors enforce journal/manifest legal states, transition identity and revision progression, monotonic manual-job progress, scope ownership, and immutable task/result payloads.
+Decommission cannot treat durable ILM objects as ordinary configuration blobs. `validate_durable_ilm_record` validates namespace, size, schema/checksum, identity, and a protocol-specific checkpoint, and most protocol branches recompute the canonical path. Its transition-transaction branch currently inherits the weaker final-component parser: mismatched shard directories, extra components, and uppercase hex can pass when the final UUID and record contents agree. Exact transition-path validation is therefore an approved target, not a current decommission guarantee. Checkpoint successors enforce journal/manifest legal states, chunk-parent revision/sequence/count/binding progression, transition identity and revision progression, monotonic manual-job progress, scope ownership, and immutable task/result payloads.
 
-The decommission coordinator copies and validates a durable record on a target, persists a receipt for that exact source path/identity/checkpoint, and records the expected receipt set on the source. While a matching decommission operation is active, protocol writers advance receipts as records change and terminal cleanup records a terminal checkpoint before deleting a covered record. Without an active decommission operation, the receipt helper creates no terminal receipt and ordinary protocol recovery proceeds with that protocol's current delete primitive: v6 journal/manifest cleanup uses the exact ETag, while transition-transaction cleanup remains unconditional as documented above. Completion verifies every expected receipt and target checkpoint before the source pool can be removed.
+The decommission coordinator copies and validates a durable record on a target, persists a receipt for that exact source path/identity/checkpoint, and records the expected receipt set on the source. While a matching decommission operation is active, protocol writers advance receipts as records change and terminal cleanup records a terminal checkpoint before deleting a covered record. Without an active decommission operation, the receipt helper creates no terminal receipt and ordinary protocol recovery proceeds with that protocol's current delete primitive: v6 journal/manifest/parent cleanup uses the exact ETag, while transition-transaction cleanup remains unconditional as documented above. Completion verifies every expected receipt and target checkpoint before the source pool can be removed.
 
 A terminal receipt is proof that an exact target copy reached a terminal checkpoint. It may authorize conditional removal of the matching source record when every active target copy is covered; it never authorizes remote DELETE. A terminal receipt on one target cannot hide a later nonterminal receipt on another target.
 
@@ -371,7 +477,7 @@ Transition transaction v1, manual job/task/result v1, and receipt v2 do not curr
 | Journal v1/v2 | Readers decode but quarantine because remote-version authority is missing; compatibility writers can preserve these forms | Retain indefinitely unless a separately approved, authoritative repair protocol resolves them; never translate empty version ID to known-disabled |
 | Journal v3/v4 | Readers recover supported committed records according to exact or explicit version-state semantics; current compatible writes use v4 for known state | Unknown/inconsistent state is retained. These legacy paths are not evidence that a new sole-owner operation may omit v5/v6 source proof |
 | Journal v5 | Readers use stable source/all-pool proof; decoded v5 can be checkpointed, while new online sole-owner transactions are not emitted as v5 | Retain and recover conservatively during upgrade. Do not manufacture v5 from older records or use it to bypass v6 manifest authorization |
-| Journal v6 and dispatch manifest v1 | v6-aware writers/readers require immutable manifest membership and topology; v5-and-older readers reject and retain v6 | Gate v6 writers on fleet capability. Drain v6 before removing all v6-aware workers; do not downgrade by rewriting a live v6 operation |
+| Journal v6, dispatch manifest v1, and chunk parent v1 | v6-aware writers/readers require immutable manifest membership and topology. Complete sets at or below 200,000 retain the legacy root manifest bytes; larger sets install a strict parent at that root and operation-scoped v1 child payloads. Pre-chunking v6 readers reject the parent schema and child paths, while v5-and-older readers reject and retain v6 journals | Gate writers on the current fleet capability and retain the root parent for the entire active chunk sequence. Drain v6 before removing all v6-aware workers; do not downgrade by rewriting a live v6 operation |
 | Decommission receipt v2 and expected manifest v1 | Current decommission readers validate exact schema/checksum/path/checkpoint and fail completion on unknown input | No ignore path. Mixed-version decommission must not complete unless every participant preserves the registered durable namespace; broader downgrade negotiation is open |
 
 ## Reconcile, observability, and retention

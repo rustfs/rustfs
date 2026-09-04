@@ -279,6 +279,27 @@ fn scanner_activity_response(
     }
 }
 
+fn scanner_dirty_usage_snapshot_response(
+    snapshot: rustfs_scanner::ScannerDirtyUsageSnapshot,
+) -> ScannerDirtyUsageSnapshotResponse {
+    ScannerDirtyUsageSnapshotResponse {
+        instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
+        generation: snapshot.generation,
+        pending_bucket_count: snapshot.pending_bucket_count,
+        protocol_version: rustfs_scanner::SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION,
+        complete: snapshot.complete,
+        buckets: snapshot
+            .buckets
+            .into_iter()
+            .map(|bucket| ScannerDirtyUsageBucket {
+                bucket: bucket.bucket,
+                generation: bucket.generation,
+            })
+            .collect(),
+        response_proof: Bytes::new(),
+    }
+}
+
 fn scanner_activity_response_v7(
     namespace_generation: u64,
     topology_digest: [u8; 32],
@@ -2085,6 +2106,42 @@ impl Node for NodeService {
         Ok(Response::new(response))
     }
 
+    async fn scanner_dirty_usage_snapshot(
+        &self,
+        request: Request<ScannerDirtyUsageSnapshotRequest>,
+    ) -> Result<Response<ScannerDirtyUsageSnapshotResponse>, Status> {
+        let canonical = rustfs_protos::canonical_scanner_dirty_usage_snapshot_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("scanner dirty usage snapshot request is too large to authenticate"))?;
+        verify_tonic_canonical_body_digest(&request, &canonical)
+            .map_err(|err| Status::permission_denied(format!("scanner dirty usage snapshot authentication failed: {err}")))?;
+        if request.get_ref().protocol_version != rustfs_scanner::SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION {
+            return Err(Status::failed_precondition(format!(
+                "unsupported scanner dirty usage snapshot request protocol {}",
+                request.get_ref().protocol_version
+            )));
+        }
+        if request.get_ref().challenge.len() != 16 {
+            return Err(Status::invalid_argument("scanner dirty usage snapshot challenge must be 16 bytes"));
+        }
+        let challenge: [u8; 16] = request
+            .into_inner()
+            .challenge
+            .as_ref()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("scanner dirty usage snapshot challenge must be 16 bytes"))?;
+        let snapshot = rustfs_scanner::scanner_dirty_usage_snapshot(rustfs_scanner::SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES);
+        if snapshot.generation == u64::MAX {
+            return Err(Status::resource_exhausted("scanner dirty usage generation is exhausted"));
+        }
+        let mut response = scanner_dirty_usage_snapshot_response(snapshot);
+        let canonical = rustfs_protos::canonical_scanner_dirty_usage_snapshot_response_body(&challenge, &response)
+            .map_err(|_| Status::internal("scanner dirty usage snapshot response is too large to authenticate"))?;
+        response.response_proof = sign_tonic_rpc_response_proof(&canonical)
+            .map_err(|_| Status::unavailable("scanner dirty usage snapshot response authentication is unavailable"))?
+            .into();
+        Ok(Response::new(response))
+    }
+
     async fn acquire_scanner_publication_lease(
         &self,
         request: Request<ScannerPublicationLeaseRequest>,
@@ -2579,12 +2636,12 @@ mod tests {
         LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
         MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest,
         ReadVersionRequest, ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest,
-        RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ScannerPublicationLeaseReleaseRequest,
-        ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest, SignalServiceRequest,
-        SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest, StartDecommissionRequest,
-        StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationFailureClass,
-        TierMutationPeerState, TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest,
-        VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, WriteRequest,
+        RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest,
+        ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest,
+        SignalServiceRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
+        StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationAbortRequest,
+        TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, UpdateMetacacheListingRequest,
+        UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, WriteRequest,
         heal_control_service_client::HealControlServiceClient,
         heal_control_service_server::{HealControlService as _, HealControlServiceServer},
         node_service_client::NodeServiceClient,
@@ -5884,6 +5941,13 @@ mod tests {
             }
         );
         assert_tampered!(
+            scanner_dirty_usage_snapshot,
+            ScannerDirtyUsageSnapshotRequest {
+                challenge: vec![7; 16].into(),
+                protocol_version: rustfs_scanner::SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION,
+            }
+        );
+        assert_tampered!(
             acquire_scanner_publication_lease,
             ScannerPublicationLeaseRequest {
                 challenge: vec![7; 16].into(),
@@ -6054,6 +6118,71 @@ mod tests {
             .await
             .expect_err("authenticated activity queries still require initialized storage");
         assert_eq!(unavailable.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn test_scanner_dirty_usage_snapshot_requires_body_bound_auth_and_signs_a_consistent_view() {
+        let _ = rustfs_credentials::set_global_rpc_secret("scanner-dirty-usage-snapshot-test-secret".to_string());
+        let service = create_test_node_service();
+        let unsigned = service
+            .scanner_dirty_usage_snapshot(Request::new(ScannerDirtyUsageSnapshotRequest {
+                challenge: vec![7; 16].into(),
+                protocol_version: rustfs_scanner::SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION,
+            }))
+            .await
+            .expect_err("unsigned scanner dirty usage snapshot requests must fail");
+        assert_eq!(unsigned.code(), tonic::Code::PermissionDenied);
+
+        let mut unsupported = Request::new(ScannerDirtyUsageSnapshotRequest {
+            challenge: vec![7; 16].into(),
+            protocol_version: rustfs_scanner::SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION + 1,
+        });
+        let unsupported_body = rustfs_protos::canonical_scanner_dirty_usage_snapshot_request_body(unsupported.get_ref())
+            .expect("scanner dirty usage snapshot request should encode");
+        set_tonic_canonical_body_digest(&mut unsupported, &unsupported_body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut unsupported);
+        let unsupported = service
+            .scanner_dirty_usage_snapshot(unsupported)
+            .await
+            .expect_err("unsupported scanner dirty usage snapshot protocols must fail closed");
+        assert_eq!(unsupported.code(), tonic::Code::FailedPrecondition);
+
+        let mut malformed = Request::new(ScannerDirtyUsageSnapshotRequest {
+            challenge: vec![7; 15].into(),
+            protocol_version: rustfs_scanner::SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION,
+        });
+        let malformed_body = rustfs_protos::canonical_scanner_dirty_usage_snapshot_request_body(malformed.get_ref())
+            .expect("scanner dirty usage snapshot request should encode");
+        set_tonic_canonical_body_digest(&mut malformed, &malformed_body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut malformed);
+        let malformed = service
+            .scanner_dirty_usage_snapshot(malformed)
+            .await
+            .expect_err("malformed scanner dirty usage snapshot challenges must fail closed");
+        assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
+
+        let challenge = [7; 16];
+        let mut signed = Request::new(ScannerDirtyUsageSnapshotRequest {
+            challenge: challenge.to_vec().into(),
+            protocol_version: rustfs_scanner::SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION,
+        });
+        let signed_body = rustfs_protos::canonical_scanner_dirty_usage_snapshot_request_body(signed.get_ref())
+            .expect("scanner dirty usage snapshot request should encode");
+        set_tonic_canonical_body_digest(&mut signed, &signed_body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut signed);
+        let response = service
+            .scanner_dirty_usage_snapshot(signed)
+            .await
+            .expect("an authenticated scanner dirty usage snapshot request should succeed")
+            .into_inner();
+        assert_eq!(response.instance_id, rustfs_scanner::scanner_activity_epoch());
+        assert_eq!(response.protocol_version, rustfs_scanner::SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION);
+        let bucket_count = u64::try_from(response.buckets.len()).expect("snapshot bucket count should fit in u64");
+        assert_eq!(response.complete, response.pending_bucket_count == bucket_count);
+        let canonical = rustfs_protos::canonical_scanner_dirty_usage_snapshot_response_body(&challenge, &response)
+            .expect("scanner dirty usage snapshot response should encode");
+        crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical, &response.response_proof)
+            .expect("scanner dirty usage snapshot response proof should verify");
     }
 
     #[test]

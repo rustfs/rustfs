@@ -87,16 +87,12 @@ use rustfs_filemeta::{
 use rustfs_scanner_metrics::metrics::{
     IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
 };
-use rustfs_utils::{
-    get_env_i64, get_env_usize,
-    path::encode_dir_object,
-    string::{parse_bool, strings_has_prefix_fold},
-};
+use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::parse_bool};
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, ObjectLockConfiguration, RestoreRequest, RestoreRequestType, RestoreStatus,
     Timestamp,
 };
-use s3s::header::{X_AMZ_RESTORE, X_AMZ_SERVER_SIDE_ENCRYPTION};
+use s3s::header::X_AMZ_RESTORE;
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -165,7 +161,6 @@ pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
     reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
 )]
 pub const AMZ_TAG_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
-pub const AMZ_ENCRYPTION_AES: &str = "AES256";
 #[allow(
     dead_code,
     reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
@@ -2777,7 +2772,8 @@ async fn run_tier_free_version_recovery_loop<F, Fut>(
         match recovery_result {
             Ok(stats) => {
                 let elapsed = started_at.elapsed();
-                schedule.record_success(&stats, elapsed);
+                schedule.record_success(&stats);
+                rustfs_io_metrics::record_stage_duration("lifecycle_free_version_recovery", elapsed.as_secs_f64() * 1000.0);
                 let (pending_tasks, active_tasks) = {
                     let state = expiry_state.read().await;
                     (state.pending_tasks(), state.stats.active_tasks())
@@ -2806,7 +2802,7 @@ async fn run_tier_free_version_recovery_loop<F, Fut>(
             }
             Err(err) => {
                 let elapsed = started_at.elapsed();
-                schedule.record_failure(elapsed);
+                schedule.record_failure();
                 rustfs_io_metrics::record_stage_duration(
                     "lifecycle_free_version_recovery_failed",
                     elapsed.as_secs_f64() * 1000.0,
@@ -2838,10 +2834,10 @@ async fn wait_for_tier_free_version_recovery(
     } else {
         schedule.next_delay
     };
-    let sleep_delay = next_delay.saturating_sub(schedule.previous_run_duration);
-    schedule.previous_run_duration = StdDuration::ZERO;
+    // Recovery delays are completion-relative. Discounting the previous run
+    // would let a page that took at least one interval restart with no cooldown.
     schedule.jitter_next_delay = false;
-    let sleep = tokio::time::sleep(sleep_delay);
+    let sleep = tokio::time::sleep(next_delay);
     tokio::pin!(sleep);
     let mut recovery_request_consumed = false;
 
@@ -2891,7 +2887,6 @@ struct TierFreeVersionRecoverySchedule {
     next_delay: StdDuration,
     idle_interval: StdDuration,
     failure_interval: StdDuration,
-    previous_run_duration: StdDuration,
     jitter_next_delay: bool,
     bucket_marker: Option<String>,
     object_marker: Option<String>,
@@ -2904,7 +2899,6 @@ impl Default for TierFreeVersionRecoverySchedule {
             next_delay: StdDuration::ZERO,
             idle_interval: TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL,
             failure_interval: TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL,
-            previous_run_duration: StdDuration::ZERO,
             jitter_next_delay: false,
             bucket_marker: None,
             object_marker: None,
@@ -2917,7 +2911,6 @@ impl TierFreeVersionRecoverySchedule {
     fn reset_idle_interval(&mut self) {
         self.idle_interval = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
         self.next_delay = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
-        self.previous_run_duration = StdDuration::ZERO;
         self.jitter_next_delay = false;
     }
 
@@ -2928,18 +2921,15 @@ impl TierFreeVersionRecoverySchedule {
         self.reset_idle_interval();
     }
 
-    fn record_failure(&mut self, _run_duration: StdDuration) {
+    fn record_failure(&mut self) {
         self.idle_interval = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
         self.next_delay = self.failure_interval;
         self.failure_interval =
             std::cmp::min(self.failure_interval.saturating_mul(2), TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL);
-        // Keep the full backoff even after a long failed run, so a run whose
-        // duration exceeds the interval cannot restart immediately.
-        self.previous_run_duration = StdDuration::ZERO;
         self.jitter_next_delay = false;
     }
 
-    fn record_success(&mut self, stats: &FreeVersionRecoveryStats, run_duration: StdDuration) {
+    fn record_success(&mut self, stats: &FreeVersionRecoveryStats) {
         self.failure_interval = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
         if stats.enqueued > 0 || stats.failed > 0 {
             self.follow_up_sweep = true;
@@ -2949,7 +2939,6 @@ impl TierFreeVersionRecoverySchedule {
         self.object_marker = stats.next_object_marker.clone();
         if stats.truncated {
             self.next_delay = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
-            self.previous_run_duration = run_duration;
             self.jitter_next_delay = false;
             return;
         }
@@ -2960,13 +2949,11 @@ impl TierFreeVersionRecoverySchedule {
             self.follow_up_sweep = false;
             self.idle_interval = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
             self.next_delay = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
-            self.previous_run_duration = run_duration;
             self.jitter_next_delay = false;
             return;
         }
 
         self.next_delay = self.idle_interval;
-        self.previous_run_duration = run_duration;
         self.jitter_next_delay = true;
         self.idle_interval = std::cmp::min(self.idle_interval.saturating_mul(2), TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL);
     }
@@ -4810,24 +4797,24 @@ fn attach_tier_operation_lease(mut reader: GetObjectReader, lease: TierOperation
     reader
 }
 
-pub async fn post_restore_opts(version_id: &str, bucket: &str, object: &str) -> Result<ObjectOptions, std::io::Error> {
+/// Resolve the RestoreObject request options.
+///
+/// Returns the typed [`StorageError`]: flattening these into an opaque
+/// `io::Error` string erased the identity the S3 layer needs to answer
+/// InvalidArgument instead of a generic 500 (backlog#2205).
+pub async fn post_restore_opts(version_id: &str, bucket: &str, object: &str) -> Result<ObjectOptions, Error> {
     let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
     let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
     let vid = version_id.trim();
     if !vid.is_empty() && vid != NULL_VERSION_ID {
         if let Err(_err) = Uuid::parse_str(vid) {
-            return Err(std::io::Error::other(
-                StorageError::InvalidVersionID(bucket.to_string(), object.to_string(), vid.to_string()).to_string(),
-            ));
+            return Err(StorageError::InvalidVersionID(bucket.to_string(), object.to_string(), vid.to_string()));
         }
         if !versioned && !version_suspended {
-            return Err(std::io::Error::other(
-                StorageError::InvalidArgument(
-                    bucket.to_string(),
-                    object.to_string(),
-                    format!("version-id specified {} but versioning is not enabled on {}", vid, bucket),
-                )
-                .to_string(),
+            return Err(StorageError::InvalidArgument(
+                bucket.to_string(),
+                object.to_string(),
+                format!("version-id specified {vid} but versioning is not enabled on {bucket}"),
             ));
         }
     }
@@ -4880,43 +4867,18 @@ pub async fn put_restore_opts(
     }
     meta.insert(X_AMZ_STORAGE_CLASS.as_str().to_lowercase(), sc);*/
 
-    if let Some(type_) = &rreq.type_
-        && type_.as_str() == RestoreRequestType::SELECT
+    // A SELECT restore must never reach the restore writer: the caller writes
+    // the retrieved bytes back to the source bucket/object, so building
+    // SELECT output options here produced a source overwrite carrying only
+    // the OutputLocation metadata instead of a write to `OutputLocation.S3`
+    // (backlog#1341). RestoreObject rejects SELECT at the API boundary; this
+    // is the fail-closed backstop for any other caller.
+    if rreq
+        .type_
+        .as_ref()
+        .is_some_and(|type_| type_.as_str() == RestoreRequestType::SELECT)
     {
-        let Some(s3) = select_restore_s3_location(rreq)? else {
-            return Err(std::io::Error::other("OutputLocation.S3 required for SELECT requests"));
-        };
-        if let Some(user_metadata) = s3.user_metadata.as_ref() {
-            for metadata in user_metadata {
-                let name = metadata
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| std::io::Error::other("SELECT restore metadata name is required"))?;
-                let value = metadata.value.clone().unwrap_or_default();
-                if strings_has_prefix_fold(name, "x-amz-meta") {
-                    meta.insert(name.to_string(), value);
-                } else {
-                    meta.insert(format!("x-amz-meta-{name}"), value);
-                }
-            }
-        }
-        if let Some(tags) = &s3.tagging {
-            meta.insert(
-                AMZ_OBJECT_TAGGING.to_string(),
-                serde_urlencoded::to_string(tags.tag_set.clone()).unwrap_or_else(|_| "".to_string()),
-            );
-        }
-        if let Some(encryption) = &s3.encryption
-            && encryption.encryption_type.as_str() != ""
-        {
-            meta.insert(X_AMZ_SERVER_SIDE_ENCRYPTION.as_str().to_string(), AMZ_ENCRYPTION_AES.to_string());
-        }
-        return Ok(ObjectOptions {
-            versioned: BucketVersioningSys::prefix_enabled(bucket, object).await,
-            version_suspended: BucketVersioningSys::prefix_suspended(bucket, object).await,
-            user_defined: meta,
-            ..Default::default()
-        });
+        return Err(std::io::Error::other("SELECT restore requests are not supported"));
     }
     for (k, v) in oi.user_defined.iter() {
         meta.insert(k.to_string(), v.clone());
@@ -5623,8 +5585,9 @@ mod tests {
     use crate::bucket::lifecycle::replication_sink::{ReplicationStatusType, VersionPurgeStatusType};
     use crate::bucket::lifecycle::runtime_boundary as runtime_sources;
     use crate::bucket::lifecycle::tier_free_version_recovery::{
-        FreeVersionRecoveryStats, RecoveryWalkTestAction, list_tier_free_versions, recover_tier_free_versions_with_cancel,
-        set_recovery_bucket_list_wait_hook, set_recovery_walk_test_hook,
+        FreeVersionRecoveryStats, RecoveryWalkTestAction, RecoveryWorkBudget, list_tier_free_versions,
+        list_tier_free_versions_with_budget, recover_tier_free_versions_with_cancel, set_recovery_bucket_list_wait_hook,
+        set_recovery_walk_test_hook,
     };
     use crate::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
@@ -5712,7 +5675,7 @@ mod tests {
 
         assert_eq!(schedule.next_delay, StdDuration::ZERO);
         for expected in [60, 120, 240, 480, 600, 600, 600, 600] {
-            schedule.record_success(&idle, StdDuration::ZERO);
+            schedule.record_success(&idle);
             assert_eq!(schedule.next_delay, StdDuration::from_secs(expected));
         }
         assert_eq!(schedule.next_delay.as_secs() / TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL.as_secs(), 10);
@@ -5723,15 +5686,13 @@ mod tests {
         let mut schedule = TierFreeVersionRecoverySchedule::default();
 
         for expected in [60, 120, 240, 480, 600, 600] {
-            schedule.record_failure(StdDuration::from_secs(75));
+            schedule.record_failure();
             assert_eq!(schedule.next_delay, StdDuration::from_secs(expected));
-            assert_eq!(schedule.previous_run_duration, StdDuration::ZERO);
         }
 
-        schedule.record_success(&free_version_recovery_stats(0, 0, false), StdDuration::ZERO);
-        schedule.record_failure(StdDuration::from_secs(75));
+        schedule.record_success(&free_version_recovery_stats(0, 0, false));
+        schedule.record_failure();
         assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
-        assert_eq!(schedule.previous_run_duration, StdDuration::ZERO);
     }
 
     #[test]
@@ -5746,22 +5707,22 @@ mod tests {
     fn tier_free_version_recovery_pagination_preserves_full_sweep_backoff() {
         let idle = free_version_recovery_stats(0, 0, false);
         let mut schedule = TierFreeVersionRecoverySchedule::default();
-        schedule.record_success(&idle, StdDuration::ZERO);
-        schedule.record_success(&idle, StdDuration::ZERO);
+        schedule.record_success(&idle);
+        schedule.record_success(&idle);
         assert_eq!(schedule.next_delay, StdDuration::from_secs(120));
         assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
 
-        schedule.record_success(&free_version_recovery_stats(0, 0, true), StdDuration::ZERO);
+        schedule.record_success(&free_version_recovery_stats(0, 0, true));
         assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
         assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
         assert_eq!(schedule.bucket_marker.as_deref(), Some("bucket"));
         assert_eq!(schedule.object_marker.as_deref(), Some("object"));
 
-        schedule.record_success(&free_version_recovery_stats(0, 0, true), StdDuration::ZERO);
+        schedule.record_success(&free_version_recovery_stats(0, 0, true));
         assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
         assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
 
-        schedule.record_success(&idle, StdDuration::ZERO);
+        schedule.record_success(&idle);
         assert_eq!(schedule.next_delay, StdDuration::from_secs(240));
         assert_eq!(schedule.idle_interval, StdDuration::from_secs(480));
         assert!(schedule.bucket_marker.is_none());
@@ -5771,7 +5732,7 @@ mod tests {
     #[test]
     fn tier_free_version_recovery_wake_during_pagination_keeps_one_full_follow_up() {
         let mut schedule = TierFreeVersionRecoverySchedule::default();
-        schedule.record_success(&free_version_recovery_stats(0, 0, true), StdDuration::ZERO);
+        schedule.record_success(&free_version_recovery_stats(0, 0, true));
 
         schedule.request_retry();
         schedule.request_retry();
@@ -5779,7 +5740,7 @@ mod tests {
         assert_eq!(schedule.bucket_marker.as_deref(), Some("bucket"));
         assert_eq!(schedule.object_marker.as_deref(), Some("object"));
 
-        schedule.record_success(&free_version_recovery_stats(0, 0, false), StdDuration::ZERO);
+        schedule.record_success(&free_version_recovery_stats(0, 0, false));
         assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
         assert!(!schedule.follow_up_sweep);
         assert!(schedule.bucket_marker.is_none());
@@ -5794,22 +5755,22 @@ mod tests {
             free_version_recovery_stats(0, 1, true),
         ] {
             let mut schedule = TierFreeVersionRecoverySchedule::default();
-            schedule.record_success(&idle, StdDuration::ZERO);
-            schedule.record_success(&idle, StdDuration::ZERO);
+            schedule.record_success(&idle);
+            schedule.record_success(&idle);
             assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
 
-            schedule.record_success(&work, StdDuration::ZERO);
+            schedule.record_success(&work);
             assert!(schedule.follow_up_sweep);
             assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
             assert!(!schedule.jitter_next_delay);
 
-            schedule.record_success(&idle, StdDuration::ZERO);
+            schedule.record_success(&idle);
             assert!(!schedule.follow_up_sweep);
             assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
             assert_eq!(schedule.idle_interval, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
             assert!(!schedule.jitter_next_delay);
 
-            schedule.record_success(&idle, StdDuration::ZERO);
+            schedule.record_success(&idle);
             assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
             assert_eq!(schedule.idle_interval, StdDuration::from_secs(120));
         }
@@ -5823,17 +5784,17 @@ mod tests {
             free_version_recovery_stats(0, 1, false),
         ] {
             let mut schedule = TierFreeVersionRecoverySchedule::default();
-            schedule.record_success(&idle, StdDuration::ZERO);
-            schedule.record_success(&idle, StdDuration::ZERO);
+            schedule.record_success(&idle);
+            schedule.record_success(&idle);
             assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
 
-            schedule.record_success(&work, StdDuration::ZERO);
+            schedule.record_success(&work);
             assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
             assert_eq!(schedule.idle_interval, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
             assert!(!schedule.follow_up_sweep);
             assert!(!schedule.jitter_next_delay);
 
-            schedule.record_success(&idle, StdDuration::ZERO);
+            schedule.record_success(&idle);
             assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
             assert_eq!(schedule.idle_interval, StdDuration::from_secs(120));
         }
@@ -5972,7 +5933,7 @@ mod tests {
         );
     }
 
-    async fn tier_free_version_recovery_page_call_times(run_duration: StdDuration) -> Vec<StdDuration> {
+    async fn tier_free_version_recovery_page_call_times(run_durations: &[StdDuration]) -> Vec<StdDuration> {
         RECOVERY_JITTER_CALLS.store(0, Ordering::SeqCst);
         let cancel = CancellationToken::new();
         let state = ExpiryState::new();
@@ -5981,6 +5942,7 @@ mod tests {
         let recorded_call_times = Arc::clone(&call_times);
         let call_index = Arc::new(AtomicUsize::new(0));
         let recorded_call_index = Arc::clone(&call_index);
+        let recovery_run_durations = run_durations.to_vec();
         let loop_cancel = cancel.clone();
         let recovery_cancel = cancel.clone();
         let worker = tokio::spawn(async move {
@@ -5991,8 +5953,9 @@ mod tests {
                     .push(tokio::time::Instant::now().duration_since(started_at));
                 let index = recorded_call_index.fetch_add(1, Ordering::SeqCst);
                 let cancel = recovery_cancel.clone();
+                let run_duration = recovery_run_durations.get(index).copied();
                 async move {
-                    if index == 0 {
+                    if let Some(run_duration) = run_duration {
                         tokio::time::sleep(run_duration).await;
                         Ok(free_version_recovery_stats(0, 0, true))
                     } else {
@@ -6005,15 +5968,14 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        tokio::time::advance(run_duration).await;
-        tokio::task::yield_now().await;
-        if run_duration < TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL {
-            let remaining = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL - run_duration;
-            tokio::time::advance(remaining - StdDuration::from_secs(1)).await;
-            assert_eq!(call_index.load(Ordering::SeqCst), 1);
+        for (index, run_duration) in run_durations.iter().copied().enumerate() {
+            tokio::time::advance(run_duration).await;
+            tokio::task::yield_now().await;
+            tokio::time::advance(TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL - StdDuration::from_secs(1)).await;
+            assert_eq!(call_index.load(Ordering::SeqCst), index + 1);
             tokio::time::advance(StdDuration::from_secs(1)).await;
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
         worker.await.expect("recovery loop should stop after cancellation");
         assert_eq!(
             RECOVERY_JITTER_CALLS.load(Ordering::SeqCst),
@@ -6029,14 +5991,75 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     #[serial]
-    async fn tier_free_version_recovery_preserves_start_to_start_page_cadence() {
+    async fn tier_free_version_recovery_waits_after_each_page_completes() {
         assert_eq!(
-            tier_free_version_recovery_page_call_times(StdDuration::from_secs(45)).await,
-            vec![StdDuration::ZERO, StdDuration::from_secs(60)]
+            tier_free_version_recovery_page_call_times(&[StdDuration::from_secs(45)]).await,
+            vec![StdDuration::ZERO, StdDuration::from_secs(105)]
         );
         assert_eq!(
-            tier_free_version_recovery_page_call_times(StdDuration::from_secs(75)).await,
-            vec![StdDuration::ZERO, StdDuration::from_secs(75)]
+            tier_free_version_recovery_page_call_times(&[StdDuration::from_secs(60)]).await,
+            vec![StdDuration::ZERO, StdDuration::from_secs(120)]
+        );
+        assert_eq!(
+            tier_free_version_recovery_page_call_times(&[StdDuration::from_secs(75)]).await,
+            vec![StdDuration::ZERO, StdDuration::from_secs(135)]
+        );
+        assert_eq!(
+            tier_free_version_recovery_page_call_times(&[StdDuration::from_secs(75), StdDuration::from_secs(45)]).await,
+            vec![StdDuration::ZERO, StdDuration::from_secs(135), StdDuration::from_secs(240)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier_free_version_recovery_notify_during_page_keeps_completion_cooldown() {
+        let cancel = CancellationToken::new();
+        let state = ExpiryState::new();
+        let recovery_notify = Arc::clone(&state.read().await.recovery_notify);
+        let started_at = tokio::time::Instant::now();
+        let call_times = Arc::new(StdMutex::new(Vec::new()));
+        let recorded_call_times = Arc::clone(&call_times);
+        let call_index = Arc::new(AtomicUsize::new(0));
+        let recorded_call_index = Arc::clone(&call_index);
+        let loop_cancel = cancel.clone();
+        let recovery_cancel = cancel.clone();
+        let worker = tokio::spawn(async move {
+            run_tier_free_version_recovery_loop(loop_cancel, state, std::convert::identity, move |_, _, _| {
+                recorded_call_times
+                    .lock()
+                    .expect("recovery call times lock should not be poisoned")
+                    .push(tokio::time::Instant::now().duration_since(started_at));
+                let index = recorded_call_index.fetch_add(1, Ordering::SeqCst);
+                let cancel = recovery_cancel.clone();
+                async move {
+                    if index == 0 {
+                        tokio::time::sleep(StdDuration::from_secs(75)).await;
+                        Ok(free_version_recovery_stats(0, 0, true))
+                    } else {
+                        cancel.cancel();
+                        Ok(free_version_recovery_stats(0, 0, false))
+                    }
+                }
+            })
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(StdDuration::from_secs(30)).await;
+        recovery_notify.notify_one();
+        tokio::time::advance(StdDuration::from_secs(45)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(StdDuration::from_secs(59)).await;
+        assert_eq!(call_index.load(Ordering::SeqCst), 1);
+        tokio::time::advance(StdDuration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        worker.await.expect("recovery loop should stop after cancellation");
+
+        assert_eq!(
+            call_times
+                .lock()
+                .expect("recovery call times lock should not be poisoned")
+                .as_slice(),
+            &[StdDuration::ZERO, StdDuration::from_secs(135)]
         );
     }
 
@@ -11283,6 +11306,120 @@ mod tests {
         }
     }
 
+    /// backlog#2202: the batch `NewerNoncurrentVersions` path used to delete
+    /// noncurrent versions without telling notification subscribers anything,
+    /// while the current-version path emitted a lifecycle expiration event.
+    /// Only versions this batch actually removed may produce an event.
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_noncurrent_batch_expiry_emits_events_only_for_committed_deletes() {
+        use crate::services::event_notification::test_recorder;
+        use rustfs_s3_types::EventName;
+
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("lifecycle-noncurrent-events-{}", Uuid::new_v4().simple());
+        let object = "logs/object";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        metadata_sys::update_in(
+            &ecstore.ctx,
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be enabled");
+
+        let now = OffsetDateTime::now_utc();
+        let mut noncurrent_reader = PutObjReader::from_vec(b"noncurrent".to_vec());
+        let noncurrent = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut noncurrent_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(now - time::Duration::days(40)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the noncurrent version should be created");
+        let noncurrent_version_id = noncurrent.version_id.expect("a versioned PUT has an exact identity");
+        let mut current_reader = PutObjReader::from_vec(b"current".to_vec());
+        let current = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut current_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(now - time::Duration::days(2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the current version should be created");
+        let current_version_id = current.version_id.expect("a versioned PUT has an exact identity");
+
+        let incarnation = ecstore
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("bucket incarnation should be available");
+
+        test_recorder::install();
+
+        // One version that exists and one that never did: `delete_objects`
+        // suppresses the not-found error, so only the committed delete may be
+        // announced.
+        let missing_version_id = Uuid::new_v4();
+        let targets = vec![
+            ObjectToDelete {
+                object_name: object.to_string(),
+                version_id: Some(noncurrent_version_id),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: object.to_string(),
+                version_id: Some(missing_version_id),
+                ..Default::default()
+            },
+        ];
+        let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+            &ecstore,
+            &bucket,
+            &targets,
+            lifecycle::Event::default(),
+            incarnation,
+        )
+        .await;
+        assert_eq!(failed, 0, "a missing version is not a batch failure");
+
+        let events = test_recorder::recorded_for_bucket(&bucket);
+        let announced = events.iter().map(|event| event.version_id).collect::<Vec<_>>();
+        assert_eq!(
+            announced,
+            vec![Some(noncurrent_version_id)],
+            "only the committed noncurrent delete should be announced \
+             (noncurrent={noncurrent_version_id}, current={current_version_id}, missing={missing_version_id}), got {events:?}"
+        );
+        assert_eq!(events[0].event_name, EventName::LifecycleExpirationDelete.to_string());
+        assert_eq!(events[0].object, object);
+        assert!(!events[0].delete_marker);
+
+        let remaining = ecstore
+            .clone()
+            .list_object_versions(&bucket, object, None, None, None, 10)
+            .await
+            .expect("remaining versions should be listable")
+            .objects
+            .into_iter()
+            .filter(|candidate| candidate.name == object)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].version_id, Some(current_version_id));
+    }
+
     #[tokio::test]
     #[serial]
     async fn lifecycle_deletes_only_the_historical_null_version_after_versioning_is_reenabled() {
@@ -12555,6 +12692,181 @@ mod tests {
             .delete_bucket(&bucket, &DeleteBucketOptions::default())
             .await
             .expect("empty recovery test bucket should be removed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_object_budget_is_global_across_buckets() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        for budget in [
+            RecoveryWorkBudget {
+                max_objects: 0,
+                max_buckets: 1,
+            },
+            RecoveryWorkBudget {
+                max_objects: 1,
+                max_buckets: 0,
+            },
+        ] {
+            let err = list_tier_free_versions_with_budget(Arc::clone(&ecstore), 1, None, None, CancellationToken::new(), budget)
+                .await
+                .expect_err("a zero recovery work budget must fail before starting an unbounded walk");
+            assert!(matches!(err, Error::Io(_)));
+        }
+
+        let suffix = Uuid::new_v4().simple();
+        let buckets = [
+            format!("zzzz-recovery-budget-{suffix}-a"),
+            format!("zzzz-recovery-budget-{suffix}-b"),
+            format!("zzzz-recovery-budget-{suffix}-c"),
+        ];
+        for bucket in &buckets {
+            create_test_bucket(&ecstore, bucket).await;
+        }
+
+        let first_bucket = buckets[0].clone();
+        let first_bucket_for_hook = first_bucket.clone();
+        let _walk = set_recovery_walk_test_hook(move |bucket| {
+            (bucket == first_bucket_for_hook).then(|| {
+                RecoveryWalkTestAction::SendItems(
+                    ["ordinary-object-0", "ordinary-object-0", "ordinary-object-1"]
+                        .into_iter()
+                        .map(|name| ObjectInfo {
+                            bucket: first_bucket_for_hook.clone(),
+                            name: name.to_string(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                )
+            })
+        });
+        let page = list_tier_free_versions_with_budget(
+            Arc::clone(&ecstore),
+            1,
+            None,
+            None,
+            CancellationToken::new(),
+            RecoveryWorkBudget {
+                max_objects: 1,
+                max_buckets: 10,
+            },
+        )
+        .await
+        .expect("the decoded-object boundary should enforce the recovery budget");
+
+        assert!(page.items.is_empty());
+        assert_eq!(page.scanned_entries, 3);
+        assert_eq!(page.buckets_scanned, 1);
+        assert!(page.truncated);
+        assert_eq!(page.next_bucket_marker.as_deref(), Some(first_bucket.as_str()));
+        assert_eq!(page.next_object_marker.as_deref(), Some("ordinary-object-0"));
+        drop(_walk);
+
+        let walked = Arc::new(StdMutex::new(Vec::new()));
+        let walked_by_hook = Arc::clone(&walked);
+        let test_buckets = buckets.clone();
+        let _walk = set_recovery_walk_test_hook(move |bucket| {
+            test_buckets
+                .iter()
+                .find(|candidate| candidate.as_str() == bucket)
+                .map(|bucket| {
+                    walked_by_hook
+                        .lock()
+                        .expect("recovery walk log should not be poisoned")
+                        .push(bucket.clone());
+                    RecoveryWalkTestAction::SendItems(vec![ObjectInfo {
+                        bucket: bucket.clone(),
+                        name: "ordinary-object".to_string(),
+                        ..Default::default()
+                    }])
+                })
+        });
+
+        let page = list_tier_free_versions_with_budget(
+            Arc::clone(&ecstore),
+            1,
+            None,
+            None,
+            CancellationToken::new(),
+            RecoveryWorkBudget {
+                max_objects: 2,
+                max_buckets: 10,
+            },
+        )
+        .await
+        .expect("the bounded recovery page should be listed");
+
+        assert!(page.items.is_empty());
+        assert_eq!(page.scanned_entries, 2);
+        assert_eq!(page.buckets_scanned, 2);
+        assert!(page.truncated);
+        assert_eq!(page.next_bucket_marker.as_deref(), Some(buckets[1].as_str()));
+        assert_eq!(page.next_object_marker.as_deref(), Some("ordinary-object"));
+        assert_eq!(walked.lock().expect("recovery walk log should not be poisoned").as_slice(), &buckets[..2]);
+
+        for bucket in &buckets {
+            ecstore
+                .delete_bucket(bucket, &DeleteBucketOptions::default())
+                .await
+                .expect("empty recovery test bucket should be removed");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_bucket_budget_resumes_at_unscanned_bucket() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let suffix = Uuid::new_v4().simple();
+        let buckets = [
+            format!("zzzz-recovery-buckets-{suffix}-a"),
+            format!("zzzz-recovery-buckets-{suffix}-b"),
+        ];
+        for bucket in &buckets {
+            create_test_bucket(&ecstore, bucket).await;
+        }
+
+        let test_buckets = buckets.clone();
+        let _walk = set_recovery_walk_test_hook(move |bucket| {
+            test_buckets
+                .iter()
+                .any(|candidate| candidate.as_str() == bucket)
+                .then(|| RecoveryWalkTestAction::SendItems(Vec::new()))
+        });
+        let budget = RecoveryWorkBudget {
+            max_objects: 10,
+            max_buckets: 1,
+        };
+        let first = list_tier_free_versions_with_budget(Arc::clone(&ecstore), 1, None, None, CancellationToken::new(), budget)
+            .await
+            .expect("the first bucket-bounded page should be listed");
+
+        assert_eq!(first.buckets_scanned, 1);
+        assert!(first.truncated);
+        assert_eq!(first.next_bucket_marker.as_deref(), Some(buckets[1].as_str()));
+        assert!(first.next_object_marker.is_none());
+
+        let second = list_tier_free_versions_with_budget(
+            Arc::clone(&ecstore),
+            1,
+            first.next_bucket_marker,
+            first.next_object_marker,
+            CancellationToken::new(),
+            budget,
+        )
+        .await
+        .expect("the second bucket-bounded page should resume");
+
+        assert_eq!(second.buckets_scanned, 1);
+        assert!(!second.truncated);
+        assert!(second.next_bucket_marker.is_none());
+        assert!(second.next_object_marker.is_none());
+
+        for bucket in &buckets {
+            ecstore
+                .delete_bucket(bucket, &DeleteBucketOptions::default())
+                .await
+                .expect("empty recovery test bucket should be removed");
+        }
     }
 
     #[tokio::test]

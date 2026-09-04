@@ -20,7 +20,8 @@ use crate::cluster::rpc::{set_tonic_canonical_body_digest, set_tonic_mutation_bo
 use crate::error::{Error, Result};
 use crate::storage_api_contracts::internode::{
     SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
-    SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
+    SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES,
+    SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
 };
 use crate::{
     bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats, TierDailyStatsWire},
@@ -47,18 +48,19 @@ use rustfs_protos::proto_gen::node_service::{
     HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
     LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
     LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest,
-    ScannerActivityRequest, ScannerActivityResponse, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
-    ScannerPublicationLeaseResponse, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest,
-    StartProfilingRequest, StopRebalanceRequest, TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest,
-    TierMutationControlResponse, TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest,
-    node_service_client::NodeServiceClient, tier_mutation_control_service_client::TierMutationControlServiceClient,
+    ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageSnapshotRequest, ScannerDirtyUsageSnapshotResponse,
+    ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse, ServerInfoRequest,
+    SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest,
+    TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse,
+    TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
+    tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
 pub use rustfs_protos::{PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS};
 use rustfs_protos::{TierMutationRpcPhase, evict_failed_connection};
 use rustfs_utils::XHost;
 use serde::{Deserialize, Serialize as _};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::Cursor,
     sync::{
         Arc, Weak,
@@ -185,18 +187,31 @@ pub struct ScannerPeerActivity {
     pub publication_blocked: Option<bool>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScannerPeerDirtyUsageSnapshot {
+    pub instance_id: String,
+    pub generation: u64,
+    pub pending_bucket_count: u64,
+    pub protocol_version: u32,
+    pub complete: bool,
+    pub buckets: BTreeMap<String, u64>,
+}
+
+fn scanner_instance_id_is_valid(instance_id: &str) -> bool {
+    instance_id.len() == 32
+        && instance_id
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
 fn decode_scanner_activity_with_verifier(
     response: ScannerActivityResponse,
     challenge: &[u8; 16],
     verify_proof: impl FnOnce(&[u8], &[u8]) -> Result<()>,
 ) -> Result<ScannerPeerActivity> {
     let instance_id = &response.instance_id;
-    if instance_id.len() != 32
-        || !instance_id
-            .as_bytes()
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-    {
+    if !scanner_instance_id_is_valid(instance_id) {
         return Err(Error::other("peer returned an invalid scanner activity instance ID"));
     }
     let (
@@ -315,6 +330,82 @@ fn decode_scanner_activity(response: ScannerActivityResponse, challenge: &[u8; 1
     decode_scanner_activity_with_verifier(response, challenge, |canonical, proof| {
         verify_tonic_rpc_response_proof(canonical, proof)
             .map_err(|_| Error::other("peer returned an invalid scanner activity response proof"))
+    })
+}
+
+fn decode_scanner_dirty_usage_snapshot_with_verifier(
+    response: ScannerDirtyUsageSnapshotResponse,
+    challenge: &[u8; 16],
+    verify_proof: impl FnOnce(&[u8], &[u8]) -> Result<()>,
+) -> Result<ScannerPeerDirtyUsageSnapshot> {
+    let canonical = rustfs_protos::canonical_scanner_dirty_usage_snapshot_response_body(challenge, &response)
+        .map_err(|_| Error::other("peer scanner dirty usage snapshot is too large to authenticate"))?;
+    verify_proof(&canonical, &response.response_proof)?;
+
+    if response.protocol_version != SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION {
+        return Err(Error::other("peer returned unsupported scanner dirty usage snapshot protocol"));
+    }
+    if !scanner_instance_id_is_valid(&response.instance_id) {
+        return Err(Error::other("peer returned an invalid scanner dirty usage snapshot instance ID"));
+    }
+    if response.generation == u64::MAX {
+        return Err(Error::other("peer scanner dirty usage snapshot exhausted its generation"));
+    }
+    if response.pending_bucket_count > 0 && response.generation == 0 {
+        return Err(Error::other("peer scanner dirty usage snapshot has pending buckets without a generation"));
+    }
+    if response.buckets.len() > SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES {
+        return Err(Error::other("peer scanner dirty usage snapshot exceeds the entry limit"));
+    }
+    let bucket_count = u64::try_from(response.buckets.len())
+        .map_err(|_| Error::other("peer scanner dirty usage snapshot entry count cannot be represented"))?;
+    let max_entries = u64::try_from(SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES).unwrap_or(u64::MAX);
+    if response.complete {
+        if response.pending_bucket_count != bucket_count {
+            return Err(Error::other(
+                "complete peer scanner dirty usage snapshot has an inconsistent bucket count",
+            ));
+        }
+    } else if !response.buckets.is_empty() || response.pending_bucket_count <= max_entries {
+        return Err(Error::other(
+            "incomplete peer scanner dirty usage snapshot must represent an entry-limit overflow",
+        ));
+    }
+    for pair in response.buckets.windows(2) {
+        if pair[0].bucket >= pair[1].bucket {
+            return Err(Error::other("peer scanner dirty usage snapshot buckets are not strictly ordered"));
+        }
+    }
+    for bucket in &response.buckets {
+        if bucket.bucket.is_empty() {
+            return Err(Error::other("peer scanner dirty usage snapshot contains an empty bucket name"));
+        }
+        if bucket.generation == 0 || bucket.generation > response.generation {
+            return Err(Error::other("peer scanner dirty usage snapshot contains an invalid bucket generation"));
+        }
+    }
+
+    Ok(ScannerPeerDirtyUsageSnapshot {
+        instance_id: response.instance_id,
+        generation: response.generation,
+        pending_bucket_count: response.pending_bucket_count,
+        protocol_version: response.protocol_version,
+        complete: response.complete,
+        buckets: response
+            .buckets
+            .into_iter()
+            .map(|bucket| (bucket.bucket, bucket.generation))
+            .collect(),
+    })
+}
+
+fn decode_scanner_dirty_usage_snapshot(
+    response: ScannerDirtyUsageSnapshotResponse,
+    challenge: &[u8; 16],
+) -> Result<ScannerPeerDirtyUsageSnapshot> {
+    decode_scanner_dirty_usage_snapshot_with_verifier(response, challenge, |canonical, proof| {
+        verify_tonic_rpc_response_proof(canonical, proof)
+            .map_err(|_| Error::other("peer returned an invalid scanner dirty usage snapshot response proof"))
     })
 }
 
@@ -1935,6 +2026,30 @@ impl PeerRestClient {
         }
     }
 
+    pub async fn scanner_dirty_usage_snapshot(&self) -> Result<ScannerPeerDirtyUsageSnapshot> {
+        self.finalize_result(
+            async {
+                let challenge = Uuid::new_v4();
+                let mut client = self
+                    .get_client()
+                    .await?
+                    .max_decoding_message_size(SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE);
+                let mut request = Request::new(ScannerDirtyUsageSnapshotRequest {
+                    challenge: challenge.as_bytes().to_vec().into(),
+                    protocol_version: SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION,
+                });
+                let canonical = rustfs_protos::canonical_scanner_dirty_usage_snapshot_request_body(request.get_ref())
+                    .map_err(|_| Error::other("scanner dirty usage snapshot request is too large to authenticate"))?;
+                set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                let response = client.scanner_dirty_usage_snapshot(request).await?.into_inner();
+                decode_scanner_dirty_usage_snapshot(response, challenge.as_bytes())
+            }
+            .await,
+        )
+        .await
+    }
+
     pub async fn acknowledge_scanner_dirty_usage(&self, instance_id: String, generation: u64) -> Result<ScannerPeerActivity> {
         let result = self
             .scanner_activity_request_with_protocol(instance_id.clone(), generation, SCANNER_ACTIVITY_PROTOCOL_VERSION)
@@ -2638,6 +2753,141 @@ mod tests {
                 .then_some(())
                 .ok_or_else(|| Error::other("peer returned an invalid scanner activity response proof"))
         })
+    }
+
+    fn decode_test_scanner_dirty_usage_snapshot(
+        response: ScannerDirtyUsageSnapshotResponse,
+    ) -> Result<ScannerPeerDirtyUsageSnapshot> {
+        decode_scanner_dirty_usage_snapshot_with_verifier(response, &[9; 16], |_canonical, proof| {
+            (proof == b"proof")
+                .then_some(())
+                .ok_or_else(|| Error::other("peer returned an invalid scanner dirty usage snapshot response proof"))
+        })
+    }
+
+    fn test_scanner_dirty_usage_snapshot_response() -> ScannerDirtyUsageSnapshotResponse {
+        ScannerDirtyUsageSnapshotResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            generation: 7,
+            pending_bucket_count: 2,
+            protocol_version: SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION,
+            complete: true,
+            buckets: vec![
+                rustfs_protos::proto_gen::node_service::ScannerDirtyUsageBucket {
+                    bucket: "archive".to_string(),
+                    generation: 3,
+                },
+                rustfs_protos::proto_gen::node_service::ScannerDirtyUsageBucket {
+                    bucket: "photos".to_string(),
+                    generation: 7,
+                },
+            ],
+            response_proof: b"proof".to_vec().into(),
+        }
+    }
+
+    #[test]
+    fn scanner_dirty_usage_snapshot_requires_a_complete_authenticated_ordered_view() {
+        let decoded = decode_test_scanner_dirty_usage_snapshot(test_scanner_dirty_usage_snapshot_response())
+            .expect("a complete authenticated dirty usage snapshot should decode");
+        assert_eq!(decoded.instance_id, "0123456789abcdef0123456789abcdef");
+        assert_eq!(decoded.generation, 7);
+        assert_eq!(decoded.pending_bucket_count, 2);
+        assert_eq!(decoded.protocol_version, SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION);
+        assert!(decoded.complete);
+        assert_eq!(decoded.buckets.get("archive"), Some(&3));
+        assert_eq!(decoded.buckets.get("photos"), Some(&7));
+
+        let overflow_count =
+            u64::try_from(SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES + 1).expect("the test snapshot entry limit should fit in u64");
+        let overflow = decode_test_scanner_dirty_usage_snapshot(ScannerDirtyUsageSnapshotResponse {
+            pending_bucket_count: overflow_count,
+            complete: false,
+            buckets: Vec::new(),
+            ..test_scanner_dirty_usage_snapshot_response()
+        })
+        .expect("an explicit all-or-nothing overflow snapshot should decode");
+        assert!(!overflow.complete);
+        assert!(overflow.buckets.is_empty());
+    }
+
+    #[test]
+    fn scanner_dirty_usage_snapshot_rejects_inconsistent_or_partial_peer_data() {
+        let mut cases = Vec::new();
+
+        let mut invalid_instance = test_scanner_dirty_usage_snapshot_response();
+        invalid_instance.instance_id = "ABCDEF0123456789ABCDEF0123456789".to_string();
+        cases.push((invalid_instance, "instance ID"));
+
+        let mut unsupported = test_scanner_dirty_usage_snapshot_response();
+        unsupported.protocol_version = SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION + 1;
+        cases.push((unsupported, "unsupported"));
+
+        let mut exhausted = test_scanner_dirty_usage_snapshot_response();
+        exhausted.generation = u64::MAX;
+        cases.push((exhausted, "exhausted"));
+
+        let mut inconsistent_count = test_scanner_dirty_usage_snapshot_response();
+        inconsistent_count.pending_bucket_count = 3;
+        cases.push((inconsistent_count, "bucket count"));
+
+        let mut unordered = test_scanner_dirty_usage_snapshot_response();
+        unordered.buckets.reverse();
+        cases.push((unordered, "strictly ordered"));
+
+        let mut future_bucket = test_scanner_dirty_usage_snapshot_response();
+        future_bucket.buckets[0].generation = 8;
+        cases.push((future_bucket, "bucket generation"));
+
+        let mut zero_generation = test_scanner_dirty_usage_snapshot_response();
+        zero_generation.buckets[0].generation = 0;
+        cases.push((zero_generation, "bucket generation"));
+
+        let mut empty_bucket = test_scanner_dirty_usage_snapshot_response();
+        empty_bucket.buckets[0].bucket.clear();
+        cases.push((empty_bucket, "empty bucket name"));
+
+        let mut partial = test_scanner_dirty_usage_snapshot_response();
+        partial.complete = false;
+        cases.push((partial, "entry-limit overflow"));
+
+        let too_many_buckets = ScannerDirtyUsageSnapshotResponse {
+            generation: 1,
+            pending_bucket_count: u64::try_from(SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES + 1)
+                .expect("the test snapshot entry limit should fit in u64"),
+            buckets: (0..=SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES)
+                .map(|index| rustfs_protos::proto_gen::node_service::ScannerDirtyUsageBucket {
+                    bucket: format!("bucket-{index:04}"),
+                    generation: 1,
+                })
+                .collect(),
+            ..test_scanner_dirty_usage_snapshot_response()
+        };
+        cases.push((too_many_buckets, "exceeds the entry limit"));
+
+        let overflow_count =
+            u64::try_from(SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES + 1).expect("the test snapshot entry limit should fit in u64");
+        let invalid_overflow = ScannerDirtyUsageSnapshotResponse {
+            generation: 0,
+            pending_bucket_count: overflow_count,
+            complete: false,
+            buckets: Vec::new(),
+            ..test_scanner_dirty_usage_snapshot_response()
+        };
+        cases.push((invalid_overflow, "without a generation"));
+
+        for (response, expected) in cases {
+            let err =
+                decode_test_scanner_dirty_usage_snapshot(response).expect_err("malformed dirty usage snapshots must fail closed");
+            assert!(err.to_string().contains(expected), "expected {expected:?} in {err}");
+        }
+
+        let mut invalid_proof = test_scanner_dirty_usage_snapshot_response();
+        invalid_proof.protocol_version = SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION + 1;
+        invalid_proof.response_proof = b"invalid".to_vec().into();
+        let err = decode_test_scanner_dirty_usage_snapshot(invalid_proof)
+            .expect_err("an invalid response proof must fail before peer fields are trusted");
+        assert!(err.to_string().contains("response proof"));
     }
 
     #[test]
