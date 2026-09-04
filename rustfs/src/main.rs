@@ -14,6 +14,8 @@
 
 #[cfg(all(feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
 use std::alloc::{GlobalAlloc, Layout};
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
+use std::ptr::NonNull;
 
 #[cfg(all(feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
 #[derive(Default)]
@@ -35,8 +37,10 @@ unsafe impl GlobalAlloc for MiMallocAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: ptr came from this allocator and layout.size() is the original allocation size.
-        unsafe { rustfs_mimalloc::MiMalloc::free_csize(ptr, layout.size()) }
+        // SAFETY: ptr came from this allocator, is non-null by GlobalAlloc's
+        // dealloc contract, and layout.size() is the original allocation size.
+        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+        unsafe { rustfs_mimalloc::MiMalloc::free_csize_nonnull(ptr, layout.size()) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {

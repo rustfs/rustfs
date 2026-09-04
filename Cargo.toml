@@ -244,8 +244,8 @@ aws-sdk-kms = { default-features = false, version = "1.117.0" }
 aws-sdk-s3 = { default-features = false, version = "1.144.0" }
 aws-sdk-sts = { default-features = false, version = "1.113.0" }
 aws-smithy-http-client = { default-features = false, version = "1.4.0" }
-aws-smithy-runtime-api = { version = "1.15.0" }
-aws-smithy-types = { version = "1.6.2" }
+aws-smithy-runtime-api = { version = "1.16.0" }
+aws-smithy-types = { version = "1.6.3" }
 base64-simd = "0.8.0"
 brotli = "9.0.0"
 clap = { version = "4.6.6" }
@@ -359,15 +359,15 @@ libunftp = { version = "0.23.0" }
 unftp-core = "0.1.0"
 suppaftp = { version = "11.0.0" }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-russh = { version = "0.63.1" }
+russh = { version = "0.63.2" }
 russh-sftp = "2.4.0"
 
 # WebDAV
 dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
-rustfs-mimalloc = { version = "0.5.2" }
-hotpath = { version = "0.24.0", default-features = false }
+rustfs-mimalloc = { version = "0.5.3" }
+hotpath = { version = "0.25.0", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }
 
