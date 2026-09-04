@@ -589,33 +589,184 @@ impl ExpiryOp for FreeVersionTask {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionDeleteVersionPlan {
+    Direct { version_id_exact: bool },
+    ProbeLegacyUnknown,
+}
+
+fn legacy_transition_version_state_missing(oi: &ObjectInfo) -> Result<bool, std::io::Error> {
+    use rustfs_utils::http::metadata_compat::{
+        SUFFIX_TRANSITIONED_VERSION_ID, SUFFIX_TRANSITIONED_VERSION_STATE, contains_key_str, get_consistent_str,
+    };
+
+    if !contains_key_str(&oi.user_defined, SUFFIX_TRANSITIONED_VERSION_STATE) {
+        let version_key_present = contains_key_str(&oi.user_defined, SUFFIX_TRANSITIONED_VERSION_ID);
+        if version_key_present {
+            if oi.transitioned_object.version_id.is_empty() {
+                let has_non_empty_version = oi.user_defined.iter().any(|(key, value)| {
+                    rustfs_utils::http::metadata_compat::strip_internal_prefix_preserving_case(key)
+                        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(SUFFIX_TRANSITIONED_VERSION_ID))
+                        && !value.is_empty()
+                });
+                if !has_non_empty_version {
+                    // MinIO writes the transitioned-versionID key with an empty value
+                    // for unversioned tier objects. The backend probe remains the proof.
+                    return Ok(true);
+                }
+            } else if get_consistent_str(&oi.user_defined, SUFFIX_TRANSITIONED_VERSION_ID)
+                == Some(oi.transitioned_object.version_id.as_str())
+            {
+                return Ok(true);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy remote tier version metadata is conflicting or malformed",
+            ));
+        }
+        if !oi.transitioned_object.version_id.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy remote tier version metadata is missing or inconsistent",
+            ));
+        }
+        return Ok(true);
+    }
+    let persisted = get_consistent_str(&oi.user_defined, SUFFIX_TRANSITIONED_VERSION_STATE).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote tier object has conflicting transition version state metadata",
+        )
+    })?;
+    if persisted != oi.transition_version_state.as_str() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote tier object transition version state metadata changed during decoding",
+        ));
+    }
+    Ok(false)
+}
+
+fn transition_remote_version_delete_plan(oi: &ObjectInfo) -> Result<TransitionDeleteVersionPlan, std::io::Error> {
+    match oi.transition_version_state {
+        rustfs_filemeta::TransitionVersionState::Unknown => {
+            if legacy_transition_version_state_missing(oi)? {
+                Ok(TransitionDeleteVersionPlan::ProbeLegacyUnknown)
+            } else {
+                validate_transition_remote_version(oi)
+                    .map(|version_id_exact| TransitionDeleteVersionPlan::Direct { version_id_exact })
+            }
+        }
+        _ => validate_transition_remote_version(oi)
+            .map(|version_id_exact| TransitionDeleteVersionPlan::Direct { version_id_exact }),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResolvedTransitionDeleteVersion {
+    version_id_exact: bool,
+    verify_missing_after_delete: bool,
+    remote_already_missing: bool,
+}
+
 async fn acquire_free_version_tier_lease(
     oi: &ObjectInfo,
     tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
-) -> Result<(TierOperationLease, bool), std::io::Error> {
-    let version_id_exact = validate_transition_remote_version(oi)?;
+) -> Result<(TierOperationLease, TransitionDeleteVersionPlan), std::io::Error> {
+    let delete_plan = transition_remote_version_delete_plan(oi)?;
     let identity = tier_destination_id_from_metadata(&oi.user_defined)?
         .ok_or_else(|| std::io::Error::other("tier free-version has no durable backend identity"))?;
     let lease =
         TierConfigMgr::acquire_operation_lease_for_backend_identity(tier_config_mgr, &oi.transitioned_object.tier, identity)
             .await
             .map_err(std::io::Error::other)?;
-    Ok((lease, version_id_exact))
+    Ok((lease, delete_plan))
+}
+
+async fn resolve_transition_delete_version_plan(
+    oi: &ObjectInfo,
+    lease: &TierOperationLease,
+    delete_plan: TransitionDeleteVersionPlan,
+) -> Result<ResolvedTransitionDeleteVersion, std::io::Error> {
+    match delete_plan {
+        TransitionDeleteVersionPlan::Direct { version_id_exact } => Ok(ResolvedTransitionDeleteVersion {
+            version_id_exact,
+            verify_missing_after_delete: false,
+            remote_already_missing: false,
+        }),
+        TransitionDeleteVersionPlan::ProbeLegacyUnknown => {
+            let probe = lease.probe_transition_candidate(&oi.transitioned_object.name).await?;
+            match (oi.transitioned_object.version_id.as_str(), probe) {
+                ("", crate::services::tier::warm_backend::TransitionCandidateProbe::UnversionedPresent) => {
+                    Ok(ResolvedTransitionDeleteVersion {
+                        version_id_exact: false,
+                        verify_missing_after_delete: true,
+                        remote_already_missing: false,
+                    })
+                }
+                (expected, crate::services::tier::warm_backend::TransitionCandidateProbe::VersionedPresent(actual))
+                    if !expected.is_empty() && expected == actual =>
+                {
+                    lease.validate_remote_version_id(expected)?;
+                    Ok(ResolvedTransitionDeleteVersion {
+                        version_id_exact: true,
+                        verify_missing_after_delete: false,
+                        remote_already_missing: false,
+                    })
+                }
+                (_, crate::services::tier::warm_backend::TransitionCandidateProbe::Missing) => {
+                    Ok(ResolvedTransitionDeleteVersion {
+                        version_id_exact: false,
+                        verify_missing_after_delete: false,
+                        remote_already_missing: true,
+                    })
+                }
+                (_, crate::services::tier::warm_backend::TransitionCandidateProbe::Unsupported) => Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "remote tier cannot prove legacy transition delete state",
+                )),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "remote tier object version state is unknown",
+                )),
+            }
+        }
+    }
+}
+
+async fn execute_resolved_transition_delete(
+    oi: &ObjectInfo,
+    lease: &TierOperationLease,
+    resolved: ResolvedTransitionDeleteVersion,
+) -> Result<(), std::io::Error> {
+    if !resolved.remote_already_missing {
+        delete_object_from_remote_tier_with_lease_idempotent(
+            &oi.transitioned_object.name,
+            &oi.transitioned_object.version_id,
+            lease,
+            resolved.version_id_exact,
+        )
+        .await?;
+    }
+    if resolved.verify_missing_after_delete
+        && lease.probe_transition_candidate(&oi.transitioned_object.name).await?
+            != crate::services::tier::warm_backend::TransitionCandidateProbe::Missing
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "remote tier could not confirm legacy unversioned deletion",
+        ));
+    }
+    Ok(())
 }
 
 async fn delete_free_version_remote_object_with_lease(
     oi: &ObjectInfo,
     lease: &TierOperationLease,
-    version_id_exact: bool,
+    delete_plan: TransitionDeleteVersionPlan,
 ) -> Result<(), std::io::Error> {
-    delete_object_from_remote_tier_with_lease_idempotent(
-        &oi.transitioned_object.name,
-        &oi.transitioned_object.version_id,
-        lease,
-        version_id_exact,
-    )
-    .await?;
-    Ok(())
+    let resolved = resolve_transition_delete_version_plan(oi, lease, delete_plan).await?;
+    execute_resolved_transition_delete(oi, lease, resolved).await
 }
 
 fn free_version_physical_topology_generation(api: &ECStore) -> String {
@@ -646,6 +797,16 @@ fn free_version_remote_tuple_matches(candidate: &ObjectInfo, expected: &ObjectIn
     if candidate.transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown
         || expected.transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown
     {
+        let candidate_legacy_missing = legacy_transition_version_state_missing(candidate)?;
+        let expected_legacy_missing = legacy_transition_version_state_missing(expected)?;
+        if candidate.transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown
+            && expected.transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown
+            && candidate_legacy_missing
+            && expected_legacy_missing
+            && candidate.transitioned_object.version_id == expected.transitioned_object.version_id
+        {
+            return Ok(true);
+        }
         return Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "tier free-version remote version state is unknown",
@@ -721,7 +882,7 @@ async fn cleanup_free_version_exact(api: Arc<ECStore>, oi: &ObjectInfo, cancel: 
         .acquire_bucket_lifecycle_read_lock(&oi.bucket)
         .await
         .map_err(std::io::Error::other)?;
-    let (lease, version_id_exact) = acquire_free_version_tier_lease(oi, &api.tier_config_mgr()).await?;
+    let (lease, delete_plan) = acquire_free_version_tier_lease(oi, &api.tier_config_mgr()).await?;
     let local_object = encode_dir_object(&oi.name);
     let object_guards = api
         .acquire_all_physical_object_write_locks("tier_free_version_cleanup", &oi.bucket, &local_object)
@@ -739,16 +900,30 @@ async fn cleanup_free_version_exact(api: Arc<ECStore>, oi: &ObjectInfo, cancel: 
             "tier free-version cleanup fence is invalid before remote delete",
         ));
     }
+    let resolved = tokio::select! {
+        _ = cancel.cancelled() => {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "tier free-version cleanup was cancelled"));
+        }
+        result = tokio::time::timeout_at(deadline, resolve_transition_delete_version_plan(oi, &lease, delete_plan)) => {
+            result.map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "tier free-version remote probe timed out")
+            })??
+        }
+    };
+    if !free_version_cleanup_fences_current(&topology_generation, &api, &bucket_guard, &object_guards, &lease, cancel, deadline) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "tier free-version cleanup fence changed after remote probe",
+        ));
+    }
     tokio::select! {
         _ = cancel.cancelled() => {
             return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "tier free-version cleanup was cancelled"));
         }
-        result = tokio::time::timeout_at(
-            deadline,
-            delete_free_version_remote_object_with_lease(oi, &lease, version_id_exact),
-        ) => {
-            result
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "tier free-version remote delete timed out"))??;
+        result = tokio::time::timeout_at(deadline, execute_resolved_transition_delete(oi, &lease, resolved)) => {
+            result.map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "tier free-version remote delete timed out")
+            })??;
         }
     }
     if !free_version_cleanup_fences_current(&topology_generation, &api, &bucket_guard, &object_guards, &lease, cancel, deadline) {
@@ -796,8 +971,8 @@ async fn delete_free_version_remote_object(
     oi: &ObjectInfo,
     tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
 ) -> Result<(), std::io::Error> {
-    let (lease, version_id_exact) = acquire_free_version_tier_lease(oi, tier_config_mgr).await?;
-    delete_free_version_remote_object_with_lease(oi, &lease, version_id_exact).await
+    let (lease, delete_plan) = acquire_free_version_tier_lease(oi, tier_config_mgr).await?;
+    delete_free_version_remote_object_with_lease(oi, &lease, delete_plan).await
 }
 
 #[allow(
@@ -813,8 +988,8 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let (lease, version_id_exact) = acquire_free_version_tier_lease(oi, tier_config_mgr).await?;
-    delete_free_version_remote_object_with_lease(oi, &lease, version_id_exact).await?;
+    let (lease, delete_plan) = acquire_free_version_tier_lease(oi, tier_config_mgr).await?;
+    delete_free_version_remote_object_with_lease(oi, &lease, delete_plan).await?;
     let result = delete_local().await;
     drop(lease);
     Ok(result)
@@ -4693,6 +4868,39 @@ fn validate_transition_remote_version(oi: &ObjectInfo) -> Result<bool, std::io::
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionReadVersionPlan {
+    Direct,
+    ProbeLegacyUnversioned,
+}
+
+const LEGACY_TRANSITION_READ_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+
+fn transition_remote_version_read_plan(oi: &ObjectInfo) -> Result<TransitionReadVersionPlan, std::io::Error> {
+    let version = oi.transitioned_object.version_id.as_str();
+    match oi.transition_version_state {
+        rustfs_filemeta::TransitionVersionState::Unknown => {
+            if !legacy_transition_version_state_missing(oi)? {
+                return validate_transition_remote_version(oi).map(|_| TransitionReadVersionPlan::Direct);
+            }
+            if version.is_empty() {
+                Ok(TransitionReadVersionPlan::ProbeLegacyUnversioned)
+            } else {
+                Ok(TransitionReadVersionPlan::Direct)
+            }
+        }
+        rustfs_filemeta::TransitionVersionState::KnownDisabled if version.is_empty() => Ok(TransitionReadVersionPlan::Direct),
+        rustfs_filemeta::TransitionVersionState::SuspendedNull if version == "null" => Ok(TransitionReadVersionPlan::Direct),
+        rustfs_filemeta::TransitionVersionState::Exact if !version.is_empty() && version != "null" => {
+            Ok(TransitionReadVersionPlan::Direct)
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote tier object version state conflicts with its version ID",
+        )),
+    }
+}
+
 // The resolver joins the tier manager as the second injected port this read
 // needs; grouping the request half into a struct would churn every call site of
 // a bug fix.
@@ -4707,7 +4915,12 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
     tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
     resolver: Option<&dyn ObjectEncryptionResolver>,
 ) -> Result<GetObjectReader, std::io::Error> {
-    validate_transition_remote_version(oi)?;
+    let read_plan = transition_remote_version_read_plan(oi)?;
+    // Reject invalid ranges and encryption requests before a compatibility
+    // probe can amplify them into remote listing work.
+    let plan = ReadPlan::build_for_request(rs.clone(), oi, opts, h, resolver)
+        .await
+        .map_err(|err| std::io::Error::other(format!("building the read plan for {bucket}/{object} failed: {err}")))?;
     let expected_identity = tier_destination_id_from_metadata(&oi.user_defined)?;
     let lease = match expected_identity {
         Some(identity) => {
@@ -4721,7 +4934,36 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
         Err(err) => return Err(std::io::Error::other(err)),
     };
 
-    tgt_client.validate_remote_version_id(&oi.transitioned_object.version_id)?;
+    match read_plan {
+        TransitionReadVersionPlan::Direct => {
+            tgt_client.validate_remote_version_id(&oi.transitioned_object.version_id)?;
+        }
+        TransitionReadVersionPlan::ProbeLegacyUnversioned => {
+            // RUSTFS_COMPAT_TODO(backlog#2203): remove operation-time probing
+            // after an admin reconcile can persist every proven legacy state.
+            let probe = tokio::time::timeout(
+                LEGACY_TRANSITION_READ_PROBE_TIMEOUT,
+                tgt_client.probe_transition_candidate(&oi.transitioned_object.name),
+            )
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "legacy remote tier version probe timed out"))??;
+            match probe {
+                crate::services::tier::warm_backend::TransitionCandidateProbe::UnversionedPresent => {}
+                crate::services::tier::warm_backend::TransitionCandidateProbe::Unsupported => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "remote tier cannot prove legacy unversioned transition state",
+                    ));
+                }
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "remote tier object version state is unknown",
+                    ));
+                }
+            }
+        }
+    }
 
     // The same read plan the local path uses, so the tier fetch is positioned in
     // the object's *stored* coordinate system and the stream is handed the same
@@ -4729,9 +4971,6 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
     // through a plaintext-coordinate range and skipping the transform is how a
     // transitioned SSE object used to come back as silently corrupt bytes of the
     // right length (rustfs/rustfs#6025).
-    let plan = ReadPlan::build_for_request(rs.clone(), oi, opts, h, resolver)
-        .await
-        .map_err(|err| std::io::Error::other(format!("building the read plan for {bucket}/{object} failed: {err}")))?;
     let (off, length) = (plan.storage_offset() as i64, plan.storage_length());
     let mut gopts = WarmBackendGetOpts::default();
 
@@ -5629,11 +5868,13 @@ mod tests {
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
     #[cfg(feature = "test-util")]
+    use crate::services::tier::test_util::MockWarmOp;
+    #[cfg(feature = "test-util")]
     use crate::services::tier::test_util::register_mock_tier;
     #[cfg(feature = "test-util")]
     use crate::services::tier::tier::TierConfigMgr;
     #[cfg(feature = "test-util")]
-    use crate::services::tier::warm_backend::WarmBackend as _;
+    use crate::services::tier::warm_backend::{TransitionCandidateProbe, WarmBackend as _};
     use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause};
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
     use crate::storage_api_contracts::namespace::NamespaceLocking as _;
@@ -6329,7 +6570,75 @@ mod tests {
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
-    async fn transitioned_get_rejects_unknown_version_state_before_backend_io() {
+    async fn transitioned_get_allows_legacy_unknown_exact_version_for_non_destructive_read() {
+        let manager = TierConfigMgr::new();
+        let tier = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&manager, &tier).await;
+        let remote_object = format!("remote/{}", Uuid::new_v4());
+        let body = Bytes::from_static(b"legacy transitioned object body");
+        let remote_version = backend
+            .put(
+                &remote_object,
+                ReaderImpl::Body(body.clone()),
+                i64::try_from(body.len()).expect("body length should fit"),
+            )
+            .await
+            .expect("mock remote object should be stored");
+        let mut user_defined = HashMap::new();
+        insert_legacy_transition_version_id(&mut user_defined, &remote_version);
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: i64::try_from(body.len()).expect("body length should fit"),
+            transitioned_object: TransitionedObject {
+                name: remote_object,
+                version_id: remote_version,
+                status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
+                tier: tier.clone(),
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: user_defined.into(),
+            ..Default::default()
+        };
+
+        let range = Some(crate::storage_api_contracts::range::HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 7,
+            end: 18,
+        });
+        let mut reader = get_transitioned_object_reader_with_tier_manager(
+            &object_info.bucket,
+            &object_info.name,
+            &range,
+            &HeaderMap::new(),
+            &object_info,
+            &ObjectOptions::default(),
+            &manager,
+            None,
+        )
+        .await
+        .expect("legacy unknown state should still allow a non-destructive read");
+        let mut got = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut got)
+            .await
+            .expect("transitioned reader should drain");
+
+        assert_eq!(got, &body.as_ref()[7..=18]);
+        assert_eq!(backend.get_count().await, 1);
+        assert_eq!(backend.remove_count().await, 0);
+        assert_eq!(
+            TierConfigMgr::active_operation_lease_count(&manager, &tier).await,
+            0,
+            "tier generation lease should release after EOF"
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn transitioned_get_rejects_explicit_unknown_version_state_before_backend_io() {
         let manager = TierConfigMgr::new();
         let tier = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&manager, &tier).await;
@@ -6339,6 +6648,181 @@ mod tests {
             size: 1,
             transitioned_object: TransitionedObject {
                 name: "remote/object".to_string(),
+                version_id: String::new(),
+                status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
+                tier,
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: user_defined_with_transition_version_state(rustfs_filemeta::TransitionVersionState::Unknown).into(),
+            ..Default::default()
+        };
+
+        let err = match get_transitioned_object_reader_with_tier_manager(
+            &object_info.bucket,
+            &object_info.name,
+            &None,
+            &HeaderMap::new(),
+            &object_info,
+            &ObjectOptions::default(),
+            &manager,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("explicit unknown remote version state must fail before backend IO"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(backend.op_log().await, Vec::<MockWarmOp>::new());
+        assert_eq!(backend.get_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn transitioned_get_rejects_present_but_invalid_legacy_version_metadata() {
+        let manager = TierConfigMgr::new();
+        let tier = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&manager, &tier).await;
+
+        for persisted_version in [
+            Uuid::nil().to_string(),
+            "\u{fffd}".to_string(),
+            "bad\u{0001}version".to_string(),
+        ] {
+            let mut user_defined = HashMap::new();
+            insert_legacy_transition_version_id(&mut user_defined, &persisted_version);
+            let object_info = ObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "object".to_string(),
+                size: 1,
+                transitioned_object: TransitionedObject {
+                    name: "remote/object".to_string(),
+                    version_id: String::new(),
+                    status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
+                    tier: tier.clone(),
+                    ..Default::default()
+                },
+                transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+                user_defined: user_defined.into(),
+                ..Default::default()
+            };
+
+            let err = match get_transitioned_object_reader_with_tier_manager(
+                &object_info.bucket,
+                &object_info.name,
+                &None,
+                &HeaderMap::new(),
+                &object_info,
+                &ObjectOptions::default(),
+                &manager,
+                None,
+            )
+            .await
+            {
+                Ok(_) => panic!("present but invalid legacy version metadata must fail before backend IO"),
+                Err(err) => err,
+            };
+
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        }
+
+        assert_eq!(backend.op_log().await, Vec::<MockWarmOp>::new());
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn transitioned_get_probes_legacy_empty_unknown_state_before_unversioned_read() {
+        let manager = TierConfigMgr::new();
+        let tier = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&manager, &tier).await;
+        backend.set_put_remote_version(Some(String::new())).await;
+        let remote_object = format!("remote/{}", Uuid::new_v4());
+        let body = Bytes::from_static(b"legacy unversioned transitioned object body");
+        let remote_version = backend
+            .put(
+                &remote_object,
+                ReaderImpl::Body(body.clone()),
+                i64::try_from(body.len()).expect("body length should fit"),
+            )
+            .await
+            .expect("mock remote object should be stored");
+        assert!(remote_version.is_empty());
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: i64::try_from(body.len()).expect("body length should fit"),
+            transitioned_object: TransitionedObject {
+                name: remote_object.clone(),
+                version_id: String::new(),
+                status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
+                tier: tier.clone(),
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: HashMap::from([("x-minio-internal-transitioned-versionID".to_string(), String::new())]).into(),
+            ..Default::default()
+        };
+
+        let mut reader = get_transitioned_object_reader_with_tier_manager(
+            &object_info.bucket,
+            &object_info.name,
+            &None,
+            &HeaderMap::new(),
+            &object_info,
+            &ObjectOptions::default(),
+            &manager,
+            None,
+        )
+        .await
+        .expect("probe-proven legacy unversioned state should allow a non-destructive read");
+        let mut got = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut got)
+            .await
+            .expect("transitioned reader should drain");
+
+        assert_eq!(got, body.as_ref());
+        assert_eq!(backend.remove_count().await, 0);
+        assert_eq!(
+            backend.op_log().await,
+            vec![
+                MockWarmOp::Put {
+                    object: remote_object.clone()
+                },
+                MockWarmOp::Probe {
+                    object: remote_object.clone()
+                },
+                MockWarmOp::Get { object: remote_object },
+            ]
+        );
+        assert_eq!(
+            TierConfigMgr::active_operation_lease_count(&manager, &tier).await,
+            0,
+            "tier generation lease should release after EOF"
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn transitioned_get_rejects_ambiguous_empty_unknown_state_without_backend_get() {
+        let manager = TierConfigMgr::new();
+        let tier = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&manager, &tier).await;
+        let remote_object = format!("remote/{}", Uuid::new_v4());
+        backend
+            .set_transition_candidate_probe_override(Some(TransitionCandidateProbe::VersionedPresent(
+                "versioned-candidate".to_string(),
+            )))
+            .await;
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: 1,
+            transitioned_object: TransitionedObject {
+                name: remote_object.clone(),
                 version_id: String::new(),
                 status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
                 tier,
@@ -6360,19 +6844,28 @@ mod tests {
         )
         .await
         {
-            Ok(_) => panic!("unknown remote version state must fail before backend IO"),
+            Ok(_) => panic!("versioned legacy unknown state without stored version must fail before backend GET"),
             Err(err) => err,
         };
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(backend.op_log().await, vec![MockWarmOp::Probe { object: remote_object }]);
         assert_eq!(backend.get_count().await, 0);
+        assert_eq!(backend.remove_count().await, 0);
     }
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
-    async fn free_version_delete_rejects_unknown_version_state_before_backend_io() {
+    async fn free_version_delete_rejects_explicit_unknown_before_backend_io() {
         let manager = TierConfigMgr::new();
         let backend = register_mock_tier(&manager, "WARM").await;
+        let identity = test_tier_destination_identity(&manager, "WARM").await;
+        let mut user_defined = user_defined_with_tier_destination_identity(identity);
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut user_defined,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_STATE,
+            rustfs_filemeta::TransitionVersionState::Unknown.as_str().to_string(),
+        );
         let object_info = ObjectInfo {
             transitioned_object: TransitionedObject {
                 name: "remote/object".to_string(),
@@ -6381,14 +6874,243 @@ mod tests {
                 ..Default::default()
             },
             transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: user_defined.into(),
             ..Default::default()
         };
 
         let err = super::delete_free_version_remote_object(&object_info, &manager)
             .await
-            .expect_err("unknown remote version state must fail before backend IO");
+            .expect_err("explicit unknown cleanup must fail before backend IO");
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("version state is unknown"));
+        assert_eq!(backend.op_log().await, Vec::<MockWarmOp>::new());
+        assert_eq!(backend.remove_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn test_tier_destination_identity(
+        manager: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
+        tier: &str,
+    ) -> crate::services::tier::tier::TierDestinationId {
+        TierConfigMgr::acquire_operation_lease(manager, tier)
+            .await
+            .expect("test tier lease should be available")
+            .backend_identity()
+    }
+
+    #[cfg(feature = "test-util")]
+    fn user_defined_with_tier_destination_identity(
+        identity: crate::services::tier::tier::TierDestinationId,
+    ) -> HashMap<String, String> {
+        let mut user_defined = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut user_defined,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(identity),
+        );
+        user_defined
+    }
+
+    #[cfg(feature = "test-util")]
+    fn user_defined_with_transition_version_state(state: rustfs_filemeta::TransitionVersionState) -> HashMap<String, String> {
+        let mut user_defined = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut user_defined,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_STATE,
+            state.as_str().to_string(),
+        );
+        user_defined
+    }
+
+    #[cfg(feature = "test-util")]
+    fn insert_legacy_transition_version_id(user_defined: &mut HashMap<String, String>, version_id: &str) {
+        rustfs_utils::http::metadata_compat::insert_str(
+            user_defined,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_ID,
+            version_id.to_string(),
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn free_version_tuple_rejects_mixed_legacy_missing_and_explicit_unknown() {
+        let manager = TierConfigMgr::new();
+        register_mock_tier(&manager, "WARM").await;
+        let identity = test_tier_destination_identity(&manager, "WARM").await;
+        let mut legacy_metadata = user_defined_with_tier_destination_identity(identity);
+        insert_legacy_transition_version_id(&mut legacy_metadata, "legacy-version");
+        let mut explicit_metadata = legacy_metadata.clone();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut explicit_metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_STATE,
+            rustfs_filemeta::TransitionVersionState::Unknown.as_str().to_string(),
+        );
+        let make_info = |user_defined: HashMap<String, String>| ObjectInfo {
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "legacy-version".to_string(),
+                tier: "WARM".to_string(),
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: user_defined.into(),
+            ..Default::default()
+        };
+
+        let err = super::free_version_remote_tuple_matches(&make_info(legacy_metadata), &make_info(explicit_metadata))
+            .expect_err("mixed legacy-missing and explicit unknown provenance must fail closed");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn free_version_delete_probes_legacy_unknown_exact_version_before_remove() {
+        let manager = TierConfigMgr::new();
+        let tier = "WARM";
+        let backend = register_mock_tier(&manager, tier).await;
+        let identity = test_tier_destination_identity(&manager, tier).await;
+        let remote_object = format!("remote/{}", Uuid::new_v4());
+        let body = Bytes::from_static(b"legacy exact cleanup body");
+        let remote_version = backend
+            .put(
+                &remote_object,
+                ReaderImpl::Body(body),
+                i64::try_from(b"legacy exact cleanup body".len()).expect("body length should fit"),
+            )
+            .await
+            .expect("mock remote object should be stored");
+        let mut user_defined = user_defined_with_tier_destination_identity(identity);
+        insert_legacy_transition_version_id(&mut user_defined, &remote_version);
+        backend.clear_op_log().await;
+        let object_info = ObjectInfo {
+            transitioned_object: TransitionedObject {
+                name: remote_object.clone(),
+                version_id: remote_version,
+                tier: tier.to_string(),
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: user_defined.into(),
+            ..Default::default()
+        };
+
+        super::delete_free_version_remote_object(&object_info, &manager)
+            .await
+            .expect("probe-proven legacy exact cleanup should delete the remote version");
+        super::delete_free_version_remote_object(&object_info, &manager)
+            .await
+            .expect("a retry after the exact remote version is already missing should be idempotent");
+
+        assert_eq!(
+            backend.op_log().await,
+            vec![
+                MockWarmOp::Probe {
+                    object: remote_object.clone()
+                },
+                MockWarmOp::Remove {
+                    object: remote_object.clone()
+                },
+                MockWarmOp::Probe {
+                    object: remote_object.clone()
+                },
+            ]
+        );
+        assert_eq!(
+            backend.remove_versions().await,
+            vec![(remote_object, object_info.transitioned_object.version_id)]
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn free_version_delete_probes_legacy_unknown_unversioned_before_remove() {
+        let manager = TierConfigMgr::new();
+        let tier = "WARM";
+        let backend = register_mock_tier(&manager, tier).await;
+        backend.set_put_remote_version(Some(String::new())).await;
+        let identity = test_tier_destination_identity(&manager, tier).await;
+        let remote_object = format!("remote/{}", Uuid::new_v4());
+        let body = Bytes::from_static(b"legacy unversioned cleanup body");
+        let remote_version = backend
+            .put(
+                &remote_object,
+                ReaderImpl::Body(body),
+                i64::try_from(b"legacy unversioned cleanup body".len()).expect("body length should fit"),
+            )
+            .await
+            .expect("mock remote object should be stored");
+        assert!(remote_version.is_empty());
+        backend.clear_op_log().await;
+        let mut user_defined = user_defined_with_tier_destination_identity(identity);
+        user_defined.insert("x-minio-internal-transitioned-versionID".to_string(), String::new());
+        let object_info = ObjectInfo {
+            transitioned_object: TransitionedObject {
+                name: remote_object.clone(),
+                version_id: String::new(),
+                tier: tier.to_string(),
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: user_defined.into(),
+            ..Default::default()
+        };
+
+        super::delete_free_version_remote_object(&object_info, &manager)
+            .await
+            .expect("probe-proven legacy unversioned cleanup should delete the remote object");
+
+        assert_eq!(
+            backend.op_log().await,
+            vec![
+                MockWarmOp::Probe {
+                    object: remote_object.clone()
+                },
+                MockWarmOp::Remove {
+                    object: remote_object.clone()
+                },
+                MockWarmOp::Probe {
+                    object: remote_object.clone()
+                },
+            ]
+        );
+        assert_eq!(backend.remove_versions().await, vec![(remote_object, String::new())]);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn free_version_delete_retains_legacy_unknown_when_probe_disagrees() {
+        let manager = TierConfigMgr::new();
+        let tier = "WARM";
+        let backend = register_mock_tier(&manager, tier).await;
+        let identity = test_tier_destination_identity(&manager, tier).await;
+        let remote_object = format!("remote/{}", Uuid::new_v4());
+        backend
+            .set_transition_candidate_probe_override(Some(TransitionCandidateProbe::VersionedPresent(
+                "different-version".to_string(),
+            )))
+            .await;
+        let mut user_defined = user_defined_with_tier_destination_identity(identity);
+        insert_legacy_transition_version_id(&mut user_defined, "legacy-version");
+        let object_info = ObjectInfo {
+            transitioned_object: TransitionedObject {
+                name: remote_object.clone(),
+                version_id: "legacy-version".to_string(),
+                tier: tier.to_string(),
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Unknown,
+            user_defined: user_defined.into(),
+            ..Default::default()
+        };
+
+        let err = super::delete_free_version_remote_object(&object_info, &manager)
+            .await
+            .expect_err("legacy unknown cleanup must not delete when the probe disagrees");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(backend.op_log().await, vec![MockWarmOp::Probe { object: remote_object }]);
         assert_eq!(backend.remove_count().await, 0);
     }
 

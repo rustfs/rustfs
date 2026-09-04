@@ -701,7 +701,7 @@ impl WarmBackend for MockWarmBackend {
         Ok(version)
     }
 
-    async fn get(&self, object: &str, _rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
+    async fn get(&self, object: &str, rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
         self.precondition().await?;
         let barrier = self.inner.get_barrier.lock().await.take();
         if let Some(barrier) = barrier {
@@ -719,6 +719,9 @@ impl WarmBackend for MockWarmBackend {
         let Some(stored) = objects.get(object) else {
             return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "mock object not found"));
         };
+        if !rv.is_empty() && stored.remote_version_id != rv {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "NoSuchVersion"));
+        }
         let bytes = &stored.bytes;
 
         let start = opts.start_offset.max(0) as usize;
