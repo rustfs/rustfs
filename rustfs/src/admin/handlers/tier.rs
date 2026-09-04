@@ -80,6 +80,82 @@ fn wasabi_payload_name(config: &TierConfig) -> S3Result<String> {
         .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Wasabi configuration"))
 }
 
+fn normalize_add_tier_payload_name(config: &mut TierConfig) -> S3Result<()> {
+    match config.tier_type {
+        TierType::S3 => {
+            let _ = config
+                .s3
+                .as_ref()
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing S3 configuration"))?;
+        }
+        TierType::Wasabi => config.name = wasabi_payload_name(config)?,
+        TierType::RustFS => {
+            config.name = config
+                .rustfs
+                .as_ref()
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing RustFS configuration"))?
+                .name
+                .clone();
+        }
+        TierType::MinIO => {
+            config.name = config
+                .minio
+                .as_ref()
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing MinIO configuration"))?
+                .name
+                .clone();
+        }
+        TierType::Aliyun => {
+            config.name = config
+                .aliyun
+                .as_ref()
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Aliyun configuration"))?
+                .name
+                .clone();
+        }
+        TierType::Tencent => {
+            config.name = config
+                .tencent
+                .as_ref()
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Tencent configuration"))?
+                .name
+                .clone();
+        }
+        TierType::Huaweicloud => {
+            config.name = config
+                .huaweicloud
+                .as_ref()
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Huawei Cloud configuration"))?
+                .name
+                .clone();
+        }
+        TierType::Azure => {
+            config.name = config
+                .azure
+                .as_ref()
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Azure configuration"))?
+                .name
+                .clone();
+        }
+        TierType::GCS => {
+            let _ = config
+                .gcs
+                .as_ref()
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing GCS configuration"))?;
+        }
+        TierType::R2 => {
+            config.name = config
+                .r2
+                .as_ref()
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing R2 configuration"))?
+                .name
+                .clone();
+        }
+        TierType::Unsupported => {}
+    }
+    Ok(())
+}
+
 fn spawn_transition_tier_config_propagation(action: &'static str) {
     if let Some(notification_sys) = current_notification_system() {
         debug!(
@@ -263,75 +339,7 @@ impl Operation for AddTier {
         let mut args: TierConfig = serde_json::from_slice(&body)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid JSON: {e}")))?;
 
-        match args.tier_type {
-            TierType::S3 => {
-                args.name = args
-                    .s3
-                    .clone()
-                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing S3 configuration"))?
-                    .name;
-            }
-            TierType::Wasabi => {
-                args.name = wasabi_payload_name(&args)?;
-            }
-            TierType::RustFS => {
-                args.name = args
-                    .rustfs
-                    .clone()
-                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing RustFS configuration"))?
-                    .name;
-            }
-            TierType::MinIO => {
-                args.name = args
-                    .minio
-                    .clone()
-                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing MinIO configuration"))?
-                    .name;
-            }
-            TierType::Aliyun => {
-                args.name = args
-                    .aliyun
-                    .clone()
-                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Aliyun configuration"))?
-                    .name;
-            }
-            TierType::Tencent => {
-                args.name = args
-                    .tencent
-                    .clone()
-                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Tencent configuration"))?
-                    .name;
-            }
-            TierType::Huaweicloud => {
-                args.name = args
-                    .huaweicloud
-                    .clone()
-                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Huawei Cloud configuration"))?
-                    .name;
-            }
-            TierType::Azure => {
-                args.name = args
-                    .azure
-                    .clone()
-                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Azure configuration"))?
-                    .name;
-            }
-            TierType::GCS => {
-                args.name = args
-                    .gcs
-                    .clone()
-                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing GCS configuration"))?
-                    .name;
-            }
-            TierType::R2 => {
-                args.name = args
-                    .r2
-                    .clone()
-                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing R2 configuration"))?
-                    .name;
-            }
-            _ => (),
-        }
+        normalize_add_tier_payload_name(&mut args)?;
         debug!(
             event = EVENT_ADMIN_TIER_STATE,
             component = LOG_COMPONENT_ADMIN,
@@ -1151,6 +1159,44 @@ mod tests {
     }
 
     #[test]
+    fn add_tier_payload_preserves_canonical_madmin_s3_and_gcs_names() {
+        for (provider, wire) in [
+            (
+                "S3",
+                serde_json::json!({
+                    "Type": "s3",
+                    "Name": "COLD-S3",
+                    "S3": {
+                        "Endpoint": "https://s3.example.invalid",
+                        "AccessKey": "access",
+                        "SecretKey": "secret",
+                        "Bucket": "archive"
+                    }
+                }),
+            ),
+            (
+                "GCS",
+                serde_json::json!({
+                    "Type": "gcs",
+                    "Name": "COLD-GCS",
+                    "GCS": {
+                        "Endpoint": "https://storage.googleapis.com",
+                        "Creds": "e30=",
+                        "Bucket": "archive"
+                    }
+                }),
+            ),
+        ] {
+            let mut config: TierConfig = serde_json::from_value(wire).expect("canonical madmin payload should decode");
+            let expected = config.name.clone();
+
+            normalize_add_tier_payload_name(&mut config).expect("canonical madmin payload should pass the handler boundary");
+
+            assert_eq!(config.name, expected, "{provider} top-level Name must not be cleared");
+        }
+    }
+
+    #[test]
     fn resolve_tier_name_prefers_path_parameter() {
         let uri: Uri = "/rustfs/admin/v3/tier/HOT?tier=COLD".parse().expect("uri should parse");
         let mut router = Router::new();
@@ -1756,5 +1802,11 @@ mod tests {
         }
 
         assert!(!production.contains("check_key_valid(get_session_token"));
+
+        let add_tier = source_block(production, "impl Operation for AddTier");
+        assert!(
+            add_tier.contains("normalize_add_tier_payload_name(&mut args)?;"),
+            "AddTier must preserve canonical top-level provider names through the tested boundary helper"
+        );
     }
 }

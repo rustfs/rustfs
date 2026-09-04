@@ -39,11 +39,11 @@ Internal metadata is stored under both `x-rustfs-internal-<suffix>` and `x-minio
 |--------|---------|
 | `transition-status` | `"complete"` when tiered |
 | `transitioned-object` | tier key path (stored without the tier prefix; `get_dest` adds it) |
-| `transitioned-versionID` | S3 version_id returned by tier PUT (16 raw UUID bytes, or absent) |
+| `transitioned-versionID` | Provider version identifier: current exact UTF-8 text, legacy RustFS raw UUID bytes, MinIO's empty unversioned value, or absent for some historical unversioned records. Interpret it only with `transitioned-version-state` or a live compatibility probe. |
 | `transition-tier` | tier name |
 | `tier-free-versionID` | delete-marker version for free-version sweep |
 
-Reading binary values must reject empty, malformed, and nil values (regression covered in `crates/filemeta/src/filemeta/version.rs` tests):
+Legacy raw UUID values must reject empty, malformed, and nil UUIDs (regression covered in `crates/filemeta/src/filemeta/version.rs` tests):
 
 ```rust
 get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)
@@ -52,7 +52,7 @@ get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)
 // None for: absent key, wrong-length bytes, nil UUID
 ```
 
-`transition_version_id == None` means the tier bucket is unversioned; the GET/DELETE against the tier must then send no `versionId` parameter. A nil UUID (`00000000-...`) sent as `?versionId=` causes `NoSuchVersion`. Do not use `Uuid::from_slice(..).unwrap_or_default()` here: it converts an empty metadata value into `Uuid::nil()`, which is exactly that failure.
+`transition_version_id == None` means only that no usable legacy UUID projection exists; it does not prove the remote bucket's versioning model. Only an explicit `KnownDisabled` state authorizes ordinary GET/DELETE to omit `versionId`. A missing state with an absent or empty version key remains `Unknown` and requires the bounded compatibility probe or the approved reconcile workflow; it never directly authorizes cleanup. A nil UUID (`00000000-...`) sent as `?versionId=` causes `NoSuchVersion`. Do not use `Uuid::from_slice(..).unwrap_or_default()` here: it converts an empty metadata value into `Uuid::nil()`, which is exactly that failure.
 
 ## Inspect xl.meta directly
 
@@ -64,8 +64,8 @@ cargo build -p rustfs-filemeta --example dump_fileinfo
 
 | Output | Meaning |
 |---|---|
-| `transition_ver_id: <none>` | No versionId will be sent to the tier (correct for a non-versioned tier bucket). |
-| `transition_ver_id: <uuid>` | That UUID will be sent as `?versionId=<uuid>`. |
+| `transition_ver_id: <none>` | No usable legacy UUID projection exists. Inspect `transitioned-version-state` and the raw compatibility keys; do not infer unversioned semantics. |
+| `transition_ver_id: <uuid>` | A legacy UUID representation decoded successfully. It is not destructive authority unless the persisted state or reconcile proof establishes the exact remote model. |
 
 There is one `xl.meta` per erasure shard disk (`{disk}/{bucket}/{object}/xl.meta`); all shards of a healthy object should be identical. `dump_versions` (same crate) lists every version in a file.
 
@@ -80,7 +80,7 @@ RUST_LOG=rustfs_ecstore::bucket::lifecycle=debug rustfs ...
 | `fetching transitioned object from tier` | DEBUG | Emitted before the tier request. |
 | `tier GET failed` | ERROR | Includes `tier_version_id`. |
 
-If both `x-rustfs-internal-transitioned-versionID` and `x-minio-internal-transitioned-versionID` are the empty string, the object was transitioned to a non-versioned tier bucket and no versionId must be sent.
+If the version keys are empty while `transitioned-version-state` is absent, the record has the historical MinIO unversioned shape but still remains `Unknown`; only the compatibility probe or reconcile protocol may prove `KnownDisabled`. If state is explicitly `KnownDisabled`, no `versionId` is sent.
 
 ## Manual transition run
 
@@ -153,6 +153,89 @@ Historical transition transactions in `upload_outcome_unknown` state can use an 
    ```
 
 `finalize_missing` re-runs the provider probe and fails closed for `unversioned_present`, `versioned_present`, `ambiguous`, `unsupported`, or probe errors. It never accepts an operator assertion in place of a live `missing` result. Providers without an authoritative probe or exact version deletion remain pending; the endpoint does not infer provider capabilities, accept external absence assertions, or select a candidate automatically.
+
+## Inspect and disposition retained recovery records
+
+This section describes an **approved target that is not implemented yet**. Current servers do not expose the routes below and continue to quarantine tier-delete journal v1/v2 records. Do not remove internal metadata objects by hand: that loses ETag, all-pool, decommission, export, and audit guarantees.
+
+The approved read-only inventory is bounded and paginated:
+
+```text
+GET /rustfs/admin/v3/ilm/recovery/records?protocol=<protocol>&classification=<classification>&limit=<n>&marker=<opaque>
+GET /rustfs/admin/v3/ilm/recovery/records/<control-id>
+```
+
+List and redacted inspect require `admin:ListTier`. The server reconstructs the canonical source identity, strongly reads every authoritative copy, and reports one logical record with its schema, classification (`retrying`, `retained_ambiguous`, `corrupt`, `operator_required`, `abandoned`, or `terminal`), stable reason code, copy/content digests, retry deadline/counters, fleet readiness, scan completeness, and decommission coverage. It does not return raw legacy bytes, object/version names, endpoints, credentials, or provider error text in the default JSON. Incomplete pool coverage, divergent copies, a missing ETag, corruption, or a truncated page without a continuation marker is fail-closed and cannot produce an actionable receipt.
+
+Inspect returns a 15-minute opaque observation receipt. It binds the authenticated actor, canonical record, every source copy/ETag/digest, topology/fleet generation, requested action class, issue/expiry time, and nonce. The receipt prevents a stale request from widening its target; it is not cleanup authority.
+
+For a strictly decoded v1/v2 tier-delete journal, the approved evidence-preserving flow is:
+
+1. Inspect the exact record and independently decide whether retaining the local cleanup obligation is still useful.
+2. With `admin:SetTier`, create an immutable server-side export from the current observation receipt. The export contains the exact raw journal bytes and copy manifest, is installed create-only at the canonical digest-derived export ID, strongly read back, and downloaded through a no-store attachment response:
+
+   ```text
+   POST /rustfs/admin/v3/ilm/recovery/records/<control-id>
+   { "action": "export", "observation_receipt": "<opaque>" }
+
+   GET /rustfs/admin/v3/ilm/recovery/exports/<export-id>
+   ```
+
+3. Only after preserving that export, submit a fresh exact disposition with `admin:SetTier`:
+
+   ```json
+   POST /rustfs/admin/v3/ilm/recovery/records/<control-id>
+   {
+     "action": "abandon_remote_cleanup",
+     "confirm": true,
+     "acknowledge_remote_cleanup_abandoned": true,
+     "observation_receipt": "<opaque>",
+     "export_id": "<export-id>",
+     "export_sha256": "<sha256>",
+     "reason_code": "<bounded-operator-reason>"
+   }
+   ```
+
+The last action removes only the exact local v1/v2 journal generations by per-copy `If-Match` after a durable `Prepared` disposition receipt and fresh all-member capability proof. The receipt advances `Prepared -> Applying -> Completed` and records a monotonic per-copy `confirmed_absent` set. If the server deletes copy A and crashes before recording progress, recovery may confirm A absent under the unchanged source/control, topology, process-epoch, migration, and decommission proofs, persist that progress, and continue with still-exact copy B. A replacement ETag is always a conflict; recovery never widens the immutable copy manifest.
+
+The action never creates a tier client, probes a backend, or issues remote PUT/GET/DELETE. Its meaning is deliberately narrow: the operator accepts that remote storage may leak and abandons RustFS cleanup after preserving evidence. A changed copy, active decommission, missing member, topology/process restart, incomplete read, or uncertain replacement proof retains the evidence. Success requires every bound copy be durably confirmed absent, a fresh all-member/decommission proof, and the disposition receipt durably `Completed`; response loss resumes only the same canonical operation ID.
+
+Canonical replay of an identical export/disposition consumes no new quota. New operations require a complete artifact inventory and are refused before source mutation when the projected retained total, including the fully encoded candidate, would exceed 10,000 exports, 10,000 disposition receipts, 1 GiB of encoded export data, or 256 MiB of encoded control/disposition data. The quota decision, create-only installation, and exact readback share one cluster-scoped admission WRITE lock. That lock is always acquired before control/source/disposition and physical metadata locks and is released before disposition `Applying` or any source deletion; callers never acquire it while holding those inner guards. A crash before installation consumes no capacity, and lost installation response is resolved by canonical readback under the same serialized order, so concurrent nodes cannot oversubscribe a stale snapshot. Admission is also limited to ten new creations per actor per minute, 100 cluster-wide per minute, 32 concurrent exports, and eight concurrent dispositions. Capacity pressure never evicts recovery evidence or blocks ordinary object I/O; the collector examines at most 100 terminal artifacts per minute.
+
+Malformed/unsupported records and journal v3-v6 cannot use abandon. Known-version and v6 manifest ownership must converge through their normal exact recovery protocol. Operators may inspect, export, and request a bounded retry, but cannot bypass source/free-version proof, manifest membership, topology, or version semantics.
+
+Automatic retry state survives restart. Retryable transport/quorum failures use a 60-second exponential base capped at one hour and a deterministic 80-to-100-percent multiplier, so jitter never increases the capped delay. After 32 consecutive failures or seven days from the first persisted failure, automatic work stops at `operator_required`. Unsupported or ambiguous evidence goes directly to `retained_ambiguous`/`operator_required`; age alone never deletes it. Resolved controls, immutable exports, and completed disposition receipts have minimum 30-day, 90-day, and 365-day retention respectively, and are collected only after exact source absence, decommission, successor, and audit checks.
+
+The full schema, lease, mixed-version, retry, privacy, and metric requirements are in [../architecture/ilm-tiering-persistence-contracts.md](../architecture/ilm-tiering-persistence-contracts.md#bounded-recovery-control-and-operator-disposition).
+
+## Reconcile legacy transition-version metadata
+
+This section describes an **approved target that is not implemented yet**. The current server has no admin route that backfills a missing `transitioned-version-state` in `xl.meta`. Do not use the transaction reconcile route above for this purpose: that route owns an upload transaction candidate and may delete it, while legacy metadata reconciliation is non-destructive and may update only the exact local metadata version.
+
+The approved interface is synchronous and accepts exactly one bucket/object/local-version tuple:
+
+```text
+GET  /rustfs/admin/v3/ilm/transition/state/reconcile?bucket=<bucket>&object=<object>&versionId=<local-version-id>
+POST /rustfs/admin/v3/ilm/transition/state/reconcile?bucket=<bucket>&object=<object>&versionId=<local-version-id>
+```
+
+`versionId` is required; use the literal `null` for a locally unversioned object. An omitted or empty selector is invalid. GET requires `admin:ListTier`. It reports the authoritative all-pool tuple, destination identity, fleet/topology readiness, live probe classification, opaque expected-tuple digest, and a machine-readable diagnosis. It returns `ready-to-migrate`, not `migrated`, when a missing state is provable because GET is read-only.
+
+POST requires `admin:SetTier`, `confirm: true`, and the complete immutable source tuple, original per-set missing-state representations, proposed target, and reconciliation digest returned by GET. The server rereads every authoritative copy and repeats the bounded live backend probe; provider console output or an operator-supplied state is diagnostic evidence only, never write authority. A retry accepts only copies that still match their digest-bound original representation or already equal the exact proven target; any other divergence is stale or corrupt. The server may persist only one of these exact state/version pairs, together with the bound destination identity:
+
+| Proven remote model | State | Version value |
+|---|---|---|
+| Versioning disabled | `KnownDisabled` | Empty/absent; later requests omit `versionId` |
+| Versioning suspended null object | `SuspendedNull` | Literal `null` |
+| One exact version | `Exact` | Exact nonempty, non-`null` opaque identifier |
+
+The response outcome is `migrated`, `retained-ambiguous`, `corrupt`, or `backend-unavailable`. `migrated` means strong all-pool readback proved the same state and destination identity on every authoritative copy; it can be idempotent with `changed=false`. Ambiguous/missing/multiple probe results are retained, and explicit `Unknown`, malformed or conflicting dual keys, nil identifiers, partial tuples, or copies outside the exact `{original missing representation, proven target}` retry subset fail closed. An unavailable backend, tier generation, metadata quorum, or required strong readback reports `backend-unavailable`; a monotonic partial write is retained for retry and never rolled back.
+
+The POST does not issue remote DELETE or PUT, remove local data, create a free-version, clean a transaction/journal, or change tier configuration. It holds the approved fleet/topology, bucket-lifecycle, exact tier-generation/destination, and stable all-pool object-version fences across authoritative reread and the bounded probe; it rechecks them before quorum writes and after strong readback. A fleet containing a node that cannot preserve the explicit state/destination binding is inspect-only, and a cross-pool first match is never enough.
+
+There is intentionally no bucket, prefix, or fleet selector. Batch repair requires a separate durable, resumable job protocol and remains future work. Until the single-record route is implemented, retain affected metadata, use external inspection only for diagnosis, and never hand-edit `xl.meta` or enable remote cleanup by assuming that an empty version field means an unversioned tier.
+
+The full approved fence, quorum, cross-set retry, destination-binding, and mixed-version contract is specified in [../architecture/ilm-tiering-persistence-contracts.md](../architecture/ilm-tiering-persistence-contracts.md#legacy-transitioned-version-state-reconciliation).
 
 ## Invariant: local-first expiry ordering
 

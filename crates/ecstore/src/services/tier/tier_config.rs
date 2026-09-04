@@ -42,7 +42,7 @@ const WASABI_ALTERNATIVE_ENDPOINTS: &[(&str, &str)] = &[
 pub enum TierType {
     #[default]
     Unsupported,
-    #[serde(rename = "s3")]
+    #[serde(rename = "s3", alias = "S3")]
     S3,
     #[serde(rename = "wasabi")]
     Wasabi,
@@ -58,7 +58,7 @@ pub enum TierType {
     Huaweicloud,
     #[serde(rename = "azure")]
     Azure,
-    #[serde(rename = "gcs")]
+    #[serde(rename = "gcs", alias = "GCS")]
     GCS,
     #[serde(rename = "r2")]
     R2,
@@ -138,16 +138,18 @@ impl TierType {
     }
 }
 
-#[derive(Default, Debug, Serialize, Deserialize)]
+pub(crate) const TIER_CREDENTIAL_REDACTED: &str = "REDACTED";
+
+#[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TierConfig {
     #[serde(skip)]
     pub version: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", alias = "Type")]
     pub tier_type: TierType,
-    #[serde(skip)]
+    #[serde(rename = "Name", alias = "name", skip_serializing)]
     pub name: String,
-    #[serde(rename = "s3", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "s3", alias = "S3", skip_serializing_if = "Option::is_none")]
     pub s3: Option<TierS3>,
     #[serde(rename = "wasabi", skip_serializing_if = "Option::is_none")]
     pub wasabi: Option<TierWasabi>,
@@ -159,7 +161,7 @@ pub struct TierConfig {
     pub huaweicloud: Option<TierHuaweicloud>,
     #[serde(rename = "azure", skip_serializing_if = "Option::is_none")]
     pub azure: Option<TierAzure>,
-    #[serde(rename = "gcs", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "gcs", alias = "GCS", skip_serializing_if = "Option::is_none")]
     pub gcs: Option<TierGCS>,
     #[serde(rename = "r2", skip_serializing_if = "Option::is_none")]
     pub r2: Option<TierR2>,
@@ -170,109 +172,91 @@ pub struct TierConfig {
 }
 
 impl Clone for TierConfig {
-    fn clone(&self) -> TierConfig {
-        let mut s3 = None;
-        let mut wasabi = None;
-        let mut r = None;
-        let mut compatible_backend = None;
-        let mut aliyun = None;
-        let mut tencent = None;
-        let mut huaweicloud = None;
-        let mut azure = None;
-        let mut gcs = None;
-        let mut r2 = None;
-        match self.tier_type {
-            TierType::S3 => {
-                if let Some(s3_) = self.s3.as_ref() {
-                    let mut s3_clone = s3_.clone();
-                    s3_clone.secret_key = "REDACTED".to_string();
-                    s3 = Some(s3_clone);
-                }
-            }
-            TierType::Wasabi => {
-                if let Some(wasabi_) = self.wasabi.as_ref() {
-                    let mut wasabi_clone = wasabi_.clone();
-                    wasabi_clone.secret_key = "REDACTED".to_string();
-                    wasabi = Some(wasabi_clone);
-                }
-            }
-            TierType::RustFS => {
-                if let Some(r_) = self.rustfs.as_ref() {
-                    let mut r_clone = r_.clone();
-                    r_clone.secret_key = "REDACTED".to_string();
-                    r = Some(r_clone);
-                }
-            }
-            TierType::MinIO => {
-                if let Some(compatible_backend_) = self.minio.as_ref() {
-                    let mut compatible_backend_clone = compatible_backend_.clone();
-                    compatible_backend_clone.secret_key = "REDACTED".to_string();
-                    compatible_backend = Some(compatible_backend_clone);
-                }
-            }
-            TierType::Aliyun => {
-                if let Some(aliyun_) = self.aliyun.as_ref() {
-                    let mut aliyun_clone = aliyun_.clone();
-                    aliyun_clone.secret_key = "REDACTED".to_string();
-                    aliyun = Some(aliyun_clone);
-                }
-            }
-            TierType::Tencent => {
-                if let Some(tencent_) = self.tencent.as_ref() {
-                    let mut tencent_clone = tencent_.clone();
-                    tencent_clone.secret_key = "REDACTED".to_string();
-                    tencent = Some(tencent_clone);
-                }
-            }
-            TierType::Huaweicloud => {
-                if let Some(huaweicloud_) = self.huaweicloud.as_ref() {
-                    let mut huaweicloud_clone = huaweicloud_.clone();
-                    huaweicloud_clone.secret_key = "REDACTED".to_string();
-                    huaweicloud = Some(huaweicloud_clone);
-                }
-            }
-            TierType::Azure => {
-                if let Some(azure_) = self.azure.as_ref() {
-                    let mut azure_clone = azure_.clone();
-                    azure_clone.secret_key = "REDACTED".to_string();
-                    azure = Some(azure_clone);
-                }
-            }
-            TierType::GCS => {
-                if let Some(gcs_) = self.gcs.as_ref() {
-                    let mut gcs_clone = gcs_.clone();
-                    gcs_clone.creds = "REDACTED".to_string();
-                    gcs = Some(gcs_clone);
-                }
-            }
-            TierType::R2 => {
-                if let Some(r2_) = self.r2.as_ref() {
-                    let mut r2_clone = r2_.clone();
-                    r2_clone.secret_key = "REDACTED".to_string();
-                    r2 = Some(r2_clone);
-                }
-            }
-            _ => (),
-        }
-        TierConfig {
-            version: self.version.clone(),
-            tier_type: self.tier_type.clone(),
-            name: self.name.clone(),
-            s3,
-            wasabi,
-            rustfs: r,
-            minio: compatible_backend,
-            aliyun,
-            tencent,
-            huaweicloud,
-            azure,
-            gcs,
-            r2,
-        }
+    fn clone(&self) -> Self {
+        self.redacted()
     }
 }
 
 impl TierConfig {
+    pub(crate) fn redacted(&self) -> Self {
+        let mut redacted = Self {
+            version: self.version.clone(),
+            tier_type: self.tier_type.clone(),
+            name: self.name.clone(),
+            ..Default::default()
+        };
+        match self.tier_type {
+            TierType::S3 => {
+                redacted.s3 = self.s3.clone().map(|mut backend| {
+                    backend.secret_key = TIER_CREDENTIAL_REDACTED.to_string();
+                    if !backend.aws_role_web_identity_token_file.is_empty() {
+                        backend.aws_role_web_identity_token_file = TIER_CREDENTIAL_REDACTED.to_string();
+                    }
+                    backend
+                });
+            }
+            TierType::Wasabi => {
+                redacted.wasabi = self.wasabi.clone().map(|mut backend| {
+                    backend.secret_key = TIER_CREDENTIAL_REDACTED.to_string();
+                    backend
+                });
+            }
+            TierType::RustFS => {
+                redacted.rustfs = self.rustfs.clone().map(|mut backend| {
+                    backend.secret_key = TIER_CREDENTIAL_REDACTED.to_string();
+                    backend
+                });
+            }
+            TierType::MinIO => {
+                redacted.minio = self.minio.clone().map(|mut backend| {
+                    backend.secret_key = TIER_CREDENTIAL_REDACTED.to_string();
+                    backend
+                });
+            }
+            TierType::Aliyun => {
+                redacted.aliyun = self.aliyun.clone().map(|mut backend| {
+                    backend.secret_key = TIER_CREDENTIAL_REDACTED.to_string();
+                    backend
+                });
+            }
+            TierType::Tencent => {
+                redacted.tencent = self.tencent.clone().map(|mut backend| {
+                    backend.secret_key = TIER_CREDENTIAL_REDACTED.to_string();
+                    backend
+                });
+            }
+            TierType::Huaweicloud => {
+                redacted.huaweicloud = self.huaweicloud.clone().map(|mut backend| {
+                    backend.secret_key = TIER_CREDENTIAL_REDACTED.to_string();
+                    backend
+                });
+            }
+            TierType::Azure => {
+                redacted.azure = self.azure.clone().map(|mut backend| {
+                    backend.secret_key = TIER_CREDENTIAL_REDACTED.to_string();
+                    if !backend.sp_auth.client_secret.is_empty() {
+                        backend.sp_auth.client_secret = TIER_CREDENTIAL_REDACTED.to_string();
+                    }
+                    backend
+                });
+            }
+            TierType::GCS => {
+                redacted.gcs = self.gcs.clone().map(|mut backend| {
+                    backend.creds = TIER_CREDENTIAL_REDACTED.to_string();
+                    backend
+                });
+            }
+            TierType::R2 => {
+                redacted.r2 = self.r2.clone().map(|mut backend| {
+                    backend.secret_key = TIER_CREDENTIAL_REDACTED.to_string();
+                    backend
+                });
+            }
+            TierType::Unsupported => {}
+        }
+        redacted
+    }
+
     pub(crate) fn clone_with_credentials(&self) -> Self {
         Self {
             version: self.version.clone(),
@@ -372,31 +356,61 @@ impl TierConfig {
     }
 }
 
+impl std::fmt::Debug for TierConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = self.redacted();
+        f.debug_struct("TierConfig")
+            .field("version", &redacted.version)
+            .field("tier_type", &redacted.tier_type)
+            .field("name", &redacted.name)
+            .field("s3", &redacted.s3)
+            .field("wasabi", &redacted.wasabi)
+            .field("aliyun", &redacted.aliyun)
+            .field("tencent", &redacted.tencent)
+            .field("huaweicloud", &redacted.huaweicloud)
+            .field("azure", &redacted.azure)
+            .field("gcs", &redacted.gcs)
+            .field("r2", &redacted.r2)
+            .field("rustfs", &redacted.rustfs)
+            .field("minio", &redacted.minio)
+            .finish()
+    }
+}
+
 //type S3Options = impl Fn(TierS3) -> Pin<Box<Result<()>>> + Send + Sync + 'static;
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(default)]
 pub struct TierS3 {
+    #[serde(alias = "Name")]
     pub name: String,
+    #[serde(alias = "Endpoint")]
     pub endpoint: String,
-    #[serde(rename = "accessKey")]
+    #[serde(rename = "accessKey", alias = "AccessKey")]
     pub access_key: String,
-    #[serde(rename = "secretKey")]
+    #[serde(rename = "secretKey", alias = "SecretKey")]
     pub secret_key: String,
+    #[serde(alias = "Bucket")]
     pub bucket: String,
+    #[serde(alias = "Prefix")]
     pub prefix: String,
+    #[serde(alias = "Region")]
     pub region: String,
-    #[serde(rename = "storageClass")]
+    #[serde(rename = "storageClass", alias = "StorageClass")]
     pub storage_class: String,
-    #[serde(skip)]
+    #[serde(rename = "AWSRole", alias = "awsRole", skip_serializing)]
     pub aws_role: bool,
-    #[serde(skip)]
+    #[serde(
+        rename = "AWSRoleWebIdentityTokenFile",
+        alias = "awsRoleWebIdentityTokenFile",
+        skip_serializing
+    )]
     pub aws_role_web_identity_token_file: String,
-    #[serde(skip)]
+    #[serde(rename = "AWSRoleARN", alias = "awsRoleARN", alias = "awsRoleArn", skip_serializing)]
     pub aws_role_arn: String,
-    #[serde(skip)]
+    #[serde(rename = "AWSRoleSessionName", alias = "awsRoleSessionName", skip_serializing)]
     pub aws_role_session_name: String,
-    #[serde(skip)]
+    #[serde(rename = "AWSRoleDurationSeconds", alias = "awsRoleDurationSeconds", skip_serializing)]
     pub aws_role_duration_seconds: i32,
 }
 
@@ -623,8 +637,11 @@ pub struct TierHuaweicloud {
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(default)]
 pub struct ServicePrincipalAuth {
+    #[serde(alias = "TenantID")]
     pub tenant_id: String,
+    #[serde(alias = "ClientID")]
     pub client_id: String,
+    #[serde(alias = "ClientSecret")]
     pub client_secret: String,
 }
 
@@ -640,9 +657,9 @@ pub struct TierAzure {
     pub bucket: String,
     pub prefix: String,
     pub region: String,
-    #[serde(rename = "storageClass")]
+    #[serde(rename = "storageClass", alias = "StorageClass")]
     pub storage_class: String,
-    #[serde(rename = "spAuth")]
+    #[serde(rename = "spAuth", alias = "SPAuth")]
     pub sp_auth: ServicePrincipalAuth,
 }
 
@@ -696,14 +713,19 @@ fn AzureStorageClass(sc string) func(az *TierAzure) error {
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(default)]
 pub struct TierGCS {
+    #[serde(alias = "Name")]
     pub name: String,
+    #[serde(alias = "Endpoint")]
     pub endpoint: String,
-    #[serde(rename = "creds")]
+    #[serde(rename = "creds", alias = "Creds")]
     pub creds: String,
+    #[serde(alias = "Bucket")]
     pub bucket: String,
+    #[serde(alias = "Prefix")]
     pub prefix: String,
+    #[serde(alias = "Region")]
     pub region: String,
-    #[serde(rename = "storageClass")]
+    #[serde(rename = "storageClass", alias = "StorageClass")]
     pub storage_class: String,
 }
 
@@ -724,6 +746,43 @@ pub struct TierR2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_gcs_type_uppercase_aliases_preserve_lowercase_output() {
+        let s3: TierType = serde_json::from_str(r#""S3""#).expect("uppercase S3 wire value should decode");
+        let gcs: TierType = serde_json::from_str(r#""GCS""#).expect("uppercase GCS wire value should decode");
+        assert!(matches!(s3, TierType::S3));
+        assert!(matches!(gcs, TierType::GCS));
+        assert_eq!(serde_json::to_string(&s3).expect("S3 type should encode"), r#""s3""#);
+        assert_eq!(serde_json::to_string(&gcs).expect("GCS type should encode"), r#""gcs""#);
+    }
+
+    #[test]
+    fn azure_service_principal_accepts_canonical_madmin_field_names() {
+        for field in ["TenantID", "ClientID", "ClientSecret"] {
+            let mut sp_auth = serde_json::Map::new();
+            sp_auth.insert(field.to_string(), serde_json::Value::String("present".to_string()));
+            let config: TierConfig = serde_json::from_value(serde_json::json!({
+                "type": "azure",
+                "Name": "COLD-AZURE",
+                "azure": {
+                    "name": "COLD-AZURE",
+                    "endpoint": "https://azure.example.invalid",
+                    "accessKey": "account",
+                    "secretKey": "key",
+                    "bucket": "archive",
+                    "SPAuth": sp_auth
+                }
+            }))
+            .expect("mixed RustFS/madmin Azure payload should decode");
+            let sp_auth = &config.azure.expect("Azure payload should exist").sp_auth;
+
+            assert!(
+                !sp_auth.tenant_id.is_empty() || !sp_auth.client_id.is_empty() || !sp_auth.client_secret.is_empty(),
+                "canonical {field} must not be silently discarded"
+            );
+        }
+    }
 
     fn wasabi_config() -> TierWasabi {
         TierWasabi {
@@ -838,9 +897,14 @@ mod tests {
         let config = TierConfig {
             tier_type: TierType::Wasabi,
             wasabi: Some(wasabi_config()),
+            rustfs: Some(TierRustFS {
+                access_key: "inactive-access".to_string(),
+                secret_key: "inactive-secret".to_string(),
+                ..Default::default()
+            }),
             ..Default::default()
         };
-        let redacted = config.clone();
+        let redacted = config.redacted();
         assert_eq!(
             redacted
                 .wasabi
@@ -849,14 +913,25 @@ mod tests {
                 .secret_key,
             "REDACTED"
         );
+        assert!(redacted.rustfs.is_none(), "the external view should retain only the active provider");
+        let cloned = config.clone();
+        assert_eq!(cloned.wasabi.expect("redacted Wasabi clone should remain").secret_key, "REDACTED");
+        assert!(cloned.rustfs.is_none(), "ordinary Clone must retain its redacted API semantics");
+        let preserved = config.clone_with_credentials();
         assert_eq!(
-            config
-                .clone_with_credentials()
+            preserved
                 .wasabi
                 .as_ref()
-                .expect("credential-bearing Wasabi payload should remain")
+                .expect("credential-bearing Wasabi snapshot should remain")
                 .secret_key,
             "secret"
+        );
+        assert_eq!(
+            preserved
+                .rustfs
+                .expect("credential-bearing snapshots should preserve inactive provider data")
+                .secret_key,
+            "inactive-secret"
         );
 
         let mut debug_config = wasabi_config();
@@ -864,6 +939,20 @@ mod tests {
         let debug = format!("{debug_config:?}");
         assert!(debug.contains("REDACTED"));
         assert!(!debug.contains("wasabi-debug-secret-value"));
+
+        let debug = format!(
+            "{:?}",
+            TierConfig {
+                tier_type: TierType::RustFS,
+                rustfs: Some(TierRustFS {
+                    secret_key: "rustfs-debug-secret-value".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        );
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains("rustfs-debug-secret-value"));
     }
 
     #[test]
@@ -894,7 +983,7 @@ mod tests {
         assert_eq!(encoded, expected);
         let decoded: TierConfig = serde_json::from_value(encoded).expect("Wasabi Admin JSON should decode");
         assert!(matches!(decoded.tier_type, TierType::Wasabi));
-        let redacted = config.clone();
+        let redacted = config.redacted();
         assert_eq!(
             config
                 .wasabi
@@ -915,5 +1004,88 @@ mod tests {
             serde_json::to_value(redacted).expect("redacted Wasabi JSON should encode")["wasabi"]["secretKey"],
             "REDACTED"
         );
+    }
+
+    #[test]
+    fn api_serialization_and_debug_redact_s3_gcs_and_azure_credentials() {
+        let cases = [
+            (
+                "s3",
+                TierConfig {
+                    tier_type: TierType::S3,
+                    s3: Some(TierS3 {
+                        secret_key: "s3-secret-bytes".to_string(),
+                        aws_role_web_identity_token_file: "/var/run/s3-private-token".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                vec!["s3-secret-bytes", "/var/run/s3-private-token"],
+            ),
+            (
+                "gcs",
+                TierConfig {
+                    tier_type: TierType::GCS,
+                    gcs: Some(TierGCS {
+                        creds: r#"{"type":"service_account","private_key":"gcs-private-key-bytes"}"#.to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                vec!["gcs-private-key-bytes"],
+            ),
+            (
+                "azure",
+                TierConfig {
+                    tier_type: TierType::Azure,
+                    azure: Some(TierAzure {
+                        secret_key: "azure-account-secret-bytes".to_string(),
+                        sp_auth: ServicePrincipalAuth {
+                            client_secret: "azure-client-secret-bytes".to_string(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                vec!["azure-account-secret-bytes", "azure-client-secret-bytes"],
+            ),
+        ];
+
+        for (provider, config, secrets) in cases {
+            let api = serde_json::to_string(&config.redacted()).expect("redacted API config should serialize");
+            let debug = format!("{config:?}");
+            assert!(api.contains(TIER_CREDENTIAL_REDACTED), "{provider} API output should be visibly redacted");
+            assert!(
+                debug.contains(TIER_CREDENTIAL_REDACTED),
+                "{provider} Debug output should be visibly redacted"
+            );
+            for secret in secrets {
+                assert!(!api.contains(secret), "{provider} API output exposed credential bytes");
+                assert!(!debug.contains(secret), "{provider} Debug output exposed credential bytes");
+            }
+        }
+    }
+
+    #[test]
+    fn azure_static_account_redaction_preserves_an_empty_service_principal_secret() {
+        let config = TierConfig {
+            tier_type: TierType::Azure,
+            azure: Some(TierAzure {
+                secret_key: "azure-account-secret-bytes".to_string(),
+                sp_auth: ServicePrincipalAuth::default(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let api = serde_json::to_value(config.redacted()).expect("redacted Azure API config should serialize");
+        let debug = format!("{config:?}");
+
+        assert_eq!(api["azure"]["secretKey"], TIER_CREDENTIAL_REDACTED);
+        assert_eq!(api["azure"]["spAuth"]["client_secret"], "");
+        assert!(debug.contains("client_secret: \"\""));
+        assert!(!debug.contains("client_secret: \"REDACTED\""));
+        assert!(!debug.contains("azure-account-secret-bytes"));
     }
 }

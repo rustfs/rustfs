@@ -10339,9 +10339,17 @@ mod tests {
     }
 
     #[cfg(feature = "test-util")]
-    #[tokio::test]
+    #[test]
     #[serial_test::serial(storage_class_env)]
-    async fn v6_decommission_checkpoint_no_lock_put_rejects_lost_publication_fence() {
+    fn v6_decommission_checkpoint_no_lock_put_rejects_lost_publication_fence() {
+        run_large_stack_async_test(
+            "v6-checkpoint-fence-loss",
+            v6_decommission_checkpoint_no_lock_put_rejects_lost_publication_fence_case,
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn v6_decommission_checkpoint_no_lock_put_rejects_lost_publication_fence_case() {
         let temp_dir = tempfile::tempdir().expect("create v6 checkpoint fence-loss store dir");
         let (_ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "v6-checkpoint-fence-loss", &[4, 4])).await;

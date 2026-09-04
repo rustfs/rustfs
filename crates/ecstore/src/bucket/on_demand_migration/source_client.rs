@@ -14,9 +14,9 @@
 
 //! Outbound client for an on-demand migration source bucket.
 //!
-//! `SourceClient` wraps an `aws_sdk_s3::Client` built through the shared
-//! remote builder and exposes the read-only surface the migration path
-//! needs (HEAD, ranged streaming GET, ListObjectsV2, GetObjectTagging, a
+//! `SourceClient` maps local keys onto a read-only `SourceBackend`. The
+//! S3 backend uses the shared remote builder and exposes the surface the
+//! migration path needs (HEAD, ranged streaming GET, ListObjectsV2, GetObjectTagging, a
 //! probe for admin validation). Every request carries the
 //! `source-proxy-request` anti-loop marker in both the `x-rustfs-` and
 //! `x-minio-` prefixes so a RustFS/MinIO source answers locally instead of
@@ -511,7 +511,7 @@ pub struct SourceObject {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SourcePage {
     pub objects: Vec<SourceObject>,
-    /// Rolled-up prefixes, in the local namespace; always empty when the
+    /// Rolled-up prefixes, in the same namespace as `objects`; always empty when the
     /// request carried no delimiter.
     pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
@@ -519,7 +519,8 @@ pub struct SourcePage {
 }
 
 /// One `ListObjectsV2` page request against the source. Keys are given in the
-/// local namespace; `SourceClient` maps them through `source_prefix`.
+/// local namespace at `SourceClient`, and in the source namespace at
+/// `SourceBackend`; `SourceClient` maps them through `source_prefix`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SourceListRequest<'a> {
     pub prefix: Option<&'a str>,
@@ -575,8 +576,30 @@ impl Intercept for SourceProxyMarkerInterceptor {
     }
 }
 
-pub struct SourceClient {
+/// Read-only provider operations in the source bucket namespace.
+///
+/// Implementations must preserve streaming, honor the requested range and
+/// pagination cursor, and classify failures without including credentials.
+/// `SourceClient` owns prefix mapping so every provider shares the same local
+/// namespace. Continuation tokens are opaque and must never be prefix-mapped.
+#[async_trait::async_trait]
+pub trait SourceBackend: Send + Sync {
+    async fn head(&self, key: &str) -> Result<SourceHead, SourceError>;
+    async fn get(&self, key: &str, range: Option<&HTTPRangeSpec>) -> Result<SourceGet, SourceError>;
+    async fn list(&self, request: &SourceListRequest<'_>) -> Result<SourcePage, SourceError>;
+    async fn tagging(&self, key: &str) -> Result<HashMap<String, String>, SourceError>;
+    /// Verify bucket access; `SourceClient` separately probes a filtered listing.
+    async fn probe(&self) -> Result<(), SourceError>;
+}
+
+/// S3-compatible implementation, including request signing and anti-loop headers.
+pub struct S3SourceBackend {
     client: S3Client,
+    bucket: String,
+}
+
+pub struct SourceClient {
+    backend: Box<dyn SourceBackend>,
     endpoint: String,
     bucket: String,
     source_prefix: Option<String>,
@@ -609,7 +632,10 @@ impl SourceClient {
     fn from_config_builder(config: aws_sdk_s3::config::Builder, endpoint: String, spec: &SourceClientSpec) -> Self {
         let client = S3Client::from_conf(config.interceptor(SourceProxyMarkerInterceptor::new()).build());
         Self {
-            client,
+            backend: Box::new(S3SourceBackend {
+                client,
+                bucket: spec.bucket.clone(),
+            }),
             endpoint,
             bucket: spec.bucket.clone(),
             source_prefix: spec.source_prefix.clone().filter(|prefix| !prefix.is_empty()),
@@ -652,35 +678,15 @@ impl SourceClient {
     }
 
     pub async fn head_object(&self, key: &str) -> Result<SourceHead, SourceError> {
-        let output = self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(self.source_key(key))
-            .send()
-            .await
-            .map_err(classify_sdk_error)?;
-        source_head_from_head_output(output)
+        self.backend.head(&self.source_key(key)).await
     }
 
-    /// Streams the object; `range` is passed through as an HTTP `Range`
-    /// header and omitted entirely when `None`.
+    /// Streams the object, preserving an optional HTTP byte range.
     pub async fn get_object(&self, key: &str, range: Option<&HTTPRangeSpec>) -> Result<SourceGet, SourceError> {
-        let range = range.map(range_header_value).transpose()?;
-        let output = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(self.source_key(key))
-            .set_range(range)
-            .send()
-            .await
-            .map_err(classify_sdk_error)?;
-        source_get_from_output(output)
+        self.backend.get(&self.source_key(key), range).await
     }
 
-    /// Lists one page under the local `prefix`. Keys are returned in the
-    /// local namespace; entries outside `source_prefix` are skipped.
+    /// Lists one page under the local prefix.
     pub async fn list_objects_v2(
         &self,
         prefix: Option<&str>,
@@ -696,9 +702,81 @@ impl SourceClient {
         .await
     }
 
-    /// [`Self::list_objects_v2`] with the delimiter and start-after the
-    /// list-through merge needs (rustfs/backlog#2164).
+    /// Maps keys and common prefixes while leaving opaque cursors untouched.
     pub async fn list_page(&self, request: &SourceListRequest<'_>) -> Result<SourcePage, SourceError> {
+        let prefix = self.source_key(request.prefix.unwrap_or_default());
+        let start_after = request.start_after.map(|key| self.source_key(key));
+        let mut page = self
+            .backend
+            .list(&SourceListRequest {
+                prefix: Some(&prefix),
+                start_after: start_after.as_deref(),
+                ..*request
+            })
+            .await?;
+        page.objects = page
+            .objects
+            .into_iter()
+            .filter_map(|object| self.local_object(object))
+            .collect();
+        page.common_prefixes = page
+            .common_prefixes
+            .into_iter()
+            .filter_map(|prefix| self.local_key(&prefix).map(str::to_string))
+            .collect();
+        Ok(page)
+    }
+
+    fn local_object(&self, mut object: SourceObject) -> Option<SourceObject> {
+        object.key = self.local_key(&object.key)?.to_string();
+        Some(object)
+    }
+
+    pub async fn get_object_tagging(&self, key: &str) -> Result<HashMap<String, String>, SourceError> {
+        self.backend.tagging(&self.source_key(key)).await
+    }
+
+    pub async fn probe(&self) -> Result<SourceProbe, SourceError> {
+        self.backend.probe().await?;
+        let page = self.list_objects_v2(None, None, 1).await?;
+        Ok(SourceProbe {
+            sample_object: page.objects.into_iter().next(),
+            has_more_objects: page.is_truncated,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl SourceBackend for S3SourceBackend {
+    async fn head(&self, key: &str) -> Result<SourceHead, SourceError> {
+        let output = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(classify_sdk_error)?;
+        source_head_from_head_output(output)
+    }
+
+    /// Streams the object; `range` is passed through as an HTTP `Range`
+    /// header and omitted entirely when `None`.
+    async fn get(&self, key: &str, range: Option<&HTTPRangeSpec>) -> Result<SourceGet, SourceError> {
+        let range = range.map(range_header_value).transpose()?;
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .set_range(range)
+            .send()
+            .await
+            .map_err(classify_sdk_error)?;
+        source_get_from_output(output)
+    }
+
+    async fn list(&self, request: &SourceListRequest<'_>) -> Result<SourcePage, SourceError> {
         // `start_after` is silently ignored by S3 once a continuation token is
         // present; refuse the ambiguous pair rather than list from the wrong
         // position.
@@ -711,9 +789,9 @@ impl SourceClient {
             .client
             .list_objects_v2()
             .bucket(&self.bucket)
-            .prefix(self.source_key(request.prefix.unwrap_or_default()))
+            .prefix(request.prefix.unwrap_or_default())
             .set_delimiter(request.delimiter.map(str::to_string))
-            .set_start_after(request.start_after.map(|after| self.source_key(after)))
+            .set_start_after(request.start_after.map(str::to_string))
             .set_continuation_token(request.continuation_token.map(str::to_string))
             .max_keys(request.max_keys)
             .send()
@@ -731,13 +809,13 @@ impl SourceClient {
             .contents
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|object| self.source_object(object))
+            .filter_map(s3_source_object)
             .collect();
         let common_prefixes = output
             .common_prefixes
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|prefix| Some(self.local_key(prefix.prefix.as_deref()?)?.to_string()))
+            .filter_map(|prefix| prefix.prefix)
             .collect();
 
         Ok(SourcePage {
@@ -748,46 +826,41 @@ impl SourceClient {
         })
     }
 
-    fn source_object(&self, object: SdkObject) -> Option<SourceObject> {
-        let key = self.local_key(object.key.as_deref()?)?.to_string();
-        let etag = normalize_etag(object.e_tag);
-        let is_multipart_etag = etag.as_deref().is_some_and(is_multipart_etag);
-        Some(SourceObject {
-            key,
-            etag,
-            size: object.size.and_then(|size| u64::try_from(size).ok()).unwrap_or(0),
-            last_modified: system_time(object.last_modified),
-            storage_class: object.storage_class.map(|class| class.as_str().to_string()),
-            is_multipart_etag,
-        })
-    }
-
-    pub async fn get_object_tagging(&self, key: &str) -> Result<HashMap<String, String>, SourceError> {
+    async fn tagging(&self, key: &str) -> Result<HashMap<String, String>, SourceError> {
         let output = self
             .client
             .get_object_tagging()
             .bucket(&self.bucket)
-            .key(self.source_key(key))
+            .key(key)
             .send()
             .await
             .map_err(classify_sdk_error)?;
         Ok(output.tag_set.into_iter().map(|tag| (tag.key, tag.value)).collect())
     }
 
-    /// Admin validation: HeadBucket plus a one-key listing under the prefix.
-    pub async fn probe(&self) -> Result<SourceProbe, SourceError> {
+    async fn probe(&self) -> Result<(), SourceError> {
         self.client
             .head_bucket()
             .bucket(&self.bucket)
             .send()
             .await
             .map_err(classify_sdk_error)?;
-        let page = self.list_objects_v2(None, None, 1).await?;
-        Ok(SourceProbe {
-            sample_object: page.objects.into_iter().next(),
-            has_more_objects: page.is_truncated,
-        })
+        Ok(())
     }
+}
+
+fn s3_source_object(object: SdkObject) -> Option<SourceObject> {
+    let key = object.key?;
+    let etag = normalize_etag(object.e_tag);
+    let is_multipart_etag = etag.as_deref().is_some_and(is_multipart_etag);
+    Some(SourceObject {
+        key,
+        etag,
+        size: object.size.and_then(|size| u64::try_from(size).ok()).unwrap_or(0),
+        last_modified: system_time(object.last_modified),
+        storage_class: object.storage_class.map(|class| class.as_str().to_string()),
+        is_multipart_etag,
+    })
 }
 
 #[cfg(test)]
@@ -1195,6 +1268,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_page_maps_delimiter_prefixes_and_start_after_but_not_cursors() {
+        let body = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<IsTruncated>true</IsTruncated><NextContinuationToken>data/opaque</NextContinuationToken>
+<CommonPrefixes><Prefix>data/photos/</Prefix></CommonPrefixes>
+<CommonPrefixes><Prefix>outside/</Prefix></CommonPrefixes>
+</ListBucketResult>"#;
+        let (client, requests) = scripted_client(&spec(Some("data/")), vec![ok(Vec::new(), body), ok(Vec::new(), body)]).await;
+        let first = client
+            .list_page(&SourceListRequest {
+                prefix: Some("photos/"),
+                delimiter: Some("/"),
+                start_after: Some("photos/a"),
+                max_keys: 2,
+                ..Default::default()
+            })
+            .await
+            .expect("delimiter listing should succeed");
+        assert_eq!(first.common_prefixes, vec!["photos/"]);
+        assert_eq!(first.next_continuation_token.as_deref(), Some("data/opaque"));
+        let second = client
+            .list_page(&SourceListRequest {
+                continuation_token: first.next_continuation_token.as_deref(),
+                max_keys: 2,
+                ..Default::default()
+            })
+            .await
+            .expect("opaque continuation should succeed");
+        assert_eq!(second.common_prefixes, first.common_prefixes);
+        let requests = recorded(&requests);
+        let query = |request: &RecordedRequest| {
+            Url::parse(&request.uri)
+                .expect("request URI")
+                .query_pairs()
+                .into_owned()
+                .collect::<HashMap<_, _>>()
+        };
+        let first_query = query(&requests[0]);
+        assert_eq!(first_query.get("prefix").map(String::as_str), Some("data/photos/"));
+        assert_eq!(first_query.get("start-after").map(String::as_str), Some("data/photos/a"));
+        assert_eq!(first_query.get("delimiter").map(String::as_str), Some("/"));
+        let second_query = query(&requests[1]);
+        assert_eq!(second_query.get("continuation-token").map(String::as_str), Some("data/opaque"));
+        assert!(!second_query.contains_key("start-after"));
+    }
+
+    #[tokio::test]
+    async fn list_page_rejects_ambiguous_cursor_before_sending() {
+        let (client, requests) = scripted_client(&spec(Some("data/")), vec![]).await;
+        let err = client
+            .list_page(&SourceListRequest {
+                start_after: Some("a"),
+                continuation_token: Some("opaque"),
+                max_keys: 1,
+                ..Default::default()
+            })
+            .await
+            .expect_err("ambiguous list position must fail");
+        assert!(matches!(err, SourceError::Other(_)));
+        assert!(recorded(&requests).is_empty(), "invalid request must never reach the source");
+    }
+
+    #[tokio::test]
     async fn list_objects_v2_rejects_truncated_page_without_token() {
         let (client, _) = scripted_client(&spec(None), vec![ok(Vec::new(), LIST_TRUNCATED_WITHOUT_TOKEN)]).await;
         let err = client
@@ -1357,11 +1492,14 @@ mod tests {
 
     fn prefix_client(prefix: Option<String>) -> SourceClient {
         SourceClient {
-            client: S3Client::from_conf(
-                aws_sdk_s3::Config::builder()
-                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-                    .build(),
-            ),
+            backend: Box::new(S3SourceBackend {
+                client: S3Client::from_conf(
+                    aws_sdk_s3::Config::builder()
+                        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                        .build(),
+                ),
+                bucket: "bucket".to_string(),
+            }),
             endpoint: "https://source.example.com".to_string(),
             bucket: "bucket".to_string(),
             source_prefix: prefix.filter(|prefix| !prefix.is_empty()),
