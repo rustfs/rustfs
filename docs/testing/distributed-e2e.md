@@ -15,7 +15,7 @@ The in-tree harness runs every node on `127.0.0.1` with a distinct port. That ma
 
 A pool striped across several localhost ports is not expressible (`RUSTFS_VOLUMES` host ellipses would collide on disk paths). Multi-host striped pools remain the hardware functional-chain / backlog #1313 / #1314 lane.
 
-Decommission and rebalance POST currently 500 on localhost DistErasure multi-pool when pool.bin writes are fenced (`pool metadata writes remain blocked` / missing fleet capability proof). Those cases still assert object bytes and SHA-256; when the API starts they wait for completion and assert post-move integrity. They do not treat the fence as a successful move.
+Decommission and rebalance POST currently 500 on localhost DistErasure multi-pool when pool.bin writes are fenced (`pool metadata writes remain blocked` / missing fleet capability proof). Those cases still assert object bytes and SHA-256; when the API starts they wait for completion and assert post-move integrity. They do not treat the fence as a successful move. This lane does not change production pool-meta bootstrap or write-fence logic; it only observes the current server behavior.
 
 ## What this lane covers
 
