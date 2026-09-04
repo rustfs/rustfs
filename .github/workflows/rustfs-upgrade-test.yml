@@ -265,13 +265,13 @@ jobs:
           # result. The dashboard renders this table directly.
           with open(matrix_file, 'w', encoding='utf-8') as out:
               out.write('## Upgrade Matrix\n\n')
-              out.write('| Topology | KMS Backend | 升级前版本 | 升级后版本 | 升级结果 |\n')
+              out.write('| Topology | KMS Backend | From Version | To Version | Result |\n')
               out.write('| --- | --- | --- | --- | --- |\n')
               for topo, backend, old_v, new_v, npass, nfail in topo_rows:
                   result = 'PASS' if nfail == '0' else 'FAIL'
                   out.write(f'| {topo} | {backend} | {old_v} | {new_v} | {result} (PASS={npass} FAIL={nfail}) |\n')
               if not topo_rows:
-                  out.write('| - | - | - | - | 未执行（套件在升级前失败） |\n')
+                  out.write('| - | - | - | - | NOT RUN (suite failed before upgrade) |\n')
           PY
           {
             echo "# RustFS upgrade compatibility report"
