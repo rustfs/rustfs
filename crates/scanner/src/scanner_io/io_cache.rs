@@ -14,6 +14,93 @@
 /// ScannerIOCache implementation for SetDisks: bucket ordering, worker fan-out, merge, and publish.
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) struct ScannerSetCacheGeneration {
+    pub(super) want_cycle: u64,
+    pub(super) leader_epoch: u64,
+    pub(super) tier_registry_generation: u64,
+    pub(super) source: DataUsageCacheSource,
+    pub(super) scan_plan_digest: DataUsageScanPlanDigest,
+}
+
+pub(super) struct PreparedScopedSetScan {
+    pub(super) buckets: Vec<BucketInfo>,
+    pub(super) cache: DataUsageCache,
+}
+
+pub(super) fn prepare_scoped_set_scan(
+    old_cache: &DataUsageCache,
+    set_buckets: &[BucketInfo],
+    all_buckets: &[BucketInfo],
+    scope: &ScannerBucketScanScope,
+    generation: ScannerSetCacheGeneration,
+) -> Option<PreparedScopedSetScan> {
+    let (Some(selected_buckets), Some(baseline_scan_plan_digest)) = (&scope.selected_buckets, scope.baseline_scan_plan_digest)
+    else {
+        return None;
+    };
+    if selected_buckets.is_empty()
+        || !old_cache.info.snapshot_complete
+        || old_cache.info.last_update.is_none()
+        || old_cache.info.name != DATA_USAGE_ROOT
+        || old_cache.info.next_cycle > generation.want_cycle
+        || old_cache.info.leader_epoch != generation.leader_epoch
+        || old_cache.info.tier_registry_generation != Some(generation.tier_registry_generation)
+        || old_cache.info.source != Some(generation.source)
+        || old_cache.info.scan_plan_digest != Some(baseline_scan_plan_digest)
+        || old_cache.info.cache_key_format != DATA_USAGE_CACHE_KEY_FORMAT
+        || old_cache.checked_flatten_complete_scope(DATA_USAGE_ROOT).is_none()
+    {
+        return None;
+    }
+
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: DATA_USAGE_ROOT.to_string(),
+            next_cycle: generation.want_cycle,
+            leader_epoch: generation.leader_epoch,
+            tier_registry_generation: Some(generation.tier_registry_generation),
+            source: Some(generation.source),
+            snapshot_complete: false,
+            scan_plan_digest: Some(generation.scan_plan_digest),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            lkg_snapshot_complete: true,
+            lkg_next_cycle: Some(old_cache.info.next_cycle),
+            lkg_last_update: old_cache.info.last_update,
+            lkg_leader_epoch: Some(old_cache.info.leader_epoch),
+            lkg_scan_plan_digest: old_cache.info.scan_plan_digest,
+            ..Default::default()
+        },
+        cache: HashMap::new(),
+    };
+    cache.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
+    let root_hash = crate::hash_path(DATA_USAGE_ROOT);
+    let mut current_bucket_names = HashSet::with_capacity(all_buckets.len());
+    for bucket in all_buckets {
+        if !current_bucket_names.insert(bucket.name.as_str()) {
+            return None;
+        }
+        if selected_buckets.contains(&bucket.name) {
+            cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
+            continue;
+        }
+
+        let bucket_hash = crate::hash_path(&bucket.name);
+        old_cache.find(&bucket.name)?;
+        cache.copy_with_children(old_cache, &bucket_hash, &Some(root_hash.clone()));
+        cache.find(&bucket.name)?;
+    }
+
+    Some(PreparedScopedSetScan {
+        buckets: set_buckets
+            .iter()
+            .filter(|bucket| selected_buckets.contains(&bucket.name))
+            .cloned()
+            .collect(),
+        cache,
+    })
+}
+
 #[async_trait::async_trait]
 impl ScannerIOCache for SetDisks {
     #[tracing::instrument(skip(self, budget, scan_plan, updates))]
@@ -27,8 +114,9 @@ impl ScannerIOCache for SetDisks {
         scan_mode: HealScanMode,
     ) -> Result<()> {
         let ScannerBucketScanPlan {
-            buckets,
+            mut buckets,
             all_buckets,
+            scope,
             digest: scan_plan_digest,
             leader_epoch,
             tier_registry_generation,
@@ -63,26 +151,57 @@ impl ScannerIOCache for SetDisks {
                 "Scanner old data usage cache load failed; rebuilding from bucket caches"
             );
         }
+        let scoped_scan = prepare_scoped_set_scan(
+            &old_cache,
+            &buckets,
+            &all_buckets,
+            &scope,
+            ScannerSetCacheGeneration {
+                want_cycle,
+                leader_epoch,
+                tier_registry_generation,
+                source,
+                scan_plan_digest,
+            },
+        );
+        let mut scoped_cache = scoped_scan.map(|prepared| {
+            buckets = prepared.buckets;
+            prepared.cache
+        });
         if buckets.is_empty() {
             let now = SystemTime::now();
-            let mut cache = DataUsageCache {
-                info: DataUsageCacheInfo {
-                    name: DATA_USAGE_ROOT.to_string(),
-                    next_cycle: want_cycle,
-                    last_update: Some(now),
-                    leader_epoch,
-                    tier_registry_generation: Some(tier_registry_generation),
-                    source: Some(source),
-                    snapshot_complete: true,
-                    scan_plan_digest: Some(scan_plan_digest),
-                    cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
-                    ..Default::default()
-                },
-                cache: HashMap::new(),
+            let mut cache = match scoped_cache.take() {
+                Some(cache) => cache,
+                None => {
+                    let mut cache = DataUsageCache {
+                        info: DataUsageCacheInfo {
+                            name: DATA_USAGE_ROOT.to_string(),
+                            next_cycle: want_cycle,
+                            leader_epoch,
+                            tier_registry_generation: Some(tier_registry_generation),
+                            source: Some(source),
+                            scan_plan_digest: Some(scan_plan_digest),
+                            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+                            ..Default::default()
+                        },
+                        cache: HashMap::new(),
+                    };
+                    cache.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
+                    for bucket in all_buckets.iter() {
+                        cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
+                    }
+                    cache
+                }
             };
-            cache.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
-            for bucket in all_buckets.iter() {
-                cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
+            cache.info.last_update = Some(now);
+            cache.info.snapshot_complete = true;
+            cache.info.lkg_snapshot_complete = false;
+            cache.info.lkg_next_cycle = None;
+            cache.info.lkg_last_update = None;
+            cache.info.lkg_leader_epoch = None;
+            cache.info.lkg_scan_plan_digest = None;
+            if cache.find(DATA_USAGE_ROOT).is_none() {
+                cache.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
             }
             reset_disk_bucket_scan_gauges(&pool_label, &set_label);
             return persist_and_publish_cache_snapshot(
@@ -269,92 +388,102 @@ impl ScannerIOCache for SetDisks {
         record_disk_bucket_scans_active(0, &pool_label, &set_label);
         let _reset_disk_bucket_scan_gauges = DiskBucketScanGaugeReset::new(pool_label.clone(), set_label.clone());
 
-        // Fence a stale set aggregate before copying entries into per-bucket work caches.
-        if old_cache.info.next_cycle <= want_cycle
-            && old_cache.info.leader_epoch <= leader_epoch
-            && old_cache.info.tier_registry_generation != Some(tier_registry_generation)
-        {
-            old_cache.info.scan_plan_digest = None;
-        }
-        let old_lkg = old_cache.info.snapshot_complete.then_some({
-            (
-                old_cache.info.next_cycle,
-                old_cache.info.last_update,
-                old_cache.info.leader_epoch,
-                old_cache.info.scan_plan_digest,
-            )
-        });
-        let prepare_outcome = match old_cache.prepare_for_scan(
-            DATA_USAGE_ROOT,
-            want_cycle,
-            leader_epoch,
-            source,
-            scan_plan_digest,
-            require_cache_source,
-        ) {
-            DataUsageCachePrepareOutcome::RejectedNewerCycle => {
-                cache_cycle_floor.fetch_max(old_cache.info.next_cycle, Ordering::AcqRel);
-                warn!(
-                    target: "rustfs::scanner::io",
-                    event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_IO,
-                    pool = self.pool_index,
-                    set = self.set_index,
-                    cache_name = DATA_USAGE_CACHE_NAME,
-                    requested_cycle = want_cycle,
-                    cached_cycle = old_cache.info.next_cycle,
-                    state = "stale_cycle_rejected",
-                    "Scanner rejected a set cache cycle regression"
-                );
-                return Ok(());
+        let mut cache = if let Some(cache) = scoped_cache.take() {
+            cache
+        } else {
+            // Fence a stale set aggregate before copying entries into per-bucket work caches.
+            if old_cache.info.next_cycle <= want_cycle
+                && old_cache.info.leader_epoch <= leader_epoch
+                && old_cache.info.tier_registry_generation != Some(tier_registry_generation)
+            {
+                old_cache.info.scan_plan_digest = None;
             }
-            DataUsageCachePrepareOutcome::RejectedNewerLeader => {
-                warn!(
-                    target: "rustfs::scanner::io",
-                    event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_IO,
-                    pool = self.pool_index,
-                    set = self.set_index,
-                    cache_name = DATA_USAGE_CACHE_NAME,
-                    requested_epoch = leader_epoch,
-                    cached_epoch = old_cache.info.leader_epoch,
-                    state = "stale_leader_rejected",
-                    "Scanner rejected work from an older leader epoch"
-                );
-                return Ok(());
-            }
-            outcome => outcome,
-        };
-        if matches!(prepare_outcome, DataUsageCachePrepareOutcome::Reused)
-            && let Some((cycle, last_update, epoch, digest)) = old_lkg
-        {
-            old_cache.info.lkg_snapshot_complete = true;
-            old_cache.info.lkg_next_cycle = Some(cycle);
-            old_cache.info.lkg_last_update = last_update;
-            old_cache.info.lkg_leader_epoch = Some(epoch);
-            old_cache.info.lkg_scan_plan_digest = digest;
-        }
-
-        let mut cache = DataUsageCache {
-            info: DataUsageCacheInfo {
-                name: DATA_USAGE_ROOT.to_string(),
-                next_cycle: want_cycle,
+            let old_lkg = old_cache.info.snapshot_complete.then_some({
+                (
+                    old_cache.info.next_cycle,
+                    old_cache.info.last_update,
+                    old_cache.info.leader_epoch,
+                    old_cache.info.scan_plan_digest,
+                )
+            });
+            let prepare_outcome = match old_cache.prepare_for_scan(
+                DATA_USAGE_ROOT,
+                want_cycle,
                 leader_epoch,
-                tier_registry_generation: Some(tier_registry_generation),
-                source: Some(source),
-                snapshot_complete: false,
-                scan_plan_digest: Some(scan_plan_digest),
-                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
-                ..Default::default()
-            },
-            cache: HashMap::new(),
+                source,
+                scan_plan_digest,
+                require_cache_source,
+            ) {
+                DataUsageCachePrepareOutcome::RejectedNewerCycle => {
+                    cache_cycle_floor.fetch_max(old_cache.info.next_cycle, Ordering::AcqRel);
+                    warn!(
+                        target: "rustfs::scanner::io",
+                        event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_IO,
+                        pool = self.pool_index,
+                        set = self.set_index,
+                        cache_name = DATA_USAGE_CACHE_NAME,
+                        requested_cycle = want_cycle,
+                        cached_cycle = old_cache.info.next_cycle,
+                        state = "stale_cycle_rejected",
+                        "Scanner rejected a set cache cycle regression"
+                    );
+                    return Ok(());
+                }
+                DataUsageCachePrepareOutcome::RejectedNewerLeader => {
+                    warn!(
+                        target: "rustfs::scanner::io",
+                        event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_IO,
+                        pool = self.pool_index,
+                        set = self.set_index,
+                        cache_name = DATA_USAGE_CACHE_NAME,
+                        requested_epoch = leader_epoch,
+                        cached_epoch = old_cache.info.leader_epoch,
+                        state = "stale_leader_rejected",
+                        "Scanner rejected work from an older leader epoch"
+                    );
+                    return Ok(());
+                }
+                outcome => outcome,
+            };
+            if matches!(prepare_outcome, DataUsageCachePrepareOutcome::Reused)
+                && let Some((cycle, last_update, epoch, digest)) = old_lkg
+            {
+                old_cache.info.lkg_snapshot_complete = true;
+                old_cache.info.lkg_next_cycle = Some(cycle);
+                old_cache.info.lkg_last_update = last_update;
+                old_cache.info.lkg_leader_epoch = Some(epoch);
+                old_cache.info.lkg_scan_plan_digest = digest;
+            }
+
+            let mut cache = DataUsageCache {
+                info: DataUsageCacheInfo {
+                    name: DATA_USAGE_ROOT.to_string(),
+                    next_cycle: want_cycle,
+                    leader_epoch,
+                    tier_registry_generation: Some(tier_registry_generation),
+                    source: Some(source),
+                    snapshot_complete: false,
+                    scan_plan_digest: Some(scan_plan_digest),
+                    cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+                    lkg_snapshot_complete: old_cache.info.lkg_snapshot_complete,
+                    lkg_next_cycle: old_cache.info.lkg_next_cycle,
+                    lkg_last_update: old_cache.info.lkg_last_update,
+                    lkg_leader_epoch: old_cache.info.lkg_leader_epoch,
+                    lkg_scan_plan_digest: old_cache.info.lkg_scan_plan_digest,
+                    ..Default::default()
+                },
+                cache: HashMap::new(),
+            };
+            cache.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
+            for bucket in all_buckets.iter() {
+                cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
+            }
+            cache
         };
-        cache.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
-        for bucket in all_buckets.iter() {
-            cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
-        }
 
         let (bucket_tx, bucket_rx) = mpsc::channel::<BucketInfo>(buckets.len());
 
@@ -1257,11 +1386,6 @@ impl ScannerIOCache for SetDisks {
             incomplete_scope.info.snapshot_complete = false;
             incomplete_scope.info.scan_plan_digest = Some(scan_plan_digest);
             incomplete_scope.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT;
-            incomplete_scope.info.lkg_snapshot_complete = old_cache.info.lkg_snapshot_complete;
-            incomplete_scope.info.lkg_next_cycle = old_cache.info.lkg_next_cycle;
-            incomplete_scope.info.lkg_last_update = old_cache.info.lkg_last_update;
-            incomplete_scope.info.lkg_leader_epoch = old_cache.info.lkg_leader_epoch;
-            incomplete_scope.info.lkg_scan_plan_digest = old_cache.info.lkg_scan_plan_digest;
             if let Err(e) = updates.send(incomplete_scope).await {
                 error!(
                     target: "rustfs::scanner::io",

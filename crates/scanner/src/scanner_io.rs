@@ -105,6 +105,12 @@ struct DirtyUsageSnapshot {
     covers_all_pending: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ScannerBucketScanScope {
+    selected_buckets: Option<Arc<HashSet<String>>>,
+    baseline_scan_plan_digest: Option<DataUsageScanPlanDigest>,
+}
+
 pub(crate) fn is_scanner_metadata_corrupt_error(err: &StorageError) -> bool {
     matches!(err, StorageError::Io(io) if io.to_string().starts_with(SCANNER_METADATA_CORRUPT_ERROR))
 }
@@ -146,6 +152,7 @@ fn object_lock_config_enabled(config: &ObjectLockConfiguration) -> bool {
 pub struct ScannerBucketScanPlan {
     buckets: Vec<BucketInfo>,
     all_buckets: Arc<Vec<BucketInfo>>,
+    scope: ScannerBucketScanScope,
     digest: DataUsageScanPlanDigest,
     leader_epoch: u64,
     tier_registry_generation: u64,
@@ -732,6 +739,8 @@ mod dirty_usage;
 mod guards;
 mod io_cache;
 mod io_cycle;
+#[cfg(test)]
+use io_cache::{ScannerSetCacheGeneration, prepare_scoped_set_scan};
 pub(crate) use io_cycle::nsscanner_with_storage_status;
 mod io_disk;
 #[cfg(test)]

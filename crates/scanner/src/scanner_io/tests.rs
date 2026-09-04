@@ -720,6 +720,155 @@ fn bucket_usage_scan_order_prioritizes_dirty_buckets() {
     assert_eq!(names, vec!["dirty", "missing", "cached"]);
 }
 
+fn complete_set_usage_cache(buckets: &[(&str, usize)], scan_plan_digest: DataUsageScanPlanDigest) -> DataUsageCache {
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: DATA_USAGE_ROOT.to_string(),
+            next_cycle: 7,
+            last_update: Some(SystemTime::now()),
+            leader_epoch: 11,
+            source: Some(DataUsageCacheSource::new(1, 2)),
+            snapshot_complete: true,
+            scan_plan_digest: Some(scan_plan_digest),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            tier_registry_generation: Some(13),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
+    for (bucket, size) in buckets {
+        cache.replace(
+            bucket,
+            DATA_USAGE_ROOT,
+            DataUsageEntry {
+                size: *size,
+                objects: 1,
+                ..Default::default()
+            },
+        );
+    }
+    cache
+}
+
+#[test]
+fn scoped_set_scan_preserves_unselected_usage_and_drops_deleted_buckets() {
+    let baseline_digest = DataUsageScanPlanDigest([1; 32]);
+    let current_digest = DataUsageScanPlanDigest([2; 32]);
+    let mut old_cache = complete_set_usage_cache(&[("stable", 10), ("dirty", 20), ("deleted", 30)], baseline_digest);
+    old_cache.replace(
+        "stable/prefix",
+        "stable",
+        DataUsageEntry {
+            size: 5,
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    let all_buckets = vec![bucket_info("stable"), bucket_info("dirty")];
+    let selected_buckets = Arc::new(HashSet::from(["dirty".to_string(), "deleted".to_string()]));
+
+    let prepared = prepare_scoped_set_scan(
+        &old_cache,
+        &all_buckets,
+        &all_buckets,
+        &ScannerBucketScanScope {
+            selected_buckets: Some(selected_buckets),
+            baseline_scan_plan_digest: Some(baseline_digest),
+        },
+        ScannerSetCacheGeneration {
+            want_cycle: 8,
+            leader_epoch: 11,
+            tier_registry_generation: 13,
+            source: DataUsageCacheSource::new(1, 2),
+            scan_plan_digest: current_digest,
+        },
+    )
+    .expect("complete matching set cache should support a scoped scan");
+
+    assert_eq!(prepared.buckets.iter().map(|bucket| bucket.name.as_str()).collect::<Vec<_>>(), ["dirty"]);
+    let stable = prepared
+        .cache
+        .checked_flatten("stable")
+        .expect("unselected bucket subtree should be retained");
+    assert_eq!((stable.size, stable.objects), (15, 2));
+    assert_eq!(prepared.cache.find("dirty").map(|entry| (entry.size, entry.objects)), Some((0, 0)));
+    assert!(prepared.cache.find("deleted").is_none());
+    assert_eq!(prepared.cache.info.scan_plan_digest, Some(current_digest));
+    assert_eq!(prepared.cache.info.next_cycle, 8);
+    assert!(!prepared.cache.info.snapshot_complete);
+    assert!(prepared.cache.info.lkg_snapshot_complete);
+    assert_eq!(prepared.cache.info.lkg_next_cycle, Some(7));
+    assert_eq!(prepared.cache.info.lkg_scan_plan_digest, Some(baseline_digest));
+}
+
+#[test]
+fn scoped_set_scan_falls_back_when_an_unselected_bucket_has_no_baseline() {
+    let baseline_digest = DataUsageScanPlanDigest([3; 32]);
+    let old_cache = complete_set_usage_cache(&[("stable", 10)], baseline_digest);
+    let all_buckets = vec![bucket_info("stable"), bucket_info("new")];
+
+    assert!(
+        prepare_scoped_set_scan(
+            &old_cache,
+            &all_buckets,
+            &all_buckets,
+            &ScannerBucketScanScope {
+                selected_buckets: Some(Arc::new(HashSet::from(["dirty".to_string()]))),
+                baseline_scan_plan_digest: Some(baseline_digest),
+            },
+            ScannerSetCacheGeneration {
+                want_cycle: 8,
+                leader_epoch: 11,
+                tier_registry_generation: 13,
+                source: DataUsageCacheSource::new(1, 2),
+                scan_plan_digest: DataUsageScanPlanDigest([4; 32]),
+            },
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn scoped_set_scan_requires_an_exact_complete_baseline() {
+    let baseline_digest = DataUsageScanPlanDigest([5; 32]);
+    let all_buckets = vec![bucket_info("dirty")];
+    let scope = ScannerBucketScanScope {
+        selected_buckets: Some(Arc::new(HashSet::from(["dirty".to_string()]))),
+        baseline_scan_plan_digest: Some(baseline_digest),
+    };
+    let generation = ScannerSetCacheGeneration {
+        want_cycle: 8,
+        leader_epoch: 11,
+        tier_registry_generation: 13,
+        source: DataUsageCacheSource::new(1, 2),
+        scan_plan_digest: DataUsageScanPlanDigest([6; 32]),
+    };
+
+    let mut incomplete = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);
+    incomplete.info.snapshot_complete = false;
+    assert!(prepare_scoped_set_scan(&incomplete, &all_buckets, &all_buckets, &scope, generation).is_none());
+
+    let mut not_durable = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);
+    not_durable.info.last_update = None;
+    assert!(prepare_scoped_set_scan(&not_durable, &all_buckets, &all_buckets, &scope, generation).is_none());
+
+    let mut wrong_digest = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);
+    wrong_digest.info.scan_plan_digest = Some(DataUsageScanPlanDigest([7; 32]));
+    assert!(prepare_scoped_set_scan(&wrong_digest, &all_buckets, &all_buckets, &scope, generation).is_none());
+
+    let empty_scope = ScannerBucketScanScope {
+        selected_buckets: Some(Arc::new(HashSet::new())),
+        baseline_scan_plan_digest: Some(baseline_digest),
+    };
+    let complete = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);
+    assert!(prepare_scoped_set_scan(&complete, &all_buckets, &all_buckets, &empty_scope, generation).is_none());
+
+    let mut future_cache = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);
+    future_cache.info.next_cycle = generation.want_cycle.saturating_add(1);
+    assert!(prepare_scoped_set_scan(&future_cache, &all_buckets, &all_buckets, &scope, generation).is_none());
+}
+
 #[test]
 fn record_set_scan_failure_preserves_first_error() {
     let mut first = None;
