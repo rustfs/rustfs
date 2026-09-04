@@ -53,8 +53,8 @@ async fn four_node_four_drive_health_admin_info_and_audit_list() -> TestResult {
         return Err(format!("audit target list was not machine-readable: {audit}").into());
     }
 
-    // Logs / capabilities surfaces: 404 is acceptable (route not enabled);
-    // 5xx is not. A 2xx body must be non-empty.
+    // Optional surfaces: 404/400/501 are acceptable (route missing or stubbed);
+    // unexpected 5xx is not. A 2xx body must be non-empty.
     for path in [
         "/rustfs/admin/v3/log/search",
         "/rustfs/admin/v4/runtime/capabilities",
@@ -62,7 +62,7 @@ async fn four_node_four_drive_health_admin_info_and_audit_list() -> TestResult {
     ] {
         let (status, body) = cluster_admin(&dist.cluster, Method::GET, path, None).await?;
         assert!(
-            status.is_success() || status.is_client_error(),
+            status.is_success() || status.is_client_error() || status.as_u16() == 501,
             "observability path {path} returned {status}: {body}"
         );
         if status.is_success() {

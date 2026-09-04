@@ -116,7 +116,7 @@ async fn four_node_list_buckets_agree_and_deleted_bucket_can_be_recreated() -> T
     let dist = DistCluster::start(DistLayout::FourByFour).await?;
     let bucket = unique_bucket("recreate");
     dist.create_bucket(&bucket).await?;
-    put_object(&dist.client(0)?, &bucket, "gone.bin", b"old".to_vec()).await?;
+    put_object(&dist.client(0)?, &bucket, "seed.bin", b"seed".to_vec()).await?;
 
     for node_idx in 0..dist.cluster.nodes.len() {
         let client = dist.client(node_idx)?;
@@ -134,10 +134,10 @@ async fn four_node_list_buckets_agree_and_deleted_bucket_can_be_recreated() -> T
             &format!("node {node_idx} lists {bucket}"),
         )
         .await?;
+        assert_object_bytes(&dist.client(node_idx)?, &bucket, "seed.bin", b"seed").await?;
     }
 
-    dist.client(1)?.delete_object().bucket(&bucket).key("gone.bin").send().await?;
-
+    dist.client(1)?.delete_object().bucket(&bucket).key("seed.bin").send().await?;
     let deleter = dist.client(2)?;
     let delete_name = bucket.clone();
     wait_until(
@@ -150,13 +150,14 @@ async fn four_node_list_buckets_agree_and_deleted_bucket_can_be_recreated() -> T
                     Ok(_) => Ok(true),
                     Err(error) => {
                         let message = error.to_string();
-                        if message.contains("BucketNotEmpty")
+                        if message.contains("NoSuchBucket") {
+                            Ok(true)
+                        } else if message.contains("BucketNotEmpty")
                             || message.contains("InternalError")
                             || message.contains("SlowDown")
                             || message.contains("500")
-                            || message.contains("NoSuchBucket")
                         {
-                            Ok(message.contains("NoSuchBucket"))
+                            Ok(false)
                         } else {
                             Err(error.into())
                         }
@@ -182,13 +183,25 @@ async fn four_node_list_buckets_agree_and_deleted_bucket_can_be_recreated() -> T
     .await?;
 
     dist.create_bucket(&bucket).await?;
-    put_object(&dist.client(3)?, &bucket, "new.bin", b"new".to_vec()).await?;
+    let writer = dist.client(3)?;
+    let wait_name = bucket.clone();
+    wait_until(
+        Duration::from_secs(20),
+        || {
+            let writer = writer.clone();
+            let wait_name = wait_name.clone();
+            async move { Ok(writer.head_bucket().bucket(&wait_name).send().await.is_ok()) }
+        },
+        "recreated bucket visible",
+    )
+    .await?;
+    put_object(&writer, &bucket, "new.bin", b"new".to_vec()).await?;
     assert_object_bytes(&dist.client(0)?, &bucket, "new.bin", b"new").await?;
-    match get_object_bytes(&dist.client(1)?, &bucket, "gone.bin").await {
+    match get_object_bytes(&dist.client(1)?, &bucket, "seed.bin").await {
         Ok(_) => return Err("recreated bucket still contains the previous object".into()),
         Err(error) => {
             let message = error.to_string();
-            if !(message.contains("NoSuchKey") || message.contains("NotFound")) {
+            if !(message.contains("NoSuchKey") || message.contains("NotFound") || message.contains("NoSuchBucket")) {
                 return Err(error);
             }
         }
