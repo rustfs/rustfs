@@ -542,6 +542,8 @@ test-group = 'e2e-cluster-nightly'
 [profile.e2e-distributed]
 default-filter = 'package(e2e_test) & test(/^distributed::/)'
 fail-fast = false
+# Decommission / rebalance cases poll for up to 180s with little stdout.
+slow-timeout = { period = "120s", terminate-after = 6 }
 
 [profile.e2e-distributed.junit]
 path = "junit.xml"

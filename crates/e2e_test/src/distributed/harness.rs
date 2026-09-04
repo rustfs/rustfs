@@ -79,6 +79,9 @@ impl DistCluster {
             DistLayout::TwoPoolFourDrive => ClusterTopology::per_node_pools(DRIVES_PER_NODE, vec![vec![0], vec![1]]),
         };
         let mut cluster = RustFSTestClusterEnvironment::with_topology(topology).await?;
+        cluster.set_env("NO_PROXY", "127.0.0.1,localhost");
+        cluster.set_env("HTTP_PROXY", "");
+        cluster.set_env("HTTPS_PROXY", "");
         for &(key, value) in extra_env {
             cluster.set_env(key, value);
         }
