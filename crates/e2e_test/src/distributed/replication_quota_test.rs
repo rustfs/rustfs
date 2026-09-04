@@ -21,6 +21,20 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use http::Method;
 use std::time::Duration;
 
+/// `Ok(true)` quota admission rejected the PUT, `Ok(false)` retry, `Err` not quota.
+fn quota_over_limit_put_outcome(code: Option<&str>, message: Option<&str>) -> Result<bool, String> {
+    let quota_message = message.is_some_and(|text| text.starts_with("Bucket quota exceeded"));
+    match code {
+        Some("InvalidRequest" | "QuotaExceeded") if quota_message => Ok(true),
+        Some("SlowDown" | "ServiceUnavailable") => Ok(false),
+        Some("AccessDenied") => Err("AccessDenied is not a quota admission rejection".to_string()),
+        Some("InvalidRequest" | "QuotaExceeded") => {
+            Err(format!("InvalidRequest/QuotaExceeded without quota admission message: {message:?}"))
+        }
+        other => Err(format!("unexpected over-quota error code {other:?} message {message:?}")),
+    }
+}
+
 #[tokio::test]
 async fn four_node_bucket_replication_converges_to_peer_cluster() -> TestResult {
     init_logging();
@@ -98,12 +112,10 @@ async fn four_node_four_drive_hard_quota_rejects_over_limit_put() -> TestResult 
                     Ok(_) => Ok(false),
                     Err(error) => {
                         let code = error.as_service_error().and_then(ProvideErrorMetadata::code);
-                        if matches!(code, Some("QuotaExceeded" | "SlowDown" | "AccessDenied" | "InvalidRequest")) {
-                            Ok(true)
-                        } else if matches!(code, Some("ServiceUnavailable")) {
-                            Ok(false)
-                        } else {
-                            Err(format!("unexpected over-quota error: {error:?}").into())
+                        let message = error.as_service_error().and_then(ProvideErrorMetadata::message);
+                        match quota_over_limit_put_outcome(code, message) {
+                            Ok(done) => Ok(done),
+                            Err(detail) => Err(format!("{detail}: {error:?}").into()),
                         }
                     }
                 }
@@ -113,4 +125,20 @@ async fn four_node_four_drive_hard_quota_rejects_over_limit_put() -> TestResult 
     )
     .await?;
     Ok(())
+}
+
+#[test]
+fn quota_over_limit_put_outcome_requires_quota_admission() {
+    assert_eq!(
+        quota_over_limit_put_outcome(Some("InvalidRequest"), Some("Bucket quota exceeded for bucket x")),
+        Ok(true)
+    );
+    assert_eq!(
+        quota_over_limit_put_outcome(Some("QuotaExceeded"), Some("Bucket quota exceeded")),
+        Ok(true)
+    );
+    assert_eq!(quota_over_limit_put_outcome(Some("SlowDown"), Some("slow down")), Ok(false));
+    assert_eq!(quota_over_limit_put_outcome(Some("ServiceUnavailable"), Some("unavailable")), Ok(false));
+    assert!(quota_over_limit_put_outcome(Some("AccessDenied"), Some("Access Denied")).is_err());
+    assert!(quota_over_limit_put_outcome(Some("InvalidRequest"), Some("invalid argument")).is_err());
 }
