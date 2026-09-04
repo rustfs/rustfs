@@ -89,8 +89,9 @@ pub mod bucket {
         #[allow(clippy::module_inception)]
         pub mod lifecycle {
             pub use crate::bucket::lifecycle::lifecycle::{
-                Event, ExpirationOptions, IlmAction, Lifecycle, LifecycleCalculate, ObjectOpts, RuleValidate,
-                TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time, object_opts_from_object_info,
+                Event, ExpirationOptions, IlmAction, LIFECYCLE_MALFORMED_XML_ERROR_KIND, Lifecycle, LifecycleCalculate,
+                ObjectOpts, RuleValidate, TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time,
+                object_opts_from_object_info,
             };
         }
 

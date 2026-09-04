@@ -22,7 +22,10 @@ use rustfs_replication::ReplicationStatusType;
 use rustfs_scanner_metrics::metrics::IlmAction;
 
 use crate::object_lock;
-use crate::{Event, Lifecycle, ObjectOpts, expiration_action_has_valid_target};
+use crate::{
+    Event, LIFECYCLE_CORRUPT_RULE_ERROR_KIND, Lifecycle, ObjectOpts, expiration_action_has_valid_target,
+    lifecycle_has_corrupt_retention_count,
+};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
@@ -153,6 +156,17 @@ impl Evaluator {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("number of versions mismatch, expected {}, got {}", objs[0].num_versions, objs.len()),
+            ));
+        }
+        // PUT validation rejects a negative retention count, so a rule that
+        // carries one came from older persistence or an import. Report it
+        // instead of evaluating a configuration that cannot be honoured;
+        // `eval_inner` independently takes no action for such a rule
+        // (backlog#2201).
+        if lifecycle_has_corrupt_retention_count(&self.policy) {
+            return Err(std::io::Error::new(
+                LIFECYCLE_CORRUPT_RULE_ERROR_KIND,
+                "lifecycle configuration carries a negative 'NewerNoncurrentVersions'",
             ));
         }
         Ok(self.eval_inner(objs, OffsetDateTime::now_utc()).await)
