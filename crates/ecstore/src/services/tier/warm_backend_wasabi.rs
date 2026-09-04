@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::services::tier::{
     tier_config::{TierS3, TierWasabi},
-    warm_backend::{WarmBackend, WarmBackendGetOpts},
+    warm_backend::{TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts},
     warm_backend_s3::WarmBackendS3,
 };
 use rustfs_s3_client::transition_api::{BucketLookupType, ReadCloser, ReaderImpl};
@@ -167,6 +167,10 @@ impl WarmBackend for WarmBackendWasabi {
             ));
         }
         self.s3.remove(object, rv).await
+    }
+
+    async fn probe_transition_candidate(&self, object: &str) -> io::Result<TransitionCandidateProbe> {
+        self.s3.probe_transition_candidate(object).await
     }
 
     async fn in_use(&self) -> io::Result<bool> {

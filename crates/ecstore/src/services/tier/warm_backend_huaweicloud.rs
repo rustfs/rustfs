@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use crate::services::tier::{
     tier_config::TierHuaweicloud,
     warm_backend::{
-        S3CompatibleWarmBackendParams, WarmBackend, WarmBackendGetOpts, build_transition_put_options,
+        S3CompatibleWarmBackendParams, TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options,
         new_s3_compatible_warm_backend, optimal_part_size,
     },
     warm_backend_s3::WarmBackendS3,
@@ -87,6 +87,10 @@ impl WarmBackend for WarmBackendHuaweicloud {
 
     async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
         self.0.remove(object, rv).await
+    }
+
+    async fn probe_transition_candidate(&self, object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
+        self.0.probe_transition_candidate(object).await
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {
