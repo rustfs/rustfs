@@ -304,7 +304,10 @@ pub(crate) mod scan {
     };
     #[cfg(test)]
     pub(crate) use super::storage_contracts::{DeleteBucketOptions, MakeBucketOptions, ObjectIO};
-    pub use super::storage_contracts::{SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION};
+    pub use super::storage_contracts::{
+        SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES,
+        SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
+    };
 }
 
 pub(crate) mod scanner_io {

@@ -502,6 +502,51 @@ fn dirty_usage_generation_acknowledgement_preserves_newer_mutations() {
 
 #[test]
 #[serial]
+fn dirty_usage_snapshot_is_sorted_and_reports_its_cutoff() {
+    clear_dirty_usage_buckets_for_tests();
+    let empty = scanner_dirty_usage_snapshot(0);
+    assert_eq!(empty.pending_bucket_count, 0);
+    assert!(empty.complete);
+    assert!(empty.buckets.is_empty());
+
+    record_dirty_usage_bucket("videos");
+    record_dirty_usage_bucket("photos");
+    let expected_generation = scanner_dirty_usage_state().generation;
+
+    let snapshot = scanner_dirty_usage_snapshot(2);
+
+    assert_eq!(snapshot.generation, expected_generation);
+    assert_eq!(snapshot.pending_bucket_count, 2);
+    assert!(snapshot.complete);
+    assert_eq!(
+        snapshot
+            .buckets
+            .iter()
+            .map(|bucket| bucket.bucket.as_str())
+            .collect::<Vec<_>>(),
+        vec!["photos", "videos"]
+    );
+    assert!(snapshot.buckets.iter().all(|bucket| bucket.generation <= snapshot.generation));
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[test]
+#[serial]
+fn dirty_usage_snapshot_marks_truncated_results_incomplete() {
+    clear_dirty_usage_buckets_for_tests();
+    record_dirty_usage_bucket("archive");
+    record_dirty_usage_bucket("photos");
+
+    let snapshot = scanner_dirty_usage_snapshot(1);
+
+    assert_eq!(snapshot.pending_bucket_count, 2);
+    assert!(!snapshot.complete);
+    assert!(snapshot.buckets.is_empty(), "incomplete snapshots must not expose a partial bucket list");
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[test]
+#[serial]
 fn dirty_usage_generation_acknowledgement_rejects_stale_process_and_future_generation() {
     clear_dirty_usage_buckets_for_tests();
     record_dirty_usage_bucket("photos");

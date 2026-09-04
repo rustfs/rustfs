@@ -882,6 +882,27 @@ message ScannerActivityResponse {
   optional bool publication_blocked = 11;
 }
 
+message ScannerDirtyUsageBucket {
+  string bucket = 1;
+  uint64 generation = 2;
+}
+
+message ScannerDirtyUsageSnapshotRequest {
+  bytes challenge = 1;
+  uint32 protocol_version = 2;
+}
+
+message ScannerDirtyUsageSnapshotResponse {
+  string instance_id = 1;
+  uint64 generation = 2;
+  uint64 pending_bucket_count = 3;
+  uint32 protocol_version = 4;
+  // Incomplete snapshots are all-or-nothing and carry no bucket entries.
+  bool complete = 5;
+  repeated ScannerDirtyUsageBucket buckets = 6;
+  bytes response_proof = 7;
+}
+
 // A short-lived storage-owned read admission used only around a final
 // scanner metadata publication.  It is intentionally separate from the
 // ScannerActivity observation wire so v6/v7 rolling compatibility remains
@@ -1206,6 +1227,7 @@ service NodeService {
   // rpc CommitBinary() returns () {};
   rpc SignalService(SignalServiceRequest) returns (SignalServiceResponse) {}; // auth-policy: body-bound
   rpc ScannerActivity(ScannerActivityRequest) returns (ScannerActivityResponse) {}; // auth-policy: body-bound
+  rpc ScannerDirtyUsageSnapshot(ScannerDirtyUsageSnapshotRequest) returns (ScannerDirtyUsageSnapshotResponse) {}; // auth-policy: body-bound
   rpc AcquireScannerPublicationLease(ScannerPublicationLeaseRequest) returns (ScannerPublicationLeaseResponse) {}; // auth-policy: body-bound
   rpc ReleaseScannerPublicationLease(ScannerPublicationLeaseReleaseRequest) returns (ScannerPublicationLeaseReleaseResponse) {}; // auth-policy: body-bound
   rpc BackgroundHealStatus(BackgroundHealStatusRequest) returns (BackgroundHealStatusResponse) {}; // auth-policy: read-only

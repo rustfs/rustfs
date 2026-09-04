@@ -1251,6 +1251,38 @@ pub struct ScannerActivityResponse {
     #[prost(bool, optional, tag = "11")]
     pub publication_blocked: ::core::option::Option<bool>,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScannerDirtyUsageBucket {
+    #[prost(string, tag = "1")]
+    pub bucket: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub generation: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScannerDirtyUsageSnapshotRequest {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub challenge: ::prost::bytes::Bytes,
+    #[prost(uint32, tag = "2")]
+    pub protocol_version: u32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScannerDirtyUsageSnapshotResponse {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub generation: u64,
+    #[prost(uint64, tag = "3")]
+    pub pending_bucket_count: u64,
+    #[prost(uint32, tag = "4")]
+    pub protocol_version: u32,
+    /// Incomplete snapshots are all-or-nothing and carry no bucket entries.
+    #[prost(bool, tag = "5")]
+    pub complete: bool,
+    #[prost(message, repeated, tag = "6")]
+    pub buckets: ::prost::alloc::vec::Vec<ScannerDirtyUsageBucket>,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub response_proof: ::prost::bytes::Bytes,
+}
 /// A short-lived storage-owned read admission used only around a final
 /// scanner metadata publication.  It is intentionally separate from the
 /// ScannerActivity observation wire so v6/v7 rolling compatibility remains
@@ -2899,6 +2931,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "ScannerActivity"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn scanner_dirty_usage_snapshot(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ScannerDirtyUsageSnapshotRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScannerDirtyUsageSnapshotResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/ScannerDirtyUsageSnapshot");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "ScannerDirtyUsageSnapshot"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn acquire_scanner_publication_lease(
             &mut self,
             request: impl tonic::IntoRequest<super::ScannerPublicationLeaseRequest>,
@@ -3457,6 +3504,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::ScannerActivityRequest>,
         ) -> std::result::Result<tonic::Response<super::ScannerActivityResponse>, tonic::Status>;
+        async fn scanner_dirty_usage_snapshot(
+            &self,
+            request: tonic::Request<super::ScannerDirtyUsageSnapshotRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScannerDirtyUsageSnapshotResponse>, tonic::Status>;
         async fn acquire_scanner_publication_lease(
             &self,
             request: tonic::Request<super::ScannerPublicationLeaseRequest>,
@@ -5740,6 +5791,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ScannerActivitySvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/ScannerDirtyUsageSnapshot" => {
+                    #[allow(non_camel_case_types)]
+                    struct ScannerDirtyUsageSnapshotSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::ScannerDirtyUsageSnapshotRequest> for ScannerDirtyUsageSnapshotSvc<T> {
+                        type Response = super::ScannerDirtyUsageSnapshotResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::ScannerDirtyUsageSnapshotRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::scanner_dirty_usage_snapshot(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ScannerDirtyUsageSnapshotSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

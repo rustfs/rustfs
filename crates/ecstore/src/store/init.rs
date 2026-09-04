@@ -816,13 +816,14 @@ mod tests {
             },
             tier_delete_journal::{
                 DecommissionCheckpointTargetFailureHook, TIER_DELETE_DISPATCH_MANIFEST_PREFIX, TIER_DELETE_JOURNAL_PREFIX,
+                TierDeleteChunkTestBarrier, TierDeleteChunkTestStage, TierDeleteDispatchBatchLimitGuard,
                 TierDeleteDispatchManifestState, TierDeleteDispatchMemberReadTestHook, TierDeleteDispatchMemberReadTestStage,
                 TierDeleteDispatchRollbackTestHook, complete_tier_delete_dispatch, encode_tier_delete_journal_entry,
                 install_test_tier_delete_dispatch_fixture, persist_tier_delete_journal_entry, prepare_tier_delete_dispatch,
                 recover_test_tier_delete_dispatch_manifest, recover_test_tier_delete_dispatch_manifest_with_page_budget,
-                recover_tier_delete_dispatch_manifests, recover_tier_delete_journal_entries,
-                test_tier_delete_dispatch_manifest_checkpoint, test_tier_delete_dispatch_manifest_state,
-                tier_delete_dispatch_manifest_operation_lock_held_for_test,
+                recover_test_tier_delete_journal_pass_with_budget, recover_tier_delete_dispatch_manifests,
+                recover_tier_delete_journal_entries, test_tier_delete_dispatch_manifest_checkpoint,
+                test_tier_delete_dispatch_manifest_state, tier_delete_dispatch_manifest_operation_lock_held_for_test,
                 tier_delete_dispatch_manifest_recovery_count_for_test, tier_delete_dispatch_manifest_recovery_inflight_for_test,
                 tier_delete_journal_object_name,
             },
@@ -8697,6 +8698,35 @@ mod tests {
     }
 
     #[cfg(feature = "test-util")]
+    async fn install_committed_tier_delete_journals(
+        store: Arc<crate::store::ECStore>,
+        tier_name: &str,
+        backend_identity: [u8; 32],
+        count: usize,
+    ) -> Vec<Jentry> {
+        let mut entries = Vec::with_capacity(count);
+        for index in 0..count {
+            let entry = Jentry {
+                persisted_version: 0,
+                obj_name: format!("remote/pass-drain-{index:06}.bin"),
+                version_id: uuid::Uuid::new_v4().to_string(),
+                tier_name: tier_name.to_string(),
+                backend_identity: Some(backend_identity),
+                version_id_exact: true,
+                version_state: rustfs_filemeta::TransitionVersionState::Exact,
+                state: TierDeleteJournalState::Committed,
+                source: None,
+                dispatch: None,
+            };
+            persist_tier_delete_journal_entry(store.clone(), &entry)
+                .await
+                .expect("committed tier-delete journal fixture should persist");
+            entries.push(entry);
+        }
+        entries
+    }
+
+    #[cfg(feature = "test-util")]
     fn synthetic_v6_dispatch_entry(
         bucket: &str,
         object: &str,
@@ -8790,6 +8820,196 @@ mod tests {
         })
         .await
         .expect("same-disk restart recovery should converge without retained dispatch state");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_delete_recovery_pass_drains_multiple_fast_manifest_pages() {
+        const MANIFEST_COUNT: usize = 10;
+
+        let temp_dir = tempfile::tempdir().expect("create fast manifest pass recovery store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-delete-fast-manifest-pass", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "tier-delete-fast-manifest-pass-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("fast manifest pass bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("fast manifest pass bucket incarnation should resolve");
+        let tier_name = "FAST-MANIFEST-PASS";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("fast manifest pass tier lease should resolve")
+            .backend_identity();
+        for index in 0..MANIFEST_COUNT {
+            install_aborting_dispatch_fixture(
+                store.clone(),
+                bucket,
+                incarnation,
+                &format!("manifest-page-{index:06}/"),
+                tier_name,
+                backend_identity,
+                1,
+            )
+            .await;
+        }
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, MANIFEST_COUNT);
+        assert_eq!(tier_delete_journal_count(store.clone()).await, MANIFEST_COUNT);
+
+        let cancel = CancellationToken::new();
+        let mut manifest_marker = None;
+        let mut journal_marker = None;
+        let stats = recover_test_tier_delete_journal_pass_with_budget(
+            store.clone(),
+            &cancel,
+            &mut manifest_marker,
+            &mut journal_marker,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(!stats.canceled);
+        assert!(!stats.deadline_exhausted);
+        assert!(
+            stats.manifest_pages > 1,
+            "one production pass must cross the default eight-manifest page limit"
+        );
+        assert_eq!(stats.manifests.scanned, MANIFEST_COUNT);
+        assert_eq!(stats.manifests.deleted, MANIFEST_COUNT);
+        assert_eq!(stats.manifests.failed, 0);
+        assert_eq!(manifest_marker, None);
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 0);
+        assert_eq!(tier_delete_journal_count(store).await, 0);
+        assert_eq!(backend.remove_count().await, 0, "rollback recovery must not call the remote tier");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_delete_recovery_pass_drains_multiple_fast_journal_pages() {
+        const JOURNAL_COUNT: usize = 25;
+
+        let temp_dir = tempfile::tempdir().expect("create fast pass recovery store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-delete-fast-pass", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "FAST-PASS-RECOVERY";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("fast pass tier lease should resolve")
+            .backend_identity();
+        let entries = install_committed_tier_delete_journals(store.clone(), tier_name, backend_identity, JOURNAL_COUNT).await;
+        assert_eq!(tier_delete_journal_count(store.clone()).await, JOURNAL_COUNT);
+
+        let cancel = CancellationToken::new();
+        let mut manifest_marker = None;
+        let mut journal_marker = None;
+        let stats = recover_test_tier_delete_journal_pass_with_budget(
+            store.clone(),
+            &cancel,
+            &mut manifest_marker,
+            &mut journal_marker,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(!stats.canceled);
+        assert!(!stats.deadline_exhausted);
+        assert!(
+            stats.journal_pages > 1,
+            "one production pass must cross the default eight-record page limit"
+        );
+        assert_eq!(stats.journals.scanned, JOURNAL_COUNT);
+        assert_eq!(stats.journals.deleted, JOURNAL_COUNT);
+        assert_eq!(stats.journals.failed, 0);
+        assert_eq!(journal_marker, None);
+        assert_eq!(tier_delete_journal_count(store).await, 0);
+        assert_eq!(backend.exact_remove_count(), JOURNAL_COUNT);
+        let mut removed = backend.remove_versions().await;
+        removed.sort();
+        let mut expected = entries
+            .into_iter()
+            .map(|entry| (entry.obj_name, entry.version_id))
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(removed, expected);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_delete_recovery_pass_rotates_failed_journal_pages_without_busy_loop() {
+        const JOURNAL_COUNT: usize = 9;
+
+        let temp_dir = tempfile::tempdir().expect("create failed pass recovery store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-delete-failed-pass", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "FAILED-PASS-RECOVERY";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("failed pass tier lease should resolve")
+            .backend_identity();
+        install_committed_tier_delete_journals(store.clone(), tier_name, backend_identity, JOURNAL_COUNT).await;
+        backend.set_remove_failure(true);
+
+        let cancel = CancellationToken::new();
+        let mut manifest_marker = None;
+        let mut journal_marker = None;
+        let first = recover_test_tier_delete_journal_pass_with_budget(
+            store.clone(),
+            &cancel,
+            &mut manifest_marker,
+            &mut journal_marker,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(first.journal_pages, 1, "a no-progress failed page must stop the pass");
+        assert_eq!(first.journals.scanned, 8);
+        assert_eq!(first.journals.deleted, 0);
+        assert_eq!(first.journals.failed, 8);
+        assert!(journal_marker.is_some(), "a truncated failed page must retain its continuation marker");
+        assert_eq!(tier_delete_journal_count(store.clone()).await, JOURNAL_COUNT);
+
+        let second = recover_test_tier_delete_journal_pass_with_budget(
+            store.clone(),
+            &cancel,
+            &mut manifest_marker,
+            &mut journal_marker,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(second.journal_pages, 1);
+        assert_eq!(second.journals.scanned, 1);
+        assert_eq!(second.journals.deleted, 0);
+        assert_eq!(second.journals.failed, 1);
+        assert_eq!(
+            journal_marker, None,
+            "end-of-list rotation must revisit the failed prefix on a later pass"
+        );
+        assert_eq!(tier_delete_journal_count(store.clone()).await, JOURNAL_COUNT);
+
+        backend.set_remove_failure(false);
+        let third = recover_test_tier_delete_journal_pass_with_budget(
+            store.clone(),
+            &cancel,
+            &mut manifest_marker,
+            &mut journal_marker,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(third.journals.scanned, JOURNAL_COUNT);
+        assert_eq!(third.journals.deleted, JOURNAL_COUNT);
+        assert_eq!(third.journals.failed, 0);
+        assert_eq!(tier_delete_journal_count(store).await, 0);
     }
 
     #[cfg(feature = "test-util")]
@@ -11635,6 +11855,612 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[test]
     #[serial_test::serial(storage_class_env)]
+    fn tier_delete_prefix_limit_and_multi_chunk_batches_converge() {
+        run_large_stack_async_test(
+            "tier-delete-prefix-limit-and-multi-chunk",
+            tier_delete_prefix_limit_and_multi_chunk_batches_converge_case,
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn tier_delete_prefix_limit_and_multi_chunk_batches_converge_case() {
+        let _batch_limit = TierDeleteDispatchBatchLimitGuard::install(2);
+        let temp_dir = tempfile::tempdir().expect("create chunked prefix-delete store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "chunked-prefix-delete", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "CHUNKED-PREFIX-DELETE";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "chunked-prefix-delete-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("chunked prefix source bucket should be created");
+
+        for (prefix, count) in [("at-limit", 2), ("limit-plus-one", 3), ("multi-chunk", 5)] {
+            for index in 0..count {
+                let object = format!("{prefix}/object-{index}.bin");
+                let mut reader = PutObjReader::from_vec(vec![b'a' + index as u8; 1024 * 1024]);
+                let source = store
+                    .put_object(bucket, &object, &mut reader, &ObjectOptions::default())
+                    .await
+                    .expect("chunked prefix source should be written");
+                store
+                    .transition_object(
+                        bucket,
+                        &object,
+                        &ObjectOptions {
+                            transition: TransitionOptions {
+                                status: TRANSITION_PENDING.to_string(),
+                                tier: tier_name.to_string(),
+                                etag: source.etag.clone().expect("chunked prefix source should have an etag"),
+                                ..Default::default()
+                            },
+                            mod_time: source.mod_time,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("chunked prefix source should transition");
+            }
+        }
+        backend.set_remove_failure(true);
+
+        store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                "at-limit/",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("exactly one batch must retain the v1 one-shot path");
+
+        let limit_plus_one_first = store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                "limit-plus-one/",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("limit plus one must start a bounded parent transaction");
+        assert!(
+            limit_plus_one_first.to_string().contains("retry the next durable batch"),
+            "unexpected first limit-plus-one result: {limit_plus_one_first}"
+        );
+        let active_limit_plus_one_records = store
+            .clone()
+            .list_objects_v2(
+                RUSTFS_META_BUCKET,
+                TIER_DELETE_DISPATCH_MANIFEST_PREFIX,
+                None,
+                None,
+                10,
+                false,
+                None,
+                false,
+            )
+            .await
+            .expect("active limit-plus-one records should be listable");
+        let mut active_limit_plus_one_parent_seen = false;
+        for record in active_limit_plus_one_records
+            .objects
+            .iter()
+            .filter(|record| !record.name.contains("/chunks/"))
+        {
+            let data = com::read_config(store.clone(), &record.name)
+                .await
+                .expect("an active dispatch root should be readable");
+            let value: serde_json::Value = serde_json::from_slice(&data).expect("an active dispatch root should contain JSON");
+            if value["prefix"] == "limit-plus-one/" {
+                assert_eq!(value["record_type"], "chunked_parent");
+                active_limit_plus_one_parent_seen = true;
+            }
+        }
+        assert!(
+            active_limit_plus_one_parent_seen,
+            "limit plus one must establish the fail-closed parent at the legacy root"
+        );
+
+        let mut limit_plus_one_completed = false;
+        let mut limit_plus_one_retries = 1;
+        for _ in 0..3 {
+            match store
+                .delete_object_with_tier_delete_journal(
+                    bucket,
+                    "limit-plus-one/",
+                    ObjectOptions {
+                        delete_prefix: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => {
+                    limit_plus_one_completed = true;
+                    break;
+                }
+                Err(err) if err.to_string().contains("retry the next durable batch") => {
+                    limit_plus_one_retries += 1;
+                }
+                Err(err) => panic!("limit-plus-one delete returned an unexpected error: {err}"),
+            }
+        }
+        assert!(limit_plus_one_completed, "limit plus one must converge through two bounded children");
+        assert_eq!(limit_plus_one_retries, 2, "limit plus one must require exactly two child batches");
+
+        let first_batch = store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                "multi-chunk/",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the first bounded child must request a successor batch");
+        assert!(
+            first_batch.to_string().contains("retry the next durable batch"),
+            "unexpected first child result: {first_batch}"
+        );
+
+        let newcomer = "multi-chunk/zzz-newcomer.bin";
+        let mut newcomer_reader = PutObjReader::from_vec(vec![b'n'; 1024 * 1024]);
+        let newcomer_source = store
+            .put_object(bucket, newcomer, &mut newcomer_reader, &ObjectOptions::default())
+            .await
+            .expect("a source created between chunks should be written");
+        store
+            .transition_object(
+                bucket,
+                newcomer,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: newcomer_source
+                            .etag
+                            .clone()
+                            .expect("the between-chunks source should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: newcomer_source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a source created between chunks should transition");
+
+        let mut completed = false;
+        let mut durable_batch_retries = 1;
+        for _ in 0..7 {
+            match store
+                .delete_object_with_tier_delete_journal(
+                    bucket,
+                    "multi-chunk/",
+                    ObjectOptions {
+                        delete_prefix: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => {
+                    completed = true;
+                    break;
+                }
+                Err(err)
+                    if err.to_string().contains("retry the next durable batch")
+                        || err.to_string().contains("retry the next batch") =>
+                {
+                    durable_batch_retries += 1;
+                }
+                Err(err) => panic!("chunked prefix delete returned an unexpected error: {err}"),
+            }
+        }
+        assert!(completed, "six entries must converge through three bounded child batches");
+        assert_eq!(durable_batch_retries, 3, "limit two should require exactly three child batches");
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 11);
+        assert_eq!(
+            backend.object_count().await,
+            11,
+            "remote cleanup must remain durable while the tier is unavailable"
+        );
+        let dispatch_records = store
+            .clone()
+            .list_objects_v2(
+                RUSTFS_META_BUCKET,
+                TIER_DELETE_DISPATCH_MANIFEST_PREFIX,
+                None,
+                None,
+                20,
+                false,
+                None,
+                false,
+            )
+            .await
+            .expect("bounded dispatch records should be listable");
+        let mut child_batches = 0;
+        let mut legacy_at_limit_seen = false;
+        for record in &dispatch_records.objects {
+            let data = com::read_config(store.clone(), &record.name)
+                .await
+                .expect("a retained dispatch record should be readable");
+            let value: serde_json::Value = serde_json::from_slice(&data).expect("a retained dispatch record should contain JSON");
+            if record.name.contains("/chunks/") {
+                let journal_count = value["journal_count"]
+                    .as_u64()
+                    .expect("a retained child should declare its journal count");
+                assert!(journal_count <= 2, "a child batch exceeded the configured resource bound");
+                child_batches += 1;
+            } else if value["prefix"] == "at-limit/" {
+                assert!(
+                    value.get("record_type").is_none(),
+                    "the exact-limit root must remain a legacy v1 manifest"
+                );
+                assert_eq!(value["journal_count"], 2);
+                legacy_at_limit_seen = true;
+            }
+        }
+        assert!(
+            legacy_at_limit_seen,
+            "the exact-limit dispatch must retain its byte-compatible root shape"
+        );
+        assert_eq!(child_batches, 5, "nine chunked sources should persist exactly five bounded children");
+
+        backend.set_remove_failure(false);
+        drive_tier_delete_dispatch_restart_to_convergence(store.clone()).await;
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 0);
+        assert_eq!(backend.object_count().await, 0);
+        assert_eq!(
+            backend.remove_versions().await.len(),
+            11,
+            "each remote version must be removed exactly once"
+        );
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn tier_delete_chunk_crash_boundaries_resume_without_skipping_sources() {
+        run_large_stack_async_test(
+            "tier-delete-chunk-crash-boundaries",
+            tier_delete_chunk_crash_boundaries_resume_without_skipping_sources_case,
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn tier_delete_chunk_crash_boundaries_resume_without_skipping_sources_case() {
+        let _batch_limit = TierDeleteDispatchBatchLimitGuard::install(1);
+        let stages = [
+            TierDeleteChunkTestStage::ParentPersisted,
+            TierDeleteChunkTestStage::ChildManifestPersisted,
+            TierDeleteChunkTestStage::ParentBound,
+            TierDeleteChunkTestStage::DispatchAuthorized,
+            TierDeleteChunkTestStage::LocalReplayCompleted,
+            TierDeleteChunkTestStage::ChildCompleted,
+            TierDeleteChunkTestStage::ParentProgressed,
+            TierDeleteChunkTestStage::FinalLocalDeletionCompleted,
+            TierDeleteChunkTestStage::ParentCompleted,
+        ];
+        for (case, stage) in stages.into_iter().enumerate() {
+            let temp_dir = tempfile::tempdir().expect("create chunk crash-boundary store dir");
+            let initial_name = format!("chunk-crash-boundary-{case}");
+            let (ctx, store, shutdown) =
+                without_storage_class_env(build_isolated_test_store(temp_dir.path(), &initial_name, &[4])).await;
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            let tier_name = format!("CHUNK-CRASH-BOUNDARY-{case}");
+            let backend = register_mock_tier(&ctx.tier_config_mgr(), &tier_name).await;
+            backend.set_remove_failure(true);
+            let bucket = format!("chunk-crash-boundary-{case}-bucket");
+            let prefix = "prefix/";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("chunk crash-boundary bucket should be created");
+            for index in 0..2 {
+                let object = format!("{prefix}object-{index}.bin");
+                let mut reader = PutObjReader::from_vec(vec![b'a' + index as u8; 1024 * 1024]);
+                let source = store
+                    .put_object(&bucket, &object, &mut reader, &ObjectOptions::default())
+                    .await
+                    .expect("chunk crash-boundary source should be written");
+                store
+                    .transition_object(
+                        &bucket,
+                        &object,
+                        &ObjectOptions {
+                            transition: TransitionOptions {
+                                status: TRANSITION_PENDING.to_string(),
+                                tier: tier_name.clone(),
+                                etag: source.etag.clone().expect("chunk crash-boundary source should have an etag"),
+                                ..Default::default()
+                            },
+                            mod_time: source.mod_time,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("chunk crash-boundary source should transition");
+            }
+            let local_only = format!("{prefix}local-only.bin");
+            let mut local_reader = PutObjReader::from_vec(vec![b'l'; 1024 * 1024]);
+            store
+                .put_object(&bucket, &local_only, &mut local_reader, &ObjectOptions::default())
+                .await
+                .expect("chunk crash-boundary local-only object should be written");
+            let tier_config = ctx
+                .tier_config_mgr()
+                .read()
+                .await
+                .tiers
+                .get(&tier_name)
+                .expect("chunk crash-boundary tier config should remain available for restart")
+                .clone_with_credentials();
+
+            if matches!(
+                stage,
+                TierDeleteChunkTestStage::FinalLocalDeletionCompleted | TierDeleteChunkTestStage::ParentCompleted
+            ) {
+                for _ in 0..2 {
+                    let retry = store
+                        .delete_object_with_tier_delete_journal(
+                            &bucket,
+                            prefix,
+                            ObjectOptions {
+                                delete_prefix: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect_err("each bounded child must complete before the final crash boundary");
+                    assert!(
+                        retry.to_string().contains("retry the next durable batch"),
+                        "unexpected bounded-child result before {stage:?}: {retry}"
+                    );
+                }
+            }
+
+            let barrier = TierDeleteChunkTestBarrier::install(stage);
+            let worker_store = store.clone();
+            let worker_bucket = bucket.clone();
+            let worker = tokio::spawn(async move {
+                worker_store
+                    .delete_object_with_tier_delete_journal(
+                        &worker_bucket,
+                        prefix,
+                        ObjectOptions {
+                            delete_prefix: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                .await
+                .unwrap_or_else(|_| panic!("chunk delete did not reach crash boundary {stage:?}"));
+            worker.abort();
+            let _ = worker.await;
+            drop(barrier);
+            let released_bucket_guard =
+                tokio::time::timeout(Duration::from_secs(5), store.acquire_bucket_lifecycle_write_lock(&bucket))
+                    .await
+                    .unwrap_or_else(|_| panic!("canceling at {stage:?} did not release the bucket lifecycle lock"))
+                    .unwrap_or_else(|err| {
+                        panic!("bucket lifecycle lock reacquire failed after cancellation at {stage:?}: {err}")
+                    });
+            drop(released_bucket_guard);
+            shutdown.cancel();
+            drop(store);
+            drop(ctx);
+
+            let restarted_name = format!("chunk-crash-boundary-{case}-restart");
+            let (restarted_ctx, restarted_store, restarted_shutdown) =
+                without_storage_class_env(build_isolated_test_store(temp_dir.path(), &restarted_name, &[4])).await;
+            {
+                let tier_config_mgr = restarted_ctx.tier_config_mgr();
+                let mut manager = tier_config_mgr.write().await;
+                manager.tiers.insert(tier_name.clone(), tier_config);
+                manager
+                    .install_test_driver(&tier_name, Box::new(backend.clone()))
+                    .expect("the exact chunk crash-boundary tier driver should reinstall after restart");
+            }
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(restarted_store.clone(), Vec::new()).await;
+
+            let mut completed = false;
+            for _ in 0..20 {
+                let recovery = recover_tier_delete_dispatch_manifests(restarted_store.clone(), 100, None)
+                    .await
+                    .expect("chunk crash-boundary manifest recovery should remain readable");
+                assert_eq!(recovery.failed, 0, "recovery must not quarantine a valid chunk boundary");
+                match restarted_store
+                    .delete_object_with_tier_delete_journal(
+                        &bucket,
+                        prefix,
+                        ObjectOptions {
+                            delete_prefix: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        completed = true;
+                        break;
+                    }
+                    Err(err)
+                        if err.to_string().contains("retry")
+                            || err.to_string().contains("rollback")
+                            || err.to_string().contains("durable cleanup") => {}
+                    Err(err) => panic!("chunk crash-boundary retry returned an unexpected error at {stage:?}: {err}"),
+                }
+            }
+            assert!(completed, "chunk state must converge after cancellation at {stage:?}");
+            for index in 0..2 {
+                let object = format!("{prefix}object-{index}.bin");
+                assert!(
+                    restarted_store.pools[0]
+                        .get_disks_by_key(&object)
+                        .load_file_info_versions_exact(&bucket, &object)
+                        .await
+                        .expect("chunk crash-boundary source lookup should succeed")
+                        .is_none(),
+                    "source {object} must not be skipped after cancellation at {stage:?}"
+                );
+            }
+            assert!(
+                restarted_store.pools[0]
+                    .get_disks_by_key(&local_only)
+                    .load_file_info_versions_exact(&bucket, &local_only)
+                    .await
+                    .expect("chunk crash-boundary local-only source lookup should succeed")
+                    .is_none(),
+                "the final raw delete must remove the local-only source after cancellation at {stage:?}"
+            );
+            assert_eq!(backend.object_count().await, 2);
+            backend.set_remove_failure(false);
+            drive_tier_delete_dispatch_restart_to_convergence(restarted_store.clone()).await;
+            assert_eq!(tier_delete_journal_count(restarted_store.clone()).await, 0);
+            assert_eq!(tier_delete_dispatch_manifest_count(restarted_store.clone()).await, 0);
+            assert_eq!(backend.object_count().await, 0);
+            assert_eq!(
+                backend.remove_versions().await.len(),
+                2,
+                "each crash case must retain exactly one cleanup owner per remote version"
+            );
+            restarted_shutdown.cancel();
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn tier_delete_chunk_missing_child_with_journals_fails_closed() {
+        run_large_stack_async_test(
+            "tier-delete-chunk-missing-child",
+            tier_delete_chunk_missing_child_with_journals_fails_closed_case,
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn tier_delete_chunk_missing_child_with_journals_fails_closed_case() {
+        let _batch_limit = TierDeleteDispatchBatchLimitGuard::install(1);
+        let temp_dir = tempfile::tempdir().expect("create missing-child store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "chunk-missing-child", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "CHUNK-MISSING-CHILD";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        backend.set_remove_failure(true);
+        let bucket = "chunk-missing-child-bucket";
+        let prefix = "prefix/";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("missing-child bucket should be created");
+        for index in 0..2 {
+            let object = format!("{prefix}object-{index}.bin");
+            let mut reader = PutObjReader::from_vec(vec![b'm' + index as u8; 1024 * 1024]);
+            let source = store
+                .put_object(bucket, &object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("missing-child source should be written");
+            store
+                .transition_object(
+                    bucket,
+                    &object,
+                    &ObjectOptions {
+                        transition: TransitionOptions {
+                            status: TRANSITION_PENDING.to_string(),
+                            tier: tier_name.to_string(),
+                            etag: source.etag.clone().expect("missing-child source should have an etag"),
+                            ..Default::default()
+                        },
+                        mod_time: source.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("missing-child source should transition");
+        }
+
+        let barrier = TierDeleteChunkTestBarrier::install(TierDeleteChunkTestStage::DispatchAuthorized);
+        let worker_store = store.clone();
+        let worker = tokio::spawn(async move {
+            worker_store
+                .delete_object_with_tier_delete_journal(
+                    bucket,
+                    prefix,
+                    ObjectOptions {
+                        delete_prefix: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .expect("chunk delete should persist its authorization before corruption injection");
+        worker.abort();
+        let _ = worker.await;
+        drop(barrier);
+
+        let records = store
+            .clone()
+            .list_objects_v2(
+                RUSTFS_META_BUCKET,
+                TIER_DELETE_DISPATCH_MANIFEST_PREFIX,
+                None,
+                None,
+                10,
+                false,
+                None,
+                false,
+            )
+            .await
+            .expect("parent and child records should be listable");
+        let child = records
+            .objects
+            .iter()
+            .find(|object| object.name.contains("/chunks/"))
+            .expect("the bound child manifest should exist")
+            .name
+            .clone();
+        com::delete_config(store.clone(), &child)
+            .await
+            .expect("the test should remove only the child manifest");
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 1);
+
+        let error = store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                prefix,
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a missing child with retained journals must quarantine the parent");
+        assert!(
+            error.to_string().contains("missing child with retained journals"),
+            "unexpected missing-child result: {error}"
+        );
+        assert_eq!(backend.object_count().await, 2, "fail-closed inspection must not remove a remote version");
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
     fn authorized_prefix_retry_replays_predecessor_before_newcomer() {
         let handle = std::thread::Builder::new()
             .name("authorized-prefix-predecessor-replay-test".to_string())
@@ -11655,6 +12481,7 @@ mod tests {
 
     #[cfg(feature = "test-util")]
     async fn authorized_prefix_retry_replays_predecessor_before_newcomer_case() {
+        let _batch_limit = TierDeleteDispatchBatchLimitGuard::install(1);
         let temp_dir = tempfile::tempdir().expect("create authorized predecessor replay store dir");
         let (ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "authorized-prefix-predecessor-replay", &[4]))
@@ -11667,8 +12494,8 @@ mod tests {
             .expect("authorized replay tier lease should resolve");
         let bucket = "authorized-prefix-predecessor-replay-bucket";
         let prefix = "prefix/";
-        let predecessor = "prefix/predecessor.bin";
-        let newcomer = "prefix/newcomer.bin";
+        let predecessor = "prefix/000-predecessor.bin";
+        let newcomer = "prefix/zzz-newcomer.bin";
         store
             .make_bucket(bucket, &MakeBucketOptions::default())
             .await

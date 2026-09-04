@@ -28,7 +28,7 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor, value::MapAccessDeserialize
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{OffsetDateTime, PrimitiveDateTime, format_description::well_known::Rfc3339};
 use time::{format_description::FormatItem, macros::format_description};
 use uuid::Uuid;
 
@@ -1417,6 +1417,31 @@ impl RestoreStatusOps for RestoreStatus {
     }
 }
 
+/// Parse the `expiry-date` value carried by a persisted `x-amz-restore` header.
+///
+/// RustFS has always serialized this field as RFC3339, while MinIO (and any
+/// object migrated in place from a MinIO deployment) writes Go's
+/// `http.TimeFormat` — RFC1123 with a literal `GMT` zone. Accept both shapes
+/// so a migrated "restored" object stays readable.
+///
+/// This is not only a HEAD 500: `is_restored_object_on_disk` fails open when
+/// the header cannot be parsed, and `MetaObject::uses_data_dir` falls back to
+/// it, so an unparseable restore header makes a live restored data dir look
+/// unused (backlog#1342).
+///
+/// The write side deliberately stays on RFC3339 for now: an older node only
+/// parses RFC3339, so switching the persisted format before this parser is
+/// deployed everywhere would break rolling upgrades and rollbacks in the
+/// opposite direction.
+fn parse_restore_expiry_date(value: &str) -> Result<OffsetDateTime> {
+    if let Ok(expiry) = OffsetDateTime::parse(value, &Rfc3339) {
+        return Ok(expiry);
+    }
+    PrimitiveDateTime::parse(value, &RFC1123)
+        .map(PrimitiveDateTime::assume_utc)
+        .map_err(|_| Error::other(ERR_RESTORE_HDR_MALFORMED))
+}
+
 pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
     let tokens: Vec<&str> = restore_hdr.splitn(2, ",").collect();
     let progress_tokens: Vec<&str> = tokens[0].splitn(2, "=").collect();
@@ -1445,8 +1470,7 @@ pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
             if expiry_tokens[0].trim() != "expiry-date" {
                 return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
             }
-            let expiry = OffsetDateTime::parse(expiry_tokens[1].trim_matches('"'), &Rfc3339)
-                .map_err(|_| Error::other(ERR_RESTORE_HDR_MALFORMED))?;
+            let expiry = parse_restore_expiry_date(expiry_tokens[1].trim_matches('"'))?;
             return Ok(RestoreStatus {
                 is_restore_in_progress: Some(false),
                 restore_expiry_date: Some(Timestamp::from(expiry)),
@@ -1471,6 +1495,7 @@ mod tests {
     use super::*;
     use proptest::collection::{hash_map, vec};
     use proptest::prelude::*;
+    use time::macros::datetime;
 
     // backlog#959 / ECA-18: the interleaved per-block bitrot subsystem in
     // rustfs-ecstore (BitrotWriter / bitrot_verify / bitrot_shard_file_size) is
@@ -2684,5 +2709,71 @@ mod tests {
 
         let empty = FileInfo::default();
         assert!(format!("{empty:?}").contains("data: None"));
+    }
+
+    /// backlog#1342: MinIO writes the persisted `x-amz-restore` completion
+    /// header with Go's `http.TimeFormat` (RFC1123/GMT). Before this parser
+    /// accepted that shape, every object migrated in place from MinIO failed
+    /// `parse_restore_obj_status`.
+    #[test]
+    fn parses_minio_rfc1123_restore_expiry() {
+        let status = parse_restore_obj_status("ongoing-request=\"false\", expiry-date=\"Wed, 01 Jan 2025 10:20:30 GMT\"")
+            .expect("RFC1123 expiry-date must parse");
+        assert_eq!(status.is_restore_in_progress, Some(false));
+        let expiry = status.expiry().expect("completed restore carries an expiry");
+        assert_eq!(expiry, datetime!(2025-01-01 10:20:30 UTC));
+    }
+
+    /// The RustFS-written shape must keep parsing unchanged: the persisted
+    /// format stays RFC3339 until every node can read both.
+    #[test]
+    fn parses_rustfs_rfc3339_restore_expiry() {
+        let status = parse_restore_obj_status("ongoing-request=\"false\", expiry-date=\"2025-01-01T10:20:30Z\"")
+            .expect("RFC3339 expiry-date must parse");
+        assert_eq!(status.expiry(), Some(datetime!(2025-01-01 10:20:30 UTC)));
+    }
+
+    /// Round-trip both directions of the migration: what RustFS emits on the
+    /// wire (`to_string2`, RFC1123) and what it persists (`to_string`,
+    /// RFC3339) must both be readable by this parser.
+    #[test]
+    fn restore_status_round_trips_through_both_formats() {
+        let status = RestoreStatus {
+            is_restore_in_progress: Some(false),
+            restore_expiry_date: Some(Timestamp::from(datetime!(2030-06-15 07:08:09 UTC))),
+        };
+        for rendered in [RestoreStatusOps::to_string(&status), status.to_string2()] {
+            let parsed = parse_restore_obj_status(&rendered).unwrap_or_else(|e| panic!("{rendered} must parse: {e}"));
+            assert_eq!(parsed.expiry(), Some(datetime!(2030-06-15 07:08:09 UTC)), "{rendered}");
+        }
+    }
+
+    /// A restored object migrated from MinIO must still be recognised as
+    /// on-disk: `is_restored_object_on_disk` fails open, and
+    /// `MetaObject::uses_data_dir` uses it to decide whether a data dir is
+    /// live, so a parse failure here can make a live data dir look reclaimable.
+    #[test]
+    fn minio_restored_object_is_recognised_as_on_disk() {
+        let mut meta = HashMap::new();
+        meta.insert(
+            X_AMZ_RESTORE.as_str().to_string(),
+            "ongoing-request=\"false\", expiry-date=\"Fri, 01 Jan 9999 00:00:00 GMT\"".to_string(),
+        );
+        assert!(is_restored_object_on_disk(&meta));
+    }
+
+    /// Widening the accepted formats must not weaken malformed-input
+    /// rejection: an unparseable or non-GMT-shaped expiry still fails closed.
+    #[test]
+    fn rejects_malformed_restore_expiry() {
+        for header in [
+            "ongoing-request=\"false\", expiry-date=\"not-a-date\"",
+            "ongoing-request=\"false\", expiry-date=\"Wed, 01 Jan 2025 10:20:30\"",
+            "ongoing-request=\"false\", expiry-date=\"01 Jan 2025 10:20:30 GMT\"",
+            "ongoing-request=\"false\"",
+            "ongoing-request=\"false\", expires=\"2025-01-01T10:20:30Z\"",
+        ] {
+            assert!(parse_restore_obj_status(header).is_err(), "{header} must be rejected");
+        }
     }
 }
