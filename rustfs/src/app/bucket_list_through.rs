@@ -336,7 +336,7 @@ async fn fetch_source_page(
             delimiter: params.delimiter.as_deref(),
             // S3 ignores start-after once a continuation token is present, so
             // the client's own start-after only applies to the first page.
-            start_after: token.is_none().then(|| params.start_after_for_query.as_deref()).flatten(),
+            start_after: token.is_none().then_some(params.start_after_for_query.as_deref()).flatten(),
             continuation_token: token,
             max_keys: params.max_keys,
         },
@@ -363,9 +363,11 @@ async fn fetch_source_page(
         SourceListPlan::Folded { common_prefix, .. } => {
             let exists = !page.objects.is_empty() || !page.common_prefixes.is_empty();
             Ok((
-                exists
-                    .then(|| vec![SideEntry::Prefix(common_prefix.clone())])
-                    .unwrap_or_default(),
+                if exists {
+                    vec![SideEntry::Prefix(common_prefix.clone())]
+                } else {
+                    Vec::new()
+                },
                 false,
                 None,
             ))
