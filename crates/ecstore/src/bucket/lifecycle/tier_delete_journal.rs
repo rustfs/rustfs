@@ -2388,22 +2388,8 @@ async fn prepare_tier_delete_dispatch_inner(
                         return Err(Error::other("a tier delete dispatch rollback is still in progress"));
                     }
                     TierDeleteDispatchManifestState::Aborted => {
-                        for name in &existing.journal_names {
-                            if read_tier_delete_journal_with_etag(api.clone(), name).await?.is_some() {
-                                return Err(Error::other("an aborted tier delete dispatch still owns journal records"));
-                            }
-                        }
-                        let data = encode_tier_delete_dispatch_manifest(&existing)?;
-                        let fences_current = || {
-                            !bucket_fence.is_lock_lost()
-                                && !operation_guard.is_lock_lost()
-                                && tier_delete_journal_fleet_proof_matches(&fleet_proof)
-                                && tier_delete_journal_topology_generation(&fleet_proof) == existing.topology_generation
-                        };
-                        match delete_durable_config_if_match(api.clone(), &manifest_name, &data, &etag, &fences_current).await {
-                            Ok(()) | Err(Error::ConfigNotFound) | Err(Error::PreconditionFailed) => continue,
-                            Err(err) => return Err(err),
-                        }
+                        schedule_aborted_tier_delete_dispatch_cleanup(api.clone(), manifest_name.clone());
+                        return Err(Error::other("an aborted tier delete dispatch is awaiting bounded recovery cleanup"));
                     }
                 }
             }
@@ -4193,6 +4179,15 @@ async fn schedule_tier_delete_dispatch_manifest_recovery(
     }
 }
 
+fn schedule_aborted_tier_delete_dispatch_cleanup(api: Arc<ECStore>, manifest_name: String) {
+    api.ctx.wake_tier_delete_journal_recovery();
+    tokio::spawn(async move {
+        let _ =
+            schedule_tier_delete_dispatch_manifest_recovery(api, manifest_name, TIER_DELETE_DISPATCH_MANIFEST_RECOVERY_TIMEOUT)
+                .await;
+    });
+}
+
 #[cfg(all(test, feature = "test-util"))]
 pub(crate) async fn recover_test_tier_delete_dispatch_manifest_with_page_budget(
     api: Arc<ECStore>,
@@ -4474,18 +4469,11 @@ pub async fn run_tier_delete_journal_recovery_loop(api: Arc<ECStore>, cancel_tok
     let mut manifest_marker: Option<String> = None;
 
     loop {
-        #[cfg(test)]
         tokio::select! {
             biased;
             _ = cancel_token.cancelled() => return,
             _ = interval.tick() => {},
             _ = api.ctx.wait_for_tier_delete_journal_recovery() => {},
-        }
-        #[cfg(not(test))]
-        tokio::select! {
-            biased;
-            _ = cancel_token.cancelled() => return,
-            _ = interval.tick() => {},
         }
 
         let manifest_recovery = recover_tier_delete_dispatch_manifests(

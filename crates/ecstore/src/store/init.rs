@@ -9066,6 +9066,107 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn aborted_dispatch_retry_defers_residual_scan_to_recovery() {
+        const JOURNAL_COUNT: usize = 65;
+
+        let temp_dir = tempfile::tempdir().expect("create aborted retry store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "aborted-dispatch-retry", &[4])).await;
+        shutdown.cancel();
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "aborted-dispatch-retry-bucket";
+        let prefix = "archive/";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("aborted retry bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("aborted retry bucket incarnation should resolve");
+        let tier_name = "ABORTED-DISPATCH-RETRY";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("aborted retry tier lease should resolve")
+            .backend_identity();
+        let aborted_entries = (0..JOURNAL_COUNT)
+            .map(|index| {
+                (
+                    synthetic_v6_dispatch_entry(
+                        bucket,
+                        &format!("{prefix}{index:06}.bin"),
+                        tier_name,
+                        identity,
+                        &uuid::Uuid::new_v4().to_string(),
+                    ),
+                    Some(TierDeleteJournalState::Prepared),
+                )
+            })
+            .collect::<Vec<_>>();
+        let entries = aborted_entries.iter().map(|(entry, _)| entry.clone()).collect::<Vec<_>>();
+        let (manifest_name, _) = install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            prefix,
+            aborted_entries,
+            TierDeleteDispatchManifestState::Aborted,
+        )
+        .await
+        .expect("Aborted retry fixture should persist");
+
+        let lifecycle_guard = store
+            .acquire_bucket_lifecycle_write_lock(bucket)
+            .await
+            .expect("aborted retry should acquire the bucket lifecycle fence");
+        let mut fence_opts = ObjectOptions::default();
+        fence_opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
+        let bucket_fence = fence_opts
+            .bucket_lifecycle_lock_fence
+            .clone()
+            .expect("aborted retry should capture the bucket lifecycle fence");
+        let fleet_proof = acquire_tier_delete_journal_fleet_proof().expect("aborted retry fixture should have a fleet proof");
+        let hook = TierDeleteDispatchMemberReadTestHook::install_pause(TierDeleteDispatchMemberReadTestStage::Validation);
+
+        let error =
+            match prepare_tier_delete_dispatch(store.clone(), bucket, incarnation, prefix, entries, fleet_proof, &bucket_fence)
+                .await
+            {
+                Ok(_) => panic!("an Aborted manifest must be retained for bounded recovery cleanup"),
+                Err(err) => err,
+            };
+
+        assert!(
+            error.to_string().contains("bounded recovery cleanup"),
+            "unexpected aborted retry error: {error}"
+        );
+        assert_eq!(
+            hook.entry_count(),
+            0,
+            "request retry must not scan the retained Aborted journal set under bucket write lock"
+        );
+        assert_eq!(
+            test_tier_delete_dispatch_manifest_state(store.clone(), &manifest_name)
+                .await
+                .expect("retained Aborted manifest should remain readable"),
+            Some(TierDeleteDispatchManifestState::Aborted)
+        );
+        assert_eq!(tier_delete_journal_count(store.clone()).await, JOURNAL_COUNT);
+        assert_eq!(backend.remove_count().await, 0, "retry must not call the remote tier");
+        drop(hook);
+        drop(lifecycle_guard);
+
+        recover_test_tier_delete_dispatch_manifest(store.clone(), &manifest_name)
+            .await
+            .expect("bounded recovery should clean the retained Aborted manifest");
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        assert_eq!(tier_delete_dispatch_manifest_count(store).await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn dispatch_manifest_page_timeout_detaches_one_deduplicated_worker_until_convergence() {
         let temp_dir = tempfile::tempdir().expect("create detached rollback store dir");
         let (ctx, store, _shutdown) =
