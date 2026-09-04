@@ -22,7 +22,7 @@ pub(crate) use rustfs_ecstore::api::bucket::lifecycle::{
     },
     lifecycle::{Event as LcEvent, IlmAction, TRANSITION_PENDING, TransitionOptions},
 };
-pub(crate) use rustfs_ecstore::api::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
+pub(crate) use rustfs_ecstore::api::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG};
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
     get as get_bucket_metadata, init_bucket_metadata_sys, update as update_bucket_metadata,
 };
@@ -50,13 +50,13 @@ pub(crate) mod lifecycle {
     };
 
     pub(crate) use super::{
-        BUCKET_LIFECYCLE_CONFIG, BucketVersioningSys, DeleteAfterObjectLockSnapshotBarrier, DiskOption, ECStore, EcstoreError,
-        Endpoint, EndpointServerPools, Endpoints, ExpiryState, IlmAction, LcEvent, LcEventSrc, MockWarmBackend, PoolEndpoints,
-        STORAGE_FORMAT_FILE, TRANSITION_PENDING, TransitionCleanupStoreBarrier, TransitionOptions,
-        assert_transition_meta_consistent, enqueue_transition_for_existing_objects, expire_transitioned_object,
-        free_version_count, get_bucket_metadata, get_global_tier_config_mgr, init_background_expiry, init_bucket_metadata_sys,
-        init_local_disks, is_err_object_not_found, is_err_version_not_found, new_disk, path2_bucket_object_with_base_path,
-        recover_transition_transaction_records, recover_transition_transaction_records_at, register_mock_tier_util,
-        update_bucket_metadata, wait_for_free_version_absence,
+        BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG, BucketVersioningSys, DeleteAfterObjectLockSnapshotBarrier, DiskOption,
+        ECStore, EcstoreError, Endpoint, EndpointServerPools, Endpoints, ExpiryState, IlmAction, LcEvent, LcEventSrc,
+        MockWarmBackend, PoolEndpoints, STORAGE_FORMAT_FILE, TRANSITION_PENDING, TransitionCleanupStoreBarrier,
+        TransitionOptions, assert_transition_meta_consistent, enqueue_transition_for_existing_objects,
+        expire_transitioned_object, free_version_count, get_bucket_metadata, get_global_tier_config_mgr, init_background_expiry,
+        init_bucket_metadata_sys, init_local_disks, is_err_object_not_found, is_err_version_not_found, new_disk,
+        path2_bucket_object_with_base_path, recover_transition_transaction_records, recover_transition_transaction_records_at,
+        register_mock_tier_util, update_bucket_metadata, wait_for_free_version_absence,
     };
 }

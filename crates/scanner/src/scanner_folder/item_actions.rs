@@ -819,14 +819,15 @@ impl ScannerItem {
                                 }
                             }
                             IlmAction::DeleteVersionAction => {
-                                if let Some(opt) = object_opts.get(i) {
-                                    to_delete_objs.push(ObjectToDelete {
-                                        object_name: opt.name.clone(),
-                                        version_id: opt.version_id,
-                                        ..Default::default()
-                                    });
+                                if let Some(target) = ecstore_lifecycle_version_delete_target(oi) {
+                                    to_delete_objs.push(target);
                                     noncurrent_events.push(event.clone());
                                     noncurrent_unknown.push(oi);
+                                } else {
+                                    if let SizeResolution::Unknown { physical, .. } = &resolved_sizes[i] {
+                                        self.heal_actions(oi, *physical, size_summary).await;
+                                    }
+                                    size_summary.actions_accounting_unknown(oi);
                                 }
                             }
                             IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
@@ -933,12 +934,8 @@ impl ScannerItem {
                         }
                     }
                     IlmAction::DeleteVersionAction => {
-                        if let Some(opt) = object_opts.get(i) {
-                            to_delete_objs.push(ObjectToDelete {
-                                object_name: opt.name.clone(),
-                                version_id: opt.version_id,
-                                ..Default::default()
-                            });
+                        if let Some(target) = ecstore_lifecycle_version_delete_target(oi) {
+                            to_delete_objs.push(target);
                             if let Some(actual_size) = known_size {
                                 noncurrent_accounting.push(PendingScannerAccounting {
                                     object: oi,
@@ -947,8 +944,8 @@ impl ScannerItem {
                                 });
                             }
                             account_now = false;
+                            noncurrent_events.push(event.clone());
                         }
-                        noncurrent_events.push(event.clone());
                     }
                     IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
                         debug!(

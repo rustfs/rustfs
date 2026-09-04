@@ -7752,7 +7752,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let marker_delete = dobj.version_id.is_none() || dobj.synthetic_version_id;
             let replication_needs_source = replicate_delete
                 && (!marker_delete || delete_config_snapshot.active_delete_marker_rules_require_tags(&replication_object_name));
-            let (goi, gerr) = if object_lock_check_required || replication_needs_source || opts.tier_delete_journal_api.is_some()
+            let (goi, gerr) = if object_lock_check_required
+                || replication_needs_source
+                || opts.tier_delete_journal_api.is_some()
+                || dobj.expected_identity.is_some()
             {
                 let (goi, _write_quorum, gerr) = self.get_object_info_and_quorum(bucket, &dobj.object_name, &check_opts).await;
                 (goi, gerr)
@@ -7762,6 +7765,19 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let source_missing = gerr
                 .as_ref()
                 .is_some_and(|err| is_err_object_not_found(err) || is_err_version_not_found(err));
+            // A pool-local miss keeps the existing idempotent batch-delete
+            // semantics. Exact-version deletes fan out to every pool, and a
+            // retry may also arrive after the intended generation is gone.
+            // Only a concrete generation with a different identity is stale.
+            if let Some(expected) = dobj.expected_identity
+                && (gerr.is_none() || matches!(gerr.as_ref(), Some(StorageError::MethodNotAllowed)))
+                && (goi.data_dir != expected.data_dir
+                    || goi.mod_time != expected.mod_time
+                    || goi.delete_marker != expected.delete_marker)
+            {
+                del_errs[i] = Some(StorageError::PreconditionFailed);
+                continue;
+            }
             // Resolve accounting from the generation selected under this
             // object's write lock. A request-layer pre-stat is only an
             // optimization and cannot identify a concurrent overwrite.
