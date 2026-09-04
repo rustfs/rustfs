@@ -1417,7 +1417,7 @@ mod tests {
         let initial_intent = tier_probe_intent_fixture();
         let initial = tier_probe_checkpoint(&initial_intent);
 
-        let mut uploaded_intent = initial_intent.clone();
+        let mut uploaded_intent = initial_intent;
         uploaded_intent
             .advance(
                 tier_probe_intent::TierProbeIntentState::Uploaded,

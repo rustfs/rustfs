@@ -1001,7 +1001,7 @@ mod tests {
             ))
         ));
 
-        let mut terminal = initial.clone();
+        let mut terminal = initial;
         terminal
             .advance(TierProbeIntentState::AbortedNoRemote, TierProbeRemoteVersion::default())
             .expect("missing candidate should terminalize");
@@ -1045,7 +1045,7 @@ mod tests {
                 if schema == "rustfs-tier-probe-intent-v999"
         ));
 
-        let mut exact_limit = encoded.clone();
+        let mut exact_limit = encoded;
         exact_limit.resize(MAX_TIER_PROBE_INTENT_SIZE, b' ');
         assert_eq!(exact_limit.len(), MAX_TIER_PROBE_INTENT_SIZE);
         assert_eq!(
