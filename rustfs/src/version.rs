@@ -14,8 +14,6 @@
 
 use const_str::concat;
 use shadow_rs::shadow;
-use std::path::Path;
-use std::process::Command;
 
 shadow!(build);
 
@@ -47,10 +45,6 @@ pub const DISPLAY_VERSION: &str = {
 
 type VersionParseResult = Result<(u32, u32, u32, Option<String>), Box<dyn std::error::Error>>;
 
-fn build_version_override() -> Option<&'static str> {
-    BUILD_VERSION_OVERRIDE.filter(|version| !version.is_empty())
-}
-
 fn version_ref(version: &str) -> String {
     if version.starts_with("refs/tags/") || version.starts_with('@') {
         version.to_string()
@@ -61,91 +55,7 @@ fn version_ref(version: &str) -> String {
 
 #[allow(clippy::const_is_empty)]
 pub fn get_version() -> String {
-    if let Some(version) = build_version_override() {
-        return version_ref(version);
-    }
-
-    // Get the latest tag
-    if let Ok(latest_tag) = get_latest_tag() {
-        // Check if current commit is newer than the latest tag
-        if is_head_newer_than_tag(&latest_tag) {
-            // If current commit is newer, increment the version number
-            if let Ok(new_version) = increment_version(&latest_tag) {
-                return format!("refs/tags/{new_version}");
-            }
-        }
-
-        // If current commit is the latest tag, or version increment failed, return current tag
-        return format!("refs/tags/{latest_tag}");
-    }
-
-    // If no tag exists, use original logic
-    if !build::TAG.is_empty() {
-        format!("refs/tags/{}", build::TAG)
-    } else if !build::SHORT_COMMIT.is_empty() {
-        format!("@{}", build::SHORT_COMMIT)
-    } else {
-        format!("refs/tags/{}", build::PKG_VERSION)
-    }
-}
-
-/// Get the latest git tag
-fn get_latest_tag() -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("git").args(["describe", "--tags", "--abbrev=0"]).output()?;
-
-    if output.status.success() {
-        let tag = String::from_utf8(output.stdout)?;
-        Ok(tag.trim().to_string())
-    } else {
-        Err("Failed to get latest tag".into())
-    }
-}
-
-/// Check if current HEAD is newer than specified tag
-fn is_head_newer_than_tag(tag: &str) -> bool {
-    is_head_newer_than_tag_in(Path::new("."), tag)
-}
-
-fn is_head_newer_than_tag_in(repo: &Path, tag: &str) -> bool {
-    let head = Command::new("git").current_dir(repo).args(["rev-parse", "HEAD"]).output();
-    let tag_commit = Command::new("git")
-        .current_dir(repo)
-        .args(["rev-list", "-n", "1", tag])
-        .output();
-
-    let (Ok(head), Ok(tag_commit)) = (head, tag_commit) else {
-        return false;
-    };
-
-    if !head.status.success() || !tag_commit.status.success() || head.stdout == tag_commit.stdout {
-        return false;
-    }
-
-    let output = Command::new("git")
-        .current_dir(repo)
-        .args(["merge-base", "--is-ancestor", tag, "HEAD"])
-        .output();
-
-    match output {
-        Ok(result) => result.status.success(),
-        Err(_) => false,
-    }
-}
-
-/// Increment version number (increase patch version)
-fn increment_version(version: &str) -> Result<String, Box<dyn std::error::Error>> {
-    // Parse version number, e.g. "1.0.0-alpha.19" -> (1, 0, 0, Some("alpha.19"))
-    let (major, minor, patch, pre_release) = parse_version(version)?;
-
-    // If there's a pre-release identifier, increment the pre-release version number
-    if let Some(pre) = pre_release
-        && let Some(new_pre) = increment_pre_release(&pre)
-    {
-        return Ok(format!("{major}.{minor}.{patch}-{new_pre}"));
-    }
-
-    // Otherwise increment patch version number
-    Ok(format!("{major}.{minor}.{}", patch + 1))
+    version_ref(DISPLAY_VERSION)
 }
 
 /// Parse version number
@@ -164,28 +74,6 @@ pub fn parse_version(version: &str) -> VersionParseResult {
     let patch: u32 = version_parts[2].parse()?;
 
     Ok((major, minor, patch, pre_release))
-}
-
-/// Increment pre-release version number
-fn increment_pre_release(pre_release: &str) -> Option<String> {
-    // Handle pre-release versions like "alpha.19"
-    let parts: Vec<&str> = pre_release.split('.').collect();
-    if parts.len() == 2
-        && let Ok(num) = parts[1].parse::<u32>()
-    {
-        return Some(format!("{}.{}", parts[0], num + 1));
-    }
-
-    // Handle pre-release versions like "alpha19"
-    if let Some(pos) = pre_release.rfind(|c: char| c.is_alphabetic()) {
-        let prefix = &pre_release[..=pos];
-        let suffix = &pre_release[pos + 1..];
-        if let Ok(num) = suffix.parse::<u32>() {
-            return Some(format!("{prefix}{}", num + 1));
-        }
-    }
-
-    None
 }
 
 /// Clean version string - removes common prefixes
@@ -284,39 +172,16 @@ mod tests {
     use super::*;
     use tracing::debug;
 
-    fn run_git(repo: &Path, args: &[&str]) {
-        let status = Command::new("git").current_dir(repo).args(args).status().unwrap();
-        assert!(status.success(), "git command failed: git {}", args.join(" "));
-    }
-
-    #[test]
-    fn test_is_head_newer_than_tag_requires_strict_descendant() {
-        let repo = tempfile::tempdir().unwrap();
-        run_git(repo.path(), &["init", "--quiet"]);
-        run_git(repo.path(), &["config", "user.name", "RustFS Tests"]);
-        run_git(repo.path(), &["config", "user.email", "rustfs@example.com"]);
-        run_git(repo.path(), &["commit", "--allow-empty", "--quiet", "-m", "tagged commit"]);
-        run_git(repo.path(), &["tag", "--annotate", "1.2.3", "--message", "1.2.3"]);
-
-        assert!(!is_head_newer_than_tag_in(repo.path(), "1.2.3"));
-
-        run_git(repo.path(), &["commit", "--allow-empty", "--quiet", "-m", "newer commit"]);
-
-        assert!(is_head_newer_than_tag_in(repo.path(), "1.2.3"));
-    }
-
-    #[test]
-    fn build_version_override_is_used_for_current_version_when_set() {
-        if let Some(version) = build_version_override() {
-            assert_eq!(get_version(), version_ref(version));
-        }
-    }
-
     #[test]
     fn version_ref_keeps_existing_ref_prefixes() {
         assert_eq!(version_ref("1.2.3"), "refs/tags/1.2.3");
         assert_eq!(version_ref("refs/tags/1.2.3"), "refs/tags/1.2.3");
         assert_eq!(version_ref("@abc123"), "@abc123");
+    }
+
+    #[test]
+    fn get_version_uses_build_metadata() {
+        assert_eq!(get_version(), version_ref(DISPLAY_VERSION));
     }
 
     #[test]
@@ -334,27 +199,6 @@ mod tests {
         assert_eq!(minor, 0);
         assert_eq!(patch, 0);
         assert_eq!(pre_release, Some("alpha.19".to_string()));
-    }
-
-    #[test]
-    fn test_increment_pre_release() {
-        // Test alpha.19 -> alpha.20
-        assert_eq!(increment_pre_release("alpha.19"), Some("alpha.20".to_string()));
-
-        // Test beta.5 -> beta.6
-        assert_eq!(increment_pre_release("beta.5"), Some("beta.6".to_string()));
-
-        // Test unparsable case
-        assert_eq!(increment_pre_release("unknown"), None);
-    }
-
-    #[test]
-    fn test_increment_version() {
-        // Test pre-release version increment
-        assert_eq!(increment_version("1.0.0-alpha.19").unwrap(), "1.0.0-alpha.20");
-
-        // Test standard version increment
-        assert_eq!(increment_version("1.0.0").unwrap(), "1.0.1");
     }
 
     #[test]
