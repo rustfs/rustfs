@@ -34,7 +34,23 @@ pub async fn delete_object_versions(
     to_del: &[ObjectToDelete],
     _lc_event: lifecycle::Event,
     bucket_incarnation_id: Uuid,
-) {
+) -> usize {
+    if to_del.iter().any(|target| {
+        target.version_id.is_none()
+            || (target.version_id.is_some_and(|version_id| version_id.is_nil()) && target.expected_identity.is_none())
+    }) {
+        debug!(
+            event = EVENT_LIFECYCLE_CLEANUP_SKIPPED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            bucket,
+            target_count = to_del.len(),
+            reason = "incomplete_version_identity",
+            "Skipped lifecycle noncurrent version cleanup"
+        );
+        return to_del.len();
+    }
+
     let delete_config_snapshot = match ReplicationObjectBridge::delete_request_config(api, bucket).await {
         Ok(snapshot) => Arc::new(snapshot),
         Err(err) => {
@@ -47,10 +63,11 @@ pub async fn delete_object_versions(
                 reason = "delete_config_snapshot_unavailable",
                 "Skipped lifecycle noncurrent version cleanup"
             );
-            return;
+            return to_del.len();
         }
     };
     let mut remaining = to_del;
+    let mut failed = 0;
     loop {
         let mut to_del = remaining;
         if to_del.len() > MAX_DELETE_LIST {
@@ -71,6 +88,7 @@ pub async fn delete_object_versions(
                 },
             )
             .await;
+        failed += errors.iter().filter(|err| err.is_some()).count();
 
         for (i, deleted_obj) in deleted_objs.iter_mut().enumerate() {
             if errors.get(i).and_then(|err| err.as_ref()).is_some() {
@@ -111,4 +129,5 @@ pub async fn delete_object_versions(
             break;
         }
     }
+    failed
 }

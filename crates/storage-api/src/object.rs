@@ -187,10 +187,25 @@ pub enum WalkVersionsSortOrder {
     Descending,
 }
 
+/// In-memory compare-and-set identity for a queued exact-version delete.
+///
+/// `version_id` identifies the S3 version while these fields identify the
+/// concrete generation observed before the delete was queued. This matters for
+/// the reusable null version ID in versioning-suspended buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectToDeleteIdentity {
+    pub data_dir: Option<Uuid>,
+    pub mod_time: Option<OffsetDateTime>,
+    pub delete_marker: bool,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ObjectToDelete {
     pub object_name: String,
     pub version_id: Option<Uuid>,
+    /// RustFS-only precondition checked under the object write lock.
+    #[doc(hidden)]
+    pub expected_identity: Option<ObjectToDeleteIdentity>,
     pub synthetic_version_id: bool,
     pub delete_marker_replication_status: Option<String>,
     pub version_purge_status: Option<VersionPurgeStatusType>,
@@ -199,6 +214,20 @@ pub struct ObjectToDelete {
 }
 
 impl ObjectToDelete {
+    pub fn with_expected_identity(
+        mut self,
+        data_dir: Option<Uuid>,
+        mod_time: Option<OffsetDateTime>,
+        delete_marker: bool,
+    ) -> Self {
+        self.expected_identity = Some(ObjectToDeleteIdentity {
+            data_dir,
+            mod_time,
+            delete_marker,
+        });
+        self
+    }
+
     pub fn replication_state(&self) -> ReplicationState {
         ReplicationState {
             replication_status_internal: self.delete_marker_replication_status.clone(),

@@ -7551,6 +7551,96 @@ mod tests {
         assert!(error.is_none());
     }
 
+    #[tokio::test]
+    async fn lifecycle_null_version_cas_distinguishes_absent_and_replacement_pools() {
+        use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
+
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_first_dirs, first_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let (_second_dirs, second_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let store = new_prepared_reader_test_store_with_ctx(&[Arc::clone(&first_set), Arc::clone(&second_set)], ctx).await;
+        let bucket = RUSTFS_META_BUCKET;
+        let suspended_snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
+            VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
+                ..Default::default()
+            },
+            None,
+        ));
+        let write_opts = ObjectOptions {
+            no_lock: true,
+            version_suspended: true,
+            ..Default::default()
+        };
+        let delete_opts = ObjectOptions {
+            version_suspended: true,
+            delete_replication_config_snapshot: Some(Arc::clone(&suspended_snapshot)),
+            ..Default::default()
+        };
+
+        let success_object = "lifecycle-null-only-in-first-pool";
+        let mut success_reader = PutObjReader::from_vec(b"single-pool null generation".to_vec());
+        let success_source = first_set
+            .put_object(bucket, success_object, &mut success_reader, &write_opts)
+            .await
+            .expect("the historical null generation should be written to one pool");
+        let success_target = crate::bucket::lifecycle::bucket_lifecycle_ops::lifecycle_version_delete_target(&success_source)
+            .expect("the null generation should produce an exact lifecycle target");
+
+        let (deleted, errors) = store
+            .handle_delete_objects(bucket, vec![success_target.clone()], delete_opts.clone())
+            .await;
+        assert!(
+            errors.iter().all(Option::is_none),
+            "an absent peer pool must not override success: {errors:?}"
+        );
+        assert!(deleted[0].found, "the pool containing the exact null generation must report success");
+
+        let (deleted, errors) = store
+            .handle_delete_objects(bucket, vec![success_target], delete_opts.clone())
+            .await;
+        assert!(
+            errors.iter().all(Option::is_none),
+            "an exact lifecycle delete retry must be idempotent: {errors:?}"
+        );
+        assert!(!deleted[0].found, "the retried generation should already be absent from every pool");
+
+        let mismatch_object = "lifecycle-null-replaced-in-second-pool";
+        let mut original_reader = PutObjReader::from_vec(b"original null generation".to_vec());
+        let original = first_set
+            .put_object(bucket, mismatch_object, &mut original_reader, &write_opts)
+            .await
+            .expect("the original null generation should be written to the first pool");
+        let stale_target = crate::bucket::lifecycle::bucket_lifecycle_ops::lifecycle_version_delete_target(&original)
+            .expect("the original null generation should produce an exact lifecycle target");
+        let mut replacement_reader = PutObjReader::from_vec(b"replacement null generation".to_vec());
+        let replacement = second_set
+            .put_object(bucket, mismatch_object, &mut replacement_reader, &write_opts)
+            .await
+            .expect("the replacement null generation should be written to the second pool");
+        assert_ne!(original.data_dir, replacement.data_dir);
+
+        let (_deleted, errors) = store.handle_delete_objects(bucket, vec![stale_target], delete_opts).await;
+        assert!(
+            matches!(errors.as_slice(), [Some(StorageError::PreconditionFailed)]),
+            "a different null generation in any pool must fail the aggregate CAS: {errors:?}"
+        );
+        let retained = second_set
+            .get_object_info(
+                bucket,
+                mismatch_object,
+                &ObjectOptions {
+                    version_id: Some(Uuid::nil().to_string()),
+                    version_suspended: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the replacement null generation must remain after a stale CAS");
+        assert_eq!(retained.data_dir, replacement.data_dir);
+    }
+
     #[test]
     fn data_movement_pool_lookup_opts_keeps_no_lock_for_tiered_moves() {
         let lookup_opts = data_movement_pool_lookup_opts(
