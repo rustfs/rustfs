@@ -62,12 +62,27 @@ const REMOTE_VERSION_STATE_PROOF_TTL: Duration = Duration::from_secs(30);
 const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 2;
 const TIER_DELETE_JOURNAL_POLICY_SUPPORTED_VERSION: u32 = 3;
 const DECOMMISSION_TARGET_FENCE_POLICY_SUPPORTED_VERSION: u32 = 4;
+// Keep this synchronized with the version served by node_service. Including
+// the local member in the minimum prevents an older coordinator from
+// self-authorizing a policy implemented only by newer remote peers.
+const LOCAL_CROSS_POOL_FENCE_POLICY_SUPPORTED_VERSION: u32 = 4;
+/// Version 5 is reserved for a fleet whose every metadata writer preserves
+/// explicit transition version state and destination identity, and implements
+/// conditional per-generation `xl.meta` writes with strong readback. The node
+/// service must not advertise this version until the conditional writer from
+/// rustfs/backlog#684 is available.
+const LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION: u32 = 5;
 type CrossPoolFencePolicyResult = Result<BTreeMap<String, Uuid>>;
 
 fn cross_pool_fence_policy_results(
     peer_epochs: BTreeMap<String, Uuid>,
     minimum_version: u32,
-) -> (CrossPoolFencePolicyResult, CrossPoolFencePolicyResult, CrossPoolFencePolicyResult) {
+) -> (
+    CrossPoolFencePolicyResult,
+    CrossPoolFencePolicyResult,
+    CrossPoolFencePolicyResult,
+    CrossPoolFencePolicyResult,
+) {
     let journal_result = if minimum_version >= TIER_DELETE_JOURNAL_POLICY_SUPPORTED_VERSION {
         Ok(peer_epochs.clone())
     } else {
@@ -78,7 +93,18 @@ fn cross_pool_fence_policy_results(
     } else {
         Err(Error::other("decommission target fence policy capability version is unsupported"))
     };
-    (Ok(peer_epochs), journal_result, decommission_target_fence_result)
+    let legacy_transition_state_reconcile_result =
+        if minimum_version >= LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION {
+            Ok(peer_epochs.clone())
+        } else {
+            Err(Error::other("legacy transition state reconcile policy capability version is unsupported"))
+        };
+    (
+        Ok(peer_epochs),
+        journal_result,
+        decommission_target_fence_result,
+        legacy_transition_state_reconcile_result,
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -252,10 +278,21 @@ pub(crate) struct TierDeleteJournalFleetProofToken {
     _permit: FleetCapabilityProofPermit,
 }
 
+/// Effect-window authority for one legacy transition-state reconciliation.
+///
+/// The token intentionally cannot be cloned. Its permit keeps the admitted
+/// fleet generation alive until the caller finishes the final strong
+/// readback, while revocation makes every later validation fail immediately.
+pub struct LegacyTransitionStateReconcileFleetProofToken {
+    token: FleetCapabilityProofToken,
+    _permit: FleetCapabilityProofPermit,
+}
+
 static REMOTE_VERSION_STATE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static CROSS_POOL_FENCE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static TIER_DELETE_JOURNAL_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static DECOMMISSION_TARGET_FENCE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
+static LEGACY_TRANSITION_STATE_RECONCILE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static REMOTE_VERSION_STATE_PROBE_TOPOLOGY: OnceLock<String> = OnceLock::new();
 
 fn cross_pool_fence_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
@@ -272,6 +309,10 @@ fn tier_delete_journal_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCap
 
 fn decommission_target_fence_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
     DECOMMISSION_TARGET_FENCE_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
+}
+
+fn legacy_transition_state_reconcile_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
+    LEGACY_TRANSITION_STATE_RECONCILE_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
 }
 
 fn revoke_fleet_capability_proof_state(state: &mut FleetCapabilityProofState) {
@@ -442,6 +483,125 @@ fn tier_delete_journal_fleet_proof_matches_at(
 
 pub(crate) fn tier_delete_journal_topology_generation(proof: &TierDeleteJournalFleetProofToken) -> String {
     stable_tier_delete_journal_topology_generation(&proof.token.topology_fingerprint)
+}
+
+/// Acquire one non-cloneable authority that must span the complete reconcile
+/// effect window, including its final strong readback.
+pub async fn acquire_legacy_transition_state_reconcile_fleet_proof() -> Option<LegacyTransitionStateReconcileFleetProofToken> {
+    let expected_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get()?;
+    let proof = {
+        let state = legacy_transition_state_reconcile_fleet_proof_slot()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, expected_topology, Instant::now())?
+    };
+    let observed_peer_epochs = observe_legacy_transition_state_reconcile_fleet(expected_topology).await?;
+    let state = legacy_transition_state_reconcile_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    legacy_transition_state_reconcile_fleet_proof_matches_observation_at(
+        &state,
+        &proof,
+        expected_topology,
+        &observed_peer_epochs,
+        Instant::now(),
+    )
+    .then_some(proof)
+}
+
+fn acquire_legacy_transition_state_reconcile_fleet_proof_from(
+    state: &FleetCapabilityProofState,
+    expected_topology: &str,
+    now: Instant,
+) -> Option<LegacyTransitionStateReconcileFleetProofToken> {
+    let token = acquire_fleet_capability_proof_from(state, expected_topology, now)?;
+    let permit = state.proof.as_ref()?.generation.try_acquire()?;
+    Some(LegacyTransitionStateReconcileFleetProofToken { token, _permit: permit })
+}
+
+async fn observe_legacy_transition_state_reconcile_fleet(expected_topology: &str) -> Option<BTreeMap<String, Uuid>> {
+    let notification_sys = get_global_notification_sys()?;
+    let (peer_epochs, minimum_version) = timeout(
+        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+        notification_sys.probe_cross_pool_fence_fleet(expected_topology),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let (_, _, _, reconcile_result) = cross_pool_fence_policy_results(peer_epochs, minimum_version);
+    reconcile_result.ok()
+}
+
+/// Revalidate the exact fleet generation captured by a reconcile token with a
+/// fresh synchronous observation. Callers must await this before each
+/// conditional metadata write and after the final strong readback.
+pub async fn legacy_transition_state_reconcile_fleet_proof_matches(
+    proof: &LegacyTransitionStateReconcileFleetProofToken,
+) -> bool {
+    let Some(expected_topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else {
+        return false;
+    };
+    legacy_transition_state_reconcile_fleet_proof_matches_with_observer(
+        legacy_transition_state_reconcile_fleet_proof_slot(),
+        proof,
+        expected_topology,
+        || observe_legacy_transition_state_reconcile_fleet(expected_topology),
+    )
+    .await
+}
+
+async fn legacy_transition_state_reconcile_fleet_proof_matches_with_observer<F, Fut>(
+    slot: &std::sync::RwLock<FleetCapabilityProofState>,
+    proof: &LegacyTransitionStateReconcileFleetProofToken,
+    expected_topology: &str,
+    observe: F,
+) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Option<BTreeMap<String, Uuid>>>,
+{
+    {
+        let state = slot.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !legacy_transition_state_reconcile_fleet_proof_matches_at(&state, proof, expected_topology, Instant::now()) {
+            return false;
+        }
+    }
+    let Some(observed_peer_epochs) = observe().await else {
+        return false;
+    };
+    let state = slot.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    legacy_transition_state_reconcile_fleet_proof_matches_observation_at(
+        &state,
+        proof,
+        expected_topology,
+        &observed_peer_epochs,
+        Instant::now(),
+    )
+}
+
+fn legacy_transition_state_reconcile_fleet_proof_matches_at(
+    state: &FleetCapabilityProofState,
+    proof: &LegacyTransitionStateReconcileFleetProofToken,
+    expected_topology: &str,
+    now: Instant,
+) -> bool {
+    proof._permit.generation.is_accepting()
+        && fleet_capability_proof_matches_at(state, &proof.token, expected_topology, now)
+        && state
+            .proof
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.generation, &proof._permit.generation))
+}
+
+fn legacy_transition_state_reconcile_fleet_proof_matches_observation_at(
+    state: &FleetCapabilityProofState,
+    proof: &LegacyTransitionStateReconcileFleetProofToken,
+    expected_topology: &str,
+    observed_peer_epochs: &BTreeMap<String, Uuid>,
+    now: Instant,
+) -> bool {
+    legacy_transition_state_reconcile_fleet_proof_matches_at(state, proof, expected_topology, now)
+        && proof.token.peer_epochs.as_ref() == observed_peer_epochs
 }
 
 #[cfg(all(test, feature = "test-util"))]
@@ -766,6 +926,7 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 cross_pool_fence_fleet_proof_slot(),
                 tier_delete_journal_fleet_proof_slot(),
                 decommission_target_fence_fleet_proof_slot(),
+                legacy_transition_state_reconcile_fleet_proof_slot(),
             ] {
                 mark_fleet_capability_topology_conflict(slot);
             }
@@ -798,11 +959,12 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 .unwrap_or_else(|_| Err(Error::other("cross-pool fence fleet capability probe timed out"))),
                 None => Err(Error::other("cross-pool fence fleet capability notification system is unavailable")),
             };
-            let (fence_result, journal_result, decommission_target_fence_result) = match fence_probe {
+            let (fence_result, journal_result, decommission_target_fence_result, reconcile_result) = match fence_probe {
                 Ok((peer_epochs, minimum_version)) => cross_pool_fence_policy_results(peer_epochs, minimum_version),
                 Err(err) => {
                     let message = err.to_string();
                     (
+                        Err(Error::other(message.clone())),
                         Err(Error::other(message.clone())),
                         Err(Error::other(message.clone())),
                         Err(Error::other(message)),
@@ -818,6 +980,7 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 revoke_fleet_capability_proof(cross_pool_fence_fleet_proof_slot());
                 revoke_fleet_capability_proof(tier_delete_journal_fleet_proof_slot());
                 revoke_fleet_capability_proof(decommission_target_fence_fleet_proof_slot());
+                revoke_fleet_capability_proof(legacy_transition_state_reconcile_fleet_proof_slot());
             } else if let Some(err) = publish_fleet_capability_probe_result(
                 remote_version_state_fleet_proof_slot(),
                 &topology_fingerprint,
@@ -875,6 +1038,24 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_NOTIFICATION,
                     capability = "decommission_target_fence_v2",
+                    state = "failed_closed",
+                    error = %err,
+                    "notification capability probe"
+                );
+            }
+            if !topology_conflict
+                && let Some(err) = publish_fleet_capability_probe_result(
+                    legacy_transition_state_reconcile_fleet_proof_slot(),
+                    &topology_fingerprint,
+                    reconcile_result,
+                    Instant::now(),
+                )
+            {
+                debug!(
+                    event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    capability = "legacy_transition_state_reconcile_v1",
                     state = "failed_closed",
                     error = %err,
                     "notification capability probe"
@@ -959,7 +1140,7 @@ impl NotificationSys {
             client.probe_cross_pool_fence(topology_fingerprint.to_string()).await
         });
         let mut peer_epochs = BTreeMap::new();
-        let mut minimum_version = u32::MAX;
+        let mut minimum_version = LOCAL_CROSS_POOL_FENCE_POLICY_SUPPORTED_VERSION;
         for result in join_all(probes).await {
             let (peer, version, epoch) = result?;
             if version < CROSS_POOL_FENCE_SUPPORTED_VERSION {
@@ -967,11 +1148,6 @@ impl NotificationSys {
             }
             minimum_version = minimum_version.min(version);
             insert_remote_version_state_peer(&mut peer_epochs, peer, epoch)?;
-        }
-        // A single-node deployment has no remote member to lower the local
-        // policy version advertised by this binary.
-        if minimum_version == u32::MAX {
-            minimum_version = DECOMMISSION_TARGET_FENCE_POLICY_SUPPORTED_VERSION;
         }
         Ok((peer_epochs, minimum_version))
     }
@@ -3190,20 +3366,36 @@ mod tests {
     #[test]
     fn cross_pool_policy_versions_authorize_only_their_supported_protocols() {
         let peers = BTreeMap::from([("node-b:9000".to_string(), Uuid::new_v4())]);
-        let (generic_v2, journal_v2, decommission_v2) = cross_pool_fence_policy_results(peers.clone(), 2);
+        let (generic_v2, journal_v2, decommission_v2, reconcile_v2) = cross_pool_fence_policy_results(peers.clone(), 2);
         assert!(generic_v2.is_ok(), "v2 remains valid for existing cross-pool fencing");
         assert!(journal_v2.is_err(), "a mixed v2/v3 fleet must fail closed for journal-v6 deletion");
         assert!(decommission_v2.is_err(), "v2 cannot authorize the sticky per-target decommission fence");
+        assert!(reconcile_v2.is_err(), "v2 cannot authorize legacy transition-state reconciliation");
 
-        let (generic_v3, journal_v3, decommission_v3) = cross_pool_fence_policy_results(peers.clone(), 3);
+        let (generic_v3, journal_v3, decommission_v3, reconcile_v3) = cross_pool_fence_policy_results(peers.clone(), 3);
         assert!(generic_v3.is_ok());
         assert!(journal_v3.is_ok(), "an all-v3 fleet may authorize journal-v6 deletion");
         assert!(decommission_v3.is_err(), "v3 members do not understand the per-target decommission fence");
+        assert!(reconcile_v3.is_err());
 
-        let (generic_v4, journal_v4, decommission_v4) = cross_pool_fence_policy_results(peers, 4);
+        let (generic_v4, journal_v4, decommission_v4, reconcile_v4) =
+            cross_pool_fence_policy_results(peers.clone(), LOCAL_CROSS_POOL_FENCE_POLICY_SUPPORTED_VERSION);
         assert!(generic_v4.is_ok());
         assert!(journal_v4.is_ok());
         assert!(decommission_v4.is_ok(), "an all-v4 fleet may create sticky per-target reservations");
+        assert!(
+            reconcile_v4.is_err(),
+            "the current local policy lacks the conditional xl.meta writer required by reconcile"
+        );
+
+        let (generic_v5, journal_v5, decommission_v5, reconcile_v5) = cross_pool_fence_policy_results(peers, 5);
+        assert!(generic_v5.is_ok());
+        assert!(journal_v5.is_ok());
+        assert!(decommission_v5.is_ok());
+        assert!(
+            reconcile_v5.is_ok(),
+            "only an all-v5 fleet preserves destination identity and conditional reconcile writes"
+        );
     }
 
     #[test]
@@ -3459,6 +3651,234 @@ mod tests {
     }
 
     #[test]
+    fn legacy_transition_state_reconcile_admits_only_compatible_single_and_multi_node_fleets() {
+        let now = Instant::now();
+        for peers in [
+            BTreeMap::new(),
+            BTreeMap::from([("peer-a".to_string(), Uuid::new_v4()), ("peer-b".to_string(), Uuid::new_v4())]),
+        ] {
+            let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+            let (_, _, _, result) =
+                cross_pool_fence_policy_results(peers, LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION);
+            assert!(publish_fleet_capability_probe_result(&slot, "topology-a", result, now).is_none());
+
+            let admitted = {
+                let state = slot.read().expect("reconcile proof slot should not poison");
+                acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                    .expect("an all-compatible fleet should admit reconciliation")
+            };
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            assert!(legacy_transition_state_reconcile_fleet_proof_matches_at(
+                &state,
+                &admitted,
+                "topology-a",
+                now,
+            ));
+        }
+    }
+
+    #[test]
+    fn legacy_transition_state_reconcile_restart_drains_concurrent_effect_windows() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let original_peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        let (_, _, _, original_result) =
+            cross_pool_fence_policy_results(original_peers, LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", original_result, now).is_none());
+
+        let (first, second) = {
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            (
+                acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                    .expect("the first reconcile writer should be admitted"),
+                acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                    .expect("the second reconcile writer should be admitted"),
+            )
+        };
+
+        let restarted_peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        let (_, _, _, restarted_result) =
+            cross_pool_fence_policy_results(restarted_peers.clone(), LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION);
+        let blocked =
+            publish_fleet_capability_probe_result(&slot, "topology-a", restarted_result, now + Duration::from_millis(1))
+                .expect("a restarted member must revoke the old generation and wait for both writers");
+        assert!(blocked.to_string().contains("previous generation to drain"));
+        {
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            assert!(state.proof.is_none());
+            assert!(state.draining_generation.is_some());
+            assert!(!legacy_transition_state_reconcile_fleet_proof_matches_at(
+                &state,
+                &first,
+                "topology-a",
+                now + Duration::from_millis(1),
+            ));
+            assert!(!legacy_transition_state_reconcile_fleet_proof_matches_at(
+                &state,
+                &second,
+                "topology-a",
+                now + Duration::from_millis(1),
+            ));
+        }
+
+        drop(first);
+        let (_, _, _, still_blocked_result) =
+            cross_pool_fence_policy_results(restarted_peers.clone(), LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION);
+        assert!(
+            publish_fleet_capability_probe_result(&slot, "topology-a", still_blocked_result, now + Duration::from_millis(2),)
+                .is_some(),
+            "one remaining writer must keep the successor generation closed"
+        );
+
+        drop(second);
+        let (_, _, _, admitted_result) =
+            cross_pool_fence_policy_results(restarted_peers, LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION);
+        assert!(
+            publish_fleet_capability_probe_result(&slot, "topology-a", admitted_result, now + Duration::from_millis(3),)
+                .is_none(),
+            "the restarted generation may publish only after every old writer drains"
+        );
+    }
+
+    #[test]
+    fn legacy_transition_state_reconcile_fresh_observation_closes_the_polling_window() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let original_peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        let (_, _, _, original_result) =
+            cross_pool_fence_policy_results(original_peers.clone(), LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", original_result, now).is_none());
+        let admitted = {
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                .expect("the original fleet should admit reconciliation")
+        };
+
+        let restarted_peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        let state = slot.read().expect("reconcile proof slot should not poison");
+        assert!(
+            legacy_transition_state_reconcile_fleet_proof_matches_at(&state, &admitted, "topology-a", now),
+            "the periodic cache has not observed the restart yet"
+        );
+        assert!(!legacy_transition_state_reconcile_fleet_proof_matches_observation_at(
+            &state,
+            &admitted,
+            "topology-a",
+            &restarted_peers,
+            now,
+        ));
+
+        let (_, _, _, downgraded) = cross_pool_fence_policy_results(original_peers, 4);
+        assert!(
+            downgraded.is_err(),
+            "a synchronous observation of a downgraded peer must fail before any cached proof can authorize a write"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_transition_state_reconcile_invalid_token_skips_fleet_observation() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(peers), now).is_none());
+        let admitted = {
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                .expect("the original fleet should admit reconciliation")
+        };
+        revoke_fleet_capability_proof(&slot);
+
+        assert!(
+            !legacy_transition_state_reconcile_fleet_proof_matches_with_observer(&slot, &admitted, "topology-a", || async {
+                panic!("an invalid local generation must not trigger a fleet observation");
+            },)
+            .await
+        );
+    }
+
+    #[test]
+    fn legacy_transition_state_reconcile_membership_and_topology_changes_revoke_authority() {
+        let now = Instant::now();
+        for replacement in [
+            BTreeMap::from([("peer-a".to_string(), Uuid::new_v4()), ("peer-b".to_string(), Uuid::new_v4())]),
+            BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]),
+        ] {
+            let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+            let original = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+            assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(original), now).is_none());
+            let admitted = {
+                let state = slot.read().expect("reconcile proof slot should not poison");
+                acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                    .expect("the original fleet should admit reconciliation")
+            };
+
+            assert!(
+                publish_fleet_capability_probe_result(&slot, "topology-a", Ok(replacement), now + Duration::from_millis(1),)
+                    .is_some(),
+                "membership or process-epoch replacement must wait for the admitted writer"
+            );
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            assert!(!legacy_transition_state_reconcile_fleet_proof_matches_at(
+                &state,
+                &admitted,
+                "topology-a",
+                now + Duration::from_millis(1),
+            ));
+        }
+
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(BTreeMap::new()), now).is_none());
+        let admitted = {
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                .expect("the original topology should admit reconciliation")
+        };
+        mark_fleet_capability_topology_conflict(&slot);
+        let state = slot.read().expect("reconcile proof slot should not poison");
+        assert!(state.topology_conflict);
+        assert!(!legacy_transition_state_reconcile_fleet_proof_matches_at(
+            &state,
+            &admitted,
+            "topology-a",
+            now,
+        ));
+    }
+
+    #[test]
+    fn legacy_transition_state_reconcile_capability_downgrade_fails_closed() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        let (_, _, _, compatible_result) =
+            cross_pool_fence_policy_results(peers.clone(), LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", compatible_result, now).is_none());
+        let admitted = {
+            let state = slot.read().expect("reconcile proof slot should not poison");
+            acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now)
+                .expect("v5 should admit reconciliation")
+        };
+
+        let (_, _, _, downgraded_result) =
+            cross_pool_fence_policy_results(peers, LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION - 1);
+        let err = publish_fleet_capability_probe_result(&slot, "topology-a", downgraded_result, now + Duration::from_millis(1))
+            .expect("a v4 member must revoke reconcile authority");
+        assert!(err.to_string().contains("reconcile policy capability version is unsupported"));
+        let state = slot.read().expect("reconcile proof slot should not poison");
+        assert!(state.proof.is_none());
+        assert!(!legacy_transition_state_reconcile_fleet_proof_matches_at(
+            &state,
+            &admitted,
+            "topology-a",
+            now + Duration::from_millis(1),
+        ));
+        assert!(
+            acquire_legacy_transition_state_reconcile_fleet_proof_from(&state, "topology-a", now + Duration::from_millis(1),)
+                .is_none(),
+            "a downgraded fleet must remain inspect-only"
+        );
+    }
+
+    #[test]
     fn remote_version_state_fleet_proof_conflict_revokes_atomic_snapshot() {
         let now = Instant::now();
         let mut state = FleetCapabilityProofState {
@@ -3537,6 +3957,57 @@ mod tests {
             .await
             .expect_err("a missing configured member slot must fail the fleet proof");
         assert!(err.to_string().contains("incomplete"));
+    }
+
+    #[tokio::test]
+    async fn legacy_transition_state_reconcile_probe_rejects_missing_or_unreachable_members() {
+        let missing = NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: vec![None],
+            peer_topology_hosts: vec!["peer-a".to_string()],
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        };
+        let missing_err = missing
+            .probe_cross_pool_fence_fleet("topology-a")
+            .await
+            .expect_err("a missing member slot must prevent reconcile capability proof");
+        assert!(missing_err.to_string().contains("incomplete"));
+
+        let unreachable = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: vec![None, None],
+            peer_topology_hosts: vec!["peer-a".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+        };
+        let unreachable_err = unreachable
+            .probe_cross_pool_fence_fleet("topology-a")
+            .await
+            .expect_err("an unreachable member must prevent reconcile capability proof");
+        assert!(unreachable_err.to_string().contains("unreachable"));
+    }
+
+    #[tokio::test]
+    async fn legacy_transition_state_reconcile_single_node_stays_closed_before_local_cas_support() {
+        let notification_sys = NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: vec![None],
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        };
+        let (peers, minimum_version) = notification_sys
+            .probe_cross_pool_fence_fleet("topology-a")
+            .await
+            .expect("a single-node capability probe should complete");
+        assert!(peers.is_empty());
+        assert_eq!(minimum_version, LOCAL_CROSS_POOL_FENCE_POLICY_SUPPORTED_VERSION);
+        let (_, _, _, reconcile_result) = cross_pool_fence_policy_results(peers, minimum_version);
+        assert!(
+            reconcile_result.is_err(),
+            "the current node must not self-authorize reconcile before the conditional writer lands"
+        );
     }
 
     fn build_props(endpoint: &str) -> ServerProperties {
