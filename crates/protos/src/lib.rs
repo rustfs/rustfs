@@ -1804,7 +1804,7 @@ mod scanner_activity_tests {
             },
             ScannerDirtyUsageSnapshotRequest {
                 protocol_version: 2,
-                ..request.clone()
+                ..request
             },
         ] {
             assert_ne!(
