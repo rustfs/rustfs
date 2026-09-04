@@ -47,6 +47,7 @@ pub enum MetricSubsystem {
 
     // other service related subsystems
     Ilm,
+    Tier,
     Audit,
     Replication,
     Notification,
@@ -91,6 +92,7 @@ impl MetricSubsystem {
 
             // other service related subsystems
             Self::Ilm => "/ilm",
+            Self::Tier => "/tier",
             Self::Audit => "/audit",
             Self::Replication => "/replication",
             Self::Notification => "/notification",
@@ -140,6 +142,7 @@ impl MetricSubsystem {
 
             // Other service-related subsystems
             "/ilm" => Self::Ilm,
+            "/tier" => Self::Tier,
             "/audit" => Self::Audit,
             "/replication" => Self::Replication,
             "/notification" => Self::Notification,
@@ -202,6 +205,7 @@ pub mod subsystems {
     pub const CLUSTER_IAM: MetricSubsystem = MetricSubsystem::ClusterIam;
     pub const CLUSTER_CONFIG: MetricSubsystem = MetricSubsystem::ClusterConfig;
     pub const ILM: MetricSubsystem = MetricSubsystem::Ilm;
+    pub const TIER: MetricSubsystem = MetricSubsystem::Tier;
     pub const AUDIT: MetricSubsystem = MetricSubsystem::Audit;
     pub const REPLICATION: MetricSubsystem = MetricSubsystem::Replication;
     pub const NOTIFICATION: MetricSubsystem = MetricSubsystem::Notification;

@@ -38,7 +38,7 @@ const WASABI_ALTERNATIVE_ENDPOINTS: &[(&str, &str)] = &[
     ("eu-south-1", "https://s3.it-1.wasabisys.com"),
 ];
 
-#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq)]
 pub enum TierType {
     #[default]
     Unsupported,

@@ -261,9 +261,9 @@ pub(crate) mod rpc_consumer {
             ECStore, Error, FileInfoVersions, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN,
             PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, SCANNER_PUBLICATION_LEASE_TTL_MS,
             SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt, StoragePeerS3ClientExt,
-            UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, get_local_server_property,
-            reload_bucket_metadata, reload_transition_tier_config, remove_bucket_metadata,
-            validate_batch_read_version_item_count,
+            TierDailyStatsWire, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref,
+            get_global_transition_state, get_local_server_property, reload_bucket_metadata, reload_transition_tier_config,
+            remove_bucket_metadata, validate_batch_read_version_item_count,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
@@ -511,7 +511,7 @@ pub(crate) mod ecstore_notification {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::notification::rotate_cross_pool_fence_fleet_proof_for_test;
     pub(crate) use rustfs_ecstore::api::notification::{
-        CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
+        ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
         cross_pool_fence_fleet_proof_matches, get_global_notification_sys, new_global_notification_sys,
         start_remote_version_state_fleet_probe,
     };
@@ -662,6 +662,7 @@ pub(crate) type BucketBandwidthMonitor = ecstore_bucket::bandwidth::monitor::Mon
 pub(crate) type CheckPartsResp = ecstore_disk::CheckPartsResp;
 pub(crate) type CollectMetricsOpts = ecstore_metrics::CollectMetricsOpts;
 pub(crate) type DailyAllTierStats = ecstore_bucket::lifecycle::tier_last_day_stats::DailyAllTierStats;
+pub(crate) type TierDailyStatsWire = ecstore_bucket::lifecycle::tier_last_day_stats::TierDailyStatsWire;
 pub(crate) type DeleteOptions = ecstore_disk::DeleteOptions;
 pub(crate) type DiskError = ecstore_disk::error::DiskError;
 pub(crate) type DiskInfo = ecstore_disk::DiskInfo;

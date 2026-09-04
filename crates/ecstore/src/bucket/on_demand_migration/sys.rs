@@ -44,11 +44,14 @@ use super::breaker::{Breaker, BreakerState, BreakerTransition, BreakerVerdict};
 use super::config::{
     ON_DEMAND_MIGRATION_CONFIG_HOOK, OnDemandMigrationConfig, PathStyle as ConfigPathStyle, Provider, SourceConfig,
 };
+use super::list_through::{SOURCE_LIST_RATE_PER_SEC, SourceListRateLimiter};
 use super::negative_cache::NegativeCache;
 use super::pull::{OdmWriteBack, PullQueue};
 use super::source_client::{SourceClient, SourceClientSpec, SourceError, SourceProvider, SourceTimeouts};
 use super::stats::{GaugeGuard, OdmStats, OdmStatsSnapshot, PullFailureReason};
-use crate::bucket::remote_s3_client::{PathStyle as ClientPathStyle, RemoteCredentials, RemoteS3ClientError};
+use crate::bucket::remote_s3_client::{
+    PathStyle as ClientPathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3RetryPolicy,
+};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -278,6 +281,8 @@ pub struct BucketOdmState {
     write_back: Option<Arc<dyn OdmWriteBack>>,
     /// Started by `pull::BucketOdmState::pull_queue` on first enqueue.
     pub(super) pull_queue: OnceLock<Arc<PullQueue>>,
+    /// Caps source listings for this bucket under `policy.list_through`.
+    list_rate_limiter: SourceListRateLimiter,
 }
 
 impl fmt::Debug for BucketOdmState {
@@ -326,6 +331,7 @@ impl BucketOdmState {
             last_source_error_logged_at: Mutex::new(None),
             write_back,
             pull_queue: OnceLock::new(),
+            list_rate_limiter: SourceListRateLimiter::new(SOURCE_LIST_RATE_PER_SEC),
         })
     }
 
@@ -356,6 +362,12 @@ impl BucketOdmState {
 
     pub fn negative_cache(&self) -> &NegativeCache {
         &self.negative_cache
+    }
+
+    /// Per-bucket rate limit on source `ListObjectsV2` calls, consulted by the
+    /// list-through merge (rustfs/backlog#2164).
+    pub fn list_rate_limiter(&self) -> &SourceListRateLimiter {
+        &self.list_rate_limiter
     }
 
     pub fn stats(&self) -> &Arc<OdmStats> {
@@ -602,6 +614,10 @@ pub fn source_client_spec(config: &OnDemandMigrationConfig) -> SourceClientSpec 
             connect: Duration::from_millis(policy.source_timeout.connect_ms),
             read: Duration::from_millis(policy.source_timeout.first_byte_ms),
         },
+        // The pull pipeline and the backfill job already retry, and the
+        // breaker counts logical calls: an SDK retry on top would triple the
+        // load on a source that is already failing.
+        retry: RemoteS3RetryPolicy::Disabled,
         bandwidth_limit: policy.bandwidth_limit_bytes_per_sec.and_then(NonZeroU64::new),
     }
 }
@@ -1192,6 +1208,11 @@ mod tests {
         assert_eq!(spec.timeouts.connect, Duration::from_millis(1500));
         assert_eq!(spec.timeouts.read, Duration::from_millis(2500));
         assert_eq!(spec.bandwidth_limit, NonZeroU64::new(1 << 20));
+        assert_eq!(
+            spec.retry,
+            RemoteS3RetryPolicy::Disabled,
+            "the pull pipeline owns the retry budget, so one source call is one wire request"
+        );
 
         let mut aws = config(None);
         aws.source.provider = Provider::Aws;

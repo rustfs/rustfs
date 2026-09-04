@@ -212,7 +212,7 @@ mod internal_put;
 mod on_demand_migration_put;
 mod put;
 mod restore;
-mod shared;
+pub(crate) mod shared;
 #[cfg(test)]
 mod test_support;
 

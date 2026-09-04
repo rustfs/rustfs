@@ -43,6 +43,7 @@ use rustfs_s3_client::{
     api_put_object::{AdvancedPutOptions, PutObjectOptions},
     transition_api::{ReadCloser, ReaderImpl},
 };
+use rustfs_scanner_metrics::metrics::{TierRequestOperation, TierRequestOutcome, global_metrics};
 use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
@@ -346,6 +347,110 @@ pub(crate) fn optimal_part_size(object_size: i64, min_part_size: i64) -> Result<
     Ok(part_size)
 }
 
+/// Counts every remote-tier request exactly once, whatever backend performs it.
+///
+/// The counters are the only production update path for the `tier` request
+/// metrics, and they must not grow with tier names, endpoints or object keys,
+/// so the wrapper deliberately records nothing but the fixed operation and
+/// outcome labels. Wrapping here rather than inside each provider keeps a new
+/// backend counted by construction, and keeps one call per request: the
+/// overridden `remove_exact` delegates to the inner backend, so the inner
+/// default's own `remove` cannot count the same request a second time.
+struct MeteredWarmBackend {
+    inner: WarmBackendImpl,
+}
+
+impl MeteredWarmBackend {
+    fn record<T>(operation: TierRequestOperation, result: Result<T, std::io::Error>) -> Result<T, std::io::Error> {
+        let outcome = match &result {
+            Ok(_) => TierRequestOutcome::Success,
+            Err(err) => TierRequestOutcome::from_error(err),
+        };
+        global_metrics().record_tier_request(operation, outcome);
+        result
+    }
+}
+
+#[async_trait::async_trait]
+impl WarmBackend for MeteredWarmBackend {
+    /// Delegated without a counter: only one backend issues a remote request
+    /// here, and every other one takes the trait default, so a `validate`
+    /// counter would mostly record requests that never happened.
+    async fn validate(&self) -> Result<(), std::io::Error> {
+        self.inner.validate().await
+    }
+
+    /// A local check of a value this process already holds; it issues no
+    /// remote request, so it is delegated without a counter.
+    fn validate_remote_version_id(&self, remote_version_id: &str) -> Result<(), std::io::Error> {
+        self.inner.validate_remote_version_id(remote_version_id)
+    }
+
+    async fn put(&self, object: &str, r: ReaderImpl, length: i64) -> Result<String, std::io::Error> {
+        Self::record(TierRequestOperation::Put, self.inner.put(object, r, length).await)
+    }
+
+    async fn put_with_meta(
+        &self,
+        object: &str,
+        r: ReaderImpl,
+        length: i64,
+        meta: HashMap<String, String>,
+    ) -> Result<String, std::io::Error> {
+        Self::record(TierRequestOperation::Put, self.inner.put_with_meta(object, r, length, meta).await)
+    }
+
+    async fn get(&self, object: &str, rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
+        Self::record(TierRequestOperation::Get, self.inner.get(object, rv, opts).await)
+    }
+
+    async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
+        Self::record(TierRequestOperation::Remove, self.inner.remove(object, rv).await)
+    }
+
+    async fn remove_exact(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
+        Self::record(TierRequestOperation::Remove, self.inner.remove_exact(object, rv).await)
+    }
+
+    async fn probe_transition_candidate(&self, object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
+        let result = self.inner.probe_transition_candidate(object).await;
+        // `Unsupported` is the trait default: the backend issued no request,
+        // so counting it would inflate the probe counter on every backend that
+        // does not implement probing.
+        if matches!(result, Ok(TransitionCandidateProbe::Unsupported)) {
+            return result;
+        }
+        Self::record(TierRequestOperation::Probe, result)
+    }
+
+    async fn in_use(&self) -> Result<bool, std::io::Error> {
+        Self::record(TierRequestOperation::InUse, self.inner.in_use().await)
+    }
+}
+
+/// The reconciler is a second remote probe path, reached from recovery rather
+/// than from the `WarmBackend` handle, so it needs its own counter: a `probe`
+/// counter that saw only one of the two paths would read as a complete count
+/// while missing every recovery probe.
+struct MeteredTransitionCandidateReconciler {
+    inner: Box<dyn TransitionCandidateReconciler + Send + Sync + 'static>,
+}
+
+#[async_trait::async_trait]
+impl TransitionCandidateReconciler for MeteredTransitionCandidateReconciler {
+    async fn probe_transition_candidate_for(
+        &self,
+        object: &str,
+        identity: TransitionCandidateIdentity,
+    ) -> Result<TransitionCandidateProbe, std::io::Error> {
+        let result = self.inner.probe_transition_candidate_for(object, identity).await;
+        if matches!(result, Ok(TransitionCandidateProbe::Unsupported)) {
+            return result;
+        }
+        MeteredWarmBackend::record(TierRequestOperation::Probe, result)
+    }
+}
+
 pub async fn check_warm_backend(w: Option<&WarmBackendImpl>) -> Result<(), AdminError> {
     let w = w.ok_or_else(|| ERR_TIER_NOT_FOUND.clone())?;
     w.validate().await.map_err(|_| ERR_TIER_INVALID_CONFIG.clone())?;
@@ -593,6 +698,8 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
         status_code: StatusCode::BAD_REQUEST,
     })?;
 
+    let d: WarmBackendImpl = Box::new(MeteredWarmBackend { inner: d });
+
     if probe {
         d.validate().await.map_err(|_| ERR_TIER_INVALID_CONFIG.clone())?;
     }
@@ -641,7 +748,7 @@ pub(crate) async fn new_transition_candidate_reconciler(
         ),
         _ => return Ok(None),
     };
-    Ok(Some(reconciler))
+    Ok(Some(Box::new(MeteredTransitionCandidateReconciler { inner: reconciler })))
 }
 
 #[cfg(test)]
@@ -654,6 +761,156 @@ mod tests {
     };
 
     const PROBE_VERSION: &str = "remote-v2";
+
+    struct CountingBackend {
+        put_result: fn() -> Result<String, std::io::Error>,
+        removes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl WarmBackend for CountingBackend {
+        async fn put(&self, _object: &str, _r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
+            (self.put_result)()
+        }
+
+        async fn put_with_meta(
+            &self,
+            object: &str,
+            r: ReaderImpl,
+            length: i64,
+            _meta: HashMap<String, String>,
+        ) -> Result<String, std::io::Error> {
+            self.put(object, r, length).await
+        }
+
+        async fn get(&self, _object: &str, _rv: &str, _opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
+            Err(std::io::Error::other("unused"))
+        }
+
+        async fn remove(&self, _object: &str, _rv: &str) -> Result<(), std::io::Error> {
+            self.removes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn in_use(&self) -> Result<bool, std::io::Error> {
+            Ok(false)
+        }
+    }
+
+    fn tier_cell(operation: TierRequestOperation, outcome: TierRequestOutcome) -> u64 {
+        global_metrics()
+            .tier_request_counts()
+            .into_iter()
+            .find(|count| count.operation == operation && count.outcome == outcome)
+            .map(|count| count.count)
+            .expect("every operation/outcome cell must be reported")
+    }
+
+    #[tokio::test]
+    async fn a_metered_put_counts_its_outcome_once() {
+        let before_success = tier_cell(TierRequestOperation::Put, TierRequestOutcome::Success);
+        let before_failure = tier_cell(TierRequestOperation::Put, TierRequestOutcome::BackendError);
+        let backend = MeteredWarmBackend {
+            inner: Box::new(CountingBackend {
+                put_result: || Ok("remote-v1".to_string()),
+                removes: Arc::new(AtomicUsize::new(0)),
+            }),
+        };
+
+        backend
+            .put("object", ReaderImpl::Body(Bytes::from_static(b"payload")), 7)
+            .await
+            .expect("the fake backend accepts the put");
+
+        assert_eq!(
+            tier_cell(TierRequestOperation::Put, TierRequestOutcome::Success),
+            before_success + 1,
+            "an acknowledged put must be counted once"
+        );
+        assert_eq!(
+            tier_cell(TierRequestOperation::Put, TierRequestOutcome::BackendError),
+            before_failure,
+            "a success must not also increment a failure cell"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_metered_put_failure_is_classified_by_error_kind() {
+        let before_timeout = tier_cell(TierRequestOperation::Put, TierRequestOutcome::Timeout);
+        let backend = MeteredWarmBackend {
+            inner: Box::new(CountingBackend {
+                put_result: || Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "endpoint stalled")),
+                removes: Arc::new(AtomicUsize::new(0)),
+            }),
+        };
+
+        backend
+            .put("object", ReaderImpl::Body(Bytes::from_static(b"payload")), 7)
+            .await
+            .expect_err("the fake backend rejects the put");
+
+        assert_eq!(
+            tier_cell(TierRequestOperation::Put, TierRequestOutcome::Timeout),
+            before_timeout + 1,
+            "a timed-out request must land in the timeout cell"
+        );
+    }
+
+    fn tier_probe_total() -> u64 {
+        global_metrics()
+            .tier_request_counts()
+            .into_iter()
+            .filter(|count| count.operation == TierRequestOperation::Probe)
+            .map(|count| count.count)
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_probe_is_not_counted_as_a_request() {
+        let before = tier_probe_total();
+        let backend = MeteredWarmBackend {
+            inner: Box::new(CountingBackend {
+                put_result: || Ok(String::new()),
+                removes: Arc::new(AtomicUsize::new(0)),
+            }),
+        };
+
+        let probe = backend
+            .probe_transition_candidate("object")
+            .await
+            .expect("the trait default answers without a remote request");
+
+        assert_eq!(probe, TransitionCandidateProbe::Unsupported);
+        assert_eq!(
+            tier_probe_total(),
+            before,
+            "a backend that issues no probe request must not appear in the probe counters"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exact_remove_is_counted_once_not_twice() {
+        let before = tier_cell(TierRequestOperation::Remove, TierRequestOutcome::Success);
+        let removes = Arc::new(AtomicUsize::new(0));
+        let backend = MeteredWarmBackend {
+            inner: Box::new(CountingBackend {
+                put_result: || Ok(String::new()),
+                removes: Arc::clone(&removes),
+            }),
+        };
+
+        backend
+            .remove_exact("object", "remote-v1")
+            .await
+            .expect("the fake backend accepts the remove");
+
+        assert_eq!(removes.load(Ordering::SeqCst), 1, "the inner backend performs one request");
+        assert_eq!(
+            tier_cell(TierRequestOperation::Remove, TierRequestOutcome::Success),
+            before + 1,
+            "the default remove_exact must not count its own inner remove a second time"
+        );
+    }
 
     struct RejectingValidationBackend {
         validations: Arc<AtomicUsize>,

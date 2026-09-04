@@ -22,7 +22,7 @@ use rustfs_replication::ReplicationStatusType;
 use rustfs_scanner_metrics::metrics::IlmAction;
 
 use crate::object_lock;
-use crate::{Event, Lifecycle, ObjectOpts};
+use crate::{Event, Lifecycle, ObjectOpts, expiration_action_has_valid_target};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
@@ -80,6 +80,9 @@ impl Evaluator {
         'top_loop: {
             for (i, obj) in objs.iter().enumerate() {
                 let mut event = self.policy.eval_inner(obj, now, newer_noncurrent_versions).await;
+                if !expiration_action_has_valid_target(event.action, obj.version_id, obj.is_latest, obj.delete_marker) {
+                    event = Event::default();
+                }
                 if lifecycle_action_waits_for_replication(event.action) && self.is_pending_replication(obj) {
                     event = Event::default();
                 }
@@ -116,16 +119,10 @@ impl Evaluator {
                     IlmAction::DeleteAction
                     | IlmAction::DeleteRestoredAction
                     | IlmAction::DeleteVersionAction
-                    | IlmAction::DeleteRestoredVersionAction => {
-                        // Defensive code, should never happen
-                        if matches!(event.action, IlmAction::DeleteVersionAction | IlmAction::DeleteRestoredVersionAction)
-                            && obj.version_id.is_none_or(|v| v.is_nil())
-                        {
-                            event.action = IlmAction::NoneAction;
-                        }
-                        if self.is_object_locked(obj) {
-                            event = Event::default();
-                        }
+                    | IlmAction::DeleteRestoredVersionAction
+                        if self.is_object_locked(obj) =>
+                    {
+                        event = Event::default();
                     }
                     _ => {}
                 }
@@ -325,6 +322,30 @@ mod tests {
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("expire-noncurrent".to_string()),
+                noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                }),
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        })
+    }
+
+    fn current_and_noncurrent_expiration_lifecycle() -> Arc<BucketLifecycleConfiguration> {
+        Arc::new(BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("expire-current-and-noncurrent".to_string()),
                 noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: None,
@@ -539,6 +560,68 @@ mod tests {
             .expect("lifecycle evaluation should succeed");
 
         assert_eq!(events[0].action, IlmAction::DeleteVersionAction);
+    }
+
+    #[tokio::test]
+    async fn evaluator_treats_explicit_null_as_an_exact_noncurrent_identity() {
+        let lifecycle = current_and_noncurrent_expiration_lifecycle();
+        let now = OffsetDateTime::now_utc();
+        let version_group =
+            |version_id: Option<Uuid>, replication_status: ReplicationStatusType, user_defined: HashMap<String, String>| {
+                vec![
+                    ObjectOpts {
+                        name: "logs/object".to_string(),
+                        mod_time: Some(now),
+                        version_id: Some(Uuid::new_v4()),
+                        is_latest: true,
+                        num_versions: 2,
+                        replication_status: ReplicationStatusType::Completed,
+                        ..Default::default()
+                    },
+                    ObjectOpts {
+                        name: "logs/object".to_string(),
+                        mod_time: Some(now - time::Duration::days(40)),
+                        successor_mod_time: Some(now - time::Duration::days(3)),
+                        version_id,
+                        is_latest: false,
+                        num_versions: 2,
+                        versioned: true,
+                        replication_status,
+                        user_defined,
+                        ..Default::default()
+                    },
+                ]
+            };
+
+        let events = Evaluator::new(lifecycle.clone())
+            .eval(&version_group(Some(Uuid::nil()), ReplicationStatusType::Completed, HashMap::new()))
+            .await
+            .expect("explicit null-version lifecycle evaluation should succeed");
+        assert_eq!(events[0].action, IlmAction::NoneAction);
+        assert_eq!(events[1].action, IlmAction::DeleteVersionAction);
+
+        let events = Evaluator::new(lifecycle.clone())
+            .eval(&version_group(None, ReplicationStatusType::Completed, HashMap::new()))
+            .await
+            .expect("missing historical identity should fail closed without aborting evaluation");
+        assert_eq!(events[1].action, IlmAction::NoneAction);
+
+        let events = Evaluator::new(lifecycle.clone())
+            .eval(&version_group(Some(Uuid::nil()), ReplicationStatusType::Pending, HashMap::new()))
+            .await
+            .expect("pending null-version replication should fail closed without aborting evaluation");
+        assert_eq!(events[1].action, IlmAction::NoneAction);
+
+        let events = Evaluator::new(lifecycle)
+            .with_lock_retention(Some(lock_enabled_without_default_retention()))
+            .eval(&version_group(
+                Some(Uuid::nil()),
+                ReplicationStatusType::Completed,
+                HashMap::from([(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string())]),
+            ))
+            .await
+            .expect("locked null-version lifecycle evaluation should fail closed without aborting evaluation");
+        assert_eq!(events[1].action, IlmAction::NoneAction);
     }
 
     #[tokio::test]

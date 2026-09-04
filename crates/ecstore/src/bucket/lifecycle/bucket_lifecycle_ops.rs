@@ -1136,7 +1136,7 @@ impl ExpiryState {
                         let version_count = u64::try_from(v.versions.len()).unwrap_or(u64::MAX);
                         let trace = LifecycleExpiryTrace::for_batch(&v.bucket, &v.event, &v.src, version_count);
                         trace.emit(EVENT_LIFECYCLE_DELETE_DISPATCHED, "delete_dispatched", None);
-                        crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+                        let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
                             &api,
                             &v.bucket,
                             &v.versions,
@@ -1144,7 +1144,19 @@ impl ExpiryState {
                             v.bucket_incarnation_id,
                         )
                         .await;
-                        trace.emit(EVENT_LIFECYCLE_DELETE_COMPLETED, "delete_completed", None);
+                        if failed == 0 {
+                            trace.emit(EVENT_LIFECYCLE_DELETE_COMPLETED, "delete_completed", None);
+                        } else {
+                            record_scanner_lifecycle_expiry_delete_failed(
+                                &v.src,
+                                u64::try_from(failed).unwrap_or(u64::MAX),
+                            );
+                            trace.emit(
+                                EVENT_LIFECYCLE_DELETE_FAILED,
+                                "delete_failed",
+                                Some("delete_operation_failed"),
+                            );
+                        }
                     }
                     else if v.as_any().is::<Jentry>() {
                         let v = v.as_any().downcast_ref::<Jentry>().expect("Jentry downcast failed");
@@ -3675,13 +3687,11 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
                 enqueue_expiry_rule_with_incarnation(event, &src, object, configs.bucket_incarnation_id).await;
             }
             IlmAction::DeleteVersionAction => {
-                to_delete_objs.push(ObjectToDelete {
-                    object_name: object.name.clone(),
-                    version_id: object.version_id,
-                    ..Default::default()
-                });
-                if noncurrent_event.is_none() {
-                    noncurrent_event = Some(event.clone());
+                if let Some(target) = lifecycle_version_delete_target(object) {
+                    to_delete_objs.push(target);
+                    if noncurrent_event.is_none() {
+                        noncurrent_event = Some(event.clone());
+                    }
                 }
             }
             _ => {}
@@ -4209,13 +4219,11 @@ async fn enqueue_expiry_for_existing_object_group(
                     }
 
                     if event.action == IlmAction::DeleteVersionAction {
-                        to_delete_objs.push(ObjectToDelete {
-                            object_name: object.name.clone(),
-                            version_id: object.version_id,
-                            ..Default::default()
-                        });
-                        if noncurrent_event.is_none() {
-                            noncurrent_event = Some(event.clone());
+                        if let Some(target) = lifecycle_version_delete_target(object) {
+                            to_delete_objs.push(target);
+                            if noncurrent_event.is_none() {
+                                noncurrent_event = Some(event.clone());
+                            }
                         }
                     } else {
                         let blocked_by_replication = match lifecycle_delete_all_versions_blocked_by_replication(
@@ -4447,16 +4455,15 @@ fn transitioned_object_delete_opts(
     version_suspended: bool,
     bucket_incarnation_id: Uuid,
 ) -> crate::error::Result<ObjectOptions> {
+    let version_id = lifecycle_expiry_target_version_id(oi, action, versioned, version_suspended)?;
     let mut opts = ObjectOptions {
+        version_id,
         versioned,
         version_suspended,
         expiration: ExpirationOptions { expire: true },
         expected_bucket_incarnation_id: Some(bucket_incarnation_id),
         ..Default::default()
     };
-    if action.delete_versioned() {
-        opts.version_id = oi.version_id.map(|id| id.to_string());
-    }
     if action.delete_restored() {
         let etag = oi
             .etag
@@ -4484,6 +4491,34 @@ fn transitioned_object_delete_opts(
         }
     }
     Ok(opts)
+}
+
+fn lifecycle_expiry_target_version_id(
+    oi: &ObjectInfo,
+    action: IlmAction,
+    versioned: bool,
+    version_suspended: bool,
+) -> crate::error::Result<Option<String>> {
+    // Delete-all revalidates the authoritative current trigger under the
+    // object write lock; queued snapshots do not always carry `is_latest`.
+    if !action.delete_all()
+        && !lifecycle::expiration_action_has_valid_target(action, oi.version_id, oi.is_latest, oi.delete_marker)
+    {
+        return Err(Error::other("lifecycle expiry action does not match the evaluated object identity"));
+    }
+    if matches!(action, IlmAction::DeleteAction | IlmAction::DeleteRestoredAction)
+        && (versioned || version_suspended)
+        && oi.version_id.is_none()
+    {
+        return Err(Error::other("current-version lifecycle expiry is missing its version identity"));
+    }
+    if action.delete_versioned() {
+        return oi
+            .version_id
+            .ok_or_else(|| Error::other("exact-version lifecycle expiry is missing its version identity"))
+            .map(|version_id| Some(version_id.to_string()));
+    }
+    Ok(None)
 }
 
 pub async fn expire_transitioned_object(
@@ -4941,12 +4976,37 @@ impl RestoreRequestOps for RestoreRequest {
 
 const _MAX_RESTORE_OBJECT_REQUEST_SIZE: i64 = 2 << 20;
 
+/// Builds an exact-version lifecycle delete target with the concrete
+/// generation observed by the evaluator. The null S3 version ID is reusable,
+/// so null data versions additionally require a write-unique data directory.
+pub fn lifecycle_version_delete_target(oi: &ObjectInfo) -> Option<ObjectToDelete> {
+    let version_id = oi.version_id?;
+    if version_id.is_nil()
+        && ((!oi.delete_marker && oi.data_dir.is_none_or(|data_dir| data_dir.is_nil()))
+            || (oi.delete_marker && oi.mod_time.is_none_or(|mod_time| mod_time == OffsetDateTime::UNIX_EPOCH)))
+    {
+        return None;
+    }
+
+    let target = ObjectToDelete {
+        object_name: oi.name.clone(),
+        version_id: Some(version_id),
+        ..Default::default()
+    };
+    Some(if version_id.is_nil() {
+        target.with_expected_identity(oi.data_dir, oi.mod_time, oi.delete_marker)
+    } else {
+        target
+    })
+}
+
 pub async fn eval_action_from_lifecycle(
     lc: &BucketLifecycleConfiguration,
     lock_config: Option<&ObjectLockConfiguration>,
     oi: &ObjectInfo,
 ) -> lifecycle::Event {
-    let event = lc.eval(&oi.to_lifecycle_opts()).await;
+    let lifecycle_opts = oi.to_lifecycle_opts();
+    let event = lc.eval(&lifecycle_opts).await;
     debug!(
         event = EVENT_LIFECYCLE_SCAN_SKIPPED,
         component = LOG_COMPONENT_ECSTORE,
@@ -4955,6 +5015,15 @@ pub async fn eval_action_from_lifecycle(
         state = "evaluated",
         "Evaluated lifecycle action during secondary scan"
     );
+
+    if !lifecycle::expiration_action_has_valid_target(
+        event.action,
+        lifecycle_opts.version_id,
+        lifecycle_opts.is_latest,
+        lifecycle_opts.delete_marker,
+    ) {
+        return lifecycle::Event::default();
+    }
 
     let lock_enabled = lock_config.is_some_and(ObjectLockApi::enabled);
     let object_locked = object_lock_boundary::is_object_locked_by_metadata(&oi.user_defined, oi.delete_marker);
@@ -4966,44 +5035,38 @@ pub async fn eval_action_from_lifecycle(
         IlmAction::DeleteAction
         | IlmAction::DeleteRestoredAction
         | IlmAction::DeleteVersionAction
-        | IlmAction::DeleteRestoredVersionAction => {
-            if matches!(event.action, IlmAction::DeleteVersionAction | IlmAction::DeleteRestoredVersionAction)
-                && oi.version_id.is_none()
-            {
-                return lifecycle::Event::default();
-            }
-            // Destructive expiry never bypasses retention. Restore expiry only
-            // removes the local copy; the retained logical version remains.
+        | IlmAction::DeleteRestoredVersionAction
             if !event.action.delete_restored()
                 && (object_locked
                     || !matches!(
                         object_lock_boundary::check_object_lock_for_deletion_with_config(lock_config, oi, false),
                         Ok(None)
-                    ))
-            {
-                //if serverDebugLog {
-                if oi.version_id.is_some() {
-                    debug!(
-                        event = EVENT_LIFECYCLE_SCAN_SKIPPED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                        object = %oi.name,
-                        version_id = %oi.version_id.map(|v| v.to_string()).unwrap_or_default(),
-                        reason = "object_locked",
-                        "Skipped lifecycle delete because object version is locked"
-                    );
-                } else {
-                    debug!(
-                        event = EVENT_LIFECYCLE_SCAN_SKIPPED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                        object = %oi.name,
-                        reason = "object_locked",
-                        "Skipped lifecycle delete because object is locked"
-                    );
-                }
-                return lifecycle::Event::default();
+                    )) =>
+        {
+            // Destructive expiry never bypasses retention. Restore expiry only
+            // removes the local copy; the retained logical version remains.
+            //if serverDebugLog {
+            if oi.version_id.is_some() {
+                debug!(
+                    event = EVENT_LIFECYCLE_SCAN_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    object = %oi.name,
+                    version_id = %oi.version_id.map(|v| v.to_string()).unwrap_or_default(),
+                    reason = "object_locked",
+                    "Skipped lifecycle delete because object version is locked"
+                );
+            } else {
+                debug!(
+                    event = EVENT_LIFECYCLE_SCAN_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    object = %oi.name,
+                    reason = "object_locked",
+                    "Skipped lifecycle delete because object is locked"
+                );
             }
+            return lifecycle::Event::default();
         }
         _ => (),
     }
@@ -5220,7 +5283,12 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
         }
     };
     let (versioned, version_suspended) = snapshot.versioning_config().delete_state(&oi.name);
+    let version_id = match lifecycle_expiry_target_version_id(oi, lc_event.action, versioned, version_suspended) {
+        Ok(version_id) => version_id,
+        Err(_) => return false,
+    };
     let mut opts = ObjectOptions {
+        version_id,
         versioned,
         version_suspended,
         expiration: ExpirationOptions { expire: true },
@@ -5231,10 +5299,6 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
     opts.add_namespace_lock_guard(&publication_guard);
     if let Some(signal) = lock_lost_signal {
         opts.add_namespace_lock_lost_signal(signal);
-    }
-
-    if lc_event.action.delete_versioned() {
-        opts.version_id = oi.version_id.map(|v| v.to_string());
     }
 
     if lc_event.action.delete_all() {
@@ -5491,14 +5555,14 @@ mod tests {
         enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report, eval_action_from_lifecycle,
         get_lock_acquire_timeout, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
-        lifecycle_rule_has_date_expiration, manual_transition_duration_elapsed, manual_transition_has_more_after_limit,
-        manual_transition_recovery_progress_sink, manual_transition_version_marker, manual_transition_worker_failure_reason,
-        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate,
-        persist_manual_transition_job_progress_if_owned, persist_manual_transition_page_checkpoint,
-        recover_manual_transition_job, recover_manual_transition_jobs, resolve_tier_free_version_recovery_enabled,
-        resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
-        resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop, select_restore_s3_location,
-        set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
+        lifecycle_rule_has_date_expiration, lifecycle_version_delete_target, manual_transition_duration_elapsed,
+        manual_transition_has_more_after_limit, manual_transition_recovery_progress_sink, manual_transition_version_marker,
+        manual_transition_worker_failure_reason, mark_delete_opts_skip_decommissioned_on_remote_success,
+        merge_stale_multipart_candidate, persist_manual_transition_job_progress_if_owned,
+        persist_manual_transition_page_checkpoint, recover_manual_transition_job, recover_manual_transition_jobs,
+        resolve_tier_free_version_recovery_enabled, resolve_transition_queue_capacity, resolve_transition_queue_send_timeout,
+        resolve_transition_worker_count, resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop,
+        select_restore_s3_location, set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
         should_defer_date_expiry_for_recent_config_update, transitioned_cleanup_tuple, transitioned_object_delete_opts,
         wait_for_tier_free_version_recovery,
     };
@@ -5509,6 +5573,8 @@ mod tests {
         decode_manual_transition_continuation_token, encode_manual_transition_continuation_token,
     };
     use crate::bucket::lifecycle::config_boundary;
+    use crate::bucket::lifecycle::evaluator::Evaluator;
+    use crate::bucket::lifecycle::lifecycle;
     use crate::bucket::lifecycle::manual_transition_job::{
         ManualTransitionJobCasBarrier, ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission,
         ManualTransitionScopeAdmissionClaim, ManualTransitionTaskRecord, ManualTransitionWorkerFailureReason,
@@ -5553,7 +5619,7 @@ mod tests {
         lifecycle::ExpirationOptions,
         list::ListOperations as _,
         multipart::MultipartOperations as _,
-        object::{ObjectIO as _, ObjectOperations as _},
+        object::{ObjectIO as _, ObjectOperations as _, ObjectToDelete},
     };
     use crate::store::ECStore;
     #[cfg(feature = "test-util")]
@@ -5570,8 +5636,8 @@ mod tests {
     use rustfs_scanner_metrics::metrics::{IlmAction, global_metrics};
     use s3s::dto::{
         BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry,
-        ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, OutputLocation, RestoreRequest,
-        RestoreRequestType, S3Location, Timestamp, Transition, TransitionStorageClass,
+        NoncurrentVersionExpiration, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule,
+        OutputLocation, RestoreRequest, RestoreRequestType, S3Location, Timestamp, Transition, TransitionStorageClass,
     };
     use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
     use serial_test::serial;
@@ -6507,6 +6573,7 @@ mod tests {
             bucket: "bucket".to_string(),
             name: "object".to_string(),
             version_id: Some(vid),
+            is_latest: true,
             data_dir: Some(Uuid::new_v4()),
             etag: Some("etag".to_string()),
             restore_expires: Some(OffsetDateTime::now_utc() - StdDuration::from_secs(1)),
@@ -6518,10 +6585,14 @@ mod tests {
             },
             ..Default::default()
         };
+        let noncurrent = ObjectInfo {
+            is_latest: false,
+            ..oi.clone()
+        };
 
         // Plain version expiry: exact version, real delete.
         let incarnation = Uuid::new_v4();
-        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteVersionAction, true, false, incarnation)
+        let opts = transitioned_object_delete_opts(&noncurrent, IlmAction::DeleteVersionAction, true, false, incarnation)
             .expect("build version expiry options");
         assert_eq!(opts.version_id.as_deref(), Some(vid_str.as_str()));
         assert_eq!(opts.expected_bucket_incarnation_id, Some(incarnation));
@@ -6537,7 +6608,7 @@ mod tests {
         // Restore-expiry of a noncurrent version: restored-copy cleanup of the
         // exact version. Routing this through the full transitioned-object
         // delete instead would remove the remote tier data.
-        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteRestoredVersionAction, true, false, incarnation)
+        let opts = transitioned_object_delete_opts(&noncurrent, IlmAction::DeleteRestoredVersionAction, true, false, incarnation)
             .expect("build restored-version expiry options");
         assert_eq!(opts.version_id.as_deref(), Some(vid_str.as_str()));
         assert!(opts.transition.expire_restored);
@@ -6547,6 +6618,45 @@ mod tests {
             .expect("build object expiry options");
         assert!(opts.version_id.is_none());
         assert!(!opts.transition.expire_restored);
+
+        let historical_null = ObjectInfo {
+            version_id: Some(Uuid::nil()),
+            ..noncurrent
+        };
+        let opts = transitioned_object_delete_opts(&historical_null, IlmAction::DeleteVersionAction, true, false, incarnation)
+            .expect("an explicit null version should remain an exact delete target");
+        let null_version_id = Uuid::nil().to_string();
+        assert_eq!(opts.version_id.as_deref(), Some(null_version_id.as_str()));
+        assert!(
+            transitioned_object_delete_opts(&historical_null, IlmAction::DeleteAction, true, false, incarnation).is_err(),
+            "a historical null version must never be routed as a current-object delete"
+        );
+
+        let versioned_current_without_identity = ObjectInfo {
+            version_id: None,
+            is_latest: true,
+            ..oi
+        };
+        assert!(
+            transitioned_object_delete_opts(
+                &versioned_current_without_identity,
+                IlmAction::DeleteAction,
+                true,
+                false,
+                incarnation,
+            )
+            .is_err(),
+            "a versioned current object without an identity is ambiguous"
+        );
+        let opts = transitioned_object_delete_opts(
+            &versioned_current_without_identity,
+            IlmAction::DeleteAction,
+            false,
+            false,
+            incarnation,
+        )
+        .expect("a truly unversioned current object should remain deletable");
+        assert!(opts.version_id.is_none());
     }
 
     #[tokio::test]
@@ -8530,6 +8640,30 @@ mod tests {
                 filter: None,
                 id: Some("expire-current".to_string()),
                 noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        }
+    }
+
+    fn current_and_noncurrent_expiration_lifecycle() -> BucketLifecycleConfiguration {
+        BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("expire-current-and-noncurrent".to_string()),
+                noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                }),
                 noncurrent_version_transitions: None,
                 prefix: None,
                 transitions: None,
@@ -11042,6 +11176,315 @@ mod tests {
         let event = eval_action_from_lifecycle(&lc, None, &object).await;
 
         assert_eq!(event.action, IlmAction::DeleteAction);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_evaluators_agree_on_null_version_identity_and_guards() {
+        let lifecycle = current_and_noncurrent_expiration_lifecycle();
+        let now = OffsetDateTime::now_utc();
+        let historical_null = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "logs/object".to_string(),
+            mod_time: Some(now - time::Duration::days(40)),
+            successor_mod_time: Some(now - time::Duration::days(3)),
+            version_id: Some(Uuid::nil()),
+            is_latest: false,
+            num_versions: 1,
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+        let cases = [
+            ("explicit historical null", historical_null.clone(), None, IlmAction::DeleteVersionAction),
+            (
+                "missing historical identity",
+                ObjectInfo {
+                    version_id: None,
+                    ..historical_null.clone()
+                },
+                None,
+                IlmAction::NoneAction,
+            ),
+            (
+                "pending null replication",
+                ObjectInfo {
+                    replication_status: ReplicationStatusType::Pending,
+                    ..historical_null.clone()
+                },
+                None,
+                IlmAction::NoneAction,
+            ),
+            (
+                "locked historical null",
+                ObjectInfo {
+                    user_defined: Arc::new(HashMap::from([(
+                        X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(),
+                        "ON".to_string(),
+                    )])),
+                    ..historical_null.clone()
+                },
+                Some(lock_enabled_without_default_retention()),
+                IlmAction::NoneAction,
+            ),
+            (
+                "unversioned current",
+                ObjectInfo {
+                    version_id: None,
+                    is_latest: true,
+                    successor_mod_time: None,
+                    ..historical_null
+                },
+                None,
+                IlmAction::DeleteAction,
+            ),
+        ];
+
+        for (name, object, lock_config, expected) in cases {
+            let object_opts = lifecycle::object_opts_from_object_info(&object);
+            let batch_event = Evaluator::new(Arc::new(lifecycle.clone()))
+                .with_lock_retention(lock_config.clone().map(Arc::new))
+                .eval(&[object_opts])
+                .await
+                .expect("batch lifecycle evaluation should succeed")
+                .remove(0);
+            let secondary_event = eval_action_from_lifecycle(&lifecycle, lock_config.as_ref(), &object).await;
+
+            assert_eq!(batch_event.action, expected, "batch evaluator mismatch for {name}");
+            assert_eq!(secondary_event.action, expected, "secondary evaluator mismatch for {name}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_deletes_only_the_historical_null_version_after_versioning_is_reenabled() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("lifecycle-null-history-{}", Uuid::new_v4().simple());
+        let object = "logs/object";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        metadata_sys::update_in(
+            &ecstore.ctx,
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should first be enabled");
+        metadata_sys::update_in(
+            &ecstore.ctx,
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be suspended");
+
+        let now = OffsetDateTime::now_utc();
+        let mut null_reader = PutObjReader::from_vec(b"historical-null".to_vec());
+        let null_version = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut null_reader,
+                &ObjectOptions {
+                    version_suspended: true,
+                    mod_time: Some(now - time::Duration::days(40)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("suspended PUT should create a null version");
+        assert_eq!(null_version.version_id, Some(Uuid::nil()));
+
+        metadata_sys::update_in(
+            &ecstore.ctx,
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be re-enabled");
+        let active_bytes = b"active-version".to_vec();
+        let active_mod_time = now - time::Duration::days(2);
+        let mut active_reader = PutObjReader::from_vec(active_bytes.clone());
+        let active = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut active_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(active_mod_time),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("re-enabled PUT should create the active version");
+        let active_version_id = active.version_id.expect("active version should have an exact identity");
+        assert!(!active_version_id.is_nil());
+
+        let mut object_infos = ecstore
+            .clone()
+            .list_object_versions(&bucket, object, None, None, None, 10)
+            .await
+            .expect("version history should be listable")
+            .objects
+            .into_iter()
+            .filter(|candidate| candidate.name == object)
+            .collect::<Vec<_>>();
+        object_infos.sort_by_key(|candidate| !candidate.is_latest);
+        assert_eq!(object_infos.len(), 2);
+        let null_index = object_infos
+            .iter()
+            .position(|candidate| candidate.version_id == Some(Uuid::nil()))
+            .expect("history should expose an explicit null identity");
+        assert!(!object_infos[null_index].is_latest);
+
+        let lifecycle = current_and_noncurrent_expiration_lifecycle();
+        let object_opts = object_infos
+            .iter()
+            .map(lifecycle::object_opts_from_object_info)
+            .collect::<Vec<_>>();
+        let events = Evaluator::new(Arc::new(lifecycle.clone()))
+            .eval(&object_opts)
+            .await
+            .expect("version group should evaluate");
+        let current_index = object_infos
+            .iter()
+            .position(|candidate| candidate.is_latest)
+            .expect("version history should expose one current version");
+        assert_eq!(events[null_index].action, IlmAction::DeleteVersionAction);
+        assert_eq!(events[current_index].action, IlmAction::NoneAction);
+        let secondary_event = eval_action_from_lifecycle(&lifecycle, None, &object_infos[null_index]).await;
+        assert_eq!(secondary_event.action, events[null_index].action);
+        let null_target = lifecycle_version_delete_target(&object_infos[null_index])
+            .expect("the historical null generation should be an exact lifecycle target");
+        assert!(null_target.expected_identity.is_some());
+
+        let incarnation = ecstore
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("bucket incarnation should be available");
+        let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+            &ecstore,
+            &bucket,
+            std::slice::from_ref(&null_target),
+            events[null_index].clone(),
+            incarnation,
+        )
+        .await;
+        assert_eq!(failed, 0, "the unchanged historical null generation should be deleted");
+
+        let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+            &ecstore,
+            &bucket,
+            &[ObjectToDelete {
+                object_name: object.to_string(),
+                version_id: None,
+                ..Default::default()
+            }],
+            events[null_index].clone(),
+            incarnation,
+        )
+        .await;
+        assert_eq!(failed, 1, "a lifecycle batch target without a version identity must fail closed");
+
+        let remaining = ecstore
+            .clone()
+            .list_object_versions(&bucket, object, None, None, None, 10)
+            .await
+            .expect("remaining version should be listable")
+            .objects
+            .into_iter()
+            .filter(|candidate| candidate.name == object)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].version_id, Some(active_version_id));
+        assert!(remaining[0].is_latest);
+
+        let mut reader = ecstore
+            .get_object_reader(&bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("active version should remain readable");
+        let actual = reader.read_all().await.expect("active version bytes should be readable");
+        assert_eq!(actual, active_bytes);
+
+        metadata_sys::update_in(
+            &ecstore.ctx,
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be suspended again");
+        let replacement_bytes = b"replacement-null-version".to_vec();
+        let mut replacement_reader = PutObjReader::from_vec(replacement_bytes.clone());
+        let replacement = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut replacement_reader,
+                &ObjectOptions {
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a later suspended PUT should reuse the null version ID");
+        assert_eq!(replacement.version_id, Some(Uuid::nil()));
+        assert_ne!(
+            replacement.data_dir, object_infos[null_index].data_dir,
+            "the replacement must be a distinct persisted generation"
+        );
+
+        let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+            &ecstore,
+            &bucket,
+            &[ObjectToDelete {
+                object_name: object.to_string(),
+                version_id: Some(Uuid::nil()),
+                ..Default::default()
+            }],
+            events[null_index].clone(),
+            incarnation,
+        )
+        .await;
+        assert_eq!(failed, 1, "a reusable null ID without its observed generation must fail closed");
+
+        let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+            &ecstore,
+            &bucket,
+            &[null_target],
+            events[null_index].clone(),
+            incarnation,
+        )
+        .await;
+        assert_eq!(failed, 1, "a stale null-generation target must fail its write-lock CAS");
+
+        let remaining = ecstore
+            .clone()
+            .list_object_versions(&bucket, object, None, None, None, 10)
+            .await
+            .expect("replacement history should be listable")
+            .objects
+            .into_iter()
+            .filter(|candidate| candidate.name == object)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            remaining
+                .iter()
+                .any(|candidate| candidate.version_id == Some(active_version_id))
+        );
+        assert!(remaining.iter().any(|candidate| candidate.version_id == Some(Uuid::nil())));
+        let mut reader = ecstore
+            .get_object_reader(&bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the replacement null version should remain current and readable");
+        let actual = reader
+            .read_all()
+            .await
+            .expect("replacement null-version bytes should be readable");
+        assert_eq!(actual, replacement_bytes);
     }
 
     #[tokio::test]

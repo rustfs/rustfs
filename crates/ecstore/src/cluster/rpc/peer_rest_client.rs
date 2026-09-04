@@ -23,6 +23,7 @@ use crate::storage_api_contracts::internode::{
     SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
 };
 use crate::{
+    bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats, TierDailyStatsWire},
     bucket::replication::BucketStats,
     disk::disk_store::{get_drive_active_check_interval, get_drive_active_check_timeout},
     layout::endpoints::EndpointServerPools,
@@ -48,7 +49,7 @@ use rustfs_protos::proto_gen::node_service::{
     LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest,
     ScannerActivityRequest, ScannerActivityResponse, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
     ScannerPublicationLeaseResponse, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest,
-    StartProfilingRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationCommitRequest,
+    StartProfilingRequest, StopRebalanceRequest, TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest,
     TierMutationControlResponse, TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest,
     node_service_client::NodeServiceClient, tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
@@ -984,6 +985,40 @@ impl PeerRestClient {
         let cpus: Cpus = Deserialize::deserialize(&mut buf)?;
 
         Ok(cpus)
+    }
+
+    /// This peer's own rolling-day transition counters, per remote tier.
+    ///
+    /// The response is untrusted peer input: a ring of the wrong width or an
+    /// unrepresentable clock is rejected here rather than merged, so a corrupt
+    /// answer makes the node non-reporting instead of silently shifting a
+    /// cluster total.
+    pub async fn tier_daily_stats(&self) -> Result<DailyAllTierStats> {
+        self.finalize_result(self.tier_daily_stats_inner().await).await
+    }
+
+    async fn tier_daily_stats_inner(&self) -> Result<DailyAllTierStats> {
+        let mut client = self.get_client().await?;
+        let request = Request::new(TierDailyStatsRequest {});
+
+        let response = client.tier_daily_stats(request).await?.into_inner();
+        if !response.success {
+            if let Some(msg) = response.error_info {
+                return Err(Error::other(msg));
+            }
+            return Err(peer_failure_without_details("tier_daily_stats", None));
+        }
+
+        let mut buf = Deserializer::new(Cursor::new(response.tier_daily_stats));
+        let wire: HashMap<String, TierDailyStatsWire> = Deserialize::deserialize(&mut buf)?;
+
+        wire.into_iter()
+            .map(|(tier, stats)| {
+                LastDayTierStats::from_wire(stats)
+                    .map(|stats| (tier, stats))
+                    .map_err(Error::from)
+            })
+            .collect()
     }
 
     pub async fn get_net_info(&self) -> Result<NetInfo> {

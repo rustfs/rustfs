@@ -1043,6 +1043,22 @@ message LoadTransitionTierConfigResponse {
   optional ControlPlaneErrorCode error_code = 3;
 }
 
+message TierDailyStatsRequest {}
+
+// One node's own rolling-day transition counters, per remote tier.
+//
+// `tier_daily_stats` is a msgpack map of tier name to the responder's 24-bin
+// ring plus the clock that ring was last aged to. A node counts only the
+// transitions it completed itself, so a caller sums the rings of every node to
+// obtain a cluster total. A peer that does not implement this RPC answers
+// UNIMPLEMENTED, which the caller reports as a non-reporting node rather than
+// as zero activity.
+message TierDailyStatsResponse {
+  bool success = 1;
+  bytes tier_daily_stats = 2;
+  optional string error_info = 3;
+}
+
 message TierMutationPrepareRequest {
   uint32 version = 1;
   string mutation_id = 2;
@@ -1203,6 +1219,7 @@ service NodeService {
   rpc CancelDecommission(CancelDecommissionRequest) returns (CancelDecommissionResponse) {}; // auth-policy: body-bound
   rpc ClearDecommission(ClearDecommissionRequest) returns (ClearDecommissionResponse) {}; // auth-policy: body-bound
   rpc LoadTransitionTierConfig(LoadTransitionTierConfigRequest) returns (LoadTransitionTierConfigResponse) {}; // auth-policy: body-bound
+  rpc TierDailyStats(TierDailyStatsRequest) returns (TierDailyStatsResponse) {}; // auth-policy: read-only
   rpc GetLiveEvents(GetLiveEventsRequest) returns (GetLiveEventsResponse) {}; // auth-policy: read-only
 }
 

@@ -15,7 +15,9 @@
 use crate::bucket::metadata::BucketMetadata;
 use crate::bucket::metadata_sys::get_bucket_targets_config;
 use crate::bucket::metadata_sys::get_replication_config;
-use crate::bucket::remote_s3_client::{PathStyle, RemoteCredentials, RemoteS3EndpointSpec, build_remote_s3_client};
+use crate::bucket::remote_s3_client::{
+    PathStyle, REPLICATION_TARGET_RETRY_POLICY, RemoteCredentials, RemoteS3EndpointSpec, build_remote_s3_client,
+};
 use crate::bucket::replication::{ObjectLockIntegrity, object_lock_put_integrity};
 use crate::bucket::replication::{ReplicationStatusType, ReplicationTargetConfigBridge};
 use crate::bucket::target::ARN;
@@ -114,6 +116,10 @@ impl From<&BucketTarget> for RemoteS3EndpointSpec {
             ca_cert_pem: (!target.ca_cert_pem.trim().is_empty()).then(|| target.ca_cert_pem.clone()),
             connect_timeout: None,
             read_timeout: None,
+            // Replication has no retry budget of its own on the request path,
+            // so it keeps the SDK's standard three attempts; stating it here
+            // pins the behaviour to this line instead of an SDK default.
+            retry: REPLICATION_TARGET_RETRY_POLICY,
             user_agent_suffix: "",
         }
     }
@@ -2348,11 +2354,11 @@ impl Error for BucketTargetError {}
 mod tests {
     use super::*;
     use crate::bucket::remote_s3_client::{
-        EXPIRED_REMOTE_TARGET_CREDENTIALS, RemoteTargetCredentialsProvider, build_aws_s3_http_client_for_spec,
-        build_aws_s3_http_client_from_target_ca_pem, build_aws_s3_http_client_with_trust_store,
-        build_insecure_aws_s3_http_client, compose_replication_trust_store, ensure_rustls_crypto_provider,
-        load_tls_path_ca_bundles, remote_sdk_credentials, replication_request_checksum_calculation,
-        validate_remote_endpoint_inner, validate_target_ca_pem,
+        EXPIRED_REMOTE_TARGET_CREDENTIALS, RemoteS3RetryPolicy, RemoteTargetCredentialsProvider,
+        build_aws_s3_http_client_for_spec, build_aws_s3_http_client_from_target_ca_pem,
+        build_aws_s3_http_client_with_trust_store, build_insecure_aws_s3_http_client, compose_replication_trust_store,
+        ensure_rustls_crypto_provider, load_tls_path_ca_bundles, remote_sdk_credentials,
+        replication_request_checksum_calculation, validate_remote_endpoint_inner, validate_target_ca_pem,
     };
     use aws_credential_types::Credentials as SdkCredentials;
     use aws_sdk_s3::Config as S3Config;
@@ -3050,6 +3056,11 @@ mod tests {
         assert!(spec.ca_cert_pem.is_none(), "whitespace-only CA PEM means unset");
         assert!(spec.connect_timeout.is_none() && spec.read_timeout.is_none());
         assert_eq!(spec.user_agent_suffix, "");
+        assert_eq!(
+            spec.retry,
+            RemoteS3RetryPolicy::Standard { max_attempts: 3 },
+            "replication targets keep the SDK's historical three attempts"
+        );
         let credentials = spec.credentials.expect("credentials carry over");
         assert_eq!(credentials.account_id, "reset-1");
         assert!(credentials.session_token.is_none(), "blank session token is absent");

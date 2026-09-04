@@ -238,6 +238,11 @@ pub struct PolicyConfig {
     pub range_get: RangeGetPolicy,
     #[serde(default)]
     pub source_error: SourceErrorPolicy,
+    /// Merge the source listing into `ListObjectsV2` so clients see the whole
+    /// namespace during the migration (rustfs/backlog#2164). Off by default:
+    /// it puts the source in the path of every listing.
+    #[serde(default)]
+    pub list_through: bool,
     #[serde(default = "default_true")]
     pub respect_local_delete_marker: bool,
     #[serde(default = "default_true")]
@@ -268,6 +273,7 @@ impl Default for PolicyConfig {
             head: HeadPolicy::default(),
             range_get: RangeGetPolicy::default(),
             source_error: SourceErrorPolicy::default(),
+            list_through: false,
             respect_local_delete_marker: true,
             preserve_etag: true,
             copy_tags: false,
@@ -615,6 +621,7 @@ mod tests {
     "head": "proxy",
     "range_get": "serve_and_backfill",
     "source_error": "propagate",
+    "list_through": false,
     "respect_local_delete_marker": true,
     "preserve_etag": true,
     "copy_tags": false,

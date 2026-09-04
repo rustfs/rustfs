@@ -103,7 +103,8 @@ The persisted blob is `on-demand-migration.json` in the bucket's metadata. Unkno
 | `filter.source_prefix` | string \| null | `null` | Null or non-empty. Prepended to the local key to form the source key |
 | `policy.head` | `proxy` \| `local_only` | `proxy` | `local_only` answers a HEAD miss with 404 and no source traffic |
 | `policy.range_get` | `serve_and_backfill` \| `serve_only` | `serve_and_backfill` | Whether a Range GET also queues a background pull of the whole object |
-| `policy.source_error` | `propagate` \| `not_found` | `propagate` | `propagate` answers 424 `SourceUnavailable`; `not_found` degrades to 404 |
+| `policy.source_error` | `propagate` \| `not_found` | `propagate` | `propagate` answers 424 `SourceUnavailable`; `not_found` degrades to 404, and for a merged listing to local state only |
+| `policy.list_through` | bool | `false` | Merges the source listing into `ListObjectsV2` so clients see the whole namespace during the migration. Off by default: it puts the source in the path of every listing |
 | `policy.respect_local_delete_marker` | bool | `true` | A local delete marker is the final answer; only a versioned bucket can produce one |
 | `policy.preserve_etag` | bool | `true` | Keeps the source ETag on the stored object unless the bucket encrypts by default |
 | `policy.copy_tags` | bool | `false` | Copies source object tags; needs `s3:GetObjectTagging` and costs one extra source call per inline pull |
@@ -124,20 +125,22 @@ Validation also rejects two shapes outright: a source whose endpoint and bucket 
 
 ## Provider presets and source permissions
 
-| Provider | Endpoint | Addressing | `region` | Notes |
-|---|---|---|---|---|
-| `aws` | Optional; derived as `https://s3.<region>.amazonaws.com` | Virtual-host | Real region required (`auto` rejected) | The derived form only accepts `[A-Za-z0-9-]` in `region` |
-| `s3` | Required | Path-style | Real region | Generic S3-compatible endpoint (Wasabi, Backblaze B2 S3 API, Ceph RGW, …) |
-| `minio` | Required | Path-style | `auto` allowed | |
-| `rustfs` | Required | Path-style | `auto` allowed | A RustFS source answers the migration request locally thanks to the anti-loop marker |
-| `r2` | `https://<account-id>.r2.cloudflarestorage.com` | Virtual-host | `auto` allowed (signed as `us-east-1`) | |
-| `gcs` | `https://storage.googleapis.com` | Virtual-host | Real region required | Uses the GCS XML interoperability API with an HMAC key pair, not a service-account JSON key |
+| Provider | Endpoint | Addressing | `region` | Notes | Interop evidence |
+|---|---|---|---|---|---|
+| `aws` | Optional; derived as `https://s3.<region>.amazonaws.com` | Virtual-host | Real region required (`auto` rejected) | The derived form only accepts `[A-Za-z0-9-]` in `region` | `cloud-source (aws)`, only while `ODM_INTEROP_AWS_*` are configured; no difference recorded yet |
+| `s3` | Required | Path-style | Real region | Generic S3-compatible endpoint (Wasabi, Backblaze B2 S3 API, Ceph RGW, …) | No lane of its own; the preset is the same code path the `minio` job exercises |
+| `minio` | Required | Path-style | `auto` allowed | | `minio-source`, nightly: read-through, HEAD passthrough, merged list pagination and a 5,000-object backfill; no difference recorded yet |
+| `rustfs` | Required | Path-style | `auto` allowed | A RustFS source answers the migration request locally thanks to the anti-loop marker | `real_source_test.rs` in the `e2e-nightly` lane |
+| `r2` | `https://<account-id>.r2.cloudflarestorage.com` | Virtual-host | `auto` allowed (signed as `us-east-1`) | | `cloud-source (r2)`, only while `ODM_INTEROP_R2_*` are configured; no difference recorded yet |
+| `gcs` | `https://storage.googleapis.com` | Virtual-host | Real region required | Uses the GCS XML interoperability API with an HMAC key pair, not a service-account JSON key | `cloud-source (gcs)`, only while `ODM_INTEROP_GCS_HMAC_*` are configured; no difference recorded yet |
 
 Azure Blob has no preset; a native provider is deferred (rustfs/backlog#2166).
 
+The "Interop evidence" column names the job in `.github/workflows/on-demand-migration-interop.yml` (rustfs/backlog#2167) that last exercised the preset against a real implementation, and is where a provider difference belongs once the lane finds one. That lane is report-only and scheduled: it runs `crates/e2e_test/src/on_demand_migration/interop_test.rs` — the same case bodies as the merge-gate suite, with the source injected through `RUSTFS_ODM_INTEROP_*` — against a pinned MinIO container, and against each cloud provider whose repository secrets are configured. A provider without secrets is skipped with a note in the run summary rather than failing, so "no difference recorded yet" means exactly that and not "verified clean"; see [ci-gates.md](../testing/ci-gates.md) for the row.
+
 The credentials only ever need read access to the source bucket:
 
-- `s3:ListBucket` on the bucket — used by the admin probe and by the backfill listing.
+- `s3:ListBucket` on the bucket — used by the admin probe, by the backfill listing, and by every merged listing under `policy.list_through`.
 - `s3:GetObject` on `<bucket>/*` — used by every HEAD and GET against the source.
 - `s3:GetObjectTagging` on `<bucket>/*` — only when `policy.copy_tags` is `true`.
 
@@ -155,7 +158,12 @@ Behaviour a client can observe. The "Test" column names the case that pins it: `
 | Client disconnects mid-stream on an inline pull | The write-back keeps draining the source and still stores the whole object | `get.rs::odm_get_inline_client_disconnect_still_stores_the_whole_object` |
 | Concurrent GET misses of one key | Singleflight: one leader tees, followers wait up to `first_byte_ms` and then re-read locally; on leader failure or timeout they stream through without queueing | `concurrency_test.rs::test_odm_concurrent_misses_on_one_key_coalesce`, `get.rs::odm_get_follower_rereads_local_after_the_leader_commits` |
 | HEAD miss | Proxied to the source, nothing is written locally; `local_only` answers 404 without source traffic | `head.rs::odm_head_source_hit_returns_output_and_writes_nothing_back`, `head.rs::odm_head_local_only_policy_is_404_without_source_traffic`, `real_source_test.rs::test_odm_rustfs_source_serves_pull_head_range_and_prefixes_real_single_node` |
-| LIST | Local only. A key that exists on the source but was never pulled is not listed, even while a GET of it succeeds | `interaction_test.rs::test_odm_write_back_respects_the_bucket_quota` |
+| LIST, `policy.list_through = false` (default) | Local only. A key that exists on the source but was never pulled is not listed, even while a GET of it succeeds | `interaction_test.rs::test_odm_write_back_respects_the_bucket_quota` |
+| `ListObjectsV2` with `policy.list_through = true` | The local and source listings are merged into one ordered page: byte-wise key order, local wins a key both sides hold, `CommonPrefixes` unioned and deduplicated under a delimiter. A source entry reports the source's own ETag, size and last-modified, storage class `STANDARD` and this bucket's owner. The continuation token is opaque and carries both cursors | `list_through_test.rs::list_through_merges_the_whole_namespace_across_full_pagination`, `list_through_test.rs::list_through_unions_common_prefixes_under_a_delimiter`, `list_through.rs::merged_pagination_equals_the_deduplicated_union` |
+| `ListObjects` (v1) and `ListObjectVersions`, whatever `list_through` says | Local only. v1 has no opaque continuation token that could carry two cursors, and a version listing has no meaning for a source whose versions were never pulled | `list_through_test.rs::a_merged_token_keeps_paginating_after_list_through_is_turned_off` |
+| Merged listing, source listing fails or the breaker is open | `propagate` answers 424 `SourceUnavailable`; `not_found` answers from local state alone and marks the response `x-rustfs-on-demand-migration-list: local_only` | `list_through_test.rs::list_through_propagates_a_source_listing_failure`, `list_through_test.rs::list_through_degrades_to_local_only_under_the_not_found_policy` |
+| Merged listing, tampered continuation token | 400 `InvalidArgument`; a token issued while `list_through` was on keeps paginating the local side after it is turned off | `list_through_test.rs::list_through_rejects_a_tampered_continuation_token`, `list_through.rs::token_round_trips_and_rejects_tampering` |
+| Merged listing, versioned bucket with a local delete marker | The shadowed key is dropped from the page, matching `respect_local_delete_marker` on GET. The local listing never returns delete markers, so such a bucket costs one extra local metadata read per source-only key in the page | `list_through_test.rs::a_local_delete_marker_hides_the_source_key_from_a_merged_listing` |
 | PUT / DELETE | Never touch the source. A local PUT shadows the source key for good | `interaction_test.rs::test_odm_delete_marker_shadows_the_source_but_a_plain_delete_does_not` |
 | Versioned bucket, local delete marker | With `respect_local_delete_marker` (default) the marker is the final answer and the source is not consulted | `interaction_test.rs::test_odm_delete_marker_shadows_the_source_but_a_plain_delete_does_not`, `head.rs::odm_head_verdict_respects_local_delete_marker_by_policy` |
 | Unversioned bucket, object deleted locally | The key becomes an ordinary miss and is pulled from the source again | `interaction_test.rs::test_odm_delete_marker_shadows_the_source_but_a_plain_delete_does_not` |
@@ -165,6 +173,7 @@ Behaviour a client can observe. The "Test" column names the case that pins it: `
 | Source answers 404 | 404 to the client and the key is negative-cached for `negative_cache_ttl_secs` | `get_basic_test.rs::get_source_not_found_is_404_and_negative_cached`, `fault_test.rs::test_odm_source_not_found_is_negative_cached_for_the_ttl` |
 | Source answers 403 | 424 (or 404 under `not_found`); the breaker is **not** opened — a credential problem is not a transient one | `fault_test.rs::test_odm_source_access_denied_propagates_without_opening_the_breaker` |
 | Repeated source 5xx / timeouts | The breaker opens, GETs answer per `source_error` and HEADs answer 404; a probe closes it again after the open window | `fault_test.rs::test_odm_repeated_source_errors_open_the_breaker_and_recover`, `head.rs::odm_head_source_errors_follow_policy_and_open_the_breaker` |
+| Source stalls mid-body on an inline pull | `source_timeout.idle_ms` ends both tee ends: the client's read fails instead of receiving a silently truncated 200, the pull counts under `source_timeout`, and no object or multipart upload is left behind | `fault_test.rs::test_odm_inline_pull_aborts_when_the_source_body_stalls`, `pull.rs::commit_inline_reports_a_stalled_source_as_a_source_timeout` |
 | Bucket default SSE | The pulled object is stored encrypted and reads back in plaintext; the ETag override is dropped, and the source ETag is kept in metadata | `interaction_test.rs::test_odm_pulled_object_uses_bucket_default_encryption`, `on_demand_migration_put.rs::write_back_under_bucket_default_sse_stores_ciphertext_and_records_source_etag` |
 | Object Lock bucket | The pulled object inherits the bucket's default retention | `interaction_test.rs::test_odm_pulled_object_inherits_object_lock_retention` |
 | Bucket quota exceeded | The client is still served from the source; the write-back is rejected, nothing is stored, and the failure counts under `quota` | `interaction_test.rs::test_odm_write_back_respects_the_bucket_quota`, `on_demand_migration_put.rs::write_back_reports_a_full_bucket_quota` |
@@ -210,7 +219,8 @@ Five provenance keys are written on every pulled object under both internal pref
 | Concurrency limit | Local write amplification | `max_concurrent_pulls` permits shared by inline and background pulls |
 | Bounded queue | Unbounded memory on a burst | `pull_queue_capacity` waiting jobs; overflow is counted as `queue_full` and never fails a client response |
 | Bandwidth limit | Source and network saturation | `bandwidth_limit_bytes_per_sec` (minimum 64 KiB/s) on the source client |
-| Retry budget | Transient source blips | Background pulls retry a retryable failure up to 3 times (1 s / 4 s / 16 s plus jitter). Inline pulls never retry: the bytes are already on their way to the client |
+| Retry budget | Transient source blips | Background pulls retry a retryable failure up to 3 times (1 s / 4 s / 16 s plus jitter). Inline pulls never retry: the bytes are already on their way to the client. The SDK retry policy on the source client is disabled (`RemoteS3RetryPolicy::Disabled`), so this is the only retry budget and one logical source call is exactly one wire request — replication targets keep the SDK's three attempts, declared on their own spec |
+| Idle timeout | A source that answers and then goes quiet mid-body | `source_timeout.idle_ms` per body chunk on both paths. The budget measures the source read, upstream of the inline tee, so a slow client is never mistaken for an idle source; when it fires the client stream ends in an error and the write-back is discarded |
 | Anti-loop marker | Migration chains between RustFS/MinIO deployments | Every source request carries `x-rustfs-source-proxy-request` and `x-minio-source-proxy-request`; a request carrying it is always answered locally |
 | Outbound endpoint policy | SSRF | See [outbound-connection-policy.md](outbound-connection-policy.md) |
 
@@ -291,7 +301,7 @@ sum by (bucket, reason) (rate(rustfs_on_demand_migration_pull_failures_total[5m]
 
 **`NoSuchBucket` from the source, or a 301/307 redirect.** The addressing style is wrong: a virtual-host request against a path-style-only server looks like a missing bucket, and a path-style request against AWS gets redirected. Set `source.path_style` explicitly instead of relying on `auto`.
 
-**Large objects are served but never stored.** Check `pull_failures_total`: `queue_full` means bursts exceed `pull_queue_capacity` (raise it, or raise `max_concurrent_pulls`); `quota` means the bucket quota rejected the write-back and `local_write` a genuine local write failure; `etag_mismatch` means the source body did not match the ETag the source advertised. The client response is served in all three cases — only the local copy is missing.
+**Large objects are served but never stored.** Check `pull_failures_total`: `queue_full` means bursts exceed `pull_queue_capacity` (raise it, or raise `max_concurrent_pulls`); `quota` means the bucket quota rejected the write-back and `local_write` a genuine local write failure; `etag_mismatch` means the source body did not match the ETag the source advertised. The client response is served in all these cases — only the local copy is missing. `source_timeout` is different: the source stopped sending mid-body, so the client's own read fails too and nothing is stored.
 
 **The first read of a key is slow, later ones are fast.** Expected: the first read pays a source HEAD plus a source GET. Watch `source_latency_seconds_*` for the source's contribution and lower `inline_max_bytes` if teeing large objects is hurting first-byte latency.
 
@@ -304,7 +314,9 @@ sum by (bucket, reason) (rate(rustfs_on_demand_migration_pull_failures_total[5m]
 - **SSE-C source objects are not supported.** They are rejected with 424 `unsupported`; migrate them by another route.
 - **Anonymous (credential-less) sources are not supported yet.** `source.credentials: null` parses and passes structural validation, but the client builder has no anonymous mode, so the admin `PUT` refuses it and the runtime would treat such a bucket as unavailable. A public source still needs a key pair.
 - **Azure Blob is not a supported source** (rustfs/backlog#2166). GCS is supported only through its XML interoperability API with HMAC keys.
-- **LIST does not merge the source** (rustfs/backlog#2164). Only local objects are listed, so a client that lists before reading will not see un-migrated keys.
+- **LIST merges the source only when asked, and only for v2.** With the default `policy.list_through = false` a client that lists before reading will not see un-migrated keys. Turning it on merges `ListObjectsV2` alone; `ListObjects` (v1) and `ListObjectVersions` stay local.
+- **A merged listing costs up to two local listings and two source listings per page** (one per side, plus a refill when the previous page consumed most of what that side had buffered). Walking N merged keys at `max-keys=K` therefore costs ceil(N/K) requests and between ceil(N/K) and 2*ceil(N/K) source listings. Source listings are capped at 10 per second per bucket (a compile-time constant); a listing that cannot get a slot inside one second is treated like a source failure and follows `policy.source_error`.
+- **A degraded merged page loses the source keys in its window.** Under `source_error = not_found` the page is answered locally and the source cursor is left where it was, so the keys the source would have contributed between the previous page's last key and this one are not shown again once pagination moves on. The `x-rustfs-on-demand-migration-list: local_only` header marks every page this happened on.
 - **Write-through is undecided** (rustfs/backlog#2165). PUT and DELETE never reach the source in this version.
 - **`pull_failures_total` counts abandoned pulls, not attempts.** A pull that failed twice and then succeeded contributes nothing; attempt-level failure needs a new counter.
 - **The breaker's 30 s open window is a compile-time constant** with no environment override, which is why breaker-related tests have to wait it out.

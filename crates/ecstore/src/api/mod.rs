@@ -49,7 +49,7 @@ pub mod bucket {
                 apply_transition_rule, enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects,
                 enqueue_transition_for_existing_objects_scoped, enqueue_transition_for_existing_objects_scoped_with_cancel,
                 enqueue_transition_immediate, expire_transitioned_object, get_global_expiry_state, get_global_transition_state,
-                init_background_expiry, manual_transition_queue_snapshot, post_restore_opts,
+                init_background_expiry, lifecycle_version_delete_target, manual_transition_queue_snapshot, post_restore_opts,
                 run_stale_multipart_upload_cleanup_once, validate_transition_tier,
             };
         }
@@ -118,7 +118,7 @@ pub mod bucket {
         }
 
         pub mod tier_last_day_stats {
-            pub use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
+            pub use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats, TierDailyStatsWire};
         }
 
         pub mod tier_sweeper {
@@ -162,8 +162,14 @@ pub mod bucket {
         };
         pub use crate::bucket::on_demand_migration::{
             EnqueueOutcome, LocalObject, MAX_MULTIPART_PARTS, OdmWriteBack, PULL_MAX_RETRIES, PULL_RETRY_BASE_DELAYS,
-            PullCompletion, PullQueue, PullReason, PullSource, QueuedPullOutcome, SourceBody, WriteBackBody, WriteBackError,
-            WriteBackOutcome, WriteBackPart, WriteBackRequest, commit_inline, commit_inline_with, idle_guarded_body,
+            PullCompletion, PullQueue, PullReason, PullSource, QueuedPullOutcome, SourceBody, SourceIdleGuard, WriteBackBody,
+            WriteBackError, WriteBackOutcome, WriteBackPart, WriteBackRequest, commit_inline, commit_inline_with,
+            idle_guarded_body,
+        };
+        pub use crate::bucket::on_demand_migration::{
+            FetchRequest, LIST_THROUGH_TOKEN_VERSION, ListEntryKey, ListThroughCursor, ListThroughMerger, ListThroughToken,
+            ListThroughTokenError, MAX_LIST_FETCHES_PER_SIDE, MergeOutcome, MergePick, MergeSide, SOURCE_LIST_MAX_RATE_WAIT,
+            SOURCE_LIST_RATE_PER_SEC, SourceListPlan, SourceListRateLimiter, decode_continuation_token, source_list_plan,
         };
         pub mod backfill {
             pub use crate::bucket::on_demand_migration::backfill::{
@@ -178,8 +184,8 @@ pub mod bucket {
         }
         pub mod source_client {
             pub use crate::bucket::on_demand_migration::source_client::{
-                SourceClient, SourceClientSpec, SourceError, SourceGet, SourceHead, SourceObject, SourcePage, SourceProbe,
-                SourceProvider, SourceSse, SourceTimeouts, USER_AGENT_SUFFIX, is_multipart_etag, range_header_value,
+                SourceClient, SourceClientSpec, SourceError, SourceGet, SourceHead, SourceListRequest, SourceObject, SourcePage,
+                SourceProbe, SourceProvider, SourceSse, SourceTimeouts, USER_AGENT_SUFFIX, is_multipart_etag, range_header_value,
                 resolve_path_style,
             };
         }
@@ -241,7 +247,7 @@ pub mod bucket {
 
     pub mod remote_s3_client {
         pub use crate::bucket::remote_s3_client::{
-            PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, build_remote_s3_client,
+            PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, RemoteS3RetryPolicy, build_remote_s3_client,
             validate_remote_endpoint,
         };
     }
@@ -466,7 +472,7 @@ pub mod notification {
     #[cfg(any(test, feature = "test-util"))]
     pub use crate::services::notification_sys::rotate_cross_pool_fence_fleet_proof_for_test;
     pub use crate::services::notification_sys::{
-        CrossPoolFenceFleetProofToken, NotificationPeerErr, NotificationSys, ScannerPublicationLeaseGrant,
+        ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationPeerErr, NotificationSys, ScannerPublicationLeaseGrant,
         acquire_cross_pool_fence_fleet_proof, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
         new_global_notification_sys, scanner_peer_transport_error_message_is_retryable, start_remote_version_state_fleet_probe,
     };

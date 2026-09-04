@@ -17,6 +17,7 @@ use crate::object_api::ObjectInfo;
 pub use rustfs_lifecycle::{
     Event, ExpirationOptions, IlmAction, Lifecycle, LifecycleCalculate, ObjectOpts, RuleValidate, TRANSITION_COMPLETE,
     TRANSITION_PENDING, TransitionOptions, abort_incomplete_multipart_upload_due, expected_expiry_time,
+    expiration_action_has_valid_target,
 };
 
 pub fn object_opts_from_object_info(oi: &ObjectInfo) -> ObjectOpts {

@@ -26,11 +26,10 @@
 //! forwarded: v1 rejects SSE-C source objects outright.
 
 use crate::bucket::remote_s3_client::{
-    PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, build_remote_s3_config,
+    PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, RemoteS3RetryPolicy, build_remote_s3_config,
 };
 use crate::storage_api_contracts::range::HTTPRangeSpec;
 use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
@@ -150,6 +149,12 @@ pub struct SourceClientSpec {
     pub skip_tls_verify: bool,
     pub ca_cert_pem: Option<String>,
     pub timeouts: SourceTimeouts,
+    /// Wire requests one logical source call may cost. The pull pipeline and
+    /// the backfill job own the retry budget (`pull.rs` `PULL_MAX_RETRIES`,
+    /// `backfill.rs` `LIST_MAX_RETRIES`) and the breaker counts logical calls,
+    /// so ODM declares [`RemoteS3RetryPolicy::Disabled`] and keeps one counted
+    /// failure equal to one request against a struggling source.
+    pub retry: RemoteS3RetryPolicy,
     /// Bytes per second the pull pipeline may consume from this source;
     /// `None` means unlimited. Enforced by the consumer, not by this client.
     pub bandwidth_limit: Option<NonZeroU64>,
@@ -193,6 +198,7 @@ impl SourceClientSpec {
             ca_cert_pem: self.ca_cert_pem.clone(),
             connect_timeout: Some(self.timeouts.connect),
             read_timeout: Some(self.timeouts.read),
+            retry: self.retry,
             user_agent_suffix: USER_AGENT_SUFFIX,
         })
     }
@@ -505,8 +511,26 @@ pub struct SourceObject {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SourcePage {
     pub objects: Vec<SourceObject>,
+    /// Rolled-up prefixes, in the local namespace; always empty when the
+    /// request carried no delimiter.
+    pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
+}
+
+/// One `ListObjectsV2` page request against the source. Keys are given in the
+/// local namespace; `SourceClient` maps them through `source_prefix`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceListRequest<'a> {
+    pub prefix: Option<&'a str>,
+    /// Rolls the source's own listing up the same way the local one is rolled
+    /// up, so a page under a delimiter stays bounded.
+    pub delimiter: Option<&'a str>,
+    /// Ignored by S3 when `continuation_token` is set, so the caller must pass
+    /// at most one of the two.
+    pub start_after: Option<&'a str>,
+    pub continuation_token: Option<&'a str>,
+    pub max_keys: i32,
 }
 
 /// Result of [`SourceClient::probe`]: the bucket answered HEAD and a
@@ -579,19 +603,11 @@ impl SourceClient {
         Ok(Self::from_config_builder(config, endpoint.endpoint_url(), spec))
     }
 
+    /// `config` must come from [`SourceClientSpec::endpoint_spec`], which is
+    /// where the retry policy that keeps one logical call equal to one wire
+    /// request is declared.
     fn from_config_builder(config: aws_sdk_s3::config::Builder, endpoint: String, spec: &SourceClientSpec) -> Self {
-        // The pull pipeline and the backfill job own the retry budget for a
-        // source call (`pull.rs` PULL_MAX_RETRIES, `backfill.rs`
-        // LIST_MAX_RETRIES), and the breaker counts logical calls. Leaving the
-        // smithy standard policy on top would turn one counted failure into
-        // three wire requests against a source that is already struggling, so
-        // keep one logical call equal to one wire request.
-        let client = S3Client::from_conf(
-            config
-                .retry_config(RetryConfig::disabled())
-                .interceptor(SourceProxyMarkerInterceptor::new())
-                .build(),
-        );
+        let client = S3Client::from_conf(config.interceptor(SourceProxyMarkerInterceptor::new()).build());
         Self {
             client,
             endpoint,
@@ -671,13 +687,35 @@ impl SourceClient {
         continuation_token: Option<&str>,
         max_keys: i32,
     ) -> Result<SourcePage, SourceError> {
+        self.list_page(&SourceListRequest {
+            prefix,
+            continuation_token,
+            max_keys,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// [`Self::list_objects_v2`] with the delimiter and start-after the
+    /// list-through merge needs (rustfs/backlog#2164).
+    pub async fn list_page(&self, request: &SourceListRequest<'_>) -> Result<SourcePage, SourceError> {
+        // `start_after` is silently ignored by S3 once a continuation token is
+        // present; refuse the ambiguous pair rather than list from the wrong
+        // position.
+        if request.continuation_token.is_some() && request.start_after.is_some() {
+            return Err(SourceError::Other(
+                "source listing takes either a continuation token or start-after, not both".to_string(),
+            ));
+        }
         let output = self
             .client
             .list_objects_v2()
             .bucket(&self.bucket)
-            .prefix(self.source_key(prefix.unwrap_or_default()))
-            .set_continuation_token(continuation_token.map(str::to_string))
-            .max_keys(max_keys)
+            .prefix(self.source_key(request.prefix.unwrap_or_default()))
+            .set_delimiter(request.delimiter.map(str::to_string))
+            .set_start_after(request.start_after.map(|after| self.source_key(after)))
+            .set_continuation_token(request.continuation_token.map(str::to_string))
+            .max_keys(request.max_keys)
             .send()
             .await
             .map_err(classify_sdk_error)?;
@@ -695,9 +733,16 @@ impl SourceClient {
             .into_iter()
             .filter_map(|object| self.source_object(object))
             .collect();
+        let common_prefixes = output
+            .common_prefixes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|prefix| Some(self.local_key(prefix.prefix.as_deref()?)?.to_string()))
+            .collect();
 
         Ok(SourcePage {
             objects,
+            common_prefixes,
             is_truncated,
             next_continuation_token,
         })
@@ -862,6 +907,7 @@ mod tests {
             }),
             skip_tls_verify: false,
             ca_cert_pem: None,
+            retry: RemoteS3RetryPolicy::Disabled,
             timeouts: SourceTimeouts::default(),
             bandwidth_limit: NonZeroU64::new(1_000_000),
         }

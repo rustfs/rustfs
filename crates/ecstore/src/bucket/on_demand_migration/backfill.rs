@@ -1717,6 +1717,7 @@ mod tests {
                 objects,
                 is_truncated,
                 next_continuation_token: is_truncated.then(|| end.to_string()),
+                ..Default::default()
             })
         }
 

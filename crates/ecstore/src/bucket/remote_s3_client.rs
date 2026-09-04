@@ -17,8 +17,11 @@
 //! Replication targets (`bucket_target_sys`) and the on-demand migration
 //! source client build their remote clients from one neutral
 //! [`RemoteS3EndpointSpec`]: endpoint assembly, credential handling, path-style
-//! selection, custom CA / skip-TLS transports and the outbound SSRF gate all
-//! live here so both callers share exactly one policy. The gate keeps the
+//! selection, custom CA / skip-TLS transports, the SDK retry policy and the
+//! outbound SSRF gate all live here so both callers share exactly one policy.
+//! The retry policy is the one knob the two consumers deliberately disagree
+//! on, so [`RemoteS3EndpointSpec::retry`] is a required field rather than an
+//! inherited SDK default. The gate keeps the
 //! relaxed replication semantics documented in
 //! `docs/operations/outbound-connection-policy.md`: private addresses are
 //! always allowed, loopback only behind `RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET`.
@@ -29,6 +32,7 @@ use aws_sdk_s3::config::Region as SdkRegion;
 use aws_sdk_s3::config::RequestChecksumCalculation;
 use aws_sdk_s3::config::SharedCredentialsProvider;
 use aws_sdk_s3::config::SharedHttpClient;
+use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::{Client as S3Client, Config as S3Config};
 use aws_smithy_http_client::{Builder as SmithyHttpClientBuilder, tls as smithy_tls};
 use aws_smithy_runtime_api::box_error::BoxError;
@@ -80,6 +84,34 @@ impl PathStyle {
     }
 }
 
+/// SDK-level retry policy for a remote client. Retries are invisible to the
+/// caller — one logical call becomes several wire requests — so every consumer
+/// states its own instead of inheriting the SDK default: a caller that already
+/// owns a retry budget would otherwise multiply it against an endpoint that is
+/// by definition already failing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteS3RetryPolicy {
+    /// One logical call is exactly one wire request; the caller owns the
+    /// retry budget.
+    Disabled,
+    /// Smithy's standard strategy, capped at `max_attempts` attempts in total
+    /// (the initial request included). Values below 1 are clamped to 1.
+    Standard { max_attempts: u32 },
+}
+
+/// The SDK default replication targets have always run with, written out so a
+/// change to it is a change to this line rather than to a dependency default.
+pub const REPLICATION_TARGET_RETRY_POLICY: RemoteS3RetryPolicy = RemoteS3RetryPolicy::Standard { max_attempts: 3 };
+
+impl RemoteS3RetryPolicy {
+    fn retry_config(self) -> RetryConfig {
+        match self {
+            RemoteS3RetryPolicy::Disabled => RetryConfig::disabled(),
+            RemoteS3RetryPolicy::Standard { max_attempts } => RetryConfig::standard().with_max_attempts(max_attempts.max(1)),
+        }
+    }
+}
+
 /// Static or temporary credentials for a remote endpoint. `expiration` without
 /// a `session_token` is rejected at build time: only STS-style temporary
 /// credentials expire, so that combination is a corrupted configuration
@@ -123,6 +155,9 @@ pub struct RemoteS3EndpointSpec {
     pub ca_cert_pem: Option<String>,
     pub connect_timeout: Option<Duration>,
     pub read_timeout: Option<Duration>,
+    /// How many wire requests one logical call may cost. Every consumer
+    /// declares it; see [`RemoteS3RetryPolicy`].
+    pub retry: RemoteS3RetryPolicy,
     /// Appended to the SDK `User-Agent` (space separated) so the remote side
     /// can identify the caller; empty means no suffix.
     pub user_agent_suffix: &'static str,
@@ -263,7 +298,8 @@ pub(crate) async fn build_remote_s3_config(
         .credentials_provider(SharedCredentialsProvider::new(RemoteTargetCredentialsProvider { credentials: creds }))
         .region(SdkRegion::new(spec.region.clone()))
         .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-        .request_checksum_calculation(replication_request_checksum_calculation());
+        .request_checksum_calculation(replication_request_checksum_calculation())
+        .retry_config(spec.retry.retry_config());
 
     if spec.path_style.force_path_style() {
         config_builder = config_builder.force_path_style(true);
@@ -618,6 +654,7 @@ mod tests {
     use super::*;
     use aws_smithy_runtime_api::http::StatusCode as SmithyStatusCode;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn spec(endpoint: &str, secure: bool) -> RemoteS3EndpointSpec {
         RemoteS3EndpointSpec {
@@ -636,6 +673,7 @@ mod tests {
             ca_cert_pem: None,
             connect_timeout: None,
             read_timeout: None,
+            retry: RemoteS3RetryPolicy::Disabled,
             user_agent_suffix: "",
         }
     }
@@ -724,6 +762,66 @@ mod tests {
             .expect_err("invalid custom CA PEM must be rejected");
         assert!(matches!(err, RemoteS3ClientError::InvalidCaPem(_)));
         assert!(err.to_string().contains("invalid target CA PEM"));
+    }
+
+    /// Answers every request with a retryable 503 and counts the wire
+    /// requests one logical call produced.
+    #[derive(Clone, Debug)]
+    struct CountingUnavailableConnector {
+        wire_requests: Arc<AtomicUsize>,
+    }
+
+    impl SmithyHttpConnector for CountingUnavailableConnector {
+        fn call(&self, _request: HttpRequest) -> HttpConnectorFuture {
+            self.wire_requests.fetch_add(1, Ordering::SeqCst);
+            HttpConnectorFuture::ready(Ok(HttpResponse::new(
+                SmithyStatusCode::try_from(503_u16).expect("503 should be a valid response status"),
+                SdkBody::empty(),
+            )))
+        }
+    }
+
+    async fn wire_requests_for_one_failed_call(retry: RemoteS3RetryPolicy) -> usize {
+        let wire_requests = Arc::new(AtomicUsize::new(0));
+        let connector = SharedHttpConnector::new(CountingUnavailableConnector {
+            wire_requests: Arc::clone(&wire_requests),
+        });
+        let http_client = http_client_fn(move |_settings, _components| connector.clone());
+
+        let mut spec = spec("s3.example.com", true);
+        spec.retry = retry;
+        let config = build_remote_s3_config(&spec)
+            .await
+            .expect("spec should build")
+            .http_client(http_client)
+            .build();
+        S3Client::from_conf(config)
+            .head_bucket()
+            .bucket("bucket")
+            .send()
+            .await
+            .expect_err("a 503 must fail the call");
+
+        wire_requests.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_policy_decides_how_many_wire_requests_one_call_costs() {
+        assert_eq!(
+            wire_requests_for_one_failed_call(RemoteS3RetryPolicy::Disabled).await,
+            1,
+            "a disabled policy must not amplify one logical call"
+        );
+        assert_eq!(
+            wire_requests_for_one_failed_call(REPLICATION_TARGET_RETRY_POLICY).await,
+            3,
+            "replication targets keep the three-attempt SDK default"
+        );
+        assert_eq!(
+            wire_requests_for_one_failed_call(RemoteS3RetryPolicy::Standard { max_attempts: 0 }).await,
+            1,
+            "a zero attempt budget is clamped to the initial request"
+        );
     }
 
     #[test]
