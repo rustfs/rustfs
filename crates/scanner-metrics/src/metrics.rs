@@ -798,6 +798,88 @@ struct ScannerActiveBucketDriveValue {
 // Metrics
 // ---------------------------------------------------------------------------
 
+/// A remote-tier request a warm backend issues on the cluster's behalf.
+///
+/// The set is closed on purpose: these values become metric labels, so a new
+/// operation is a deliberate schema change rather than something a call site
+/// can invent.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TierRequestOperation {
+    Put,
+    Get,
+    Remove,
+    Probe,
+    InUse,
+}
+
+impl TierRequestOperation {
+    pub const ALL: [Self; 5] = [Self::Put, Self::Get, Self::Remove, Self::Probe, Self::InUse];
+
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Put => "put",
+            Self::Get => "get",
+            Self::Remove => "remove",
+            Self::Probe => "probe",
+            Self::InUse => "in_use",
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// How a remote-tier request ended.
+///
+/// This classifies the request only. A transition whose remote PUT succeeded
+/// and whose local commit then failed is a `Success` here: the remote service
+/// did perform the request, and reporting it as a tier failure would hide a
+/// leaked remote object behind an apparent backend outage.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TierRequestOutcome {
+    Success,
+    BackendError,
+    Timeout,
+    Cancelled,
+}
+
+impl TierRequestOutcome {
+    pub const ALL: [Self; 4] = [Self::Success, Self::BackendError, Self::Timeout, Self::Cancelled];
+
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::BackendError => "backend_error",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Classify a warm backend error without letting its message into a label.
+    pub fn from_error(err: &std::io::Error) -> Self {
+        match err.kind() {
+            std::io::ErrorKind::TimedOut => Self::Timeout,
+            std::io::ErrorKind::Interrupted => Self::Cancelled,
+            _ => Self::BackendError,
+        }
+    }
+}
+
+/// One fixed operation/outcome cell of the tier request counters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TierRequestCount {
+    pub operation: TierRequestOperation,
+    pub outcome: TierRequestOutcome,
+    pub count: u64,
+}
+
+const TIER_REQUEST_COUNTER_SLOTS: usize = TierRequestOperation::ALL.len() * TierRequestOutcome::ALL.len();
+
 pub struct Metrics {
     operations: Vec<AtomicU64>,
     latency: Vec<LockedLastMinuteLatency>,
@@ -892,6 +974,10 @@ pub struct Metrics {
     scanner_transition_queued_total: AtomicU64,
     scanner_transition_missed_total: AtomicU64,
     scanner_transition_completed: AtomicU64,
+    /// Remote tier requests by operation and outcome. The width is fixed by
+    /// the two label enums, so the series count cannot grow with tier names,
+    /// endpoints or object keys.
+    tier_requests: [AtomicU64; TIER_REQUEST_COUNTER_SLOTS],
     scanner_transition_failed: AtomicU64,
     scanner_throttle_idle_mode_enabled: AtomicBool,
     scanner_throttle_sleep_factor_micros: AtomicU64,
@@ -1943,6 +2029,7 @@ impl Metrics {
             scanner_transition_queued_total: AtomicU64::new(0),
             scanner_transition_missed_total: AtomicU64::new(0),
             scanner_transition_completed: AtomicU64::new(0),
+            tier_requests: std::array::from_fn(|_| AtomicU64::new(0)),
             scanner_transition_failed: AtomicU64::new(0),
             scanner_throttle_idle_mode_enabled: AtomicBool::new(false),
             scanner_throttle_sleep_factor_micros: AtomicU64::new(0),
@@ -2212,6 +2299,33 @@ impl Metrics {
             .store(state.compensation_pending, Ordering::Relaxed);
         self.scanner_transition_compensation_running
             .store(state.compensation_running, Ordering::Relaxed);
+    }
+
+    /// Count one completed remote tier request.
+    ///
+    /// Called once per request at the single point where every warm backend
+    /// call returns, so a retried request is counted once per attempt and a
+    /// successful attempt is never also counted as a failure.
+    pub fn record_tier_request(&self, operation: TierRequestOperation, outcome: TierRequestOutcome) {
+        let slot = operation.index() * TierRequestOutcome::ALL.len() + outcome.index();
+        self.tier_requests[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Every operation/outcome cell, including the zero ones, so a scrape has
+    /// a stable series set from the first request onward.
+    pub fn tier_request_counts(&self) -> Vec<TierRequestCount> {
+        let mut counts = Vec::with_capacity(TIER_REQUEST_COUNTER_SLOTS);
+        for operation in TierRequestOperation::ALL {
+            for outcome in TierRequestOutcome::ALL {
+                let slot = operation.index() * TierRequestOutcome::ALL.len() + outcome.index();
+                counts.push(TierRequestCount {
+                    operation,
+                    outcome,
+                    count: self.tier_requests[slot].load(Ordering::Relaxed),
+                });
+            }
+        }
+        counts
     }
 
     pub fn record_scanner_transition_completed(&self, count: u64) {
@@ -3548,6 +3662,76 @@ impl Drop for CloseDiskGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tier_cell(metrics: &Metrics, operation: TierRequestOperation, outcome: TierRequestOutcome) -> u64 {
+        metrics
+            .tier_request_counts()
+            .into_iter()
+            .find(|count| count.operation == operation && count.outcome == outcome)
+            .map(|count| count.count)
+            .expect("every operation/outcome cell must be reported")
+    }
+
+    #[test]
+    fn a_tier_request_lands_in_exactly_one_operation_outcome_cell() {
+        let metrics = Metrics::default();
+        metrics.record_tier_request(TierRequestOperation::Put, TierRequestOutcome::Success);
+
+        assert_eq!(tier_cell(&metrics, TierRequestOperation::Put, TierRequestOutcome::Success), 1);
+        assert_eq!(
+            metrics
+                .tier_request_counts()
+                .into_iter()
+                .map(|count| count.count)
+                .sum::<u64>(),
+            1,
+            "one request must not increment a second cell"
+        );
+    }
+
+    #[test]
+    fn every_operation_outcome_pair_has_its_own_cell() {
+        let metrics = Metrics::default();
+        for operation in TierRequestOperation::ALL {
+            for outcome in TierRequestOutcome::ALL {
+                metrics.record_tier_request(operation, outcome);
+            }
+        }
+
+        let counts = metrics.tier_request_counts();
+        assert_eq!(
+            counts.len(),
+            TierRequestOperation::ALL.len() * TierRequestOutcome::ALL.len(),
+            "the series set is fixed by the two label enums"
+        );
+        assert!(
+            counts.iter().all(|count| count.count == 1),
+            "two different pairs must not share a counter slot"
+        );
+    }
+
+    #[test]
+    fn a_backend_error_is_classified_without_reading_its_message() {
+        assert_eq!(
+            TierRequestOutcome::from_error(&std::io::Error::new(std::io::ErrorKind::TimedOut, "s3.example.com:9000 timed out")),
+            TierRequestOutcome::Timeout
+        );
+        assert_eq!(
+            TierRequestOutcome::from_error(&std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled")),
+            TierRequestOutcome::Cancelled
+        );
+        assert_eq!(
+            TierRequestOutcome::from_error(&std::io::Error::other("AccessDenied")),
+            TierRequestOutcome::BackendError
+        );
+    }
+
+    #[test]
+    fn tier_request_labels_are_stable_identifiers() {
+        assert_eq!(TierRequestOperation::Put.as_label(), "put");
+        assert_eq!(TierRequestOperation::InUse.as_label(), "in_use");
+        assert_eq!(TierRequestOutcome::BackendError.as_label(), "backend_error");
+    }
 
     #[test]
     fn scanner_metrics_report_timestamps_serialize_as_rfc3339_utc() {

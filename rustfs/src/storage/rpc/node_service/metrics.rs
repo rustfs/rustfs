@@ -14,11 +14,14 @@
 
 use super::NodeService;
 use crate::storage::rpc::encode_msgpack_map;
-use crate::storage::storage_api::rpc_consumer::node_service::{CollectMetricsOpts, MetricType, collect_local_metrics};
+use crate::storage::storage_api::rpc_consumer::node_service::{
+    CollectMetricsOpts, MetricType, TierDailyStatsWire, collect_local_metrics, get_global_transition_state,
+};
 use bytes::Bytes;
 use rmp_serde::Deserializer;
 use rustfs_protos::proto_gen::node_service::*;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::io::Cursor;
 use tonic::{Request, Response, Status};
 use tracing::error;
@@ -70,6 +73,37 @@ impl NodeService {
                 realtime_metrics: Bytes::new(),
                 error_info: Some(err.to_string()),
             })),
+        }
+    }
+
+    /// This node's own rolling-day transition counters.
+    ///
+    /// Only this node's completions are reported; the caller sums the rings of
+    /// every member, so answering with anything wider would double count.
+    pub(super) async fn handle_tier_daily_stats(
+        &self,
+        _request: Request<TierDailyStatsRequest>,
+    ) -> Result<Response<TierDailyStatsResponse>, Status> {
+        let stats = get_global_transition_state()
+            .get_daily_all_tier_stats()
+            .into_iter()
+            .map(|(tier, stats)| (tier, stats.to_wire()))
+            .collect::<HashMap<String, TierDailyStatsWire>>();
+
+        match encode_msgpack_map(&stats) {
+            Ok(buf) => Ok(Response::new(TierDailyStatsResponse {
+                success: true,
+                tier_daily_stats: buf.into(),
+                error_info: None,
+            })),
+            Err(err) => {
+                error!(error = %err, "failed to serialize tier daily stats");
+                Ok(Response::new(TierDailyStatsResponse {
+                    success: false,
+                    tier_daily_stats: Bytes::new(),
+                    error_info: Some(err.to_string()),
+                }))
+            }
         }
     }
 }

@@ -65,7 +65,7 @@ mod ecstore_metrics {
 
 mod ecstore_notification {
     pub(crate) use crate::storage::storage_api::ecstore_notification::{
-        CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
+        ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
     };
 }
 
@@ -102,6 +102,7 @@ pub(crate) type ECStore = ecstore_storage::ECStore;
 pub(crate) type EndpointServerPools = ecstore_layout::EndpointServerPools;
 pub(crate) type MetricType = ecstore_metrics::MetricType;
 pub(crate) type NotificationSys = ecstore_notification::NotificationSys;
+pub(crate) type ClusterTierDailyStats = ecstore_notification::ClusterTierDailyStats;
 pub(crate) type PeerRestClient = ecstore_rpc::PeerRestClient;
 pub(crate) type RebalSaveOpt = ecstore_rebalance::RebalSaveOpt;
 pub(crate) type RebalanceCleanupWarnings = ecstore_rebalance::RebalanceCleanupWarnings;
@@ -1031,9 +1032,9 @@ pub(crate) mod s3 {
 
 pub(crate) mod tier {
     pub(crate) use super::{
-        AdminError, DailyAllTierStats, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY,
-        ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CONFIG, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS,
-        ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND, ERR_TIER_RESERVED_NAME, TierConfig, TierConfigUpdateError, TierCreds,
-        TierType,
+        AdminError, ClusterTierDailyStats, DailyAllTierStats, ECStore, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE,
+        ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CONFIG, ERR_TIER_INVALID_CREDENTIALS,
+        ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND, ERR_TIER_RESERVED_NAME, TierConfig,
+        TierConfigUpdateError, TierCreds, TierType,
     };
 }

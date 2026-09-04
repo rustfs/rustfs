@@ -40,6 +40,7 @@ pub mod system_memory;
 pub mod system_network;
 pub mod system_network_host;
 pub mod system_process;
+pub mod tier;
 
 pub use entry::descriptor::MetricDescriptor;
 pub use entry::metric_name::MetricName;
