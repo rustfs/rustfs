@@ -47,7 +47,9 @@ use crate::admin::storage_api::bucket::on_demand_migration::source_client::{
 use crate::admin::storage_api::bucket::on_demand_migration::{
     OdmBucketSnapshot, OnDemandMigrationConfig, OnDemandMigrationConfigError, OnDemandMigrationSys, PathStyle, ValidationContext,
 };
-use crate::admin::storage_api::bucket::remote_s3_client::{PathStyle as RemotePathStyle, RemoteCredentials, RemoteS3ClientError};
+use crate::admin::storage_api::bucket::remote_s3_client::{
+    PathStyle as RemotePathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3RetryPolicy,
+};
 use crate::admin::storage_api::contract::bucket::{BucketOperations as _, BucketOptions};
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::s3::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, error as admin_s3_error};
@@ -615,6 +617,9 @@ pub(crate) fn source_client_spec(config: &OnDemandMigrationConfig) -> SourceClie
             connect: Duration::from_millis(timeout.connect_ms),
             read: Duration::from_millis(timeout.first_byte_ms),
         },
+        // The probe reports the source's own answer; an SDK retry would hide
+        // a flapping source behind a success and triple the probe's cost.
+        retry: RemoteS3RetryPolicy::Disabled,
         bandwidth_limit: config.policy.bandwidth_limit_bytes_per_sec.and_then(NonZeroU64::new),
     }
 }

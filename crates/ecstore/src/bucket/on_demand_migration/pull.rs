@@ -54,6 +54,7 @@ use std::fmt;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -149,28 +150,58 @@ pub enum EnqueueOutcome {
 /// Body a source read produces; consumed inside the pump task only.
 pub type SourceBody = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send + 'static>>;
 
+/// Says whether an [`idle_guarded_body`] stream ended because the source
+/// stalled. The tee flattens a stalled source into an ordinary body read
+/// error, which the write-back would otherwise report as a local write
+/// failure; the inline path consults this to count the pull under
+/// [`PullFailureReason::SourceTimeout`] instead.
+#[derive(Clone, Debug, Default)]
+pub struct SourceIdleGuard {
+    timed_out: Arc<AtomicBool>,
+}
+
+impl SourceIdleGuard {
+    /// True once the guarded stream ended on the idle budget.
+    pub fn timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::Acquire)
+    }
+}
+
 /// Applies `source_timeout.idle_ms` to a source body chunk by chunk: a chunk
 /// that does not arrive within `idle_timeout` ends the stream with a timeout
-/// error. The background pump enforces the same budget itself; the inline tee
-/// path in the app layer has no pump and wraps its body with this instead, so
-/// a stalled source cannot hold an inline pull open past the configured
-/// budget.
-pub fn idle_guarded_body(body: SourceBody, idle_timeout: Duration) -> SourceBody {
-    Box::pin(futures::stream::unfold(Some(body), move |state| async move {
-        let mut body = state?;
-        match tokio::time::timeout(idle_timeout, body.next()).await {
-            Err(_elapsed) => Some((
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("source body stalled for more than {}ms", idle_timeout.as_millis()),
-                )),
-                None,
-            )),
-            Ok(None) => None,
-            Ok(Some(Err(err))) => Some((Err(err), None)),
-            Ok(Some(Ok(chunk))) => Some((Ok(chunk), Some(body))),
+/// error. Both pull paths share this one implementation — the background pump
+/// wraps the body it copies into the write-back channel, and the app layer
+/// wraps the body it tees between the client and [`commit_inline`].
+///
+/// The budget measures the source, not the consumer: the timeout is armed
+/// inside the stream's own poll, so a consumer that stops asking for bytes (a
+/// slow client, or a tee whose queue is full) leaves no timer running and is
+/// never mistaken for an idle source.
+pub fn idle_guarded_body(body: SourceBody, idle_timeout: Duration) -> (SourceBody, SourceIdleGuard) {
+    let guard = SourceIdleGuard::default();
+    let timed_out = Arc::clone(&guard.timed_out);
+    let stream = futures::stream::unfold(Some(body), move |state| {
+        let timed_out = Arc::clone(&timed_out);
+        async move {
+            let mut body = state?;
+            match tokio::time::timeout(idle_timeout, body.next()).await {
+                Err(_elapsed) => {
+                    timed_out.store(true, Ordering::Release);
+                    Some((
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("source body stalled for more than {}ms", idle_timeout.as_millis()),
+                        )),
+                        None,
+                    ))
+                }
+                Ok(None) => None,
+                Ok(Some(Err(err))) => Some((Err(err), None)),
+                Ok(Some(Ok(chunk))) => Some((Ok(chunk), Some(body))),
+            }
         }
-    }))
+    });
+    (Box::pin(stream), guard)
 }
 
 /// Body handed to the write-back; `Sync` because the app-layer put path
@@ -362,13 +393,15 @@ impl PumpState {
 }
 
 /// Copies the source body into a bounded channel, enforcing `idle_timeout`
-/// per chunk, `cancel`, and the advertised `expected_size`.
+/// per chunk (through [`idle_guarded_body`]), `cancel`, and the advertised
+/// `expected_size`.
 fn spawn_pump(
-    mut body: SourceBody,
+    body: SourceBody,
     expected_size: u64,
     idle_timeout: Duration,
     cancel: CancellationToken,
 ) -> (mpsc::Receiver<io::Result<Bytes>>, Arc<PumpState>) {
+    let (mut body, _idle) = idle_guarded_body(body, idle_timeout);
     let (tx, rx) = mpsc::channel(PUMP_CHANNEL_CHUNKS);
     let state = Arc::new(PumpState::default());
     let pump_state = Arc::clone(&state);
@@ -377,13 +410,12 @@ fn spawn_pump(
         loop {
             let next = tokio::select! {
                 _ = cancel.cancelled() => Err(pump_state.fail(PumpFailure::Canceled)),
-                next = tokio::time::timeout(idle_timeout, body.next()) => match next {
-                    Err(_elapsed) => Err(pump_state.fail(PumpFailure::Source(SourceError::Timeout))),
-                    Ok(None) if delivered < expected_size => Err(pump_state.fail(PumpFailure::Source(SourceError::Connect(
+                next = body.next() => match next {
+                    None if delivered < expected_size => Err(pump_state.fail(PumpFailure::Source(SourceError::Connect(
                         format!("source body ended after {delivered} of {expected_size} bytes"),
                     )))),
-                    Ok(None) => return,
-                    Ok(Some(Err(err))) => {
+                    None => return,
+                    Some(Err(err)) => {
                         let failure = if err.kind() == io::ErrorKind::TimedOut {
                             SourceError::Timeout
                         } else {
@@ -391,7 +423,7 @@ fn spawn_pump(
                         };
                         Err(pump_state.fail(PumpFailure::Source(failure)))
                     }
-                    Ok(Some(Ok(chunk))) => {
+                    Some(Ok(chunk)) => {
                         let len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
                         delivered = delivered.saturating_add(len);
                         if delivered > expected_size {
@@ -738,19 +770,25 @@ fn record_completion(state: &BucketOdmState, key: &str, path: PullPath, result: 
 /// Inline write-back of a body the GET handler is already streaming (the
 /// tee secondary). No retry: the bytes cannot be re-read. The caller owns
 /// the singleflight slot; this only writes and accounts.
+///
+/// `idle` is the guard of the [`idle_guarded_body`] the caller teed, so a
+/// write-back that failed because the source stalled is counted as the source
+/// timeout it is rather than as a local write failure. Callers that do not
+/// wrap the source body pass a default guard.
 pub async fn commit_inline(
     state: &Arc<BucketOdmState>,
     key: &str,
     head: SourceHead,
     tags: Option<HashMap<String, String>>,
     body: WriteBackBody,
+    idle: &SourceIdleGuard,
 ) -> Result<WriteBackOutcome, PullError> {
     let Some(write_back) = state.write_back() else {
         let error = PullError::new(PullFailureReason::LocalWrite, "on-demand migration write-back is not installed");
         record_completion(state, key, PullPath::Inline, &Err(error.clone()));
         return Err(error);
     };
-    commit_inline_with(state, write_back, key, head, tags, body).await
+    commit_inline_with(state, write_back, key, head, tags, body, idle).await
 }
 
 /// [`commit_inline`] with an explicit write-back (tests and embedders).
@@ -761,12 +799,16 @@ pub async fn commit_inline_with(
     head: SourceHead,
     tags: Option<HashMap<String, String>>,
     body: WriteBackBody,
+    idle: &SourceIdleGuard,
 ) -> Result<WriteBackOutcome, PullError> {
     let request = WriteBackRequest::new(state, key, head, tags);
-    let result = write_back
-        .put_object(&request, body)
-        .await
-        .map_err(|err| PullError::new(err.reason(), err.to_string()));
+    let result = write_back.put_object(&request, body).await.map_err(|err| {
+        if idle.timed_out() {
+            PullError::new(PullFailureReason::SourceTimeout, SourceError::Timeout.to_string())
+        } else {
+            PullError::new(err.reason(), err.to_string())
+        }
+    });
     let completion = result
         .as_ref()
         .map(|outcome| PullCompletion::Stored(outcome.clone()))
@@ -1516,10 +1558,11 @@ mod tests {
     async fn idle_guarded_body_ends_a_stalled_stream_and_passes_chunks_through() {
         let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
         let body: SourceBody = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
-        let mut guarded = idle_guarded_body(body, Duration::from_secs(2));
+        let (mut guarded, idle) = idle_guarded_body(body, Duration::from_secs(2));
 
         tx.send(Ok(Bytes::from_static(b"chunk"))).await.expect("send a chunk");
         assert_eq!(guarded.next().await.expect("a chunk").expect("chunk is ok"), Bytes::from_static(b"chunk"));
+        assert!(!idle.timed_out(), "a delivered chunk is not a stall");
 
         // The producer never sends again: the guard ends the stream itself.
         let started = tokio::time::Instant::now();
@@ -1530,8 +1573,115 @@ mod tests {
             .expect_err("a stalled body must time out");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() >= Duration::from_secs(2));
+        assert!(idle.timed_out(), "the guard reports why the stream ended");
         assert!(guarded.next().await.is_none(), "the stream ends after the timeout");
         drop(tx);
+    }
+
+    /// A source that keeps producing, only slowly, must survive: the budget
+    /// is per chunk, not for the whole body.
+    #[tokio::test(start_paused = true)]
+    async fn idle_guarded_body_accepts_a_slow_but_advancing_source() {
+        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(1);
+        let body: SourceBody = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+        let (mut guarded, idle) = idle_guarded_body(body, Duration::from_secs(2));
+
+        let producer = tokio::spawn(async move {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                if tx.send(Ok(Bytes::from_static(b"chunk"))).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let mut chunks = 0;
+        while let Some(chunk) = guarded.next().await {
+            chunk.expect("a source that keeps advancing must not time out");
+            chunks += 1;
+        }
+        producer.await.expect("producer task");
+        assert_eq!(chunks, 5);
+        assert!(!idle.timed_out());
+    }
+
+    /// The budget measures the source, not the consumer: a reader that stops
+    /// asking for bytes for far longer than the budget still gets the rest of
+    /// the body once it resumes.
+    #[tokio::test(start_paused = true)]
+    async fn idle_guarded_body_does_not_time_out_a_slow_consumer() {
+        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
+        let body: SourceBody = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+        let (mut guarded, idle) = idle_guarded_body(body, Duration::from_secs(2));
+
+        for _ in 0..3 {
+            tx.send(Ok(Bytes::from_static(b"chunk"))).await.expect("send a chunk");
+        }
+        drop(tx);
+
+        let mut chunks = 0;
+        while let Some(chunk) = guarded.next().await {
+            chunk.expect("a stalled consumer must not fail the source");
+            chunks += 1;
+            // Ten times the budget passes between reads.
+            tokio::time::sleep(Duration::from_secs(20)).await;
+        }
+        assert_eq!(chunks, 3);
+        assert!(!idle.timed_out(), "the consumer's own pace is not source idleness");
+    }
+
+    /// The inline path has no pump: the guard is what turns a stalled source
+    /// into a `source_timeout` failure instead of a local write failure.
+    #[tokio::test(start_paused = true)]
+    async fn commit_inline_reports_a_stalled_source_as_a_source_timeout() {
+        let sys = OnDemandMigrationSys::new();
+        let mock = Arc::new(MockWriteBack::default());
+        let mock_dyn: Arc<dyn OdmWriteBack> = mock.clone();
+        sys.set_write_back(mock_dyn);
+        let state = enabled_state(&sys, &config()).await;
+
+        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
+        let body: SourceBody = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+        let (mut guarded, idle) = idle_guarded_body(body, Duration::from_secs(1));
+        tx.send(Ok(Bytes::from(body_bytes(100)))).await.expect("send the first chunk");
+        // The source announced 300 bytes and then stops sending; holding the
+        // sender keeps the stream open the way a stalled connection would.
+        let keep_open = tx;
+
+        // Stands in for the tee, which forwards the guarded source to the
+        // write-back and is the reason the write-back only ever sees a plain
+        // body read error.
+        let (relay_tx, relay_rx) = mpsc::channel::<io::Result<Bytes>>(4);
+        tokio::spawn(async move {
+            while let Some(chunk) = guarded.next().await {
+                let failed = chunk.is_err();
+                if relay_tx.send(chunk).await.is_err() || failed {
+                    return;
+                }
+            }
+        });
+        let write_body: WriteBackBody = Box::pin(tokio_stream::wrappers::ReceiverStream::new(relay_rx));
+
+        // The inline path holds the singleflight slot across the commit, the
+        // way `odm_get_inline` does.
+        let PullSlot::Leader(leader) = state.acquire_pull_slot("stalled").await.expect("the first caller leads") else {
+            panic!("the first caller must be the leader");
+        };
+        assert_eq!(state.stats().inflight_pulls(), 1);
+
+        let err = commit_inline(&state, "stalled", head(300), None, write_body, &idle)
+            .await
+            .expect_err("a stalled source must not commit");
+        assert_eq!(err.reason, PullFailureReason::SourceTimeout, "{err}");
+        assert!(idle.timed_out());
+        assert_eq!(failures(&state).get("source_timeout"), Some(&1));
+        assert_eq!(failures(&state).get("local_write"), None, "a stalled source is not a local write failure");
+        assert!(mock.local.lock().get("stalled").is_none(), "nothing is stored");
+
+        leader.complete(Err(err));
+        assert_eq!(state.stats().inflight_pulls(), 0, "the aborted pull releases its slot");
+        assert_eq!(state.inflight_keys(), 0);
+        drop(keep_open);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1695,7 +1845,7 @@ mod tests {
 
         let body = body_bytes(300);
         let stream: WriteBackBody = Box::pin(futures::stream::iter(vec![Ok(Bytes::from(body.clone()))]));
-        let outcome = commit_inline(&state, "inline", head(300), None, stream)
+        let outcome = commit_inline(&state, "inline", head(300), None, stream, &SourceIdleGuard::default())
             .await
             .expect("inline commit succeeds");
         assert_eq!(outcome.size, 300);
@@ -1706,7 +1856,7 @@ mod tests {
 
         *mock.forced_put_error.lock() = Some(WriteBackError::Integrity);
         let stream: WriteBackBody = Box::pin(futures::stream::iter(vec![Ok(Bytes::from(body.clone()))]));
-        let err = commit_inline_with(&state, &mock_dyn, "inline", head(300), None, stream)
+        let err = commit_inline_with(&state, &mock_dyn, "inline", head(300), None, stream, &SourceIdleGuard::default())
             .await
             .expect_err("integrity failure surfaces");
         assert_eq!(err.reason, PullFailureReason::EtagMismatch);
@@ -1717,7 +1867,7 @@ mod tests {
             Ok(Bytes::from(body_bytes(100))),
             Err(io::Error::new(io::ErrorKind::BrokenPipe, "tee primary dropped")),
         ]));
-        let err = commit_inline(&state, "torn", head(300), None, stream)
+        let err = commit_inline(&state, "torn", head(300), None, stream, &SourceIdleGuard::default())
             .await
             .expect_err("a broken secondary must fail");
         assert_eq!(err.reason, PullFailureReason::LocalWrite);
@@ -1728,7 +1878,7 @@ mod tests {
         let bare_state = enabled_state(&bare, &config()).await;
         assert!(bare_state.write_back().is_none());
         let stream: WriteBackBody = Box::pin(futures::stream::empty());
-        let err = commit_inline(&bare_state, "x", head(0), None, stream)
+        let err = commit_inline(&bare_state, "x", head(0), None, stream, &SourceIdleGuard::default())
             .await
             .expect_err("no write-back");
         assert_eq!(err.reason, PullFailureReason::LocalWrite);

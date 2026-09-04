@@ -481,7 +481,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
             return Event::default();
         };
 
-        if obj.delete_marker || !(obj.is_latest || obj.version_id.is_none_or(|v| v.is_nil())) {
+        if obj.delete_marker || !obj.is_latest {
             return Event::default();
         }
 
@@ -676,10 +676,11 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     obj.is_latest,
                     obj.delete_marker,
                     obj.version_id,
-                    (obj.is_latest || obj.version_id.is_none_or(|v| v.is_nil())) && !obj.delete_marker
+                    obj.is_latest && !obj.delete_marker
                 );
-                // Allow expiration for latest objects OR non-versioned objects (empty version_id)
-                if (obj.is_latest || obj.version_id.is_none_or(|v| v.is_nil())) && !obj.delete_marker {
+                // Current-version expiration is selected by the authoritative
+                // latest flag. An explicit null version can also be historical.
+                if obj.is_latest && !obj.delete_marker {
                     debug!("eval_inner: entering expiration check");
                     if let Some(ref expiration) = rule.expiration {
                         if let Some(ref date) = expiration.date {
@@ -1040,6 +1041,26 @@ pub struct ObjectOpts {
 impl ObjectOpts {
     pub fn expired_object_deletemarker(&self) -> bool {
         self.delete_marker && self.is_latest && self.num_versions == 1
+    }
+}
+
+/// Returns whether an expiry action has enough identity to target the object
+/// it was evaluated against. A nil UUID is an explicit S3 null-version
+/// identity; only an absent version ID is ambiguous for an exact-version
+/// action.
+pub fn expiration_action_has_valid_target(
+    action: IlmAction,
+    version_id: Option<Uuid>,
+    is_latest: bool,
+    delete_marker: bool,
+) -> bool {
+    match action {
+        IlmAction::DeleteAction | IlmAction::DeleteRestoredAction => is_latest && !delete_marker,
+        IlmAction::DeleteVersionAction => version_id.is_some() && (!is_latest || delete_marker),
+        IlmAction::DeleteRestoredVersionAction => version_id.is_some() && !is_latest && !delete_marker,
+        IlmAction::DeleteAllVersionsAction => is_latest && !delete_marker,
+        IlmAction::DelMarkerDeleteAllVersionsAction => is_latest && delete_marker,
+        _ => true,
     }
 }
 
@@ -4006,6 +4027,76 @@ mod tests {
         let event = lc.eval_inner(&opts, now, 0).await;
         // Without ExpiredObjectAllVersions, should use normal DeleteAction
         assert_eq!(event.action, IlmAction::DeleteAction);
+    }
+
+    #[tokio::test]
+    async fn current_expiration_requires_latest_even_for_null_version_identity() {
+        let base_time = datetime!(2025-01-01 00:00:00 UTC);
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![enabled_rule(
+                Some(LifecycleExpiration {
+                    days: Some(1),
+                    ..Default::default()
+                }),
+                None,
+                Some("expire-current"),
+            )],
+        };
+        let now = base_time + Duration::days(2);
+
+        let unversioned_current = ObjectOpts {
+            name: "object".to_string(),
+            mod_time: Some(base_time),
+            is_latest: true,
+            version_id: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            lc.eval_inner(&unversioned_current, now, 0).await.action,
+            IlmAction::DeleteAction,
+            "a truly unversioned current object must remain eligible"
+        );
+        assert_eq!(lc.predict_expiration(&unversioned_current).await.action, IlmAction::DeleteAction);
+        assert!(expiration_action_has_valid_target(
+            IlmAction::DeleteAction,
+            unversioned_current.version_id,
+            unversioned_current.is_latest,
+            unversioned_current.delete_marker,
+        ));
+        assert!(!expiration_action_has_valid_target(
+            IlmAction::DeleteVersionAction,
+            unversioned_current.version_id,
+            unversioned_current.is_latest,
+            unversioned_current.delete_marker,
+        ));
+
+        let historical_null = ObjectOpts {
+            name: "object".to_string(),
+            mod_time: Some(base_time),
+            version_id: Some(Uuid::nil()),
+            is_latest: false,
+            versioned: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            lc.eval_inner(&historical_null, now, 0).await.action,
+            IlmAction::NoneAction,
+            "an explicit null identity does not make a historical version current"
+        );
+        assert_eq!(lc.predict_expiration(&historical_null).await.action, IlmAction::NoneAction);
+        assert!(!expiration_action_has_valid_target(
+            IlmAction::DeleteAction,
+            historical_null.version_id,
+            historical_null.is_latest,
+            historical_null.delete_marker,
+        ));
+        assert!(expiration_action_has_valid_target(
+            IlmAction::DeleteVersionAction,
+            historical_null.version_id,
+            historical_null.is_latest,
+            historical_null.delete_marker,
+        ));
     }
 
     /// backlog#1148 ilm-8: once a restored copy's expiry passes, the evaluator

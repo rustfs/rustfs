@@ -40,7 +40,7 @@ use uuid::Uuid;
 mod storage_api;
 
 use storage_api::lifecycle::{
-    BUCKET_LIFECYCLE_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart,
+    BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart,
     DeleteAfterObjectLockSnapshotBarrier, DiskOption, ECStore, EcstoreError, Endpoint, EndpointServerPools, Endpoints,
     ExpiryState, IlmAction, LcEvent, LcEventSrc, ListOperations as _, MakeBucketOptions, MockWarmBackend,
     MultipartOperations as _, ObjectIO as _, ObjectOperations as _, PoolEndpoints, STORAGE_FORMAT_FILE, TRANSITION_PENDING,
@@ -2110,6 +2110,116 @@ mod serial_tests {
             wait_for_version_count(&ecstore, bucket_name.as_str(), object_name, 1, Duration::from_secs(3)).await,
             "scanner should delete zero-day noncurrent versions after enqueueing expiry"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#2198"]
+    async fn test_scanner_expires_historical_null_without_deleting_active_version() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
+        let bucket_name = format!("test-historical-null-expire-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        update_bucket_metadata(
+            bucket_name.as_str(),
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should first be enabled");
+        update_bucket_metadata(
+            bucket_name.as_str(),
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be suspended");
+
+        let mut null_reader = PutObjReader::from_vec(b"historical null body".to_vec());
+        let historical_null = ecstore
+            .put_object(
+                bucket_name.as_str(),
+                object_name,
+                &mut null_reader,
+                &ObjectOptions {
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("suspended PUT should create a null version");
+        assert_eq!(historical_null.version_id, Some(Uuid::nil()));
+
+        update_bucket_metadata(
+            bucket_name.as_str(),
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be re-enabled");
+        let active_body = b"active uuid body".to_vec();
+        let mut active_reader = PutObjReader::from_vec(active_body.clone());
+        let active = ecstore
+            .put_object(
+                bucket_name.as_str(),
+                object_name,
+                &mut active_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("re-enabled PUT should create an active UUID version");
+        let active_version_id = active.version_id.expect("the active version should have an identity");
+        assert!(!active_version_id.is_nil());
+
+        let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+    <Rule>
+        <ID>expire-historical-null</ID>
+        <Status>Enabled</Status>
+        <Filter>
+            <Prefix>test/</Prefix>
+        </Filter>
+        <NoncurrentVersionExpiration>
+            <NoncurrentDays>0</NoncurrentDays>
+        </NoncurrentVersionExpiration>
+    </Rule>
+</LifecycleConfiguration>"#;
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
+            .await
+            .expect("noncurrent expiration should be configured");
+        init_background_expiry(ecstore.clone()).await;
+
+        assert_eq!(object_version_count(&ecstore, bucket_name.as_str(), object_name).await, 2);
+        scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
+        assert!(
+            wait_for_version_count(&ecstore, bucket_name.as_str(), object_name, 1, Duration::from_secs(3)).await,
+            "scanner should delete only the historical null generation"
+        );
+
+        let remaining = ecstore
+            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("the active UUID version must remain visible");
+        assert_eq!(remaining.version_id, Some(active_version_id));
+        assert_eq!(read_object_fully(&ecstore, bucket_name.as_str(), object_name).await, active_body);
+
+        let null_error = ecstore
+            .get_object_info(
+                bucket_name.as_str(),
+                object_name,
+                &ObjectOptions {
+                    version_id: Some(Uuid::nil().to_string()),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the historical null generation should be gone");
+        assert!(is_err_object_not_found(&null_error) || is_err_version_not_found(&null_error));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
