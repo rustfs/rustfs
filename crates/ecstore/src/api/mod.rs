@@ -252,6 +252,13 @@ pub mod bucket {
         };
     }
 
+    pub mod sealed_credentials {
+        pub use crate::bucket::sealed_credentials::{
+            CredentialSealer, SEALED_CREDENTIAL_VERSION, SealScope, SealedCredential, SealedCredentialError,
+            SealedCredentialStore, credential_sealer, install_credential_sealer, seal_secret, unseal_secret,
+        };
+    }
+
     pub mod replication {
         pub use crate::bucket::replication::replication_pool::{
             DurableMrfBacklogSummary, DurableMrfBucketBacklog, DurableMrfTargetBacklog, MrfBacklogObservabilitySummary,
