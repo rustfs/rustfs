@@ -23,8 +23,8 @@
 //!   tests. Live expand-then-restart currently hits `pool metadata recovery
 //!   required` on localhost DistErasure. That is a production bootstrap-proof
 //!   limitation this test lane does not change. Movement tests use 4×4 single
-//!   pool and classify decommission/rebalance 4xx/5xx as a refused move while
-//!   still asserting object bytes.
+//!   pool and classify decommission/rebalance product refusals (and opaque
+//!   500 InternalError) as a refused move while still asserting object bytes.
 //!
 //! Genuine multi-node *striped* pools still need multi-host CI (backlog
 //! #1313 / #1314). Site replication uses two 4-node 1-drive clusters so the
@@ -57,8 +57,6 @@ pub(crate) enum DistLayout {
     FourByFour,
     /// 4 nodes × 1 drive, one erasure pool (minimum 4-node 4-disk layout).
     FourNodeFourDisk,
-    /// 2 single-node pools, 4 drives each (expansion seed).
-    TwoPoolFourDrive,
 }
 
 pub(crate) struct DistCluster {
@@ -88,7 +86,6 @@ impl DistCluster {
         let topology = match layout {
             DistLayout::FourByFour => ClusterTopology::single_pool_multidrive(NODE_COUNT, DRIVES_PER_NODE),
             DistLayout::FourNodeFourDisk => ClusterTopology::single_pool(NODE_COUNT),
-            DistLayout::TwoPoolFourDrive => ClusterTopology::per_node_pools(DRIVES_PER_NODE, vec![vec![0], vec![1]]),
         };
         let mut cluster = RustFSTestClusterEnvironment::with_topology(topology).await?;
         cluster.set_env("NO_PROXY", "127.0.0.1,localhost");
@@ -516,9 +513,10 @@ pub(crate) fn is_pool_meta_write_fence(body: &str) -> bool {
         || body.contains("live fleet capability proof")
 }
 
-/// Product refusals that movement tests observe. Opaque 5xx stays in
-/// [`classify_data_movement_http`] because admin often wraps the fence as
-/// InternalError XML without the inner string. Auth failures are not refusals.
+/// Product refusals that movement tests observe. Opaque 500 InternalError stays
+/// in [`classify_data_movement_http`] because admin often wraps the fence as
+/// InternalError XML without the inner string. 502/503 and auth failures are
+/// not refusals.
 pub(crate) fn is_known_data_movement_refusal(body: &str) -> bool {
     is_pool_meta_write_fence(body)
         || body.contains("NotImplemented")
@@ -536,7 +534,7 @@ pub(crate) fn classify_data_movement_http(status: StatusCode, body: &str) -> Res
     if status.is_success() {
         return Ok(DataMovementStart::Started);
     }
-    if is_known_data_movement_refusal(body) || status.as_u16() == 501 || status.is_server_error() {
+    if is_known_data_movement_refusal(body) || status.as_u16() == 501 || status == StatusCode::INTERNAL_SERVER_ERROR {
         return Ok(DataMovementStart::Refused(format!("{status} {body}")));
     }
     Err(format!("{status} {body}"))
@@ -552,7 +550,7 @@ pub(crate) async fn try_start_decommission(
 }
 
 /// Returns whether decommission actually started. A product refusal or opaque
-/// 5xx is not a test failure: callers still assert object bytes.
+/// 500 InternalError is not a test failure: callers still assert object bytes.
 pub(crate) async fn decommission_started_or_refused(cluster: &RustFSTestClusterEnvironment, pool_id: usize) -> TestResult<bool> {
     match try_start_decommission(cluster, pool_id).await? {
         DataMovementStart::Started => Ok(true),
@@ -778,17 +776,18 @@ pub(crate) async fn retrying_get_equals(
 
 #[tokio::test]
 async fn append_single_node_pool_extends_ellipses_volumes() {
-    let mut dist = DistCluster::new_stopped(DistLayout::TwoPoolFourDrive)
-        .await
-        .expect("two-pool seed topology");
-    assert_eq!(dist.cluster.rustfs_volumes_arg().split(' ').count(), 2);
+    let mut env =
+        RustFSTestClusterEnvironment::with_topology(ClusterTopology::per_node_pools(DRIVES_PER_NODE, vec![vec![0], vec![1]]))
+            .await
+            .expect("two-pool seed topology");
+    assert_eq!(env.rustfs_volumes_arg().split(' ').count(), 2);
 
-    let added = dist.cluster.append_single_node_pool().await.expect("append third pool");
+    let added = env.append_single_node_pool().await.expect("append third pool");
     assert_eq!(added, 2);
-    assert_eq!(dist.cluster.nodes.len(), 3);
-    assert_eq!(dist.cluster.nodes[2].pool_idx, 2);
-    assert_eq!(dist.cluster.nodes[2].data_dirs.len(), DRIVES_PER_NODE);
-    let volumes = dist.cluster.rustfs_volumes_arg();
+    assert_eq!(env.nodes.len(), 3);
+    assert_eq!(env.nodes[2].pool_idx, 2);
+    assert_eq!(env.nodes[2].data_dirs.len(), DRIVES_PER_NODE);
+    let volumes = env.rustfs_volumes_arg();
     assert_eq!(volumes.split(' ').count(), 3, "expected three pool arguments, got: {volumes}");
     assert!(volumes.contains("/drive{0...3}"), "expanded layout must keep drive ellipses: {volumes}");
 }
@@ -804,6 +803,35 @@ async fn append_single_node_pool_rejects_striped_single_pool() {
     assert!(
         message.contains("drives_per_node") || message.contains("one node per pool"),
         "unexpected error: {message}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cluster_start_fails_fast_when_node_process_exits() {
+    let mut dist = DistCluster::new_stopped(DistLayout::FourNodeFourDisk)
+        .await
+        .expect("stopped 4-node cluster");
+    let script = format!("{}/immediate-exit.sh", dist.cluster.temp_dir);
+    std::fs::write(&script, "#!/bin/sh\nexit 1\n").expect("write exit stub");
+    let mut perms = std::fs::metadata(&script).expect("stat exit stub").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod exit stub");
+
+    let started = Instant::now();
+    let err = dist
+        .start_from_binary(Path::new(&script))
+        .await
+        .expect_err("a node that exits immediately must fail start");
+    let elapsed = started.elapsed();
+    let message = err.to_string();
+    assert!(
+        message.contains("exited before TCP ready") || message.contains("exited before S3 ready"),
+        "unexpected start error: {message}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "cluster start must fail fast when a node exits, took {elapsed:?}"
     );
 }
 
@@ -896,4 +924,10 @@ fn classify_data_movement_http_observes_product_refusals_not_auth_failures() {
     ));
     let denied = classify_data_movement_http(StatusCode::FORBIDDEN, "AccessDenied").expect_err("auth failure is not a refusal");
     assert!(denied.contains("AccessDenied"), "{denied}");
+    let unavailable = classify_data_movement_http(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable")
+        .expect_err("503 is not a product refusal");
+    assert!(unavailable.contains("ServiceUnavailable"), "{unavailable}");
+    let bad_gateway =
+        classify_data_movement_http(StatusCode::BAD_GATEWAY, "Bad Gateway").expect_err("502 is not a product refusal");
+    assert!(bad_gateway.contains("502") || bad_gateway.contains("Bad Gateway"), "{bad_gateway}");
 }

@@ -15,7 +15,7 @@ The in-tree harness runs every node on `127.0.0.1` with a distinct port. That ma
 
 A pool striped across several localhost ports is not expressible (`RUSTFS_VOLUMES` host ellipses would collide on disk paths). Multi-host striped pools remain the hardware functional-chain / backlog #1313 / #1314 lane.
 
-Decommission and rebalance POST on the 4×4 single-pool layout is refused by the current product (`single pool deployments do not support decommission`, NotImplemented, or an opaque admin 5xx when the inner pool-meta fence is wrapped as InternalError). Those cases still assert object bytes and SHA-256; when the API starts they wait for completion and assert post-move integrity. They do not treat a refusal as a successful move. This lane does not change production pool-meta bootstrap, write-fence, or decommission policy; it only observes the current server behavior.
+Decommission and rebalance POST on the 4×4 single-pool layout is refused by the current product (`single pool deployments do not support decommission`, NotImplemented, or opaque 500 InternalError when the inner pool-meta fence is wrapped). 502/503 are not treated as a product refusal. Those cases still assert object bytes and SHA-256; when the API starts they wait for completion and assert post-move integrity. They do not treat a refusal as a successful move. This lane does not change production pool-meta bootstrap, write-fence, or decommission policy; it only observes the current server behavior.
 
 ## What this lane covers
 

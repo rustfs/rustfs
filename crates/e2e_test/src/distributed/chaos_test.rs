@@ -17,7 +17,9 @@ use super::harness::{
     take_drive_offline, unique_bucket, wait_for_ready,
 };
 use crate::common::init_logging;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Barrier;
 
 #[tokio::test]
 async fn kill_and_restart_node_preserves_objects() -> TestResult {
@@ -80,18 +82,21 @@ async fn concurrent_gets_survive_peer_node_kill() -> TestResult {
     let body = vec![0x7Au8; 96 * 1024];
     put_object(&dist.client(0)?, &bucket, "steady.bin", body.clone()).await?;
 
-    dist.cluster.stop_node(3)?;
-
     let live: Vec<_> = (0..3).map(|idx| dist.client(idx)).collect::<Result<Vec<_>, _>>()?;
+    let start = Arc::new(Barrier::new(13));
     let mut handles = Vec::new();
     for idx in 0..12 {
         let client = live[idx % live.len()].clone();
         let bucket = bucket.clone();
         let body = body.clone();
+        let start = start.clone();
         handles.push(tokio::spawn(async move {
+            start.wait().await;
             retrying_get_equals(&client, &bucket, "steady.bin", &body, Duration::from_secs(20)).await
         }));
     }
+    start.wait().await;
+    dist.cluster.stop_node(3)?;
     for handle in handles {
         handle.await??;
     }

@@ -1770,11 +1770,6 @@ impl RustFSTestClusterEnvironment {
         self.node_capture_log_paths.push(None);
         self.volume_proxy_addresses.push(None);
 
-        if !self.extra_env.iter().any(|(key, _)| key == "RUSTFS_UNSAFE_BYPASS_DISK_CHECK") {
-            self.extra_env
-                .push(("RUSTFS_UNSAFE_BYPASS_DISK_CHECK".to_string(), "true".to_string()));
-        }
-
         Ok(new_idx)
     }
 
