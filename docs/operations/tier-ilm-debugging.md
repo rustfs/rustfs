@@ -21,6 +21,16 @@
 | `FileMeta` / `FileInfo` / version metadata | `crates/filemeta/src/` |
 | Dual-key internal metadata helpers (`insert_bytes` / `get_bytes`) | `crates/utils/src/http/metadata_compat.rs` |
 
+## Free-version recovery controls
+
+The dedicated free-version recovery loop is enabled by default and is independent of the data scanner and heal switches. Setting `RUSTFS_SCANNER_ENABLED=false` does not stop this repair loop. Set `RUSTFS_TIER_FREE_VERSION_RECOVERY_ENABLED=false` before process startup to disable only the dedicated persisted-marker walk. That setting does not disable lifecycle workers or prevent another scanner path from discovering a free version, and it can leave remote cleanup markers pending for longer, so use it as a break-glass pressure control rather than a cleanup mechanism.
+
+Normal transitioned deletes pass a post-commit receipt directly to the lifecycle queue. The namespace walk is the crash, queue-pressure, mixed-version, and historical-record fallback. It cannot safely skip a bucket merely because that bucket has no current lifecycle rule or the referenced tier was removed: an older `xl.meta` free-version can still be the only owner of a required remote DELETE.
+
+One background recovery page completes at most 10,000 logical objects across at most 100 buckets and enqueues at most 1,000 recoverable free versions. The scanner can decode one additional object to detect truncation; a continuation marker preserves the first unscanned bucket or the last completely scanned object. Every truncated page and follow-up sweep waits at least 60 seconds after the previous page completes; failed pages back off from 60 seconds to 10 minutes, and complete idle sweeps exponentially back off to 10 minutes with jitter. Individual walks have no fixed total timeout, but inherit the drive walk stall timeout so a large healthy bucket can make progress without recreating the old timeout/restart loop.
+
+The structured `lifecycle_worker_state` recovery event reports `duration_ms`, `scanned_entries`, `buckets_scanned`, queue counts, truncation, and continuation markers. `rustfs_internal_stage_duration_ms{stage="lifecycle_free_version_recovery"}` records successful page duration; `stage="lifecycle_free_version_recovery_failed"` records failures.
+
 ## Metadata key conventions
 
 Internal metadata is stored under both `x-rustfs-internal-<suffix>` and `x-minio-internal-<suffix>` for MinIO interoperability. `get_bytes` prefers the RustFS key and falls back to the MinIO key.

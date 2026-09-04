@@ -32,7 +32,10 @@ use crate::store::ECStore;
 use rustfs_filemeta::FileInfo;
 
 pub const DEFAULT_FREE_VERSION_RECOVERY_LIMIT: usize = 1_000;
+// These are page-wide repair budgets. Applying them per bucket would still let
+// one recovery pass walk an unbounded namespace before the scheduler can cool down.
 const DEFAULT_FREE_VERSION_RECOVERY_SCAN_LIMIT: usize = 10_000;
+const DEFAULT_FREE_VERSION_RECOVERY_BUCKET_LIMIT: usize = 100;
 #[cfg(not(test))]
 const BACKGROUND_WALK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -40,6 +43,12 @@ const BACKGROUND_WALK_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, crate::error::Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RecoveryWorkBudget {
+    pub(super) max_objects: usize,
+    pub(super) max_buckets: usize,
+}
 
 fn recovery_walk_options(limit: usize, marker: Option<String>) -> WalkOptions {
     WalkOptions {
@@ -58,6 +67,7 @@ fn recovery_walk_options(limit: usize, marker: Option<String>) -> WalkOptions {
 
 #[cfg(test)]
 pub(super) enum RecoveryWalkTestAction {
+    SendItems(Vec<ObjectInfo>),
     SendItemsThenError(Vec<ObjectInfo>, crate::error::Error),
     SendItemsThenHang(Vec<ObjectInfo>, Arc<tokio::sync::Notify>),
     SendItemsUntilReceiverCloses(Arc<tokio::sync::Notify>),
@@ -278,6 +288,17 @@ pub(super) async fn list_tier_free_versions(
     object_marker: Option<String>,
     cancel_token: CancellationToken,
 ) -> Result<FreeVersionRecoveryPage> {
+    list_tier_free_versions_with_budget(api, limit, bucket_marker, object_marker, cancel_token, recovery_work_budget(limit)).await
+}
+
+pub(super) async fn list_tier_free_versions_with_budget(
+    api: Arc<ECStore>,
+    limit: usize,
+    bucket_marker: Option<String>,
+    object_marker: Option<String>,
+    cancel_token: CancellationToken,
+    work_budget: RecoveryWorkBudget,
+) -> Result<FreeVersionRecoveryPage> {
     let mut page = FreeVersionRecoveryPage {
         items: Vec::new(),
         next_bucket_marker: None,
@@ -289,6 +310,9 @@ pub(super) async fn list_tier_free_versions(
 
     if limit == 0 {
         return Ok(page);
+    }
+    if work_budget.max_objects == 0 || work_budget.max_buckets == 0 {
+        return Err(std::io::Error::other("free-version recovery work budget must be greater than zero").into());
     }
 
     let bucket_options = BucketOptions::default();
@@ -313,7 +337,7 @@ pub(super) async fn list_tier_free_versions(
     };
     let mut bucket_seen = bucket_marker.is_none();
     let mut truncated_after: Option<RecoveryCursor> = None;
-    let walk_scan_limit = recovery_walk_scan_limit(limit);
+    let mut remaining_scan_objects = work_budget.max_objects;
 
     for bucket in buckets {
         if cancel_token.is_cancelled() {
@@ -329,12 +353,20 @@ pub(super) async fn list_tier_free_versions(
             bucket_seen = true;
         }
 
+        if page.buckets_scanned >= work_budget.max_buckets {
+            page.truncated = true;
+            page.next_bucket_marker = Some(bucket.name);
+            page.next_object_marker = None;
+            break;
+        }
+
         page.buckets_scanned += 1;
         let bucket_object_marker = if bucket_marker.as_deref() == Some(bucket.name.as_str()) {
             object_marker.clone()
         } else {
             None
         };
+        let bucket_walk_limit = remaining_scan_objects;
 
         let (tx, mut rx) = mpsc::channel::<ObjectInfoOrErr>(100);
         let cancel = cancel_token.child_token();
@@ -358,6 +390,21 @@ pub(super) async fn list_tier_free_versions(
                 #[cfg(test)]
                 if let Some(action) = test_action {
                     match action {
+                        RecoveryWalkTestAction::SendItems(items) => {
+                            for item in items {
+                                if tx
+                                    .send(ObjectInfoOrErr {
+                                        item: Some(item),
+                                        err: None,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok(());
+                                }
+                            }
+                            return Ok(());
+                        }
                         RecoveryWalkTestAction::SendItemsThenError(items, err) => {
                             for item in items {
                                 if tx
@@ -425,7 +472,7 @@ pub(super) async fn list_tier_free_versions(
                     }
                 }
 
-                api.walk(cancel, &bucket_name, "", tx, recovery_walk_options(walk_scan_limit, object_marker))
+                api.walk(cancel, &bucket_name, "", tx, recovery_walk_options(bucket_walk_limit, object_marker))
                     .await
             }
         });
@@ -466,6 +513,18 @@ pub(super) async fn list_tier_free_versions(
             let Some(oi) = item.item else {
                 continue;
             };
+            if last_seen_object.as_deref() != Some(oi.name.as_str()) && scanned_objects >= bucket_walk_limit {
+                // The disk listing limit follows S3-visible counting rules and
+                // does not charge metadata containing only hidden/free versions.
+                // Enforce the repair budget again at the decoded-object boundary.
+                page.truncated = true;
+                page.next_bucket_marker = Some(bucket.name.clone());
+                page.next_object_marker = last_seen_object.clone();
+                cancel.cancel();
+                draining_after_truncation = true;
+                drain_deadline = Some(tokio::time::Instant::now() + BACKGROUND_WALK_SHUTDOWN_TIMEOUT);
+                continue;
+            }
             record_scanned_object(&mut last_seen_object, &mut scanned_objects, &oi.name);
             if let Some(cursor) = &truncated_after
                 && (cursor.bucket.as_str() != bucket.name.as_str() || cursor.object.as_str() != oi.name.as_str())
@@ -509,7 +568,8 @@ pub(super) async fn list_tier_free_versions(
             return Err(err);
         }
         walk_result?;
-        mark_scan_truncated_if_needed(&mut page, scanned_objects, walk_scan_limit, &bucket.name, last_seen_object.as_deref());
+        remaining_scan_objects = remaining_scan_objects.saturating_sub(scanned_objects);
+        mark_scan_truncated_if_needed(&mut page, scanned_objects, bucket_walk_limit, &bucket.name, last_seen_object.as_deref());
 
         if page.truncated {
             break;
@@ -526,6 +586,13 @@ pub(super) async fn list_tier_free_versions(
 
 fn recovery_walk_scan_limit(limit: usize) -> usize {
     DEFAULT_FREE_VERSION_RECOVERY_SCAN_LIMIT.max(limit.saturating_add(1))
+}
+
+fn recovery_work_budget(limit: usize) -> RecoveryWorkBudget {
+    RecoveryWorkBudget {
+        max_objects: recovery_walk_scan_limit(limit),
+        max_buckets: DEFAULT_FREE_VERSION_RECOVERY_BUCKET_LIMIT,
+    }
 }
 
 fn record_scanned_object(last_seen_object: &mut Option<String>, scanned_objects: &mut usize, object: &str) {
@@ -699,6 +766,13 @@ mod tests {
         assert_eq!(
             recovery_walk_scan_limit(DEFAULT_FREE_VERSION_RECOVERY_SCAN_LIMIT),
             DEFAULT_FREE_VERSION_RECOVERY_SCAN_LIMIT + 1
+        );
+        assert_eq!(
+            recovery_work_budget(DEFAULT_FREE_VERSION_RECOVERY_LIMIT),
+            RecoveryWorkBudget {
+                max_objects: DEFAULT_FREE_VERSION_RECOVERY_SCAN_LIMIT,
+                max_buckets: DEFAULT_FREE_VERSION_RECOVERY_BUCKET_LIMIT,
+            }
         );
     }
 
