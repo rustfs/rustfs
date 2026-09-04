@@ -63,6 +63,41 @@ pub(crate) async fn nsscanner_with_storage_status<S>(
 where
     S: ScannerStorage,
 {
+    let request = ScannerCycleRequest {
+        ctx,
+        budget,
+        updates,
+        want_cycle,
+        leader_epoch,
+        scan_mode,
+        scan_scope: ScannerBucketScanScope::default(),
+    };
+    nsscanner_with_storage_status_scoped(store, request).await
+}
+
+pub(crate) struct ScannerCycleRequest {
+    pub(crate) ctx: CancellationToken,
+    pub(crate) budget: Arc<ScannerCycleBudget>,
+    pub(crate) updates: mpsc::Sender<DataUsageInfo>,
+    pub(crate) want_cycle: u64,
+    pub(crate) leader_epoch: u64,
+    pub(crate) scan_mode: HealScanMode,
+    pub(crate) scan_scope: ScannerBucketScanScope,
+}
+
+pub(crate) async fn nsscanner_with_storage_status_scoped<S>(store: &S, request: ScannerCycleRequest) -> Result<ScannerCycleResult>
+where
+    S: ScannerStorage,
+{
+    let ScannerCycleRequest {
+        ctx,
+        budget,
+        updates,
+        want_cycle,
+        leader_epoch,
+        scan_mode,
+        scan_scope,
+    } = request;
     let child_token = ctx.child_token();
     let _tier_cycle_guard = begin_tier_registry_cycle(want_cycle, leader_epoch);
 
@@ -280,6 +315,7 @@ where
         let scan_plan = ScannerBucketScanPlan {
             buckets: set_buckets,
             all_buckets: Arc::clone(&all_buckets),
+            scope: scan_scope.clone(),
             digest: scan_plan_digest,
             leader_epoch,
             tier_registry_generation,
