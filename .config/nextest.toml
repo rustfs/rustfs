@@ -183,6 +183,13 @@ test-group = 'e2e-reliability'
 filter = 'package(e2e_test) & test(/^inline_fast_path_cluster_test::/)'
 test-group = 'e2e-inline-boundaries'
 
+# 4-node 4-drive distributed Actions suite: each case starts four rustfs
+# processes and up to sixteen data directories. Serialize across nextest's
+# process boundary so several 4x4 clusters never overlap.
+[[profile.default.overrides]]
+filter = 'package(e2e_test) & test(/^distributed::/)'
+test-group = 'e2e-cluster-nightly'
+
 # Vault KMS tests share the fixed dev-server port 8200. serial_test's #[serial]
 # does not cross nextest process boundaries, so keep every Vault-backed test in
 # one group.
@@ -527,6 +534,23 @@ filter = 'package(e2e_test)'
 test-group = 'e2e-cluster-nightly'
 
 # ---------------------------------------------------------------------------
+# e2e-distributed profile — 4-node 4-disk Actions suite
+# ---------------------------------------------------------------------------
+# Nightly / dispatch lane owned by .github/workflows/e2e-distributed.yml.
+# Each case starts four rustfs processes (and for site replication, two
+# clusters). Serialized via e2e-cluster-nightly. Not a PR merge gate.
+[profile.e2e-distributed]
+default-filter = 'package(e2e_test) & test(/^distributed::/)'
+fail-fast = false
+
+[profile.e2e-distributed.junit]
+path = "junit.xml"
+
+[[profile.e2e-distributed.overrides]]
+filter = 'package(e2e_test)'
+test-group = 'e2e-cluster-nightly'
+
+# ---------------------------------------------------------------------------
 # e2e-odm-interop profile — on-demand migration provider interop lane (ODM-20)
 # ---------------------------------------------------------------------------
 # backlog#2167. Report-only, scheduled, never a required check; wired by
@@ -586,6 +610,10 @@ path = "junit.xml"
 #     cluster-fault lane. heal_erasure_disk_rebuild is intentionally not
 #     excluded here because backlog#2213 promotes core heal rebuild coverage to
 #     this merge/main lane while retaining nightly coverage.
+#   * distributed:: — 4-node 4-disk Actions suite (S3, lock, versioning,
+#     replication, quota, observability, expand/decommission/rebalance, site
+#     replication, chaos). Owns [profile.e2e-distributed] and
+#     .github/workflows/e2e-distributed.yml.
 #   * on_demand_migration::interop_test — the ODM-20 provider interoperability
 #     cases, which are meaningless without a source: they run in the dedicated
 #     [profile.e2e-odm-interop] lane below, where the workflow points them at a
@@ -607,6 +635,7 @@ default-filter = """
     package(e2e_test)
     & !test(/^protocols::/)
     & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|cluster_multidrive_pool_test|degraded_listing_availability_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
+    & !test(/^distributed::/)
     & !test(/^replication_extension_test::/)
     & !test(/^replication_target_matrix_test::/)
     & !test(/^on_demand_migration::(concurrency_test|fault_test|interop_test|real_source_test)::/)

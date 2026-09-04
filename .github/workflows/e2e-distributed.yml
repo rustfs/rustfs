@@ -1,0 +1,117 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# 4-node 4-disk distributed e2e lane.
+#
+# Each selected test starts a real localhost cluster via
+# `RustFSTestClusterEnvironment` (4 processes; 4 drives per node unless the
+# case is a two-site 4-node 1-drive pair). Membership is
+# `[profile.e2e-distributed]` in `.config/nextest.toml`. This is not a required
+# merge check: it is the scheduled/dispatch counterpart to the hardware
+# functional chain that currently clones rustfs/auto-testing onto three VMs.
+
+name: e2e-distributed
+
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: "Optional nextest -E filter (default: the whole e2e-distributed profile)"
+        required: false
+        default: ""
+  schedule:
+    # 05:53 UTC nightly — clear of e2e-nightly (04:29) and ODM interop (05:23).
+    - cron: "53 5 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+jobs:
+  distributed:
+    name: Distributed 4-node 4-disk e2e
+    runs-on: sm-standard-4
+    timeout-minutes: 180
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-e2e-distributed
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          install-build-packaging-tools: 'false'
+
+      - name: Build rustfs binary
+        run: |
+          cargo build -p rustfs --bins
+          : > target/debug/rustfs.features
+
+      - name: Verify distributed e2e membership
+        env:
+          NEXTEST_LISTING: ${{ runner.temp }}/rustfs-e2e-distributed-list.json
+        run: |
+          cargo nextest list --profile e2e-distributed -p e2e_test --message-format json > "${NEXTEST_LISTING}"
+          python3 ./scripts/check_test_wiring.py --check-profile e2e-distributed "${NEXTEST_LISTING}"
+
+      - name: Run distributed 4-node e2e suite
+        env:
+          RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-distributed-logs
+        run: |
+          set -euo pipefail
+          FILTER='${{ github.event.inputs.filter }}'
+          if [ -n "${FILTER}" ]; then
+            cargo nextest run --profile e2e-distributed -p e2e_test -E "${FILTER}"
+          else
+            cargo nextest run --profile e2e-distributed -p e2e_test --no-tests=fail
+          fi
+
+      - name: Upload distributed e2e diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: e2e-distributed-${{ github.run_number }}
+          path: |
+            target/nextest/e2e-distributed/junit.xml
+            ${{ runner.temp }}/rustfs-e2e-distributed-list.json
+            ${{ runner.temp }}/rustfs-e2e-distributed-logs/
+          retention-days: 7
+          if-no-files-found: warn
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs: [distributed]
+    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
