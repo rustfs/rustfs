@@ -123,17 +123,17 @@ pub fn scanner_dirty_usage_snapshot(max_entries: usize) -> ScannerDirtyUsageSnap
         let generation = DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire);
         let pending_bucket_count = usize_to_u64_saturated(dirty_buckets.len());
         let complete = dirty_buckets.len() <= max_entries;
-        let buckets = complete
-            .then(|| {
-                dirty_buckets
-                    .iter()
-                    .map(|(bucket, generation)| ScannerDirtyUsageBucket {
-                        bucket: bucket.clone(),
-                        generation: *generation,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let buckets = if complete {
+            dirty_buckets
+                .iter()
+                .map(|(bucket, generation)| ScannerDirtyUsageBucket {
+                    bucket: bucket.clone(),
+                    generation: *generation,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         (generation, pending_bucket_count, complete, buckets)
     };
     buckets.sort_unstable_by(|left, right| left.bucket.cmp(&right.bucket));
