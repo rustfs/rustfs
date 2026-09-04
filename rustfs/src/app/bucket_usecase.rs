@@ -64,6 +64,8 @@ use super::storage_api::bucket_usecase::{
     get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
     request_context, validate_list_object_unordered_with_delimiter,
 };
+use crate::app::bucket_list_through as list_through;
+use crate::app::object::shared::mark_on_demand_migration_list_local_only;
 use crate::app::object_data_cache::invalidate_object_data_cache_bucket_after_delete;
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_encryption_service, current_notification_system,
@@ -2719,19 +2721,47 @@ impl DefaultBucketUsecase {
             .map(|v| v.as_ref() == "true")
             .unwrap_or_default();
 
-        let object_infos = store
-            .list_objects_v2(
-                &bucket,
-                &params.prefix,
-                params.decoded_continuation_token.clone(),
-                params.delimiter.clone(),
-                params.max_keys,
-                fetch_owner.unwrap_or_default(),
-                params.start_after_for_query.clone(),
-                incl_deleted,
-            )
-            .await
-            .map_err(ApiError::from)?;
+        // The on-demand migration envelope is decoded whether or not this
+        // bucket still merges: a token handed out under `list_through` must keep
+        // paginating after the policy is turned off (rustfs/backlog#2164).
+        let merged_token = list_through::decode_list_cursor(params.decoded_continuation_token.as_deref())?;
+        let (object_infos, degraded) = match list_through::list_through_state(&bucket, &req.headers) {
+            Some(state) => {
+                let outcome = list_through::merged_list_objects_v2(
+                    &store,
+                    &state,
+                    &bucket,
+                    &params,
+                    fetch_owner.unwrap_or_default(),
+                    incl_deleted,
+                    merged_token.as_ref(),
+                )
+                .await?;
+                (outcome.info, outcome.degraded)
+            }
+            None => {
+                let cursor = list_through::local_cursor(params.decoded_continuation_token.as_deref(), merged_token.as_ref());
+                match cursor {
+                    list_through::LocalListCursor::Exhausted => (StorageListObjectsV2Info::default(), false),
+                    list_through::LocalListCursor::Token(token) => {
+                        let infos = store
+                            .list_objects_v2(
+                                &bucket,
+                                &params.prefix,
+                                token,
+                                params.delimiter.clone(),
+                                params.max_keys,
+                                fetch_owner.unwrap_or_default(),
+                                params.start_after_for_query.clone(),
+                                incl_deleted,
+                            )
+                            .await
+                            .map_err(ApiError::from)?;
+                        (infos, false)
+                    }
+                }
+            }
+        };
 
         let output = build_list_objects_v2_output(
             object_infos,
@@ -2745,7 +2775,11 @@ impl DefaultBucketUsecase {
             params.response_start_after,
         );
 
-        Ok(S3Response::new(output))
+        let mut response = S3Response::new(output);
+        if degraded {
+            mark_on_demand_migration_list_local_only(&mut response.headers);
+        }
+        Ok(response)
     }
 
     pub(crate) async fn execute_list_objects_v2m(

@@ -33,6 +33,7 @@ pub(crate) mod s3 {
         ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus, ServerSideEncryptionByDefault,
         ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, VersioningConfiguration,
     };
+    pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
 }
 
 pub(crate) mod admin {
@@ -626,7 +627,7 @@ pub(crate) mod bucket {
 
     pub(crate) mod on_demand_migration {
         pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::source_client::{
-            SourceClient, SourceError, SourceGet, SourceHead,
+            SourceClient, SourceError, SourceGet, SourceHead, SourceListRequest, SourceObject, SourcePage,
         };
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
@@ -637,6 +638,10 @@ pub(crate) mod bucket {
             BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OdmStateError, OnDemandMigrationSys, PolicyConfig,
             PullError, PullLeader, PullOutcome, PullReason, PullSlot, RangeGetPolicy, SourceBody, SourceErrorPolicy,
             commit_inline, idle_guarded_body,
+        };
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
+            ListEntryKey, ListThroughCursor, ListThroughMerger, ListThroughToken, ListThroughTokenError, MergeSide,
+            SOURCE_LIST_MAX_RATE_WAIT, SourceListPlan, decode_continuation_token, source_list_plan,
         };
     }
 
@@ -1157,12 +1162,16 @@ pub(crate) mod bucket_usecase {
         pub(crate) mod list {
             pub(crate) use super::super::super::storage_contracts::{ListObjectVersionsInfo, ListObjectsV2Info, ListOperations};
         }
+
+        pub(crate) mod object {
+            pub(crate) use super::super::super::storage_contracts::ObjectOperations;
+        }
     }
 
-    pub(crate) use super::{access, bucket, error, helper, object_utils, request_context, s3_api};
+    pub(crate) use super::{access, bucket, error, helper, object_utils, request_context, s3, s3_api};
     pub(crate) use crate::storage::storage_api::{
-        ECStore, StorageObjectInfo, get_validated_store, process_lambda_configurations, process_queue_configurations,
-        process_topic_configurations, validate_list_object_unordered_with_delimiter,
+        ECStore, StorageObjectInfo, StorageObjectOptions, get_validated_store, process_lambda_configurations,
+        process_queue_configurations, process_topic_configurations, validate_list_object_unordered_with_delimiter,
     };
 }
 

@@ -18,7 +18,8 @@
 //! fake S3 source, admin-API wrappers, seeding and local-state assertions.
 //! `harness_self_test` proves the harness itself; `get_basic_test` covers the
 //! GET read-through (rustfs/backlog#2156) and `backfill_test` the background
-//! backfill job (ODM-12, rustfs/backlog#2159). The fault, concurrency,
+//! backfill job (ODM-12, rustfs/backlog#2159); `list_through_test` covers the
+//! optional merged `ListObjectsV2` (ODM-17, rustfs/backlog#2164). The fault, concurrency,
 //! interaction and real-source matrix is rustfs/backlog#2158; its lane split
 //! lives in `.config/nextest.toml` (fault / concurrency / real source run
 //! nightly, the rest in the merge lane).
@@ -31,4 +32,5 @@ mod fault_test;
 mod get_basic_test;
 mod harness_self_test;
 mod interaction_test;
+mod list_through_test;
 mod real_source_test;
