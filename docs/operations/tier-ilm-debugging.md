@@ -154,6 +154,60 @@ Historical transition transactions in `upload_outcome_unknown` state can use an 
 
 `finalize_missing` re-runs the provider probe and fails closed for `unversioned_present`, `versioned_present`, `ambiguous`, `unsupported`, or probe errors. It never accepts an operator assertion in place of a live `missing` result. Providers without an authoritative probe or exact version deletion remain pending; the endpoint does not infer provider capabilities, accept external absence assertions, or select a candidate automatically.
 
+## Inspect and disposition retained recovery records
+
+This section describes an **approved target that is not implemented yet**. Current servers do not expose the routes below and continue to quarantine tier-delete journal v1/v2 records. Do not remove internal metadata objects by hand: that loses ETag, all-pool, decommission, export, and audit guarantees.
+
+The approved read-only inventory is bounded and paginated:
+
+```text
+GET /rustfs/admin/v3/ilm/recovery/records?protocol=<protocol>&classification=<classification>&limit=<n>&marker=<opaque>
+GET /rustfs/admin/v3/ilm/recovery/records/<control-id>
+```
+
+List and redacted inspect require `admin:ListTier`. The server reconstructs the canonical source identity, strongly reads every authoritative copy, and reports one logical record with its schema, classification (`retrying`, `retained_ambiguous`, `corrupt`, `operator_required`, `abandoned`, or `terminal`), stable reason code, copy/content digests, retry deadline/counters, fleet readiness, scan completeness, and decommission coverage. It does not return raw legacy bytes, object/version names, endpoints, credentials, or provider error text in the default JSON. Incomplete pool coverage, divergent copies, a missing ETag, corruption, or a truncated page without a continuation marker is fail-closed and cannot produce an actionable receipt.
+
+Inspect returns a 15-minute opaque observation receipt. It binds the authenticated actor, canonical record, every source copy/ETag/digest, topology/fleet generation, requested action class, issue/expiry time, and nonce. The receipt prevents a stale request from widening its target; it is not cleanup authority.
+
+For a strictly decoded v1/v2 tier-delete journal, the approved evidence-preserving flow is:
+
+1. Inspect the exact record and independently decide whether retaining the local cleanup obligation is still useful.
+2. With `admin:SetTier`, create an immutable server-side export from the current observation receipt. The export contains the exact raw journal bytes and copy manifest, is installed create-only at the canonical digest-derived export ID, strongly read back, and downloaded through a no-store attachment response:
+
+   ```text
+   POST /rustfs/admin/v3/ilm/recovery/records/<control-id>
+   { "action": "export", "observation_receipt": "<opaque>" }
+
+   GET /rustfs/admin/v3/ilm/recovery/exports/<export-id>
+   ```
+
+3. Only after preserving that export, submit a fresh exact disposition with `admin:SetTier`:
+
+   ```json
+   POST /rustfs/admin/v3/ilm/recovery/records/<control-id>
+   {
+     "action": "abandon_remote_cleanup",
+     "confirm": true,
+     "acknowledge_remote_cleanup_abandoned": true,
+     "observation_receipt": "<opaque>",
+     "export_id": "<export-id>",
+     "export_sha256": "<sha256>",
+     "reason_code": "<bounded-operator-reason>"
+   }
+   ```
+
+The last action removes only the exact local v1/v2 journal generations by per-copy `If-Match` after a durable `Prepared` disposition receipt and fresh all-member capability proof. The receipt advances `Prepared -> Applying -> Completed` and records a monotonic per-copy `confirmed_absent` set. If the server deletes copy A and crashes before recording progress, recovery may confirm A absent under the unchanged source/control, topology, process-epoch, migration, and decommission proofs, persist that progress, and continue with still-exact copy B. A replacement ETag is always a conflict; recovery never widens the immutable copy manifest.
+
+The action never creates a tier client, probes a backend, or issues remote PUT/GET/DELETE. Its meaning is deliberately narrow: the operator accepts that remote storage may leak and abandons RustFS cleanup after preserving evidence. A changed copy, active decommission, missing member, topology/process restart, incomplete read, or uncertain replacement proof retains the evidence. Success requires every bound copy be durably confirmed absent, a fresh all-member/decommission proof, and the disposition receipt durably `Completed`; response loss resumes only the same canonical operation ID.
+
+Canonical replay of an identical export/disposition consumes no new quota. New operations require a complete artifact inventory and are refused before source mutation when the projected retained total, including the fully encoded candidate, would exceed 10,000 exports, 10,000 disposition receipts, 1 GiB of encoded export data, or 256 MiB of encoded control/disposition data. The quota decision, create-only installation, and exact readback share one cluster-scoped admission WRITE lock. That lock is always acquired before control/source/disposition and physical metadata locks and is released before disposition `Applying` or any source deletion; callers never acquire it while holding those inner guards. A crash before installation consumes no capacity, and lost installation response is resolved by canonical readback under the same serialized order, so concurrent nodes cannot oversubscribe a stale snapshot. Admission is also limited to ten new creations per actor per minute, 100 cluster-wide per minute, 32 concurrent exports, and eight concurrent dispositions. Capacity pressure never evicts recovery evidence or blocks ordinary object I/O; the collector examines at most 100 terminal artifacts per minute.
+
+Malformed/unsupported records and journal v3-v6 cannot use abandon. Known-version and v6 manifest ownership must converge through their normal exact recovery protocol. Operators may inspect, export, and request a bounded retry, but cannot bypass source/free-version proof, manifest membership, topology, or version semantics.
+
+Automatic retry state survives restart. Retryable transport/quorum failures use a 60-second exponential base capped at one hour and a deterministic 80-to-100-percent multiplier, so jitter never increases the capped delay. After 32 consecutive failures or seven days from the first persisted failure, automatic work stops at `operator_required`. Unsupported or ambiguous evidence goes directly to `retained_ambiguous`/`operator_required`; age alone never deletes it. Resolved controls, immutable exports, and completed disposition receipts have minimum 30-day, 90-day, and 365-day retention respectively, and are collected only after exact source absence, decommission, successor, and audit checks.
+
+The full schema, lease, mixed-version, retry, privacy, and metric requirements are in [../architecture/ilm-tiering-persistence-contracts.md](../architecture/ilm-tiering-persistence-contracts.md#bounded-recovery-control-and-operator-disposition).
+
 ## Reconcile legacy transition-version metadata
 
 This section describes an **approved target that is not implemented yet**. The current server has no admin route that backfills a missing `transitioned-version-state` in `xl.meta`. Do not use the transaction reconcile route above for this purpose: that route owns an upload transaction candidate and may delete it, while legacy metadata reconciliation is non-destructive and may update only the exact local metadata version.
