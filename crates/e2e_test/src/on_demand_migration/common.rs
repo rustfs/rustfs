@@ -30,6 +30,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use bytes::Bytes;
+use futures::stream::{StreamExt, TryStreamExt};
 use serde::Serialize;
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -627,6 +628,37 @@ impl OdmTestEnv {
         }
     }
 
+    /// Waits until the migration runtime for `bucket` is live, whatever the
+    /// source is. [`Self::wait_until_source_consulted`] proves the same thing
+    /// from the fake source's journal, which a real source does not have; this
+    /// one reads the bucket's own `requests_total.get` counters instead, which
+    /// only start moving once the state has been built. The probe is a GET of a
+    /// key that exists nowhere and is unique per call, so nothing is pulled and
+    /// only that key enters the negative cache.
+    pub async fn wait_until_odm_engaged(&self, bucket: &str) -> Result<(), BoxError> {
+        let probe_key = format!("_odm-engaged-probe-{}", uuid::Uuid::new_v4());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let _ = self.raw_get(bucket, &probe_key).await?;
+            let counted: u64 = self
+                .status_json(bucket)
+                .await
+                .ok()
+                .as_ref()
+                .and_then(|status| status.pointer("/counters/requests_total/get"))
+                .and_then(serde_json::Value::as_object)
+                .map(|by_outcome| by_outcome.values().filter_map(serde_json::Value::as_u64).sum())
+                .unwrap_or(0);
+            if counted > 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("on-demand migration runtime for {bucket} did not engage in time").into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Creates `bucket` unless it already exists, installs `spec` on it and
     /// returns once the runtime consults the source. Scenarios with a second
     /// bucket, a bucket created with non-default options, or a reinstalled
@@ -820,4 +852,401 @@ pub async fn start_configured_env_with(
     adjust(&mut spec);
     env.configure_and_wait(bucket, &spec).await?;
     Ok(env)
+}
+
+// ---------------------------------------------------------------------------
+// Provider interoperability lane (ODM-20, rustfs/backlog#2167)
+// ---------------------------------------------------------------------------
+//
+// `interop_test.rs` has one body per case; which source that body runs against
+// is decided here, from the environment. Unset means the in-process fake
+// source, which is what a local run gets; the scheduled interop workflow sets
+// the variables below to a MinIO container or a real cloud provider. Nothing
+// else about the cases changes, so a provider difference shows up as the same
+// assertion failing rather than as a separate, drifting test file.
+
+/// Provider preset of the interop source (`minio`, `aws`, `r2`, `gcs`, `s3`).
+/// Unset selects the in-process fake source.
+pub const INTEROP_PROVIDER_ENV: &str = "RUSTFS_ODM_INTEROP_PROVIDER";
+/// `http(s)://host[:port]`. Required for every provider including `aws`, where
+/// the runtime could derive it from the region: the lane pins exactly one
+/// endpoint per provider so its report names what was actually reached.
+pub const INTEROP_ENDPOINT_ENV: &str = "RUSTFS_ODM_INTEROP_ENDPOINT";
+pub const INTEROP_REGION_ENV: &str = "RUSTFS_ODM_INTEROP_REGION";
+/// Source bucket, which must already exist: the harness never creates a bucket
+/// on a real provider account.
+pub const INTEROP_BUCKET_ENV: &str = "RUSTFS_ODM_INTEROP_BUCKET";
+pub const INTEROP_ACCESS_KEY_ENV: &str = "RUSTFS_ODM_INTEROP_ACCESS_KEY";
+pub const INTEROP_SECRET_KEY_ENV: &str = "RUSTFS_ODM_INTEROP_SECRET_KEY";
+pub const INTEROP_SESSION_TOKEN_ENV: &str = "RUSTFS_ODM_INTEROP_SESSION_TOKEN";
+/// `auto` (default), `path` or `virtual`.
+pub const INTEROP_PATH_STYLE_ENV: &str = "RUSTFS_ODM_INTEROP_PATH_STYLE";
+/// Objects the backfill case seeds.
+pub const INTEROP_BACKFILL_OBJECTS_ENV: &str = "RUSTFS_ODM_INTEROP_BACKFILL_OBJECTS";
+/// Directory each case writes its JSON report entry into. Unset means no
+/// report, which is what a local run wants.
+pub const INTEROP_REPORT_DIR_ENV: &str = "RUSTFS_ODM_INTEROP_REPORT_DIR";
+
+/// Backfill objects when [`INTEROP_BACKFILL_OBJECTS_ENV`] is unset. The fake
+/// source retains at most 4,096 object versions and 4,096 journal entries, and
+/// one pull is a HEAD plus a GET, so the default has to stay far below that.
+/// A real source has no such cap and the workflow raises the count there.
+pub const INTEROP_DEFAULT_BACKFILL_OBJECTS: usize = 200;
+/// In-flight requests while seeding or cleaning a real source. High enough to
+/// hide the round-trip on a few thousand tiny objects, low enough not to look
+/// like a burst to a cloud provider.
+const INTEROP_SOURCE_CONCURRENCY: usize = 32;
+
+/// A real S3-compatible endpoint acting as the migration source.
+#[derive(Clone)]
+pub struct InteropRemoteSource {
+    pub provider: String,
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    pub path_style: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub session_token: Option<String>,
+}
+
+impl fmt::Debug for InteropRemoteSource {
+    /// The interop lane uploads its logs as an artifact; keep the credentials
+    /// out of them.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InteropRemoteSource")
+            .field("provider", &self.provider)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("path_style", &self.path_style)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"REDACTED")
+            .field("session_token", &self.session_token.as_ref().map(|_| "REDACTED"))
+            .finish()
+    }
+}
+
+impl InteropRemoteSource {
+    /// Enabled configuration pointing at this source.
+    fn spec(&self) -> OdmSourceSpec {
+        let mut spec = OdmSourceSpec::new(
+            &self.provider,
+            &self.endpoint,
+            &self.region,
+            self.bucket.clone(),
+            &self.access_key,
+            &self.secret_key,
+        );
+        spec.source.path_style = self.path_style.clone();
+        spec.source.credentials = Some(OdmCredentials {
+            access_key: self.access_key.clone(),
+            secret_key: self.secret_key.clone(),
+            session_token: self.session_token.clone(),
+        });
+        spec
+    }
+
+    /// S3 client for seeding and cleaning the source bucket. Retries are off
+    /// so a provider-side failure surfaces as itself instead of being masked
+    /// by a second attempt.
+    fn client(&self) -> Result<Client, BoxError> {
+        let credentials =
+            Credentials::new(&self.access_key, &self.secret_key, self.session_token.clone(), None, "odm-interop-source");
+        let mut config = aws_sdk_s3::Config::builder()
+            .credentials_provider(credentials)
+            .region(Region::new(self.region.clone()))
+            .endpoint_url(&self.endpoint)
+            .force_path_style(self.path_style == "path")
+            .behavior_version_latest()
+            .retry_config(RetryConfig::standard().with_max_attempts(1));
+        // The default connector is HTTPS-only; a container source is plain HTTP.
+        if self.endpoint.starts_with("http://") {
+            config = config.http_client(SmithyHttpClientBuilder::new().build_http());
+        }
+        Ok(Client::from_conf(config.build()))
+    }
+}
+
+/// Where an interop case gets its source objects from.
+#[derive(Debug, Clone)]
+pub enum InteropSource {
+    /// The in-process fake source of the [`OdmTestEnv`].
+    Fake,
+    /// A real S3-compatible endpoint described by the environment.
+    Remote(InteropRemoteSource),
+}
+
+impl InteropSource {
+    /// Reads the source description from the environment. An unset
+    /// [`INTEROP_PROVIDER_ENV`] means the fake source; a named provider with
+    /// any required variable missing is an error rather than a silent
+    /// fallback, so a misconfigured CI secret can never pass as a green
+    /// real-source run.
+    pub fn from_env() -> Result<Self, BoxError> {
+        let Some(provider) = interop_env(INTEROP_PROVIDER_ENV) else {
+            return Ok(Self::Fake);
+        };
+        let mut missing = Vec::new();
+        let mut required = |name: &'static str| {
+            interop_env(name).unwrap_or_else(|| {
+                missing.push(name);
+                String::new()
+            })
+        };
+        let endpoint = required(INTEROP_ENDPOINT_ENV);
+        let region = required(INTEROP_REGION_ENV);
+        let bucket = required(INTEROP_BUCKET_ENV);
+        let access_key = required(INTEROP_ACCESS_KEY_ENV);
+        let secret_key = required(INTEROP_SECRET_KEY_ENV);
+        if !missing.is_empty() {
+            return Err(format!("{INTEROP_PROVIDER_ENV}={provider} needs {}", missing.join(", ")).into());
+        }
+        Ok(Self::Remote(InteropRemoteSource {
+            provider,
+            endpoint,
+            region,
+            bucket,
+            path_style: interop_env(INTEROP_PATH_STYLE_ENV).unwrap_or_else(|| "auto".to_string()),
+            access_key,
+            secret_key,
+            session_token: interop_env(INTEROP_SESSION_TOKEN_ENV),
+        }))
+    }
+
+    /// Name the report uses for this source.
+    pub fn provider(&self) -> &str {
+        match self {
+            Self::Fake => "fake",
+            Self::Remote(remote) => &remote.provider,
+        }
+    }
+}
+
+/// A set but empty variable is the shape a missing GitHub secret takes, so it
+/// reads the same as unset here.
+fn interop_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Objects the backfill case seeds, from [`INTEROP_BACKFILL_OBJECTS_ENV`].
+pub fn interop_backfill_objects() -> Result<usize, BoxError> {
+    match interop_env(INTEROP_BACKFILL_OBJECTS_ENV) {
+        Some(value) => Ok(value
+            .parse::<usize>()
+            .map_err(|error| format!("{INTEROP_BACKFILL_OBJECTS_ENV}: {error}"))?),
+        None => Ok(INTEROP_DEFAULT_BACKFILL_OBJECTS),
+    }
+}
+
+/// One interop case: a RustFS under test migrating `bucket` from whichever
+/// source [`InteropSource::from_env`] resolved.
+///
+/// Every source key of a run lives under a unique `filter.source_prefix`, so
+/// a shared real bucket can host concurrent runs, a backfill lists only this
+/// run's objects, and [`Self::finish`] can delete exactly what it seeded.
+pub struct OdmInteropEnv {
+    pub env: OdmTestEnv,
+    pub source: InteropSource,
+    pub bucket: String,
+    case: &'static str,
+    source_bucket: String,
+    source_prefix: String,
+    remote: Option<Client>,
+    /// Source-side keys this run created, for cleanup.
+    seeded: std::sync::Mutex<Vec<String>>,
+    /// Start of the case body, after the fixture is up. The report keeps this
+    /// next to the JUnit wall time so a provider's own latency is readable
+    /// without the constant cost of starting a RustFS server drowning it.
+    started: Instant,
+}
+
+impl OdmInteropEnv {
+    /// Starts the pair and installs the configuration `adjust` tweaked,
+    /// returning once the migration runtime is live.
+    pub async fn start(case: &'static str, bucket: &str, adjust: impl FnOnce(&mut OdmSourceSpec)) -> Result<Self, BoxError> {
+        let source = InteropSource::from_env()?;
+        let env = OdmTestEnv::start().await?;
+        env.rustfs.create_test_bucket(bucket).await?;
+
+        let source_prefix = format!("odm-interop/{case}/{}/", uuid::Uuid::new_v4());
+        let (mut spec, remote, source_bucket) = match &source {
+            InteropSource::Fake => {
+                let source_bucket = format!("{bucket}-source");
+                env.source.create_bucket_with_mode(&source_bucket, BucketMode::Unversioned);
+                (env.fake_source_spec(&source_bucket), None, source_bucket)
+            }
+            InteropSource::Remote(remote) => {
+                let client = remote.client()?;
+                client
+                    .head_bucket()
+                    .bucket(&remote.bucket)
+                    .send()
+                    .await
+                    .map_err(|error| format!("interop source bucket {} is not reachable: {error}", remote.bucket))?;
+                (remote.spec(), Some(client), remote.bucket.clone())
+            }
+        };
+        spec.filter.source_prefix = Some(source_prefix.clone());
+        adjust(&mut spec);
+
+        let response = env.configure_source(bucket, &spec).await?;
+        if response.status != 200 {
+            return Err(format!("configure on-demand migration for {bucket}: {} {}", response.status, response.body).into());
+        }
+        env.wait_until_odm_engaged(bucket).await?;
+        Ok(Self {
+            env,
+            source,
+            bucket: bucket.to_string(),
+            case,
+            source_bucket,
+            source_prefix,
+            remote,
+            seeded: std::sync::Mutex::new(Vec::new()),
+            started: Instant::now(),
+        })
+    }
+
+    /// Source-side key for a local key, the same mapping the runtime applies.
+    fn source_key(&self, local_key: &str) -> String {
+        format!("{}{local_key}", self.source_prefix)
+    }
+
+    /// Stores `objects` in the source under this run's prefix and returns
+    /// their ETags, unquoted, in input order.
+    pub async fn seed(&self, objects: &[SeedObject]) -> Result<Vec<String>, BoxError> {
+        let etags = match &self.remote {
+            None => objects
+                .iter()
+                .map(|object| {
+                    self.env.source.put_seed_object(
+                        &self.source_bucket,
+                        self.source_key(&object.key),
+                        object.body.clone(),
+                        &object.metadata,
+                    )
+                })
+                .collect(),
+            Some(client) => {
+                futures::stream::iter(objects.iter().map(|object| {
+                    let key = self.source_key(&object.key);
+                    let body = object.body.clone();
+                    async move {
+                        let output = client
+                            .put_object()
+                            .bucket(&self.source_bucket)
+                            .key(&key)
+                            .body(aws_sdk_s3::primitives::ByteStream::from(body))
+                            .send()
+                            .await
+                            .map_err(|error| format!("seeding {}/{key}: {error}", self.source_bucket))?;
+                        Ok::<String, BoxError>(unquote_etag(output.e_tag().unwrap_or_default()))
+                    }
+                }))
+                .buffered(INTEROP_SOURCE_CONCURRENCY)
+                .try_collect::<Vec<String>>()
+                .await?
+            }
+        };
+        self.seeded
+            .lock()
+            .expect("interop seed ledger is not poisoned")
+            .extend(objects.iter().map(|object| self.source_key(&object.key)));
+        Ok(etags)
+    }
+
+    /// Records the case in the lane's report and removes everything it seeded
+    /// from the source. Call it at the end of every case: a case that fails
+    /// before this point leaves no report entry, which is why the workflow
+    /// reconciles the entries against the JUnit case list rather than trusting
+    /// them to be complete.
+    pub async fn finish(self) -> Result<(), BoxError> {
+        let duration = self.started.elapsed();
+        let counters = self
+            .env
+            .status_json(&self.bucket)
+            .await
+            .ok()
+            .and_then(|status| status.get("counters").cloned());
+        self.write_report(duration, counters).await?;
+        self.clean_source().await
+    }
+
+    async fn write_report(&self, duration: Duration, counters: Option<serde_json::Value>) -> Result<(), BoxError> {
+        let Some(dir) = interop_env(INTEROP_REPORT_DIR_ENV) else {
+            return Ok(());
+        };
+        // The fake source journals every wire request, so its count is exact.
+        // A real provider has no such journal, so the report falls back to the
+        // bucket's own counters, which count client requests that entered
+        // migration rather than requests that left for the source; the
+        // `counted_by` field says which of the two a reader is looking at.
+        let (counted_by, total) = match self.remote {
+            None => ("fake_source_journal", self.env.source.requests().len() as u64),
+            Some(_) => (
+                "odm_status_counters",
+                counters
+                    .as_ref()
+                    .and_then(|counters| counters.pointer("/requests_total"))
+                    .and_then(serde_json::Value::as_object)
+                    .map(|by_op| {
+                        by_op
+                            .values()
+                            .filter_map(serde_json::Value::as_object)
+                            .flat_map(|by_outcome| by_outcome.values().filter_map(serde_json::Value::as_u64))
+                            .sum()
+                    })
+                    .unwrap_or(0),
+            ),
+        };
+        let entry = serde_json::json!({
+            "case": self.case,
+            "provider": self.source.provider(),
+            "source_bucket": self.source_bucket,
+            "source_prefix": self.source_prefix,
+            "duration_ms": duration.as_millis() as u64,
+            "source_requests": {"counted_by": counted_by, "total": total},
+            "odm_counters": counters,
+        });
+        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::write(
+            format!("{dir}/{}-{}.json", self.source.provider(), self.case),
+            serde_json::to_vec_pretty(&entry)?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Deletes this run's source keys one by one: the multi-object delete is
+    /// not available on every provider the lane targets (the GCS XML API has
+    /// no equivalent), and the object counts here are small enough that the
+    /// portable form costs nothing worth saving.
+    async fn clean_source(&self) -> Result<(), BoxError> {
+        let Some(client) = &self.remote else {
+            return Ok(());
+        };
+        let keys = std::mem::take(&mut *self.seeded.lock().expect("interop seed ledger is not poisoned"));
+        futures::stream::iter(keys.into_iter().map(|key| async move {
+            client
+                .delete_object()
+                .bucket(&self.source_bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|error| format!("deleting {}/{key}: {error}", self.source_bucket))?;
+            Ok::<(), BoxError>(())
+        }))
+        .buffered(INTEROP_SOURCE_CONCURRENCY)
+        .try_collect::<Vec<()>>()
+        .await?;
+        Ok(())
+    }
+}
+
+fn unquote_etag(etag: &str) -> String {
+    etag.trim_matches('"').to_string()
 }

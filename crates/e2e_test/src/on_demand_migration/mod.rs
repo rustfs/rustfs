@@ -22,7 +22,10 @@
 //! optional merged `ListObjectsV2` (ODM-17, rustfs/backlog#2164). The fault, concurrency,
 //! interaction and real-source matrix is rustfs/backlog#2158; its lane split
 //! lives in `.config/nextest.toml` (fault / concurrency / real source run
-//! nightly, the rest in the merge lane).
+//! nightly, the rest in the merge lane). `interop_test` is the provider
+//! interoperability lane (ODM-20, rustfs/backlog#2167): the same case bodies
+//! against the fake source locally and against a real provider named by the
+//! environment in `.github/workflows/on-demand-migration-interop.yml`.
 
 pub mod common;
 
@@ -32,5 +35,6 @@ mod fault_test;
 mod get_basic_test;
 mod harness_self_test;
 mod interaction_test;
+mod interop_test;
 mod list_through_test;
 mod real_source_test;
