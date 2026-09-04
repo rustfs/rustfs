@@ -26,11 +26,12 @@ use crate::services::tier::{
     tier_config::TierS3,
     warm_backend::{
         TransitionCandidateIdentity, TransitionCandidateProbe, TransitionCandidateReconciler, WarmBackend, WarmBackendGetOpts,
-        build_transition_put_options,
+        build_transition_put_options, endpoint_authority,
     },
 };
 use http::HeaderMap;
 use rustfs_s3_client::{
+    api_error_response::to_error_response,
     api_get_options::GetObjectOptions,
     api_list::ListObjectsOptions,
     api_put_object::PutObjectOptions,
@@ -43,7 +44,7 @@ use rustfs_s3_client::{
 };
 use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::path::SLASH_SEPARATOR;
-use s3s::dto::BucketVersioningStatus;
+use s3s::{S3ErrorCode, dto::BucketVersioningStatus};
 
 pub struct WarmBackendS3 {
     pub client: Arc<TransitionClient>,
@@ -72,6 +73,19 @@ fn remote_bucket_versioning_from_status(status: Option<&str>) -> Result<RemoteBu
         }
         None => RemoteBucketVersioning::Disabled,
     })
+}
+
+fn bounded_get_range(opts: &WarmBackendGetOpts) -> Result<Option<(i64, i64)>, std::io::Error> {
+    if opts.start_offset < 0 || opts.length <= 0 {
+        return Ok(None);
+    }
+    usize::try_from(opts.length)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid range: length does not fit in memory"))?;
+    let end_offset = opts
+        .start_offset
+        .checked_add(opts.length - 1)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid range: end offset overflow"))?;
+    Ok(Some((opts.start_offset, end_offset)))
 }
 
 impl WarmBackendS3 {
@@ -132,10 +146,8 @@ impl WarmBackendS3 {
             bucket_lookup,
             ..Default::default()
         };
-        let host = u
-            .host()
-            .ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
-        let client = TransitionClient::new(&host.to_string(), opts, tier_type).await?;
+        let endpoint = endpoint_authority(&u)?;
+        let client = TransitionClient::new(&endpoint, opts, tier_type).await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));
@@ -177,10 +189,8 @@ impl WarmBackendS3 {
         if !rv.is_empty() {
             gopts.version_id = rv.to_string();
         }
-        if opts.start_offset >= 0 && opts.length > 0 {
-            gopts
-                .set_range(opts.start_offset, opts.start_offset + opts.length - 1)
-                .map_err(std::io::Error::other)?;
+        if let Some((start_offset, end_offset)) = bounded_get_range(&opts)? {
+            gopts.set_range(start_offset, end_offset)?;
         }
         let (_, headers, reader) = self.core.get_object(&self.bucket, &self.get_dest(object), &gopts).await?;
         Ok((headers, reader))
@@ -191,34 +201,62 @@ impl WarmBackendS3 {
         remote_bucket_versioning_from_status(config.status.as_ref().map(|status| status.as_str()))
     }
 
-    async fn probe_transition_candidate_versions(
+    async fn probe_current_transition_candidate_with_header(
         &self,
         object: &str,
-        bucket_versioning: RemoteBucketVersioning,
+        raw_version_header: Option<&'static str>,
     ) -> Result<TransitionCandidateProbe, std::io::Error> {
-        let remote_object = self.get_dest(object);
-        let mut opts = ListObjectsOptions::default();
-        opts.set("prefix", &remote_object);
-        opts.set("max-keys", "1000");
-
-        let mut key_marker = String::new();
-        let mut version_id_marker = String::new();
-        let mut candidates = TransitionCandidateVersions::default();
-        loop {
-            let versions = self
-                .client
-                .list_object_versions_query(&self.bucket, &opts, &key_marker, &version_id_marker, "")
-                .await?;
-            candidates.extend(&remote_object, &versions);
-            if candidates.is_ambiguous() {
-                return Ok(TransitionCandidateProbe::Ambiguous);
+        match self
+            .get_with_headers(
+                object,
+                "",
+                WarmBackendGetOpts {
+                    start_offset: 0,
+                    length: 1,
+                },
+            )
+            .await
+        {
+            Ok((headers, _)) => {
+                let version_id = match raw_version_header {
+                    Some(header_name) => match headers.get(header_name) {
+                        Some(value) => {
+                            let version_id = value.to_str().map_err(|_| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "remote object version id is not valid ASCII",
+                                )
+                            })?;
+                            validate_remote_version_id(version_id)?;
+                            Some(version_id)
+                        }
+                        None => None,
+                    },
+                    None => self.client.raw_version_id(&headers)?,
+                };
+                Ok(match version_id {
+                    Some(version_id) => TransitionCandidateProbe::VersionedPresent(version_id.to_string()),
+                    None => TransitionCandidateProbe::UnversionedPresent,
+                })
             }
-            if !versions.is_truncated {
-                return classify_transition_candidates(candidates, bucket_versioning);
+            Err(err) => {
+                let response = to_error_response(&err);
+                if response.code == S3ErrorCode::NoSuchKey {
+                    Ok(TransitionCandidateProbe::Missing)
+                } else {
+                    Err(err)
+                }
             }
-
-            advance_version_markers(&mut key_marker, &mut version_id_marker, &versions)?;
         }
+    }
+
+    pub(crate) async fn probe_transition_candidate_with_raw_version_header(
+        &self,
+        object: &str,
+        raw_version_header: &'static str,
+    ) -> Result<TransitionCandidateProbe, std::io::Error> {
+        self.probe_current_transition_candidate_with_header(object, Some(raw_version_header))
+            .await
     }
 
     async fn probe_transition_candidate_identity(
@@ -343,6 +381,7 @@ struct TransitionCandidateVersions {
 }
 
 impl TransitionCandidateVersions {
+    #[cfg(test)]
     fn extend(&mut self, remote_object: &str, versions: &ListVersionsResult) {
         for version in versions.versions.iter().filter(|version| version.key == remote_object) {
             if self.version_id.is_some() {
@@ -351,10 +390,6 @@ impl TransitionCandidateVersions {
             }
             self.version_id = Some(version.version_id.clone());
         }
-    }
-
-    fn is_ambiguous(&self) -> bool {
-        self.ambiguous
     }
 
     fn classify(self, bucket_versioning: RemoteBucketVersioning) -> TransitionCandidateProbe {
@@ -380,6 +415,8 @@ impl TransitionCandidateVersions {
 mod tests {
     use super::*;
     use rustfs_s3_client::api_s3_datatypes::{ListVersionsResult, Version};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn new_rejects_loopback_endpoint_before_network_setup() {
@@ -395,6 +432,204 @@ mod tests {
         match WarmBackendS3::new(&conf, "tier").await {
             Ok(_) => panic!("loopback endpoint should be rejected"),
             Err(err) => assert!(err.to_string().contains("not allowed")),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_preserves_an_explicit_endpoint_port() {
+        let conf = TierS3 {
+            endpoint: "https://tier.example.com:9443".to_string(),
+            bucket: "tier-bucket".to_string(),
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            region: "us-east-1".to_string(),
+            ..Default::default()
+        };
+
+        let backend = WarmBackendS3::new(&conf, "tier")
+            .await
+            .expect("a well-formed S3 endpoint should initialize without network I/O");
+        assert_eq!(backend.client.endpoint_url.host_str(), Some("tier.example.com"));
+        assert_eq!(backend.client.endpoint_url.port(), Some(9443));
+    }
+
+    #[tokio::test]
+    async fn overflowing_get_range_is_rejected_before_network_io() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let endpoint = listener
+            .local_addr()
+            .expect("listener local address should be available")
+            .to_string();
+        let client = Arc::new(
+            TransitionClient::new(
+                &endpoint,
+                Options {
+                    creds: Credentials::new(Static(Value {
+                        access_key_id: "access-key".to_string(),
+                        secret_access_key: "secret-key".to_string(),
+                        signer_type: SignatureType::SignatureV4,
+                        ..Default::default()
+                    })),
+                    region: "us-east-1".to_string(),
+                    bucket_lookup: BucketLookupType::BucketLookupPath,
+                    max_retries: 1,
+                    ..Default::default()
+                },
+                "s3",
+            )
+            .await
+            .expect("fixture client should build"),
+        );
+        let backend = WarmBackendS3 {
+            core: TransitionCore(Arc::clone(&client)),
+            client,
+            bucket: "bucket".to_string(),
+            prefix: String::new(),
+            storage_class: String::new(),
+        };
+
+        let err = backend
+            .get_with_headers(
+                "probe",
+                "",
+                WarmBackendGetOpts {
+                    start_offset: i64::MAX,
+                    length: 2,
+                },
+            )
+            .await
+            .expect_err("an overflowing range must fail before issuing a GET");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    async fn candidate_probe_fixture() -> Option<(WarmBackendS3, tokio::task::JoinHandle<Vec<String>>)> {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let endpoint = listener
+            .local_addr()
+            .expect("listener local address should be available")
+            .to_string();
+        let fixture = tokio::spawn(async move {
+            let responses = [
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nx-amz-version-id: opaque-version\r\nConnection: close\r\n\r\nx",
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 63\r\nConnection: close\r\n\r\n<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>",
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 66\r\nConnection: close\r\n\r\n<Error><Code>NoSuchObject</Code><Message>missing</Message></Error>",
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/xml\r\nContent-Length: 65\r\nConnection: close\r\n\r\n<Error><Code>AccessDenied</Code><Message>denied</Message></Error>",
+            ];
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.expect("fixture should accept candidate GET");
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                loop {
+                    let read = stream.read(&mut buffer).await.expect("fixture should read request headers");
+                    assert_ne!(read, 0, "connection closed before request headers were received");
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&request).into_owned());
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("fixture should write candidate response");
+            }
+            requests
+        });
+        let client = Arc::new(
+            TransitionClient::new(
+                &endpoint,
+                Options {
+                    creds: Credentials::new(Static(Value {
+                        access_key_id: "access-key".to_string(),
+                        secret_access_key: "secret-key".to_string(),
+                        signer_type: SignatureType::SignatureV4,
+                        ..Default::default()
+                    })),
+                    region: "us-east-1".to_string(),
+                    bucket_lookup: BucketLookupType::BucketLookupPath,
+                    max_retries: 1,
+                    ..Default::default()
+                },
+                "s3",
+            )
+            .await
+            .expect("fixture client should build"),
+        );
+        Some((
+            WarmBackendS3 {
+                core: TransitionCore(Arc::clone(&client)),
+                client,
+                bucket: "bucket".to_string(),
+                prefix: String::new(),
+                storage_class: String::new(),
+            },
+            fixture,
+        ))
+    }
+
+    #[tokio::test]
+    async fn candidate_probe_uses_only_exact_bounded_get_permissions() {
+        let Some((backend, fixture)) = candidate_probe_fixture().await else {
+            return;
+        };
+
+        assert_eq!(
+            backend
+                .probe_transition_candidate("versioned-probe")
+                .await
+                .expect("versioned candidate should be discovered"),
+            TransitionCandidateProbe::VersionedPresent("opaque-version".to_string())
+        );
+        assert_eq!(
+            backend
+                .probe_transition_candidate("unversioned-probe")
+                .await
+                .expect("unversioned candidate should be discovered"),
+            TransitionCandidateProbe::UnversionedPresent
+        );
+        assert_eq!(
+            backend
+                .probe_transition_candidate("missing-probe")
+                .await
+                .expect("a missing key should be classified"),
+            TransitionCandidateProbe::Missing
+        );
+        assert_eq!(
+            backend
+                .probe_transition_candidate("provider-missing-probe")
+                .await
+                .expect("a provider-specific missing code should be classified"),
+            TransitionCandidateProbe::Missing
+        );
+        let err = backend
+            .probe_transition_candidate("forbidden-probe")
+            .await
+            .expect_err("an authorization failure must not be mistaken for a missing key");
+        assert_eq!(to_error_response(&err).code, S3ErrorCode::AccessDenied);
+
+        let requests = fixture.await.expect("candidate fixture should join");
+        for request in requests {
+            let request = request.to_ascii_lowercase();
+            assert!(request.starts_with("get /bucket/"), "candidate discovery must use object GET");
+            assert!(request.contains("\r\nrange: bytes=0-0\r\n"));
+            assert!(!request.contains("?versioning"));
+            assert!(!request.contains("?versions"));
         }
     }
 
@@ -631,8 +866,7 @@ impl WarmBackend for WarmBackendS3 {
     }
 
     async fn probe_transition_candidate(&self, object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
-        let bucket_versioning = self.remote_bucket_versioning().await?;
-        self.probe_transition_candidate_versions(object, bucket_versioning).await
+        self.probe_current_transition_candidate_with_header(object, None).await
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {

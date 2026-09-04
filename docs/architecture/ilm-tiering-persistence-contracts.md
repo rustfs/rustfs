@@ -327,9 +327,89 @@ Recursive prefix/delete-all is the exception because physical directory removal 
 
 - Every code path that removes or overwrites transitioned metadata either atomically leaves an exact free-version owner or enters an already-authorized v6 dispatch.
 - If both a journal and free-version are observable, recovery preserves the remote object until version-specific authority and all-pool absence prove a single owner.
-- Missing `transition-version-state` remains unknown. Compatibility work must not synthesize known-disabled or exact semantics merely from an empty stored version ID.
+- Missing `transitioned-version-state` remains unknown. Compatibility work must not synthesize known-disabled or exact semantics merely from an empty stored version ID.
 
-How historical objects without RustFS transition-version-state can be upgraded safely is an **open design**. It requires a read/repair rule with rollback behavior before destructive cleanup may consume those records.
+The following single-record protocol approves how historical objects without RustFS `transitioned-version-state` can be upgraded. It does not approve a bulk scanner or allow destructive cleanup to consume an unproven record.
+
+## Legacy transitioned-version-state reconciliation
+
+### Current
+
+An absent `transitioned-version-state` key decodes as `TransitionVersionState::Unknown`. The current GET and free-version cleanup paths reject that state rather than interpreting an empty remote version as unversioned. There is no admin route that repairs this field in `xl.meta`. The existing transition-transaction reconcile route operates on expired `UploadOutcomeUnknown` transaction records and can exact-delete their canonical candidates; it is a separate protocol and must not be reused for metadata reconciliation.
+
+An explicitly persisted `unknown`, a malformed state, conflicting RustFS/MinIO compatibility keys, an invalid or nil version identifier, and a partial transition tuple are not legacy absence. They remain invalid or ambiguous and fail closed.
+
+### Approved single-record control surface
+
+The approved target is one synchronous, exact logical-version operation. It does not list a bucket or prefix and does not create a durable job:
+
+```text
+GET  /rustfs/admin/v3/ilm/transition/state/reconcile?bucket=<bucket>&object=<object>&versionId=<local-version-id>
+POST /rustfs/admin/v3/ilm/transition/state/reconcile?bucket=<bucket>&object=<object>&versionId=<local-version-id>
+```
+
+`versionId` is required; the literal `null` is the explicit selector for a locally unversioned object, while an omitted or empty selector is invalid. GET requires `admin:ListTier`. It performs an authoritative all-pool metadata read and a bounded server-side live backend probe, but it never writes metadata or mutates the remote tier. Its response includes the canonical immutable source tuple, every original per-set missing-state representation, the proposed target tuple when one is provable, an opaque reconciliation digest over all three, fleet/topology and tier-generation readiness, and whether POST is ready to attempt migration. GET never labels an unmodified legacy record `migrated`.
+
+POST requires `admin:SetTier`. Its body contains `confirm: true`, the complete source and target tuples, every original per-set representation, and their reconciliation digest returned by a recent GET. The server does not trust a client-supplied state or external assertion: it rereads the object, requires every immutable source field to match exactly after canonicalization, repeats the bounded live probe, and derives the target state itself. For the mutable state/version/destination fields, each set must equal either its original missing-state representation bound by the digest or the exact newly proven target; this is the only accepted partial-retry shape. A missing confirmation, any other stale tuple or digest, or a widened selector is rejected before any write.
+
+The expected tuple binds all evidence whose change could redirect the repair:
+
+- bucket name and incarnation; exact object name, local version ID, data directory, modification time, size, and ETag;
+- transition completion status, tier name, canonical remote object name, raw remote-version key presence/value, and raw state-key presence/value under both compatibility prefixes;
+- tier-config generation and the `transition-tier-destination-id` binding, including backend type, endpoint/bucket/prefix identity, and the credential-independent backend fingerprint;
+- topology generation and the generation/digest of every authoritative `xl.meta` copy found across pools and sets.
+
+The only allowed state derivations are:
+
+| Live proof | Persisted state | Persisted remote version | Remote request meaning |
+|---|---|---|---|
+| Provider proves versioning disabled and the candidate is present | `KnownDisabled` | Absent/empty | Send no `versionId` |
+| Provider proves suspended-version null semantics and the exact candidate is present | `SuspendedNull` | Literal `null` | Send the provider's null-version form |
+| Provider proves one exact, nonempty, non-`null` opaque version | `Exact` | That exact opaque identifier | Send that exact `versionId` |
+
+Missing, multiple, changing, or unsupported probe results do not select a state. In particular, a preexisting empty remote-version field is not evidence for `KnownDisabled`, and a client may not nominate `Exact` or `SuspendedNull`.
+
+The POST may write only the derived `transitioned-version-state`, its corresponding `transitioned-versionID` value when the proven model requires one, and the exact `transition-tier-destination-id` binding under both compatibility prefixes in the matching `xl.meta` version. It does not issue remote GET beyond the proof probe, remote PUT, remote DELETE, local object DELETE, free-version cleanup, transaction/journal cleanup, tier-config mutation, restore, or source-payload rewrite. Reconciliation establishes metadata meaning; a later ordinary owner may perform cleanup under its own destructive protocol.
+
+### Outcome contract
+
+POST returns exactly one of the following outcomes and whether it changed bytes. GET uses the same diagnostic names for non-applicable cases, returns `ready-to-migrate` when a missing state is provable, and returns `migrated` only when strong readback shows the record was already explicit and converged:
+
+| Outcome | Meaning and permitted effect |
+|---|---|
+| `migrated` | All authoritative copies already contain, or were monotonically advanced to, the same proven state and destination identity. Only this outcome makes the record eligible for later ordinary read/delete semantics. |
+| `retained-ambiguous` | The tuple is structurally legacy-compatible, but the live probe is missing, multiple, changing, unsupported, or otherwise cannot prove exactly one state. No metadata or remote object is changed. |
+| `corrupt` | Explicit `Unknown`, malformed/contradictory compatibility keys, nil/invalid identifiers, partial transition metadata, or authoritative copies outside the one allowed `{original missing representation, exact proven target}` retry subset were observed. No backend probe is required after corruption is established, and nothing is changed. |
+| `backend-unavailable` | The bound tier generation/destination cannot be acquired, the bounded probe fails, or a metadata quorum/strong readback needed to complete the operation is unavailable. Any already-persisted monotonic subset is retained for an idempotent retry; it is never rolled back. |
+
+HTTP failure detail may distinguish a stale expected tuple, lost fence, timeout, or unavailable quorum, but it must preserve one of these machine-readable outcomes. Logs and audit events include request identity, object identity, tier, generations, outcome, and whether bytes changed; they never include credentials or raw credential-derived configuration.
+
+### Fence, write, and retry order
+
+The approved POST executes the following order. A step that cannot be proven stops the operation without remote mutation:
+
+1. Authenticate `admin:SetTier`, validate the exact single-record selector, `confirm: true`, expected tuple, and digest.
+2. Prove every required node advertises the reconciliation format and destination-identity capability; capture the fleet and topology generation. Unknown or unsupported nodes block the writer.
+3. Acquire the bucket-lifecycle WRITE fence and validate the bucket incarnation.
+4. Acquire the exact tier-config generation lease bound to the expected destination identity.
+5. Acquire exact object-version WRITE locks for every owning physical pool/set in stable pool/set order.
+6. Perform an authoritative all-pool read, reject duplicate/conflicting ownership, validate every compatibility key, and require each set to match the immutable source tuple plus either its digest-bound original missing-state representation or the exact proposed target.
+7. Run one bounded, cancellation-aware live probe through the leased backend. No client or cached probe result is authority.
+8. Before writing, revalidate the fleet/topology generation, bucket incarnation and lifecycle fence, tier lease/destination identity, physical owner set, and complete metadata tuple.
+9. Write the same derived state and destination identity to each authoritative set with that set's metadata quorum and conditional generation. A timeout or response loss is resolved only by a strong read of that exact set.
+10. Strongly reread every authoritative set and revalidate the full tuple, state, destination identity, and topology before returning `migrated`. Release locks and leases in reverse order.
+
+Cross-pool and cross-set partial success is monotonic. The only legal repair edge is `missing state -> one proven {state, remote version, destination identity}`. A retry may accept an already-written subset only when every known copy equals the newly proven target, every remaining copy equals its original missing-state representation captured by the reconciliation digest, and all immutable source fields still match; it then fills only the missing copies. This exact target-plus-original subset is neither stale nor corrupt. The retry never clears a known state, rewrites it to another state, changes destination identity, or rolls a successful set back to missing/`Unknown`. Any other divergent value produces `corrupt`; an unavailable set/readback produces `backend-unavailable`, and destructive cleanup remains blocked until a later strong all-pool read proves complete convergence.
+
+GET takes the same fleet/topology snapshot and authoritative all-pool read but no write locks that imply mutation authority. Because GET is advisory, POST always repeats every fence, read, and live proof rather than promoting the GET result.
+
+### Mixed-version and future batch work
+
+The writer gate requires every node that can serve, rewrite, heal, decommission, or recover the affected `xl.meta` to preserve the explicit state and destination identity. A rolling fleet with an unknown/unsupported node is inspect-only. Downgrade is blocked while reconciled records could be rewritten by readers that erase or misinterpret those fields. Cross-pool movement must either copy the proven tuple unchanged or block reconciliation; a first-match lookup is never sufficient.
+
+Explicit `Unknown`, corruption, and ambiguity remain fail closed for reads that cannot prove non-destructive semantics and for every destructive path. A migrated record becomes ordinary explicit metadata, but reconciliation itself never transfers remote DELETE ownership.
+
+A bucket/prefix/fleet batch reconcile is still an **open design**. It requires a separate durable job identity, create-only admission, lease/CAS checkpoint, bounded pages, per-record expected tuples and outcomes, cancellation/restart semantics, retention, fleet rollout negotiation, and status counters. Implementations must not approximate that protocol by adding a list selector or background loop to the synchronous route.
 
 ## Durable namespace receipts during decommission
 

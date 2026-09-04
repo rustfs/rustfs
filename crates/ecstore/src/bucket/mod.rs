@@ -31,6 +31,7 @@ pub mod policy_sys;
 pub mod quota;
 pub mod remote_s3_client;
 pub mod replication;
+pub mod sealed_credentials;
 pub mod tagging;
 pub mod target;
 pub mod utils;
