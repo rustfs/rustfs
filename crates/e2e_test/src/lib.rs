@@ -378,6 +378,11 @@ mod bucket_stats_regression_test;
 #[cfg(test)]
 mod distributed_startup_regression_test;
 
+// 4-node / 4-disk distributed Actions suite (S3, lock, versioning, replication,
+// quota, observability, expand/decommission/rebalance, site replication, chaos).
+#[cfg(test)]
+mod distributed;
+
 // P1 regression: tier/ILM transition (rustfs#5218, #5130, #5011, #4826, #5024)
 #[cfg(test)]
 mod tier_transition_regression_test;

@@ -22,6 +22,7 @@ on:
       - "Continuous Integration"
       - "coverage"
       - "e2e-nightly"
+      - "e2e-distributed"
       - "e2e-s3tests"
       - "Fuzz"
       - "mint"
