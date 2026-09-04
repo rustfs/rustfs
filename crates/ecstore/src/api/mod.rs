@@ -166,6 +166,11 @@ pub mod bucket {
             WriteBackError, WriteBackOutcome, WriteBackPart, WriteBackRequest, commit_inline, commit_inline_with,
             idle_guarded_body,
         };
+        pub use crate::bucket::on_demand_migration::{
+            FetchRequest, LIST_THROUGH_TOKEN_VERSION, ListEntryKey, ListThroughCursor, ListThroughMerger, ListThroughToken,
+            ListThroughTokenError, MAX_LIST_FETCHES_PER_SIDE, MergeOutcome, MergePick, MergeSide, SOURCE_LIST_MAX_RATE_WAIT,
+            SOURCE_LIST_RATE_PER_SEC, SourceListPlan, SourceListRateLimiter, decode_continuation_token, source_list_plan,
+        };
         pub mod backfill {
             pub use crate::bucket::on_demand_migration::backfill::{
                 BACKFILL_CHECKPOINT_FILE, BACKFILL_CHECKPOINT_FORMAT_VERSION, BACKFILL_FAILED_KEYS_CAPACITY, BACKFILL_LEASE,
@@ -179,8 +184,8 @@ pub mod bucket {
         }
         pub mod source_client {
             pub use crate::bucket::on_demand_migration::source_client::{
-                SourceClient, SourceClientSpec, SourceError, SourceGet, SourceHead, SourceObject, SourcePage, SourceProbe,
-                SourceProvider, SourceSse, SourceTimeouts, USER_AGENT_SUFFIX, is_multipart_etag, range_header_value,
+                SourceClient, SourceClientSpec, SourceError, SourceGet, SourceHead, SourceListRequest, SourceObject, SourcePage,
+                SourceProbe, SourceProvider, SourceSse, SourceTimeouts, USER_AGENT_SUFFIX, is_multipart_etag, range_header_value,
                 resolve_path_style,
             };
         }

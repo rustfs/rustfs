@@ -511,8 +511,26 @@ pub struct SourceObject {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SourcePage {
     pub objects: Vec<SourceObject>,
+    /// Rolled-up prefixes, in the local namespace; always empty when the
+    /// request carried no delimiter.
+    pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
+}
+
+/// One `ListObjectsV2` page request against the source. Keys are given in the
+/// local namespace; `SourceClient` maps them through `source_prefix`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceListRequest<'a> {
+    pub prefix: Option<&'a str>,
+    /// Rolls the source's own listing up the same way the local one is rolled
+    /// up, so a page under a delimiter stays bounded.
+    pub delimiter: Option<&'a str>,
+    /// Ignored by S3 when `continuation_token` is set, so the caller must pass
+    /// at most one of the two.
+    pub start_after: Option<&'a str>,
+    pub continuation_token: Option<&'a str>,
+    pub max_keys: i32,
 }
 
 /// Result of [`SourceClient::probe`]: the bucket answered HEAD and a
@@ -669,13 +687,35 @@ impl SourceClient {
         continuation_token: Option<&str>,
         max_keys: i32,
     ) -> Result<SourcePage, SourceError> {
+        self.list_page(&SourceListRequest {
+            prefix,
+            continuation_token,
+            max_keys,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// [`Self::list_objects_v2`] with the delimiter and start-after the
+    /// list-through merge needs (rustfs/backlog#2164).
+    pub async fn list_page(&self, request: &SourceListRequest<'_>) -> Result<SourcePage, SourceError> {
+        // `start_after` is silently ignored by S3 once a continuation token is
+        // present; refuse the ambiguous pair rather than list from the wrong
+        // position.
+        if request.continuation_token.is_some() && request.start_after.is_some() {
+            return Err(SourceError::Other(
+                "source listing takes either a continuation token or start-after, not both".to_string(),
+            ));
+        }
         let output = self
             .client
             .list_objects_v2()
             .bucket(&self.bucket)
-            .prefix(self.source_key(prefix.unwrap_or_default()))
-            .set_continuation_token(continuation_token.map(str::to_string))
-            .max_keys(max_keys)
+            .prefix(self.source_key(request.prefix.unwrap_or_default()))
+            .set_delimiter(request.delimiter.map(str::to_string))
+            .set_start_after(request.start_after.map(|after| self.source_key(after)))
+            .set_continuation_token(request.continuation_token.map(str::to_string))
+            .max_keys(request.max_keys)
             .send()
             .await
             .map_err(classify_sdk_error)?;
@@ -693,9 +733,16 @@ impl SourceClient {
             .into_iter()
             .filter_map(|object| self.source_object(object))
             .collect();
+        let common_prefixes = output
+            .common_prefixes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|prefix| Some(self.local_key(prefix.prefix.as_deref()?)?.to_string()))
+            .collect();
 
         Ok(SourcePage {
             objects,
+            common_prefixes,
             is_truncated,
             next_continuation_token,
         })

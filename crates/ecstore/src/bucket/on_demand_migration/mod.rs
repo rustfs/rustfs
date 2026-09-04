@@ -23,6 +23,7 @@
 pub mod backfill;
 pub mod breaker;
 pub mod config;
+pub mod list_through;
 pub mod negative_cache;
 pub mod pull;
 pub mod source_client;
@@ -37,6 +38,11 @@ pub use config::{
     ConfigPublishHook, FilterConfig, HeadPolicy, ON_DEMAND_MIGRATION_CONFIG_HOOK, ON_DEMAND_MIGRATION_CONFIG_VERSION,
     OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig, Provider, RangeGetPolicy, SourceConfig,
     SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
+};
+pub use list_through::{
+    FetchRequest, LIST_THROUGH_TOKEN_VERSION, ListEntryKey, ListThroughCursor, ListThroughMerger, ListThroughToken,
+    ListThroughTokenError, MAX_LIST_FETCHES_PER_SIDE, MergeOutcome, MergePick, MergeSide, SOURCE_LIST_MAX_RATE_WAIT,
+    SOURCE_LIST_RATE_PER_SEC, SourceListPlan, SourceListRateLimiter, decode_continuation_token, source_list_plan,
 };
 pub use negative_cache::{NEGATIVE_CACHE_MAX_ENTRIES, NegativeCache};
 pub use pull::{

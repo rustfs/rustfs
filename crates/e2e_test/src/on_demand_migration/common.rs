@@ -109,6 +109,7 @@ pub struct OdmPolicy {
     pub head: String,
     pub range_get: String,
     pub source_error: String,
+    pub list_through: bool,
     pub respect_local_delete_marker: bool,
     pub preserve_etag: bool,
     pub copy_tags: bool,
@@ -136,6 +137,7 @@ impl Default for OdmPolicy {
             head: "proxy".to_string(),
             range_get: "serve_and_backfill".to_string(),
             source_error: "propagate".to_string(),
+            list_through: false,
             respect_local_delete_marker: true,
             preserve_etag: true,
             copy_tags: false,
@@ -576,6 +578,23 @@ impl OdmTestEnv {
     }
 
     /// Raw signed `GET /{bucket}/{key}` against the RustFS under test.
+    /// Raw signed `ListObjectsV2` (`?list-type=2&<query>`) so a scenario can
+    /// assert on the response headers and the raw XML, which the SDK hides.
+    pub async fn raw_list_objects_v2(&self, bucket: &str, query: &str) -> Result<RawResponse, BoxError> {
+        let url = format!(
+            "{}/{bucket}?list-type=2{}{query}",
+            self.rustfs.url,
+            if query.is_empty() { "" } else { "&" }
+        );
+        let response =
+            signed_request(http::Method::GET, &url, &self.rustfs.access_key, &self.rustfs.secret_key, None, None).await?;
+        Ok(RawResponse {
+            status: response.status().as_u16(),
+            headers: response.headers().clone(),
+            body: response.bytes().await?,
+        })
+    }
+
     pub async fn raw_get(&self, bucket: &str, key: &str) -> Result<RawResponse, BoxError> {
         let url = format!("{}/{bucket}/{key}", self.rustfs.url);
         let response =

@@ -799,6 +799,12 @@ pub(super) fn object_lock_checks_required_for_state(state: &metadata_sys::Object
 pub(crate) const ON_DEMAND_MIGRATION_HEADER: http::HeaderName = http::HeaderName::from_static("x-rustfs-on-demand-migration");
 pub(crate) const ON_DEMAND_MIGRATION_SOURCE: HeaderValue = HeaderValue::from_static("source");
 
+/// Response header marking a `ListObjectsV2` that could not consult the source
+/// and was answered from local state alone (rustfs/backlog#2164).
+pub(crate) const ON_DEMAND_MIGRATION_LIST_HEADER: http::HeaderName =
+    http::HeaderName::from_static("x-rustfs-on-demand-migration-list");
+pub(crate) const ON_DEMAND_MIGRATION_LIST_LOCAL_ONLY: HeaderValue = HeaderValue::from_static("local_only");
+
 /// Custom S3 error code for a source failure surfaced under
 /// `policy.source_error = propagate`; carried on HTTP 424.
 pub(crate) const ODM_SOURCE_UNAVAILABLE_CODE: &str = "SourceUnavailable";
@@ -870,6 +876,12 @@ pub(crate) fn odm_state_error_class(error: &OdmStateError) -> &'static str {
 
 pub(crate) fn mark_on_demand_migration_response(headers: &mut HeaderMap) {
     headers.insert(ON_DEMAND_MIGRATION_HEADER, ON_DEMAND_MIGRATION_SOURCE);
+}
+
+/// Marks a merged listing that fell back to local state because the source
+/// could not be consulted (rustfs/backlog#2164).
+pub(crate) fn mark_on_demand_migration_list_local_only(headers: &mut HeaderMap) {
+    headers.insert(ON_DEMAND_MIGRATION_LIST_HEADER, ON_DEMAND_MIGRATION_LIST_LOCAL_ONLY);
 }
 
 /// Evaluates the request's conditional headers (`If-Match`, `If-None-Match`,

@@ -192,6 +192,9 @@ pub struct OnDemandMigrationPolicy {
     pub range_get: OnDemandMigrationRangeGetPolicy,
     #[serde(default)]
     pub source_error: OnDemandMigrationSourceErrorPolicy,
+    /// Merge the source listing into `ListObjectsV2` (rustfs/backlog#2164).
+    #[serde(default)]
+    pub list_through: bool,
     #[serde(default = "default_true")]
     pub respect_local_delete_marker: bool,
     #[serde(default = "default_true")]
@@ -222,6 +225,7 @@ impl Default for OnDemandMigrationPolicy {
             head: OnDemandMigrationHeadPolicy::default(),
             range_get: OnDemandMigrationRangeGetPolicy::default(),
             source_error: OnDemandMigrationSourceErrorPolicy::default(),
+            list_through: false,
             respect_local_delete_marker: true,
             preserve_etag: true,
             copy_tags: false,

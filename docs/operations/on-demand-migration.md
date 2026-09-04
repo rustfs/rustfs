@@ -103,7 +103,8 @@ The persisted blob is `on-demand-migration.json` in the bucket's metadata. Unkno
 | `filter.source_prefix` | string \| null | `null` | Null or non-empty. Prepended to the local key to form the source key |
 | `policy.head` | `proxy` \| `local_only` | `proxy` | `local_only` answers a HEAD miss with 404 and no source traffic |
 | `policy.range_get` | `serve_and_backfill` \| `serve_only` | `serve_and_backfill` | Whether a Range GET also queues a background pull of the whole object |
-| `policy.source_error` | `propagate` \| `not_found` | `propagate` | `propagate` answers 424 `SourceUnavailable`; `not_found` degrades to 404 |
+| `policy.source_error` | `propagate` \| `not_found` | `propagate` | `propagate` answers 424 `SourceUnavailable`; `not_found` degrades to 404, and for a merged listing to local state only |
+| `policy.list_through` | bool | `false` | Merges the source listing into `ListObjectsV2` so clients see the whole namespace during the migration. Off by default: it puts the source in the path of every listing |
 | `policy.respect_local_delete_marker` | bool | `true` | A local delete marker is the final answer; only a versioned bucket can produce one |
 | `policy.preserve_etag` | bool | `true` | Keeps the source ETag on the stored object unless the bucket encrypts by default |
 | `policy.copy_tags` | bool | `false` | Copies source object tags; needs `s3:GetObjectTagging` and costs one extra source call per inline pull |
@@ -137,7 +138,7 @@ Azure Blob has no preset; a native provider is deferred (rustfs/backlog#2166).
 
 The credentials only ever need read access to the source bucket:
 
-- `s3:ListBucket` on the bucket — used by the admin probe and by the backfill listing.
+- `s3:ListBucket` on the bucket — used by the admin probe, by the backfill listing, and by every merged listing under `policy.list_through`.
 - `s3:GetObject` on `<bucket>/*` — used by every HEAD and GET against the source.
 - `s3:GetObjectTagging` on `<bucket>/*` — only when `policy.copy_tags` is `true`.
 
@@ -155,7 +156,12 @@ Behaviour a client can observe. The "Test" column names the case that pins it: `
 | Client disconnects mid-stream on an inline pull | The write-back keeps draining the source and still stores the whole object | `get.rs::odm_get_inline_client_disconnect_still_stores_the_whole_object` |
 | Concurrent GET misses of one key | Singleflight: one leader tees, followers wait up to `first_byte_ms` and then re-read locally; on leader failure or timeout they stream through without queueing | `concurrency_test.rs::test_odm_concurrent_misses_on_one_key_coalesce`, `get.rs::odm_get_follower_rereads_local_after_the_leader_commits` |
 | HEAD miss | Proxied to the source, nothing is written locally; `local_only` answers 404 without source traffic | `head.rs::odm_head_source_hit_returns_output_and_writes_nothing_back`, `head.rs::odm_head_local_only_policy_is_404_without_source_traffic`, `real_source_test.rs::test_odm_rustfs_source_serves_pull_head_range_and_prefixes_real_single_node` |
-| LIST | Local only. A key that exists on the source but was never pulled is not listed, even while a GET of it succeeds | `interaction_test.rs::test_odm_write_back_respects_the_bucket_quota` |
+| LIST, `policy.list_through = false` (default) | Local only. A key that exists on the source but was never pulled is not listed, even while a GET of it succeeds | `interaction_test.rs::test_odm_write_back_respects_the_bucket_quota` |
+| `ListObjectsV2` with `policy.list_through = true` | The local and source listings are merged into one ordered page: byte-wise key order, local wins a key both sides hold, `CommonPrefixes` unioned and deduplicated under a delimiter. A source entry reports the source's own ETag, size and last-modified, storage class `STANDARD` and this bucket's owner. The continuation token is opaque and carries both cursors | `list_through_test.rs::list_through_merges_the_whole_namespace_across_full_pagination`, `list_through_test.rs::list_through_unions_common_prefixes_under_a_delimiter`, `list_through.rs::merged_pagination_equals_the_deduplicated_union` |
+| `ListObjects` (v1) and `ListObjectVersions`, whatever `list_through` says | Local only. v1 has no opaque continuation token that could carry two cursors, and a version listing has no meaning for a source whose versions were never pulled | `list_through_test.rs::a_merged_token_keeps_paginating_after_list_through_is_turned_off` |
+| Merged listing, source listing fails or the breaker is open | `propagate` answers 424 `SourceUnavailable`; `not_found` answers from local state alone and marks the response `x-rustfs-on-demand-migration-list: local_only` | `list_through_test.rs::list_through_propagates_a_source_listing_failure`, `list_through_test.rs::list_through_degrades_to_local_only_under_the_not_found_policy` |
+| Merged listing, tampered continuation token | 400 `InvalidArgument`; a token issued while `list_through` was on keeps paginating the local side after it is turned off | `list_through_test.rs::list_through_rejects_a_tampered_continuation_token`, `list_through.rs::token_round_trips_and_rejects_tampering` |
+| Merged listing, versioned bucket with a local delete marker | The shadowed key is dropped from the page, matching `respect_local_delete_marker` on GET. The local listing never returns delete markers, so such a bucket costs one extra local metadata read per source-only key in the page | `list_through_test.rs::a_local_delete_marker_hides_the_source_key_from_a_merged_listing` |
 | PUT / DELETE | Never touch the source. A local PUT shadows the source key for good | `interaction_test.rs::test_odm_delete_marker_shadows_the_source_but_a_plain_delete_does_not` |
 | Versioned bucket, local delete marker | With `respect_local_delete_marker` (default) the marker is the final answer and the source is not consulted | `interaction_test.rs::test_odm_delete_marker_shadows_the_source_but_a_plain_delete_does_not`, `head.rs::odm_head_verdict_respects_local_delete_marker_by_policy` |
 | Unversioned bucket, object deleted locally | The key becomes an ordinary miss and is pulled from the source again | `interaction_test.rs::test_odm_delete_marker_shadows_the_source_but_a_plain_delete_does_not` |
@@ -306,7 +312,9 @@ sum by (bucket, reason) (rate(rustfs_on_demand_migration_pull_failures_total[5m]
 - **SSE-C source objects are not supported.** They are rejected with 424 `unsupported`; migrate them by another route.
 - **Anonymous (credential-less) sources are not supported yet.** `source.credentials: null` parses and passes structural validation, but the client builder has no anonymous mode, so the admin `PUT` refuses it and the runtime would treat such a bucket as unavailable. A public source still needs a key pair.
 - **Azure Blob is not a supported source** (rustfs/backlog#2166). GCS is supported only through its XML interoperability API with HMAC keys.
-- **LIST does not merge the source** (rustfs/backlog#2164). Only local objects are listed, so a client that lists before reading will not see un-migrated keys.
+- **LIST merges the source only when asked, and only for v2.** With the default `policy.list_through = false` a client that lists before reading will not see un-migrated keys. Turning it on merges `ListObjectsV2` alone; `ListObjects` (v1) and `ListObjectVersions` stay local.
+- **A merged listing costs one local listing plus up to two source listings per page**, and source listings are capped at 10 per second per bucket (a compile-time constant). A listing that cannot get a slot inside one second is treated like a source failure and follows `policy.source_error`.
+- **A degraded merged page loses the source keys in its window.** Under `source_error = not_found` the page is answered locally and the source cursor is left where it was, so the keys the source would have contributed between the previous page's last key and this one are not shown again once pagination moves on. The `x-rustfs-on-demand-migration-list: local_only` header marks every page this happened on.
 - **Write-through is undecided** (rustfs/backlog#2165). PUT and DELETE never reach the source in this version.
 - **`pull_failures_total` counts abandoned pulls, not attempts.** A pull that failed twice and then succeeded contributes nothing; attempt-level failure needs a new counter.
 - **The breaker's 30 s open window is a compile-time constant** with no environment override, which is why breaker-related tests have to wait it out.
