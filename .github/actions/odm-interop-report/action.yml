@@ -1,0 +1,100 @@
+name: On-demand migration interop report
+description: >-
+  Merge the per-case JSON entries an on-demand-migration interop run wrote with
+  the nextest JUnit result into one provider report, and summarise it.
+
+inputs:
+  provider:
+    description: Provider the run addressed (minio, aws, r2, gcs).
+    required: true
+  cases-dir:
+    description: Directory the cases wrote their JSON entries into.
+    required: true
+  junit:
+    description: nextest JUnit XML of the run.
+    required: true
+  output:
+    description: Path of the merged JSON report to write.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # The JUnit file is authoritative for which cases ran and how they ended:
+    # a case that fails or panics never reaches its own report entry, so
+    # trusting the entries alone would silently shorten the report exactly when
+    # something went wrong. The entries only add what JUnit cannot know — the
+    # source request accounting and the bucket's migration counters.
+    - name: Merge interop case reports
+      shell: bash
+      env:
+        ODM_REPORT_PROVIDER: ${{ inputs.provider }}
+        ODM_REPORT_CASES_DIR: ${{ inputs.cases-dir }}
+        ODM_REPORT_JUNIT: ${{ inputs.junit }}
+        ODM_REPORT_OUTPUT: ${{ inputs.output }}
+      run: |
+        python3 - <<'PY'
+        import json
+        import os
+        import pathlib
+        import xml.etree.ElementTree as ElementTree
+
+        provider = os.environ["ODM_REPORT_PROVIDER"]
+        cases_dir = pathlib.Path(os.environ["ODM_REPORT_CASES_DIR"])
+        junit = pathlib.Path(os.environ["ODM_REPORT_JUNIT"])
+        output = pathlib.Path(os.environ["ODM_REPORT_OUTPUT"])
+
+        entries = {}
+        if cases_dir.is_dir():
+            for path in sorted(cases_dir.glob("*.json")):
+                entry = json.loads(path.read_text())
+                entries[entry["case"]] = entry
+
+        cases = []
+        for case in ElementTree.parse(junit).getroot().iter("testcase"):
+            name = case.get("name", "")
+            failed = [child for child in case if child.tag in ("failure", "error")]
+            skipped = [child for child in case if child.tag == "skipped"]
+            outcome = "failed" if failed else "skipped" if skipped else "passed"
+            entry = entries.get(name.rsplit("::", 1)[-1], {})
+            cases.append(
+                {
+                    "name": name,
+                    "outcome": outcome,
+                    "junit_duration_ms": round(float(case.get("time", "0")) * 1000),
+                    "case_duration_ms": entry.get("duration_ms"),
+                    "source_requests": entry.get("source_requests"),
+                    "odm_counters": entry.get("odm_counters"),
+                }
+            )
+
+        report = {
+            "provider": provider,
+            "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+            "sha": os.environ.get("GITHUB_SHA", ""),
+            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+            "cases": cases,
+            "totals": {
+                "cases": len(cases),
+                "passed": sum(1 for case in cases if case["outcome"] == "passed"),
+                "failed": sum(1 for case in cases if case["outcome"] == "failed"),
+            },
+        }
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+
+        summary = [f"### On-demand migration interop: `{provider}`", "", "| Case | Outcome | Duration | Source requests |", "|---|---|---|---|"]
+        for case in cases:
+            requests = case["source_requests"]
+            counted = f"{requests['total']} ({requests['counted_by']})" if requests else "not reported"
+            summary.append(f"| `{case['name']}` | {case['outcome']} | {case['junit_duration_ms']} ms | {counted} |")
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+            handle.write("\n".join(summary) + "\n\n")
+
+        # A passed case with no entry of its own means the harness stopped
+        # writing one: the report would keep looking complete while silently
+        # losing its request accounting.
+        unreported = [case["name"] for case in cases if case["outcome"] == "passed" and case["source_requests"] is None]
+        if unreported:
+            raise SystemExit(f"passed cases wrote no interop report entry: {', '.join(unreported)}")
+        PY

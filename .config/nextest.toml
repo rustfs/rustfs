@@ -527,6 +527,34 @@ filter = 'package(e2e_test)'
 test-group = 'e2e-cluster-nightly'
 
 # ---------------------------------------------------------------------------
+# e2e-odm-interop profile — on-demand migration provider interop lane (ODM-20)
+# ---------------------------------------------------------------------------
+# backlog#2167. Report-only, scheduled, never a required check; wired by
+# .github/workflows/on-demand-migration-interop.yml.
+#
+# The four cases in `on_demand_migration::interop_test` take their source from
+# the environment (`RUSTFS_ODM_INTEROP_*`, documented on the constants in
+# `crates/e2e_test/src/on_demand_migration/common.rs`), so the same bodies run
+# against the in-process fake source locally and against a MinIO container or a
+# real cloud provider in the lane. The cloud jobs narrow this profile with their
+# own `-E` filter to the three-case minimum (GET miss, HEAD miss, merged list
+# pagination) and pass `--no-tests=fail` so a rename cannot silently select
+# nothing; the MinIO job runs the whole profile, backfill included.
+#
+# These cases are deliberately absent from every other lane: without an
+# interop source they only re-prove what `get_basic_test` and
+# `list_through_test` already cover in e2e-smoke and e2e-full. The committed
+# selection digest is the guard against a rename dropping one of them.
+[profile.e2e-odm-interop]
+default-filter = 'package(e2e_test) & test(/^on_demand_migration::interop_test::/)'
+fail-fast = false
+
+[profile.e2e-odm-interop.junit]
+# Emitted to target/nextest/e2e-odm-interop/junit.xml; the lane uploads it and
+# reconciles it against the per-case JSON report entries.
+path = "junit.xml"
+
+# ---------------------------------------------------------------------------
 # e2e-protocols profile — serial protocol lane
 # ---------------------------------------------------------------------------
 # The suite owns fixed ports, so the nightly workflow runs this exact profile
@@ -558,6 +586,11 @@ path = "junit.xml"
 #     cluster-fault lane. heal_erasure_disk_rebuild is intentionally not
 #     excluded here because backlog#2213 promotes core heal rebuild coverage to
 #     this merge/main lane while retaining nightly coverage.
+#   * on_demand_migration::interop_test — the ODM-20 provider interoperability
+#     cases, which are meaningless without a source: they run in the dedicated
+#     [profile.e2e-odm-interop] lane below, where the workflow points them at a
+#     MinIO container or a real cloud provider. Excluding them here also keeps
+#     this profile's committed selection digest stable.
 #   * replication_extension_test — repl-1 already splits it into the PR
 #     `e2e-smoke` (20 fast) and `e2e-repl-nightly` (56 slow) lanes and reserves
 #     it for those, so e2e-full does not double-run it.
@@ -576,7 +609,7 @@ default-filter = """
     & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|cluster_multidrive_pool_test|degraded_listing_availability_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
     & !test(/^replication_extension_test::/)
     & !test(/^replication_target_matrix_test::/)
-    & !test(/^on_demand_migration::(concurrency_test|fault_test|real_source_test)::/)
+    & !test(/^on_demand_migration::(concurrency_test|fault_test|interop_test|real_source_test)::/)
 """
 fail-fast = false
 
