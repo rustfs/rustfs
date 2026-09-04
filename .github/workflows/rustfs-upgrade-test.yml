@@ -18,9 +18,9 @@ on:
   workflow_dispatch:
     inputs:
       from_version:
-        description: 'OLD RustFS release tag (e.g. 1.0.0-rc.4-preview.1)'
+        description: 'OLD RustFS release tag (must ship a .deb asset, e.g. 1.0.0-rc.3)'
         required: false
-        default: '1.0.0-rc.4-preview.1'
+        default: '1.0.0-rc.3'
       from_url:
         description: 'OLD .deb URL. Overrides from_version.'
         required: false
@@ -203,54 +203,75 @@ jobs:
             TO_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
           fi
           CASE_TABLE="/tmp/rustfs-upgrade-cases.md"
-          python3 - "${LOG_FILE}" "${CASE_TABLE}" <<'PY'
+          MATRIX_TABLE="/tmp/rustfs-upgrade-matrix.md"
+          python3 - "${LOG_FILE}" "${CASE_TABLE}" "${MATRIX_TABLE}" <<'PY'
           import re
           import sys
 
-          log_file, out_file = sys.argv[1], sys.argv[2]
+          log_file, out_file, matrix_file = sys.argv[1], sys.argv[2], sys.argv[3]
           ansi = re.compile(r'\x1b\[[0-9;]*m')
           start_re = re.compile(r'^---\s+([A-Z]+-[0-9]+)\s+(.+?)\s+---$')
           done_re = re.compile(r'^\[(PASS|FAIL|UNSUPPORTED)\]\s+([A-Z]+-[0-9]+)\b')
+          topo_re = re.compile(
+              r'^\[UPG-TOPO\]\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+PASS=(\d+)\s+FAIL=(\d+)\s*$')
 
           rows = []
           index = {}
+          topo_rows = []
           try:
-            with open(log_file, 'r', encoding='utf-8', errors='replace') as fh:
-              for raw in fh:
-                line = ansi.sub('', raw).strip()
-                m = start_re.match(line)
-                if m:
-                  case_id, name = m.group(1), m.group(2)
-                  if case_id not in index:
-                    index[case_id] = len(rows)
-                    rows.append([case_id, name, 'RUNNING'])
-                  continue
-                m = done_re.match(line)
-                if m:
-                  status, case_id = m.group(1), m.group(2)
-                  if case_id in index:
-                    rows[index[case_id]][2] = status
-                  else:
-                    rows.append([case_id, case_id, status])
-                    index[case_id] = len(rows) - 1
+              with open(log_file, 'r', encoding='utf-8', errors='replace') as fh:
+                  for raw in fh:
+                      line = ansi.sub('', raw).strip()
+                      m = topo_re.match(line)
+                      if m:
+                          topo_rows.append(m.groups())
+                          continue
+                      m = start_re.match(line)
+                      if m:
+                          case_id, name = m.group(1), m.group(2)
+                          if case_id not in index:
+                              index[case_id] = len(rows)
+                              rows.append([case_id, name, 'RUNNING'])
+                          continue
+                      m = done_re.match(line)
+                      if m:
+                          status, case_id = m.group(1), m.group(2)
+                          if case_id in index:
+                              rows[index[case_id]][2] = status
+                          else:
+                              rows.append([case_id, case_id, status])
+                              index[case_id] = len(rows) - 1
           except FileNotFoundError:
-            rows = []
+              rows = []
 
           counts = {'PASS': 0, 'FAIL': 0, 'UNSUPPORTED': 0, 'RUNNING': 0}
           for _, _, status in rows:
-            counts[status] = counts.get(status, 0) + 1
+              counts[status] = counts.get(status, 0) + 1
 
           with open(out_file, 'w', encoding='utf-8') as out:
-            out.write('## Case Summary\n\n')
-            out.write(f"- Total: {len(rows)}\\n")
-            out.write(f"- PASS: {counts.get('PASS', 0)}\\n")
-            out.write(f"- FAIL: {counts.get('FAIL', 0)}\\n")
-            out.write(f"- UNSUPPORTED: {counts.get('UNSUPPORTED', 0)}\\n")
-            out.write('\\n')
-            out.write('| Case | Name | Status |\\n')
-            out.write('| --- | --- | --- |\\n')
-            for case_id, name, status in rows:
-              out.write(f'| {case_id} | {name} | {status} |\\n')
+              out.write('## Case Summary\n\n')
+              out.write(f"- Total: {len(rows)}\\n")
+              out.write(f"- PASS: {counts.get('PASS', 0)}\\n")
+              out.write(f"- FAIL: {counts.get('FAIL', 0)}\\n")
+              out.write(f"- UNSUPPORTED: {counts.get('UNSUPPORTED', 0)}\\n")
+              out.write('\\n')
+              out.write('| Case | Name | Status |\\n')
+              out.write('| --- | --- | --- |\\n')
+              for case_id, name, status in rows:
+                  out.write(f'| {case_id} | {name} | {status} |\\n')
+
+          # Upgrade matrix: one row per topology/backend with the versions
+          # captured on the nodes (rustfs --version) and the aggregated
+          # result. The dashboard renders this table directly.
+          with open(matrix_file, 'w', encoding='utf-8') as out:
+              out.write('## Upgrade Matrix\n\n')
+              out.write('| Topology | KMS Backend | 升级前版本 | 升级后版本 | 升级结果 |\n')
+              out.write('| --- | --- | --- | --- | --- |\n')
+              for topo, backend, old_v, new_v, npass, nfail in topo_rows:
+                  result = 'PASS' if nfail == '0' else 'FAIL'
+                  out.write(f'| {topo} | {backend} | {old_v} | {new_v} | {result} (PASS={npass} FAIL={nfail}) |\n')
+              if not topo_rows:
+                  out.write('| - | - | - | - | 未执行（套件在升级前失败） |\n')
           PY
           {
             echo "# RustFS upgrade compatibility report"
@@ -260,6 +281,8 @@ jobs:
             echo "- From: ${FROM_SOURCE}"
             echo "- To: ${TO_SOURCE}"
             echo "- Test Step Outcome: ${{ steps.test.outcome }}"
+            echo ""
+            cat "${MATRIX_TABLE}" || true
             echo ""
             cat "${CASE_TABLE}" || true
             echo ""
