@@ -160,6 +160,18 @@ fn tier_delete_walk_cancellation_is_expected(truncated: bool, limit_cancellation
     truncated && limit_cancellation && matches!(error, Error::OperationCanceled)
 }
 
+fn combine_tier_delete_walk_results(results: impl IntoIterator<Item = Result<()>>) -> Result<()> {
+    let mut cancelled = false;
+    for result in results {
+        match result {
+            Ok(()) => {}
+            Err(Error::OperationCanceled) => cancelled = true,
+            Err(err) => return Err(err),
+        }
+    }
+    if cancelled { Err(Error::OperationCanceled) } else { Ok(()) }
+}
+
 async fn acquire_prefix_tier_delete_reference_leases(
     api: &Arc<ECStore>,
     tier_references: &std::collections::HashSet<TierDeleteLeaseReference>,
@@ -203,7 +215,15 @@ async fn prepare_prefix_tier_delete_journal_entries_inner(
             .bucket_lifecycle_lock_fence
             .as_ref()
             .ok_or_else(|| Error::other("tier delete dispatch requires a bucket lifecycle write fence"))?;
-        match inspect_tier_delete_chunk_parent(Arc::clone(api), bucket, bucket_incarnation, prefix, bucket_fence).await? {
+        match Box::pin(inspect_tier_delete_chunk_parent(
+            Arc::clone(api),
+            bucket,
+            bucket_incarnation,
+            prefix,
+            bucket_fence,
+        ))
+        .await?
+        {
             TierDeleteChunkParentInspection::NoParent => (false, false, None),
             TierDeleteChunkParentInspection::LegacyManifest => (false, true, None),
             TierDeleteChunkParentInspection::Ready(topology_generation) => (true, false, Some(topology_generation)),
@@ -267,7 +287,7 @@ async fn prepare_prefix_tier_delete_journal_entries_inner(
         .collect::<Vec<_>>()
         .await;
         drop(tx);
-        results.into_iter().collect::<Result<Vec<_>>>().map(|_| ())
+        combine_tier_delete_walk_results(results)
     };
     let collect_limit_cancellation = limit_cancellation.clone();
     let collect = async {
@@ -380,7 +400,7 @@ async fn prepare_prefix_tier_delete_journal_entries_inner(
         return Err(Error::other("tier delete chunk parent topology changed during source scan"));
     }
     let mut dispatch = if !legacy_manifest_active && (chunk_parent_active || truncated) {
-        prepare_tier_delete_chunk_dispatch(
+        Box::pin(prepare_tier_delete_chunk_dispatch(
             Arc::clone(api),
             bucket,
             bucket_incarnation,
@@ -389,7 +409,7 @@ async fn prepare_prefix_tier_delete_journal_entries_inner(
             truncated && !chunk_parent_active,
             fleet_proof,
             bucket_fence,
-        )
+        ))
         .await?
     } else if legacy_manifest_active && truncated {
         resume_tier_delete_dispatch(Arc::clone(api), bucket, bucket_incarnation, prefix, entries, fleet_proof, bucket_fence)
@@ -550,14 +570,14 @@ async fn delete_prefix_with_tier_delete_journal(
                 .bucket_lifecycle_lock_fence
                 .as_ref()
                 .ok_or_else(|| Error::other("tier delete dispatch requires a bucket lifecycle write fence"))?;
-            if !complete_tier_delete_chunk_parent(
+            if !Box::pin(complete_tier_delete_chunk_parent(
                 Arc::clone(api),
                 bucket,
                 bucket_incarnation,
                 object,
                 bucket_fence,
                 parent_fleet_proof,
-            )
+            ))
             .await?
             {
                 return Err(Error::other("tier delete chunk parent disappeared after final local deletion"));
@@ -6788,6 +6808,19 @@ mod tests {
         assert!(!tier_delete_walk_cancellation_is_expected(false, true, &cancelled));
         assert!(!tier_delete_walk_cancellation_is_expected(true, false, &cancelled));
         assert!(!tier_delete_walk_cancellation_is_expected(true, true, &Error::other("scan failed")));
+    }
+
+    #[test]
+    fn tier_delete_walk_results_prioritize_real_errors_over_cancellation() {
+        let err = combine_tier_delete_walk_results([Err(Error::OperationCanceled), Ok(()), Err(StorageError::FileAccessDenied)])
+            .expect_err("a real walk error must not be hidden by earlier cancellation");
+        assert_eq!(err, StorageError::FileAccessDenied);
+
+        assert_eq!(
+            combine_tier_delete_walk_results([Ok(()), Err(Error::OperationCanceled)])
+                .expect_err("cancellation must remain visible when there is no real error"),
+            Error::OperationCanceled
+        );
     }
 
     impl Drop for BodyCacheHookGuard {
