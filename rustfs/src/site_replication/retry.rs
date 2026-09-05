@@ -889,6 +889,51 @@ pub(crate) fn retry_bucket_name(path: &str) -> Option<String> {
         .find_map(|(key, value)| (key == "bucket" && !value.is_empty()).then(|| value.into_owned()))
 }
 
+pub(crate) fn bucket_op_retry_replay_tasks<'a>(
+    plan: &'a SiteReplicationBootstrapPlan,
+    operation: &str,
+    bucket: &str,
+) -> S3Result<Vec<SiteReplicationRepairTask<'a>>> {
+    let matches_bucket = |path: &&String| retry_bucket_name(path).as_deref() == Some(bucket);
+    match operation {
+        SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING => {
+            let mut tasks = plan
+                .bucket_make_ops
+                .iter()
+                .filter(matches_bucket)
+                .map(|path| SiteReplicationRepairTask::BucketMake(path.as_str()))
+                .collect::<Vec<_>>();
+            if tasks.is_empty() {
+                return Ok(tasks);
+            }
+            let configure_tasks = plan
+                .bucket_configure_ops
+                .iter()
+                .filter(matches_bucket)
+                .map(|path| SiteReplicationRepairTask::Replication(path.as_str()))
+                .collect::<Vec<_>>();
+            if configure_tasks.is_empty() {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("site replication retry plan has no configure operation for bucket {bucket:?}"),
+                ));
+            }
+            tasks.extend(configure_tasks);
+            Ok(tasks)
+        }
+        SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION => Ok(plan
+            .bucket_configure_ops
+            .iter()
+            .filter(matches_bucket)
+            .map(|path| SiteReplicationRepairTask::Replication(path.as_str()))
+            .collect()),
+        _ => Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            format!("unsupported site replication retry bucket operation {operation:?}"),
+        )),
+    }
+}
+
 /// A collapsed retry event after a stable snapshot resend is escalated with
 /// this marker instead of being cleared: the snapshot contains no task for a
 /// failed deletion, so remote absence remains operator-visible. Collapsed
@@ -1358,23 +1403,13 @@ pub(crate) async fn drain_one_site_replication_retry_event(
             // Replay from the CURRENT plan, never the recorded path: the
             // recorded query can carry an expired one-shot bootstrap token or
             // a stale createdAt.
-            let make_op = operation == SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING;
-            let paths = if make_op {
-                &plan.bucket_make_ops
-            } else {
-                &plan.bucket_configure_ops
+            let tasks = match bucket_op_retry_replay_tasks(plan, &operation, &bucket) {
+                Ok(tasks) => tasks,
+                Err(err) => {
+                    enqueue_site_replication_retry_event(peer, &event.path, &err).await;
+                    return Err(err);
+                }
             };
-            let tasks: Vec<SiteReplicationRepairTask<'_>> = paths
-                .iter()
-                .filter(|path| retry_bucket_name(path).as_deref() == Some(bucket.as_str()))
-                .map(|path| {
-                    if make_op {
-                        SiteReplicationRepairTask::BucketMake(path)
-                    } else {
-                        SiteReplicationRepairTask::Replication(path)
-                    }
-                })
-                .collect();
             if tasks.is_empty() {
                 // The bucket left the plan (deleted, or replication no longer
                 // configured): the recorded intent is stale, settle it.

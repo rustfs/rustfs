@@ -750,6 +750,50 @@ fn test_classify_site_replication_retry_event_actions() {
 }
 
 #[test]
+fn test_bucket_make_retry_replays_matching_configure_before_settlement() {
+    let make_photos =
+        "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning".to_string();
+    let configure_photos =
+        "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=configure-replication".to_string();
+    let plan = SiteReplicationBootstrapPlan {
+        bucket_make_ops: vec![
+            make_photos.clone(),
+            "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=videos&operation=make-with-versioning".to_string(),
+        ],
+        bucket_configure_ops: vec![
+            "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=videos&operation=configure-replication".to_string(),
+            configure_photos.clone(),
+        ],
+        ..Default::default()
+    };
+
+    let tasks = bucket_op_retry_replay_tasks(&plan, SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING, "photos")
+        .expect("make retry plan should include its configure follow-up");
+    assert_eq!(
+        tasks.iter().map(SiteReplicationRepairTask::path).collect::<Vec<_>>(),
+        vec![make_photos.as_str(), configure_photos.as_str()]
+    );
+    assert!(matches!(tasks[0], SiteReplicationRepairTask::BucketMake(_)));
+    assert!(matches!(tasks[1], SiteReplicationRepairTask::Replication(_)));
+}
+
+#[test]
+fn test_bucket_make_retry_without_matching_configure_fails_closed() {
+    let plan = SiteReplicationBootstrapPlan {
+        bucket_make_ops: vec![
+            "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning".to_string(),
+        ],
+        ..Default::default()
+    };
+
+    let err = match bucket_op_retry_replay_tasks(&plan, SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING, "photos") {
+        Ok(_) => panic!("make retry must not settle without a matching configure operation"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code(), &S3ErrorCode::InternalError);
+}
+
+#[test]
 fn test_retry_snapshot_fingerprint_detects_concurrent_iam_change() {
     let old = SRIAMItem {
         r#type: "policy".to_string(),
