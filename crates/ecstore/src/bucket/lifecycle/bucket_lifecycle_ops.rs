@@ -660,7 +660,6 @@ fn transition_remote_version_delete_plan(oi: &ObjectInfo) -> Result<TransitionDe
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ResolvedTransitionDeleteVersion {
     version_id_exact: bool,
-    verify_missing_after_delete: bool,
     remote_already_missing: bool,
 }
 
@@ -686,33 +685,32 @@ async fn resolve_transition_delete_version_plan(
     match delete_plan {
         TransitionDeleteVersionPlan::Direct { version_id_exact } => Ok(ResolvedTransitionDeleteVersion {
             version_id_exact,
-            verify_missing_after_delete: false,
             remote_already_missing: false,
         }),
         TransitionDeleteVersionPlan::ProbeLegacyUnknown => {
-            let probe = lease.probe_transition_candidate(&oi.transitioned_object.name).await?;
-            match (oi.transitioned_object.version_id.as_str(), probe) {
-                ("", crate::services::tier::warm_backend::TransitionCandidateProbe::UnversionedPresent) => {
-                    Ok(ResolvedTransitionDeleteVersion {
-                        version_id_exact: false,
-                        verify_missing_after_delete: true,
-                        remote_already_missing: false,
-                    })
-                }
+            let expected_version = oi.transitioned_object.version_id.as_str();
+            if expected_version.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "remote tier cannot safely delete a legacy object without an exact version ID",
+                ));
+            }
+            let probe = lease
+                .probe_transition_version(&oi.transitioned_object.name, expected_version)
+                .await?;
+            match (expected_version, probe) {
                 (expected, crate::services::tier::warm_backend::TransitionCandidateProbe::VersionedPresent(actual))
-                    if !expected.is_empty() && expected == actual =>
+                    if expected == actual =>
                 {
                     lease.validate_remote_version_id(expected)?;
                     Ok(ResolvedTransitionDeleteVersion {
                         version_id_exact: true,
-                        verify_missing_after_delete: false,
                         remote_already_missing: false,
                     })
                 }
                 (_, crate::services::tier::warm_backend::TransitionCandidateProbe::Missing) => {
                     Ok(ResolvedTransitionDeleteVersion {
                         version_id_exact: false,
-                        verify_missing_after_delete: false,
                         remote_already_missing: true,
                     })
                 }
@@ -742,15 +740,6 @@ async fn execute_resolved_transition_delete(
             resolved.version_id_exact,
         )
         .await?;
-    }
-    if resolved.verify_missing_after_delete
-        && lease.probe_transition_candidate(&oi.transitioned_object.name).await?
-            != crate::services::tier::warm_backend::TransitionCandidateProbe::Missing
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "remote tier could not confirm legacy unversioned deletion",
-        ));
     }
     Ok(())
 }
@@ -6936,7 +6925,7 @@ mod tests {
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
-    async fn free_version_delete_probes_legacy_unknown_exact_version_before_remove() {
+    async fn free_version_delete_probes_exact_version_hidden_by_current_delete_marker() {
         let manager = TierConfigMgr::new();
         let tier = "WARM";
         let backend = register_mock_tier(&manager, tier).await;
@@ -6953,6 +6942,17 @@ mod tests {
             .expect("mock remote object should be stored");
         let mut user_defined = user_defined_with_tier_destination_identity(identity);
         insert_legacy_transition_version_id(&mut user_defined, &remote_version);
+        backend
+            .set_transition_candidate_probe_override(Some(TransitionCandidateProbe::Missing))
+            .await;
+        assert_eq!(
+            backend
+                .probe_transition_candidate_state(&remote_object)
+                .await
+                .expect("current remote view should be readable"),
+            TransitionCandidateProbe::Missing,
+            "a current delete marker must hide the historical data version from an unversioned probe"
+        );
         backend.clear_op_log().await;
         let object_info = ObjectInfo {
             transitioned_object: TransitionedObject {
@@ -6976,13 +6976,13 @@ mod tests {
         assert_eq!(
             backend.op_log().await,
             vec![
-                MockWarmOp::Probe {
+                MockWarmOp::Get {
                     object: remote_object.clone()
                 },
                 MockWarmOp::Remove {
                     object: remote_object.clone()
                 },
-                MockWarmOp::Probe {
+                MockWarmOp::Get {
                     object: remote_object.clone()
                 },
             ]
@@ -6995,7 +6995,7 @@ mod tests {
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
-    async fn free_version_delete_probes_legacy_unknown_unversioned_before_remove() {
+    async fn free_version_delete_retains_legacy_unknown_unversioned_object() {
         let manager = TierConfigMgr::new();
         let tier = "WARM";
         let backend = register_mock_tier(&manager, tier).await;
@@ -7027,40 +7027,34 @@ mod tests {
             ..Default::default()
         };
 
-        super::delete_free_version_remote_object(&object_info, &manager)
+        let err = super::delete_free_version_remote_object(&object_info, &manager)
             .await
-            .expect("probe-proven legacy unversioned cleanup should delete the remote object");
+            .expect_err("legacy unversioned cleanup cannot exclude a versioning-state race");
 
-        assert_eq!(
-            backend.op_log().await,
-            vec![
-                MockWarmOp::Probe {
-                    object: remote_object.clone()
-                },
-                MockWarmOp::Remove {
-                    object: remote_object.clone()
-                },
-                MockWarmOp::Probe {
-                    object: remote_object.clone()
-                },
-            ]
-        );
-        assert_eq!(backend.remove_versions().await, vec![(remote_object, String::new())]);
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(backend.op_log().await.is_empty());
+        assert_eq!(backend.remove_count().await, 0);
+        assert!(backend.remove_versions().await.is_empty());
     }
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
-    async fn free_version_delete_retains_legacy_unknown_when_probe_disagrees() {
+    async fn free_version_delete_does_not_remove_a_different_remote_version() {
         let manager = TierConfigMgr::new();
         let tier = "WARM";
         let backend = register_mock_tier(&manager, tier).await;
         let identity = test_tier_destination_identity(&manager, tier).await;
         let remote_object = format!("remote/{}", Uuid::new_v4());
+        backend.set_put_remote_version(Some("different-version".to_string())).await;
         backend
-            .set_transition_candidate_probe_override(Some(TransitionCandidateProbe::VersionedPresent(
-                "different-version".to_string(),
-            )))
-            .await;
+            .put(
+                &remote_object,
+                ReaderImpl::Body(Bytes::from_static(b"different remote version")),
+                i64::try_from(b"different remote version".len()).expect("body length should fit"),
+            )
+            .await
+            .expect("different remote version should be stored");
+        backend.clear_op_log().await;
         let mut user_defined = user_defined_with_tier_destination_identity(identity);
         insert_legacy_transition_version_id(&mut user_defined, "legacy-version");
         let object_info = ObjectInfo {
@@ -7075,13 +7069,13 @@ mod tests {
             ..Default::default()
         };
 
-        let err = super::delete_free_version_remote_object(&object_info, &manager)
+        super::delete_free_version_remote_object(&object_info, &manager)
             .await
-            .expect_err("legacy unknown cleanup must not delete when the probe disagrees");
+            .expect("a missing exact legacy version should be an idempotent cleanup success");
 
-        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
-        assert_eq!(backend.op_log().await, vec![MockWarmOp::Probe { object: remote_object }]);
+        assert_eq!(backend.op_log().await, vec![MockWarmOp::Get { object: remote_object }]);
         assert_eq!(backend.remove_count().await, 0);
+        assert!(backend.remove_versions().await.is_empty());
     }
 
     #[cfg(feature = "test-util")]
