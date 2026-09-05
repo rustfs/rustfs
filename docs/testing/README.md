@@ -12,10 +12,10 @@ Pick the lowest layer that can prove the change; add a higher-layer test only wh
 |---|---|---|---|
 | Unit & crate integration | Per-crate logic and in-process integration tests | `cargo nextest run --all --exclude e2e_test` (or `-p <crate>`); `make test` wraps it | Every PR, required (`Test and Lint`, `ci` profile) |
 | ecstore black-box | Erasure-coded read/write/recovery validation; profiles `quick` / `full` / `destructive` / `fuzz` | `scripts/run_ecstore_validation_suite.sh --profile quick` | Local and release validation only; not wired into any workflow. Contract: [ecstore-validation-suite-design.md](ecstore-validation-suite-design.md) |
-| e2e (`e2e_test` crate) | A real `rustfs` binary per test, driven over the S3, admin, and protocol APIs | `cargo nextest run --profile e2e-smoke -p e2e_test` | PR: `e2e-smoke` (report-only); merge queue / main push: `e2e-full`; nightly: `e2e-repl-nightly`, `e2e-nightly`, `e2e-protocols`. Guide: [`crates/e2e_test/README.md`](../../crates/e2e_test/README.md) |
+| e2e (`e2e_test` crate) | A real `rustfs` binary per test, driven over the S3, admin, and protocol APIs | `cargo nextest run --profile e2e-smoke -p e2e_test` | PR: `e2e-smoke` (report-only); merge queue / main push: `e2e-full`; nightly: `e2e-repl-nightly`, `e2e-nightly`, `e2e-protocols`, `e2e-distributed`. Guide: [`crates/e2e_test/README.md`](../../crates/e2e_test/README.md); 4-node 4-disk map: [distributed-e2e.md](distributed-e2e.md) |
 | s3s-e2e conformance | External S3 conformance tool against a live server | `./scripts/e2e-run.sh ./target/debug/rustfs <data-dir>` | PR, report-only (second half of the `End-to-End Tests` job) |
 | S3 compatibility | `ceph/s3-tests` (boto3; allow-list `scripts/s3-tests/implemented_tests.txt`) and MinIO `mint` | `scripts/s3-tests/run.sh`; mint via `.github/workflows/mint.yml` | s3-tests: PR report-only plus a weekly full sweep; mint: weekly, report-only |
-| Chaos / fault-injection | Single-node disk fault injection (`crates/e2e_test/src/chaos.rs`, `crates/e2e_test/src/fault_proxy.rs`) used by the reliability and heal e2e modules | Part of the e2e crate (`e2e-reliability` test-group) | With the `e2e-full` and nightly e2e lanes. A multi-node power-loss harness is not in tree |
+| Chaos / fault-injection | Single-node disk fault injection (`crates/e2e_test/src/chaos.rs`, `crates/e2e_test/src/fault_proxy.rs`) plus the 4-node kill/fresh-drive/blackhole cases in `crates/e2e_test/src/distributed/chaos_test.rs` | Part of the e2e crate (`e2e-reliability` and `e2e-distributed`) | Reliability cases with `e2e-full`; 4-node chaos on storage-sensitive PRs and nightly via `e2e-distributed` |
 | Fuzz | `cargo-fuzz` targets over untrusted parsing surfaces; isolated sub-workspace under `fuzz/` | `./scripts/fuzz/run.sh` (see [`fuzz/README.md`](../../fuzz/README.md)) | PR smoke on the paths listed in `.github/workflows/fuzz.yml`, plus nightly corpus |
 | Benchmarks | Criterion benches under each crate's `benches/` | `cargo bench -p <crate>` | On demand; never a gate |
 
@@ -63,6 +63,7 @@ All profiles are defined in `.config/nextest.toml`; its block comments hold the 
 | `e2e-full` | Merge-queue / main-push single-node e2e lane |
 | `e2e-repl-nightly` | Nightly slow / cross-process replication lane |
 | `e2e-nightly` | Nightly serial multi-process cluster fault lane |
+| `e2e-distributed` | Storage-sensitive PR and nightly 4-node 4-disk S3 / lock / versioning / replication / quota / expand / decommission / rebalance / site-replication / chaos / upgrade (history + IAM AK/SK) lane |
 | `e2e-protocols` | Nightly fixed-port FTPS/SFTP/WebDAV lane, run with `-j 1` |
 
 Membership of each e2e profile is pinned by a digest in `.config/e2e-<profile>-selection.txt` and checked by `scripts/check_test_wiring.py --check-profile <profile>` before the lane runs. To list what a profile selects on your platform (the result is platform-dependent because some modules are linux-only):
