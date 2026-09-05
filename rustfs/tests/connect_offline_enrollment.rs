@@ -595,6 +595,25 @@ fn malformed_top_level_signature_precedes_malformed_first_link_routing() {
 }
 
 #[test]
+fn malformed_top_level_signature_precedes_malformed_second_link_envelope() {
+    let source = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let now = unix(field(&source, "evaluationTime"));
+    let mut challenge_envelope = source["document"].clone();
+    challenge_envelope["signature"]["algorithm"] = Value::String("ES384".to_string());
+
+    let mut challenge = signed_document(&challenge_envelope);
+    challenge["trustChain"].as_array_mut().expect("challenge carries a chain")[1]
+        .as_object_mut()
+        .expect("trust link envelope is an object")
+        .remove("signature");
+    challenge_envelope["bytes"] = Value::String(encoded_document(&challenge));
+
+    let error = OfflineEnrollment::verify_challenge(&envelope(&challenge_envelope), now)
+        .expect_err("a malformed top-level signature and second-link envelope must not verify");
+    assert_eq!(error.reason(), "SIGNATURE_MALFORMED");
+}
+
+#[test]
 fn unpinned_root_precedes_a_malformed_chain_shape() {
     let source = accept_vector_named("challenge signed by a chained signing key under the pinned root");
     let now = unix(field(&source, "evaluationTime"));

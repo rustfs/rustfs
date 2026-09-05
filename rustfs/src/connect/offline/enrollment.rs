@@ -286,7 +286,7 @@ struct DocumentSignature {
 struct ChallengeRouting {
     connect_key_id: String,
     issued_at: String,
-    trust_chain: Vec<SignedDocument>,
+    trust_chain: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -382,26 +382,33 @@ impl OfflineEnrollment {
         let issued_at = parse_timestamp(&routing.issued_at)?;
 
         // The frozen decision order classifies the top-level signature before
-        // parsing any trust-link routing fields. Otherwise a malformed first
-        // link could mask a malformed artifact signature with DOCUMENT_MALFORMED.
+        // parsing any trust-link envelope or routing fields. Otherwise a
+        // malformed link could mask a malformed artifact signature with
+        // DOCUMENT_MALFORMED.
         let signature = decode_signature(&envelope.signature)?;
 
         let first = routing.trust_chain.first().ok_or(EnrollmentError::MalformedDocument)?;
-        let first_bytes = decode_document_bytes(&first.bytes)?;
+        let first_bytes = first
+            .get("bytes")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(EnrollmentError::MalformedDocument)
+            .and_then(decode_document_bytes)?;
         let first_routing: TrustLinkRouting =
             serde_json::from_slice(&first_bytes).map_err(|_| EnrollmentError::MalformedDocument)?;
         if !is_key_id(&first_routing.issuer_key_id) {
             return Err(EnrollmentError::MalformedDocument);
         }
 
+        // The pinned-root decision precedes full chain-envelope validation.
+        if first_routing.issuer_key_id != root.key_id {
+            return Err(EnrollmentError::EnrollmentRootUnknown);
+        }
+        let trust_chain: Vec<SignedDocument> = serde_json::from_value(serde_json::Value::Array(routing.trust_chain))
+            .map_err(|_| EnrollmentError::TrustChainInvalid)?;
+
         // Steps 3 to 5.
-        let connect_key = verify_trust_chain(
-            &routing.trust_chain,
-            &routing.connect_key_id,
-            &first_routing.issuer_key_id,
-            issued_at,
-            root,
-        )?;
+        let connect_key =
+            verify_trust_chain(&trust_chain, &routing.connect_key_id, &first_routing.issuer_key_id, issued_at, root)?;
 
         // Step 6. The detached signature must name the same chained key whose
         // public key verifies it. A different well-formed key id is a signature
