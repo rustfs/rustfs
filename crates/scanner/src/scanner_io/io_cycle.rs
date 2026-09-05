@@ -72,6 +72,9 @@ where
         scan_mode,
         scan_scope: ScannerBucketScanScope::default(),
         persisted_usage_baseline: None,
+        requires_full_scan: true,
+        #[cfg(test)]
+        resolved_scope_observer: None,
     };
     nsscanner_with_storage_status_scoped(store, request).await
 }
@@ -85,6 +88,10 @@ pub(crate) struct ScannerCycleRequest {
     pub(crate) scan_mode: HealScanMode,
     pub(crate) scan_scope: ScannerBucketScanScope,
     pub(crate) persisted_usage_baseline: Option<Bytes>,
+    /// Scheduled maintenance must visit clean buckets even with a valid dirty scope.
+    pub(crate) requires_full_scan: bool,
+    #[cfg(test)]
+    pub(crate) resolved_scope_observer: Option<tokio::sync::oneshot::Sender<ScannerBucketScanScope>>,
 }
 
 struct ScannerBucketScopeResolution<'a> {
@@ -93,6 +100,7 @@ struct ScannerBucketScopeResolution<'a> {
     activity_before: &'a crate::scanner::ScannerActivitySnapshot,
     dirty_usage_snapshot: &'a DirtyUsageSnapshot,
     all_buckets: &'a [BucketInfo],
+    requires_full_scan: bool,
 }
 
 async fn resolve_scanner_bucket_scan_scope<S>(
@@ -103,6 +111,9 @@ async fn resolve_scanner_bucket_scan_scope<S>(
 where
     S: ScannerStorage,
 {
+    if resolution.requires_full_scan {
+        return ScannerBucketScanScope::default();
+    }
     if !resolution.requested_scope.is_default()
         || !resolution.dirty_usage_snapshot.covers_all_pending
         || resolution.dirty_usage_snapshot.generation == u64::MAX
@@ -172,6 +183,9 @@ where
         scan_mode,
         scan_scope,
         persisted_usage_baseline,
+        requires_full_scan,
+        #[cfg(test)]
+        resolved_scope_observer,
     } = request;
     let child_token = ctx.child_token();
     let _tier_cycle_guard = begin_tier_registry_cycle(want_cycle, leader_epoch);
@@ -260,13 +274,13 @@ where
         }
     }
     bucket_plan_complete &= buckets_by_source.keys().copied().collect::<HashSet<_>>() == *expected_sources;
-    let activity_digest = crate::scanner::scanner_activity_snapshot_digest(&activity_before);
-    let scan_plan_digest =
+    bucket_plan_complete &= scanner_bucket_inventory_is_complete(&all_buckets, &buckets_by_source);
+    let structural_scan_plan_digest =
         scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_structural_digest(&activity_before));
-    let mut execution_hasher = Sha256::new();
-    execution_hasher.update(scan_plan_digest.0);
-    execution_hasher.update(activity_digest);
-    let execution_digest = DataUsageScanPlanDigest(execution_hasher.finalize().into());
+    let scan_plan_digest = scanner_bucket_work_digest(structural_scan_plan_digest, scan_mode, requires_full_scan);
+    let activity_digest = crate::scanner::scanner_activity_snapshot_digest(&activity_before);
+    let bucket_coverage_digest = scanner_bucket_plan_digest(&all_buckets, activity_digest);
+    let execution_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
     let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets(&all_buckets, dirty_generation_before_bucket_list));
     let scan_scope = resolve_scanner_bucket_scan_scope(
         store,
@@ -278,14 +292,19 @@ where
                 expected_sources: &expected_sources,
                 leader_epoch,
                 want_cycle,
-                scan_plan_digest,
+                scan_plan_digest: structural_scan_plan_digest,
             },
             activity_before: &activity_before,
             dirty_usage_snapshot: &dirty_usage_snapshot,
             all_buckets: &all_buckets,
+            requires_full_scan: requires_full_scan || scan_mode == HealScanMode::Deep,
         },
     )
     .await;
+    #[cfg(test)]
+    if let Some(observer) = resolved_scope_observer {
+        let _ = observer.send(scan_scope.clone());
+    }
     let cache_cycle_floor = Arc::new(AtomicU64::new(want_cycle));
     let tier_registry = runtime_tier_registry_for_cycle(want_cycle, leader_epoch).await;
     let tier_registry_generation = tier_registry.generation;
@@ -415,7 +434,9 @@ where
             buckets: set_buckets,
             all_buckets: Arc::clone(&all_buckets),
             scope: scan_scope.clone(),
-            digest: scan_plan_digest,
+            digest: structural_scan_plan_digest,
+            bucket_coverage_digest,
+            requires_full_scan,
             execution_digest,
             leader_epoch,
             tier_registry_generation,
@@ -543,8 +564,17 @@ where
     let all_bucket_names = all_buckets.iter().map(|bucket| bucket.name.clone()).collect::<Vec<_>>();
     let completed_usage = completed_data_usage_info(
         &results,
-        &expected_sources,
-        &all_bucket_names,
+        &ScannerSnapshotScope {
+            sources: &expected_sources,
+            buckets: &all_bucket_names,
+            identity: ScannerSnapshotIdentity {
+                cycle: want_cycle,
+                leader_epoch,
+                plan_digest: scan_plan_digest,
+                coverage_digest: bucket_coverage_digest,
+                tier_registry_generation: Some(tier_registry_generation),
+            },
+        },
         &tier_registry.names,
         bucket_plan_complete,
         budget_elapsed,

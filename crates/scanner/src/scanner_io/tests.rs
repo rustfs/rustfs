@@ -126,6 +126,41 @@ async fn setup_two_pool_scanner_store() -> (tempfile::TempDir, Arc<ECStore>) {
 
 #[tokio::test]
 #[serial]
+async fn checkpoint_fixture_bucket_identity_uses_its_set_instance_owner() {
+    let (_first_dir, first) = setup_two_pool_scanner_store().await;
+    first
+        .make_bucket("checkpoint-identity", &MakeBucketOptions::default())
+        .await
+        .expect("first instance bucket");
+    let first_identity =
+        scanner_bucket_checkpoint_identity(&first.pools[0].disk_set[0], "checkpoint-identity", 0, 7, HealScanMode::Normal)
+            .await
+            .expect("first durable identity");
+    let (_second_dir, second) = setup_two_pool_scanner_store().await;
+    second
+        .make_bucket("checkpoint-identity", &MakeBucketOptions::default())
+        .await
+        .expect("second instance bucket");
+    let second_identity =
+        scanner_bucket_checkpoint_identity(&second.pools[0].disk_set[0], "checkpoint-identity", 0, 7, HealScanMode::Normal)
+            .await
+            .expect("second durable identity");
+    assert_ne!(first_identity.bucket_incarnation, second_identity.bucket_incarnation);
+    assert_eq!(
+        scanner_bucket_checkpoint_identity(&first.pools[0].disk_set[0], "checkpoint-identity", 0, 7, HealScanMode::Normal)
+            .await
+            .expect("first owner remains bound"),
+        first_identity
+    );
+    assert!(
+        scanner_bucket_checkpoint_identity(&first.pools[0].disk_set[0], "missing-checkpoint-bucket", 0, 7, HealScanMode::Normal)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn scanner_cache_locks_block_same_source_workers() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
     let set = &store.pools[0].disk_set[0];
@@ -280,6 +315,211 @@ async fn scanner_cycle_is_deferred_while_terminal_decommission_is_blocked() {
 
         assert_eq!(result.status, ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement));
         assert!(receiver.recv().await.is_none(), "blocked cycle must not publish usage");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work() {
+    let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+    clear_dirty_usage_buckets_for_tests();
+    for bucket in ["hot-bucket", "cold-bucket"] {
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = ScannerPutObjReader::from_vec(b"initial".to_vec());
+        store.pools[0].disk_set[0]
+            .put_object(bucket, "initial", &mut reader, &ScannerObjectOptions::default())
+            .await
+            .expect("initial object should persist");
+    }
+    let mut baseline = None;
+    for (index, (scan_mode, requires_full_scan, explicit_scope)) in [
+        (HealScanMode::Normal, true, false),
+        (HealScanMode::Normal, false, false),
+        (HealScanMode::Deep, false, false),
+        (HealScanMode::Normal, true, false),
+        (HealScanMode::Deep, false, true),
+        (HealScanMode::Normal, true, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            let mut reader = ScannerPutObjReader::from_vec(b"maintenance".to_vec());
+            store.pools[0].disk_set[0]
+                .put_object("cold-bucket", &format!("added-{index}"), &mut reader, &ScannerObjectOptions::default())
+                .await
+                .expect("cold bucket mutation should persist");
+            // Only the hot bucket is in the usage hint. The cold result must
+            // come from this cycle's storage walk, not its previous baseline.
+            record_dirty_usage_bucket("hot-bucket");
+        }
+        let requested_scope = if explicit_scope {
+            ScannerBucketScanScope::from_dirty_buckets(
+                HashSet::from(["hot-bucket".to_string()]),
+                DataUsageScanPlanDigest([7; 32]),
+            )
+        } else {
+            ScannerBucketScanScope::default()
+        };
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+        let (updates, mut receiver) = mpsc::channel(1);
+        let (observer, observed_scope) = tokio::sync::oneshot::channel();
+        let cycle = u64::try_from(index + 1).expect("test cycle should fit");
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            nsscanner_with_storage_status_scoped(
+                store.as_ref(),
+                ScannerCycleRequest {
+                    ctx,
+                    budget,
+                    updates,
+                    want_cycle: cycle,
+                    leader_epoch: 11,
+                    scan_mode,
+                    scan_scope: requested_scope,
+                    persisted_usage_baseline: baseline,
+                    requires_full_scan,
+                    resolved_scope_observer: Some(observer),
+                },
+            ),
+        )
+        .await
+        .expect("cycle should finish within the test deadline")
+        .expect("cycle should succeed");
+        assert_eq!(result.status, ScannerCycleStatus::Complete, "cycle {cycle}");
+        let resolved = observed_scope.await.expect("production resolver should report its scope");
+        if index == 1 {
+            assert_eq!(
+                resolved.selected_buckets.as_deref(),
+                Some(&HashSet::from(["hot-bucket".to_string()])),
+                "ordinary dirty work must retain the existing planner"
+            );
+        } else {
+            assert!(resolved.is_default(), "cycle {cycle} must visit the full maintenance scope");
+        }
+        let mut snapshot = receiver.recv().await.expect("cycle should publish a snapshot");
+        assert!(snapshot.usage_snapshot_complete, "cycle {cycle}");
+        assert_eq!(
+            snapshot.buckets_usage["cold-bucket"].objects_count,
+            u64::try_from(index + 1).expect("count should fit")
+        );
+        assert_eq!(snapshot.buckets_usage["hot-bucket"].objects_count, 1);
+        assert_eq!(snapshot.scanner_cycle, Some(cycle));
+        assert_eq!(snapshot.scanner_epoch, Some(11));
+        snapshot.usage_snapshot_converged = Some(true);
+        baseline = Some(Bytes::from(serde_json::to_vec(&snapshot).expect("complete baseline should encode")));
+    }
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[tokio::test]
+#[serial]
+async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure() {
+    for (scan_mode, requires_full_scan) in [
+        (HealScanMode::Normal, false),
+        (HealScanMode::Deep, false),
+        (HealScanMode::Normal, true),
+    ] {
+        let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+        clear_dirty_usage_buckets_for_tests();
+        for bucket in ["hot-bucket", "cold-bucket"] {
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            let mut reader = ScannerPutObjReader::from_vec(b"initial".to_vec());
+            store.pools[0].disk_set[0]
+                .put_object(bucket, "initial", &mut reader, &ScannerObjectOptions::default())
+                .await
+                .expect("initial object should persist");
+        }
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+        let (updates, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let failed = tokio::time::timeout(
+            Duration::from_secs(30),
+            nsscanner_with_storage_status_scoped(
+                store.as_ref(),
+                ScannerCycleRequest {
+                    ctx,
+                    budget,
+                    updates,
+                    want_cycle: 7,
+                    leader_epoch: 11,
+                    scan_mode: HealScanMode::Normal,
+                    scan_scope: ScannerBucketScanScope::default(),
+                    persisted_usage_baseline: None,
+                    requires_full_scan: false,
+                    resolved_scope_observer: None,
+                },
+            ),
+        )
+        .await
+        .expect("normal scan should finish")
+        .expect_err("root delivery must fail after bucket cache persistence");
+        assert!(failed.to_string().contains("receiver closed"), "{failed}");
+        let cache_name = path_join_buf(&["cold-bucket", DATA_USAGE_CACHE_NAME]);
+        let mut cached = DataUsageCache::default();
+        cached
+            .load(store.pools[0].disk_set[0].clone(), &cache_name)
+            .await
+            .expect("normal bucket cache should have committed");
+        assert!(cached.info.snapshot_complete);
+        assert_eq!(cached.info.next_cycle, 7);
+        assert_eq!(
+            cached
+                .checked_flatten("cold-bucket")
+                .expect("cached root should be valid")
+                .objects,
+            1
+        );
+
+        let mut reader = ScannerPutObjReader::from_vec(b"maintenance".to_vec());
+        store.pools[0].disk_set[0]
+            .put_object("cold-bucket", "new", &mut reader, &ScannerObjectOptions::default())
+            .await
+            .expect("new cold object should persist");
+        record_dirty_usage_bucket("hot-bucket");
+        if scan_mode == HealScanMode::Normal && !requires_full_scan {
+            record_dirty_usage_bucket("cold-bucket");
+        }
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+        let (updates, mut receiver) = mpsc::channel(1);
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            nsscanner_with_storage_status_scoped(
+                store.as_ref(),
+                ScannerCycleRequest {
+                    ctx,
+                    budget,
+                    updates,
+                    want_cycle: 7,
+                    leader_epoch: 11,
+                    scan_mode,
+                    scan_scope: ScannerBucketScanScope::default(),
+                    persisted_usage_baseline: None,
+                    requires_full_scan,
+                    resolved_scope_observer: None,
+                },
+            ),
+        )
+        .await
+        .expect("maintenance scan should finish")
+        .expect("maintenance scan should succeed");
+        assert_eq!(result.status, ScannerCycleStatus::Complete);
+        let snapshot = receiver.recv().await.expect("maintenance snapshot should be published");
+        assert_eq!(snapshot.scanner_cycle, Some(7));
+        assert_eq!(
+            snapshot.buckets_usage["cold-bucket"].objects_count, 2,
+            "{scan_mode:?}/full={requires_full_scan} must not replay the same-cycle Normal root"
+        );
+        clear_dirty_usage_buckets_for_tests();
     }
 }
 
@@ -893,6 +1133,7 @@ fn complete_set_usage_cache(buckets: &[(&str, usize)], scan_plan_digest: DataUsa
             source: Some(DataUsageCacheSource::new(1, 2)),
             snapshot_complete: true,
             scan_plan_digest: Some(scan_plan_digest),
+            scan_coverage_digest: Some(scan_plan_digest),
             cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
             tier_registry_generation: Some(13),
             ..Default::default()
@@ -1010,6 +1251,8 @@ async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers
             all_buckets: Arc::new(Vec::new()),
             scope: ScannerBucketScanScope::default(),
             digest: DataUsageScanPlanDigest([6; 32]),
+            bucket_coverage_digest: DataUsageScanPlanDigest([6; 32]),
+            requires_full_scan: false,
             execution_digest: empty_execution,
             leader_epoch: 11,
             tier_registry_generation: 13,
@@ -1139,6 +1382,36 @@ fn scoped_scan_selects_only_current_dirty_buckets_after_baseline_validation() {
     assert_ne!(scope.baseline_scan_plan_digest, Some(baseline_scan_plan_digest));
 }
 
+#[test]
+fn scoped_scan_baseline_work_proof_requires_uniform_known_set_identity() {
+    let source = DataUsageCacheSource::new(1, 2);
+    let second_source = DataUsageCacheSource::new(1, 3);
+    let sources = HashSet::from([source, second_source]);
+    let structural = DataUsageScanPlanDigest([9; 32]);
+    let full = scanner_bucket_work_digest(structural, HealScanMode::Normal, true);
+    let deep = scanner_bucket_work_digest(structural, HealScanMode::Deep, true);
+    let encoded = complete_usage_baseline(source, full, 7, 11);
+    let baseline: DataUsageInfo = serde_json::from_slice(&encoded).expect("baseline should decode");
+    for (second_plan, expected) in [(full, Some(full)), (deep, None), (DataUsageScanPlanDigest([8; 32]), None)] {
+        let mut candidate = baseline.clone();
+        let mut second = candidate.usage_snapshot_set_states[0].clone();
+        second.set_index = 3;
+        second.scan_plan_digest = Some(second_plan.0);
+        candidate.usage_snapshot_set_states.push(second);
+        let data = Bytes::from(serde_json::to_vec(&candidate).expect("candidate should encode"));
+        assert_eq!(
+            complete_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
+                data: Some(&data),
+                expected_sources: &sources,
+                leader_epoch: 11,
+                want_cycle: 8,
+                scan_plan_digest: structural,
+            }),
+            expected
+        );
+    }
+}
+
 fn peer_dirty_usage_snapshot(
     instance_id: &str,
     generation: u64,
@@ -1221,8 +1494,15 @@ fn verified_remote_dirty_usage_buckets_rejects_incomplete_or_stale_peer_state() 
     }
 }
 
+fn bucket_info_with_created_time(name: &str) -> BucketInfo {
+    BucketInfo {
+        created: Some(time::OffsetDateTime::UNIX_EPOCH),
+        ..bucket_info(name)
+    }
+}
+
 #[test]
-fn scoped_set_scan_preserves_unselected_usage_and_drops_deleted_buckets() {
+fn scoped_set_scan_rebuilds_selected_buckets_and_drops_deleted_buckets() {
     let baseline_digest = DataUsageScanPlanDigest([1; 32]);
     let current_digest = DataUsageScanPlanDigest([2; 32]);
     let mut old_cache = complete_set_usage_cache(&[("stable", 10), ("dirty", 20), ("deleted", 30)], baseline_digest);
@@ -1235,8 +1515,11 @@ fn scoped_set_scan_preserves_unselected_usage_and_drops_deleted_buckets() {
             ..Default::default()
         },
     );
-    let all_buckets = vec![bucket_info("stable"), bucket_info("dirty")];
-    let selected_buckets = Arc::new(HashSet::from(["dirty".to_string(), "deleted".to_string()]));
+    let all_buckets = vec![
+        bucket_info_with_created_time("stable"),
+        bucket_info_with_created_time("dirty"),
+    ];
+    let selected_buckets = Arc::new(HashSet::from(["stable".to_string(), "dirty".to_string(), "deleted".to_string()]));
 
     let prepared = prepare_scoped_set_scan(
         &old_cache,
@@ -1256,12 +1539,16 @@ fn scoped_set_scan_preserves_unselected_usage_and_drops_deleted_buckets() {
     )
     .expect("complete matching set cache should support a scoped scan");
 
-    assert_eq!(prepared.buckets.iter().map(|bucket| bucket.name.as_str()).collect::<Vec<_>>(), ["dirty"]);
+    assert_eq!(
+        prepared.buckets.iter().map(|bucket| bucket.name.as_str()).collect::<Vec<_>>(),
+        ["stable", "dirty"]
+    );
     let stable = prepared
         .cache
         .checked_flatten("stable")
-        .expect("unselected bucket subtree should be retained");
-    assert_eq!((stable.size, stable.objects), (15, 2));
+        .expect("selected bucket placeholder should exist");
+    assert_eq!((stable.size, stable.objects), (0, 0));
+    assert!(prepared.cache.find("stable/prefix").is_none());
     assert_eq!(prepared.cache.find("dirty").map(|entry| (entry.size, entry.objects)), Some((0, 0)));
     assert!(prepared.cache.find("deleted").is_none());
     assert_eq!(prepared.cache.info.scan_plan_digest, Some(current_digest));
@@ -1273,10 +1560,40 @@ fn scoped_set_scan_preserves_unselected_usage_and_drops_deleted_buckets() {
 }
 
 #[test]
+fn scoped_set_scan_rejects_unbound_bucket_incarnations() {
+    let baseline_digest = DataUsageScanPlanDigest([1; 32]);
+    let old_cache = complete_set_usage_cache(&[("stable", 10), ("dirty", 20)], baseline_digest);
+    let scope = ScannerBucketScanScope {
+        selected_buckets: Some(Arc::new(HashSet::from(["dirty".to_string()]))),
+        baseline_scan_plan_digest: Some(baseline_digest),
+    };
+    let generation = ScannerSetCacheGeneration {
+        want_cycle: 8,
+        leader_epoch: 11,
+        tier_registry_generation: 13,
+        source: DataUsageCacheSource::new(1, 2),
+        scan_plan_digest: DataUsageScanPlanDigest([2; 32]),
+    };
+    for created in [
+        None,
+        Some(OffsetDateTime::UNIX_EPOCH),
+        Some(OffsetDateTime::UNIX_EPOCH + time::Duration::days(1)),
+    ] {
+        let mut stable = bucket_info("stable");
+        stable.created = created;
+        let buckets = vec![stable, bucket_info_with_created_time("dirty")];
+        assert!(
+            prepare_scoped_set_scan(&old_cache, &buckets, &buckets, &scope, generation).is_none(),
+            "missing identity, volume timestamps and same-name recreation must all rebuild"
+        );
+    }
+}
+
+#[test]
 fn scoped_set_scan_falls_back_when_an_unselected_bucket_has_no_baseline() {
     let baseline_digest = DataUsageScanPlanDigest([3; 32]);
     let old_cache = complete_set_usage_cache(&[("stable", 10)], baseline_digest);
-    let all_buckets = vec![bucket_info("stable"), bucket_info("new")];
+    let all_buckets = vec![bucket_info_with_created_time("stable"), bucket_info_with_created_time("new")];
 
     assert!(
         prepare_scoped_set_scan(
@@ -1302,7 +1619,7 @@ fn scoped_set_scan_falls_back_when_an_unselected_bucket_has_no_baseline() {
 #[test]
 fn scoped_set_scan_requires_an_exact_complete_baseline() {
     let baseline_digest = DataUsageScanPlanDigest([5; 32]);
-    let all_buckets = vec![bucket_info("dirty")];
+    let all_buckets = vec![bucket_info_with_created_time("dirty")];
     let scope = ScannerBucketScanScope {
         selected_buckets: Some(Arc::new(HashSet::from(["dirty".to_string()]))),
         baseline_scan_plan_digest: Some(baseline_digest),
@@ -1323,6 +1640,10 @@ fn scoped_set_scan_requires_an_exact_complete_baseline() {
     not_durable.info.last_update = None;
     assert!(prepare_scoped_set_scan(&not_durable, &all_buckets, &all_buckets, &scope, generation).is_none());
 
+    let mut unscoped_usage = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);
+    unscoped_usage.cache.get_mut(DATA_USAGE_ROOT).expect("set root").objects = 1;
+    assert!(prepare_scoped_set_scan(&unscoped_usage, &all_buckets, &all_buckets, &scope, generation).is_none());
+
     let mut wrong_digest = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);
     wrong_digest.info.scan_plan_digest = Some(DataUsageScanPlanDigest([7; 32]));
     assert!(prepare_scoped_set_scan(&wrong_digest, &all_buckets, &all_buckets, &scope, generation).is_none());
@@ -1333,6 +1654,13 @@ fn scoped_set_scan_requires_an_exact_complete_baseline() {
     };
     let complete = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);
     assert!(prepare_scoped_set_scan(&complete, &all_buckets, &all_buckets, &empty_scope, generation).is_none());
+    assert!(prepare_scoped_set_scan(&complete, &all_buckets, &all_buckets, &scope, generation).is_some());
+
+    let unidentified_buckets = vec![bucket_info("dirty")];
+    assert!(
+        prepare_scoped_set_scan(&complete, &unidentified_buckets, &unidentified_buckets, &scope, generation).is_some(),
+        "fully selected buckets are rebuilt without reusing an unproven incarnation"
+    );
 
     let mut future_cache = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);
     future_cache.info.next_cycle = generation.want_cycle.saturating_add(1);

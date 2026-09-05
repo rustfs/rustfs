@@ -1086,6 +1086,12 @@ impl ScannerMaintenanceFeatures {
     fn needs_regular_cycle(self) -> bool {
         self.lifecycle || self.replication || self.inspection_failed
     }
+
+    fn requires_full_scan(self, observed_generation: Option<u64>, current_generation: u64, wake: ScannerCycleWakeReason) -> bool {
+        self.needs_regular_cycle()
+            || observed_generation != Some(current_generation)
+            || !matches!(wake, ScannerCycleWakeReason::DirtyUsage | ScannerCycleWakeReason::ClusterActivity)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1283,18 +1289,18 @@ async fn configure_scanner_defaults(
     ctx: &CancellationToken,
     storeapi: &Arc<impl ScannerStorage>,
 ) -> (ScannerMaintenanceFeatures, Option<u64>) {
+    let (features, maintenance_generation) = detect_stable_scanner_maintenance_features(ctx, storeapi)
+        .await
+        .unwrap_or_else(|| {
+            (
+                ScannerMaintenanceFeatures {
+                    inspection_failed: true,
+                    ..Default::default()
+                },
+                scanner_maintenance_generation(),
+            )
+        });
     if storeapi.setup_is_erasure_sd().await {
-        let (features, maintenance_generation) = detect_stable_scanner_maintenance_features(ctx, storeapi)
-            .await
-            .unwrap_or_else(|| {
-                (
-                    ScannerMaintenanceFeatures {
-                        inspection_failed: true,
-                        ..Default::default()
-                    },
-                    scanner_maintenance_generation(),
-                )
-            });
         // Single-disk keeps the speed-preset-derived default cycle (60s at the
         // `default` preset) instead of a special shorter cycle: no measured
         // cold-start ILM latency basis for an override, and clean-idle backoff
@@ -1319,7 +1325,7 @@ async fn configure_scanner_defaults(
     } else {
         set_scanner_default_speed(ScannerSpeed::Default);
         set_scanner_default_cycle_secs(None);
-        (ScannerMaintenanceFeatures::default(), None)
+        (features, Some(maintenance_generation))
     }
 }
 
@@ -1564,7 +1570,7 @@ where
     S: ScannerStorage,
 {
     let cycle_budget = ScannerCycleBudget::new(ctx, scanner_cycle_budget_config());
-    run_data_scanner_cycle_with_budget(ctx, storeapi, cycle_info, cycle_revision, leader_epoch, cycle_budget).await
+    run_data_scanner_cycle_with_budget(ctx, storeapi, cycle_info, cycle_revision, leader_epoch, cycle_budget, true).await
 }
 
 #[instrument(skip_all)]
@@ -1576,6 +1582,7 @@ async fn run_data_scanner_cycle_with_budget<S>(
     cycle_revision: &mut DataUsageCacheRevision,
     leader_epoch: u64,
     cycle_budget: Arc<ScannerCycleBudget>,
+    requires_full_scan: bool,
 ) -> ScannerCycleOutcome
 where
     S: ScannerStorage,
@@ -1714,6 +1721,9 @@ where
             scan_mode,
             scan_scope: crate::scanner_io::ScannerBucketScanScope::default(),
             persisted_usage_baseline: usage_persist_baseline.data.clone(),
+            requires_full_scan,
+            #[cfg(test)]
+            resolved_scope_observer: None,
         },
     )
     .await;
@@ -2574,10 +2584,7 @@ where
     let mut superseded_backoff = ScannerRetryBackoff::default();
     let mut deferred_backoff = ScannerRetryBackoff::default();
     let initial_runtime_config = resolve_scanner_runtime_config();
-    if clean_idle_topology_supported
-        && scanner_clean_idle_backoff_configured(&initial_runtime_config)
-        && maintenance_generation_seen.is_none()
-    {
+    if clean_idle_topology_supported && maintenance_generation_seen.is_none() {
         let Some((features, generation)) = detect_stable_scanner_maintenance_features(&ctx, &storeapi).await else {
             global_metrics().set_cycle(None).await;
             finish_scanner_leader_iteration(false, "stopped", String::new()).await;
@@ -2785,6 +2792,7 @@ where
                 &mut cycle_revision,
                 leader_epoch,
                 cycle_budget.clone(),
+                true,
             ),
             guard.lock_lost_notified(),
         )
@@ -2879,7 +2887,7 @@ where
         #[cfg(test)]
         notify_scanner_runtime_observed_for_test(&storeapi, pause_backlog_observation);
         let runtime_config = resolve_scanner_runtime_config();
-        if clean_idle_topology_supported && scanner_clean_idle_backoff_configured(&runtime_config) {
+        if clean_idle_topology_supported {
             let current_generation = scanner_maintenance_generation();
             if maintenance_generation_seen != Some(current_generation) {
                 scanner_activity_seen = None;
@@ -3075,6 +3083,11 @@ where
                 &mut cycle_revision,
                 leader_epoch,
                 cycle_budget.clone(),
+                maintenance_features.requires_full_scan(
+                    maintenance_generation_seen,
+                    scanner_maintenance_generation(),
+                    wake_reason,
+                ),
             ),
             guard.lock_lost_notified(),
         )
@@ -3132,10 +3145,7 @@ where
         let maintenance_config_changed =
             maintenance_generation_seen.is_some_and(|generation| generation != current_maintenance_generation);
         let retry_failed_inspection = maintenance_inspection_retry.retry_due(maintenance_features, wake_reason, Instant::now());
-        if clean_idle_topology_supported
-            && scanner_clean_idle_backoff_configured(&runtime_config)
-            && (maintenance_config_changed || retry_failed_inspection)
-        {
+        if clean_idle_topology_supported && (maintenance_config_changed || retry_failed_inspection) {
             let Some((features, generation)) = detect_stable_scanner_maintenance_features(&ctx, &storeapi).await else {
                 break;
             };

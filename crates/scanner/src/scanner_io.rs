@@ -183,6 +183,18 @@ fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<
         return None;
     }
 
+    // Completed maintenance also covers ordinary usage. Keep its exact stored
+    // proof for cache reuse, and reject mixtures of different set work proofs.
+    let baseline_plan_digest = DataUsageScanPlanDigest(baseline.usage_snapshot_set_states.first()?.scan_plan_digest?);
+    if ![
+        proof.scan_plan_digest,
+        scanner_bucket_work_digest(proof.scan_plan_digest, HealScanMode::Normal, true),
+        scanner_bucket_work_digest(proof.scan_plan_digest, HealScanMode::Deep, true),
+    ]
+    .contains(&baseline_plan_digest)
+    {
+        return None;
+    }
     let mut states = HashSet::with_capacity(baseline.usage_snapshot_set_states.len());
     for state in &baseline.usage_snapshot_set_states {
         let source = DataUsageCacheSource::new(usize::try_from(state.pool_index).ok()?, usize::try_from(state.set_index).ok()?);
@@ -192,13 +204,13 @@ fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<
             || state.tombstone
             || state.scanner_epoch != Some(proof.leader_epoch)
             || state.scanner_cycle.is_none_or(|cycle| cycle > proof.want_cycle)
-            || state.scan_plan_digest != Some(proof.scan_plan_digest.0)
+            || state.scan_plan_digest != Some(baseline_plan_digest.0)
         {
             return None;
         }
     }
 
-    (states == *proof.expected_sources).then_some(proof.scan_plan_digest)
+    (states == *proof.expected_sources).then_some(baseline_plan_digest)
 }
 
 fn scoped_scan_scope_from_dirty_buckets(
@@ -271,6 +283,9 @@ pub struct ScannerBucketScanPlan {
     all_buckets: Arc<Vec<BucketInfo>>,
     scope: ScannerBucketScanScope,
     digest: DataUsageScanPlanDigest,
+    /// Includes mutation generations even when the set planner uses a structural digest.
+    bucket_coverage_digest: DataUsageScanPlanDigest,
+    requires_full_scan: bool,
     // Cache work must invalidate on namespace completion even when its scoped baseline remains reusable.
     execution_digest: DataUsageScanPlanDigest,
     leader_epoch: u64,
@@ -311,6 +326,53 @@ fn scanner_bucket_plan_digest(buckets: &[BucketInfo], activity_digest: [u8; 32])
             None => hasher.update([0]),
         }
     }
+    DataUsageScanPlanDigest(hasher.finalize().into())
+}
+
+fn scanner_bucket_inventory_is_complete(
+    all_buckets: &[BucketInfo],
+    buckets_by_source: &HashMap<DataUsageCacheSource, Vec<BucketInfo>>,
+) -> bool {
+    let inventory = all_buckets
+        .iter()
+        .map(|bucket| (bucket.name.as_str(), bucket.created))
+        .collect::<HashMap<_, _>>();
+    if inventory.len() != all_buckets.len() || inventory.keys().any(|name| name.is_empty() || *name == DATA_USAGE_ROOT) {
+        return false;
+    }
+    let mut covered = HashSet::with_capacity(inventory.len());
+    for buckets in buckets_by_source.values() {
+        let mut set_names = HashSet::with_capacity(buckets.len());
+        for bucket in buckets {
+            if !set_names.insert(bucket.name.as_str()) || inventory.get(bucket.name.as_str()) != Some(&bucket.created) {
+                return false;
+            }
+            covered.insert(bucket.name.as_str());
+        }
+    }
+    covered.len() == inventory.len()
+}
+
+// Bind known work requirements before both local and remote cache admission.
+// Matching requirements remain reusable for the same intent; this is not a
+// new deadline or a durable generation for newly due maintenance.
+fn scanner_bucket_work_digest(
+    scan_plan_digest: DataUsageScanPlanDigest,
+    scan_mode: HealScanMode,
+    requires_full_scan: bool,
+) -> DataUsageScanPlanDigest {
+    if scan_mode == HealScanMode::Normal && !requires_full_scan {
+        return scan_plan_digest;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"scanner-bucket-work-v1");
+    hasher.update(scan_plan_digest.0);
+    hasher.update([match scan_mode {
+        HealScanMode::Unknown => 0,
+        HealScanMode::Normal => 1,
+        HealScanMode::Deep => 2,
+    }]);
+    hasher.update([u8::from(requires_full_scan || scan_mode == HealScanMode::Deep)]);
     DataUsageScanPlanDigest(hasher.finalize().into())
 }
 
@@ -709,6 +771,39 @@ pub(crate) async fn scanner_set_disk_inventory(set: &SetDisks) -> Vec<Arc<Disk>>
     disks.extend(membership.returning);
     disks.extend(membership.offline);
     disks
+}
+
+pub(crate) async fn scanner_bucket_checkpoint_identity(
+    set: &SetDisks,
+    bucket: &str,
+    publication_epoch: u64,
+    tier_registry_generation: u64,
+    scan_mode: HealScanMode,
+) -> Result<crate::DataUsageScanIdentity> {
+    let bucket_incarnation = set.bucket_incarnation_id_from_disk(bucket).await?;
+    let disks = set
+        .format
+        .erasure
+        .sets
+        .get(set.set_index)
+        .filter(|disks| !disks.is_empty())
+        .ok_or_else(|| Error::other("scanner checkpoint set layout is absent"))?;
+    if set.format.id.is_nil() || disks.iter().any(uuid::Uuid::is_nil) {
+        return Err(Error::other("scanner checkpoint set layout has a nil identity"));
+    }
+    let mut digest = Sha256::new();
+    digest.update(set.format.id.as_bytes());
+    for disk in disks {
+        digest.update(disk.as_bytes());
+    }
+    Ok(crate::DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation,
+        set_layout: crate::DataUsageScanPlanDigest(digest.finalize().into()),
+        publication_epoch,
+        tier_registry_generation,
+        scan_mode,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
