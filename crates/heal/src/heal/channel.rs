@@ -447,6 +447,7 @@ impl HealChannelProcessor {
                 progress,
                 next_seq,
                 min_seq,
+                ..
             }) => (
                 "running".to_string(),
                 None,
@@ -463,6 +464,7 @@ impl HealChannelProcessor {
                 progress,
                 next_seq,
                 min_seq,
+                ..
             }) => (
                 "running".to_string(),
                 Some(format!("heal task retrying after recoverable failure, attempt {retry_attempt}: {error}")),
@@ -479,6 +481,7 @@ impl HealChannelProcessor {
                 progress,
                 next_seq,
                 min_seq,
+                ..
             }) => (
                 "finished".to_string(),
                 None,
@@ -495,6 +498,7 @@ impl HealChannelProcessor {
                 progress,
                 next_seq,
                 min_seq,
+                ..
             }) => (
                 "stopped".to_string(),
                 Some("heal task cancelled".to_string()),
@@ -511,6 +515,7 @@ impl HealChannelProcessor {
                 progress,
                 next_seq,
                 min_seq,
+                ..
             }) => (
                 "stopped".to_string(),
                 Some("heal task timed out".to_string()),
@@ -527,6 +532,7 @@ impl HealChannelProcessor {
                 progress,
                 next_seq,
                 min_seq,
+                ..
             }) => (
                 "stopped".to_string(),
                 Some(error),

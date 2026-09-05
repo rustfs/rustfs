@@ -83,6 +83,7 @@ pub(super) struct CompletedHealStatus {
     pub(super) heal_type: HealType,
     pub(super) status: HealTaskStatus,
     pub(super) progress: Option<HealProgress>,
+    pub(super) outcome: Option<Arc<HealTaskOutcome>>,
     pub(super) retained_bytes: std::sync::OnceLock<usize>,
     pub(super) result_items_truncated: bool,
     pub(super) completed_at: SystemTime,
@@ -105,6 +106,7 @@ impl CompletedHealStatus {
     fn measure_retained_bytes(&self) -> usize {
         let mut bytes = size_of::<Self>();
         let mut add = |amount: usize| bytes = bytes.saturating_add(amount);
+        add(self.outcome.as_ref().map_or(0, |outcome| outcome.retained_bytes()));
         match &self.heal_type {
             HealType::Cluster => {}
             HealType::Bucket { bucket } => add(bucket.capacity()),
@@ -209,6 +211,7 @@ impl CompletedHealStatus {
             heal_type: task.heal_type.clone(),
             status,
             progress: Some(task.get_progress().await),
+            outcome: Some(Arc::new(task.get_outcome().await)),
             retained_bytes: std::sync::OnceLock::new(),
             result_items_truncated: task.result_items_truncated(),
             completed_at: SystemTime::now(),
