@@ -309,6 +309,16 @@ pub(crate) fn prequeue_site_replication_destructive_events_in_state(
             "destructive site replication bucket operation pending delivery",
             None,
         );
+        if let Some(event) = state
+            .retry_queue
+            .iter_mut()
+            .find(|event| retry_event_matches(event, peer, path))
+        {
+            // Zero is a durable reservation that has not yet crossed the
+            // local-delete commit point. A successful older delete must not
+            // settle it.
+            event.edit_generation = Some(0);
+        }
     }
     Ok(missing)
 }
@@ -321,13 +331,49 @@ pub(crate) fn settle_site_replication_destructive_retry_events(
     let Some(bucket) = retry_bucket_name(path) else {
         return 0;
     };
+    let Some(fence) = queue
+        .iter()
+        .find(|event| retry_event_matches(event, peer, path))
+        .and_then(|event| event.edit_generation)
+        .filter(|generation| *generation > 0)
+    else {
+        return 0;
+    };
     let before = queue.len();
     queue.retain(|event| {
-        !(retry_event_matches_peer(event, peer)
+        let within_fence = event
+            .edit_generation
+            .is_none_or(|generation| generation > 0 && generation <= fence);
+        let remove = within_fence
+            && retry_event_matches_peer(event, peer)
             && retry_event_is_destructive_bucket_op(event)
-            && retry_bucket_name(&event.path).as_deref() == Some(bucket.as_str()))
+            && retry_bucket_name(&event.path).as_deref() == Some(bucket.as_str());
+        !remove
     });
     before.saturating_sub(queue.len())
+}
+
+pub(crate) async fn commit_site_replication_destructive_events(peers: &[PeerInfo], path: &str) -> S3Result<()> {
+    let peers = peers.to_vec();
+    let path = path.to_string();
+    update_site_replication_state(move |state| {
+        let generation = next_peer_edit_generation(state);
+        for peer in &peers {
+            let event = state
+                .retry_queue
+                .iter_mut()
+                .find(|event| retry_event_matches(event, peer, &path))
+                .ok_or_else(|| {
+                    S3Error::with_message(
+                        S3ErrorCode::InternalError,
+                        "destructive site replication reservation is missing at local commit".to_string(),
+                    )
+                })?;
+            event.edit_generation = Some(generation);
+        }
+        Ok(())
+    })
+    .await
 }
 
 fn retry_event_matches_peer(event: &SiteReplicationRetryEvent, peer: &PeerInfo) -> bool {
@@ -885,17 +931,43 @@ pub(crate) async fn send_retry_task_if_peer_current(
     access_key: &str,
     secret_key: &str,
 ) -> S3Result<bool> {
-    let _bucket_op = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
-    let state = load_site_replication_state().await?;
-    let current = state
-        .peers
-        .get(&peer.deployment_id)
-        .is_some_and(|current| same_identity_endpoint(&current.endpoint, &peer.endpoint));
-    if !current {
-        return Ok(false);
+    let body = match task {
+        SiteReplicationRepairTask::Iam(item) => serde_json::to_value(item),
+        SiteReplicationRepairTask::BucketMetadata(item) => serde_json::to_value(item),
+        SiteReplicationRepairTask::BucketMake(_) | SiteReplicationRepairTask::Replication(_) => Ok(serde_json::json!({})),
     }
-    task.send(transport, access_key, secret_key).await?;
-    Ok(true)
+    .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize retry task failed: {err}")))?;
+    send_retry_request_if_peer_current(peer, transport, task.path(), access_key, secret_key, body).await
+}
+
+pub(crate) async fn send_retry_request_if_peer_current(
+    peer: &PeerInfo,
+    transport: &PeerTransport,
+    path: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: Value,
+) -> S3Result<bool> {
+    let peer = peer.clone();
+    let transport = transport.clone();
+    let path = path.to_string();
+    let access_key = access_key.to_string();
+    let secret_key = secret_key.to_string();
+    with_site_replication_state_read_lock(move |state| async move {
+        let current = state
+            .peers
+            .get(&peer.deployment_id)
+            .is_some_and(|current| same_identity_endpoint(&current.endpoint, &peer.endpoint));
+        if !current {
+            return Ok(false);
+        }
+        PeerAdminRequest::put(&transport.connection, &path, &access_key)
+            .with_client(&transport.client)
+            .send(&secret_key, &body)
+            .await?;
+        Ok(true)
+    })
+    .await
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -1670,28 +1742,22 @@ pub(crate) async fn drain_one_site_replication_retry_event(
             let edit_path = peer_edit_path_with_fence(local_deployment_id, generation);
             let delivery_fence = local_deployment_id.is_some().then_some(generation);
             for body in &bodies {
-                let _bucket_op = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
-                let current_state = load_site_replication_state().await?;
-                let current = current_state
-                    .peers
-                    .get(&peer.deployment_id)
-                    .is_some_and(|current| same_identity_endpoint(&current.endpoint, &peer.endpoint));
-                if !current {
-                    return Ok(false);
-                }
-                if let Err(err) = PeerAdminRequest::put(&transport.connection, &edit_path, access_key)
-                    .with_client(&transport.client)
-                    .send(secret_key, body)
-                    .await
-                {
-                    enqueue_site_replication_retry_event_for_generation(
-                        peer,
-                        SITE_REPLICATION_PEER_EDIT_PATH,
-                        &err,
-                        delivery_fence,
-                    )
-                    .await;
-                    return Err(err);
+                let body = serde_json::to_value(body).map_err(|err| {
+                    S3Error::with_message(S3ErrorCode::InternalError, format!("serialize retry peer edit failed: {err}"))
+                })?;
+                match send_retry_request_if_peer_current(peer, transport, &edit_path, access_key, secret_key, body).await {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(false),
+                    Err(err) => {
+                        enqueue_site_replication_retry_event_for_generation(
+                            peer,
+                            SITE_REPLICATION_PEER_EDIT_PATH,
+                            &err,
+                            delivery_fence,
+                        )
+                        .await;
+                        return Err(err);
+                    }
                 }
             }
             dequeue_site_replication_retry_event_for_generation(peer, SITE_REPLICATION_PEER_EDIT_PATH, delivery_fence).await;

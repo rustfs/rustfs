@@ -34,8 +34,8 @@
 //! Lock order: lifecycle -> bucket operation -> repair admission
 //! -> state object lock -> per-bucket metadata.
 
-use super::{S3Error, S3ErrorCode, S3Result};
-use crate::storage_api::site_replication::{ECStore, with_config_object_write_lock};
+use super::{S3Error, S3ErrorCode, S3Result, SiteReplicationState, load_site_replication_state_no_lock};
+use crate::storage_api::site_replication::{ECStore, with_config_object_read_lock, with_config_object_write_lock};
 use std::sync::Arc;
 
 use crate::runtime_sources::current_object_store_handle;
@@ -55,6 +55,25 @@ where
 {
     let store = current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
     with_site_replication_state_lock_on(store, operation).await
+}
+
+/// Hold the distributed state-object read lock while `operation` validates a
+/// topology snapshot and performs one bounded side effect. Topology writers
+/// use the matching write lock through [`with_site_replication_state_lock`].
+pub(crate) async fn with_site_replication_state_read_lock<T, F, Fut>(operation: F) -> S3Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(SiteReplicationState) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = S3Result<T>> + Send + 'static,
+{
+    let store = current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init"))?;
+    let read_store = store.clone();
+    with_config_object_read_lock(store, SITE_REPLICATION_STATE_PATH.to_string(), move || async move {
+        let state = load_site_replication_state_no_lock(read_store).await?;
+        operation(state).await
+    })
+    .await
+    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("lock site replication state failed: {e}")))?
 }
 
 /// Context-store variant for callers that resolve their store from an

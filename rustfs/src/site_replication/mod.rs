@@ -47,6 +47,7 @@ use self::identity::{
     canonical_endpoint, deployment_id_for_endpoint, mark_unknown_peer_sync_enabled, normalize_peer_map_by_identity_with,
     same_identity_endpoint,
 };
+pub(crate) use self::state_lock::with_site_replication_state_read_lock;
 use self::state_lock::{SITE_REPLICATION_STATE_PATH, with_site_replication_state_lock};
 use crate::auth::constant_time_eq;
 use crate::config::get_config_snapshot;

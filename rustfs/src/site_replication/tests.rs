@@ -865,29 +865,48 @@ fn test_destructive_bucket_op_prequeue_does_not_evict_existing_liability() {
 #[test]
 fn test_destructive_success_settles_equivalent_bucket_intents() {
     let peer = peer("remote", "https://remote.example.com");
-    let failed = drain_event(
+    let mut failed = drain_event(
         "remote",
         "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket&retryIntent=a",
         1,
         None,
     );
-    let current = drain_event(
+    let mut current = drain_event(
         "remote",
         "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=force-delete-bucket&retryIntent=b",
         1,
         None,
     );
-    let unrelated = drain_event(
+    let mut later = drain_event(
         "remote",
-        "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=videos&operation=delete-bucket&retryIntent=c",
+        "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket&retryIntent=c",
         1,
         None,
     );
-    let mut queue = vec![failed, current.clone(), unrelated.clone()];
+    let unrelated = drain_event(
+        "remote",
+        "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=videos&operation=delete-bucket&retryIntent=d",
+        1,
+        None,
+    );
+    let mut uncommitted = drain_event(
+        "remote",
+        "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket&retryIntent=e",
+        1,
+        None,
+    );
+    failed.edit_generation = None;
+    current.edit_generation = Some(2);
+    later.edit_generation = Some(3);
+    uncommitted.edit_generation = Some(0);
+    let mut queue = vec![failed, current.clone(), later.clone(), uncommitted.clone(), unrelated.clone()];
 
     assert_eq!(settle_site_replication_destructive_retry_events(&mut queue, &peer, &current.path), 2);
-    assert_eq!(queue.len(), 1);
-    assert_eq!(queue[0].id, unrelated.id);
+    assert_eq!(queue.len(), 3);
+    assert_eq!(
+        queue.iter().map(|event| event.id.as_str()).collect::<Vec<_>>(),
+        vec![later.id, uncommitted.id, unrelated.id]
+    );
 }
 
 #[test]

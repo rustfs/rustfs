@@ -433,6 +433,12 @@ pub(crate) struct SiteReplicationDeleteBucketIntent {
     path: String,
 }
 
+impl SiteReplicationDeleteBucketIntent {
+    pub(crate) fn topology_updated_at(&self) -> Option<OffsetDateTime> {
+        self.runtime.state.updated_at
+    }
+}
+
 pub(crate) async fn prepare_site_replication_delete_bucket_hook(
     bucket: &str,
     force_delete: bool,
@@ -479,6 +485,10 @@ pub(crate) async fn cancel_site_replication_delete_bucket_hook(intent: &SiteRepl
     for peer in &intent.reserved_peers {
         dequeue_site_replication_retry_event(peer, &intent.path).await;
     }
+}
+
+pub(crate) async fn commit_site_replication_delete_bucket_hook(intent: &SiteReplicationDeleteBucketIntent) -> S3Result<()> {
+    commit_site_replication_destructive_events(&intent.peers, &intent.path).await
 }
 
 pub(crate) async fn finish_site_replication_delete_bucket_hook(intent: SiteReplicationDeleteBucketIntent) -> S3Result<()> {

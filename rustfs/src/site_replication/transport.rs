@@ -331,6 +331,7 @@ pub(crate) fn runtime_peer_connection(peer: &PeerInfo) -> S3Result<PeerConnectio
     })
 }
 
+#[derive(Clone)]
 pub(crate) struct PeerTransport {
     pub(crate) connection: PeerConnection,
     pub(crate) client: reqwest::Client,
