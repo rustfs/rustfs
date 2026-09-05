@@ -208,6 +208,7 @@ const EVENT_PEER_ADDR_UNAVAILABLE: &str = "peer_addr_unavailable";
 const EVENT_RPC_SIGNATURE_VERIFICATION_FAILED: &str = "rpc_signature_verification_failed";
 const EVENT_GRPC_TRACE_CONTEXT_PROPAGATION_FAILED: &str = "grpc_trace_context_propagation_failed";
 const HEAL_CONTROL_TONIC_RPC_PATH: &str = "/node_service.HealControlService/HealControl";
+const SCANNER_SCOPED_DIRTY_USAGE_ACK_TONIC_RPC_PATH: &str = "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck";
 const TIER_MUTATION_PREPARE_TONIC_RPC_PATH: &str = "/node_service.TierMutationControlService/PrepareTierMutation";
 const TIER_MUTATION_COMMIT_TONIC_RPC_PATH: &str = "/node_service.TierMutationControlService/CommitTierMutation";
 const TIER_MUTATION_ABORT_TONIC_RPC_PATH: &str = "/node_service.TierMutationControlService/AbortTierMutation";
@@ -1856,6 +1857,7 @@ fn process_connection(
         );
         let rpc_service = RpcRequestPathService::new(
             Routes::new(node_service)
+                .add_service(InterceptedService::new(storage::tonic_service::make_scanner_control_server(), check_auth))
                 .add_service(heal_control_service)
                 .add_service(tier_mutation_control_service)
                 .prepare(),
@@ -2259,6 +2261,7 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
         .strip_prefix(TONIC_RPC_PREFIX)
         .and_then(|suffix| suffix.strip_prefix('/'))
         .or_else(|| (target.uri.path() == HEAL_CONTROL_TONIC_RPC_PATH).then_some("HealControl"))
+        .or_else(|| (target.uri.path() == SCANNER_SCOPED_DIRTY_USAGE_ACK_TONIC_RPC_PATH).then_some("ScannerScopedDirtyUsageAck"))
         .or_else(|| (target.uri.path() == TIER_MUTATION_PREPARE_TONIC_RPC_PATH).then_some("PrepareTierMutation"))
         .or_else(|| (target.uri.path() == TIER_MUTATION_COMMIT_TONIC_RPC_PATH).then_some("CommitTierMutation"))
         .or_else(|| (target.uri.path() == TIER_MUTATION_ABORT_TONIC_RPC_PATH).then_some("AbortTierMutation"))
@@ -3425,6 +3428,50 @@ mod tests {
         );
 
         rustfs_common::set_global_local_node_name(&previous_node_name).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn scoped_dirty_usage_peer_probe_reaches_handler_through_production_auth() {
+        let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind scoped ACK auth test");
+        let addr = listener.local_addr().expect("listener address");
+        let previous_node_name = rustfs_common::get_global_local_node_name().await;
+        rustfs_common::set_global_local_node_name(&addr.to_string()).await;
+        let node = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
+        let scanner = InterceptedService::new(storage::tonic_service::make_scanner_control_server(), check_auth);
+        let service = RpcRequestPathService::new(Routes::new(node).add_service(scanner).prepare());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept test connection");
+            ConnBuilder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                .await
+                .expect("serve scoped ACK auth test");
+        });
+        let host = rustfs_utils::XHost::try_from(addr.to_string()).expect("peer address");
+        let client = storage::PeerRestClient::new(host, format!("http://{addr}"));
+        let result = client
+            .scanner_scoped_dirty_usage_capability(
+                "11111111-1111-1111-1111-111111111111".to_string(),
+                "a".repeat(32),
+                vec![rustfs_protos::proto_gen::node_service::ScannerScopedDirtyUsageEntry {
+                    bucket: "photos".into(),
+                    bucket_incarnation: vec![1; 16].into(),
+                    generation: 8,
+                }],
+            )
+            .await;
+        client.evict_connection().await;
+        server.abort();
+        let _ = server.await;
+        rustfs_common::set_global_local_node_name(&previous_node_name).await;
+        let error = result
+            .expect_err("probe must fail closed without the requested storage owner")
+            .to_string();
+        assert!(
+            error.contains("storage layer is not initialized") || error.contains("scoped dirty usage peer or process changed"),
+            "signed probe must pass production path authentication and reach owner validation: {error}"
+        );
     }
 
     #[tokio::test]

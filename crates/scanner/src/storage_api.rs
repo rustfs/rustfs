@@ -38,8 +38,8 @@ pub(crate) use rustfs_ecstore::api::bucket::lifecycle::lifecycle::object_opts_fr
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys as ecstore_init_bucket_metadata_sys;
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
-    get_lifecycle_config as ecstore_get_lifecycle_config, get_object_lock_config as ecstore_get_object_lock_config,
-    get_replication_config as ecstore_get_replication_config,
+    BucketMetadataMutationGuard as EcstoreBucketMetadataMutationGuard, get_lifecycle_config as ecstore_get_lifecycle_config,
+    get_object_lock_config as ecstore_get_object_lock_config, get_replication_config as ecstore_get_replication_config,
 };
 pub(crate) use rustfs_ecstore::api::bucket::replication::{
     ReplicateObjectInfo, ReplicationConfig as EcstoreReplicationConfig,
