@@ -276,6 +276,7 @@ rcgen = { workspace = true }
 # Async Runtime and Networking
 async-trait = { workspace = true }
 axum.workspace = true
+faster-hex.workspace = true
 futures.workspace = true
 futures-lite.workspace = true
 futures-util.workspace = true
