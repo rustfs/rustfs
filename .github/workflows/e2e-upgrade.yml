@@ -78,6 +78,10 @@ jobs:
             cache_key: e2e-bucket-config-rollback
             test: rollback_to_previous_release_reads_current_bucket_metadata
             artifact: bucket-config-rollback
+          - name: ODM configuration recovery after rc.5 rollback
+            cache_key: e2e-odm-config-rollback
+            test: rc5_rollback_requires_restoring_odm_configuration
+            artifact: odm-config-rollback
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:

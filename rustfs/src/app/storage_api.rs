@@ -28,11 +28,15 @@ pub(crate) fn EndpointServerPools(
 /// the direct s3s surface (s3s footprint ratchet, `scripts/check_s3s_footprint.sh`).
 pub(crate) mod s3 {
     #[cfg(test)]
+    pub(crate) use s3s::dto::ListObjectsInput;
+    #[cfg(test)]
     pub(crate) use s3s::dto::{
         BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ListObjectsV2Input,
         ListObjectsV2Output, ReplicationConfiguration, ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus,
         ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, VersioningConfiguration,
     };
+    #[cfg(test)]
+    pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
     #[cfg(test)]
     pub(crate) use s3s::{S3Request, S3Response};
@@ -628,26 +632,6 @@ pub(crate) mod bucket {
         }
     }
 
-    pub(crate) mod on_demand_migration {
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::source_client::{
-            SourceClient, SourceError, SourceGet, SourceHead, SourceListRequest, SourceObject, SourcePage,
-        };
-        #[cfg(test)]
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
-            BREAKER_FAILURE_THRESHOLD, BreakerState, FilterConfig, MAX_LIST_NO_PROGRESS_PAGES, OnDemandMigrationConfig,
-            PathStyle, Provider, SourceConfig, SourceCredentials, TlsConfig,
-        };
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
-            BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OdmStateError, OnDemandMigrationSys, PolicyConfig,
-            PullError, PullLeader, PullOutcome, PullReason, PullSlot, RangeGetPolicy, SourceBody, SourceErrorPolicy,
-            commit_inline, idle_guarded_body,
-        };
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
-            ListEntryKey, ListPageError, ListThroughCursor, ListThroughMerger, ListThroughToken, ListThroughTokenError,
-            MergeSide, SOURCE_LIST_MAX_RATE_WAIT, SourceListPlan, decode_continuation_token, source_list_plan,
-        };
-    }
-
     pub(crate) mod policy_sys {
         pub(crate) type PolicySys = crate::storage::storage_api::ecstore_bucket::policy_sys::PolicySys;
     }
@@ -1180,19 +1164,6 @@ pub(crate) mod bucket_usecase {
 
 pub(crate) mod object_usecase {
     pub(crate) use super::storage_contracts::BUCKET_LIFECYCLE_LOCK_OBJECT;
-
-    pub(crate) mod on_demand_migration {
-        #[cfg(test)]
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::PullFailureReason;
-        #[cfg(test)]
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::source_client::SourceSse;
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::source_client::{
-            SourceHead, is_multipart_etag,
-        };
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
-            LocalObject, OdmWriteBack, WriteBackBody, WriteBackError, WriteBackOutcome, WriteBackPart, WriteBackRequest,
-        };
-    }
 
     pub(crate) mod object_cache {
         #[cfg(test)]

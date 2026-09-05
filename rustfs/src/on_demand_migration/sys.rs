@@ -19,7 +19,7 @@
 //! [`SourceClient`], a circuit breaker, a negative cache, a per-key
 //! singleflight table, a pull concurrency limit and counters. Its lifecycle
 //! follows the bucket metadata cache through the publish hook registered in
-//! [`ON_DEMAND_MIGRATION_CONFIG_HOOK`]; the hook fires on every cache install
+//! [`BUCKET_CONFIG_PUBLISH_HOOK`]; the hook fires on every cache install
 //! path (initial load, admin update, peer reload, refresh loop, lazy load).
 //!
 //! Change detection compares the config by value (`PartialEq`) rather than
@@ -41,9 +41,7 @@
 
 use super::backfill::{PriorityPullPermits, PullPermit, PullPriority};
 use super::breaker::{Breaker, BreakerState, BreakerTransition, BreakerVerdict};
-use super::config::{
-    ON_DEMAND_MIGRATION_CONFIG_HOOK, OnDemandMigrationConfig, PathStyle as ConfigPathStyle, Provider, SourceConfig,
-};
+use super::config::{OnDemandMigrationConfig, PathStyle as ConfigPathStyle, Provider, SourceConfig};
 use super::list_through::{SOURCE_LIST_RATE_PER_SEC, SourceListRateLimiter};
 use super::negative_cache::NegativeCache;
 use super::pull::{OdmWriteBack, PullQueue};
@@ -52,9 +50,10 @@ use super::source_client::{
     SourceTimeouts,
 };
 use super::stats::{GaugeGuard, OdmStats, OdmStatsSnapshot, PullFailureReason};
-use crate::bucket::remote_s3_client::{
+use super::storage_api::remote_s3_client::{
     PathStyle as ClientPathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3RetryPolicy,
 };
+use super::storage_api::{BUCKET_CONFIG_PUBLISH_HOOK, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -740,9 +739,32 @@ impl OnDemandMigrationSys {
     /// Registers `publish` as the bucket-metadata publish hook. Returns
     /// `false` when a hook was already registered.
     pub fn register_config_hook(&'static self) -> bool {
-        ON_DEMAND_MIGRATION_CONFIG_HOOK
-            .set(Box::new(move |bucket, config| self.publish(bucket, config)))
+        BUCKET_CONFIG_PUBLISH_HOOK
+            .set(Box::new(move |bucket, config_file, stored| {
+                if config_file == BUCKET_ON_DEMAND_MIGRATION_CONFIG {
+                    self.publish_stored(bucket, stored.map(|(bytes, _)| bytes));
+                }
+            }))
             .is_ok()
+    }
+
+    /// Corrupt persisted bytes withdraw state synchronously, just like deletion.
+    fn publish_stored(&'static self, bucket: &str, stored: Option<&[u8]>) {
+        match stored.map(OnDemandMigrationConfig::from_json).transpose() {
+            Ok(config) => self.publish(bucket, config.as_ref()),
+            Err(err) => {
+                warn!(
+                    event = EVENT_ODM_BUCKET_STATE_APPLIED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_ON_DEMAND_MIGRATION,
+                    result = "invalid",
+                    bucket = %bucket,
+                    error = %err,
+                    "Failed to parse on-demand migration config"
+                );
+                self.publish(bucket, None);
+            }
+        }
     }
 
     /// Hook entry point: removals apply immediately, installs are spawned
@@ -951,8 +973,8 @@ impl OnDemandMigrationSys {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bucket::on_demand_migration::breaker::BREAKER_FAILURE_THRESHOLD;
-    use crate::bucket::on_demand_migration::config::{FilterConfig, PolicyConfig, SourceCredentials, SourceTimeout, TlsConfig};
+    use crate::on_demand_migration::breaker::BREAKER_FAILURE_THRESHOLD;
+    use crate::on_demand_migration::config::{FilterConfig, PolicyConfig, SourceCredentials, SourceTimeout, TlsConfig};
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::Barrier;
 
@@ -1342,6 +1364,17 @@ mod tests {
         sys.publish("p", None);
         assert!(sys.state("p").is_none(), "removal is synchronous");
         assert!(state.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn corrupt_stored_config_withdraws_runtime_state() {
+        let sys: &'static OnDemandMigrationSys = Box::leak(Box::new(enabled_sys()));
+        let cfg = config(None);
+        assert_eq!(sys.apply("corrupt", Some(&cfg)).await, ApplyOutcome::Installed);
+        let state = sys.state("corrupt").expect("state installed");
+        sys.publish_stored("corrupt", Some(b"not-json"));
+        assert!(sys.state("corrupt").is_none(), "corruption cannot keep an older source active");
+        assert!(state.is_cancelled(), "corruption cancels in-flight work");
     }
 
     #[tokio::test]

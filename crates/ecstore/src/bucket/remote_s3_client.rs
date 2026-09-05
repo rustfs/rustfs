@@ -283,9 +283,7 @@ impl Intercept for UserAgentSuffixInterceptor {
 
 /// Builds the SDK config for `spec` without finalizing it, so callers can add
 /// interceptors or (in tests) swap the HTTP client before `build()`.
-pub(crate) async fn build_remote_s3_config(
-    spec: &RemoteS3EndpointSpec,
-) -> Result<aws_sdk_s3::config::Builder, RemoteS3ClientError> {
+pub async fn build_remote_s3_config(spec: &RemoteS3EndpointSpec) -> Result<aws_sdk_s3::config::Builder, RemoteS3ClientError> {
     let Some(credentials) = &spec.credentials else {
         return Err(RemoteS3ClientError::MissingCredentials);
     };
@@ -525,7 +523,7 @@ fn validate_ca_pem_bundle(ca_cert_pem: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn validate_target_ca_pem(ca_cert_pem: &str) -> Result<(), RemoteS3ClientError> {
+pub fn validate_target_ca_pem(ca_cert_pem: &str) -> Result<(), RemoteS3ClientError> {
     validate_ca_pem_bundle(ca_cert_pem.as_bytes()).map_err(RemoteS3ClientError::InvalidCaPem)
 }
 
