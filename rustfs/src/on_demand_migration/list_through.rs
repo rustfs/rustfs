@@ -1089,10 +1089,17 @@ mod tests {
 
     #[test]
     fn progress_tokens_preserve_v1_bytes_and_validate_v2_counts() {
+        fn framed(payload: &str) -> String {
+            format!("{LIST_THROUGH_TOKEN_PREFIX}{payload}")
+        }
+
         let token = progress_token(None, true, false);
         assert_eq!(
             token.encode(),
-            r#"{"t":"odm-list","v":1,"local":null,"local_done":true,"source":"A","source_done":false,"last_key":"last-key"}"#
+            concat!(
+                "\0odm-list:",
+                r#"{"t":"odm-list","v":1,"local":null,"local_done":true,"source":"A","source_done":false,"last_key":"last-key"}"#
+            )
         );
         for count in 1..MAX_LIST_NO_PROGRESS_PAGES {
             let token = progress_token(Some(count), true, false);
@@ -1100,16 +1107,17 @@ mod tests {
         }
         for version in [1, 2] {
             for value in ["null", "0", "16", "-1", "1.5", "256", "18446744073709551616", "\"1\""] {
-                let encoded = format!(r#"{{"t":"odm-list","v":{version},"no_progress":{value}}}"#);
+                let encoded = framed(&format!(r#"{{"t":"odm-list","v":{version},"no_progress":{value}}}"#));
                 assert_eq!(decode_continuation_token(&encoded), Err(ListThroughTokenError::Malformed), "{encoded}");
             }
         }
-        for encoded in [
+        for payload in [
             r#"{"t":"odm-list","v":1,"no_progress":1}"#,
             r#"{"t":"odm-list","v":2}"#,
             r#"{"t":"odm-list","v":2,"no_progress":1,"extra":true}"#,
         ] {
-            assert_eq!(decode_continuation_token(encoded), Err(ListThroughTokenError::Malformed), "{encoded}");
+            let encoded = framed(payload);
+            assert_eq!(decode_continuation_token(&encoded), Err(ListThroughTokenError::Malformed), "{encoded}");
         }
     }
 

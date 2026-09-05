@@ -84,3 +84,41 @@ The server-config model (`Config`, `KV`, `KVS`) and the global server-config sna
 ## Required Architecture Documents
 
 The guard requires the documents and section headings listed in its `require_source_contains` entries (`scripts/check_architecture_migration_rules.sh`); the directory index is [README.md](README.md).
+
+## On-Demand Migration Service
+
+Read-through, backfill and external pull orchestration belong in an application
+service under `rustfs/src/<service>/`. ECStore owns the storage primitives they
+need, including atomic commits, lifecycle locks and on-disk metadata. A service
+may use these primitives without moving its provider clients or scheduling
+policy into the engine.
+
+`rustfs/src/on_demand_migration/` owns source clients, pull scheduling, list
+merging, runtime state and backfill orchestration. Its `storage_api.rs` is the
+only ECStore facade boundary. Object write-back still enters the application's
+internal PUT and multipart use cases, including the atomic create-only commit,
+delete-marker protection, encryption, quota and notification rules.
+
+ECStore stores the existing ODM bytes and update timestamp without interpreting
+the JSON. Every metadata cache install or removal publishes those bytes through
+`BUCKET_CONFIG_PUBLISH_HOOK`; the application decodes them and synchronously
+withdraws corrupt configurations. Configuration writes validate structure and
+deployment constraints in the admin use case before the incarnation-fenced
+metadata update. Backfill reads metadata from its store's instance context and
+preserves the checkpoint ETag compare-and-set, lease and tail-drained writes.
+
+An ODM runtime is bound to the bucket incarnation published with its metadata,
+not just its name. Source reads and write-back reject a different incarnation.
+Checkpoint writes hold the user bucket's lifecycle fence through their complete
+commit and read-back, even if their caller stops waiting; the storage commit
+also observes lock loss. Deleting and recreating a bucket must not let work for
+its previous incarnation repopulate objects or checkpoints.
+
+Observability owns its metric DTOs and accepts application snapshot callbacks;
+it does not depend on the ODM runtime. The application registers both bucket
+and backfill snapshots during startup, before metadata and metric collection.
+
+This boundary does not change `.metadata.bin`, the ODM wire format or the
+backfill checkpoint format. An older binary may still discard unknown metadata
+fields when it rewrites a bucket; service relocation does not make mixed-version
+configuration writes or rollback preserve ODM configuration.
