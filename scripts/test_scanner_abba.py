@@ -76,8 +76,15 @@ def fake_adapter():
             result["convergence"]["walk_objects"] = 121
         elif fault == "latency-regression" and request["leg"].startswith("B"):
             result["metrics"]["p99_ms"] = 12
+        elif fault == "exact-thresholds" and request["leg"].startswith("B"):
+            result["metrics"].update(p99_ms=10.5, throughput_ops=97)
+        elif fault == "just-over-threshold" and request["comparison"] == "build" and request["leg"].startswith("B"):
+            result["metrics"]["p99_ms"] = 10.500001
         elif fault == "p1-regression" and not baseline:
             result["metrics"]["walk_objects"] = 30
+        elif fault in ("p1-exact-fraction", "p1-over-fraction"):
+            result["metrics"].update(walk_objects=9 if baseline else 5 + (fault == "p1-over-fraction"),
+                                     cold_walk_objects=5 if baseline else 0)
         elif fault == "missing-metric":
             del result["metrics"]["save_bytes"]
         elif fault == "incomplete-repair":
@@ -284,6 +291,21 @@ class ScannerAbbaTest(unittest.TestCase):
                 self.root = Path(directory)
                 with patch.object(harness, "SCENARIOS", ("cold-hot",)):
                     self.assertEqual(self.run_harness(fault), 1)
+
+    def test_exact_threshold_boundaries_pass(self):
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)):
+            self.assertEqual(self.run_harness("exact-thresholds"), 0)
+
+    def test_just_over_threshold_fails(self):
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)):
+            self.assertEqual(self.run_harness("just-over-threshold"), 1)
+
+    def test_p1_fractional_boundary(self):
+        for fault, expected in (("p1-exact-fraction", 0), ("p1-over-fraction", 1)):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                self.root = Path(directory)
+                with patch.object(harness, "SCENARIOS", ("cold-hot",)):
+                    self.assertEqual(self.run_harness(fault), expected)
 
     def test_manifest_rejects_missing_build_or_oracle(self):
         for section, key in (("baseline", "binary"), ("oracles", "cold-hot")):

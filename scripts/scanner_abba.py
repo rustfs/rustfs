@@ -2,6 +2,7 @@
 """Run isolated scanner/heal ABBA cells through a deployment-specific adapter."""
 
 import argparse
+from decimal import Decimal
 import hashlib
 import json
 import math
@@ -22,6 +23,8 @@ METRICS = (
     "cache_clone_bytes", "encode_bytes", "save_bytes", "oldest_age_seconds",
     "walk_objects", "cold_walk_objects", "healed_objects", "errors", "requests",
 )
+REPEATABILITY_LIMIT = Decimal("0.05")
+P2_WORK_MULTIPLE_LIMIT = Decimal("1.2")
 
 
 def require(condition, message):
@@ -33,6 +36,38 @@ def number(value, name, minimum=0):
     require(type(value) in (float, int) and math.isfinite(value) and value >= minimum,
             f"invalid {name}")
     return value
+
+
+def decimal_number(value, name, minimum=0):
+    if isinstance(value, Decimal):
+        require(value.is_finite() and value >= Decimal(str(minimum)), f"invalid {name}")
+        return value
+    number(value, name, minimum)
+    return Decimal(str(value))
+
+
+def ratio(numerator, denominator, name):
+    denominator = decimal_number(denominator, f"{name} denominator")
+    require(denominator > 0, f"invalid {name} denominator")
+    return decimal_number(numerator, name) / denominator
+
+
+def relative_change(current, baseline, name):
+    return ratio(current, baseline, name) - Decimal("1")
+
+
+def repeatability_change(first, second, name):
+    first = decimal_number(first, name)
+    second = decimal_number(second, name)
+    if first == 0 and second == 0:
+        return Decimal("0")
+    if first == 0 or second == 0:
+        return Decimal("Infinity")
+    return abs(second / first - Decimal("1"))
+
+
+def report_number(value):
+    return None if value.is_infinite() else float(value)
 
 
 def digest(path):
@@ -236,7 +271,7 @@ def convergence(result):
     require(window["full_walk_objects"] > 0, "zero full walk reference")
     require(0 < window["budget_available_seconds"] <= window["window_end"] - window["window_start"],
             "invalid convergence budget window")
-    return window["walk_objects"] / window["full_walk_objects"]
+    return ratio(window["walk_objects"], window["full_walk_objects"], "convergence work")
 
 
 def evaluate(cells):
@@ -248,38 +283,46 @@ def evaluate(cells):
         require([cell["leg"] for cell in group] == list(LEGS), "incomplete ABBA group")
         a1, b1, b2, a2 = (cell["result"]["metrics"] for cell in group)
         control = group[0]["comparison"] == "background"
-        drift = max(abs(a2[k] / a1[k] - 1) for k in ("p99_ms", "throughput_ops"))
-        repeat_drift = max(abs(b2[k] / b1[k] - 1) for k in ("p99_ms", "throughput_ops"))
-        noise = max(drift, repeat_drift) > 0.05
-        a = {key: (a1[key] + a2[key]) / 2 for key in METRICS}
-        b = {key: (b1[key] + b2[key]) / 2 for key in METRICS}
-        p99 = b["p99_ms"] / a["p99_ms"] - 1
-        throughput = b["throughput_ops"] / a["throughput_ops"] - 1
-        thresholds = {"p99_regression": 0.10 if control else 0.05,
-                      "throughput_loss": 0.05 if control else 0.03}
+        drift = max(abs(relative_change(a2[k], a1[k], k)) for k in ("p99_ms", "throughput_ops"))
+        repeat_drift = max(abs(relative_change(b2[k], b1[k], k)) for k in ("p99_ms", "throughput_ops"))
+        noise = max(drift, repeat_drift) > REPEATABILITY_LIMIT
+        a = {key: (decimal_number(a1[key], key) + decimal_number(a2[key], key)) / Decimal("2") for key in METRICS}
+        b = {key: (decimal_number(b1[key], key) + decimal_number(b2[key], key)) / Decimal("2") for key in METRICS}
+        p99 = relative_change(b["p99_ms"], a["p99_ms"], "p99_ms")
+        throughput = relative_change(b["throughput_ops"], a["throughput_ops"], "throughput_ops")
+        thresholds = {"p99_regression": Decimal("0.10") if control else Decimal("0.05"),
+                      "throughput_loss": Decimal("0.05") if control else Decimal("0.03")}
         passed = p99 <= thresholds["p99_regression"] and throughput >= -thresholds["throughput_loss"]
         p1 = None
+        work_drift = None
         if not control:
             if group[0]["scenario"] == "cold-hot":
                 require(a["cold_walk_objects"] > 0, "cold-hot baseline has no cold walk samples")
-            required = a["cold_walk_objects"] / a["walk_objects"] * 0.80
-            reduction = 1 - b["walk_objects"] / a["walk_objects"]
-            p1 = {"required_reduction": required, "observed_reduction": reduction}
+            work_drift = max(repeatability_change(a1[key], a2[key], key) for key in ("walk_objects", "cold_walk_objects"))
+            work_drift = max(work_drift, *(repeatability_change(b1[key], b2[key], key) for key in ("walk_objects", "cold_walk_objects")))
+            noise |= work_drift > REPEATABILITY_LIMIT
+            required = ratio(a["cold_walk_objects"], a["walk_objects"], "cold walk baseline") * Decimal("0.80")
+            reduction = Decimal("1") - ratio(b["walk_objects"], a["walk_objects"], "walk reduction")
+            p1 = {"required_reduction": float(required), "observed_reduction": float(reduction),
+                  "repeatability_drift": report_number(work_drift)}
             if group[0]["scenario"] == "cold-hot":
-                passed &= reduction >= required
+                # Compare counts before division can round repeating decimal ratios.
+                passed &= a["walk_objects"] - b["walk_objects"] >= a["cold_walk_objects"] * Decimal("0.80")
         p2 = [convergence(cell["result"]) if cell["background"] == "on" else None for cell in group]
         candidate_p2 = [value for cell, value in zip(group, p2) if cell["leg"].startswith("B")]
         p2_pending = any(value is None for value in candidate_p2)
-        passed &= all(value <= 1.2 for value in candidate_p2 if value is not None)
+        passed &= all(ratio(value, 1, "p2 work multiple") <= P2_WORK_MULTIPLE_LIMIT for value in candidate_p2 if value is not None)
+        p2_report = [None if value is None else float(value) for value in p2]
         inconclusive |= noise or p2_pending
         if not noise and not passed:
             failed = True
         comparisons.append({"scenario": group[0]["scenario"], "comparison": group[0]["comparison"],
                             "round": group[0]["round"], "status": "inconclusive" if noise else ("fail" if not passed else "inconclusive" if p2_pending else "pass"),
-                            "a2_a1_drift": drift, "b2_b1_drift": repeat_drift,
-                            "p99_regression": p99, "throughput_change": throughput,
-                            "thresholds": thresholds, "p1": p1, "p2_max_work_multiple": 1.2,
-                            "p2_post_stop_work_multiples": p2})
+                            "a2_a1_drift": report_number(drift), "b2_b1_drift": report_number(repeat_drift),
+                            "p99_regression": float(p99), "throughput_change": float(throughput),
+                            "thresholds": {key: float(value) for key, value in thresholds.items()},
+                            "p1": p1, "p2_max_work_multiple": float(P2_WORK_MULTIPLE_LIMIT),
+                            "p2_post_stop_work_multiples": p2_report})
     return ("fail" if failed else "inconclusive" if inconclusive else "pass"), comparisons
 
 
