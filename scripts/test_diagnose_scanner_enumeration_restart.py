@@ -42,6 +42,12 @@ class ReportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.validate(report)
 
+    def test_complete_coverage_without_entry_observation_rejected(self):
+        report = self.report()
+        report["raw_entries"] = 0
+        with self.assertRaises(ValueError):
+            self.validate(report)
+
     def test_missing_wrong_type_and_negative_counter_rejected(self):
         for value in (None, True, -1, "8", 1048577):
             with self.subTest(value=value):

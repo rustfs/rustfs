@@ -33,6 +33,8 @@ def validate_report(report, *, round_number, pid, objects, budget):
                 "versions_retained", "bytes_retained", "objects_processed"):
         if type(report.get(key)) is not int or not 0 <= report[key] <= 1048576:
             raise ValueError(f"invalid bounded counter: {key}")
+    if report["raw_entries"] == 0:
+        raise ValueError("nonempty fixture must observe raw entries; budget hook may not have run")
     if report["raw_entries"] > budget:
         raise ValueError("raw-entry budget exceeded; no unbudgeted tail is permitted")
     if type(report.get("snapshot_complete")) is not bool:
