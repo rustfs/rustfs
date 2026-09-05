@@ -2490,9 +2490,9 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
             return Ok((result, err.map(|e| e.into())));
         }
 
-        let disks = self.disks.read().await;
-
-        let disks = disks.clone();
+        // The inner heal and missing-object report read the registry again;
+        // release this snapshot guard before a topology writer can queue between reads.
+        let disks = self.get_disks_internal().await;
         let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false)
             .await
             .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
@@ -3417,6 +3417,366 @@ mod heal_result_report_tests {
             .await
             .expect_err("a rejected fallback must not format the missing slot");
         assert_eq!(unformatted, DiskError::UnformattedDisk);
+    }
+
+    #[derive(Clone, Copy)]
+    enum InventoryWriterHealCase {
+        Existing,
+        Missing,
+        MissingVersion,
+    }
+
+    async fn assert_heal_object_inventory_writer(case: InventoryWriterHealCase) {
+        use crate::set_disk::core::io_primitives::disk_call_counters;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let (_temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "heal-inventory-writer-bucket";
+        let object = match case {
+            InventoryWriterHealCase::Existing => "heal-inventory-writer-existing",
+            InventoryWriterHealCase::Missing => "heal-inventory-writer-missing",
+            InventoryWriterHealCase::MissingVersion => "heal-inventory-writer-missing-version",
+        };
+        set.make_bucket(
+            bucket,
+            &MakeBucketOptions {
+                versioning_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("heal fixture bucket should be created");
+        let body = vec![0x67; 64 * 1024];
+        let stored_version = Uuid::new_v4();
+        let stored_version_string = stored_version.to_string();
+        let published = if matches!(case, InventoryWriterHealCase::Missing) {
+            None
+        } else {
+            let mut reader = PutObjReader::from_vec(body.clone());
+            let info = set
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        no_lock: true,
+                        versioned: true,
+                        version_id: Some(stored_version_string.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("full-fanout PUT should seed the heal fixture");
+            for disk in &disks {
+                let metadata = disk
+                    .read_version("", bucket, object, &stored_version_string, &ReadOptions::default())
+                    .await
+                    .expect("the seeded version must be present on every disk");
+                assert_eq!(metadata.version_id, Some(stored_version));
+                assert_eq!(metadata.size, i64::try_from(body.len()).expect("fixture size should fit i64"));
+            }
+            Some(info)
+        };
+        let requested_version = match case {
+            InventoryWriterHealCase::Existing => stored_version_string.clone(),
+            InventoryWriterHealCase::Missing => String::new(),
+            InventoryWriterHealCase::MissingVersion => Uuid::new_v4().to_string(),
+        };
+        let opts = HealOpts {
+            no_lock: true,
+            ..Default::default()
+        };
+        let calls = disk_call_counters::observe(object);
+        let read_gate = set.disks.read().await;
+        // UFCS selects the trait's outer precheck, not the same-named inherent heal.
+        let heal = <SetDisks as crate::storage_api_contracts::heal::HealOperations>::heal_object(
+            set.as_ref(),
+            bucket,
+            object,
+            &requested_version,
+            &opts,
+        );
+        tokio::pin!(heal);
+        assert!(matches!(
+            futures::poll!(tokio::task::unconstrained(heal.as_mut())),
+            std::task::Poll::Pending
+        ));
+        // These tests use the current-thread runtime: full-wait metadata tasks
+        // have been spawned, but cannot run during the single unconstrained poll.
+        assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 0);
+        let writer = set.disks.write();
+        tokio::pin!(writer);
+        assert!(matches!(
+            futures::poll!(tokio::task::unconstrained(writer.as_mut())),
+            std::task::Poll::Pending
+        ));
+        assert!(set.disks.try_read().is_err(), "the writer must already block new inventory readers");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while calls.total(disk_call_counters::KIND_READ_VERSION) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the suspended trait heal must have started the real metadata fanout");
+        for disk_index in 0..4 {
+            assert_eq!(calls.for_disk(disk_call_counters::KIND_READ_VERSION, disk_index), 1);
+        }
+        drop(read_gate);
+
+        let (_, outcome) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(async { drop(writer.await) }, heal) })
+                .await
+                .expect("trait heal must not deadlock its nested inventory read with the queued writer");
+        let (result, error) = outcome.expect("heal should report the object's outcome");
+        match case {
+            InventoryWriterHealCase::Existing => assert!(error.is_none(), "existing object heal failed: {error:?}"),
+            InventoryWriterHealCase::Missing => assert!(matches!(error, Some(Error::FileNotFound))),
+            InventoryWriterHealCase::MissingVersion => assert!(matches!(error, Some(Error::FileVersionNotFound))),
+        }
+        assert_eq!(result.bucket, bucket);
+        assert_eq!(result.object, object);
+        assert_eq!(result.version_id, requested_version);
+        assert_eq!(result.disk_count, 4);
+        assert_eq!(result.before.drives.len(), 4);
+        assert_eq!(result.after.drives.len(), 4);
+        for disk_index in 0..4 {
+            let endpoint = set.set_endpoints[disk_index].to_string();
+            assert_eq!(result.before.drives[disk_index].endpoint, endpoint);
+            assert_eq!(result.after.drives[disk_index].endpoint, endpoint);
+        }
+        if let Some(published) = published {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut reader = set
+                    .get_object_reader(
+                        bucket,
+                        object,
+                        None,
+                        Default::default(),
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(stored_version_string),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("the stored version must remain readable after heal");
+                assert_eq!(reader.object_info.etag, published.etag);
+                assert_eq!(reader.object_info.version_id, Some(stored_version));
+                let mut observed_body = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut observed_body)
+                    .await
+                    .expect("stored body should stream");
+                assert_eq!(observed_body, body);
+            })
+            .await
+            .expect("GET must finish after the inventory writer and heal");
+        }
+    }
+
+    #[tokio::test]
+    async fn heal_object_inventory_writer_existing() {
+        assert_heal_object_inventory_writer(InventoryWriterHealCase::Existing).await;
+    }
+
+    #[tokio::test]
+    async fn heal_object_inventory_writer_missing() {
+        assert_heal_object_inventory_writer(InventoryWriterHealCase::Missing).await;
+    }
+
+    #[tokio::test]
+    async fn heal_object_inventory_writer_missing_version() {
+        assert_heal_object_inventory_writer(InventoryWriterHealCase::MissingVersion).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_object_with_queued_disk_renewal() {
+        use crate::layout::endpoints::SetupType;
+        use crate::runtime::instance::InstanceContext;
+        use crate::set_disk::core::io_primitives::disk_call_counters;
+        use std::collections::HashMap;
+        use std::future::Future;
+        use std::task::Poll;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        // renew_disk still registers local disks on the ambient context. Match
+        // the default serial group used by its other setup/registry fixtures,
+        // and restore only this temporary endpoint, including on a failed join.
+        struct RenewDiskTestState {
+            ctx: Arc<InstanceContext>,
+            was_dist_erasure: bool,
+            map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
+            endpoint: String,
+            previous_disk: Option<Option<DiskStore>>,
+        }
+
+        impl Drop for RenewDiskTestState {
+            fn drop(&mut self) {
+                let ctx = self.ctx.clone();
+                let was_dist_erasure = self.was_dist_erasure;
+                let map = self.map.clone();
+                let endpoint = self.endpoint.clone();
+                let previous_disk = self.previous_disk.take();
+                let handle = tokio::runtime::Handle::current();
+                std::thread::spawn(move || {
+                    handle.block_on(async move {
+                        let mut map = map.write().await;
+                        match previous_disk {
+                            Some(disk) => {
+                                map.insert(endpoint, disk);
+                            }
+                            None => {
+                                map.remove(&endpoint);
+                            }
+                        }
+                        drop(map);
+                        if was_dist_erasure {
+                            ctx.update_erasure_type(SetupType::DistErasure).await;
+                        }
+                    });
+                })
+                .join()
+                .expect("renew fixture state restoration should finish");
+            }
+        }
+
+        let (_temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let endpoint = set.set_endpoints[0].clone();
+        let ctx = crate::runtime::global::current_ctx();
+        let map = ctx.local_disk_map();
+        let restore = RenewDiskTestState {
+            ctx: ctx.clone(),
+            was_dist_erasure: ctx.is_dist_erasure().await,
+            map: map.clone(),
+            endpoint: endpoint.to_string(),
+            previous_disk: map.read().await.get(&endpoint.to_string()).cloned(),
+        };
+        // Only distributed erasure needs an override to avoid the ambient slot array.
+        if restore.was_dist_erasure {
+            ctx.update_erasure_type(SetupType::Erasure).await;
+        }
+
+        let bucket = "heal-disk-renewal-bucket";
+        let object = "heal-disk-renewal-object";
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("renew fixture bucket should be created");
+        let body = vec![0x73; 64 * 1024];
+        let mut reader = PutObjReader::from_vec(body.clone());
+        let published = set
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("full-fanout PUT should seed the renewal fixture");
+        for disk in &disks {
+            let metadata = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("the seeded object must be present on every disk");
+            assert_eq!(metadata.size, i64::try_from(body.len()).expect("fixture size should fit i64"));
+        }
+
+        let opts = HealOpts {
+            no_lock: true,
+            ..Default::default()
+        };
+        let calls = disk_call_counters::observe(object);
+        let read_gate = set.disks.read().await;
+        let heal = <SetDisks as crate::storage_api_contracts::heal::HealOperations>::heal_object(
+            set.as_ref(),
+            bucket,
+            object,
+            "",
+            &opts,
+        );
+        tokio::pin!(heal);
+        assert!(matches!(futures::poll!(tokio::task::unconstrained(heal.as_mut())), Poll::Pending));
+        assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 0);
+
+        let renew = set.renew_disk(&endpoint);
+        tokio::pin!(renew);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            futures::future::poll_fn(|cx| {
+                assert!(
+                    std::pin::pin!(tokio::task::unconstrained(renew.as_mut()))
+                        .poll(cx)
+                        .is_pending(),
+                    "renewal must reach its inventory write before returning"
+                );
+                if set.disks.try_read().is_err() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("real renewal must queue its topology writer behind the read gate");
+        let registered = map
+            .read()
+            .await
+            .get(&endpoint.to_string())
+            .cloned()
+            .flatten()
+            .expect("renewal must register the connected disk before its inventory write");
+        assert!(!Arc::ptr_eq(&registered, &disks[0]), "renewal must construct a new disk handle");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while calls.total(disk_call_counters::KIND_READ_VERSION) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the suspended trait heal must have started the real metadata fanout");
+        for disk_index in 0..4 {
+            assert_eq!(calls.for_disk(disk_call_counters::KIND_READ_VERSION, disk_index), 1);
+        }
+        drop(read_gate);
+
+        let (_, outcome) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(renew, heal) })
+            .await
+            .expect("trait heal and real disk renewal must finish without a nested inventory read deadlock");
+        let (report, error) = outcome.expect("heal should report the existing object");
+        assert!(error.is_none(), "existing object heal failed after renewal: {error:?}");
+        assert_eq!(report.bucket, bucket);
+        assert_eq!(report.object, object);
+        assert_eq!(report.disk_count, 4);
+        let renewed = set.get_disks_internal().await[0]
+            .clone()
+            .expect("the renewed slot must remain online");
+        assert!(Arc::ptr_eq(&renewed, &registered), "the set must publish the newly connected handle");
+        assert_eq!(renewed.endpoint(), endpoint);
+        let format = load_format_erasure(&renewed, false)
+            .await
+            .expect("renewed disk format should remain readable");
+        assert_eq!(format.erasure.this, set.format.erasure.sets[0][0]);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut reader = set
+                .get_object_reader(bucket, object, None, Default::default(), &ObjectOptions::default())
+                .await
+                .expect("the object must remain readable after renewal and heal");
+            assert_eq!(reader.object_info.etag, published.etag);
+            let mut observed_body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut observed_body)
+                .await
+                .expect("stored body should stream");
+            assert_eq!(observed_body, body);
+        })
+        .await
+        .expect("GET must finish after renewal and heal");
     }
 
     // Regression for #955: an offline disk must contribute exactly one drive

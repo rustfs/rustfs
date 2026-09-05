@@ -89,9 +89,11 @@ Setting `"enabled": false` in the config has the same read-path effect as deleti
 
 The status endpoint reports **the node that answered the request**. Counters, queue depth and breaker state are per-node runtime state, so in a distributed deployment query every node; the saved configuration and `updated_at` are cluster-wide.
 
-### Backfill (ships with ODM-12)
+### Backfill
 
-Read-through only migrates what clients touch. The background backfill job walks the source listing and pulls the remainder, with a persisted checkpoint (`.rustfs.sys/buckets/<bucket>/on-demand-migration-backfill.json`), a single-owner lease, resume after restart, and `POST .../{bucket}/backfill?op=start|cancel` plus `GET .../{bucket}/backfill` admin routes. That slice (rustfs/backlog#2159) is not part of the build this page was written against: the shape above is the agreed design, and the exact request/response bodies must be re-checked against `docs/architecture/admin-route-action-snapshot.md` once it lands.
+Backfill waits for the result of every pull, including a pull already queued by an online request. A failed or cancelled shared pull is counted as a failure, never as successful migration. The persisted continuation cursor stays at the first failed page; a takeover replays from there and skips objects already present locally. `completed_with_failures` is not a cutover-ready state.
+
+Read-through only migrates what clients touch. The background backfill job walks the source listing and pulls the remainder, with a persisted checkpoint (`.rustfs.sys/buckets/<bucket>/on-demand-migration-backfill.json`), a single-owner lease, resume after restart, and `POST .../{bucket}/backfill?op=start|cancel` plus `GET .../{bucket}/backfill` admin routes. See `docs/architecture/admin-route-action-snapshot.md` for the route contract.
 
 ## Configuration reference
 
@@ -101,14 +103,20 @@ The persisted blob is `on-demand-migration.json` in the bucket's metadata. Unkno
 |---|---|---|---|
 | `version` | integer | `1` | Must be `1` |
 | `enabled` | bool | `true` | `false` keeps the config but stops all source traffic |
-| `source.provider` | `s3` \| `aws` \| `minio` \| `rustfs` \| `r2` \| `gcs` | — (required) | Drives endpoint and addressing defaults |
-| `source.endpoint` | string \| null | — | `http(s)://host[:port]`, no path, query, fragment or userinfo. Required for every provider except `aws`, where it is derived from `region` |
-| `source.region` | string | — (required) | Non-empty. `auto` is accepted only for `r2`, `minio`, `rustfs` and is signed as `us-east-1` |
-| `source.bucket` | string | — (required) | Non-empty, no `/` and no whitespace |
+| `source.provider` | `s3` \| `aws` \| `minio` \| `rustfs` \| `r2` \| `gcs` \| `azure` \| `gcs_native` | — (required) | Drives endpoint and addressing defaults, and which backend the client builds: every value but `azure` and `gcs_native` speaks S3 |
+| `source.endpoint` | string \| null | — | `http(s)://host[:port]`, no path, query, fragment or userinfo. Required except for `aws` (derived from `region`), `azure` (derived as `https://<account>.blob.core.windows.net`) and `gcs_native` (`https://storage.googleapis.com`). Set it explicitly to point at Azurite or fake-gcs-server, subject to the same outbound policy as any other source endpoint |
+| `source.region` | string | — (required) | Non-empty. `auto` is accepted for `r2`, `minio`, `rustfs` and for the native providers, and is signed as `us-east-1`. `azure` and `gcs_native` never sign with a region, so `auto` is the honest value there |
+| `source.bucket` | string | — (required) | Non-empty, no `/` and no whitespace. For `azure` this is the container name, for `gcs_native` the bucket name; the provider block never repeats it |
 | `source.path_style` | `auto` \| `path` \| `virtual` | `auto` | `auto` resolves to path-style for IP-literal or `localhost` endpoints and for `s3`/`minio`/`rustfs`; virtual-host for `aws`/`gcs`/`r2` |
-| `source.credentials` | object \| null | `null` | `null` means anonymous, which the client builder does not support yet: the admin `PUT` refuses it with `InvalidArgument`, and a config that reached the metadata another way resolves as unavailable. `access_key` and `secret_key` must be non-empty; `session_token` is optional but must be non-empty when present |
+| `source.credentials` | object \| null | `null` | Read only by the S3 providers; `azure` and `gcs_native` must leave it `null` and carry their credentials in their own block. `null` means anonymous, which the client builder does not support yet: the admin `PUT` refuses it with `InvalidArgument`, and a config that reached the metadata another way resolves as unavailable. `access_key` and `secret_key` must be non-empty; `session_token` is optional but must be non-empty when present |
 | `source.tls.skip_verify` | bool | `false` | Disables certificate verification for the source connection |
 | `source.tls.ca_cert_pem` | string \| null | `null` | Must contain `-----BEGIN CERTIFICATE-----` |
+| `source.azure` | object \| null | `null` | Required for `provider = "azure"` and rejected for every other provider |
+| `source.azure.account` | string | — (required) | Storage account name; `[A-Za-z0-9-]` only, because it becomes the first label of the derived host |
+| `source.azure.account_key` | string \| null | `null` | Base64 storage-account key, signed per request with Shared Key. Mutually exclusive with `sas_token`; exactly one of the two is required |
+| `source.azure.sas_token` | string \| null | `null` | SAS query string without the leading `?` and without whitespace, appended to every request URL |
+| `source.gcs` | object \| null | `null` | Required for `provider = "gcs_native"` and rejected for every other provider |
+| `source.gcs.service_account_json` | string | — (required) | Service-account key JSON; must parse and carry `type: service_account`, `client_email` and `private_key`. Tokens are minted read-only (`devstorage.read_only`) |
 | `filter.prefix` | string \| null | `null` | Null or non-empty. Only local keys with this prefix consult the source |
 | `filter.source_prefix` | string \| null | `null` | Null or non-empty. Prepended to the local key to form the source key |
 | `policy.head` | `proxy` \| `local_only` | `proxy` | `local_only` answers a HEAD miss with 404 and no source traffic |
@@ -117,7 +125,7 @@ The persisted blob is `on-demand-migration.json` in the bucket's metadata. Unkno
 | `policy.list_through` | bool | `false` | Merges the source listing into `ListObjectsV2` so clients see the whole namespace during the migration. Off by default: it puts the source in the path of every listing |
 | `policy.respect_local_delete_marker` | bool | `true` | A local delete marker is the final answer; only a versioned bucket can produce one |
 | `policy.preserve_etag` | bool | `true` | Keeps the source ETag on the stored object unless the bucket encrypts by default |
-| `policy.copy_tags` | bool | `false` | Copies source object tags; needs `s3:GetObjectTagging` and costs one extra source call per inline pull |
+| `policy.copy_tags` | bool | `false` | Copies source object tags; needs `s3:GetObjectTagging` and costs one extra source call per inline pull. `azure` reads blob tags instead; `gcs_native` has no tags and always finds none |
 | `policy.emit_events` | bool | `true` | Whether a write-back emits `ObjectCreated` notifications |
 | `policy.negative_cache_ttl_secs` | integer | `30` | `0..=3600`; `0` disables the negative cache |
 | `policy.inline_max_bytes` | integer | `16777216` (16 MiB) | `0..=268435456` (256 MiB). At or below this size a GET miss is teed inline; above it the response streams through and a background pull stores the object |
@@ -129,7 +137,7 @@ The persisted blob is `on-demand-migration.json` in the bucket's metadata. Unkno
 | `policy.source_timeout.idle_ms` | integer | `30000` | `100..=600000`; enforced per body chunk on both the background pump and the inline tee |
 | `policy.bandwidth_limit_bytes_per_sec` | integer \| null | `null` | When set, at least `65536` |
 
-Values that are **not** configurable: the breaker opens after 5 consecutive counted failures inside a 30 s window, stays open for 30 s and then admits one probe (`breaker.rs`); the negative cache holds at most 100 000 keys per bucket with LRU eviction (`negative_cache.rs`); a background pull retries a retryable source failure at most 3 times with 1 s / 4 s / 16 s base delays plus up to 25 % jitter (`pull.rs`). The SDK's own retry policy is disabled on the source client, so one logical source call is exactly one wire request and the retry budget above is the only one.
+Values that are **not** configurable: the breaker opens after 5 consecutive counted failures inside a 30 s window, stays open for 30 s and then admits one probe (`breaker.rs`); the negative cache holds at most 100 000 keys per bucket with LRU eviction (`negative_cache.rs`); a background pull retries a retryable source failure at most 3 times with 1 s / 4 s / 16 s base delays plus up to 25 % jitter (`pull.rs`). The SDK's own retry policy is disabled on the source client. Each SDK operation makes one wire request; an ambiguous HEAD 404 additionally probes the bucket, within the same configured first-byte budget.
 
 Validation also rejects two shapes outright: a source whose endpoint and bucket name **this** bucket on this deployment (`SelfReference`), and a source that matches one of the bucket's own replication targets (`ReplicationLoop`) — that pairing would amplify a write-back into a loop.
 
@@ -143,8 +151,14 @@ Validation also rejects two shapes outright: a source whose endpoint and bucket 
 | `rustfs` | Required | Path-style | `auto` allowed | A RustFS source answers the migration request locally thanks to the anti-loop marker | `real_source_test.rs` in the `e2e-nightly` lane |
 | `r2` | `https://<account-id>.r2.cloudflarestorage.com` | Virtual-host | `auto` allowed (signed as `us-east-1`) | | `cloud-source (r2)`, only while `ODM_INTEROP_R2_*` are configured; no difference recorded yet |
 | `gcs` | `https://storage.googleapis.com` | Virtual-host | Real region required | Uses the GCS XML interoperability API with an HMAC key pair, not a service-account JSON key | `cloud-source (gcs)`, only while `ODM_INTEROP_GCS_HMAC_*` are configured; no difference recorded yet |
+| `azure` | Optional; derived as `https://<account>.blob.core.windows.net` | Native Blob REST, not S3 | Unused; write `auto` | Needs `source.azure`; the container is `source.bucket`. Reads need `Read` on the blob and `List` on the container, plus `Tags` when `policy.copy_tags` is on | None yet: no interop job covers Azure |
+| `gcs_native` | Optional; derived as `https://storage.googleapis.com` | Native GCS API, not S3 | Unused; write `auto` | Needs `source.gcs`. Reads use the XML API for objects and `objects.list` for listings, both with an OAuth token minted from the service-account key; the key needs `storage.objects.get` and `storage.objects.list` | None yet: no interop job covers native GCS |
 
-Azure Blob has no preset; a native provider is deferred (rustfs/backlog#2166).
+Every backend answers the same trait contract, pinned by `backend_contract.rs` in `crates/ecstore/src/bucket/on_demand_migration/`, and the three differences that contract allows are the ones documented here.
+
+`azure` differs in two of them. Its ETag is a concurrency token rather than a digest of the bytes, so it is stored as `odm-source-etag` provenance and never used as the expected MD5 of a pulled object — the write-back integrity check falls back to the local digest. And its listing paginates only with an opaque marker: there is no "start after this key" form, so a caller that asks for one gets `Unsupported` instead of a listing that silently starts over.
+
+`gcs_native` differs in the other two. Its listing also has no exclusive "start after" form (`startOffset` is inclusive), so it refuses one the same way. And GCS has no object tagging at all: `policy.copy_tags` finds no tags rather than failing the pull, because GCS custom metadata is already carried by the head mapping. Its ETag is normally usable: the `x-goog-hash` MD5 is converted to hex and checked against the pulled bytes, except on a composite object, which has no MD5 and whose ETag is then treated as opaque.
 
 The "Interop evidence" column names the job in `.github/workflows/on-demand-migration-interop.yml` (rustfs/backlog#2167) that last exercised the preset against a real implementation, and is where a provider difference belongs once the lane finds one. That lane is report-only and scheduled: it runs `crates/e2e_test/src/on_demand_migration/interop_test.rs` — the same case bodies as the merge-gate suite, with the source injected through `RUSTFS_ODM_INTEROP_*` — against a pinned MinIO container, and against each cloud provider whose repository secrets are configured. A provider without secrets is skipped with a note in the run summary rather than failing, so "no difference recorded yet" means exactly that and not "verified clean"; see [ci-gates.md](../testing/ci-gates.md) for the row.
 
@@ -159,6 +173,14 @@ No write, delete, ACL or versioning permission is required or used. Scope the po
 ## Request semantics
 
 Behaviour a client can observe. The "Test" column names the case that pins it: `*_test.rs` files live under `crates/e2e_test/src/on_demand_migration/`, and the unit tests live next to the code in `rustfs/src/app/object/get.rs`, `head.rs` and `shared.rs`.
+
+ODM merged continuation tokens use a NUL-prefixed JSON envelope inside the existing base64 encoding. NUL is not valid in a local object key, so a legitimate JSON-shaped key can never be mistaken for a merged cursor. Upgrade every node before using list-through, and restart any in-progress ODM listing issued by an older build: its unframed JSON tokens cannot be distinguished from legitimate local keys. Ordinary local listing tokens remain unchanged. Tokens issued by this build can still resume the local side after list-through is disabled.
+
+Source `HEAD` responses with status 404 require a successful bucket probe before being negative-cached. The source credential therefore needs permission for `HeadBucket` (S3 `ListBucket`); a prefix-restricted ListBucket policy can deny that probe, in which case the response is a source failure rather than a cached miss. A missing/inaccessible source bucket, a missing source version, or an ambiguous GET 404 is not proof that the requested key is absent. Conditional GET validators are checked against the actual source GET metadata as well as the advisory HEAD; a missing required validator fails with 424. Source LIST entries without a key or a non-negative size fail the page rather than fabricating an empty object.
+
+Write-back currently requires namespace locking enabled and exactly one pool with one erasure set. Other topologies fail write-back explicitly as `unsupported`: source reads remain available, but backfill cannot complete successfully or certify cutover. This restriction avoids relying on a set-local condition across distinct pool or lock domains; it does not restrict ordinary S3 writes. Full cross-pool migration requires a globally fenced commit protocol.
+
+On the supported topology, write-back uses a create-only check under the local storage commit lock for both single-part PUT and multipart completion. A client write that commits while ODM is reading the source is preserved. With `respect_local_delete_marker=true`, a concurrent versioned deletion is preserved too. An explicit `respect_local_delete_marker=false` still permits revival; an unversioned deletion has no tombstone and therefore cannot be distinguished from a key that has never existed locally.
 
 | Situation | Behaviour | Test |
 |---|---|---|
@@ -229,7 +251,7 @@ Five provenance keys are written on every pulled object under both internal pref
 | Concurrency limit | Local write amplification | `max_concurrent_pulls` permits shared by inline and background pulls |
 | Bounded queue | Unbounded memory on a burst | `pull_queue_capacity` waiting jobs; overflow is counted as `queue_full` and never fails a client response |
 | Bandwidth limit | Source and network saturation | `bandwidth_limit_bytes_per_sec` (minimum 64 KiB/s) on the source client |
-| Retry budget | Transient source blips | Background pulls retry a retryable failure up to 3 times (1 s / 4 s / 16 s plus jitter). Inline pulls never retry: the bytes are already on their way to the client. The SDK retry policy on the source client is disabled (`RemoteS3RetryPolicy::Disabled`), so this is the only retry budget and one logical source call is exactly one wire request — replication targets keep the SDK's three attempts, declared on their own spec |
+| Retry budget | Transient source blips | Background pulls retry a retryable failure up to 3 times (1 s / 4 s / 16 s plus jitter). Inline pulls never retry: the bytes are already on their way to the client. The SDK retry policy is disabled (`RemoteS3RetryPolicy::Disabled`); HEAD 404 also requires one bucket probe. Replication targets keep their separately declared three SDK attempts |
 | Idle timeout | A source that answers and then goes quiet mid-body | `source_timeout.idle_ms` per body chunk on both paths. The budget measures the source read, upstream of the inline tee, so a slow client is never mistaken for an idle source; when it fires the client stream ends in an error and the write-back is discarded |
 | Anti-loop marker | Migration chains between RustFS/MinIO deployments | Every source request carries `x-rustfs-source-proxy-request` and `x-minio-source-proxy-request`; a request carrying it is always answered locally |
 | Outbound endpoint policy | SSRF | See [outbound-connection-policy.md](outbound-connection-policy.md) |
