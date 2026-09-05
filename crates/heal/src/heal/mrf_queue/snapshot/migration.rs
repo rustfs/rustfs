@@ -29,6 +29,7 @@ const CLAIM: &str = ".heal-mrf-import-claim.bin";
 pub struct MigrationLimits {
     pub max_bytes: usize,
     pub max_records: usize,
+    pub max_sources: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -49,7 +50,7 @@ pub enum MigrationError {
     Claimed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum LegacyPath {
     Scoped,
     Mirror,
@@ -107,9 +108,6 @@ impl PendingMigration {
                 offset = end;
             }
         }
-        if records.is_empty() {
-            return Err(MigrationError::Empty);
-        }
         Ok(records.into_iter().collect())
     }
 
@@ -119,6 +117,14 @@ impl PendingMigration {
         }
         if self.sources.is_empty() || self.sources.len() > MAX_DISKS * 2 {
             return Err(MigrationError::Invalid);
+        }
+        if self
+            .sources
+            .len()
+            .checked_add(self.inherited.len())
+            .is_none_or(|count| count > limits.max_sources)
+        {
+            return Err(SnapshotError::TooLarge.into());
         }
         // Bound the raw input before allocating the JSON representation.
         let total = self
@@ -247,14 +253,21 @@ struct Staged {
     slot: usize,
 }
 
-async fn read_staged(disks: &[EcstoreDiskStore], limits: MigrationLimits) -> Result<Option<Staged>, MigrationError> {
+async fn read_staged(
+    disks: &[EcstoreDiskStore],
+    limits: MigrationLimits,
+    retry_payload: Option<&[u8]>,
+) -> Result<Option<Staged>, MigrationError> {
     let mut selected: Option<Staged> = None;
-    let mut damage = None;
     let mut identities = std::collections::BTreeMap::new();
+    let mut orphaned_payloads = Vec::new();
     for disk in disks {
         for slot in 0..2 {
             let result = async {
                 let Some(bytes) = read_bounded(disk, COMMITS[slot], MANIFEST_LEN).await? else {
+                    if let Some(payload) = read_bounded(disk, PAYLOADS[slot], limits.max_bytes).await? {
+                        orphaned_payloads.push((payload.len(), <[u8; 32]>::from(Sha256::digest(&payload))));
+                    }
                     return Ok(None);
                 };
                 let manifest = Manifest::decode(&bytes, limits.max_bytes)?;
@@ -266,7 +279,7 @@ async fn read_staged(disks: &[EcstoreDiskStore], limits: MigrationLimits) -> Res
                     return Err(MigrationError::Invalid);
                 }
                 let candidate: PendingMigration = serde_json::from_slice(&payload).map_err(|_| MigrationError::Invalid)?;
-                if candidate.encode(limits)? != payload {
+                if candidate.encode(limits)? != payload || candidate.replay_records(limits)?.is_empty() {
                     return Err(MigrationError::Invalid);
                 }
                 Ok(Some(Staged {
@@ -293,16 +306,24 @@ async fn read_staged(disks: &[EcstoreDiskStore], limits: MigrationLimits) -> Res
                     }
                 }
                 Ok(None) => {}
-                Err(MigrationError::Snapshot(SnapshotError::Unsupported)) => return Err(SnapshotError::Unsupported.into()),
-                Err(error) => damage = Some(error),
+                Err(error) => return Err(error),
             }
         }
     }
-    match (selected, damage) {
-        (Some(staged), _) => Ok(Some(staged)),
-        (None, Some(error)) => Err(error),
-        (None, None) => Ok(None),
+    // A missing manifest is repairable only for the exact retry candidate or
+    // payload already validated through another committed replica. Unknown
+    // candidate bytes may contain additional obligations and block selection.
+    let retry_identity = retry_payload.map(|payload| (payload.len(), <[u8; 32]>::from(Sha256::digest(payload))));
+    let committed_identity = selected
+        .as_ref()
+        .map(|staged| (staged.manifest.payload_len, staged.manifest.payload_digest));
+    if orphaned_payloads
+        .into_iter()
+        .any(|identity| Some(identity) != retry_identity && Some(identity) != committed_identity)
+    {
+        return Err(MigrationError::Conflict);
     }
+    Ok(selected)
 }
 
 async fn install(disk: &EcstoreDiskStore, path: &str, bytes: &[u8], limit: usize) -> Result<(), MigrationError> {
@@ -349,14 +370,29 @@ pub async fn stage_legacy_migration(
         stage_claimed(&disks, candidate, owner, limits).await
     }
     .await;
+    let mut release_error = None;
     for disk in claimed {
-        let released =
-            EcstoreDiskAPI::compare_and_update_file(disk.as_ref(), RUSTFS_META_BUCKET, CLAIM, Some(claim.clone()), None)
-                .await
-                .map_err(SnapshotError::Disk)?;
-        if released != EcstoreConditionalFileUpdate::Updated {
-            return Err(MigrationError::Claimed);
+        let release = async {
+            #[cfg(test)]
+            tests::interrupt_at(owner, tests::Boundary::Release).await?;
+            let released =
+                EcstoreDiskAPI::compare_and_update_file(disk.as_ref(), RUSTFS_META_BUCKET, CLAIM, Some(claim.clone()), None)
+                    .await
+                    .map_err(SnapshotError::Disk)?;
+            if released != EcstoreConditionalFileUpdate::Updated {
+                return Err(MigrationError::Claimed);
+            }
+            Ok(())
         }
+        .await;
+        if let Err(error) = release
+            && release_error.is_none()
+        {
+            release_error = Some(error);
+        }
+    }
+    if let Some(error) = release_error {
+        return Err(error);
     }
     result
 }
@@ -367,36 +403,59 @@ async fn stage_claimed(
     owner: Uuid,
     limits: MigrationLimits,
 ) -> Result<u64, MigrationError> {
-    candidate.revalidate(&disks, limits).await?;
-    let previous = read_staged(&disks, limits).await?;
+    candidate.revalidate(disks, limits).await?;
+    let captured_payload = candidate.encode(limits)?;
+    let previous = read_staged(disks, limits, Some(&captured_payload)).await?;
     if previous.as_ref().is_some_and(|old| old.manifest.owner != owner) {
         return Err(MigrationError::Conflict);
     }
     let mut candidate = candidate.clone();
+    let key = |source: &Source| (source.disk_id, source.path, source.digest, source.bytes.is_some());
+    let mut source_index = std::collections::HashMap::new();
+    for (index, source) in candidate.sources.iter().chain(&candidate.inherited).enumerate() {
+        if source_index.insert(key(source), index).is_some() {
+            return Err(MigrationError::Invalid);
+        }
+    }
     if let Some(old) = &previous {
         for source in old.candidate.sources.iter().chain(&old.candidate.inherited) {
-            if !candidate.sources.contains(source) && !candidate.inherited.contains(source) {
+            if let Some(index) = source_index.get(&key(source)).copied() {
+                let existing = if index < candidate.sources.len() {
+                    &candidate.sources[index]
+                } else {
+                    &candidate.inherited[index - candidate.sources.len()]
+                };
+                if existing != source {
+                    return Err(MigrationError::Conflict);
+                }
+            } else {
+                if source_index.len() >= limits.max_sources {
+                    return Err(SnapshotError::TooLarge.into());
+                }
+                source_index.insert(key(source), candidate.sources.len() + candidate.inherited.len());
                 candidate.inherited.push(source.clone());
             }
         }
     }
+    if candidate.replay_records(limits)?.is_empty() {
+        return Err(MigrationError::Empty);
+    }
     let payload = candidate.encode(limits)?;
     let digest: [u8; 32] = Sha256::digest(&payload).into();
-    if let Some(old) = &previous
-        && old.manifest.payload_digest == digest
-    {
-        candidate.revalidate(&disks, limits).await?;
-        return Ok(old.manifest.sequence);
-    }
-    let sequence = previous.as_ref().map_or(1, |old| old.manifest.sequence.saturating_add(1));
-    let slot = previous.as_ref().map_or(0, |old| 1 - old.slot);
+    let (sequence, slot) = previous.as_ref().map_or((1, 0), |old| {
+        if old.manifest.payload_digest == digest {
+            (old.manifest.sequence, old.slot)
+        } else {
+            (old.manifest.sequence.saturating_add(1), 1 - old.slot)
+        }
+    });
     let manifest = Manifest::encode(owner, sequence, &payload)?;
     for disk in disks {
         install(disk, PAYLOADS[slot], &payload, limits.max_bytes).await?;
     }
     #[cfg(test)]
     tests::interrupt_at(owner, tests::Boundary::AfterPayload).await?;
-    candidate.revalidate(&disks, limits).await?;
+    candidate.revalidate(disks, limits).await?;
     #[cfg(test)]
     tests::interrupt_at(owner, tests::Boundary::BeforeManifest).await?;
     for disk in disks {
@@ -404,11 +463,11 @@ async fn stage_claimed(
     }
     #[cfg(test)]
     tests::interrupt_at(owner, tests::Boundary::AfterManifest).await?;
-    let recovered = read_staged(&disks, limits).await?.ok_or(MigrationError::Invalid)?;
+    let recovered = read_staged(disks, limits, None).await?.ok_or(MigrationError::Invalid)?;
     if recovered.manifest.sequence != sequence || recovered.manifest.payload_digest != digest {
         return Err(MigrationError::Conflict);
     }
-    recovered.candidate.revalidate(&disks, limits).await?;
+    recovered.candidate.revalidate(disks, limits).await?;
     #[cfg(test)]
     tests::interrupt_at(owner, tests::Boundary::AfterReadback).await?;
     Ok(sequence)
@@ -421,7 +480,7 @@ pub async fn recover_pending_migration(
     limits: MigrationLimits,
 ) -> Result<Option<PendingMigration>, MigrationError> {
     let disks = configured_disks(disks).await?;
-    let Some(staged) = read_staged(&disks, limits).await? else {
+    let Some(staged) = read_staged(&disks, limits, None).await? else {
         return Ok(None);
     };
     staged.candidate.revalidate(&disks, limits).await?;
@@ -440,6 +499,7 @@ mod tests {
     const LIMITS: MigrationLimits = MigrationLimits {
         max_bytes: 64 * 1024,
         max_records: 100,
+        max_sources: 64,
     };
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -448,6 +508,7 @@ mod tests {
         BeforeManifest,
         AfterManifest,
         AfterReadback,
+        Release,
     }
 
     static INTERRUPTIONS: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeMap<Uuid, Boundary>>> =
@@ -698,6 +759,7 @@ mod tests {
         stage_legacy_migration(&disks, &candidate, Uuid::new_v4(), LIMITS)
             .await
             .expect("initial commit");
+        let previous = read_bounded(&disk, PAYLOADS[0], LIMITS.max_bytes).await.expect("old payload");
         for (path, bytes) in [
             (PAYLOADS[1], b"torn payload".as_slice()),
             (COMMITS[1], b"torn manifest".as_slice()),
@@ -705,16 +767,11 @@ mod tests {
             install(&disk, path, bytes, LIMITS.max_bytes)
                 .await
                 .expect("interrupted inactive write");
-            assert_eq!(
-                recover_pending_migration(&disks, LIMITS)
-                    .await
-                    .expect("recover previous")
-                    .expect("anchor")
-                    .replay_records(LIMITS)
-                    .expect("retained responsibility")
-                    .len(),
-                1
+            assert!(
+                recover_pending_migration(&disks, LIMITS).await.is_err(),
+                "unknown successor responsibility must block recovery"
             );
+            assert_eq!(read_bounded(&disk, PAYLOADS[0], LIMITS.max_bytes).await.expect("old anchor"), previous);
         }
     }
 
@@ -726,8 +783,11 @@ mod tests {
             capture_legacy_migration(&[Some(disk.clone()), None], LIMITS).await,
             Err(MigrationError::CoverageGap)
         ));
+        let empty = capture_legacy_migration(&[Some(disk.clone())], LIMITS)
+            .await
+            .expect("observed empty sources");
         assert!(matches!(
-            capture_legacy_migration(&[Some(disk.clone())], LIMITS).await,
+            stage_legacy_migration(&[Some(disk.clone())], &empty, Uuid::new_v4(), LIMITS).await,
             Err(MigrationError::Empty)
         ));
         source(&disk, b"corrupt").await;
@@ -760,8 +820,15 @@ mod tests {
                     .expect("source survives interruption"),
                 bytes
             );
-            let recovery = recover_pending_migration(&disks, LIMITS).await.expect("restart inspection");
-            assert_eq!(recovery.is_some(), matches!(boundary, Boundary::AfterManifest | Boundary::AfterReadback));
+            let recovery = recover_pending_migration(&disks, LIMITS).await;
+            if matches!(boundary, Boundary::AfterManifest | Boundary::AfterReadback) {
+                assert!(recovery.expect("committed restart").is_some());
+            } else {
+                assert!(
+                    matches!(recovery, Err(MigrationError::Conflict)),
+                    "uncommitted candidate is not a committed recovery result"
+                );
+            }
             assert_eq!(
                 stage_legacy_migration(&disks, &candidate, owner, LIMITS)
                     .await
@@ -833,12 +900,7 @@ mod tests {
             stage_legacy_migration(&disks, &candidate, owner, LIMITS).await,
             Err(MigrationError::SourceChanged)
         ));
-        assert!(
-            recover_pending_migration(&disks, LIMITS)
-                .await
-                .expect("no committed import")
-                .is_none()
-        );
+        assert!(matches!(recover_pending_migration(&disks, LIMITS).await, Err(MigrationError::Conflict)));
         assert_eq!(
             EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, MRF_SCOPED_JOURNAL_PATH)
                 .await
@@ -896,5 +958,218 @@ mod tests {
         for variant in variants {
             assert!(records.contains(&variant));
         }
+    }
+
+    async fn slot_bytes(disk: &EcstoreDiskStore) -> Vec<Option<Vec<u8>>> {
+        let mut bytes = Vec::new();
+        for path in PAYLOADS.into_iter().chain(COMMITS) {
+            bytes.push(read_bounded(disk, path, LIMITS.max_bytes).await.expect("slot bytes"));
+        }
+        bytes
+    }
+
+    #[tokio::test]
+    async fn migration_damaged_newer_commit_never_overwrites_successor_responsibility() {
+        let root = TempDir::new().expect("test directory");
+        let disk = disk(&root, "disk").await;
+        let disks = [Some(disk.clone())];
+        let owner = Uuid::new_v4();
+        for name in ["a", "b"] {
+            source(&disk, &record(name, MrfKind::PartialWrite, None)).await;
+            let candidate = capture_legacy_migration(&disks, LIMITS).await.expect("capture");
+            stage_legacy_migration(&disks, &candidate, owner, LIMITS)
+                .await
+                .expect("committed generation");
+        }
+        install(&disk, COMMITS[1], b"torn higher manifest", MANIFEST_LEN)
+            .await
+            .expect("manifest fault");
+        source(&disk, &record("c", MrfKind::PartialWrite, None)).await;
+        let before = slot_bytes(&disk).await;
+        let candidate = capture_legacy_migration(&disks, LIMITS).await.expect("latest legacy source");
+        assert!(stage_legacy_migration(&disks, &candidate, owner, LIMITS).await.is_err());
+        assert_eq!(slot_bytes(&disk).await, before, "the only payload containing b must not be overwritten");
+    }
+
+    #[tokio::test]
+    async fn migration_lower_limits_never_fall_back_to_a_smaller_old_generation() {
+        let root = TempDir::new().expect("test directory");
+        let disk = disk(&root, "disk").await;
+        let disks = [Some(disk.clone())];
+        let owner = Uuid::new_v4();
+        for name in ["a", "b"] {
+            source(&disk, &record(name, MrfKind::PartialWrite, None)).await;
+            let candidate = capture_legacy_migration(&disks, LIMITS).await.expect("capture");
+            stage_legacy_migration(&disks, &candidate, owner, LIMITS)
+                .await
+                .expect("committed generation");
+        }
+        source(&disk, &record("a", MrfKind::PartialWrite, None)).await;
+        let before = slot_bytes(&disk).await;
+        let first_len = before[0].as_ref().expect("first payload").len();
+        for limits in [
+            MigrationLimits {
+                max_bytes: first_len,
+                ..LIMITS
+            },
+            MigrationLimits {
+                max_records: 1,
+                ..LIMITS
+            },
+            MigrationLimits {
+                max_sources: 2,
+                ..LIMITS
+            },
+        ] {
+            assert!(matches!(
+                recover_pending_migration(&disks, limits).await,
+                Err(MigrationError::Snapshot(SnapshotError::TooLarge))
+            ));
+            assert_eq!(slot_bytes(&disk).await, before);
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_source_history_count_is_bounded_before_successor_write() {
+        let root = TempDir::new().expect("test directory");
+        let disk = disk(&root, "disk").await;
+        let disks = [Some(disk.clone())];
+        let owner = Uuid::new_v4();
+        let limits = MigrationLimits {
+            max_sources: 3,
+            ..LIMITS
+        };
+        let mut records = (0..10)
+            .map(|n| record(&n.to_string(), MrfKind::PartialWrite, None))
+            .collect::<Vec<_>>();
+        for round in 0..3 {
+            records.rotate_left(1);
+            source(&disk, &records.concat()).await;
+            let candidate = capture_legacy_migration(&disks, limits)
+                .await
+                .expect("bounded current sources");
+            assert_eq!(candidate.replay_records(limits).expect("same responsibilities").len(), 10);
+            let before = slot_bytes(&disk).await;
+            let result = stage_legacy_migration(&disks, &candidate, owner, limits).await;
+            if round < 2 {
+                assert_eq!(result.expect("within source count"), round + 1);
+            } else {
+                assert!(matches!(result, Err(MigrationError::Snapshot(SnapshotError::TooLarge))));
+                assert_eq!(slot_bytes(&disk).await, before);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_empty_legacy_sources_still_inherit_prior_responsibilities() {
+        let root = TempDir::new().expect("test directory");
+        let disk = disk(&root, "disk").await;
+        let disks = [Some(disk.clone())];
+        let owner = Uuid::new_v4();
+        let bytes = record("a", MrfKind::PartialWrite, None);
+        source(&disk, &bytes).await;
+        let candidate = capture_legacy_migration(&disks, LIMITS).await.expect("initial source");
+        stage_legacy_migration(&disks, &candidate, owner, LIMITS)
+            .await
+            .expect("initial stage");
+        EcstoreDiskAPI::compare_and_update_file(
+            disk.as_ref(),
+            RUSTFS_META_BUCKET,
+            MRF_SCOPED_JOURNAL_PATH,
+            Some(bytes.clone().into()),
+            None,
+        )
+        .await
+        .expect("legacy removes source");
+        let empty = capture_legacy_migration(&disks, LIMITS)
+            .await
+            .expect("valid absent-source observation");
+        assert!(empty.replay_records(LIMITS).expect("empty observation").is_empty());
+        assert_eq!(
+            stage_legacy_migration(&disks, &empty, owner, LIMITS)
+                .await
+                .expect("inherit earlier obligation"),
+            2
+        );
+        assert_eq!(
+            recover_pending_migration(&disks, LIMITS)
+                .await
+                .expect("restart")
+                .expect("pending")
+                .replay_records(LIMITS)
+                .expect("inherited responsibility"),
+            vec![bytes]
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_release_failure_still_releases_other_owned_claims() {
+        let root = TempDir::new().expect("test directory");
+        let first = disk(&root, "first").await;
+        let second = disk(&root, "second").await;
+        source(&first, &record("a", MrfKind::PartialWrite, None)).await;
+        source(&second, &record("a", MrfKind::PartialWrite, None)).await;
+        let disks = [Some(first), Some(second)];
+        let ordered = configured_disks(&disks).await.expect("disk order");
+        let owner = Uuid::new_v4();
+        let candidate = capture_legacy_migration(&disks, LIMITS).await.expect("capture");
+        INTERRUPTIONS.lock().expect("fault map").insert(owner, Boundary::Release);
+        assert!(stage_legacy_migration(&disks, &candidate, owner, LIMITS).await.is_err());
+        assert!(
+            read_bounded(&ordered[0], CLAIM, 64)
+                .await
+                .expect("failed release remains claimed")
+                .is_some()
+        );
+        assert!(
+            read_bounded(&ordered[1], CLAIM, 64)
+                .await
+                .expect("later release attempted")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_retry_repairs_missing_manifest_replica() {
+        let root = TempDir::new().expect("test directory");
+        let first = disk(&root, "first").await;
+        let second = disk(&root, "second").await;
+        let disks = [Some(first.clone()), Some(second.clone())];
+        let owner = Uuid::new_v4();
+        for name in ["a", "b"] {
+            let bytes = record(name, MrfKind::PartialWrite, None);
+            source(&first, &bytes).await;
+            source(&second, &bytes).await;
+            let candidate = capture_legacy_migration(&disks, LIMITS).await.expect("capture generation");
+            stage_legacy_migration(&disks, &candidate, owner, LIMITS)
+                .await
+                .expect("stage generation");
+        }
+        let candidate = capture_legacy_migration(&disks, LIMITS).await.expect("capture");
+        let committed = read_bounded(&second, COMMITS[1], MANIFEST_LEN)
+            .await
+            .expect("manifest")
+            .expect("committed");
+        EcstoreDiskAPI::compare_and_update_file(
+            second.as_ref(),
+            RUSTFS_META_BUCKET,
+            COMMITS[1],
+            Some(committed.clone().into()),
+            None,
+        )
+        .await
+        .expect("lost replica");
+        assert_eq!(
+            stage_legacy_migration(&disks, &candidate, owner, LIMITS)
+                .await
+                .expect("retry missing replica"),
+            2
+        );
+        assert_eq!(
+            read_bounded(&second, COMMITS[1], MANIFEST_LEN)
+                .await
+                .expect("repaired manifest"),
+            Some(committed)
+        );
     }
 }
