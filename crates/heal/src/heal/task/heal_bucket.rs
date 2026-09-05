@@ -554,7 +554,7 @@ impl HealTask {
 
                 continuation_token = next_heal_listing_token(bucket, prefix, next_token, is_truncated)?;
                 if continuation_token.is_none() {
-                    self.outcome.write().await.mark_untraversable();
+                    // Truncated without a continuation token is a compatibility EOF.
                     break;
                 }
             }

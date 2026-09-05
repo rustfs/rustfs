@@ -1778,6 +1778,8 @@ async fn test_recursive_bucket_heal_skips_object_dir_candidates() {
 
 #[tokio::test]
 async fn test_recursive_bucket_heal_treats_missing_continuation_token_as_end() {
+    use crate::heal::outcome::{HealExecutionOutcome, HealTraversalCoverage};
+
     // A version listing can report the final page as truncated with no
     // continuation token. That is treated as end-of-listing (not an error),
     // so the returned page is healed and the pass terminates cleanly instead
@@ -1799,9 +1801,15 @@ async fn test_recursive_bucket_heal_treats_missing_continuation_token_as_end() {
     );
     let task = HealTask::from_request(request, storage.clone());
 
-    task.heal_bucket("bucket-a")
+    task.execute()
         .await
         .expect("truncated-without-token must terminate cleanly, not loop or error");
+
+    assert_eq!(task.get_status().await, HealTaskStatus::Completed);
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+    assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+    assert_eq!(outcome.counters.processed, 1);
 
     assert_eq!(
         storage.healed_objects.lock().unwrap().as_slice(),
