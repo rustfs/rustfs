@@ -567,6 +567,32 @@ pub async fn update_if_incarnation(
         config_file,
         data,
         Some(expected_incarnation_id),
+        None,
+    ))
+    .await
+}
+
+/// [`update_if_incarnation`] stamping the config with `updated_at` instead of
+/// the local clock.
+///
+/// For a site-replication receiver the edit's source time is the peer's
+/// `updated_at`; persisting it keeps the stored `*_config_updated_at` on the
+/// source clock so the next item's staleness is judged source-time against
+/// source-time (backlog#2292). See [`BucketMetadata::update_config_at`].
+pub async fn update_if_incarnation_at(
+    bucket: &str,
+    config_file: &str,
+    data: Vec<u8>,
+    expected_incarnation_id: Uuid,
+    updated_at: OffsetDateTime,
+) -> Result<OffsetDateTime> {
+    Box::pin(update_with_sys_expected(
+        get_bucket_metadata_sys()?,
+        bucket,
+        config_file,
+        data,
+        Some(expected_incarnation_id),
+        Some(updated_at),
     ))
     .await
 }
@@ -577,6 +603,30 @@ pub async fn delete_if_incarnation(bucket: &str, config_file: &str, expected_inc
         bucket,
         config_file,
         Some(expected_incarnation_id),
+        None,
+    ))
+    .await
+}
+
+/// [`delete_if_incarnation`] stamping the cleared config with `updated_at`
+/// (a replicated deletion's source time) instead of the local clock.
+///
+/// The stamp survives the deletion as the config's `*_config_updated_at`, and
+/// that is what the next incoming item is judged against: a local stamp on
+/// the delete would reject a newer source re-create that was merely delivered
+/// later (backlog#2292). See [`update_if_incarnation_at`].
+pub async fn delete_if_incarnation_at(
+    bucket: &str,
+    config_file: &str,
+    expected_incarnation_id: Uuid,
+    updated_at: OffsetDateTime,
+) -> Result<OffsetDateTime> {
+    Box::pin(delete_with_sys_expected(
+        get_bucket_metadata_sys()?,
+        bucket,
+        config_file,
+        Some(expected_incarnation_id),
+        Some(updated_at),
     ))
     .await
 }
@@ -598,34 +648,41 @@ async fn update_with_sys(
     config_file: &str,
     data: Vec<u8>,
 ) -> Result<OffsetDateTime> {
-    update_with_sys_expected(sys, bucket, config_file, data, None).await
+    update_with_sys_expected(sys, bucket, config_file, data, None, None).await
 }
 
+/// `updated_at` is the stamp persisted on the config; `None` uses the local
+/// clock (the edit originates here), `Some` carries a replicated edit's
+/// source time (backlog#2292).
 async fn update_with_sys_expected(
     sys: Arc<RwLock<BucketMetadataSys>>,
     bucket: &str,
     config_file: &str,
     data: Vec<u8>,
     expected_incarnation_id: Option<Uuid>,
+    updated_at: Option<OffsetDateTime>,
 ) -> Result<OffsetDateTime> {
     let guard = acquire_config_write_guard_for_incarnation(sys.clone(), bucket, expected_incarnation_id).await?;
-    update_under_config_write_guard(sys, &guard, config_file, data).await
+    update_under_config_write_guard(sys, &guard, config_file, data, updated_at).await
 }
 
 /// [`delete`] against an explicitly supplied metadata system. See
 /// [`update_with_sys`].
 async fn delete_with_sys(sys: Arc<RwLock<BucketMetadataSys>>, bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
-    delete_with_sys_expected(sys, bucket, config_file, None).await
+    delete_with_sys_expected(sys, bucket, config_file, None, None).await
 }
 
+/// `updated_at`: `None` stamps the local clock; `Some` persists a replicated
+/// deletion's source time (backlog#2292).
 async fn delete_with_sys_expected(
     sys: Arc<RwLock<BucketMetadataSys>>,
     bucket: &str,
     config_file: &str,
     expected_incarnation_id: Option<Uuid>,
+    updated_at: Option<OffsetDateTime>,
 ) -> Result<OffsetDateTime> {
     let guard = acquire_config_write_guard_for_incarnation(sys.clone(), bucket, expected_incarnation_id).await?;
-    delete_under_config_write_guard(sys, &guard, config_file).await
+    delete_under_config_write_guard(sys, &guard, config_file, updated_at).await
 }
 
 /// Owns the complete bucket-config mutation fence.
@@ -772,7 +829,21 @@ pub async fn update_under_transaction_lock(
     data: Vec<u8>,
 ) -> Result<OffsetDateTime> {
     guard.ensure_valid(bucket)?;
-    update_under_config_write_guard(get_bucket_metadata_sys()?, guard, config_file, data).await
+    update_under_config_write_guard(get_bucket_metadata_sys()?, guard, config_file, data, None).await
+}
+
+/// [`update_under_transaction_lock`] stamping the config with `updated_at`
+/// (a replicated edit's source time) instead of the local clock; see
+/// [`update_if_incarnation_at`] (backlog#2292).
+pub async fn update_under_transaction_lock_at(
+    guard: &BucketMetadataMutationGuard,
+    bucket: &str,
+    config_file: &str,
+    data: Vec<u8>,
+    updated_at: OffsetDateTime,
+) -> Result<OffsetDateTime> {
+    guard.ensure_valid(bucket)?;
+    update_under_config_write_guard(get_bucket_metadata_sys()?, guard, config_file, data, Some(updated_at)).await
 }
 
 /// Clear one config file while the caller holds this bucket's transaction lock.
@@ -782,7 +853,7 @@ pub async fn delete_under_transaction_lock(
     config_file: &str,
 ) -> Result<OffsetDateTime> {
     guard.ensure_valid(bucket)?;
-    delete_under_config_write_guard(get_bucket_metadata_sys()?, guard, config_file).await
+    delete_under_config_write_guard(get_bucket_metadata_sys()?, guard, config_file, None).await
 }
 
 pub async fn update_quota_if_incarnation(
@@ -790,6 +861,29 @@ pub async fn update_quota_if_incarnation(
     data: Vec<u8>,
     expected_incarnation_id: Uuid,
     proof: &crate::services::notification_sys::CrossPoolFenceFleetProofToken,
+) -> Result<OffsetDateTime> {
+    update_quota_if_incarnation_stamped(bucket, data, expected_incarnation_id, proof, None).await
+}
+
+/// [`update_quota_if_incarnation`] stamping the quota config with
+/// `updated_at` (a replicated edit's source time) instead of the local
+/// clock; see [`update_if_incarnation_at`] (backlog#2292).
+pub async fn update_quota_if_incarnation_at(
+    bucket: &str,
+    data: Vec<u8>,
+    expected_incarnation_id: Uuid,
+    proof: &crate::services::notification_sys::CrossPoolFenceFleetProofToken,
+    updated_at: OffsetDateTime,
+) -> Result<OffsetDateTime> {
+    update_quota_if_incarnation_stamped(bucket, data, expected_incarnation_id, proof, Some(updated_at)).await
+}
+
+async fn update_quota_if_incarnation_stamped(
+    bucket: &str,
+    data: Vec<u8>,
+    expected_incarnation_id: Uuid,
+    proof: &crate::services::notification_sys::CrossPoolFenceFleetProofToken,
+    updated_at: Option<OffsetDateTime>,
 ) -> Result<OffsetDateTime> {
     let sys = get_bucket_metadata_sys()?;
     let guard = Box::pin(acquire_config_write_guard_for_incarnation(
@@ -807,7 +901,7 @@ pub async fn update_quota_if_incarnation(
             achieved: 0,
         });
     }
-    update_under_config_write_guard(sys, &guard, rustfs_config::QUOTA_CONFIG_FILE, data).await
+    update_under_config_write_guard(sys, &guard, rustfs_config::QUOTA_CONFIG_FILE, data, updated_at).await
 }
 
 pub async fn update_bucket_targets_under_transaction_lock(
@@ -823,6 +917,7 @@ async fn update_under_config_write_guard(
     guard: &BucketMetadataMutationGuard,
     config_file: &str,
     data: Vec<u8>,
+    updated_at: Option<OffsetDateTime>,
 ) -> Result<OffsetDateTime> {
     guard.ensure_valid(&guard.bucket)?;
     let metadata_sys = sys.read().await.clone();
@@ -834,7 +929,7 @@ async fn update_under_config_write_guard(
             Some(&guard.transaction_guard),
             &guard.bucket,
             "bucket config transaction",
-            metadata_sys.update_checked(&guard.bucket, config_file, data, true, guard.incarnation_id),
+            metadata_sys.update_checked(&guard.bucket, config_file, data, true, guard.incarnation_id, updated_at),
         ),
     )
     .await?;
@@ -846,6 +941,7 @@ async fn delete_under_config_write_guard(
     sys: Arc<RwLock<BucketMetadataSys>>,
     guard: &BucketMetadataMutationGuard,
     config_file: &str,
+    updated_at: Option<OffsetDateTime>,
 ) -> Result<OffsetDateTime> {
     guard.ensure_valid(&guard.bucket)?;
     let metadata_sys = sys.read().await.clone();
@@ -857,7 +953,7 @@ async fn delete_under_config_write_guard(
             Some(&guard.transaction_guard),
             &guard.bucket,
             "bucket config deletion transaction",
-            metadata_sys.update_checked(&guard.bucket, config_file, Vec::new(), false, guard.incarnation_id),
+            metadata_sys.update_checked(&guard.bucket, config_file, Vec::new(), false, guard.incarnation_id, updated_at),
         ),
     )
     .await?;
@@ -1762,15 +1858,17 @@ impl BucketMetadataSys {
     /// `update` and the config read alone). Keep these boxed.
     pub async fn update(&self, bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
         let incarnation_id = Box::pin(self.get_bucket_incarnation_id(bucket)).await?;
-        Box::pin(self.update_checked(bucket, config_file, data, true, incarnation_id)).await
+        Box::pin(self.update_checked(bucket, config_file, data, true, incarnation_id, None)).await
     }
 
     pub async fn delete(&self, bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
         let incarnation_id = self.get_bucket_incarnation_id(bucket).await?;
-        self.update_checked(bucket, config_file, Vec::new(), false, incarnation_id)
+        self.update_checked(bucket, config_file, Vec::new(), false, incarnation_id, None)
             .await
     }
 
+    /// `updated_at`: `None` stamps the local clock; `Some` persists a
+    /// replicated edit's source time (backlog#2292).
     async fn update_checked(
         &self,
         bucket: &str,
@@ -1778,6 +1876,7 @@ impl BucketMetadataSys {
         data: Vec<u8>,
         parse: bool,
         expected_incarnation_id: Uuid,
+        updated_at: Option<OffsetDateTime>,
     ) -> Result<OffsetDateTime> {
         // Load through this system's own store, the one `save` persists to
         // (backlog#1052 S7). Reading from the ambient handle instead made the
@@ -1788,7 +1887,10 @@ impl BucketMetadataSys {
             return Err(Error::BucketNotFound(bucket.to_string()));
         }
 
-        let updated = bm.update_config(config_file, data)?;
+        let updated = match updated_at {
+            Some(updated_at) => bm.update_config_at(config_file, data, updated_at)?,
+            None => bm.update_config(config_file, data)?,
+        };
 
         Box::pin(self.save(bm)).await?;
 
@@ -3755,6 +3857,106 @@ mod tests {
         );
     }
 
+    /// backlog#2292: the explicit-stamp write path persists the given source
+    /// time as the config's `*_config_updated_at` — through the incarnation
+    /// path and through an already-held transaction guard — and survives a
+    /// reload from disk, while the plain path keeps stamping the local clock.
+    #[tokio::test]
+    async fn explicit_updated_at_is_persisted_as_the_config_stamp() {
+        let (dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let bucket = "source-stamped-config";
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).expect("bucket volume should be created");
+        }
+        let sys = Arc::new(RwLock::new(BucketMetadataSys::new(ecstore)));
+        let source_time = OffsetDateTime::now_utc() - Duration::from_secs(3 * 3600);
+        let policy = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+        let tagging = b"<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>".to_vec();
+
+        // Incarnation path (`update_if_incarnation_at` minus the ambient lookup).
+        let stamped =
+            update_with_sys_expected(sys.clone(), bucket, BUCKET_POLICY_CONFIG, policy.clone(), None, Some(source_time))
+                .await
+                .expect("source-stamped policy write should persist");
+        assert_eq!(stamped, source_time);
+
+        // Held-guard path (`update_under_transaction_lock_at` minus the ambient lookup).
+        let guard = acquire_config_write_guard(sys.clone(), bucket).await.expect("write guard");
+        let stamped = update_under_config_write_guard(sys.clone(), &guard, BUCKET_TAGGING_CONFIG, tagging, Some(source_time))
+            .await
+            .expect("source-stamped tagging write should persist");
+        drop(guard);
+        assert_eq!(stamped, source_time);
+
+        let metadata_sys = sys.read().await.clone();
+        metadata_sys.metadata_map.write().await.clear();
+        let reloaded = metadata_sys.get_config_from_disk(bucket).await.expect("reload from disk");
+        assert_eq!(reloaded.policy_config_updated_at, source_time);
+        assert_eq!(reloaded.tagging_config_updated_at, source_time);
+
+        // The plain path is unchanged: a local edit is stamped with the local clock.
+        let before = OffsetDateTime::now_utc();
+        let stamped = update_with_sys(sys.clone(), bucket, BUCKET_POLICY_CONFIG, policy)
+            .await
+            .expect("locally stamped policy write should persist");
+        assert!(stamped >= before, "the plain write path must keep stamping the local clock");
+        let reloaded = metadata_sys.get_config_from_disk(bucket).await.expect("reload from disk");
+        assert_eq!(reloaded.policy_config_updated_at, stamped);
+        assert_eq!(
+            reloaded.tagging_config_updated_at, source_time,
+            "an unrelated config keeps its source stamp"
+        );
+    }
+
+    /// backlog#2292: a replicated delete persists the source time as the
+    /// cleared config's `*_config_updated_at`, so the receive-side gate
+    /// (source time against stored stamp) lets a newer source re-create land
+    /// even when the delete was applied later than the re-create's source
+    /// time; the plain delete keeps stamping the local clock.
+    #[tokio::test]
+    async fn explicit_updated_at_is_persisted_by_a_delete() {
+        let (dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let bucket = "source-stamped-delete";
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).expect("bucket volume should be created");
+        }
+        let sys = Arc::new(RwLock::new(BucketMetadataSys::new(ecstore)));
+        let policy = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+        let created_at = OffsetDateTime::now_utc() - Duration::from_secs(3 * 3600);
+        let deleted_at = created_at + Duration::from_secs(60);
+        let recreated_at = deleted_at + Duration::from_secs(60);
+
+        update_with_sys_expected(sys.clone(), bucket, BUCKET_POLICY_CONFIG, policy.clone(), None, Some(created_at))
+            .await
+            .expect("source-stamped policy write should persist");
+        let stamped = delete_with_sys_expected(sys.clone(), bucket, BUCKET_POLICY_CONFIG, None, Some(deleted_at))
+            .await
+            .expect("source-stamped policy delete should persist");
+        assert_eq!(stamped, deleted_at);
+
+        let metadata_sys = sys.read().await.clone();
+        metadata_sys.metadata_map.write().await.clear();
+        let reloaded = metadata_sys.get_config_from_disk(bucket).await.expect("reload from disk");
+        assert!(reloaded.policy_config_json.is_empty(), "the delete cleared the payload");
+        assert_eq!(reloaded.policy_config_updated_at, deleted_at, "the delete kept the source stamp");
+        assert!(
+            recreated_at >= reloaded.policy_config_updated_at,
+            "a re-create newer than the delete's source time is not stale against the stored stamp"
+        );
+
+        // The plain delete path is unchanged: stamped with the local clock.
+        update_with_sys_expected(sys.clone(), bucket, BUCKET_POLICY_CONFIG, policy, None, Some(recreated_at))
+            .await
+            .expect("re-create should persist");
+        let before = OffsetDateTime::now_utc();
+        let stamped = delete_with_sys_expected(sys.clone(), bucket, BUCKET_POLICY_CONFIG, None, None)
+            .await
+            .expect("locally stamped delete should persist");
+        assert!(stamped >= before, "the plain delete path must keep stamping the local clock");
+        let reloaded = metadata_sys.get_config_from_disk(bucket).await.expect("reload from disk");
+        assert_eq!(reloaded.policy_config_updated_at, stamped);
+    }
+
     /// The load and the persisted write share one write guard, so concurrent
     /// rewrites of the same config compose instead of clobbering each other.
     /// Moving the load outside that guard loses all but the last tag.
@@ -3971,10 +4173,16 @@ mod tests {
         let new_incarnation = store.bucket_incarnation_id_from_disk(bucket).await.unwrap();
         assert_ne!(old_incarnation, new_incarnation);
 
-        let err =
-            update_with_sys_expected(sys.clone(), bucket, BUCKET_TAGGING_CONFIG, b"<Tagging/>".to_vec(), Some(old_incarnation))
-                .await
-                .expect_err("a request authorized for the deleted incarnation must fail closed");
+        let err = update_with_sys_expected(
+            sys.clone(),
+            bucket,
+            BUCKET_TAGGING_CONFIG,
+            b"<Tagging/>".to_vec(),
+            Some(old_incarnation),
+            None,
+        )
+        .await
+        .expect_err("a request authorized for the deleted incarnation must fail closed");
         assert!(matches!(err, Error::BucketNotFound(name) if name == bucket));
 
         let persisted = sys.read().await.get_config_from_disk(bucket).await.unwrap();
@@ -4009,7 +4217,7 @@ mod tests {
             }],
         })
         .unwrap();
-        update_under_config_write_guard(sys, &guard, BUCKET_TAGGING_CONFIG, tagging)
+        update_under_config_write_guard(sys, &guard, BUCKET_TAGGING_CONFIG, tagging, None)
             .await
             .unwrap();
         assert!(!delete.is_finished());

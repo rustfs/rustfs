@@ -554,6 +554,145 @@ fn test_iam_item_deletion_entity_shapes() {
     assert!(iam_item_deletion_entity(&policy_set).is_none());
 }
 
+/// Deletion marks (backlog#2291) key on the same entities as the replay
+/// records, except that a group member removal is marked per member (so a
+/// stale re-add of one member can be judged) and a group delete marks the
+/// group itself. Creates and updates leave no mark.
+#[test]
+fn test_iam_item_deletion_mark_entities_shapes() {
+    assert_eq!(
+        iam_item_deletion_mark_entities(&user_delete_item("alice")),
+        vec!["iam-user:alice".to_string()]
+    );
+    assert_eq!(
+        iam_item_deletion_mark_entities(&policy_delete_item("readonly")),
+        vec!["policy:readonly".to_string()]
+    );
+
+    let mut group_remove = SRIAMItem {
+        r#type: "group-info".to_string(),
+        group_info: Some(SRGroupInfo {
+            update_req: GroupAddRemove {
+                group: "devs".to_string(),
+                members: vec!["bob".to_string(), "alice".to_string()],
+                status: GroupStatus::Enabled,
+                is_remove: true,
+            },
+            api_version: None,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        iam_item_deletion_mark_entities(&group_remove),
+        vec!["group-member:devs:bob".to_string(), "group-member:devs:alice".to_string()]
+    );
+    group_remove
+        .group_info
+        .as_mut()
+        .expect("group info")
+        .update_req
+        .members
+        .clear();
+    assert_eq!(
+        iam_item_deletion_mark_entities(&group_remove),
+        vec!["group:devs".to_string()],
+        "a removal without members deletes the group"
+    );
+    group_remove.group_info.as_mut().expect("group info").update_req.is_remove = false;
+    assert!(iam_item_deletion_mark_entities(&group_remove).is_empty());
+
+    let mapping_clear = SRIAMItem {
+        r#type: "policy-mapping".to_string(),
+        policy_mapping: Some(SRPolicyMapping {
+            user_or_group: "alice".to_string(),
+            user_type: 0,
+            is_group: false,
+            policy: String::new(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        iam_item_deletion_mark_entities(&mapping_clear),
+        vec!["policy-mapping:alice:0:false".to_string()]
+    );
+
+    let mut user_create = user_delete_item("alice");
+    user_create.iam_user.as_mut().expect("iam user").is_delete_req = false;
+    assert!(iam_item_deletion_mark_entities(&user_create).is_empty());
+}
+
+/// Newest wins per entity, marks are pruned by age only (never by count: a
+/// count bound would drop a mark still inside the delivery window as soon as
+/// enough newer deletions happen), and the timestamps survive the state
+/// object as RFC 3339.
+#[test]
+fn test_record_iam_deletion_marks_newest_wins_and_expires_by_age_only() {
+    let at = |seconds: i64| OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds);
+    let now = at(1_000_000);
+    let mut state = SiteReplicationState::default();
+    let alice = vec!["iam-user:alice".to_string()];
+
+    assert!(record_iam_deletion_marks_at(&mut state, &alice, at(20), now));
+    assert!(
+        !record_iam_deletion_marks_at(&mut state, &alice, at(10), now),
+        "an older deletion does not move the mark"
+    );
+    assert!(
+        !record_iam_deletion_marks_at(&mut state, &alice, at(20), now),
+        "a replayed deletion is not a change"
+    );
+    assert_eq!(iam_deletion_mark(&state, &alice), Some(at(20)));
+    assert!(record_iam_deletion_marks_at(&mut state, &alice, at(30), now));
+    assert_eq!(iam_deletion_mark(&state, &alice), Some(at(30)));
+    assert_eq!(iam_deletion_mark(&state, &["iam-user:bob".to_string()]), None);
+    assert!(!record_iam_deletion_marks_at(&mut state, &[], at(40), now));
+
+    // Many newer deletions never evict an older mark that is still within the retention.
+    let members: Vec<String> = (0..4096).map(|index| format!("group-member:devs:user-{index:04}")).collect();
+    for (index, member) in members.iter().enumerate() {
+        record_iam_deletion_marks_at(&mut state, std::slice::from_ref(member), at(100 + index as i64), now);
+    }
+    assert_eq!(state.iam_deletion_marks.len(), members.len() + 1);
+    assert_eq!(iam_deletion_mark(&state, &alice), Some(at(30)), "no count-based eviction");
+
+    // Marks older than the retention are pruned, on the pass that records a
+    // newer one and on a pass that changes nothing else; younger ones stay.
+    let later = at(100) + SITE_REPLICATION_IAM_DELETION_MARK_RETENTION;
+    assert!(
+        record_iam_deletion_marks_at(&mut state, &["iam-user:carol".to_string()], at(200_000), later),
+        "pruning alone is a change"
+    );
+    assert_eq!(iam_deletion_mark(&state, &alice), None, "alice's mark aged out");
+    assert_eq!(
+        iam_deletion_mark(&state, &members[..1]),
+        Some(at(100)),
+        "a mark exactly at the retention edge stays, and so do the younger ones"
+    );
+    assert_eq!(state.iam_deletion_marks.len(), members.len() + 1);
+    assert_eq!(iam_deletion_mark(&state, &["iam-user:carol".to_string()]), Some(at(200_000)));
+    let mut state = SiteReplicationState::default();
+    record_iam_deletion_marks_at(&mut state, &alice, at(30), now);
+    let past_edge = at(30) + SITE_REPLICATION_IAM_DELETION_MARK_RETENTION + time::Duration::seconds(1);
+    assert!(
+        record_iam_deletion_marks_at(&mut state, &[], at(0), past_edge),
+        "a pass that only prunes reports the change"
+    );
+    assert_eq!(iam_deletion_mark(&state, &alice), None);
+    record_iam_deletion_marks_at(&mut state, &alice, at(30), now);
+
+    let json = serde_json::to_value(&state).expect("serialize state");
+    assert_eq!(json["iam_deletion_marks"]["iam-user:alice"], serde_json::json!("1970-01-01T00:00:30Z"));
+    let reloaded = parse_site_replication_state(&serde_json::to_vec(&state).expect("serialize state")).expect("parse state");
+    assert_eq!(reloaded.iam_deletion_marks, state.iam_deletion_marks);
+    assert!(
+        parse_site_replication_state(br#"{"name":"a","service_account_access_key":"","service_account_parent":"","peers":{},"updated_at":null,"resync_status":{}}"#)
+            .expect("state without marks")
+            .iam_deletion_marks
+            .is_empty()
+    );
+}
+
 /// A failed deletion delivery persists a replay record next to the collapsed
 /// retry entry; a fresh entry is stamped `deletions_recorded` so a later
 /// replay can settle it, and a repeated deletion of the same entity keeps the
@@ -1679,7 +1818,8 @@ fn test_site_replication_bootstrap_plan_includes_replayable_snapshot_items() {
         },
     );
 
-    let plan = site_replication_bootstrap_plan(&info).expect("bootstrap plan should build");
+    let plan =
+        site_replication_bootstrap_plan(&info, &SiteReplicationIamCredentials::default()).expect("bootstrap plan should build");
 
     assert_eq!(plan.iam_items.iter().map(|item| item.r#type.as_str()).collect::<Vec<_>>(), {
         vec!["policy", "iam-user", "group-info", "policy-mapping"]
@@ -1717,7 +1857,8 @@ fn test_site_replication_bootstrap_plan_skips_lifecycle_by_default() {
         },
     );
 
-    let plan = site_replication_bootstrap_plan(&info).expect("bootstrap plan should build");
+    let plan =
+        site_replication_bootstrap_plan(&info, &SiteReplicationIamCredentials::default()).expect("bootstrap plan should build");
 
     assert!(!plan.bucket_items.iter().any(|item| item.r#type == "lc-config"));
 }
@@ -1748,7 +1889,8 @@ fn test_site_replication_bootstrap_plan_emits_timestamped_lifecycle_delete() {
         },
     );
 
-    let plan = site_replication_bootstrap_plan(&info).expect("bootstrap plan should build");
+    let plan =
+        site_replication_bootstrap_plan(&info, &SiteReplicationIamCredentials::default()).expect("bootstrap plan should build");
 
     let item = plan
         .bucket_items
@@ -1935,8 +2077,8 @@ fn test_site_replication_repair_preflight_token_is_deterministic_for_equal_state
         },
     );
 
-    let plan_a = site_replication_bootstrap_plan(&info).expect("first plan");
-    let plan_b = site_replication_bootstrap_plan(&info).expect("second plan");
+    let plan_a = site_replication_bootstrap_plan(&info, &SiteReplicationIamCredentials::default()).expect("first plan");
+    let plan_b = site_replication_bootstrap_plan(&info, &SiteReplicationIamCredentials::default()).expect("second plan");
     let token_a = site_replication_repair_preflight_token(&state, &plan_a, b"test-signing-key").expect("first token");
     let token_b = site_replication_repair_preflight_token(&state, &plan_b, b"test-signing-key").expect("second token");
 
@@ -3218,4 +3360,346 @@ fn test_reconcile_adds_missing_peer_rules_to_existing_config() {
     let rule_ids: Vec<&str> = existing_rules.iter().filter_map(|r| r.id.as_deref()).collect();
     assert!(rule_ids.contains(&"site-repl-dep-b"));
     assert!(rule_ids.contains(&"site-repl-dep-c"));
+}
+
+/// backlog#2289: the IAM snapshot (retry resend, repair, site-add bootstrap)
+/// used to be built from `list_users`, whose `UserInfo` never carries a
+/// secret key, so the plan dropped every user and a status change or secret
+/// rotation committed while a peer was unreachable never reached it. The
+/// credentials now come from a separate store read; SRInfo stays secret-free.
+#[test]
+fn test_bootstrap_plan_carries_users_from_the_credential_snapshot() {
+    let mut info = SRInfo::default();
+    // Exactly what `list_users` builds: status, policy, updated_at — never secret_key.
+    info.user_info_map.insert(
+        "alice".to_string(),
+        rustfs_madmin::UserInfo {
+            status: rustfs_madmin::AccountStatus::Disabled,
+            policy_name: Some("readwrite".to_string()),
+            updated_at: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp")),
+            ..Default::default()
+        },
+    );
+    info.user_info_map.insert(
+        "external-idp-user".to_string(),
+        rustfs_madmin::UserInfo {
+            status: rustfs_madmin::AccountStatus::Enabled,
+            ..Default::default()
+        },
+    );
+    let user_updated_at = OffsetDateTime::from_unix_timestamp(1_700_000_500).expect("timestamp");
+    let mut credentials = SiteReplicationIamCredentials::default();
+    credentials.users.insert(
+        "alice".to_string(),
+        SiteReplicationUserCredential {
+            secret_key: "alice-secret".to_string(),
+            status: rustfs_madmin::AccountStatus::Disabled,
+            updated_at: Some(user_updated_at),
+        },
+    );
+
+    let plan = site_replication_bootstrap_plan(&info, &credentials).expect("bootstrap plan should build");
+
+    let users: Vec<_> = plan.iam_items.iter().filter(|item| item.r#type == "iam-user").collect();
+    assert_eq!(users.len(), 1, "only the user with a credential travels: {:?}", plan.iam_items);
+    let alice = users[0].iam_user.as_ref().expect("iam user body");
+    assert_eq!(alice.access_key, "alice");
+    let req = alice.user_req.as_ref().expect("user request");
+    assert_eq!(req.secret_key, "alice-secret");
+    assert_eq!(req.status, rustfs_madmin::AccountStatus::Disabled);
+    assert_eq!(req.policy.as_deref(), Some("readwrite"));
+    // the user record's own axis, not the policy-mapping time list_users reports
+    assert_eq!(users[0].updated_at, Some(user_updated_at));
+}
+
+fn service_account_snapshot(access_key: &str, parent: &str, status: &str) -> SiteReplicationServiceAccountSnapshot {
+    SiteReplicationServiceAccountSnapshot {
+        create: rustfs_madmin::SRSvcAccCreate {
+            parent: parent.to_string(),
+            access_key: access_key.to_string(),
+            secret_key: format!("{access_key}-secret"),
+            groups: Vec::new(),
+            claims: HashMap::new(),
+            session_policy: SRSessionPolicy::default(),
+            status: status.to_string(),
+            name: String::new(),
+            description: String::new(),
+            expiration: None,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        },
+        envelope: None,
+        updated_at: Some(OffsetDateTime::from_unix_timestamp(1_700_000_600).expect("timestamp")),
+    }
+}
+
+/// backlog#2289: service accounts were absent from every snapshot (the
+/// listing filters them). They now travel as the create item the live hook
+/// emits — after their parents — carrying secret and status.
+#[test]
+fn test_bootstrap_plan_emits_service_accounts_after_their_parents() {
+    let mut info = SRInfo::default();
+    info.user_info_map
+        .insert("alice".to_string(), rustfs_madmin::UserInfo::default());
+    let mut credentials = SiteReplicationIamCredentials::default();
+    credentials.users.insert(
+        "alice".to_string(),
+        SiteReplicationUserCredential {
+            secret_key: "alice-secret".to_string(),
+            status: rustfs_madmin::AccountStatus::Enabled,
+            updated_at: None,
+        },
+    );
+    credentials
+        .service_accounts
+        .push(service_account_snapshot("alice-svc", "alice", "off"));
+
+    let plan = site_replication_bootstrap_plan(&info, &credentials).expect("bootstrap plan should build");
+
+    let types: Vec<_> = plan.iam_items.iter().map(|item| item.r#type.as_str()).collect();
+    assert_eq!(types, vec!["iam-user", "service-account"]);
+    let change = plan.iam_items[1].svc_acc_change.as_ref().expect("service account change");
+    let create = change.create.as_ref().expect("create body");
+    assert_eq!((create.access_key.as_str(), create.parent.as_str()), ("alice-svc", "alice"));
+    assert_eq!(create.secret_key, "alice-svc-secret");
+    assert_eq!(create.status, "off", "a disabled account must arrive disabled");
+    assert!(change.delete.is_none() && change.update.is_none());
+}
+
+/// A service account present in the previous snapshot but gone from the
+/// fresh one is replayed as an explicit delete, like the other IAM kinds.
+#[test]
+fn test_retry_snapshot_tombstones_removed_service_accounts() {
+    let observed_at = OffsetDateTime::from_unix_timestamp(1_700_001_000).expect("timestamp");
+    let mut info = SRInfo::default();
+    info.user_info_map
+        .insert("alice".to_string(), rustfs_madmin::UserInfo::default());
+    let mut credentials = SiteReplicationIamCredentials::default();
+    credentials.users.insert(
+        "alice".to_string(),
+        SiteReplicationUserCredential {
+            secret_key: "alice-secret".to_string(),
+            status: rustfs_madmin::AccountStatus::Enabled,
+            updated_at: None,
+        },
+    );
+    let mut with_account = credentials.clone();
+    with_account
+        .service_accounts
+        .push(service_account_snapshot("alice-svc", "alice", "on"));
+    let previous = site_replication_bootstrap_plan(&info, &with_account).expect("previous plan");
+    let fresh = site_replication_bootstrap_plan(&info, &credentials).expect("fresh plan");
+
+    let replay = RetrySnapshot::replay_after_change(
+        &RetrySnapshot::Iam(previous.iam_items),
+        &RetrySnapshot::Iam(fresh.iam_items),
+        observed_at,
+    );
+    let RetrySnapshot::Iam(items) = replay else {
+        panic!("IAM snapshot expected");
+    };
+    let tombstone = items
+        .iter()
+        .find(|item| item.r#type == "service-account")
+        .expect("service account tombstone");
+    let change = tombstone.svc_acc_change.as_ref().expect("change");
+    assert_eq!(change.delete.as_ref().map(|delete| delete.access_key.as_str()), Some("alice-svc"));
+    assert!(change.create.is_none());
+    assert_eq!(tombstone.updated_at, Some(observed_at));
+}
+
+/// Spawns a one-shot HTTP peer that answers 200 and flips the returned flag
+/// once a request head has arrived.
+async fn spawn_reached_probe_peer() -> (String, Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind healthy peer");
+    let endpoint = format!("http://{}", listener.local_addr().expect("healthy peer address"));
+    let reached = Arc::new(AtomicBool::new(false));
+    let reached_by_server = reached.clone();
+    let server = tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let Ok(read) = stream.read(&mut buffer).await else {
+                return;
+            };
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        reached_by_server.store(true, Ordering::SeqCst);
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+            .await;
+    });
+    (endpoint, reached, server)
+}
+
+/// Three-peer runtime whose local peer is `local`; BTreeMap order visits the
+/// failing peer `b` before the healthy peer `c`.
+fn broadcast_runtime_with_failing_peer_before_healthy(failing_endpoint: &str, healthy_endpoint: &str) -> SiteReplicationRuntime {
+    let local_peer = PeerInfo {
+        deployment_id: "local".to_string(),
+        ..peer("local", "http://127.0.0.1:9")
+    };
+    let mut state = SiteReplicationState {
+        name: "local".to_string(),
+        service_account_access_key: "site-replicator-0".to_string(),
+        ..Default::default()
+    };
+    state.peers.insert("local".to_string(), local_peer.clone());
+    state.peers.insert(
+        "b".to_string(),
+        PeerInfo {
+            deployment_id: "b".to_string(),
+            ..peer("b", failing_endpoint)
+        },
+    );
+    state.peers.insert(
+        "c".to_string(),
+        PeerInfo {
+            deployment_id: "c".to_string(),
+            ..peer("c", healthy_endpoint)
+        },
+    );
+    SiteReplicationRuntime {
+        state,
+        local_peer,
+        service_account_secret_key: "site-replicator-secret".to_string(),
+    }
+}
+
+const BROADCAST_PROBE_DELETE_BUCKET_PATH: &str =
+    "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket";
+
+/// The generic JSON broadcast (bucket make/delete, bucket-meta hook, bucket
+/// ops) attempts every remote peer: a peer whose request fails must not stop
+/// delivery to the peers that follow it in deployment-id order, and the
+/// failure is still reported to the caller (backlog#2293).
+#[tokio::test]
+#[serial]
+async fn test_broadcast_json_reaches_healthy_peers_after_a_failed_peer() {
+    // Peer "b": nothing listens on the port, so the connect is refused.
+    let refused = TcpListener::bind("127.0.0.1:0").await.expect("bind refused-peer probe");
+    let refused_endpoint = format!("http://{}", refused.local_addr().expect("refused-peer address"));
+    drop(refused);
+
+    let (healthy_endpoint, reached, server) = spawn_reached_probe_peer().await;
+    let runtime = broadcast_runtime_with_failing_peer_before_healthy(&refused_endpoint, &healthy_endpoint);
+
+    let result = temp_env::async_with_vars([(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV, Some("true"))], async {
+        broadcast_site_replication_json_with_runtime(&runtime, BROADCAST_PROBE_DELETE_BUCKET_PATH, &serde_json::json!({})).await
+    })
+    .await;
+
+    let err = result.expect_err("peer b refuses connections, the broadcast must report it");
+    assert!(
+        reached.load(Ordering::SeqCst),
+        "peer c never received the broadcast once peer b failed: {err}"
+    );
+    server.abort();
+}
+
+/// Same guarantee when the failing peer never gets a transport: an endpoint
+/// that `PeerTransport::for_runtime_peer` rejects must be skipped past (and
+/// reported), not abort the broadcast before the healthy peers (backlog#2293).
+#[tokio::test]
+#[serial]
+async fn test_broadcast_json_reaches_healthy_peers_after_a_peer_without_transport() {
+    // Peer "b": a scheme the peer connection validator refuses outright.
+    let forbidden_endpoint = "ftp://peer-b.example.com";
+
+    let (healthy_endpoint, reached, server) = spawn_reached_probe_peer().await;
+    let runtime = broadcast_runtime_with_failing_peer_before_healthy(forbidden_endpoint, &healthy_endpoint);
+
+    let result = temp_env::async_with_vars([(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV, Some("true"))], async {
+        broadcast_site_replication_json_with_runtime(&runtime, BROADCAST_PROBE_DELETE_BUCKET_PATH, &serde_json::json!({})).await
+    })
+    .await;
+
+    let err = result.expect_err("peer b has no usable transport, the broadcast must report it");
+    assert!(
+        err.to_string().contains("invalid persisted site replication peer"),
+        "the reported error must be peer b's transport failure: {err}"
+    );
+    assert!(
+        reached.load(Ordering::SeqCst),
+        "peer c never received the broadcast once peer b failed to get a transport: {err}"
+    );
+    server.abort();
+}
+
+fn service_account_item_with_claims(order: &[&str]) -> SRIAMItem {
+    let mut claims = HashMap::new();
+    for key in order {
+        claims.insert((*key).to_string(), serde_json::json!(format!("value-of-{key}")));
+    }
+    SRIAMItem {
+        r#type: "service-account".to_string(),
+        svc_acc_change: Some(SRSvcAccChange {
+            create: Some(rustfs_madmin::SRSvcAccCreate {
+                parent: "alice".to_string(),
+                access_key: "alice-svc".to_string(),
+                secret_key: "alice-svc-secret".to_string(),
+                groups: Vec::new(),
+                claims,
+                session_policy: SRSessionPolicy::default(),
+                status: "on".to_string(),
+                name: String::new(),
+                description: String::new(),
+                expiration: None,
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        }),
+        updated_at: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp")),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The repair preflight token and the retry-snapshot fingerprint hash the
+/// serialized items. Service-account claims live in a `HashMap`, whose
+/// iteration order differs between instances, so the hash must not depend on
+/// it (the real-VM repair returned 412 "preflight is stale" between dry-run
+/// and execute once snapshots carried service accounts).
+#[test]
+fn test_repair_task_id_and_retry_fingerprint_ignore_claim_map_order() {
+    let forward = service_account_item_with_claims(&["accessKey", "exp", "parent", "sa-policy", "sub", "tenant"]);
+    let backward = service_account_item_with_claims(&["tenant", "sub", "sa-policy", "parent", "exp", "accessKey"]);
+
+    let canonical = canonical_json_vec(&forward).expect("canonical json");
+    let text = String::from_utf8(canonical).expect("utf8");
+    let positions: Vec<usize> = [
+        "\"accessKey\"",
+        "\"exp\"",
+        "\"parent\"",
+        "\"sa-policy\"",
+        "\"sub\"",
+        "\"tenant\"",
+    ]
+    .iter()
+    .map(|key| text.find(key).expect("claim key present"))
+    .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "claim keys must serialize sorted: {text}"
+    );
+
+    assert_eq!(
+        SiteReplicationRepairTask::Iam(&forward).id().expect("id"),
+        SiteReplicationRepairTask::Iam(&backward).id().expect("id"),
+        "identical items must yield the same repair task id regardless of claim map order"
+    );
+    assert_eq!(
+        RetrySnapshot::Iam(vec![forward]).fingerprint().expect("fingerprint"),
+        RetrySnapshot::Iam(vec![backward]).fingerprint().expect("fingerprint"),
+        "identical snapshots must fingerprint equal regardless of claim map order"
+    );
 }

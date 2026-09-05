@@ -32,11 +32,11 @@ use super::replication_msgp_boundary::ReplicationMsgpCodec;
 use super::replication_object_config::{ReplicationConfig, get_replication_config, must_replicate};
 use super::replication_object_decision_boundary::{
     MustReplicateOptions, ReplicationMultipartPartInput, delete_marker_purge_mrf_entry, delete_marker_purge_version_id,
-    delete_replication_creates_marker, heal_uses_delete_replication_path, is_object_lock_denied_delete,
-    is_retryable_delete_replication_head_error, is_version_delete_replication, replicate_delete_outcome, replication_etags_match,
-    replication_multipart_complete_actual_size, replication_multipart_part_plan, replication_single_put_size_error,
-    resync_existing_delete_replication_info, should_retry_delete_marker_purge, single_part_replica_etag_mismatch,
-    target_delete_version_id,
+    delete_replication_creates_marker, delete_replication_target_version_id, heal_uses_delete_replication_path,
+    is_object_lock_denied_delete, is_retryable_delete_replication_head_error, is_version_delete_replication,
+    replicate_delete_outcome, replication_etags_match, replication_multipart_complete_actual_size,
+    replication_multipart_part_plan, replication_single_put_size_error, resync_existing_delete_replication_info,
+    should_retry_delete_marker_purge, single_part_replica_etag_mismatch,
 };
 use super::replication_queue_boundary::{DeletedObjectReplicationInfo, ReplicationQueueAdmission};
 use super::replication_resync_boundary::ResyncStatusType;
@@ -2051,7 +2051,11 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
 
     let is_version_purge = is_version_delete_replication(&dobj.delete_object);
 
-    let requires_delayed_purge = should_retry_delete_marker_purge(&dobj.delete_object);
+    // The watcher exists to purge a replicated marker once the SOURCE marker
+    // vanishes. A version purge is that purge already (its failures reach the
+    // journal as a purge entry), so it must not spawn a second watcher that
+    // journals a duplicate intent (backlog#2290).
+    let requires_delayed_purge = should_retry_delete_marker_purge(&dobj.delete_object) && !is_version_purge;
 
     let (replication_status, prev_status) = if !is_version_purge {
         (
@@ -2761,12 +2765,6 @@ fn unavailable_delete_target_info(dobj: &DeletedObjectReplicationInfo, arn: &str
 }
 
 async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
-    let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
-        version_id.to_owned()
-    } else {
-        dobj.delete_object.version_id.unwrap_or_default()
-    };
-
     let mut rinfo = dobj
         .delete_object
         .replication_state
@@ -2799,7 +2797,25 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         return rinfo;
     }
 
-    let version_id = target_delete_version_id(version_id, is_version_purge);
+    // Purging a replicated delete marker addresses the version the target
+    // assigned (recorded when the marker was created there); see
+    // `delete_replication_target_version_id`. A corrupt record is a failure,
+    // not a guess: the entry stays visible until the metadata is repaired.
+    let Some(version_id) = delete_replication_target_version_id(&dobj.delete_object, &tgt_client.arn) else {
+        warn!(
+            event = EVENT_DELETE_MARKER_PURGE_FAILED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+            bucket = tgt_client.bucket,
+            object = dobj.delete_object.object_name,
+            arn = %tgt_client.arn,
+            reason = "recorded_target_version_inconsistent",
+            "Replicated version purge refused: recorded target delete-marker version metadata is inconsistent"
+        );
+        rinfo.version_purge_status = VersionPurgeStatusType::Failed;
+        rinfo.error = Some("recorded target delete-marker version metadata is inconsistent".to_string());
+        return rinfo;
+    };
 
     if dobj.delete_object.delete_marker && dobj.delete_object.delete_marker_version_id.is_some() {
         match head_object_for_worker(

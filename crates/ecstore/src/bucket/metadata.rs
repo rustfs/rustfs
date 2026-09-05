@@ -791,9 +791,22 @@ impl BucketMetadata {
         }
     }
 
+    /// Replace one config payload and stamp its `*_config_updated_at` with the
+    /// local clock. This is the entry for edits that originate here: the
+    /// local write time is the edit's source time.
     pub fn update_config(&mut self, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
-        let updated = OffsetDateTime::now_utc();
+        self.update_config_at(config_file, data, OffsetDateTime::now_utc())
+    }
 
+    /// [`Self::update_config`] with an explicit `updated_at` stamp.
+    ///
+    /// For a config replicated from another site the edit's source time is
+    /// the peer's `updated_at`, not the moment it lands here: staleness of
+    /// the next incoming item is judged against the stored stamp, so stamping
+    /// the local apply time would reject a newer source edit that was merely
+    /// delivered late (backlog#2292). Only replication receivers should pass
+    /// a foreign time; local edits keep [`Self::update_config`].
+    pub fn update_config_at(&mut self, config_file: &str, data: Vec<u8>, updated: OffsetDateTime) -> Result<OffsetDateTime> {
         match config_file {
             BUCKET_POLICY_CONFIG => {
                 self.policy_config_json = data;
@@ -1523,6 +1536,39 @@ mod test {
         metadata.update_config(OBJECT_LOCK_CONFIG, Vec::new()).unwrap();
 
         assert_eq!(metadata.bucket_incarnation_id, incarnation);
+    }
+
+    /// backlog#2292: a replicated config is stamped with the source
+    /// `updated_at` it was given, not the local clock, while the plain
+    /// `update_config` entry keeps stamping the local clock.
+    #[test]
+    fn update_config_at_stamps_the_given_time_and_update_config_stamps_now() {
+        let source_time = OffsetDateTime::now_utc() - time::Duration::hours(3);
+        let mut metadata = BucketMetadata::new("source-stamped");
+
+        let stamped = metadata
+            .update_config_at(BUCKET_POLICY_CONFIG, br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec(), source_time)
+            .unwrap();
+        assert_eq!(stamped, source_time);
+        assert_eq!(metadata.policy_config_updated_at, source_time);
+
+        let tagging = b"<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>".to_vec();
+        let stamped = metadata
+            .update_config_at(BUCKET_TAGGING_CONFIG, tagging, source_time)
+            .unwrap();
+        assert_eq!(stamped, source_time);
+        assert_eq!(metadata.tagging_config_updated_at, source_time);
+
+        let before = OffsetDateTime::now_utc();
+        let stamped = metadata
+            .update_config(BUCKET_POLICY_CONFIG, br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec())
+            .unwrap();
+        assert!(stamped >= before, "a local edit is stamped with the local clock");
+        assert_eq!(metadata.policy_config_updated_at, stamped);
+        assert_eq!(
+            metadata.tagging_config_updated_at, source_time,
+            "restamping one config must not move another config's stamp"
+        );
     }
 
     #[test]

@@ -429,6 +429,27 @@ where
         }
     }
 
+    /// The cached mapping record for one user or group, looked up in the same
+    /// cache partition `policy_db_set` writes it to (group / STS / regular+service
+    /// user). `None` when no mapping is stored.
+    pub async fn get_mapped_policy_record(&self, name: &str, user_type: UserType, is_group: bool) -> Option<MappedPolicy> {
+        let cache = self.cache.snapshot();
+        if is_group {
+            cache.group_policies.get(name).cloned()
+        } else if user_type == UserType::Sts {
+            cache.sts_policies.get(name).cloned()
+        } else {
+            cache.user_policies.get(name).cloned()
+        }
+    }
+
+    /// The cached group record (members, status, own timestamp) without the
+    /// mapped-policy overlay `get_group_description` applies. `None` when the
+    /// group does not exist.
+    pub async fn get_group_info(&self, name: &str) -> Option<GroupInfo> {
+        self.cache.snapshot().groups.get(name).cloned()
+    }
+
     pub async fn get_policy(&self, name: &str) -> Result<Policy> {
         if name.is_empty() {
             return Err(Error::InvalidArgument);
@@ -534,6 +555,17 @@ where
     }
 
     pub async fn set_policy(&self, name: &str, policy: Policy) -> Result<OffsetDateTime> {
+        self.set_policy_at(name, policy, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::set_policy`] stamping the document with `updated_at` instead
+    /// of the local clock.
+    ///
+    /// A site-replication receiver passes the edit's source time: the next
+    /// incoming revision is judged against the stored `UpdateDate`, so a
+    /// local stamp would reject a newer source edit that was merely delivered
+    /// later (backlog#2291). The returned stamp is the one persisted.
+    pub async fn set_policy_at(&self, name: &str, policy: Policy, updated_at: OffsetDateTime) -> Result<OffsetDateTime> {
         if name.is_empty() || policy.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -544,18 +576,17 @@ where
             .get(name)
             .map(|v| {
                 let mut p = v.clone();
-                p.update(policy.clone());
+                p.update_at(policy.clone(), updated_at);
                 p
             })
-            .unwrap_or_else(|| PolicyDoc::new(policy));
+            .unwrap_or_else(|| PolicyDoc::new_at(policy, updated_at));
 
         self.api.save_policy_doc(name, policy_doc.clone()).await?;
 
-        let now = OffsetDateTime::now_utc();
+        self.cache
+            .add_or_update_policy_doc(name, &policy_doc, OffsetDateTime::now_utc());
 
-        self.cache.add_or_update_policy_doc(name, &policy_doc, now);
-
-        Ok(now)
+        Ok(updated_at)
     }
 
     pub async fn list_policies(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {
@@ -789,6 +820,12 @@ where
 
     /// create a service account and update cache
     pub async fn add_service_account(&self, cred: Credentials) -> Result<OffsetDateTime> {
+        self.add_service_account_at(cred, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::add_service_account`] stamping the identity with `updated_at`
+    /// instead of the local clock; see [`Self::set_policy_at`] (backlog#2291).
+    pub async fn add_service_account_at(&self, cred: Credentials, updated_at: OffsetDateTime) -> Result<OffsetDateTime> {
         if cred.access_key.is_empty() || cred.parent_user.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -800,7 +837,8 @@ where
         }
         drop(cache);
 
-        let u = UserIdentity::new(cred);
+        let mut u = UserIdentity::new(cred);
+        u.update_at = Some(updated_at);
 
         self.api
             .save_user_identity(&u.credentials.access_key, UserType::Svc, u.clone(), None)
@@ -808,10 +846,22 @@ where
 
         self.update_user_with_claims(&u.credentials.access_key, u.clone())?;
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(updated_at)
     }
 
     pub async fn update_service_account(&self, name: &str, opts: UpdateServiceAccountOpts) -> Result<OffsetDateTime> {
+        self.update_service_account_at(name, opts, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::update_service_account`] stamping the identity with
+    /// `updated_at` instead of the local clock; see [`Self::set_policy_at`]
+    /// (backlog#2291).
+    pub async fn update_service_account_at(
+        &self,
+        name: &str,
+        opts: UpdateServiceAccountOpts,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
         let _mutation_guard = self.cache.service_account_mutation_lock().lock().await;
         let cache = self.cache.snapshot();
         let Some(ui) = cache.users.get(name).cloned() else {
@@ -858,13 +908,7 @@ where
         }
 
         if let Some(status) = opts.status {
-            match status.as_str() {
-                val if val == AccountStatus::Enabled.as_ref() => cr.status = auth::ACCOUNT_ON.to_owned(),
-                val if val == AccountStatus::Disabled.as_ref() => cr.status = auth::ACCOUNT_OFF.to_owned(),
-                auth::ACCOUNT_ON => cr.status = auth::ACCOUNT_ON.to_owned(),
-                auth::ACCOUNT_OFF => cr.status = auth::ACCOUNT_OFF.to_owned(),
-                _ => cr.status = auth::ACCOUNT_OFF.to_owned(),
-            }
+            cr.status = account_status_flag(&status).to_owned();
         }
 
         let mut m: HashMap<String, Value> = if token_without_expiration {
@@ -916,8 +960,8 @@ where
 
         cr.session_token = jwt_sign(&m, &cr.secret_key)?;
 
-        let u = UserIdentity::new(cr);
-        let updated_at = u.update_at.unwrap_or_else(OffsetDateTime::now_utc);
+        let mut u = UserIdentity::new(cr);
+        u.update_at = Some(updated_at);
         self.api
             .save_user_identity(&u.credentials.access_key, UserType::Svc, u.clone(), None)
             .await?;
@@ -1149,6 +1193,20 @@ where
         Ok((policies.into_iter().collect(), update_at))
     }
     pub async fn policy_db_set(&self, name: &str, user_type: UserType, is_group: bool, policy: &str) -> Result<OffsetDateTime> {
+        self.policy_db_set_at(name, user_type, is_group, policy, OffsetDateTime::now_utc())
+            .await
+    }
+
+    /// [`Self::policy_db_set`] stamping the mapping with `updated_at` instead
+    /// of the local clock; see [`Self::set_policy_at`] (backlog#2291).
+    pub async fn policy_db_set_at(
+        &self,
+        name: &str,
+        user_type: UserType,
+        is_group: bool,
+        policy: &str,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
         if name.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -1168,10 +1226,11 @@ where
                 self.cache.delete_user_policy(name, OffsetDateTime::now_utc());
             }
 
-            return Ok(OffsetDateTime::now_utc());
+            return Ok(updated_at);
         }
 
-        let mp = MappedPolicy::new(policy);
+        let mut mp = MappedPolicy::new(policy);
+        mp.update_at = updated_at;
 
         let cache = self.cache.snapshot();
         let policy_docs_cache = Arc::clone(&cache.policy_docs);
@@ -1194,7 +1253,7 @@ where
             self.cache.add_or_update_user_policy(name, &mp, OffsetDateTime::now_utc());
         }
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(updated_at)
     }
 
     pub async fn set_temp_user(&self, access_key: &str, cred: &Credentials, policy_name: Option<&str>) -> Result<OffsetDateTime> {
@@ -1391,6 +1450,17 @@ where
     }
 
     pub async fn add_user(&self, access_key: &str, args: &AddOrUpdateUserReq) -> Result<OffsetDateTime> {
+        self.add_user_at(access_key, args, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::add_user`] stamping the identity with `updated_at` instead of
+    /// the local clock; see [`Self::set_policy_at`] (backlog#2291).
+    pub async fn add_user_at(
+        &self,
+        access_key: &str,
+        args: &AddOrUpdateUserReq,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
         let cache = self.cache.snapshot();
         let users = Arc::clone(&cache.users);
         if let Some(x) = users.get(access_key) {
@@ -1408,12 +1478,13 @@ where
                 _ => auth::ACCOUNT_OFF,
             }
         };
-        let user_entry = UserIdentity::from(Credentials {
+        let mut user_entry = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
             secret_key: args.secret_key.to_string(),
             status: status.to_owned(),
             ..Default::default()
         });
+        user_entry.update_at = Some(updated_at);
 
         self.api
             .save_user_identity(access_key, UserType::Reg, user_entry.clone(), None)
@@ -1421,7 +1492,7 @@ where
 
         self.update_user_with_claims(access_key, user_entry)?;
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(updated_at)
     }
 
     pub async fn delete_user(&self, access_key: &str, utype: UserType) -> Result<()> {
@@ -1599,6 +1670,17 @@ where
     }
 
     pub async fn set_user_status(&self, access_key: &str, status: AccountStatus) -> Result<OffsetDateTime> {
+        self.set_user_status_at(access_key, status, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::set_user_status`] stamping the identity with `updated_at`
+    /// instead of the local clock; see [`Self::set_policy_at`] (backlog#2291).
+    pub async fn set_user_status_at(
+        &self,
+        access_key: &str,
+        status: AccountStatus,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
         if access_key.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -1625,12 +1707,13 @@ where
             }
         };
 
-        let user_entry = UserIdentity::from(Credentials {
+        let mut user_entry = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
             secret_key: u.credentials.secret_key.clone(),
             status: status.to_owned(),
             ..Default::default()
         });
+        user_entry.update_at = Some(updated_at);
         drop(cache);
         drop(users);
 
@@ -1640,7 +1723,7 @@ where
 
         self.update_user_with_claims(access_key, user_entry)?;
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(updated_at)
     }
 
     fn update_user_with_claims(&self, k: &str, u: UserIdentity) -> Result<()> {
@@ -1676,6 +1759,17 @@ where
     }
 
     pub async fn add_users_to_group(&self, group: &str, members: Vec<String>) -> Result<OffsetDateTime> {
+        self.add_users_to_group_at(group, members, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::add_users_to_group`] stamping the group with `updated_at`
+    /// instead of the local clock; see [`Self::set_policy_at`] (backlog#2291).
+    pub async fn add_users_to_group_at(
+        &self,
+        group: &str,
+        members: Vec<String>,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
         if group.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -1693,6 +1787,10 @@ where
             }
         }
 
+        // The group's own timestamp moves with every membership or status
+        // change: site replication judges an incoming group item against it
+        // (backlog#2291), so it must reflect the last change, not creation.
+        let now = updated_at;
         let gi = match cache.groups.get(group) {
             Some(res) => {
                 let mut gi = res.clone();
@@ -1701,16 +1799,20 @@ where
                 uniq_set.extend(members.iter().cloned());
 
                 gi.members = uniq_set.into_iter().collect();
+                gi.update_at = Some(now);
                 gi
             }
-            None => GroupInfo::new(members.clone()),
+            None => {
+                let mut gi = GroupInfo::new(members.clone());
+                gi.update_at = Some(now);
+                gi
+            }
         };
         drop(cache);
 
         self.api.save_group_info(group, gi.clone()).await?;
 
-        let now = self.cache.with_write_lock(|cache| {
-            let now = OffsetDateTime::now_utc();
+        self.cache.with_write_lock(|cache| {
             cache.add_or_update_group(group, &gi, now);
 
             let user_group_memberships = Arc::clone(&cache.state().user_group_memberships);
@@ -1719,13 +1821,18 @@ where
                 m.insert(group.to_string());
                 cache.add_or_update_user_group_membership(member, &m, now);
             });
-            now
         });
 
         Ok(now)
     }
 
     pub async fn set_group_status(&self, name: &str, enable: bool) -> Result<OffsetDateTime> {
+        self.set_group_status_at(name, enable, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::set_group_status`] stamping the group with `updated_at` instead
+    /// of the local clock; see [`Self::set_policy_at`] (backlog#2291).
+    pub async fn set_group_status_at(&self, name: &str, enable: bool, updated_at: OffsetDateTime) -> Result<OffsetDateTime> {
         if name.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -1743,12 +1850,14 @@ where
         } else {
             gi.status = STATUS_DISABLED.to_owned();
         }
+        let now = updated_at;
+        gi.update_at = Some(now);
 
         self.api.save_group_info(name, gi.clone()).await?;
 
-        self.cache.add_or_update_group(name, &gi, OffsetDateTime::now_utc());
+        self.cache.add_or_update_group(name, &gi, now);
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(now)
     }
 
     pub async fn get_group_description(&self, name: &str) -> Result<GroupDesc> {
@@ -1819,6 +1928,20 @@ where
         members: Vec<String>,
         update_cache_only: bool,
     ) -> Result<OffsetDateTime> {
+        self.remove_members_from_group_at(name, members, update_cache_only, OffsetDateTime::now_utc())
+            .await
+    }
+
+    /// [`Self::remove_members_from_group`] stamping the group with
+    /// `updated_at` instead of the local clock; see [`Self::set_policy_at`]
+    /// (backlog#2291).
+    pub async fn remove_members_from_group_at(
+        &self,
+        name: &str,
+        members: Vec<String>,
+        update_cache_only: bool,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
         let cache = self.cache.snapshot();
         let mut gi = cache
             .groups
@@ -1830,13 +1953,14 @@ where
         let s: HashSet<&String> = HashSet::from_iter(gi.members.iter());
         let d: HashSet<&String> = HashSet::from_iter(members.iter());
         gi.members = s.difference(&d).map(|v| v.to_string()).collect::<Vec<String>>();
+        let now = updated_at;
+        gi.update_at = Some(now);
 
         if !update_cache_only {
             self.api.save_group_info(name, gi.clone()).await?;
         }
 
-        let now = self.cache.with_write_lock(|cache| {
-            let now = OffsetDateTime::now_utc();
+        self.cache.with_write_lock(|cache| {
             cache.add_or_update_group(name, &gi, now);
 
             let user_group_memberships = Arc::clone(&cache.state().user_group_memberships);
@@ -1847,13 +1971,25 @@ where
                     cache.add_or_update_user_group_membership(member, &m, now);
                 }
             });
-            now
         });
 
         Ok(now)
     }
 
     pub async fn remove_users_from_group(&self, group: &str, members: Vec<String>) -> Result<OffsetDateTime> {
+        self.remove_users_from_group_at(group, members, OffsetDateTime::now_utc())
+            .await
+    }
+
+    /// [`Self::remove_users_from_group`] stamping the group with `updated_at`
+    /// instead of the local clock; a group delete (no members) leaves no
+    /// record and returns the stamp unchanged (backlog#2291).
+    pub async fn remove_users_from_group_at(
+        &self,
+        group: &str,
+        members: Vec<String>,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
         if group.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -1902,18 +2038,17 @@ where
                 return Err(err);
             }
 
-            let now = self.cache.with_write_lock(|cache| {
+            self.cache.with_write_lock(|cache| {
                 let now = OffsetDateTime::now_utc();
                 self.remove_group_from_memberships_map_unlocked(cache, group, now);
                 cache.delete_group(group, now);
                 cache.delete_group_policy(group, now);
-                now
             });
 
-            return Ok(now);
+            return Ok(updated_at);
         }
 
-        self.remove_members_from_group(group, members, false).await
+        self.remove_members_from_group_at(group, members, false, updated_at).await
     }
 
     fn remove_group_from_memberships_map_unlocked(&self, cache: &mut LockedCache, group: &str, now: OffsetDateTime) {
@@ -2232,6 +2367,19 @@ where
         });
 
         Ok(())
+    }
+}
+
+/// The stored `status` flag for a service-account status given on the admin
+/// or replication wire: the madmin `enabled` / `disabled` words and the stored
+/// `on` / `off` flags are both accepted; anything else disables the account.
+pub(crate) fn account_status_flag(status: &str) -> &'static str {
+    match status {
+        val if val == AccountStatus::Enabled.as_ref() => auth::ACCOUNT_ON,
+        val if val == AccountStatus::Disabled.as_ref() => auth::ACCOUNT_OFF,
+        auth::ACCOUNT_ON => auth::ACCOUNT_ON,
+        auth::ACCOUNT_OFF => auth::ACCOUNT_OFF,
+        _ => auth::ACCOUNT_OFF,
     }
 }
 
