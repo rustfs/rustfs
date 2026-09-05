@@ -78,10 +78,18 @@ pub struct OnDemandMigrationSource {
     #[serde(default)]
     pub path_style: OnDemandMigrationPathStyle,
     /// `None` means anonymous access to a public source bucket.
+    /// `None` means anonymous access to a public source bucket. The native
+    /// providers carry their credentials in `azure` / `gcs` instead.
     #[serde(default)]
     pub credentials: Option<OnDemandMigrationCredentials>,
     #[serde(default)]
     pub tls: OnDemandMigrationTls,
+    /// Required for `azure` and rejected for every other provider.
+    #[serde(default)]
+    pub azure: Option<OnDemandMigrationAzure>,
+    /// Required for `gcs_native` and rejected for every other provider.
+    #[serde(default)]
+    pub gcs: Option<OnDemandMigrationGcs>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,7 +100,49 @@ pub enum OnDemandMigrationProvider {
     Minio,
     Rustfs,
     R2,
+    /// GCS XML interoperability API with HMAC keys.
     Gcs,
+    /// Native Azure Blob service.
+    Azure,
+    /// Native GCS JSON API with a service-account key.
+    #[serde(rename = "gcs_native")]
+    GcsNative,
+}
+
+/// Native Azure Blob parameters. The container is `source.bucket`; exactly one
+/// of `account_key` and `sas_token` is set. Responses carry both as `REDACTED`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDemandMigrationAzure {
+    pub account: String,
+    #[serde(default)]
+    pub account_key: Option<String>,
+    #[serde(default)]
+    pub sas_token: Option<String>,
+}
+
+impl fmt::Debug for OnDemandMigrationAzure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OnDemandMigrationAzure")
+            .field("account", &self.account)
+            .field("account_key", &self.account_key.as_ref().map(|_| "REDACTED"))
+            .field("sas_token", &self.sas_token.as_ref().map(|_| "REDACTED"))
+            .finish()
+    }
+}
+
+/// Native GCS parameters. The bucket is `source.bucket`; the key JSON embeds a
+/// private key, so responses carry it as `REDACTED`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDemandMigrationGcs {
+    pub service_account_json: String,
+}
+
+impl fmt::Debug for OnDemandMigrationGcs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OnDemandMigrationGcs")
+            .field("service_account_json", &"REDACTED")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -806,6 +856,8 @@ mod tests {
                 session_token: None,
             }),
             tls: OnDemandMigrationTls::default(),
+            azure: None,
+            gcs: None,
         });
         let mut expected: OnDemandMigrationConfig = serde_json::from_str(SET_REQUEST_FIXTURE.trim()).expect("fixture");
         expected.filter.source_prefix = None;
@@ -819,6 +871,42 @@ mod tests {
         assert!(minimal.enabled);
         assert_eq!(minimal.policy.max_concurrent_pulls, 8);
         assert!(minimal.source.credentials.is_none());
+    }
+
+    #[test]
+    fn native_provider_documents_round_trip_and_hide_their_secrets() {
+        for (label, json) in [
+            (
+                "azure",
+                r#"{"provider":"azure","endpoint":null,"region":"auto","bucket":"legacy-photos","path_style":"auto","credentials":null,"tls":{"skip_verify":false,"ca_cert_pem":null},"azure":{"account":"legacyaccount","account_key":null,"sas_token":"sv=2021-08-06&sig=topsecret"},"gcs":null}"#,
+            ),
+            (
+                "gcs_native",
+                r#"{"provider":"gcs_native","endpoint":null,"region":"auto","bucket":"legacy-photos","path_style":"auto","credentials":null,"tls":{"skip_verify":false,"ca_cert_pem":null},"azure":null,"gcs":{"service_account_json":"{\"type\":\"service_account\"}"}}"#,
+            ),
+        ] {
+            let source: OnDemandMigrationSource = serde_json::from_str(json).unwrap_or_else(|err| panic!("{label}: {err}"));
+            assert_eq!(
+                serde_json::to_string(&source).expect("re-encodes"),
+                json,
+                "{label} must reproduce the server wire shape byte for byte"
+            );
+        }
+
+        let azure = OnDemandMigrationAzure {
+            account: "legacyaccount".to_string(),
+            account_key: Some("c2VjcmV0".to_string()),
+            sas_token: Some("sig=topsecret".to_string()),
+        };
+        let rendered = format!("{azure:?}");
+        assert!(rendered.contains("legacyaccount"));
+        assert!(!rendered.contains("c2VjcmV0"), "{rendered}");
+        assert!(!rendered.contains("topsecret"), "{rendered}");
+
+        let gcs = OnDemandMigrationGcs {
+            service_account_json: r#"{"private_key":"-----BEGIN PRIVATE KEY-----"}"#.to_string(),
+        };
+        assert!(!format!("{gcs:?}").contains("PRIVATE KEY"), "{gcs:?}");
     }
 
     #[test]
