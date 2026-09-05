@@ -168,9 +168,10 @@ pub mod bucket {
             idle_guarded_body,
         };
         pub use crate::bucket::on_demand_migration::{
-            FetchRequest, LIST_THROUGH_TOKEN_VERSION, ListEntryKey, ListThroughCursor, ListThroughMerger, ListThroughToken,
-            ListThroughTokenError, MAX_LIST_FETCHES_PER_SIDE, MergeOutcome, MergePick, MergeSide, SOURCE_LIST_MAX_RATE_WAIT,
-            SOURCE_LIST_RATE_PER_SEC, SourceListPlan, SourceListRateLimiter, decode_continuation_token, source_list_plan,
+            FetchRequest, LIST_THROUGH_TOKEN_VERSION, ListEntryKey, ListPageError, ListThroughCursor, ListThroughMerger,
+            ListThroughToken, ListThroughTokenError, MAX_LIST_FETCHES_PER_SIDE, MAX_LIST_NO_PROGRESS_PAGES, MergeOutcome,
+            MergePick, MergeSide, SOURCE_LIST_MAX_RATE_WAIT, SOURCE_LIST_RATE_PER_SEC, SourceListPlan, SourceListRateLimiter,
+            decode_continuation_token, source_list_plan,
         };
         pub mod backfill {
             pub use crate::bucket::on_demand_migration::backfill::{

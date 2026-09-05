@@ -43,6 +43,10 @@ const ERR_LIFECYCLE_BUCKET_LOCKED: &str =
     "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an object locked bucket";
 const ERR_LIFECYCLE_TOO_MANY_RULES: &str = "Lifecycle configuration should have at most 1000 rules";
 const ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS: &str = "'Days' for Expiration action must be a positive integer";
+const ERR_LIFECYCLE_EXPIRATION_DAYS_DATE_CONFLICT: &str = "Expiration cannot specify both Days and Date";
+const ERR_LIFECYCLE_MULTIPLE_TRANSITIONS: &str = "Only one Transition action per lifecycle rule is supported";
+const ERR_LIFECYCLE_MULTIPLE_NONCURRENT_TRANSITIONS: &str =
+    "Only one NoncurrentVersionTransition action per lifecycle rule is supported";
 const ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS: &str =
     "'NoncurrentDays' for NoncurrentVersionExpiration action must be a positive integer";
 const ERR_LIFECYCLE_INVALID_ABORT_INCOMPLETE_MPU_DAYS: &str =
@@ -514,6 +518,12 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 {
                     return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_EXPIRED_OBJECT_ALL_VERSIONS));
                 }
+                if expiration.days.is_some() && expiration.date.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        ERR_LIFECYCLE_EXPIRATION_DAYS_DATE_CONFLICT,
+                    ));
+                }
                 if let Some(expiration_date) = &expiration.date {
                     let date = OffsetDateTime::from(expiration_date.clone());
                     if date.hour() != 0 || date.minute() != 0 || date.second() != 0 || date.nanosecond() != 0 {
@@ -547,11 +557,20 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 }
             }
             if let Some(transitions) = &r.transitions {
+                if transitions.len() > 1 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, ERR_LIFECYCLE_MULTIPLE_TRANSITIONS));
+                }
                 for transition in transitions {
                     TransitionOps::validate(transition)?;
                 }
             }
             if let Some(noncurrent_transitions) = &r.noncurrent_version_transitions {
+                if noncurrent_transitions.len() > 1 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        ERR_LIFECYCLE_MULTIPLE_NONCURRENT_TRANSITIONS,
+                    ));
+                }
                 for transition in noncurrent_transitions {
                     NoncurrentVersionTransitionOps::validate(transition)?;
                 }
@@ -626,6 +645,8 @@ impl Lifecycle for BucketLifecycleConfiguration {
     }
 
     async fn eval(&self, obj: &ObjectOpts) -> Event {
+        // A single-object lookup cannot prove how many newer historical versions
+        // survive. Count-dependent actions wait for the complete-group evaluator.
         self.eval_inner(obj, OffsetDateTime::now_utc(), 0).await
     }
 
@@ -689,23 +710,8 @@ impl Lifecycle for BucketLifecycleConfiguration {
             return Event::default();
         };
 
-        if let Some(restore_expires) = obj.restore_expires
-            && restore_expires.unix_timestamp() != 0
-            && now.unix_timestamp() > restore_expires.unix_timestamp()
-        {
-            let mut action = IlmAction::DeleteRestoredAction;
-            if !obj.is_latest {
-                action = IlmAction::DeleteRestoredVersionAction;
-            }
-
-            events.push(Event {
-                action,
-                due: Some(now),
-                rule_id: "".into(),
-                noncurrent_days: 0,
-                newer_noncurrent_versions: 0,
-                storage_class: "".into(),
-            });
+        if let Some(event) = obj.restored_copy_expiry(now) {
+            events.push(event);
         }
 
         if let Some(ref lc_rules) = self.filter_rules(obj).await {
@@ -783,19 +789,13 @@ impl Lifecycle for BucketLifecycleConfiguration {
 
                 if !obj.is_latest
                     && let Some(ref noncurrent_version_expiration) = rule.noncurrent_version_expiration
-                    && let Some(retain_newer_noncurrent_versions) = noncurrent_version_expiration.newer_noncurrent_versions
-                    && let Some(retained) = retained_noncurrent_versions(retain_newer_noncurrent_versions)
-                    && newer_noncurrent_versions < retained
-                {
-                    continue;
-                }
-
-                if !obj.is_latest
-                    && let Some(ref noncurrent_version_expiration) = rule.noncurrent_version_expiration
                     && (noncurrent_version_expiration.noncurrent_days.is_some()
                         || noncurrent_version_expiration
                             .newer_noncurrent_versions
                             .is_some_and(|count| count > 0))
+                    && noncurrent_version_expiration
+                        .newer_noncurrent_versions
+                        .is_none_or(|retain| usize::try_from(retain).is_ok_and(|retain| newer_noncurrent_versions >= retain))
                 {
                     // A count-only rule (MinIO extension) has no age condition:
                     // every version past the retained count is due as soon as it
@@ -829,7 +829,11 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     && let Some(noncurrent_version_transition) = rule
                         .noncurrent_version_transitions
                         .as_ref()
+                        .filter(|transitions| transitions.len() == 1)
                         .and_then(|transitions| transitions.first())
+                    && noncurrent_version_transition
+                        .newer_noncurrent_versions
+                        .is_none_or(|retain| usize::try_from(retain).is_ok_and(|retain| newer_noncurrent_versions >= retain))
                     && let Some(storage_class) = noncurrent_version_transition.storage_class.as_ref()
                     && !storage_class.as_str().is_empty()
                     && !obj.delete_marker
@@ -913,7 +917,11 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     }
 
                     if obj.transition_status != TRANSITION_COMPLETE
-                        && let Some(transition) = rule.transitions.as_ref().and_then(|transitions| transitions.first())
+                        && let Some(transition) = rule
+                            .transitions
+                            .as_ref()
+                            .filter(|transitions| transitions.len() == 1)
+                            .and_then(|transitions| transitions.first())
                         && let Some(storage_class) = transition.storage_class.as_ref()
                         && !storage_class.as_str().is_empty()
                     {
@@ -936,18 +944,15 @@ impl Lifecycle for BucketLifecycleConfiguration {
         }
 
         if !events.is_empty() {
-            // Select the winning event using a strict total order (MinIO semantics):
-            // the earliest `due` wins, and ties break toward delete-type actions. A
-            // missing `due` is treated as UNIX_EPOCH. This replaces a hand-written
-            // `sort_by` comparator that was not a strict weak ordering (it could return
-            // `Ordering::Less` for both `(a, b)` and `(b, a)`), which panics on the
-            // repository toolchain and did not deterministically pick the earliest event.
+            // Eligible expiration takes precedence over transition, even when a
+            // failed transition has an earlier deadline. Within each action class,
+            // prefer the earliest deadline using a deterministic total order.
             let event = events
                 .iter()
                 .min_by_key(|event| {
                     (
-                        event.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp(),
                         ilm_action_priority_rank(&event.action),
+                        event.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp(),
                     )
                 })
                 .cloned()
@@ -1223,6 +1228,27 @@ impl ObjectOpts {
     pub fn expired_object_deletemarker(&self) -> bool {
         self.delete_marker && self.is_latest && self.num_versions == 1
     }
+
+    pub(crate) fn restored_copy_expiry(&self, now: OffsetDateTime) -> Option<Event> {
+        let restore_expires = self.restore_expires?;
+        // Restore metadata alone does not prove that a durable remote copy exists.
+        if self.transition_status != TRANSITION_COMPLETE
+            || restore_expires.unix_timestamp() == 0
+            || now.unix_timestamp() <= restore_expires.unix_timestamp()
+        {
+            return None;
+        }
+        let action = if self.is_latest {
+            IlmAction::DeleteRestoredAction
+        } else {
+            IlmAction::DeleteRestoredVersionAction
+        };
+        expiration_action_has_valid_target(action, self.version_id, self.is_latest, self.delete_marker).then(|| Event {
+            action,
+            due: Some(now),
+            ..Default::default()
+        })
+    }
 }
 
 /// Returns whether an expiry action has enough identity to target the object
@@ -1245,11 +1271,8 @@ pub fn expiration_action_has_valid_target(
     }
 }
 
-/// Total-order rank for lifecycle actions used to break `due` ties.
-///
-/// Delete-type actions rank before every other action so that, when two events
-/// share the same `due`, a delete wins (MinIO semantics). The concrete numeric
-/// values only matter relative to each other.
+/// Eligible logical expiration takes precedence over transition and restore-copy
+/// cleanup. Deadlines break ties within an action class.
 fn ilm_action_priority_rank(action: &IlmAction) -> u8 {
     match action {
         IlmAction::DeleteAllVersionsAction
@@ -4344,24 +4367,6 @@ mod tests {
         assert_eq!(event.action, IlmAction::NoneAction);
     }
 
-    // Property-based tests for the rule evaluator (backlog#1148 ilm-14,
-    // follow-up to backlog#1030 / rustfs#4455).
-    //
-    // backlog#1030 found that the old hand-written winner comparator was not a
-    // strict weak ordering and could panic — proof that enumerated cases do
-    // not cover the space of colliding events. These properties pin, over
-    // randomized rule sets and object states:
-    //
-    // * `eval_inner` never panics and is deterministic for a fixed input;
-    // * the winning event matches an independently recomputed candidate set:
-    //   earliest `due` wins, ties break toward delete-class actions (the
-    //   `min_by_key` selection that replaced the rustfs#4455 comparator);
-    // * `expected_expiry_time` is monotonically non-decreasing in `days` and
-    //   always lands on the processing boundary, both at production defaults
-    //   and under an explicit `RUSTFS_ILM_PROCESS_TIME`.
-    //
-    // Case counts are tuned so the whole module runs in seconds inside the
-    // default CI test job.
     // ---- backlog#2201: retention-count and Filter invariants -----------------
 
     fn rule_with_noncurrent_expiration(expiration: NoncurrentVersionExpiration) -> LifecycleRule {
@@ -4939,6 +4944,410 @@ mod tests {
         );
     }
 
+    mod adversarial_regressions {
+        use super::*;
+        use s3s::dto::NoncurrentVersionExpiration;
+
+        fn run(test: impl std::future::Future<Output = ()>) {
+            with_default_ilm_process_time(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("lifecycle regression runtime should build")
+                    .block_on(test);
+            });
+        }
+
+        fn noncurrent_object() -> ObjectOpts {
+            ObjectOpts {
+                name: "logs/object".to_string(),
+                mod_time: Some(datetime!(2020-01-01 00:00:00 UTC)),
+                successor_mod_time: Some(datetime!(2020-01-02 00:00:00 UTC)),
+                version_id: Some(Uuid::from_u128(1)),
+                size: 1024 * 1024,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn noncurrent_transition_retains_the_requested_newer_versions() {
+            run(async {
+                let mut rule = enabled_rule(None, None, Some("retain-two-hot-versions"));
+                rule.filter = Some(LifecycleRuleFilter::default());
+                rule.noncurrent_version_transitions = Some(vec![NoncurrentVersionTransition {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: Some(2),
+                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                }]);
+                let lc = Arc::new(BucketLifecycleConfiguration {
+                    rules: vec![rule],
+                    expiry_updated_at: None,
+                });
+                lc.validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect("valid noncurrent transition policy");
+                let objects = (0..4)
+                    .map(|index| ObjectOpts {
+                        mod_time: Some(datetime!(2020-01-05 00:00:00 UTC) - Duration::days(index)),
+                        successor_mod_time: (index > 0).then_some(datetime!(2020-01-06 00:00:00 UTC) - Duration::days(index)),
+                        version_id: Some(Uuid::from_u128(u128::try_from(index + 1).expect("small version index"))),
+                        is_latest: index == 0,
+                        num_versions: 4,
+                        ..noncurrent_object()
+                    })
+                    .collect::<Vec<_>>();
+                let actions = crate::Evaluator::new(lc)
+                    .eval(&objects)
+                    .await
+                    .expect("complete version chain should evaluate")
+                    .into_iter()
+                    .map(|event| event.action)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actions,
+                    [
+                        IlmAction::NoneAction,
+                        IlmAction::NoneAction,
+                        IlmAction::NoneAction,
+                        IlmAction::TransitionVersionAction
+                    ],
+                    "the two newest noncurrent versions must remain in their current storage class"
+                );
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn noncurrent_transition_checks_count_age_and_single_object_context() {
+            run(async {
+                let mut rule = enabled_rule(None, None, Some("retain-two"));
+                rule.filter = Some(LifecycleRuleFilter::default());
+                rule.noncurrent_version_transitions = Some(vec![NoncurrentVersionTransition {
+                    noncurrent_days: Some(3),
+                    newer_noncurrent_versions: Some(2),
+                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                }]);
+                let mut lc = BucketLifecycleConfiguration {
+                    rules: vec![rule],
+                    expiry_updated_at: None,
+                };
+                lc.validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect("valid counted transition");
+                let object = noncurrent_object();
+                let now = datetime!(2020-01-10 00:00:00 UTC);
+                for (newer, expected) in [
+                    (0, IlmAction::NoneAction),
+                    (1, IlmAction::NoneAction),
+                    (2, IlmAction::TransitionVersionAction),
+                    (3, IlmAction::TransitionVersionAction),
+                ] {
+                    assert_eq!(lc.eval_inner(&object, now, newer).await.action, expected, "newer count: {newer}");
+                }
+                assert_eq!(
+                    lc.eval_inner(&object, datetime!(2020-01-04 00:00:00 UTC), 2).await.action,
+                    IlmAction::NoneAction,
+                    "the retention count does not replace the age condition"
+                );
+                assert_eq!(
+                    lc.eval(&object).await.action,
+                    IlmAction::NoneAction,
+                    "a single-object lookup must not assume a complete version history"
+                );
+                for retain in [None, Some(0), Some(-1), Some(i32::MAX)] {
+                    lc.rules[0]
+                        .noncurrent_version_transitions
+                        .as_mut()
+                        .expect("transition exists")[0]
+                        .newer_noncurrent_versions = retain;
+                    let expected = if matches!(retain, None | Some(0)) {
+                        IlmAction::TransitionVersionAction
+                    } else {
+                        IlmAction::NoneAction
+                    };
+                    assert_eq!(lc.eval_inner(&object, now, 2).await.action, expected, "retention: {retain:?}");
+                }
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn noncurrent_expiration_and_transition_have_independent_retention_counts() {
+            run(async {
+                let mut rule = enabled_rule(None, None, Some("independent-counts"));
+                rule.filter = Some(LifecycleRuleFilter::default());
+                rule.noncurrent_version_expiration = Some(NoncurrentVersionExpiration {
+                    noncurrent_days: Some(90),
+                    newer_noncurrent_versions: Some(4),
+                });
+                rule.noncurrent_version_transitions = Some(vec![NoncurrentVersionTransition {
+                    noncurrent_days: Some(30),
+                    newer_noncurrent_versions: Some(2),
+                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                }]);
+                let lc = BucketLifecycleConfiguration {
+                    rules: vec![rule],
+                    expiry_updated_at: None,
+                };
+                lc.validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect("valid independent retention limits");
+                let object = noncurrent_object();
+                let now = datetime!(2020-05-01 00:00:00 UTC);
+                for (newer, expected) in [
+                    (1, IlmAction::NoneAction),
+                    (2, IlmAction::TransitionVersionAction),
+                    (3, IlmAction::TransitionVersionAction),
+                    (4, IlmAction::DeleteVersionAction),
+                ] {
+                    assert_eq!(lc.eval_inner(&object, now, newer).await.action, expected, "newer count: {newer}");
+                }
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn expiration_retention_does_not_skip_an_independent_transition() {
+            run(async {
+                let mut rule = enabled_rule(None, None, Some("transition-then-expire"));
+                rule.filter = Some(LifecycleRuleFilter::default());
+                rule.noncurrent_version_transitions = Some(vec![NoncurrentVersionTransition {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                }]);
+                let mut lc = BucketLifecycleConfiguration {
+                    rules: vec![rule],
+                    expiry_updated_at: None,
+                };
+                let object = noncurrent_object();
+                let now = datetime!(2020-01-10 00:00:00 UTC);
+                let transition_only = lc.eval_inner(&object, now, 0).await;
+                assert_eq!(transition_only.action, IlmAction::TransitionVersionAction);
+
+                lc.rules[0].noncurrent_version_expiration = Some(NoncurrentVersionExpiration {
+                    noncurrent_days: Some(90),
+                    newer_noncurrent_versions: Some(2),
+                });
+                lc.validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect("valid combined policy");
+                let combined = lc.eval_inner(&object, now, 0).await;
+                assert_eq!(combined.action, transition_only.action, "retention limits expiration, not transition");
+                assert_eq!(combined.storage_class, transition_only.storage_class);
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn current_transition_rejects_multiple_stages_in_any_order() {
+            run(async {
+                let mut rule = enabled_rule(None, None, Some("two-current-transitions"));
+                rule.transitions = Some(vec![
+                    Transition {
+                        date: Some(datetime!(2020-03-01 00:00:00 UTC).into()),
+                        days: None,
+                        storage_class: Some(TransitionStorageClass::from_static("COLD")),
+                    },
+                    Transition {
+                        date: Some(datetime!(2020-01-03 00:00:00 UTC).into()),
+                        days: None,
+                        storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                    },
+                ]);
+                let mut lc = BucketLifecycleConfiguration {
+                    rules: vec![rule],
+                    expiry_updated_at: None,
+                };
+                let object = ObjectOpts {
+                    is_latest: true,
+                    ..noncurrent_object()
+                };
+                let now = datetime!(2020-01-10 00:00:00 UTC);
+                for status in [ExpirationStatus::ENABLED, ExpirationStatus::DISABLED] {
+                    lc.rules[0].status = ExpirationStatus::from_static(status);
+                    for _ in 0..2 {
+                        let err = lc
+                            .validate(&ObjectLockConfiguration::default())
+                            .await
+                            .expect_err("multiple transition stages must be rejected");
+                        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+                        assert_eq!(err.to_string(), ERR_LIFECYCLE_MULTIPLE_TRANSITIONS);
+                        assert_eq!(
+                            lc.eval_inner(&object, now, 0).await.action,
+                            IlmAction::NoneAction,
+                            "legacy multi-stage configurations must not silently execute their first stage"
+                        );
+                        lc.rules[0]
+                            .transitions
+                            .as_mut()
+                            .expect("transition array is present")
+                            .reverse();
+                    }
+                }
+                lc.rules[0]
+                    .transitions
+                    .as_mut()
+                    .expect("transition array is present")
+                    .remove(0);
+                lc.rules[0].status = ExpirationStatus::from_static(ExpirationStatus::ENABLED);
+                lc.validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect("one stage is supported");
+                let event = lc.eval_inner(&object, now, 0).await;
+                assert_eq!(event.action, IlmAction::TransitionAction);
+                assert_eq!(event.storage_class, "WARM");
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn noncurrent_transition_rejects_multiple_stages_in_any_order() {
+            run(async {
+                let mut rule = enabled_rule(None, None, Some("two-noncurrent-transitions"));
+                rule.noncurrent_version_transitions = Some(vec![
+                    NoncurrentVersionTransition {
+                        noncurrent_days: Some(30),
+                        newer_noncurrent_versions: None,
+                        storage_class: Some(TransitionStorageClass::from_static("COLD")),
+                    },
+                    NoncurrentVersionTransition {
+                        noncurrent_days: Some(1),
+                        newer_noncurrent_versions: None,
+                        storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                    },
+                ]);
+                let mut lc = BucketLifecycleConfiguration {
+                    rules: vec![rule],
+                    expiry_updated_at: None,
+                };
+                let object = noncurrent_object();
+                let now = datetime!(2020-01-10 00:00:00 UTC);
+                for status in [ExpirationStatus::ENABLED, ExpirationStatus::DISABLED] {
+                    lc.rules[0].status = ExpirationStatus::from_static(status);
+                    for _ in 0..2 {
+                        let err = lc
+                            .validate(&ObjectLockConfiguration::default())
+                            .await
+                            .expect_err("multiple noncurrent transition stages must be rejected");
+                        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+                        assert_eq!(err.to_string(), ERR_LIFECYCLE_MULTIPLE_NONCURRENT_TRANSITIONS);
+                        assert_eq!(
+                            lc.eval_inner(&object, now, 0).await.action,
+                            IlmAction::NoneAction,
+                            "legacy multi-stage configurations must not silently execute their first stage"
+                        );
+                        lc.rules[0]
+                            .noncurrent_version_transitions
+                            .as_mut()
+                            .expect("transition array is present")
+                            .reverse();
+                    }
+                }
+                lc.rules[0]
+                    .noncurrent_version_transitions
+                    .as_mut()
+                    .expect("transition array is present")
+                    .remove(0);
+                lc.rules[0].status = ExpirationStatus::from_static(ExpirationStatus::ENABLED);
+                lc.validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect("one stage is supported");
+                let event = lc.eval_inner(&object, now, 0).await;
+                assert_eq!(event.action, IlmAction::TransitionVersionAction);
+                assert_eq!(event.storage_class, "WARM");
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn expiration_rejects_simultaneous_days_and_date() {
+            run(async {
+                let mut lc = BucketLifecycleConfiguration {
+                    rules: vec![enabled_rule(
+                        Some(LifecycleExpiration {
+                            days: Some(1),
+                            ..Default::default()
+                        }),
+                        None,
+                        Some("ambiguous-expiry"),
+                    )],
+                    expiry_updated_at: None,
+                };
+                lc.validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect("a single Days expiration is valid");
+                lc.rules[0].expiration.as_mut().expect("expiration is present").date =
+                    Some(datetime!(2099-01-01 00:00:00 UTC).into());
+                let err = lc
+                    .validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect_err("Days and Date are mutually exclusive; accepting both silently overrides Days");
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+                assert_eq!(err.to_string(), ERR_LIFECYCLE_EXPIRATION_DAYS_DATE_CONFLICT);
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn overdue_transition_does_not_starve_permanent_expiration() {
+            run(async {
+                let mut rule = enabled_rule(
+                    Some(LifecycleExpiration {
+                        days: Some(90),
+                        ..Default::default()
+                    }),
+                    None,
+                    Some("archive-then-delete"),
+                );
+                rule.transitions = Some(vec![Transition {
+                    days: Some(30),
+                    date: None,
+                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                }]);
+                let lc = BucketLifecycleConfiguration {
+                    rules: vec![rule],
+                    expiry_updated_at: None,
+                };
+                lc.validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect("valid transition and expiration policy");
+                let object = ObjectOpts {
+                    is_latest: true,
+                    version_id: None,
+                    transition_status: TRANSITION_PENDING.to_string(),
+                    ..noncurrent_object()
+                };
+                let before_expiration = lc.eval_inner(&object, datetime!(2020-02-15 00:00:00 UTC), 0).await;
+                assert_eq!(before_expiration.action, IlmAction::TransitionAction);
+                let overdue = lc.eval_inner(&object, datetime!(2020-05-01 00:00:00 UTC), 0).await;
+                assert_eq!(
+                    overdue.action,
+                    IlmAction::DeleteAction,
+                    "an unavailable tier must not prevent permanent expiration indefinitely"
+                );
+            });
+        }
+    }
+
+    /// Property-based tests for the rule evaluator (backlog#1148 ilm-14,
+    /// follow-up to backlog#1030 / rustfs#4455).
+    ///
+    /// backlog#1030 found that the old hand-written winner comparator was not a
+    /// strict weak ordering and could panic — proof that enumerated cases do
+    /// not cover the space of colliding events. These properties pin, over
+    /// randomized rule sets and object states:
+    ///
+    /// * `eval_inner` never panics and is deterministic for a fixed input;
+    /// * the winning event matches an independently recomputed candidate set:
+    ///   eligible expiration wins over transition, then earliest `due` wins (the
+    ///   `min_by_key` selection that replaced the rustfs#4455 comparator);
+    /// * `expected_expiry_time` is monotonically non-decreasing in `days` and
+    ///   always lands on the processing boundary, both at production defaults
+    ///   and under an explicit `RUSTFS_ILM_PROCESS_TIME`.
+    ///
+    /// Case counts are tuned so the whole module runs in seconds inside the
+    /// default CI test job.
     mod proptests {
         use super::*;
         use proptest::prelude::*;
@@ -5220,8 +5629,8 @@ mod tests {
         /// consider for a live current version under `selection`-shaped rules
         /// (expiration and first-transition only, no filters): expiration
         /// fires when `now >= due`, transition when `now > due` and the object
-        /// has not already transitioned. Selection semantics under test:
-        /// earliest due wins, ties prefer delete-class.
+        /// has not already transitioned. Eligible expiration wins over transition;
+        /// the earliest deadline wins within the selected action class.
         fn oracle_candidates(lc: &BucketLifecycleConfiguration, obj: &ObjectOpts, now: OffsetDateTime) -> Vec<Candidate> {
             let mod_time = obj.mod_time.expect("selection strategy always sets mod_time");
             let mut candidates = Vec::new();
@@ -5310,8 +5719,8 @@ mod tests {
             /// Differential test of winner selection (the rustfs#4455 fix):
             /// for a live current version under randomized expiration and
             /// transition rules, `eval_inner`'s winner must carry the
-            /// minimum `(due, rank)` of the independently recomputed
-            /// candidate set — earliest due wins, ties prefer delete-class —
+            /// earliest expiration from the independently recomputed candidate
+            /// set, or the earliest transition when no expiration is eligible,
             /// and must be `NoneAction` exactly when that set is empty.
             #[test]
             #[serial]
@@ -5340,7 +5749,13 @@ mod tests {
 
                 // Oracle and evaluator must observe the same (pinned) time env.
                 let (event, expected) = with_production_time_env(|| {
-                    let expected = oracle_candidates(&lc, &obj, now).into_iter().min();
+                    let candidates = oracle_candidates(&lc, &obj, now);
+                    let expected = candidates
+                        .iter()
+                        .filter(|(_, rank)| *rank == 0)
+                        .min()
+                        .copied()
+                        .or_else(|| candidates.into_iter().min());
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
