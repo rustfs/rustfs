@@ -683,6 +683,7 @@ async fn write_checkpoint(
     };
     let opts = ObjectOptions {
         max_parity: true,
+        write_completion: crate::object_api::WriteCompletion::TailDrained,
         http_preconditions: Some(preconditions),
         ..Default::default()
     };
@@ -1190,6 +1191,7 @@ impl Job {
 
     async fn main_loop(&mut self) -> Result<(), Stop> {
         let mut cursor = self.checkpoint.continuation_token.clone();
+        let failed_at_resume = self.checkpoint.failed;
         loop {
             self.check_cancel()?;
             let page = self.list_page(cursor.as_deref()).await?;
@@ -1208,7 +1210,7 @@ impl Job {
             // progress. Keep it at the first failed page for crash recovery.
             self.drain_all().await?;
             cursor = page.next_continuation_token;
-            if self.checkpoint.failed == 0 {
+            if self.checkpoint.failed == failed_at_resume {
                 self.checkpoint.continuation_token = cursor.clone();
             }
             self.tick(true).await?;
@@ -2188,6 +2190,68 @@ mod tests {
             "the resumed job lists from the persisted cursor, never from the start"
         );
         assert_eq!(runner.recover_once().await.taken_over, 0, "a finished job is not recovered");
+    }
+
+    #[tokio::test]
+    async fn recovery_advances_past_historical_failures_but_pins_new_failures() {
+        let bucket = "backfill-takeover-failed";
+        let mut context = MockContext::new(8, 2);
+        {
+            let ctx = Arc::get_mut(&mut context).expect("unshared");
+            ctx.auto_complete = AtomicBool::new(false);
+            ctx.fail_keys.insert("k/00004".to_string());
+        }
+        let (_dirs, store, runner) = runner_with("node-b", bucket, Arc::clone(&context)).await;
+        let crashed_at = OffsetDateTime::now_utc() - Duration::from_secs(300);
+        let mut crashed = BackfillCheckpoint::new(&BackfillRequest::default(), ts(1_700_000_000), "node-a", crashed_at);
+        crashed.continuation_token = Some("2".to_string());
+        crashed.failed = 1;
+        crashed.record_failure("local_write", Some("k/00002"), crashed_at);
+        write_checkpoint(&store, bucket, &crashed, None)
+            .await
+            .expect("seed failed page with an expired lease");
+
+        assert_eq!(runner.recover_once().await.taken_over, 1);
+        for (page_start, durable_token, failures) in [(2, "2", 1), (4, "4", 1), (6, "4", 2)] {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if context.pending.lock().len() == 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("resumed page enqueued before its reports complete");
+            assert_eq!(
+                context.pending.lock().iter().map(|(key, _)| key.clone()).collect::<Vec<_>>(),
+                vec![format!("k/{page_start:05}"), format!("k/{:05}", page_start + 1)]
+            );
+            let cp = read_checkpoint(&store, bucket)
+                .await
+                .expect("read persisted page boundary")
+                .expect("checkpoint")
+                .checkpoint;
+            assert_eq!(cp.job_id, crashed.job_id);
+            assert_eq!(cp.owner.as_ref().map(|owner| owner.node.as_str()), Some("node-b"));
+            assert_eq!(cp.continuation_token.as_deref(), Some(durable_token));
+            assert_eq!(cp.failed, failures);
+            context.complete_pending();
+        }
+        runner.wait_until_idle(bucket).await;
+        let cp = read_checkpoint(&store, bucket)
+            .await
+            .expect("read completed checkpoint")
+            .expect("checkpoint")
+            .checkpoint;
+        assert_eq!(cp.state, BackfillState::CompletedWithFailures);
+        assert_eq!((cp.pulled, cp.failed), (5, 2));
+        assert_eq!(cp.continuation_token.as_deref(), Some("4"));
+        assert_eq!(cp.failed_keys, vec![key_hash("k/00002"), key_hash("k/00004")]);
+        assert_eq!(
+            context.list_requests.lock().as_slice(),
+            &[Some("2".to_string()), Some("4".to_string()), Some("6".to_string())]
+        );
     }
 
     #[tokio::test]

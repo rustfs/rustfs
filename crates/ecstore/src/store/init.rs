@@ -3328,41 +3328,33 @@ mod tests {
     #[cfg(feature = "test-util")]
     const DECOMMISSION_TEST_FAULT_STAGE_TIERED: &str = "decommission_tiered_object";
 
-    fn inject_decommission_copy_fault(faults: &AtomicUsize, attempt: usize, succeeded: bool) -> bool {
-        // Entry retries reset attempt, not the global post-commit fault budget.
-        // A real failure may consume an attempt, so preserve the final chance.
-        succeeded
-            && faults
+    fn decommission_retry_fault_hook(
+        bucket: &str,
+        object: &str,
+        faults: Arc<AtomicUsize>,
+    ) -> crate::core::pools::DecommissionTestFaultDecision {
+        let target_bucket = bucket.to_string();
+        let target_object = object.to_string();
+        Arc::new(move |stage, bucket, object, attempt, succeeded| {
+            if !succeeded
+                || attempt >= crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS
+                || stage != DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT
+                || bucket != target_bucket
+                || object != target_object
+            {
+                return false;
+            }
+
+            // Entry retries reset the local attempt; real copy errors can skip
+            // successful attempts. Only injected faults spend this global budget.
+            // A real failure may consume an attempt, so preserve the final chance.
+            faults
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |faults| {
-                    (faults < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS.saturating_sub(1)
-                        && attempt < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS)
+                    (faults < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS.saturating_sub(1))
                         .then_some(faults.saturating_add(1))
                 })
                 .is_ok()
-    }
-
-    #[test]
-    fn decommission_copy_fault_budget_survives_entry_restarts_and_preserves_last_attempt() {
-        let cases: &[&[(usize, bool, bool)]] = &[
-            &[(1, true, true), (2, true, true), (3, true, false)],
-            &[(1, true, true), (2, false, false), (1, true, true), (2, true, false)],
-            &[(1, true, true), (2, false, false), (3, true, false)],
-            &[(1, true, true), (1, true, true), (1, true, false)],
-            &[(3, true, false), (4, true, false)],
-        ];
-        for case in cases {
-            let faults = AtomicUsize::new(0);
-            let mut expected_faults = 0;
-            for &(attempt, succeeded, expected) in *case {
-                assert_eq!(
-                    inject_decommission_copy_fault(&faults, attempt, succeeded),
-                    expected,
-                    "fault plan {case:?} at attempt {attempt}"
-                );
-                expected_faults += usize::from(expected);
-                assert_eq!(faults.load(Ordering::SeqCst), expected_faults);
-            }
-        }
+        })
     }
 
     async fn seed_decommission_source(
@@ -5508,6 +5500,43 @@ mod tests {
     }
 
     #[test]
+    fn decommission_retry_fault_budget_counts_successes_across_attempt_changes() {
+        let cases: &[&[(usize, bool, bool)]] = &[
+            &[(1, true, true), (2, true, true), (3, true, false)],
+            &[(1, true, true), (1, true, true), (2, true, false)],
+            &[(1, true, true), (3, true, false), (3, true, false)],
+            &[(1, true, true), (2, false, false), (1, true, true), (2, true, false)],
+            &[(1, true, true), (2, false, false), (3, true, false)],
+            &[(3, true, false), (4, true, false)],
+        ];
+        for case in cases {
+            let faults = Arc::new(AtomicUsize::new(0));
+            let hook = decommission_retry_fault_hook("bucket", "object", Arc::clone(&faults));
+
+            for (stage, bucket, object, succeeded) in [
+                ("other-stage", "bucket", "object", true),
+                (DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT, "other-bucket", "object", true),
+                (DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT, "bucket", "other-object", true),
+                (DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT, "bucket", "object", false),
+            ] {
+                assert!(!hook(stage, bucket, object, 1, succeeded));
+            }
+            assert_eq!(faults.load(Ordering::SeqCst), 0, "unrelated or failed copies must not consume faults");
+
+            let mut expected_faults = 0;
+            for &(attempt, succeeded, expected) in *case {
+                assert_eq!(
+                    hook(DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT, "bucket", "object", attempt, succeeded),
+                    expected,
+                    "fault plan {case:?} at attempt {attempt}"
+                );
+                expected_faults += usize::from(expected);
+                assert_eq!(faults.load(Ordering::SeqCst), expected_faults);
+            }
+        }
+    }
+
+    #[test]
     #[serial_test::serial(storage_class_env)]
     fn decommission_entry_retries_source_changed_without_canceling_other_bucket() {
         let handle = std::thread::Builder::new()
@@ -5601,16 +5630,8 @@ mod tests {
                     ));
 
                     let ordinary_faults = Arc::new(AtomicUsize::new(0));
-                    let ordinary_faults_for_hook = Arc::clone(&ordinary_faults);
-                    let fault_bucket = other_bucket.clone();
-                    let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
-                        move |stage, bucket, object, attempt, succeeded| {
-                            let candidate = stage == DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT
-                                && bucket == fault_bucket.as_str()
-                                && object == other_object;
-                            candidate && inject_decommission_copy_fault(&ordinary_faults_for_hook, attempt, succeeded)
-                        },
-                    ));
+                    let fault_hook = decommission_retry_fault_hook(&other_bucket, other_object, Arc::clone(&ordinary_faults));
+                    let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(fault_hook);
 
                     let rx = CancellationToken::new();
                     let source_changed_exhaustions = Arc::new(AtomicUsize::new(0));
@@ -8428,10 +8449,15 @@ mod tests {
         );
         assert!(com::read_config(store.pools[0].clone(), &second_page_path).await.is_ok());
 
-        com::save_config(store.pools[target_pool_idx].clone(), &second_page_path, receipt_bytes.clone())
+        let full_tail = ObjectOptions {
+            max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        com::save_config_with_opts(store.pools[target_pool_idx].clone(), &second_page_path, receipt_bytes.clone(), &full_tail)
             .await
             .expect("second page receipt should restore");
-        com::save_config(store.pools[target_pool_idx].clone(), &second_page_path, b"{corrupt".to_vec())
+        com::save_config_with_opts(store.pools[target_pool_idx].clone(), &second_page_path, b"{corrupt".to_vec(), &full_tail)
             .await
             .expect("second page receipt should corrupt deterministically");
         let corrupt = store
@@ -10724,8 +10750,17 @@ mod tests {
         const JOURNAL_COUNT: usize = 40;
 
         let temp_dir = tempfile::tempdir().expect("create rollback retry store dir");
-        let (ctx, store, _shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-rollback-retry", &[4])).await;
+        // Manual retries must own progress between fault removal and the next attempt.
+        let mut instance_ctx = crate::runtime::instance::InstanceContext::new();
+        instance_ctx.suppress_tier_delete_journal_recovery_for_test();
+        let (ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "dispatch-rollback-retry",
+            &[(1, 4)],
+            CancellationToken::new(),
+            Some(Arc::new(instance_ctx)),
+        ))
+        .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         let bucket = "dispatch-rollback-retry-bucket";
         store
@@ -10799,6 +10834,7 @@ mod tests {
 
         assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 0);
         assert_eq!(backend.remove_count().await, 0, "rollback retries must never call the remote tier");
+        shutdown.cancel();
     }
 
     #[cfg(feature = "test-util")]
