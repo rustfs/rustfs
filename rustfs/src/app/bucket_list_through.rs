@@ -432,10 +432,10 @@ mod tests {
     use crate::app::storage_api::bucket_usecase::bucket::on_demand_migration::{
         FilterConfig, OnDemandMigrationConfig, PathStyle, PolicyConfig, Provider, SourceConfig, SourceCredentials, TlsConfig,
     };
+    use crate::app::storage_api::bucket_usecase::s3::{ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response};
     use crate::app::storage_api::test::StoragePutObjReader;
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::app::storage_api::test::contract::object::ObjectIO as _;
-    use s3s::{S3Request, dto::ListObjectsV2Input};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -621,7 +621,7 @@ mod tests {
         policy: SourceErrorPolicy,
         resume_source: Option<&str>,
         filter_prefix: Option<&str>,
-    ) -> (S3Result<s3s::S3Response<s3s::dto::ListObjectsV2Output>>, Vec<String>) {
+    ) -> (S3Result<S3Response<ListObjectsV2Output>>, Vec<String>) {
         let store = shared_gating_ecstore().await;
         crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
         let bucket = format!("odm-list-{}", uuid::Uuid::new_v4().simple());
@@ -842,7 +842,7 @@ mod tests {
         });
     }
 
-    fn assert_source_policy_result(result: S3Result<s3s::S3Response<s3s::dto::ListObjectsV2Output>>, policy: SourceErrorPolicy) {
+    fn assert_source_policy_result(result: S3Result<S3Response<ListObjectsV2Output>>, policy: SourceErrorPolicy) {
         match policy {
             SourceErrorPolicy::Propagate => {
                 let error = result.expect_err("propagate must expose malformed pagination");
