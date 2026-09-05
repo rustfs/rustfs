@@ -4034,7 +4034,7 @@ mod tests {
             let enabled_before = sys.is_module_enabled();
             sys.set_module_enabled(true);
             let bucket = format!("odm-capture-failure-{}", uuid::Uuid::new_v4());
-            let mut config: crate::on_demand_migration::OnDemandMigrationConfig = serde_json::from_str(r#"{"source":{"provider":"minio","endpoint":"https://source.example.com","bucket":"source","credentials":{"access_key":"test","secret_key":"test"}}}"#).expect("source config");
+            let mut config: crate::on_demand_migration::OnDemandMigrationConfig = serde_json::from_str(r#"{"source":{"provider":"minio","endpoint":"https://source.example.com","region":"us-east-1","bucket":"source","credentials":{"access_key":"test","secret_key":"test"}}}"#).expect("source config");
             config.policy.list_through = true;
             sys.apply_for_incarnation(&bucket, uuid::Uuid::new_v4(), Some(&config)).await;
             let mut get = build_request(

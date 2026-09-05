@@ -133,6 +133,7 @@ impl NativeHttp {
         self.send_classified(request, error_code_header, false).await
     }
 
+    #[cfg(feature = "gcs")]
     pub(super) async fn send_object(
         &self,
         request: reqwest::Request,
@@ -210,6 +211,7 @@ pub(super) async fn read_text(response: reqwest::Response, max_bytes: usize) -> 
 /// Base64 digest (`Content-MD5`, `md5Hash`, `x-goog-hash`) as lowercase hex.
 /// `None` when the value is not a 16-byte digest, so a CRC32C never passes as
 /// an MD5.
+#[cfg(any(test, feature = "gcs"))]
 pub(super) fn base64_md5_to_hex(value: &str) -> Option<String> {
     let raw = base64_simd::STANDARD.decode_to_vec(value.trim().as_bytes()).ok()?;
     (raw.len() == 16).then(|| faster_hex::hex_string(&raw))
