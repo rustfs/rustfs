@@ -708,7 +708,12 @@ pub(crate) async fn broadcast_site_replication_make_bucket(
     } else {
         path
     };
-    broadcast_site_replication_json_using_runtime(runtime, &path, &serde_json::json!({})).await?;
+    // Both steps run to completion on their own: the broadcast attempts every
+    // peer and reports the first failure (backlog#2293), so stopping here on
+    // that error would skip `configure-replication` for the peers whose
+    // `make` just succeeded — and nothing records a retry for that gap. The
+    // failed peer's retry events cover both steps independently.
+    let make_result = broadcast_site_replication_json_using_runtime(runtime, &path, &serde_json::json!({})).await;
 
     let configure_path = bootstrap_bucket_op_path(bucket, "configure-replication");
     let configure_path = if let Some(token) = bootstrap_token {
@@ -716,7 +721,8 @@ pub(crate) async fn broadcast_site_replication_make_bucket(
     } else {
         configure_path
     };
-    broadcast_site_replication_json_using_runtime(runtime, &configure_path, &serde_json::json!({})).await
+    let configure_result = broadcast_site_replication_json_using_runtime(runtime, &configure_path, &serde_json::json!({})).await;
+    make_result.and(configure_result)
 }
 
 const SITE_REPLICATION_DELETE_INTENT_PENDING: &str =
