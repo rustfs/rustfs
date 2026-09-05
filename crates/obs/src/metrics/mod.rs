@@ -38,3 +38,4 @@ pub(crate) use storage_api::metrics::{
     obs_on_demand_migration_snapshot, obs_replication_site_stats_snapshot, obs_resolve_object_store_handle,
     obs_transition_state_handle,
 };
+pub use storage_api::register_on_demand_migration_metrics_source;

@@ -29,10 +29,10 @@ use super::azure::AzureSourceBackend;
 #[cfg(feature = "gcs")]
 use super::gcs::GcsNativeSourceBackend;
 use super::list_through::{ListPageError, validate_list_page};
-use crate::bucket::remote_s3_client::{
+use super::storage_api::HTTPRangeSpec;
+use super::storage_api::remote_s3_client::{
     PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, RemoteS3RetryPolicy, build_remote_s3_config,
 };
-use crate::storage_api_contracts::range::HTTPRangeSpec;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
@@ -995,7 +995,7 @@ fn s3_source_object(object: SdkObject) -> Result<SourceObject, SourceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bucket::on_demand_migration::backend_contract::{BackendCapabilities, OBJECT_MD5, assert_backend_contract};
+    use crate::on_demand_migration::backend_contract::{BackendCapabilities, OBJECT_MD5, assert_backend_contract};
     use aws_smithy_runtime_api::client::http::{HttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn};
     use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
     use aws_smithy_runtime_api::client::result::ConnectorError;
