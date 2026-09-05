@@ -299,7 +299,7 @@ use crate::error::is_err_invalid_upload_id;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
 use crate::object_api::{
     NamespaceLockFence, ReplicationStatusWritebackCondition, ReplicationStatusWritebackMode,
-    SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY,
+    SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, WriteCompletion,
 };
 use crate::services::notification_sys::RemoteVersionStateFleetProofToken;
 use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease, tier_destination_id_from_metadata};
@@ -4266,13 +4266,17 @@ impl SetDisks {
             // complete rename fan-out drains. Keep this path synchronous so
             // its terminal state is known before the coordinator releases
             // remote leases.
-            let commit_allows_early_ack = !(opts.data_movement && opts.has_decommission_capacity_reservation())
-                && (commit_object_lock_guard.is_some()
-                    || commit_decommission_object_lock_guard.is_some()
-                    || commit_publication_guard.is_some())
+            let commit_owns_namespace_guard = commit_object_lock_guard.is_some()
+                || commit_decommission_object_lock_guard.is_some()
+                || commit_publication_guard.is_some();
+            let commit_allows_early_ack = opts.write_completion == WriteCompletion::Quorum
+                && !(opts.data_movement && opts.has_decommission_capacity_reservation())
+                && commit_owns_namespace_guard
                 && commit_scanner_publication_scope.is_none();
+            // Full-tail callers also transfer owned guards to the coordinator:
+            // cancelling their ACK waiter must not cancel an in-flight rename.
             let detach_commit_owner = commit_scanner_publication_scope.is_some()
-                || commit_allows_early_ack
+                || commit_owns_namespace_guard
                 || commit_bucket_lifecycle_guard.is_some()
                 || quota_mutation_fence;
             let commit_write_path_label = write_path.metric_label();
@@ -4617,9 +4621,8 @@ impl SetDisks {
                     request.object_version_id = committed_version_id
                         .or_else(|| commit_version_suspended.then(Uuid::nil))
                         .map(|version_id| version_id.to_string());
-                    tokio::spawn(async move {
-                        let _ = rustfs_heal_contracts::heal_channel::send_heal_request(request).await;
-                    });
+                    let heal_set = commit_set.clone();
+                    tokio::spawn(async move { heal_set.submit_rename_tail_heal(request).await });
                 }
 
                 let rename_stage_elapsed = rename_stage_start.elapsed();
@@ -18157,6 +18160,256 @@ mod put_object_tmp_cleanup_tests {
         .await;
     }
 
+    async fn make_completion_test_bucket(disks: &[DiskStore], bucket: &str) {
+        for disk in disks {
+            disk.make_volume(bucket)
+                .await
+                .expect("completion test bucket should be created");
+        }
+    }
+
+    /// Observe the actual metadata quorum while the remaining rename is parked.
+    /// A completed task count alone can race tasks that have not started yet.
+    async fn wait_for_paused_tail_metadata_quorum(disks: &[DiskStore], bucket: &str, object: &str) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let mut committed = 0;
+                for disk in disks {
+                    match disk.read_version("", bucket, object, "", &ReadOptions::default()).await {
+                        Ok(_) => committed += 1,
+                        Err(DiskError::FileNotFound | DiskError::FileVersionNotFound) => {}
+                        Err(err) => panic!("unexpected metadata error while observing {bucket}/{object}: {err}"),
+                    }
+                }
+                if committed == 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("three disks must publish metadata while the fourth rename remains paused");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn tail_drained_put_waits_for_tail_and_allows_immediate_cas() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            for size in [4096, 1024 * 1024] {
+                let (_dirs, disks, set) = hermetic_set_disks(4).await;
+                let bucket = "put-full-tail-cas";
+                let object = "full-tail-cas-object";
+                make_completion_test_bucket(&disks, bucket).await;
+                let tasks = rename_fanout_barrier::observe_tasks(object);
+                let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+                let writer = Arc::clone(&set);
+                let put = tokio::spawn(async move {
+                    let mut reader = PutObjReader::from_vec(vec![b'1'; size]);
+                    writer
+                        .put_object(
+                            bucket,
+                            object,
+                            &mut reader,
+                            &ObjectOptions {
+                                write_completion: WriteCompletion::TailDrained,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                    .await
+                    .expect("full-tail PUT must reach the rename barrier");
+                wait_for_paused_tail_metadata_quorum(&disks, bucket, object).await;
+                assert!(!put.is_finished(), "full-tail PUT must remain pending after metadata quorum");
+                let mut lock_probe = Box::pin(set.acquire_write_lock_diag("full_tail_probe", bucket, object));
+                assert!(
+                    futures::poll!(lock_probe.as_mut()).is_pending(),
+                    "the owned namespace guard must remain held"
+                );
+                barrier.release();
+                let written = tokio::time::timeout(Duration::from_secs(30), put)
+                    .await
+                    .expect("full-tail PUT should finish after release")
+                    .expect("full-tail PUT task should join")
+                    .expect("full-tail PUT must commit");
+                assert_eq!(tasks.running(), 0, "full-tail response must follow every rename task");
+                drop(
+                    tokio::time::timeout(Duration::from_secs(5), lock_probe)
+                        .await
+                        .expect("same-key lock should be available on return")
+                        .expect("same-key lock probe should succeed"),
+                );
+                for disk in &disks {
+                    disk.read_version("", bucket, object, "", &ReadOptions::default())
+                        .await
+                        .expect("successful full-tail PUT must publish on every healthy disk");
+                }
+                drop(barrier);
+                let mut replacement = PutObjReader::from_vec(b"cas successor".to_vec());
+                set.put_object(
+                    bucket,
+                    object,
+                    &mut replacement,
+                    &ObjectOptions {
+                        write_completion: WriteCompletion::TailDrained,
+                        http_preconditions: Some(HTTPPreconditions {
+                            if_match: written.etag,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("immediate same-key CAS must acquire the namespace guard");
+                let mut read = set
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("CAS successor must be immediately readable");
+                let mut body = Vec::new();
+                read.stream.read_to_end(&mut body).await.expect("successor body must drain");
+                assert_eq!(body, b"cas successor");
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn tail_drained_put_preserves_quorum_success_and_heals_failed_tail() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "put-full-tail-heal";
+        let object = "full-tail-heal-object";
+        make_completion_test_bucket(&disks, bucket).await;
+        let mut heals = set.capture_test_rename_tail_heals();
+        let tasks = rename_fanout_barrier::observe_tasks(object);
+        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+        let _fault = rename_fault_injection::fail_rename_on(object, &[0]);
+        let writer = Arc::clone(&set);
+        let put = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+            writer
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        write_completion: WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .expect("failed tail must first reach the rename barrier");
+        wait_for_paused_tail_metadata_quorum(&disks, bucket, object).await;
+        assert!(!put.is_finished(), "committed quorum must still wait for the failing tail");
+        barrier.release();
+        tokio::time::timeout(Duration::from_secs(30), put)
+            .await
+            .expect("failed tail should drain")
+            .expect("PUT task should join")
+            .expect("a minority tail error must not negate committed quorum");
+        assert_eq!(tasks.running(), 0);
+        let heal = tokio::time::timeout(Duration::from_secs(30), heals.recv())
+            .await
+            .expect("failed tail must schedule heal")
+            .expect("heal capture must remain connected");
+        assert_eq!(heal.bucket, bucket);
+        assert_eq!(heal.object_prefix.as_deref(), Some(object));
+        let info = set
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("committed object must remain readable despite the failed tail");
+        assert_eq!(info.size, TEST_OBJECT_SIZE as i64);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn tail_drained_put_rejects_quorum_minus_one() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "put-full-tail-no-quorum";
+        let object = "full-tail-no-quorum-object";
+        make_completion_test_bucket(&disks, bucket).await;
+        let _fault = rename_fault_injection::fail_rename_on(object, &[0, 1]);
+        let tasks = rename_fanout_barrier::observe_tasks(object);
+        let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+        let err = set
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("draining two successful disks cannot satisfy write quorum three");
+        assert!(
+            matches!(err, Error::ErasureWriteQuorum | Error::InsufficientWriteQuorum(_, _)),
+            "original quorum error expected: {err}"
+        );
+        assert_eq!(tasks.running(), 0, "failed fan-out and rollback must complete before return");
+        assert!(
+            set.get_object_info(bucket, object, &ObjectOptions::default()).await.is_err(),
+            "failed fresh write must not become visible"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn tail_drained_put_owned_commit_survives_waiter_cancellation() {
+        let (dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = RUSTFS_META_BUCKET;
+        let object = "full-tail-cancelled-receipt";
+        // Internal config writes do not own a bucket lifecycle guard. The object
+        // guard alone must keep the full-tail coordinator alive after cancellation.
+        let tasks = rename_fanout_barrier::observe_tasks(object);
+        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+        let writer = Arc::clone(&set);
+        let put = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+            writer
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        write_completion: WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .expect("cancelled receipt must first reach the rename barrier");
+        wait_for_paused_tail_metadata_quorum(&disks, bucket, object).await;
+        put.abort();
+        assert!(put.await.expect_err("ACK waiter should cancel").is_cancelled());
+        let mut lock_probe = Box::pin(set.acquire_write_lock_diag("cancelled_full_tail_probe", bucket, object));
+        assert!(
+            futures::poll!(lock_probe.as_mut()).is_pending(),
+            "owned coordinator must retain the namespace guard after waiter cancellation"
+        );
+        barrier.release();
+        drop(
+            tokio::time::timeout(Duration::from_secs(30), lock_probe)
+                .await
+                .expect("cancelled coordinator must eventually release its guard")
+                .expect("post-commit lock probe should succeed"),
+        );
+        assert_eq!(tasks.running(), 0, "cancelled coordinator must reap every rename task");
+        for disk in &disks {
+            disk.read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("caller cancellation must not interrupt committed receipt materialization");
+        }
+        wait_for_tmp_workspace_to_drain(&dirs, "cancelled full-tail commit should release staging ownership").await;
+    }
+
     #[tokio::test]
     #[serial_test::serial(capacity_dirty_scope)]
     async fn no_lock_put_waits_for_rename_tail_under_outer_guard() {
@@ -18184,6 +18437,7 @@ mod put_object_tmp_cleanup_tests {
                         &mut reader,
                         &ObjectOptions {
                             no_lock: true,
+                            write_completion: WriteCompletion::TailDrained,
                             ..Default::default()
                         },
                     )
@@ -18209,7 +18463,18 @@ mod put_object_tmp_cleanup_tests {
             put.await
                 .expect("no-lock PUT task should join")
                 .expect("no-lock PUT should commit after the rename tail releases");
+            let mut lock_probe = Box::pin(set_disks.acquire_write_lock_diag("borrowed_full_tail_probe", bucket, object));
+            assert!(
+                futures::poll!(lock_probe.as_mut()).is_pending(),
+                "full-tail PUT must not release the caller's outer guard"
+            );
             drop(outer_guard);
+            drop(
+                tokio::time::timeout(Duration::from_secs(5), lock_probe)
+                    .await
+                    .expect("outer owner releasing its guard should unblock the probe")
+                    .expect("post-outer-guard probe should succeed"),
+            );
         })
         .await;
     }
