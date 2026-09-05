@@ -143,11 +143,12 @@ struct TierDriverBuildBarrier {
 static TIER_DRIVER_BUILD_BARRIER: LazyLock<Mutex<Option<Arc<TierDriverBuildBarrier>>>> = LazyLock::new(|| Mutex::new(None));
 
 #[cfg(test)]
-type TierDriverTestFactory = Arc<dyn Fn(&TierConfig) -> std::result::Result<WarmBackendImpl, AdminError> + Send + Sync + 'static>;
+pub(crate) type TierDriverTestFactory =
+    Arc<dyn Fn(&TierConfig) -> std::result::Result<WarmBackendImpl, AdminError> + Send + Sync + 'static>;
 
 #[cfg(test)]
 tokio::task_local! {
-    static TIER_DRIVER_TEST_FACTORY: TierDriverTestFactory;
+    pub(crate) static TIER_DRIVER_TEST_FACTORY: TierDriverTestFactory;
 }
 
 #[cfg(test)]
@@ -1377,27 +1378,42 @@ async fn ensure_no_authoritative_persisted_references<S>(
 where
     S: TierReferenceProofStore,
 {
-    ensure_no_authoritative_persisted_references_with(api.clone(), TIER_DELETE_JOURNAL_PREFIX, |_object, data| {
-        let journal = decode_tier_delete_journal_entry(data).map_err(io::Error::other)?;
-        Ok((
-            journal.tier_name.clone(),
-            tier_persisted_reference_blocks_any_target(&journal.tier_name, journal.backend_identity, targets),
-        ))
-    })
+    ensure_no_authoritative_persisted_references_with(
+        api.clone(),
+        TIER_DELETE_JOURNAL_PREFIX,
+        "tier-delete journal",
+        |_object, data| {
+            let journal = decode_tier_delete_journal_entry(data).map_err(io::Error::other)?;
+            Ok((
+                journal.tier_name.clone(),
+                tier_persisted_reference_blocks_any_target(&journal.tier_name, journal.backend_identity, targets),
+            ))
+        },
+    )
     .await?;
-    ensure_no_authoritative_persisted_references_with(api, TRANSITION_TRANSACTION_RECORD_PREFIX, |object, data| {
-        let transaction = decode_transition_transaction_record(object, data).map_err(io::Error::other)?;
-        Ok((
-            transaction.tier_name.clone(),
-            tier_persisted_reference_blocks_any_target(&transaction.tier_name, Some(transaction.backend_fingerprint), targets),
-        ))
-    })
+    ensure_no_authoritative_persisted_references_with(
+        api,
+        TRANSITION_TRANSACTION_RECORD_PREFIX,
+        "transition transaction",
+        |object, data| {
+            let transaction = decode_transition_transaction_record(object, data).map_err(io::Error::other)?;
+            Ok((
+                transaction.tier_name.clone(),
+                tier_persisted_reference_blocks_any_target(
+                    &transaction.tier_name,
+                    Some(transaction.backend_fingerprint),
+                    targets,
+                ),
+            ))
+        },
+    )
     .await
 }
 
 async fn ensure_no_authoritative_persisted_references_with<S, F>(
     api: Arc<S>,
     prefix: &str,
+    reference_kind: &str,
     blocks_target: F,
 ) -> std::result::Result<(), AdminError>
 where
@@ -1426,7 +1442,7 @@ where
                 .map_err(tier_reference_proof_admin_error)?;
             let (tier_name, blocks) = blocks_target(&object.name, &data).map_err(tier_reference_proof_admin_error)?;
             if blocks {
-                return Err(tier_reference_proof_persisted_in_use_error(&tier_name, &object.name));
+                return Err(tier_reference_proof_persisted_in_use_error(&tier_name, reference_kind, &object.name));
             }
         }
         if !page.is_truncated {
@@ -1488,16 +1504,21 @@ fn tier_persisted_reference_blocks_target(
 
 fn tier_reference_proof_in_use_error(tier_name: &str, object: &ObjectInfo) -> AdminError {
     let mut err = ERR_TIER_BACKEND_IN_USE.clone();
+    let reference_kind = if object.transitioned_object.free_version {
+        "free-version ownership"
+    } else {
+        "transitioned-object"
+    };
     err.message = format!(
-        "Remote tier {tier_name} still has object references, for example {}/{}",
+        "Remote tier {tier_name} still has a {reference_kind} reference, for example {}/{}",
         object.bucket, object.name
     );
     err
 }
 
-fn tier_reference_proof_persisted_in_use_error(tier_name: &str, object: &str) -> AdminError {
+fn tier_reference_proof_persisted_in_use_error(tier_name: &str, reference_kind: &str, object: &str) -> AdminError {
     let mut err = ERR_TIER_BACKEND_IN_USE.clone();
-    err.message = format!("Remote tier {tier_name} still has a persisted reference, for example {object}");
+    err.message = format!("Remote tier {tier_name} still has a {reference_kind} reference, for example {object}");
     err
 }
 
@@ -3685,13 +3706,17 @@ impl TierConfigMgr {
         let manager = handle.read().await;
         let runtime = tier_driver_runtime(handle, &manager);
         let runtime = lock_unpoisoned(&runtime);
-        if !runtime
+        let prepared = runtime
+            .prepared_mutation_blocks
+            .values()
+            .any(|blocked_mutation_id| *blocked_mutation_id == mutation_id);
+        let committed = runtime
             .committed_mutation_blocks
             .values()
-            .any(|mutation_ids| mutation_ids.contains(&mutation_id))
-        {
+            .any(|mutation_ids| mutation_ids.contains(&mutation_id));
+        if !prepared && !committed {
             let mut err = ERR_TIER_INVALID_CONFIG.clone();
-            err.message = "Remote tier committed mutation fence was not installed".to_string();
+            err.message = "Remote tier mutation fence was not installed".to_string();
             return Err(err);
         }
         Ok(MutationBlockAllowance {
@@ -3896,14 +3921,6 @@ impl TierConfigMgr {
         let changed = changed_tier_names(manager, candidate);
         let replaced_destinations = replaced_tier_destinations(manager, candidate)?;
         Self::begin_tier_transition_with_destinations(handle, manager, changed, replaced_destinations, mutation_block_allowance)
-    }
-
-    fn begin_tier_transition(
-        handle: &Arc<RwLock<Self>>,
-        manager: &mut Self,
-        changed: HashSet<String>,
-    ) -> std::result::Result<TierPublishTransition, AdminError> {
-        Self::begin_tier_transition_with_destinations(handle, manager, changed, HashMap::new(), None)
     }
 
     fn begin_tier_transition_with_destinations(
@@ -4176,7 +4193,7 @@ impl TierConfigMgr {
                     let mut config_lock = config_lock;
                     let coordinated_config_update = config_lock.is_some();
                     let mut update = Some(update);
-                    let (mutation_kind, explicit_tier_name, mutation_force, current_for_targets, driver_tier, mut transition) =
+                    let (mutation_kind, explicit_tier_name, mutation_force, current_for_targets, driver_tier, target_tiers) =
                         match mutation {
                             TierCandidateMutation::Prevalidated(prepared) => {
                                 if version != prepared.version {
@@ -4192,9 +4209,8 @@ impl TierConfigMgr {
                                     )));
                                 }
                                 candidate = prepared.candidate;
-                                let validation_deadline = Instant::now() + TIER_REMOTE_VALIDATION_TIMEOUT;
-                                let mut transition = {
-                                    let mut manager = handle.write().await;
+                                let target_tiers = {
+                                    let manager = handle.read().await;
                                     let mut target_tiers = changed_tier_names(&manager, &candidate);
                                     if let Some(tier_name) = prepared.explicit_tier_name.as_ref()
                                         && (manager.tiers.contains_key(tier_name)
@@ -4203,8 +4219,7 @@ impl TierConfigMgr {
                                     {
                                         target_tiers.insert(tier_name.clone());
                                     }
-                                    Self::begin_tier_transition(&handle, &mut manager, target_tiers)
-                                        .map_err(TierConfigUpdateError::Publish)?
+                                    target_tiers
                                 };
                                 (
                                     prepared.kind,
@@ -4212,7 +4227,7 @@ impl TierConfigMgr {
                                     prepared.force,
                                     prepared.current,
                                     prepared.driver_tier,
-                                    transition,
+                                    target_tiers,
                                 )
                             }
                             mutation => {
@@ -4237,11 +4252,9 @@ impl TierConfigMgr {
                                     last_refreshed_at: candidate.last_refreshed_at,
                                 };
                                 let validation_deadline = Instant::now() + TIER_REMOTE_VALIDATION_TIMEOUT;
-                                let mut transition = {
-                                    let mut manager = handle.write().await;
-                                    let target_tiers = mutation.target_tiers(&manager, &candidate);
-                                    Self::begin_tier_transition(&handle, &mut manager, target_tiers)
-                                        .map_err(TierConfigUpdateError::Publish)?
+                                let target_tiers = {
+                                    let manager = handle.read().await;
+                                    mutation.target_tiers(&manager, &candidate)
                                 };
                                 let driver_tier = apply_tier_candidate_mutation(mutation, &mut candidate, validation_deadline)
                                     .await
@@ -4252,7 +4265,7 @@ impl TierConfigMgr {
                                     mutation_force,
                                     current_for_targets,
                                     driver_tier,
-                                    transition,
+                                    target_tiers,
                                 )
                             }
                         };
@@ -4275,28 +4288,83 @@ impl TierConfigMgr {
                     save_coordinator_tier_mutation_intent(api.clone(), coordinator_intent.as_ref())
                         .await
                         .map_err(TierConfigUpdateError::Save)?;
+                    let mut blocked_target_tiers = target_tiers.clone();
                     if let Some(intent) = coordinator_intent.as_ref() {
-                        TierConfigMgr::apply_prepared_mutation_intent_block(&handle, intent)
+                        blocked_target_tiers.extend(intent.affected_targets.iter().map(|target| target.tier_name.clone()));
+                    }
+                    if let Some(intent) = coordinator_intent.as_ref() {
+                        // `target_tiers` may include a stale local-only manager
+                        // entry that is absent from the persisted proof
+                        // snapshot. Fence that local transition under the same
+                        // mutation ID as well; recovery may discard this
+                        // process-local superset, which advances the revision
+                        // and makes the deferred transition fail closed.
+                        TierConfigMgr::apply_prepared_mutation_intent_block_for_tiers(&handle, intent, &blocked_target_tiers)
                             .await
                             .map_err(TierConfigUpdateError::Publish)?;
                     }
+                    let prepared_mutation_block_allowance = match coordinator_intent.as_ref() {
+                        Some(intent) => Some(
+                            TierConfigMgr::mutation_block_allowance_for(&handle, intent.mutation_id)
+                                .await
+                                .map_err(TierConfigUpdateError::Publish)?,
+                        ),
+                        None => None,
+                    };
+                    // A durable coordinator intent supplies the admission
+                    // fence that lets us defer generation revocation. Keep the
+                    // original early transition for no-intent paths (for
+                    // example, reconciling a stale local manager to an
+                    // idempotently removed persisted tier), where there is no
+                    // Prepared record capable of blocking a new lease.
+                    let (mut transition, deferred_target_tiers) = if coordinator_intent.is_some() {
+                        (None, Some(target_tiers))
+                    } else {
+                        let transition = {
+                            let mut manager = handle.write().await;
+                            Self::begin_tier_transition_with_destinations(
+                                &handle,
+                                &mut manager,
+                                target_tiers,
+                                HashMap::new(),
+                                None,
+                            )
+                            .map_err(TierConfigUpdateError::Publish)?
+                        };
+                        (Some(transition), None)
+                    };
                     if coordinated_config_update {
                         drop(update.take());
                         drop(config_lock.take());
                     }
-                    let drain_deadline = Instant::now() + TIER_REMOTE_VALIDATION_TIMEOUT;
-                    if let Err(drain_error) = transition.wait_for_active_leases_until(drain_deadline).await {
-                        if !abort_prepared_tier_mutation(&handle, api.clone(), coordinator_intent.as_ref(), Vec::new()).await {
+                    // The durable Prepared block closes admission before the
+                    // zero-reference proof, but deliberately leaves already
+                    // issued generations current. In particular, an exact
+                    // free-version cleanup that has completed remote DELETE
+                    // must still be able to remove its local ownership marker;
+                    // revoking its generation here would strand that marker
+                    // and make this mutation reject its own interrupted work.
+                    if let Some(intent) = coordinator_intent.as_ref()
+                        && let Err(drain_error) =
+                            TierConfigMgr::wait_for_blocked_tier_operation_leases_for_tiers(&handle, &blocked_target_tiers).await
+                    {
+                        if !abort_prepared_tier_mutation(&handle, api.clone(), Some(intent), Vec::new()).await {
                             warn!(
                                 event = "tier_mutation_abort",
                                 component = LOG_COMPONENT_ECSTORE,
                                 subsystem = LOG_SUBSYSTEM_TIER,
                                 result = "prepared_intent_retained",
-                                coordinator_intent = coordinator_intent.is_some(),
+                                mutation_id = %intent.mutation_id,
                                 "tier mutation lease drain failed and abort was incomplete"
                             );
                         }
                         return Err(TierConfigUpdateError::Publish(drain_error));
+                    } else if let Some(transition) = transition.as_ref() {
+                        let drain_deadline = Instant::now() + TIER_REMOTE_VALIDATION_TIMEOUT;
+                        transition
+                            .wait_for_active_leases_until(drain_deadline)
+                            .await
+                            .map_err(TierConfigUpdateError::Publish)?;
                     }
                     let prepared_peers = if let Some(intent) = coordinator_intent.as_ref() {
                         let peers = match remote_tier_mutation_peers().await {
@@ -4362,6 +4430,71 @@ impl TierConfigMgr {
                             );
                         }
                         return Err(TierConfigUpdateError::Publish(proof_error));
+                    }
+                    // No affected-tier lease can start after Prepared, and the
+                    // existing set was drained above. It is now safe to revoke
+                    // the generation for publication without invalidating a
+                    // cleanup between its remote and local commit boundaries.
+                    if transition.is_none() {
+                        let target_tiers = deferred_target_tiers.ok_or_else(|| {
+                            let mut err = ERR_TIER_INVALID_CONFIG.clone();
+                            err.message = "Remote tier mutation lost its deferred transition targets".to_string();
+                            TierConfigUpdateError::Publish(err)
+                        })?;
+                        let mut manager = handle.write().await;
+                        transition = Some(
+                            match Self::begin_tier_transition_with_destinations(
+                                &handle,
+                                &mut manager,
+                                target_tiers,
+                                HashMap::new(),
+                                prepared_mutation_block_allowance.as_ref(),
+                            ) {
+                                Ok(transition) => transition,
+                                Err(transition_error) => {
+                                    drop(manager);
+                                    if !abort_prepared_tier_mutation(
+                                        &handle,
+                                        api.clone(),
+                                        coordinator_intent.as_ref(),
+                                        prepared_peers,
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            event = "tier_mutation_abort",
+                                            component = LOG_COMPONENT_ECSTORE,
+                                            subsystem = LOG_SUBSYSTEM_TIER,
+                                            result = "prepared_intent_retained",
+                                            coordinator_intent = coordinator_intent.is_some(),
+                                            "tier mutation publish transition failed and abort was incomplete"
+                                        );
+                                    }
+                                    return Err(TierConfigUpdateError::Publish(transition_error));
+                                }
+                            },
+                        );
+                    }
+                    let mut transition = transition.ok_or_else(|| {
+                        let mut err = ERR_TIER_INVALID_CONFIG.clone();
+                        err.message = "Remote tier mutation lost its publish transition".to_string();
+                        TierConfigUpdateError::Publish(err)
+                    })?;
+                    let drain_deadline = Instant::now() + TIER_REMOTE_VALIDATION_TIMEOUT;
+                    if let Err(drain_error) = transition.wait_for_active_leases_until(drain_deadline).await {
+                        drop(transition);
+                        if !abort_prepared_tier_mutation(&handle, api.clone(), coordinator_intent.as_ref(), prepared_peers).await
+                        {
+                            warn!(
+                                event = "tier_mutation_abort",
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_TIER,
+                                result = "prepared_intent_retained",
+                                coordinator_intent = coordinator_intent.is_some(),
+                                "tier mutation publish drain failed and abort was incomplete"
+                            );
+                        }
+                        return Err(TierConfigUpdateError::Publish(drain_error));
                     }
                     let candidate_digest = tier_config_candidate_digest(&candidate).map_err(TierConfigUpdateError::Save)?;
                     if coordinated_config_update {
@@ -5414,11 +5547,40 @@ impl TierConfigMgr {
         handle: &Arc<RwLock<Self>>,
         intent: &TierMutationIntent,
     ) -> std::result::Result<(), AdminError> {
+        let target_tiers = intent
+            .affected_targets
+            .iter()
+            .map(|target| target.tier_name.clone())
+            .collect();
+        Self::apply_prepared_mutation_intent_block_for_tiers(handle, intent, &target_tiers).await
+    }
+
+    async fn apply_prepared_mutation_intent_block_for_tiers(
+        handle: &Arc<RwLock<Self>>,
+        intent: &TierMutationIntent,
+        target_tiers: &HashSet<String>,
+    ) -> std::result::Result<(), AdminError> {
+        if intent.state != TierMutationIntentState::Prepared {
+            return Ok(());
+        }
         let manager = handle.read().await;
         let runtime = tier_driver_runtime(handle, &manager);
         let mut runtime = lock_unpoisoned(&runtime);
         let mut prepared_mutation_blocks = runtime.prepared_mutation_blocks.clone();
         Self::collect_prepared_mutation_intent_block(&mut prepared_mutation_blocks, intent)?;
+        for tier_name in target_tiers {
+            match prepared_mutation_blocks.entry(tier_name.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(intent.mutation_id);
+                }
+                Entry::Occupied(entry) if *entry.get() == intent.mutation_id => {}
+                Entry::Occupied(_) => {
+                    let mut err = ERR_TIER_BACKEND_IN_USE.clone();
+                    err.message = format!("Remote tier {tier_name} already has another prepared mutation");
+                    return Err(err);
+                }
+            }
+        }
         if prepared_mutation_blocks == runtime.prepared_mutation_blocks {
             return Ok(());
         }
@@ -5435,16 +5597,27 @@ impl TierConfigMgr {
         handle: &Arc<RwLock<Self>>,
         intent: &TierMutationIntent,
     ) -> std::result::Result<(), AdminError> {
+        let target_tiers = intent
+            .affected_targets
+            .iter()
+            .map(|target| target.tier_name.clone())
+            .collect();
+        Self::wait_for_blocked_tier_operation_leases_for_tiers(handle, &target_tiers).await
+    }
+
+    async fn wait_for_blocked_tier_operation_leases_for_tiers(
+        handle: &Arc<RwLock<Self>>,
+        target_tiers: &HashSet<String>,
+    ) -> std::result::Result<(), AdminError> {
         let generations = {
             let manager = handle.read().await;
             let Some(runtime) = registered_tier_driver_runtime(&manager) else {
                 return Ok(());
             };
             let runtime = lock_unpoisoned(&runtime);
-            intent
-                .affected_targets
+            target_tiers
                 .iter()
-                .filter_map(|target| runtime.generations.get(&target.tier_name).cloned())
+                .filter_map(|tier_name| runtime.generations.get(tier_name).cloned())
                 .collect::<Vec<_>>()
         };
         let drain = async {
@@ -14414,6 +14587,13 @@ mod tests {
                 .push(object);
         }
 
+        fn remove_listed_version(&self, bucket: &str, object: &str) {
+            self.listed_versions
+                .lock()
+                .expect("tier reference fixture should not poison")
+                .retain(|version| version.bucket != bucket || version.name != object);
+        }
+
         fn add_lifecycle_config(&self, bucket: &str, config: BucketLifecycleConfiguration) {
             self.lifecycle_configs
                 .lock()
@@ -15682,6 +15862,152 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tier_remove_prepared_fence_allows_inflight_free_version_cleanup_to_finish() {
+        let store = Arc::new(CasConfigStore::default());
+        let tier = build_rustfs_tier("COLD-A");
+        let identity = tier_backend_identity(&tier).expect("test tier identity should encode");
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), tier.clone_with_credentials());
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("free-version drain fixture should persist");
+
+        let manager = TierConfigMgr::new();
+        {
+            let mut guard = manager.write().await;
+            guard.tiers.insert("COLD-A".to_string(), tier);
+            guard.tiers.insert("COLD-B".to_string(), build_rustfs_tier("COLD-B"));
+            guard
+                .replace_driver("COLD-A", Box::new(LeaseTestBackend::ready("cleanup")))
+                .expect("cleanup driver generation should install");
+            guard
+                .replace_driver("COLD-B", Box::new(LeaseTestBackend::ready("stale-local")))
+                .expect("stale local driver generation should install");
+        }
+        let cleanup_lease = TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
+            .await
+            .expect("in-flight cleanup lease should be available");
+        let stale_local_lease = TierConfigMgr::acquire_operation_lease(&manager, "COLD-B")
+            .await
+            .expect("stale local tier lease should be available");
+        let mut free_version = transitioned_tier_object("photos", "2026/free-version.jpg", "COLD-A", Some(identity));
+        free_version.transitioned_object.status = "pending".to_string();
+        free_version.transitioned_object.free_version = true;
+        store.add_listed_version(free_version);
+
+        let remove_manager = manager.clone();
+        let remove_store = store.clone();
+        let remove = tokio::spawn(async move {
+            TIER_MUTATION_TEST_PEERS
+                .scope(
+                    Vec::new(),
+                    TierConfigMgr::remove_and_save_with(&remove_manager, remove_store, "COLD-A", true),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let guard = manager.read().await;
+                let runtime = registered_tier_driver_runtime(&guard).expect("runtime should remain registered");
+                let prepared = {
+                    let runtime = lock_unpoisoned(&runtime);
+                    runtime.prepared_mutation_blocks.contains_key("COLD-A")
+                        && runtime.prepared_mutation_blocks.contains_key("COLD-B")
+                };
+                if prepared {
+                    break;
+                }
+                drop(guard);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tier remove should install its durable prepared fence");
+
+        assert!(
+            cleanup_lease.is_current(&manager).await,
+            "the prepared fence must let the already leased cleanup finish its exact local marker deletion"
+        );
+        assert!(
+            stale_local_lease.is_current(&manager).await,
+            "the local superset fence must also let an already leased stale-manager operation finish"
+        );
+        let blocked = match TierConfigMgr::acquire_operation_lease(&manager, "COLD-A").await {
+            Ok(_) => panic!("the prepared fence must reject new tier operations"),
+            Err(err) => err,
+        };
+        assert!(TierConfigMgr::operation_lease_blocked_by_mutation(&blocked));
+        let stale_blocked = match TierConfigMgr::acquire_operation_lease(&manager, "COLD-B").await {
+            Ok(_) => panic!("the local superset fence must reject new stale-manager operations"),
+            Err(err) => err,
+        };
+        assert!(TierConfigMgr::operation_lease_blocked_by_mutation(&stale_blocked));
+
+        store.remove_listed_version("photos", "2026/free-version.jpg");
+        drop(cleanup_lease);
+        drop(stale_local_lease);
+
+        tokio::time::timeout(Duration::from_secs(5), remove)
+            .await
+            .expect("tier remove should finish after both in-flight operations release their leases")
+            .expect("tier remove task should join")
+            .expect("tier remove should pass once the in-flight cleanup removes its marker");
+        assert!(!manager.read().await.tiers.contains_key("COLD-A"));
+        assert!(!manager.read().await.tiers.contains_key("COLD-B"));
+        assert!(
+            !load_tier_config_for_update(store)
+                .await
+                .expect("removed tier config should reload")
+                .0
+                .tiers
+                .contains_key("COLD-A")
+        );
+    }
+
+    #[tokio::test]
+    async fn no_intent_stale_manager_removal_keeps_early_generation_drain() {
+        let store = Arc::new(CasConfigStore::default());
+        empty_mgr()
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("empty persisted tier config should exist");
+        let manager = TierConfigMgr::new();
+        {
+            let mut guard = manager.write().await;
+            install_lease_backend(&mut guard, "COLD-A", LeaseTestBackend::ready("stale"));
+        }
+        let old = TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
+            .await
+            .expect("stale manager lease should be available");
+
+        let remove_manager = manager.clone();
+        let remove_store = store.clone();
+        let remove =
+            tokio::spawn(async move { TierConfigMgr::remove_and_save_with(&remove_manager, remove_store, "COLD-A", true).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while old.is_current(&manager).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("no-intent stale-manager reconciliation should revoke before its proof");
+        let blocked = match TierConfigMgr::acquire_operation_lease(&manager, "COLD-A").await {
+            Ok(_) => panic!("stale-manager reconciliation must not admit a new operation"),
+            Err(err) => err,
+        };
+        assert!(TierConfigMgr::operation_lease_blocked_by_mutation(&blocked));
+
+        drop(old);
+        remove
+            .await
+            .expect("stale-manager removal task should join")
+            .expect("stale-manager removal should converge to the persisted empty config");
+        assert!(!manager.read().await.tiers.contains_key("COLD-A"));
+    }
+
     async fn assert_lifecycle_only_reference_obeys_force(clear: bool, force: bool) {
         let store = Arc::new(CasConfigStore::default());
         let tier = build_rustfs_tier("COLD-A");
@@ -16585,12 +16911,23 @@ mod tests {
             .await
         });
         tokio::time::timeout(Duration::from_secs(1), async {
-            while old.is_current(&manager).await {
+            loop {
+                let guard = manager.read().await;
+                let runtime = registered_tier_driver_runtime(&guard).expect("runtime should remain registered");
+                let prepared = lock_unpoisoned(&runtime).prepared_mutation_blocks.contains_key("COLD-A");
+                if prepared {
+                    break;
+                }
+                drop(guard);
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("owned update should revoke before caller cancellation");
+        .expect("owned update should install its prepared fence before caller cancellation");
+        assert!(
+            old.is_current(&manager).await,
+            "an already leased operation must remain current until it can finish"
+        );
         caller.abort();
         drop(old);
 
@@ -16635,12 +16972,23 @@ mod tests {
             .await
         });
         tokio::time::timeout(Duration::from_secs(1), async {
-            while old.is_current(&manager).await {
+            loop {
+                let guard = manager.read().await;
+                let runtime = registered_tier_driver_runtime(&guard).expect("runtime should remain registered");
+                let prepared = lock_unpoisoned(&runtime).prepared_mutation_blocks.contains_key("COLD-A");
+                if prepared {
+                    break;
+                }
+                drop(guard);
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("owned update should revoke before caller cancellation");
+        .expect("owned update should install its prepared fence before caller cancellation");
+        assert!(
+            old.is_current(&manager).await,
+            "the prepared fence must not invalidate an already leased operation"
+        );
         caller.abort();
 
         let config_file = tier_config_lock_path();
@@ -17024,6 +17372,71 @@ mod tests {
             .0;
         assert!(current.tiers.contains_key("COLD-A"));
         assert!(current.tiers.contains_key("COLD-B"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reference_proof_rejects_a_changed_prepared_fence_revision_before_publish() {
+        let manager = TierConfigMgr::new();
+        let store = Arc::new(CasConfigStore::default());
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("prepared-fence revision fixture should persist");
+        {
+            let mut guard = manager.write().await;
+            install_lease_backend(&mut guard, "COLD-A", LeaseTestBackend::ready("old"));
+        }
+
+        let barrier = tier_reference_proof_test_barrier();
+        let scoped_barrier = barrier.clone();
+        let update_manager = manager.clone();
+        let update_store = store.clone();
+        let update = tokio::spawn(async move {
+            TIER_REFERENCE_PROOF_TEST_BARRIER
+                .scope(
+                    scoped_barrier,
+                    TIER_MUTATION_TEST_PEERS.scope(
+                        Vec::new(),
+                        TierConfigMgr::update_candidate_with_config_lock(
+                            &update_manager,
+                            update_store,
+                            TierCandidateMutation::Remove("COLD-A".to_string(), true),
+                        ),
+                    ),
+                )
+                .await
+        });
+        barrier.arrived.notified().await;
+
+        let unrelated = prepared_remove_intent("COLD-B", uuid::Uuid::from_u128(0x2237));
+        TierConfigMgr::apply_prepared_mutation_intent_block(&manager, &unrelated)
+            .await
+            .expect("an unrelated prepared fence should advance the runtime revision");
+        barrier.release.add_permits(1);
+
+        let err = update
+            .await
+            .expect("tier update task should join")
+            .expect_err("a reference proof cannot authorize publication across a fence revision change");
+        let TierConfigUpdateError::Publish(err) = err else {
+            panic!("the stale prepared-fence allowance should fail publication: {err:?}");
+        };
+        assert!(err.message.contains("changed before replacement"), "{err}");
+        assert!(manager.read().await.tiers.contains_key("COLD-A"));
+        assert!(
+            load_tier_config_for_update(store)
+                .await
+                .expect("rejected tier config should remain readable")
+                .0
+                .tiers
+                .contains_key("COLD-A")
+        );
+        TierConfigMgr::clear_prepared_mutation_intent_block(&manager, unrelated.mutation_id)
+            .await
+            .expect("unrelated test fence should clear");
     }
 
     #[tokio::test]
