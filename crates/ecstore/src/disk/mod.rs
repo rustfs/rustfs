@@ -75,6 +75,25 @@ use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
+/// Local preflight evidence stays outside DiskAPI and the RPC response format.
+pub(crate) struct RenameDataObservation {
+    pub(crate) result: Result<RenameDataResp>,
+    preflight_rejection: Option<local::LocalRenamePreflightRejection>,
+}
+
+impl RenameDataObservation {
+    fn unknown(result: Result<RenameDataResp>) -> Self {
+        Self {
+            result,
+            preflight_rejection: None,
+        }
+    }
+
+    pub(crate) fn rejected_before_publication(&self) -> bool {
+        self.result.is_err() && self.preflight_rejection.is_some()
+    }
+}
+
 const QUOTA_MUTATION_FENCE_PREFIX: &str = "tmp/quota-mutation-fences/";
 pub(crate) const QUOTA_MUTATION_FENCE_METADATA_SUFFIX: &str = "quota-mutation-fence-token";
 
@@ -709,6 +728,36 @@ impl Disk {
     ) -> Result<RenameDataResp> {
         self.rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None)
             .await
+    }
+
+    pub(crate) async fn rename_data_borrowed_with_fence_observed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        scanner_publication_lease_token: Option<Uuid>,
+    ) -> RenameDataObservation {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .rename_data_observed(src_volume, src_path, fi, dst_volume, dst_path, None)
+                    .await
+            }
+            Disk::Remote(remote_disk) => RenameDataObservation::unknown(
+                remote_disk
+                    .rename_data_borrowed_with_fence(
+                        src_volume,
+                        src_path,
+                        fi,
+                        dst_volume,
+                        dst_path,
+                        scanner_publication_lease_token,
+                    )
+                    .await,
+            ),
+        }
     }
 
     pub(crate) async fn rename_data_borrowed_with_fence(

@@ -5493,6 +5493,7 @@ where
     fence.ensure_held()?;
     let mut opts = ObjectOptions {
         max_parity: true,
+        write_completion: crate::object_api::WriteCompletion::TailDrained,
         no_lock: true,
         http_preconditions: Some(pool_meta_cas_preconditions(token, object)?),
         ..Default::default()
@@ -14412,6 +14413,7 @@ impl ECStore {
                 encoded.clone(),
                 &ObjectOptions {
                     max_parity: true,
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
                     http_preconditions: Some(HTTPPreconditions {
                         if_none_match: Some("*".to_string()),
                         ..Default::default()
@@ -14566,6 +14568,7 @@ impl ECStore {
                 encoded,
                 &ObjectOptions {
                     max_parity: true,
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
                     http_preconditions: Some(http_preconditions),
                     ..Default::default()
                 },
@@ -14957,6 +14960,7 @@ impl ECStore {
                 encoded,
                 &ObjectOptions {
                     max_parity: true,
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
                     http_preconditions: Some(HTTPPreconditions {
                         if_match: Some(etag),
                         ..Default::default()
