@@ -1043,11 +1043,8 @@ pub async fn get_on_demand_migration_config(bucket: &str) -> Result<Option<(Vec<
 }
 
 /// Resolve opaque configuration from the store's own metadata system.
-pub async fn get_on_demand_migration_config_in(
-    ctx: &crate::runtime::instance::InstanceContext,
-    bucket: &str,
-) -> Result<Option<(Vec<u8>, OffsetDateTime)>> {
-    let sys = bucket_metadata_sys_of(ctx)?;
+pub async fn get_on_demand_migration_config_in(api: &ECStore, bucket: &str) -> Result<Option<(Vec<u8>, OffsetDateTime)>> {
+    let sys = bucket_metadata_sys_of(&api.ctx)?;
     let lock = sys.read().await;
     lock.get_on_demand_migration_config(bucket).await
 }

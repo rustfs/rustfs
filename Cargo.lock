@@ -9503,6 +9503,7 @@ dependencies = [
  "clap",
  "const-str",
  "datafusion",
+ "faster-hex",
  "flatbuffers",
  "flate2",
  "futures",
