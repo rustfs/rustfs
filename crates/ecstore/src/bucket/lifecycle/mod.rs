@@ -24,6 +24,7 @@ pub(crate) use metadata_boundary::{LifecycleExpiryConfigs, get_expiry_configs, g
 mod object_handlers_common;
 mod object_lock_boundary;
 pub use self::core as lifecycle;
+pub mod recovery_control;
 mod replication_sink;
 pub mod rule;
 mod runtime_boundary;
