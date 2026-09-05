@@ -8127,6 +8127,76 @@ fn clean_idle_backoff_policy_preserves_explicit_and_maintenance_cycles() {
     }
 }
 
+#[tokio::test]
+#[serial]
+async fn scoped_scan_explicit_bitrot_keeps_dirty_planning_without_idle_backoff() {
+    temp_env::async_with_vars([(ENV_SCANNER_CYCLE, None), (ENV_SCANNER_BITROT_CYCLE_SECS, Some("3600"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+        let (_temp_dir, store) = setup_scanner_cycle_store_with_pool_count(true, 2).await;
+        let ctx = CancellationToken::new();
+        let (features, generation) = configure_scanner_defaults(&ctx, &store).await;
+        let config = resolve_scanner_runtime_config();
+        assert_eq!(config.cycle_interval_source, ScannerRuntimeConfigSource::Default);
+        assert_eq!(config.bitrot_cycle_source, ScannerRuntimeConfigSource::Env);
+        assert!(!scanner_clean_idle_backoff_configured(&config));
+        assert!(!features.needs_regular_cycle());
+        assert_eq!(
+            generation,
+            Some(scanner_maintenance_generation()),
+            "multi-disk startup must inspect maintenance independently"
+        );
+        let observed = ScannerCycleObservedGenerations::for_wait(&config, None, 7, 0, scanner_maintenance_generation());
+        assert_eq!(observed.dirty_usage, Some(7), "explicit bitrot still permits ordinary dirty wakeups");
+        for (wake, full) in [
+            (ScannerCycleWakeReason::DirtyUsage, false),
+            (ScannerCycleWakeReason::ClusterActivity, false),
+            (ScannerCycleWakeReason::Timer, true),
+            (ScannerCycleWakeReason::ClusterMaintenance, true),
+        ] {
+            assert_eq!(
+                features.requires_full_scan(generation, scanner_maintenance_generation(), wake),
+                full,
+                "{wake:?}"
+            );
+        }
+        assert!(features.requires_full_scan(None, scanner_maintenance_generation(), ScannerCycleWakeReason::DirtyUsage));
+        for unsafe_features in [
+            ScannerMaintenanceFeatures {
+                lifecycle: true,
+                ..Default::default()
+            },
+            ScannerMaintenanceFeatures {
+                replication: true,
+                ..Default::default()
+            },
+            ScannerMaintenanceFeatures {
+                inspection_failed: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(unsafe_features.requires_full_scan(
+                generation,
+                scanner_maintenance_generation(),
+                ScannerCycleWakeReason::DirtyUsage
+            ));
+        }
+        crate::scanner_io::record_scanner_maintenance_change("maintenance-proof-change");
+        assert!(features.requires_full_scan(generation, scanner_maintenance_generation(), ScannerCycleWakeReason::DirtyUsage));
+        let (refreshed, refreshed_generation) = detect_stable_scanner_maintenance_features(&ctx, &store)
+            .await
+            .expect("changed maintenance generation should be inspected");
+        assert!(!refreshed.requires_full_scan(
+            Some(refreshed_generation),
+            scanner_maintenance_generation(),
+            ScannerCycleWakeReason::DirtyUsage
+        ));
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
 #[test]
 fn clean_idle_backoff_requires_activity_probes() {
     let default_config = ScannerRuntimeConfig::default();
