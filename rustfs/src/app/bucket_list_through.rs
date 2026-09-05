@@ -551,6 +551,9 @@ mod tests {
 
     #[test]
     fn a_plain_local_token_is_passed_through_and_a_tampered_one_is_rejected() {
+        let json_key = r#"{"t":"odm-list","v":1,"local_done":true}"#;
+        assert!(decode_list_cursor(Some(json_key)).expect("valid local key").is_none());
+        assert!(matches!(local_cursor(Some(json_key), None), LocalListCursor::Token(Some(local)) if local == json_key));
         assert!(
             decode_list_cursor(Some("photos/a.jpg"))
                 .expect("plain markers decode")
