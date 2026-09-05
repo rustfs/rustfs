@@ -2346,6 +2346,10 @@ impl WarmBackend for SharedWarmBackendProxy {
         self.0.probe_transition_candidate(object).await
     }
 
+    async fn probe_transition_version(&self, object: &str, remote_version_id: &str) -> io::Result<TransitionCandidateProbe> {
+        self.0.probe_transition_version(object, remote_version_id).await
+    }
+
     async fn in_use(&self) -> io::Result<bool> {
         self.0.in_use().await
     }
@@ -2456,6 +2460,15 @@ impl TierOperationLease {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) async fn probe_transition_version(
+        &self,
+        object: &str,
+        remote_version_id: &str,
+    ) -> io::Result<TransitionCandidateProbe> {
+        self.validate_remote_version_id(remote_version_id)?;
+        self.inner.driver.probe_transition_version(object, remote_version_id).await
     }
 
     pub(crate) fn is_current_generation(&self) -> bool {

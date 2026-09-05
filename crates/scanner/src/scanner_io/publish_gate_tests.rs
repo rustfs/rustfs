@@ -807,9 +807,31 @@ fn completed_data_usage_info_requires_every_set_before_publish() {
         .expect("all completed sets should produce a publishable data usage snapshot");
     assert_eq!(last_update, SystemTime::UNIX_EPOCH + Duration::from_secs(20));
     assert_eq!(data_usage_info.scanner_cycle, Some(0));
+    assert_eq!(data_usage_info.scanner_epoch, Some(0));
     assert_eq!(data_usage_info.objects_total_count, 3);
     assert_eq!(data_usage_info.buckets_usage.len(), 3);
     assert!(data_usage_info.usage_snapshot_complete);
+    assert_eq!(
+        data_usage_info
+            .usage_snapshot_set_states
+            .iter()
+            .map(|state| {
+                (
+                    state.pool_index,
+                    state.set_index,
+                    state.scanner_cycle,
+                    state.scanner_epoch,
+                    state.scan_plan_digest,
+                    state.complete,
+                    state.tombstone,
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (0, 0, Some(0), Some(0), Some(TEST_PLAN_DIGEST.0), true, false),
+            (1, 0, Some(0), Some(0), Some(TEST_PLAN_DIGEST.0), true, false),
+        ]
+    );
     assert_eq!(
         data_usage_info
             .buckets_usage

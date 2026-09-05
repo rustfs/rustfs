@@ -341,9 +341,26 @@ pub(super) fn completed_data_usage_info(
         .iter()
         .map(|(bucket, usage)| (bucket.clone(), usage.size))
         .collect();
+    let mut usage_snapshot_set_states = results
+        .iter()
+        .map(|result| {
+            let source = result.info.source?;
+            Some(DataUsageSnapshotSetState {
+                pool_index: u64::try_from(source.pool_index).ok()?,
+                set_index: u64::try_from(source.set_index).ok()?,
+                scanner_cycle: Some(result.info.next_cycle),
+                scanner_epoch: Some(result.info.leader_epoch),
+                scan_plan_digest: Some(result.info.scan_plan_digest?.0),
+                complete: true,
+                tombstone: false,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    usage_snapshot_set_states.sort_by_key(|state| (state.pool_index, state.set_index));
     let data_usage_info = DataUsageInfo {
         last_update: Some(merged_last_update),
         scanner_cycle: Some(scope.identity.cycle),
+        scanner_epoch: Some(scope.identity.leader_epoch),
         objects_total_count: u64::try_from(total.objects).ok()?,
         versions_total_count: u64::try_from(total.versions).ok()?,
         delete_markers_total_count: u64::try_from(total.delete_markers).ok()?,
@@ -354,6 +371,7 @@ pub(super) fn completed_data_usage_info(
         bucket_sizes,
         buckets_usage,
         usage_snapshot_complete: true,
+        usage_snapshot_set_states,
         ..Default::default()
     };
     Some((data_usage_info, merged_last_update))

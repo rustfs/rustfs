@@ -17,6 +17,7 @@ use super::io_disk::tier_stats_template;
 use super::*;
 use crate::scanner_budget::ScannerCycleBudgetConfig;
 use crate::scanner_folder::ScannerItem;
+use crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot;
 use crate::storage_api::owner::{
     EcstorePoolDecommissionInfo, EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats,
 };
@@ -803,6 +804,195 @@ fn bucket_info_with_created_time(name: &str) -> BucketInfo {
     }
 }
 
+fn complete_usage_baseline(
+    source: DataUsageCacheSource,
+    scan_plan_digest: DataUsageScanPlanDigest,
+    scanner_cycle: u64,
+    scanner_epoch: u64,
+) -> bytes::Bytes {
+    let baseline = DataUsageInfo {
+        last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+        scanner_cycle: Some(scanner_cycle),
+        scanner_epoch: Some(scanner_epoch),
+        buckets_count: 1,
+        buckets_usage: HashMap::from([("photos".to_string(), Default::default())]),
+        usage_snapshot_complete: true,
+        usage_snapshot_converged: Some(true),
+        usage_snapshot_set_states: vec![DataUsageSnapshotSetState {
+            pool_index: u64::try_from(source.pool_index).expect("test pool index should fit"),
+            set_index: u64::try_from(source.set_index).expect("test set index should fit"),
+            scanner_cycle: Some(scanner_cycle),
+            scanner_epoch: Some(scanner_epoch),
+            scan_plan_digest: Some(scan_plan_digest.0),
+            complete: true,
+            tombstone: false,
+        }],
+        ..Default::default()
+    };
+    bytes::Bytes::from(serde_json::to_vec(&baseline).expect("test baseline should encode"))
+}
+
+#[test]
+fn scoped_scan_requires_a_converged_complete_baseline_with_exact_set_provenance() {
+    let source = DataUsageCacheSource::new(1, 2);
+    let expected_sources = HashSet::from([source]);
+    let scan_plan_digest = DataUsageScanPlanDigest([9; 32]);
+    let baseline = complete_usage_baseline(source, scan_plan_digest, 7, 11);
+
+    assert_eq!(
+        complete_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
+            data: Some(&baseline),
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest,
+        }),
+        Some(scan_plan_digest)
+    );
+
+    let mut incomplete = serde_json::from_slice::<DataUsageInfo>(&baseline).expect("test baseline should decode");
+    incomplete.usage_snapshot_converged = Some(false);
+    let incomplete = bytes::Bytes::from(serde_json::to_vec(&incomplete).expect("test baseline should encode"));
+    assert_eq!(
+        complete_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
+            data: Some(&incomplete),
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest,
+        }),
+        None
+    );
+
+    let mut wrong_provenance = serde_json::from_slice::<DataUsageInfo>(&baseline).expect("test baseline should decode");
+    wrong_provenance.usage_snapshot_set_states[0].scan_plan_digest = Some([8; 32]);
+    let wrong_provenance = bytes::Bytes::from(serde_json::to_vec(&wrong_provenance).expect("test baseline should encode"));
+    assert_eq!(
+        complete_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
+            data: Some(&wrong_provenance),
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest,
+        }),
+        None
+    );
+}
+
+#[test]
+fn scoped_scan_selects_only_current_dirty_buckets_after_baseline_validation() {
+    let source = DataUsageCacheSource::new(1, 2);
+    let expected_sources = HashSet::from([source]);
+    let baseline_scan_plan_digest = DataUsageScanPlanDigest([4; 32]);
+    let current_scan_plan_digest = DataUsageScanPlanDigest([5; 32]);
+    let baseline = complete_usage_baseline(source, current_scan_plan_digest, 7, 11);
+    let scope = scoped_scan_scope_from_dirty_buckets(
+        ScannerBucketScanScope::default(),
+        HashSet::from(["photos".to_string(), "deleted".to_string()]),
+        true,
+        &[bucket_info("photos")],
+        ScannerCacheBaselineProof {
+            data: Some(&baseline),
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest: current_scan_plan_digest,
+        },
+    );
+
+    assert_eq!(scope.baseline_scan_plan_digest, Some(current_scan_plan_digest));
+    assert_eq!(
+        scope
+            .selected_buckets
+            .as_deref()
+            .expect("validated scope should select a bucket"),
+        &HashSet::from(["photos".to_string()])
+    );
+    assert_ne!(scope.baseline_scan_plan_digest, Some(baseline_scan_plan_digest));
+}
+
+fn peer_dirty_usage_snapshot(
+    instance_id: &str,
+    generation: u64,
+    complete: bool,
+    buckets: &[(&str, u64)],
+) -> EcstoreScannerPeerDirtyUsageSnapshot {
+    EcstoreScannerPeerDirtyUsageSnapshot {
+        instance_id: instance_id.to_string(),
+        generation,
+        pending_bucket_count: u64::try_from(buckets.len()).expect("test bucket count should fit"),
+        protocol_version: crate::SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION,
+        complete,
+        buckets: buckets
+            .iter()
+            .map(|(bucket, generation)| ((*bucket).to_string(), *generation))
+            .collect(),
+    }
+}
+
+#[test]
+fn verified_remote_dirty_usage_buckets_merges_only_complete_current_snapshots() {
+    let expected_peers = HashMap::from([
+        (
+            "node-a:9000".to_string(),
+            ScannerPeerDirtyUsageExpectation {
+                instance_id: "instance-a".to_string(),
+                generation: 7,
+                pending: true,
+            },
+        ),
+        (
+            "node-b:9000".to_string(),
+            ScannerPeerDirtyUsageExpectation {
+                instance_id: "instance-b".to_string(),
+                generation: 3,
+                pending: false,
+            },
+        ),
+    ]);
+
+    assert_eq!(
+        verified_remote_dirty_usage_buckets(
+            &expected_peers,
+            vec![
+                (
+                    "node-a:9000".to_string(),
+                    peer_dirty_usage_snapshot("instance-a", 7, true, &[("photos", 7)]),
+                ),
+                (
+                    "node-b:9000".to_string(),
+                    peer_dirty_usage_snapshot("instance-b", 3, true, &[("archive", 3)]),
+                ),
+            ],
+        ),
+        Some(HashSet::from(["photos".to_string(), "archive".to_string()]))
+    );
+}
+
+#[test]
+fn verified_remote_dirty_usage_buckets_rejects_incomplete_or_stale_peer_state() {
+    let expected_peers = HashMap::from([(
+        "node-a:9000".to_string(),
+        ScannerPeerDirtyUsageExpectation {
+            instance_id: "instance-a".to_string(),
+            generation: 7,
+            pending: true,
+        },
+    )]);
+
+    for snapshot in [
+        peer_dirty_usage_snapshot("instance-a", 7, false, &[("photos", 7)]),
+        peer_dirty_usage_snapshot("instance-a", 6, true, &[("photos", 6)]),
+        peer_dirty_usage_snapshot("instance-b", 7, true, &[("photos", 7)]),
+        peer_dirty_usage_snapshot("instance-a", 7, true, &[]),
+    ] {
+        assert!(
+            verified_remote_dirty_usage_buckets(&expected_peers, vec![("node-a:9000".to_string(), snapshot)]).is_none(),
+            "incomplete, stale, mismatched, or empty pending peer state must fall back to a full scan"
+        );
+    }
+}
+
 #[test]
 fn scoped_set_scan_rebuilds_selected_buckets_and_drops_deleted_buckets() {
     let baseline_digest = DataUsageScanPlanDigest([1; 32]);
@@ -1100,6 +1290,27 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
         ),
     ] {
         assert_eq!(status, ScannerCycleStatus::Incomplete);
+    }
+}
+
+#[test]
+fn checkpoint_fixture_superseded_is_distinct_from_partial_and_cancel() {
+    for (budget, cancelled, bucket, expected) in [
+        (false, false, ScannerBucketScanStatus::Complete, ScannerCycleStatus::Superseded),
+        (true, false, ScannerBucketScanStatus::Partial, ScannerCycleStatus::Incomplete),
+        (false, true, ScannerBucketScanStatus::Partial, ScannerCycleStatus::Incomplete),
+    ] {
+        assert_eq!(
+            classify_nsscanner_cycle(
+                true,
+                budget,
+                cancelled,
+                bucket,
+                DirtyUsageSnapshotStatus::Changed,
+                ScannerCycleActivityStatus::Unchanged
+            ),
+            expected,
+        );
     }
 }
 
