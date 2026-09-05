@@ -2784,7 +2784,7 @@ impl DefaultBucketUsecase {
                 match cursor {
                     list_through::LocalListCursor::Exhausted => (StorageListObjectsV2Info::default(), false),
                     list_through::LocalListCursor::Token(token) => {
-                        let infos = store
+                        let mut infos = store
                             .list_objects_v2(
                                 &bucket,
                                 &params.prefix,
@@ -2797,6 +2797,7 @@ impl DefaultBucketUsecase {
                             )
                             .await
                             .map_err(ApiError::from)?;
+                        list_through::preserve_framed_local_cursor(&mut infos, merged_token.as_ref());
                         (infos, false)
                     }
                 }

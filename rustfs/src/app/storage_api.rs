@@ -29,9 +29,10 @@ pub(crate) fn EndpointServerPools(
 pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::dto::{
-        BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ListObjectsV2Input,
-        ListObjectsV2Output, ReplicationConfiguration, ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus,
-        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, VersioningConfiguration,
+        BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ListObjectsInput,
+        ListObjectsV2Input, ListObjectsV2Output, ReplicationConfiguration, ReplicationRule, ReplicationRuleFilter,
+        ReplicationRuleStatus, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag,
+        VersioningConfiguration,
     };
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
     #[cfg(test)]

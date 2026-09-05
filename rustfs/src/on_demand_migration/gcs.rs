@@ -55,10 +55,6 @@ use url::Url;
 /// Read-only object scope: this backend never writes to the source.
 const READ_ONLY_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_only";
 const METADATA_PREFIX: &str = "x-goog-meta-";
-/// GCS reports its error code in the response body, not a header; the shared
-/// transport takes a header name, so it is given one that never matches and
-/// classification falls back to the status.
-const NO_ERROR_CODE_HEADER: &str = "x-goog-unused-error-code";
 /// One `objects.list` page is small; refuse an unbounded document.
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 
@@ -125,7 +121,7 @@ impl GcsNativeSourceBackend {
     }
 
     async fn send_object(&self, request: reqwest::Request) -> Result<reqwest::Response, SourceError> {
-        match self.http.send_object(request, NO_ERROR_CODE_HEADER).await {
+        match self.http.send_object(request, None).await {
             Err(SourceError::NotFound) => {
                 // An XML object URL also returns 404 when its bucket is gone.
                 // Reuse the read-only listing probe before caching a key miss.
@@ -225,7 +221,7 @@ impl SourceBackend for GcsNativeSourceBackend {
         }
 
         let request = self.request(Method::GET, url, HeaderMap::new()).await?;
-        let response = self.http.send(request, NO_ERROR_CODE_HEADER).await?;
+        let response = self.http.send(request, None).await?;
         let body = read_text(response, MAX_JSON_BYTES).await?;
         parse_objects_list(&body)
     }
@@ -245,7 +241,7 @@ impl SourceBackend for GcsNativeSourceBackend {
         let mut url = self.objects_url()?;
         url.query_pairs_mut().append_pair("maxResults", "1");
         let request = self.request(Method::GET, url, HeaderMap::new()).await?;
-        let response = self.http.send(request, NO_ERROR_CODE_HEADER).await?;
+        let response = self.http.send(request, None).await?;
         read_text(response, MAX_JSON_BYTES)
             .await
             .and_then(|body| parse_objects_list(&body))?;
@@ -289,23 +285,30 @@ fn parse_objects_list(body: &str) -> Result<SourcePage, SourceError> {
         .items
         .into_iter()
         .map(|item| {
+            if item.name.is_empty() {
+                return Err(SourceError::Other("source listing object has no name".to_string()));
+            }
+            let size = item
+                .size
+                .and_then(|size| size.parse::<u64>().ok())
+                .ok_or_else(|| SourceError::Other("source listing object has no valid size".to_string()))?;
             let etag = item
                 .md5_hash
                 .as_deref()
                 .and_then(base64_md5_to_hex)
                 .or_else(|| item.etag.map(|etag| etag.trim_matches('"').to_string()))
                 .filter(|etag| !etag.is_empty());
-            SourceObject {
+            Ok(SourceObject {
                 key: item.name,
                 etag,
-                size: item.size.and_then(|size| size.parse().ok()).unwrap_or(0),
+                size,
                 last_modified: item.updated.as_deref().and_then(parse_http_timestamp),
                 storage_class: item.storage_class,
                 // GCS never encodes a part count in a digest or an ETag.
                 is_multipart_etag: false,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_, SourceError>>()?;
 
     Ok(SourcePage {
         objects,
@@ -319,7 +322,7 @@ fn parse_objects_list(body: &str) -> Result<SourcePage, SourceError> {
 mod tests {
     use super::*;
     use crate::on_demand_migration::backend_contract::{BackendCapabilities, assert_backend_contract};
-    use crate::on_demand_migration::test_http_fixture::{ScriptedResponse, scripted_server};
+    use crate::on_demand_migration::test_http_fixture::{ScriptedResponse, assert_requests, scripted_server};
     use google_cloud_auth::credentials::anonymous::Builder as AnonymousBuilder;
 
     const LIST_PAGE_ONE: &str = r#"{
@@ -558,6 +561,155 @@ mod tests {
                 assert_eq!(recorded[0].method, method.as_str());
                 assert_eq!(recorded[1].method, "GET");
                 assert_eq!(recorded[1].target, "/storage/v1/b/legacy/o?maxResults=1");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_listing_rejects_missing_or_invalid_required_object_fields() {
+        for entry in [
+            r#"{"size":"1"}"#,
+            r#"{"name":"","size":"1"}"#,
+            r#"{"name":"broken"}"#,
+            r#"{"name":"broken","size":null}"#,
+            r#"{"name":"broken","size":""}"#,
+            r#"{"name":"broken","size":"-1"}"#,
+            r#"{"name":"broken","size":"18446744073709551616"}"#,
+            r#"{"name":"broken","size":"not-a-size"}"#,
+            r#"{"name":"broken","size":1}"#,
+        ] {
+            let body = format!(r#"{{"items":[{{"name":"valid","size":"1"}},{entry}],"nextPageToken":"next"}}"#);
+            let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(200, Vec::new(), body)]).await;
+            let err = backend(&endpoint)
+                .list(&SourceListRequest {
+                    prefix: Some("dir/"),
+                    delimiter: Some("/"),
+                    continuation_token: Some("opaque+/="),
+                    max_keys: 2,
+                    ..Default::default()
+                })
+                .await
+                .expect_err("malformed object must reject the complete native page");
+            assert!(matches!(err, SourceError::Other(_)), "{entry}: {err:?}");
+            assert!(!err.is_retryable());
+            assert_requests(
+                &recorded,
+                &[(
+                    "GET",
+                    "/storage/v1/b/legacy/o?prefix=dir%2F&delimiter=%2F&pageToken=opaque%2B%2F%3D&maxResults=2",
+                )],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_listing_preserves_zero_size_unicode_prefixes_and_opaque_cursors() {
+        let body = r#"{"items":[{"name":"目录/空 & file","size":"0"}],"prefixes":["目录/子/"],"nextPageToken":"opaque+/="}"#;
+        let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(200, Vec::new(), body.to_string())]).await;
+        let page = backend(&endpoint)
+            .list(&SourceListRequest {
+                max_keys: 2,
+                ..Default::default()
+            })
+            .await
+            .expect("valid native page");
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.objects[0].key, "目录/空 & file");
+        assert_eq!(page.objects[0].size, 0);
+        assert_eq!(page.common_prefixes, ["目录/子/"]);
+        assert!(page.is_truncated);
+        assert_eq!(page.next_continuation_token.as_deref(), Some("opaque+/="));
+        assert_requests(&recorded, &[("GET", "/storage/v1/b/legacy/o?maxResults=2")]);
+    }
+
+    #[tokio::test]
+    async fn missing_object_head_requires_one_successful_bucket_probe() {
+        for (status, body, expected, retryable) in [
+            (200, "{}", "not_found", false),
+            (403, "", "access_denied", false),
+            (404, "", "other", false),
+            (429, "", "throttled", true),
+            (500, "", "server_error", true),
+            (503, "", "throttled", true),
+            (200, "not JSON", "other", false),
+        ] {
+            let (endpoint, recorded) = scripted_server(vec![
+                ScriptedResponse::new(404, Vec::new(), String::new()),
+                ScriptedResponse::new(status, Vec::new(), body.to_string()),
+            ])
+            .await;
+            let err = backend(&endpoint).head("missing").await.expect_err("missing HEAD must fail");
+            assert_eq!(err.class_label(), expected, "probe {status} {body:?}: {err:?}");
+            assert_eq!(err.is_retryable(), retryable, "probe {status} {body:?}: {err:?}");
+            if status == 500 {
+                assert!(matches!(err, SourceError::ServerError(500)));
+            }
+            assert_requests(&recorded, &[("HEAD", "/legacy/missing"), ("GET", "/storage/v1/b/legacy/o?maxResults=1")]);
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_object_reads_do_not_probe_or_become_object_absence() {
+        for method in [Method::HEAD, Method::GET] {
+            let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(
+                403,
+                vec![("x-goog-unused-error-code", "NoSuchKey".to_string())],
+                "untrusted-error-body".to_string(),
+            )])
+            .await;
+            let backend = backend(&endpoint);
+            let result = if method == Method::HEAD {
+                backend.head("missing").await.map(|_| ())
+            } else {
+                backend.get("missing", None).await.map(|_| ())
+            };
+            let err = result.expect_err("denied object read must remain a failure");
+            assert_eq!(err.class_label(), "access_denied");
+            assert!(!err.is_retryable());
+            assert!(!err.to_string().contains("untrusted-error-body"));
+            assert_requests(&recorded, &[(method.as_str(), "/legacy/missing")]);
+        }
+    }
+    #[tokio::test]
+    async fn non_object_errors_ignore_untrusted_error_code_headers() {
+        for probe in [false, true] {
+            for (status, expected, retryable) in [(403, "access_denied", false), (500, "server_error", true)] {
+                let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(
+                    status,
+                    vec![("x-goog-unused-error-code", "NoSuchKey".to_string())],
+                    "untrusted-error-body".to_string(),
+                )])
+                .await;
+                let backend = backend(&endpoint);
+                let result = if probe {
+                    backend.probe().await
+                } else {
+                    backend
+                        .list(&SourceListRequest {
+                            max_keys: 2,
+                            ..Default::default()
+                        })
+                        .await
+                        .map(|_| ())
+                };
+                let err = result.expect_err("a synthetic provider header cannot change the source status");
+                assert_eq!(err.class_label(), expected, "probe={probe} status={status}: {err:?}");
+                assert_eq!(err.is_retryable(), retryable);
+                assert!(!err.to_string().contains("untrusted-error-body"));
+                if status == 500 {
+                    assert!(matches!(err, SourceError::ServerError(500)));
+                }
+                assert_requests(
+                    &recorded,
+                    &[(
+                        "GET",
+                        if probe {
+                            "/storage/v1/b/legacy/o?maxResults=1"
+                        } else {
+                            "/storage/v1/b/legacy/o?maxResults=2"
+                        },
+                    )],
+                );
             }
         }
     }
