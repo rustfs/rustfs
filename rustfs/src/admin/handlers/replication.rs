@@ -29,7 +29,7 @@ use crate::admin::storage_api::bucket::replication::{REMOTE_TARGET_READ_ONLY_HIS
 use crate::admin::storage_api::bucket::target::{
     BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat, duration_from_secs_or_nanos,
 };
-use crate::admin::storage_api::bucket::target_sys::{BucketTargetError, BucketTargetSys};
+use crate::admin::storage_api::bucket::target_sys::{BucketTargetError, BucketTargetSys, UnreadableTargetsPolicy};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::contract::list::ListOperations as _;
 use crate::admin::storage_api::error::StorageError;
@@ -56,6 +56,20 @@ use tracing::{debug, error, info, warn};
 use url::Host;
 
 const SUPPORTED_REMOTE_TARGET_API: &str = "s3v4";
+
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_REPLICATION: &str = "replication";
+const EVENT_ADMIN_REMOTE_TARGET_STATE: &str = "admin_remote_target_state";
+
+/// `set-remote-target?replace-unreadable=true`: the operator's explicit
+/// acknowledgement that this bucket's persisted target set cannot be decoded
+/// and is to be discarded (rustfs/backlog#2309).
+///
+/// Without it the refusal from rustfs/rustfs#7172 stands, which is what keeps
+/// an unreadable set from being silently rewritten from a partial view. The
+/// flag is deliberately absent from `PutBucketReplication`: targets are
+/// repaired first, then the rule is set.
+const REPLACE_UNREADABLE_TARGETS_PARAM: &str = "replace-unreadable";
 
 /// Field groups a `set-remote-target?update=true` request may modify, mirroring
 /// MinIO's `TargetUpdateType` / `GetTargetUpdateOps` query contract: the update
@@ -541,6 +555,7 @@ impl Operation for SetRemoteTargetHandler {
         };
 
         let update = queries.get("update").is_some_and(|v| v == "true");
+        let replace_unreadable = queries.get(REPLACE_UNREADABLE_TARGETS_PARAM).is_some_and(|v| v == "true");
 
         warn!("set remote target, bucket: {}, update: {}", bucket, update);
 
@@ -708,10 +723,37 @@ impl Operation for SetRemoteTargetHandler {
 
         let arn = remote_target.arn.clone();
 
+        let unreadable_policy = if replace_unreadable {
+            UnreadableTargetsPolicy::Replace
+        } else {
+            UnreadableTargetsPolicy::FailClosed
+        };
+        let discarding_unreadable_targets = replace_unreadable
+            && matches!(
+                bucket_target_sys.list_bucket_targets(bucket).await,
+                Err(BucketTargetError::BucketRemoteTargetsUnreadable { .. })
+            );
+
         let targets = bucket_target_sys
-            .set_target(bucket, &remote_target, update)
+            .set_target(bucket, &remote_target, update, unreadable_policy)
             .await
             .map_err(map_bucket_target_error)?;
+
+        // Audited only where the discard actually happened: the flag alone is
+        // not an event, on a readable set it changes nothing, and a refused
+        // write must not leave a record claiming the set was replaced.
+        if discarding_unreadable_targets {
+            warn!(
+                event = EVENT_ADMIN_REMOTE_TARGET_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                action = "set_remote_target",
+                result = "unreadable_targets_replaced",
+                bucket = %bucket,
+                arn = %remote_target.arn,
+                "admin remote target state"
+            );
+        }
         let json_targets = serde_json::to_vec(&targets).map_err(|e| {
             error!("Serialization error: {}", e);
             S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())

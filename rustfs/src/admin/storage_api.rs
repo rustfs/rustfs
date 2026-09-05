@@ -212,6 +212,7 @@ pub(crate) mod bucket_target_sys {
     pub(crate) type S3ClientError = super::ecstore_bucket::bucket_target_sys::S3ClientError;
     pub(crate) type SsecPassthroughCapability = super::ecstore_bucket::bucket_target_sys::SsecPassthroughCapability;
     pub(crate) type TargetClient = super::ecstore_bucket::bucket_target_sys::TargetClient;
+    pub(crate) type UnreadableTargetsPolicy = super::ecstore_bucket::bucket_target_sys::UnreadableTargetsPolicy;
 }
 
 pub(crate) mod lifecycle {
