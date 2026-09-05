@@ -130,6 +130,21 @@ Scanner cycle budget controls:
   - timeout returns S3 `SlowDown`, so clients should use normal SDK retry handling.
   - this is not a fdatasync or group-commit switch. Track fdatasync batching separately with `rustfs_s3_put_object_rename_fdatasync_batch_files`.
 
+## Remote tier timeout environment variables
+
+- `RUSTFS_TIER_REMOTE_CONNECT_TIMEOUT_SECS`
+  - remote tier TCP connect timeout.
+  - default is `10`.
+  - must be positive; zero fails tier client initialization, while an invalid integer is logged and falls back to the default.
+- `RUSTFS_TIER_REMOTE_REQUEST_TIMEOUT_SECS`
+  - remote tier request timeout through response headers.
+  - default is `86400` so large transition uploads keep a production-safe budget.
+  - must be positive; zero fails tier client initialization, while an invalid integer is logged and falls back to the default. Very large values are accepted and act as a correspondingly long budget.
+- `RUSTFS_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS`
+  - maximum idle time between remote tier response-body chunks.
+  - default is `60`; the timer resets only when non-empty body data keeps progressing.
+  - must be positive; zero fails tier client initialization, while an invalid integer is logged and falls back to the default.
+
 ## Drive timeout environment variables
 
 - `RUSTFS_DRIVE_METADATA_TIMEOUT_SECS`

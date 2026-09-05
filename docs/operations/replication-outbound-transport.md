@@ -29,6 +29,18 @@
 
 Both knobs are read by the RustFS process that owns the replication target, at client build time; restart the server after changing them.
 
+### Remote tier transport timeouts
+
+Remote tier S3-compatible clients use separate transport budgets. These settings do not change bucket or site replication clients.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RUSTFS_TIER_REMOTE_CONNECT_TIMEOUT_SECS` | `10` | Maximum time to establish the remote tier TCP connection. |
+| `RUSTFS_TIER_REMOTE_REQUEST_TIMEOUT_SECS` | `86400` | Maximum time for a remote tier request to reach response headers. The long default preserves large transition-upload headroom. |
+| `RUSTFS_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS` | `60` | Maximum time without a non-empty response-body chunk. Empty HTTP/2 frames do not count as progress. |
+
+All three values must be positive integers. Zero fails tier client initialization instead of silently disabling the boundary. An invalid integer is logged and falls back to the default; very large values are accepted and provide a correspondingly long effective budget. The values are read when the tier client is built; recreate or reload the tier configuration after changing them.
+
 ## Before changing any of this
 
 Follow the SOP in `docs/postmortems/2026-09-03-replication-checksum-default-regression.md`: inventory the target-side rules the current default satisfies, run the outbound target matrix, and document any new knob here in the same PR.
