@@ -179,7 +179,10 @@ impl DefaultObjectUsecase {
             Ok(_) => return None,
             Err(err) => return Some(Err(ApiError::from(err).into())),
         }
-        let lookup = OnDemandMigrationSys::get().resolve_for_incarnation(bucket, key, expected_incarnation)?;
+        if !sys.is_module_enabled() {
+            return None;
+        }
+        let lookup = state.filter_incarnation(expected_incarnation)?.resolve_key(key)?;
         match odm_head_verdict(lookup, miss) {
             OdmHeadVerdict::Ignore => None,
             OdmHeadVerdict::Fail(err) => Some(Err(err)),

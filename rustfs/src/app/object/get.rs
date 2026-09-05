@@ -3871,7 +3871,10 @@ impl DefaultObjectUsecase {
             Ok(_) => return None,
             Err(err) => return Some(OdmGetOutcome::Respond(Err(ApiError::from(err).into()))),
         }
-        let lookup = OnDemandMigrationSys::get().resolve_for_incarnation(bucket, key, expected_incarnation)?;
+        if !sys.is_module_enabled() {
+            return None;
+        }
+        let lookup = state.filter_incarnation(expected_incarnation)?.resolve_key(key)?;
         let (state, client) = match odm_get_verdict(lookup) {
             OdmGetVerdict::Fail(err) => return Some(OdmGetOutcome::Respond(Err(err))),
             OdmGetVerdict::Consult { state, client } => (state, client),

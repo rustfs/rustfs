@@ -1437,6 +1437,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn changed_delete_marker_policy_withdraws_the_captured_lookup() {
+        let sys = enabled_sys();
+        let incarnation = uuid::Uuid::new_v4();
+        let mut cfg = config(None);
+        cfg.policy.respect_local_delete_marker = false;
+        sys.apply_for_incarnation("policy-snapshot", incarnation, Some(&cfg)).await;
+        let captured = sys.state("policy-snapshot").expect("policy A installed");
+        assert!(!captured.config().policy.respect_local_delete_marker);
+
+        cfg.policy.respect_local_delete_marker = true;
+        sys.apply_for_incarnation("policy-snapshot", incarnation, Some(&cfg)).await;
+        let replacement = sys.state("policy-snapshot").expect("policy B installed");
+        assert!(replacement.config().policy.respect_local_delete_marker);
+        assert!(captured.is_cancelled());
+        assert!(
+            captured
+                .filter_incarnation(incarnation)
+                .and_then(|state| state.resolve_key("key"))
+                .is_none(),
+            "a request that evaluated policy A cannot continue through policy B"
+        );
+        assert!(
+            replacement
+                .clone()
+                .filter_incarnation(incarnation)
+                .and_then(|state| state.resolve_key("key"))
+                .is_some()
+        );
+        assert_eq!(
+            replacement
+                .stats()
+                .snapshot(replacement.breaker().state())
+                .source_latency
+                .count,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn missing_incarnation_cannot_install_or_retain_source_state() {
         let sys: &'static OnDemandMigrationSys = Box::leak(Box::new(enabled_sys()));
         let cfg = config(None);
