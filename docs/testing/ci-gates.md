@@ -91,6 +91,12 @@ Scheduled lanes never block a PR. Their workflow-local gate fails the run, sched
 
 Manual `workflow_dispatch` runs are debugging evidence and do not open scheduled-failure issues. A manual performance run may explicitly allow a known regression; that override is not a passing baseline.
 
+## Packaged functional acceptance
+
+`rustfs-functional-chain.yml` dispatches the packaged-build suites in `rustfs-*-test.yml` on the shared lab runners. A failing suite step or job must fail its workflow. Report collection, cleanup, and dispatch of the next suite can still run with `always()`; continuing diagnostics does not make the failed suite successful.
+
+Workflow status preserves errors that the test scripts report. It does not establish complete execution or a common package identity across the chain: inspect the current run's case results, package identity, and test-script revision as well. A script that returns zero after a failed tool invocation needs its own result check.
+
 ## Release validation
 
 Post-merge and tag-driven; not a substitute for a PR gate.
@@ -217,8 +223,9 @@ does not approve release. In particular, R-E requires fixed-budget real
 restarts without an unbudgeted final sweep, R-D requires the full
 manager/event/ledger disposition chain, and R-L requires source-conflict and
 crash/retirement evidence. Reader-only or unit fixtures cannot substitute for
-these. The external `rustfs/auto-testing` nightly workflow and its deliberate
-continue-on-error policy are not interpreted as a passed release gate.
+these. The external `rustfs/auto-testing` functional workflows propagate suite
+failures. Their workflow status does not establish this registry's required
+case coverage, build provenance, or object-level oracles.
 
 Run parser/receipt regressions with
 `scripts/python_bin.sh scripts/check_test_wiring.py --self-test`. Those fixtures

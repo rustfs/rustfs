@@ -54,14 +54,26 @@ env:
 jobs:
   heal-test:
     runs-on: smoke-testing
-    # Requirement: a failing suite must not fail the workflow; failures
-    # are filed to rustfs/backlog and the chain continues.
-    continue-on-error: true
     timeout-minutes: 480
     # Standalone manual run, or one link of the nightly functional chain
     # (storage -> heal -> pool). Pool expansion no longer re-runs heal.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
+      - name: Initialize functional evidence
+        id: evidence
+        run: |
+          set -euo pipefail
+          umask 077
+          FUNCTIONAL_ARTIFACTS_DIR="${RUNNER_TEMP}/rustfs-heal-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -- "${FUNCTIONAL_ARTIFACTS_DIR}" "${FUNCTIONAL_ARTIFACTS_DIR}-scratch"
+          {
+            printf 'FUNCTIONAL_ARTIFACTS_DIR=%s\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+            printf 'LOG_FILE=%s/suite.log\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+            printf 'RUSTFS_WARP_LOG_FILE=%s/warp.log\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+            printf 'REPORT_FILE=%s/report.md\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+            printf 'TMPDIR=%s-scratch\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+          } >> "${GITHUB_ENV}"
+
       # auto-testing is private: clone it with the dedicated PF token (not
       # GITHUB_TOKEN) and retry transient GitHub/network failures.
       - name: Checkout auto-testing scripts (with retry)
@@ -117,7 +129,7 @@ jobs:
           else
             ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
           fi
-          ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}"
+          ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}" --log-file "${LOG_FILE}"
 
       - name: Preflight checks
         run: |
@@ -127,7 +139,7 @@ jobs:
           else
             ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
           fi
-          ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}"
+          ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}" --log-file "${LOG_FILE}"
 
       - name: Run heal test (write -> outage -> heal -> verify)
         id: test
@@ -137,13 +149,10 @@ jobs:
             --endpoint "${{ env.RUSTFS_API_ENDPOINT }}" \
             --stop-node-gb "${{ inputs.stop_node_gb || '15' }}" \
             --warp-stop-gb "${{ inputs.warp_stop_gb || '40' }}" \
-            --log-file /tmp/rustfs-heal-test.log
+            --log-file "${LOG_FILE}"
 
       - name: Generate report
-        if: always()
-        env:
-          LOG_FILE: /tmp/rustfs-heal-test.log
-          REPORT_FILE: /tmp/rustfs-heal-report.md
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
         run: |
           set -euo pipefail
           PACKAGE_URL='${{ inputs.package_url }}'
@@ -152,8 +161,9 @@ jobs:
           else
             PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
           fi
-          STEPS_TABLE="/tmp/rustfs-heal-steps.md"
-          python3 - "${LOG_FILE}" "${STEPS_TABLE}" <<'PY'
+          STEPS_TABLE="${FUNCTIONAL_ARTIFACTS_DIR}/steps.md"
+          CASE_RESULT=success
+          python3 - "${LOG_FILE}" "${STEPS_TABLE}" <<'PY' || CASE_RESULT=failure
           import re
           import sys
 
@@ -165,6 +175,7 @@ jobs:
 
           steps = {}
           order = []
+          status_rank = {'SKIP': 0, 'PASS': 1, 'FAIL': 2}
           version = None
           version_node = None
           verdict = None
@@ -178,14 +189,15 @@ jobs:
                           n, desc, status = m.group(1), m.group(2), m.group(3)
                           if n not in steps:
                               order.append(n)
-                          steps[n] = (desc, status)  # later lines win (fail after pass)
+                          if n not in steps or status_rank[status] > status_rank[steps[n][1]]:
+                              steps[n] = (desc, status)
                           continue
                       m = ver_re.match(line)
                       if m:
                           version, version_node = m.group(1), m.group(2)
                           continue
                       m = result_re.match(line)
-                      if m:
+                      if m and verdict != 'FAIL':
                           verdict, verdict_detail = m.group(1), m.group(2)
           except FileNotFoundError:
               pass
@@ -205,30 +217,43 @@ jobs:
                   out.write(f'| {n} | {desc} | {status} |\n')
               if not order:
                   out.write('| - | - | NOT RUN (no step result lines found) |\n')
+          complete = set(steps) == {str(n) for n in range(1, 8)}
+          sys.exit(0 if complete and verdict != 'FAIL' and all(status == 'PASS' for _, status in steps.values()) else 1)
           PY
+          RESULT=failure
+          if [ '${{ steps.test.outcome }}' = 'success' ] && [ "${CASE_RESULT}" = 'success' ]; then
+            RESULT=success
+          fi
           {
             echo "# RustFS heal test report"
             echo ""
             echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Attempt: ${GITHUB_RUN_ATTEMPT}"
+            echo "- Workflow Commit: ${GITHUB_SHA}"
             echo "- Trigger: ${{ github.event_name }}"
             echo "- Package: ${PACKAGE_SOURCE}"
-            echo "- Test Step Outcome: ${{ steps.test.outcome }}"
+            echo "- Test Step Outcome: ${RESULT}"
+            echo "- Suite Step Outcome: ${{ steps.test.outcome }}"
             echo ""
-            cat "${STEPS_TABLE}" || true
-            echo ""
-            echo "## Log tail"
-            echo '```text'
-            tail -n 200 "${LOG_FILE}" || true
-            echo '```'
+            if [ "${RESULT}" = "success" ]; then
+              cat "${STEPS_TABLE}"
+              echo ""
+              echo "## Log tail"
+              echo '```text'
+              tail -n 200 "${LOG_FILE}"
+              echo '```'
+            else
+              echo "The suite or evidence validation failed. See this run's artifact for partial step results and suite.log."
+            fi
           } | tee "${REPORT_FILE}"
           cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+          [ "${RESULT}" = "success" ]
 
       - name: Upload functional report to dashboard
-        if: always()
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
-          REPORT_FILE: /tmp/rustfs-heal-report.md
           SUITE: heal
         run: |
           set -euo pipefail
@@ -238,28 +263,32 @@ jobs:
           fi
           DATE="$(date -u +%Y-%m-%d)"
           REPORT_PATH="functional-reports/${SUITE}/${DATE}.md"
-          CONTENT="$(python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}")"
+          # Base64-encode the report into a temp file and feed it to jq via
+          # --rawfile: large reports (e.g. pool) exceed the OS argv limit and
+          # make `jq --arg content "${CONTENT}"` fail with "Argument list too long".
+          B64_FILE="$(mktemp)"
+          python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}" > "${B64_FILE}"
           SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
           if [ -n "${SHA}" ]; then
-            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" --arg sha "${SHA}" \
-              '{message:$msg, content:$content, sha:$sha}' \
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --rawfile content "${B64_FILE}" --arg sha "${SHA}" \
+              '{message:$msg, content:($content|rtrimstr("\n")), sha:$sha}' \
               | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
           else
-            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" \
-              '{message:$msg, content:$content}' \
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --rawfile content "${B64_FILE}" \
+              '{message:$msg, content:($content|rtrimstr("\n"))}' \
               | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
           fi
+          rm -f "${B64_FILE}"
 
       - name: File failure issue in rustfs/backlog
         if: ${{ always() && (failure() || steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled') }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
           SUITE: 'heal'
           SUITE_LABEL: 'Heal'
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          REPORT_FILE: '/tmp/rustfs-heal-report.md'
-          LOG_FILE: '/tmp/rustfs-heal-test.log'
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
@@ -287,14 +316,16 @@ jobs:
             echo ""
             echo "- Suite: \`${SUITE}\`"
             echo "- Run: ${RUN_URL}"
+            echo "- Attempt: ${GITHUB_RUN_ATTEMPT}"
+            echo "- Workflow Commit: ${GITHUB_SHA}"
             echo "- Trigger: ${GITHUB_EVENT_NAME}"
             echo "- Date: $(date -u +%Y-%m-%d)"
             echo ""
             echo "## Report (errors and symptoms)"
             echo ""
-            if [ -s "${REPORT_FILE}" ]; then
+            if [ "${EVIDENCE_OUTCOME}" = "success" ] && [ -s "${REPORT_FILE}" ]; then
               redact < "${REPORT_FILE}"
-            elif [ -s "${LOG_FILE:-}" ]; then
+            elif [ "${EVIDENCE_OUTCOME}" = "success" ] && [ -s "${LOG_FILE:-}" ]; then
               echo "(report file missing; log tail below)"
               echo ""
               tail -n 200 "${LOG_FILE}" | redact
@@ -310,14 +341,16 @@ jobs:
           echo "filed backlog issue for suite ${SUITE}"
 
       - name: Upload test logs
-        if: always()
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: rustfs-heal-test-${{ github.run_id }}
+          name: rustfs-heal-test-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            /tmp/rustfs-heal-test*.log
-            /tmp/rustfs-warp.*.log
-          if-no-files-found: warn
+            ${{ env.FUNCTIONAL_ARTIFACTS_DIR }}/report.md
+            ${{ env.FUNCTIONAL_ARTIFACTS_DIR }}/suite.log
+            ${{ env.FUNCTIONAL_ARTIFACTS_DIR }}/warp.log
+            ${{ env.FUNCTIONAL_ARTIFACTS_DIR }}/steps.md
+          if-no-files-found: error
 
       - name: Cleanup environment (after)
         if: ${{ always() && inputs.cleanup_after != 'false' }}

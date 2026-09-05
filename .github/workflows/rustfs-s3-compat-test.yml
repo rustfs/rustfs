@@ -37,10 +37,28 @@ env:
 jobs:
   s3-compat-test:
     runs-on: smoke-testing
-    continue-on-error: true
     timeout-minutes: 360
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
+      - name: Checkout repository (for report parser)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Initialize functional evidence
+        id: evidence
+        run: |
+          set -euo pipefail
+          umask 077
+          FUNCTIONAL_ARTIFACTS_DIR="${RUNNER_TEMP}/rustfs-s3-compat-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -- "${FUNCTIONAL_ARTIFACTS_DIR}" "${FUNCTIONAL_ARTIFACTS_DIR}-scratch"
+          {
+            printf 'FUNCTIONAL_ARTIFACTS_DIR=%s\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+            printf 'LOG_FILE=%s/suite.log\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+            printf 'REPORT_FILE=%s/report.md\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+            printf 'TMPDIR=%s-scratch\n' "${FUNCTIONAL_ARTIFACTS_DIR}"
+          } >> "${GITHUB_ENV}"
+
       # auto-testing is private: clone it with the dedicated PF token (not
       # GITHUB_TOKEN) and retry transient GitHub/network failures.
       - name: Checkout auto-testing scripts (with retry)
@@ -88,9 +106,6 @@ jobs:
 
       - name: Run S3 compatibility suite
         id: test
-        continue-on-error: true
-        env:
-          LOG_FILE: /tmp/rustfs-s3-compat.log
         run: |
           set -euo pipefail
           chmod +x auto-testing/rustfs-s3-compat-test.sh
@@ -107,10 +122,7 @@ jobs:
           ./auto-testing/rustfs-s3-compat-test.sh "${ARGS[@]}"
 
       - name: Generate report
-        if: always()
-        env:
-          LOG_FILE: /tmp/rustfs-s3-compat.log
-          REPORT_FILE: /tmp/rustfs-s3-compat-report.md
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
         run: |
           set -euo pipefail
           PACKAGE_URL='${{ inputs.package_url }}'
@@ -132,83 +144,44 @@ jobs:
               RUSTFS_VERSION_INFO="${DETECTED_VERSION}"
             fi
           fi
-          CASE_TABLE="/tmp/rustfs-s3-compat-cases.md"
-          python3 - "${LOG_FILE}" "${CASE_TABLE}" <<'PY'
-          import re
-          import sys
-
-          log_file, out_file = sys.argv[1], sys.argv[2]
-          ansi = re.compile(r'\x1b\[[0-9;]*m')
-          start_re = re.compile(r'^---\s+([A-Z0-9]+-[0-9]+)\s+(.+?)\s+---$')
-          done_re = re.compile(r'^\[(PASS|FAIL|UNSUPPORTED)\]\s+([A-Z0-9]+-[0-9]+)\b')
-
-          rows = []
-          index = {}
-          current = None
-          try:
-            with open(log_file, 'r', encoding='utf-8', errors='replace') as fh:
-              for raw in fh:
-                line = ansi.sub('', raw).strip()
-                m = start_re.match(line)
-                if m:
-                  case_id, name = m.group(1), m.group(2)
-                  current = case_id
-                  if case_id not in index:
-                    index[case_id] = len(rows)
-                    rows.append([case_id, name, 'RUNNING'])
-                  continue
-                m = done_re.match(line)
-                if m:
-                  status, case_id = m.group(1), m.group(2)
-                  if case_id in index:
-                    rows[index[case_id]][2] = status
-                  else:
-                    rows.append([case_id, case_id, status])
-                    index[case_id] = len(rows) - 1
-                  current = None
-          except FileNotFoundError:
-            rows = []
-
-          counts = {'PASS': 0, 'FAIL': 0, 'UNSUPPORTED': 0, 'RUNNING': 0}
-          for _, _, status in rows:
-            counts[status] = counts.get(status, 0) + 1
-
-          with open(out_file, 'w', encoding='utf-8') as out:
-            out.write('## Case Summary\n\n')
-            out.write(f"- Total: {len(rows)}\\n")
-            out.write(f"- PASS: {counts.get('PASS', 0)}\\n")
-            out.write(f"- FAIL: {counts.get('FAIL', 0)}\\n")
-            out.write(f"- UNSUPPORTED: {counts.get('UNSUPPORTED', 0)}\\n")
-            out.write('\\n')
-            out.write('| Case | Name | Status |\\n')
-            out.write('| --- | --- | --- |\\n')
-            for case_id, name, status in rows:
-              out.write(f'| {case_id} | {name} | {status} |\\n')
-          PY
+          CASE_TABLE="${FUNCTIONAL_ARTIFACTS_DIR}/cases.md"
+          CASE_RESULT=success
+          python3 scripts/functional_case_report.py "${LOG_FILE}" "${CASE_TABLE}" || CASE_RESULT=failure
+          RESULT=failure
+          if [ '${{ steps.test.outcome }}' = 'success' ] && [ "${CASE_RESULT}" = 'success' ]; then
+            RESULT=success
+          fi
           {
             echo "# RustFS S3 compatibility test report"
             echo ""
             echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Attempt: ${GITHUB_RUN_ATTEMPT}"
+            echo "- Workflow Commit: ${GITHUB_SHA}"
             echo "- Trigger: ${{ github.event_name }}"
             echo "- Package: ${PACKAGE_SOURCE}"
             echo "- RustFS Version: ${RUSTFS_VERSION_INFO}"
-            echo "- Test Step Outcome: ${{ steps.test.outcome }}"
+            echo "- Test Step Outcome: ${RESULT}"
+            echo "- Suite Step Outcome: ${{ steps.test.outcome }}"
             echo ""
-            cat "${CASE_TABLE}" || true
-            echo ""
-            echo "## Log tail"
-            echo '```text'
-            tail -n 200 "${LOG_FILE}" || true
-            echo '```'
+            if [ "${RESULT}" = "success" ]; then
+              cat "${CASE_TABLE}"
+              echo ""
+              echo "## Log tail"
+              echo '```text'
+              tail -n 200 "${LOG_FILE}"
+              echo '```'
+            else
+              echo "The suite or evidence validation failed. See this run's artifact for partial case results and suite.log."
+            fi
           } | tee "${REPORT_FILE}"
           cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+          [ "${RESULT}" = "success" ]
 
       - name: Upload functional report to dashboard
-        if: always()
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
-          REPORT_FILE: /tmp/rustfs-s3-compat-report.md
           SUITE: s3
         run: |
           set -euo pipefail
@@ -218,28 +191,32 @@ jobs:
           fi
           DATE="$(date -u +%Y-%m-%d)"
           REPORT_PATH="functional-reports/${SUITE}/${DATE}.md"
-          CONTENT="$(python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}")"
+          # Base64-encode the report into a temp file and feed it to jq via
+          # --rawfile: large reports (e.g. pool) exceed the OS argv limit and
+          # make `jq --arg content "${CONTENT}"` fail with "Argument list too long".
+          B64_FILE="$(mktemp)"
+          python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}" > "${B64_FILE}"
           SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
           if [ -n "${SHA}" ]; then
-            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" --arg sha "${SHA}" \
-              '{message:$msg, content:$content, sha:$sha}' \
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --rawfile content "${B64_FILE}" --arg sha "${SHA}" \
+              '{message:$msg, content:($content|rtrimstr("\n")), sha:$sha}' \
               | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
           else
-            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" \
-              '{message:$msg, content:$content}' \
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --rawfile content "${B64_FILE}" \
+              '{message:$msg, content:($content|rtrimstr("\n"))}' \
               | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
           fi
+          rm -f "${B64_FILE}"
 
       - name: File failure issue in rustfs/backlog
         if: ${{ always() && (failure() || steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled') }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
           SUITE: 's3'
           SUITE_LABEL: 'S3 compatibility'
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          REPORT_FILE: '/tmp/rustfs-s3-compat-report.md'
-          LOG_FILE: '/tmp/rustfs-s3-compat.log'
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
@@ -267,14 +244,16 @@ jobs:
             echo ""
             echo "- Suite: \`${SUITE}\`"
             echo "- Run: ${RUN_URL}"
+            echo "- Attempt: ${GITHUB_RUN_ATTEMPT}"
+            echo "- Workflow Commit: ${GITHUB_SHA}"
             echo "- Trigger: ${GITHUB_EVENT_NAME}"
             echo "- Date: $(date -u +%Y-%m-%d)"
             echo ""
             echo "## Report (errors and symptoms)"
             echo ""
-            if [ -s "${REPORT_FILE}" ]; then
+            if [ "${EVIDENCE_OUTCOME}" = "success" ] && [ -s "${REPORT_FILE}" ]; then
               redact < "${REPORT_FILE}"
-            elif [ -s "${LOG_FILE:-}" ]; then
+            elif [ "${EVIDENCE_OUTCOME}" = "success" ] && [ -s "${LOG_FILE:-}" ]; then
               echo "(report file missing; log tail below)"
               echo ""
               tail -n 200 "${LOG_FILE}" | redact
@@ -290,14 +269,15 @@ jobs:
           echo "filed backlog issue for suite ${SUITE}"
 
       - name: Upload report and logs
-        if: always()
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: rustfs-s3-compat-${{ github.run_id }}
+          name: rustfs-s3-compat-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            /tmp/rustfs-s3-compat.log
-            /tmp/rustfs-s3-compat-report.md
-          if-no-files-found: warn
+            ${{ env.FUNCTIONAL_ARTIFACTS_DIR }}/report.md
+            ${{ env.FUNCTIONAL_ARTIFACTS_DIR }}/suite.log
+            ${{ env.FUNCTIONAL_ARTIFACTS_DIR }}/cases.md
+          if-no-files-found: error
 
       - name: Cleanup environment (after)
         if: always()
