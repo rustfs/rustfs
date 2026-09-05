@@ -87,12 +87,24 @@ def verify_results(needs: object, event: str, ref: str) -> list[str]:
 
 def check_workflow(root: Path) -> list[str]:
     # Reuse the repository's canonical-indentation checker; actionlint validates YAML syntax.
-    from check_test_wiring import yaml_block
+    from check_test_wiring import yaml_block, yaml_scalar_continues
 
     errors = []
     lines = (root / ".github/workflows/ci.yml").read_text().splitlines()
     jobs = yaml_block(lines, "jobs", 0) or []
-    names = set(re.findall(r"^  ([a-z][a-z0-9-]*):$", "\n".join(jobs), re.M))
+    names = set()
+    for index, line in enumerate(jobs):
+        if not re.match(r"^  \S", line) or line.lstrip().startswith("#"):
+            continue
+        header = re.fullmatch(r'''  (["']?)([A-Za-z_][A-Za-z0-9_-]*)\1\s*:\s*(?:#.*)?''', line)
+        if header is None:
+            errors.append("CI job declarations must use single-line job IDs")
+            continue
+        name = header[2]
+        if name in names:
+            errors.append(f"duplicate CI job ID: {name}")
+        names.add(name)
+        jobs[index] = f"  {name}:"
     required = set(ALWAYS_JOBS + CODE_JOBS + OPTIONAL_JOBS)
     if names - NON_VALIDATION_JOBS != required:
         errors.append("CI verification jobs and the required gate contract differ")
@@ -107,16 +119,29 @@ def check_workflow(root: Path) -> list[str]:
         if len(matches) != 1:
             return None
         index = matches[0]
-        following = next((line for line in block[index + 1:] if line.strip() and not line.lstrip().startswith("#")), None)
-        if following is not None and len(following) - len(following.lstrip()) > indent:
+        if yaml_scalar_continues(block, index, indent):
             return None
         return block[index][len(prefix):]
+
+    display_names = {}
+    for job in names:
+        block = [re.sub(r'''^    (?:'name'|"name")\s*:\s*''', "    name: ", line)
+                 for line in yaml_block(jobs, job, 2) or []]
+        value = scalar(block, "name", 4)
+        display = re.fullmatch(r'''(?:"([^"\\]*)"|'([^']*)'|([^'"#][^#]*?))(?:\s+#.*)?\s*''', (value or "").strip())
+        if display is None or (display[3] is not None and display[3].startswith(tuple("|>*&!{[?"))):
+            errors.append(f"{job} must use a verifiable single-line display name")
+            continue
+        name = next(value for value in display.groups() if value is not None)
+        if "${{" in name and (job != "test-and-lint-protocols" or name != "Test and Lint (${{ matrix.features.name }})"):
+            errors.append(f"{job} has an unverifiable dynamic display name")
+        display_names[job] = name
 
     dependencies = yaml_block(gate, "needs", 4) or []
     declared = [line.strip().removeprefix("- ") for line in dependencies if line.strip()]
     if set(declared) != required or len(declared) != len(required):
         errors.append("required-checks must directly depend on every verification job exactly once")
-    if scalar(gate, "name", 4) != "Test and Lint" or sum(line.strip() == "name: Test and Lint" for line in jobs) != 1:
+    if display_names.get("required-checks") != "Test and Lint" or list(display_names.values()).count("Test and Lint") != 1:
         errors.append("Test and Lint must uniquely name the aggregate gate")
     if scalar(gate, "if", 4) != "always() && (github.event_name != 'pull_request' || github.event.action != 'closed')":
         errors.append("required-checks must run after failed or skipped dependencies")
@@ -224,6 +249,38 @@ class SelfTests(unittest.TestCase):
                     self.assertTrue(check_workflow(root), (job, field, "step"))
             path.write_text(source + "\n  cancel-after-test-and-lint-failure:\n    runs-on: ubuntu-latest\n")
             self.assertTrue(check_workflow(root))
+
+    def test_job_ids_and_display_names_cannot_hide_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".github/workflows").mkdir(parents=True)
+            source = (ROOT / ".github/workflows/ci.yml").read_text()
+            path = root / ".github/workflows/ci.yml"
+            for header in ("typos", "'typos'", '"typos"'):
+                path.write_text(source.replace("  typos:\n", f"  {header}: # spelling\n"))
+                self.assertEqual(check_workflow(root), [], header)
+            for name in ("Test and Lint # required", "'Test and Lint'", '"Test and Lint" # required'):
+                path.write_text(source.replace("    name: Test and Lint\n", f"    name: {name}\n"))
+                self.assertEqual(check_workflow(root), [], name)
+            for key in ("'name'", '"name"'):
+                path.write_text(source.replace("    name: Typos\n", f"    {key}: Typos\n"))
+                self.assertEqual(check_workflow(root), [], key)
+            for header in ("new_test", "NewTest", "_new_test", "'new_test'", '"new_test"', '"new\\u005ftest"'):
+                path.write_text(source + f"\n  {header}:\n    name: New test\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 1\n")
+                self.assertTrue(check_workflow(root), header)
+            path.write_text(source + "\n  'typos':\n    name: Duplicate\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 1\n")
+            self.assertIn("duplicate CI job ID: typos", check_workflow(root))
+            for name in (
+                "Test and Lint", "Test and Lint # duplicate", "'Test and Lint'",
+                '"Test and Lint" # duplicate', '"Test\\u0020and Lint"',
+                ">-\n      Test and Lint", "|-\n      Test and Lint", "Test and\n      Lint",
+                "*required_name", "&required_name Test and Lint", "!!str Test and Lint",
+                "${{ 'Test and Lint' }}", '"${{ github.event.inputs.check_name }}"',
+            ):
+                path.write_text(source.replace("    name: Typos\n", f"    name: {name}\n"))
+                self.assertTrue(check_workflow(root), name)
+            path.write_text(source.replace("    name: Typos\n", ""))
+            self.assertIn("typos must use a verifiable single-line display name", check_workflow(root))
 
     def test_verify_command_preserves_failures(self):
         good = {job: {"result": value} for job, value in expected_results("full", "pull_request", "refs/pull/1/merge").items()}

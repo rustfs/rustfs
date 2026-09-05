@@ -567,7 +567,10 @@ def check_quick_checks(root: Path) -> list[str]:
         errors.append(f"{relative}: missing composite action")
         return errors
     steps = yaml_block(runs, "steps", 2) or []
-    for command in ("shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh"):
+    for command in (
+        "shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh",
+        "python3 scripts/ci_gate.py --self-test",
+    ):
         step = workflow_step_block(steps, command, key="run", indent=4)
         if step is None:
             errors.append(f"{relative}: missing direct execution of {command}")
@@ -906,6 +909,8 @@ class SelfTests(unittest.TestCase):
                 "    - name: Lint workflows\n      shell: bash\n      run: shellcheck --version && actionlint\n"
                 "    - name: Error format ratchet\n      shell: bash\n"
                 "      run: ./scripts/check_error_other_format_ratchet.sh\n"
+                "    - name: Required gate contract\n      shell: bash\n"
+                "      run: python3 scripts/ci_gate.py --self-test\n"
             )
             sources = {
                 ".github/workflows/ci.yml": caller.replace(
@@ -963,8 +968,10 @@ class SelfTests(unittest.TestCase):
                 "only installed actionlint": action.replace("run: shellcheck --version && actionlint", "run: echo actionlint"),
                 "missing shellcheck preflight": action.replace("shellcheck --version && ", ""),
                 "missing ratchet": action.replace("run: ./scripts/check_error_other_format_ratchet.sh", "run: echo skipped"),
+                "missing gate contract": action.replace("run: python3 scripts/ci_gate.py --self-test", "run: echo skipped"),
                 "swallowed lint failure": action.replace("&& actionlint", "&& actionlint || true"),
                 "swallowed ratchet failure": action.replace("ratchet.sh", "ratchet.sh || true"),
+                "swallowed gate failure": action.replace("ci_gate.py --self-test", "ci_gate.py --self-test || true"),
                 "conditional lint": action.replace("run: shellcheck", "if: false\n      run: shellcheck"),
                 "ignored ratchet failure": action.replace("run: ./scripts/", "continue-on-error: true\n      run: ./scripts/"),
                 "non-failing shell": action.replace("shell: bash", "shell: bash {0}"),
@@ -972,7 +979,10 @@ class SelfTests(unittest.TestCase):
                     "name: Lint workflows", "name: |\n        run: shellcheck --version && actionlint"
                 ).replace("\n      run: shellcheck --version && actionlint\n", "\n      run: shellcheck --version && actionlint\n        || true\n"),
             }
-            for command in ("shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh"):
+            for command in (
+                "shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh",
+                "python3 scripts/ci_gate.py --self-test",
+            ):
                 for key in ("'if' : false", '"if": false', "'continue-on-error': true", '"continue-on-error" : true'):
                     mutations[f"quoted {command} {key}"] = action.replace(f"run: {command}", f"{key}\n      run: {command}")
                 for separator in ("", "\n", "        # continued command\n"):
@@ -992,10 +1002,14 @@ class SelfTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "scripts").mkdir()
-            commands = ("shellcheck", "actionlint", "./scripts/check_error_other_format_ratchet.sh")
-            for failing in commands:
+            commands = ("shellcheck", "actionlint", "./scripts/check_error_other_format_ratchet.sh", "python3")
+            for failing, run in (
+                ("shellcheck", "shellcheck --version && actionlint"),
+                ("actionlint", "shellcheck --version && actionlint"),
+                ("./scripts/check_error_other_format_ratchet.sh", "./scripts/check_error_other_format_ratchet.sh"),
+                ("python3", "python3 scripts/ci_gate.py --self-test"),
+            ):
                 with self.subTest(command=failing):
-                    run = "shellcheck --version && actionlint" if failing != commands[-1] else failing
                     step = workflow_step_block(steps, run, key="run", indent=4)
                     self.assertIsNotNone(step)
                     run_index = next(index for index, line in enumerate(step[1]) if line.startswith("      run:"))
