@@ -868,6 +868,38 @@ pub(crate) async fn send_retry_request_if_peer_current(
     .await
 }
 
+async fn send_peer_edit_retry_if_peer_current(
+    peer: &PeerInfo,
+    transport: &PeerTransport,
+    path: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: Value,
+) -> S3Result<bool> {
+    let peer_owned = peer.clone();
+    let current = with_site_replication_state_read_lock(move |state| async move {
+        Ok(state
+            .peers
+            .get(&peer_owned.deployment_id)
+            .is_some_and(|current| same_identity_endpoint(&current.endpoint, &peer_owned.endpoint)))
+    })
+    .await?;
+    if !current {
+        return Ok(false);
+    }
+
+    // A peer-edit handler takes its own site's state write lock. Releasing
+    // this site's read lock before the request prevents simultaneous A -> B
+    // and B -> A retries from waiting on each other's write lock. The edit
+    // generation carried by `path` fences a delivery overtaken by a newer
+    // topology commit after this check.
+    PeerAdminRequest::put(&transport.connection, path, access_key)
+        .with_client(&transport.client)
+        .send(secret_key, &body)
+        .await?;
+    Ok(true)
+}
+
 #[derive(Hash, PartialEq, Eq)]
 pub(crate) enum IamSnapshotKey {
     Policy(String),
@@ -1477,7 +1509,7 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
     promote_reachable_deferred_retry_events(&runtime, &actionable, deferred).await?;
 
     // Serialize against operator repair execution. Peer membership is
-    // re-checked under the bucket-op read lock immediately before each
+    // re-checked from a distributed state snapshot immediately before each
     // network request, so the caller need not hold the lifecycle guard while
     // a large snapshot is replayed. This does NOT close the
     // dry-run -> execute window (dry-run takes no lock): a drain settling a
@@ -1822,7 +1854,7 @@ pub(crate) async fn drain_one_site_replication_retry_event(
                 let body = serde_json::to_value(body).map_err(|err| {
                     S3Error::with_message(S3ErrorCode::InternalError, format!("serialize retry peer edit failed: {err}"))
                 })?;
-                match send_retry_request_if_peer_current(peer, transport, &edit_path, access_key, secret_key, body).await {
+                match send_peer_edit_retry_if_peer_current(peer, transport, &edit_path, access_key, secret_key, body).await {
                     Ok(true) => {}
                     Ok(false) => return Ok(false),
                     Err(err) => {
