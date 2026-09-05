@@ -40,8 +40,8 @@ use super::source_client::{
     AzureAuth, AzureSourceSpec, SourceBackend, SourceError, SourceGet, SourceHead, SourceListRequest, SourceObject, SourcePage,
     SourceTimeouts, range_header_value,
 };
-use crate::bucket::remote_s3_client::RemoteS3ClientError;
-use crate::storage_api_contracts::range::HTTPRangeSpec;
+use super::storage_api::HTTPRangeSpec;
+use super::storage_api::remote_s3_client::RemoteS3ClientError;
 use hmac::{Hmac, Mac, digest::KeyInit};
 use http::{HeaderMap, HeaderValue, Method};
 use quick_xml::Reader;
@@ -549,9 +549,9 @@ fn leaf_text(reader: &mut Reader<&[u8]>, end: quick_xml::name::QName<'_>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bucket::on_demand_migration::backend_contract::{BackendCapabilities, assert_backend_contract};
-    use crate::bucket::on_demand_migration::source_client::SourceError;
-    use crate::bucket::on_demand_migration::test_http_fixture::{ScriptedResponse, scripted_server};
+    use crate::on_demand_migration::backend_contract::{BackendCapabilities, assert_backend_contract};
+    use crate::on_demand_migration::source_client::SourceError;
+    use crate::on_demand_migration::test_http_fixture::{ScriptedResponse, scripted_server};
 
     const LIST_PAGE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <EnumerationResults ServiceEndpoint="https://acct.blob.core.windows.net/" ContainerName="legacy">
