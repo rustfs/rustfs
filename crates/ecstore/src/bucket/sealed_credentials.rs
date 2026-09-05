@@ -203,9 +203,8 @@ mod tests {
     use parking_lot::Mutex;
     use std::collections::BTreeMap;
 
-    fn encode_context(context: &HashMap<String, String>) -> String {
-        let ordered = context.iter().collect::<BTreeMap<_, _>>();
-        serde_json::to_string(&ordered).expect("context serializes")
+    fn encode_context(context: &BTreeMap<String, String>) -> String {
+        serde_json::to_string(context).expect("context serializes")
     }
 
     /// Stands in for the KMS-backed sealer: records the context it was called
