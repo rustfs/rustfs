@@ -38,8 +38,8 @@ pub(crate) use rustfs_ecstore::api::bucket::lifecycle::lifecycle::object_opts_fr
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys as ecstore_init_bucket_metadata_sys;
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
-    get_lifecycle_config as ecstore_get_lifecycle_config, get_object_lock_config as ecstore_get_object_lock_config,
-    get_replication_config as ecstore_get_replication_config,
+    BucketMetadataMutationGuard as EcstoreBucketMetadataMutationGuard, get_lifecycle_config as ecstore_get_lifecycle_config,
+    get_object_lock_config as ecstore_get_object_lock_config, get_replication_config as ecstore_get_replication_config,
 };
 pub(crate) use rustfs_ecstore::api::bucket::replication::{
     ReplicateObjectInfo, ReplicationConfig as EcstoreReplicationConfig,
@@ -103,7 +103,9 @@ pub(crate) use rustfs_ecstore::api::rebalance::{
     RebalStatus as EcstoreRebalStatus, RebalanceInfo as EcstoreRebalanceInfo, RebalanceMeta as EcstoreRebalanceMeta,
     RebalanceStats as EcstoreRebalanceStats,
 };
-pub(crate) use rustfs_ecstore::api::rpc::ScannerBucketListing as EcstoreScannerBucketListing;
+pub(crate) use rustfs_ecstore::api::rpc::{
+    ScannerBucketListing as EcstoreScannerBucketListing, ScannerPeerDirtyUsageSnapshot as EcstoreScannerPeerDirtyUsageSnapshot,
+};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::runtime::InstanceContext as EcstoreInstanceContext;
 pub(crate) use rustfs_ecstore::api::runtime::{
