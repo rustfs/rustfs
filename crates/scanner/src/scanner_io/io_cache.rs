@@ -1039,8 +1039,10 @@ impl ScannerIOCache for SetDisks {
                         set_disk_inventory_clone.as_ref().clone(),
                         cache.clone(),
                         None,
-                        scan_mode,
-                        prefix_scan_scope,
+                        ScannerDiskScanOptions {
+                            scan_mode,
+                            prefix_scan_scope,
+                        },
                     );
                     tokio::pin!(scan);
                     let mut lock_watch = tokio::time::interval(SCANNER_CACHE_LOCK_POLL_INTERVAL);

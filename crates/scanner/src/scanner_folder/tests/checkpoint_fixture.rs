@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::scanner_budget::ScannerCycleBudgetConfig;
-use crate::scanner_io::{ScannerDiskScanOutcome, ScannerIODisk};
+use crate::scanner_io::{ScannerDiskScanOptions, ScannerDiskScanOutcome, ScannerIODisk};
 use crate::storage_api::scanner_io::ObjectIO;
 use crate::{DataUsageCacheSource, DataUsageScanPlanDigest};
 use std::io::Cursor;
@@ -298,8 +298,10 @@ async fn run_checkpoint_fixture(change_digest: bool) {
                 vec![scanner.local_disk.clone()],
                 cache,
                 None,
-                HealScanMode::Normal,
-                None,
+                ScannerDiskScanOptions {
+                    scan_mode: HealScanMode::Normal,
+                    prefix_scan_scope: None,
+                },
             )
             .await
             .expect("budgeted local disk scan returns partial cache");
@@ -378,8 +380,10 @@ async fn run_checkpoint_fixture(change_digest: bool) {
             vec![scanner.local_disk.clone()],
             loaded.clone(),
             None,
-            HealScanMode::Normal,
-            None,
+            ScannerDiskScanOptions {
+                scan_mode: HealScanMode::Normal,
+                prefix_scan_scope: None,
+            },
         )
         .await;
     assert!(result.is_err(), "pre-scan cancellation must not produce a complete root");
@@ -396,8 +400,10 @@ async fn run_checkpoint_fixture(change_digest: bool) {
             vec![scanner.local_disk.clone()],
             loaded,
             None,
-            HealScanMode::Normal,
-            None,
+            ScannerDiskScanOptions {
+                scan_mode: HealScanMode::Normal,
+                prefix_scan_scope: None,
+            },
         )
         .await
         .expect("unbounded scan must complete after durable partial progress");

@@ -697,6 +697,12 @@ pub trait ScannerIOCache: Send + Sync + Debug + 'static {
     ) -> Result<()>;
 }
 
+#[derive(Debug)]
+pub struct ScannerDiskScanOptions {
+    pub scan_mode: HealScanMode,
+    pub prefix_scan_scope: Option<ScannerBucketPrefixScanScope>,
+}
+
 #[async_trait::async_trait]
 pub trait ScannerIODisk: Send + Sync + Debug + 'static {
     async fn nsscanner_disk(
@@ -706,8 +712,7 @@ pub trait ScannerIODisk: Send + Sync + Debug + 'static {
         set_disks: Vec<Arc<Disk>>,
         cache: DataUsageCache,
         updates: Option<mpsc::Sender<DataUsageEntry>>,
-        scan_mode: HealScanMode,
-        prefix_scan_scope: Option<ScannerBucketPrefixScanScope>,
+        options: ScannerDiskScanOptions,
     ) -> Result<ScannerDiskScanOutcome>;
 
     async fn get_size(&self, item: ScannerItem) -> Result<SizeSummary>;
