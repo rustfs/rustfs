@@ -46,7 +46,7 @@ use super::replication_storage_boundary::{
     HTTPPreconditions, ObjectInfo, ObjectOptions, ObjectToDelete, ReplicationDeletedObject, ReplicationObjectIO,
     ReplicationStorage,
 };
-use super::replication_target_boundary::{ReplicationTargetStore, replication_object_is_ssec_encrypted};
+use super::replication_target_boundary::{BucketTargetError, ReplicationTargetStore, replication_object_is_ssec_encrypted};
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
 use futures_util::stream::{self, StreamExt};
@@ -3084,6 +3084,23 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
 
     let tgts = match ReplicationTargetStore::list_bucket_targets(bucket).await {
         Ok(targets) => Some(targets),
+        // A bucket whose persisted target configuration cannot be decoded has
+        // an unknown target set, not an empty one: scheduling against `None`
+        // here would drop every heal for it without a trace
+        // (rustfs/backlog#2282). Report it missed so the object is retried
+        // once the configuration is readable again.
+        Err(BucketTargetError::BucketRemoteTargetsUnreadable { .. }) => {
+            warn!(
+                event = EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket,
+                reason = "target_config_unreadable",
+                "Bucket replication targets are unreadable; replication heal queue fails closed"
+            );
+
+            return ReplicationQueueAdmission::Missed;
+        }
         Err(err) => {
             debug!(
                 event = EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED,
