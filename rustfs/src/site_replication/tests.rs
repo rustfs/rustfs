@@ -863,6 +863,54 @@ fn test_destructive_bucket_op_prequeue_does_not_evict_existing_liability() {
 }
 
 #[test]
+fn test_destructive_success_settles_equivalent_bucket_intents() {
+    let peer = peer("remote", "https://remote.example.com");
+    let failed = drain_event(
+        "remote",
+        "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket&retryIntent=a",
+        1,
+        None,
+    );
+    let current = drain_event(
+        "remote",
+        "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=force-delete-bucket&retryIntent=b",
+        1,
+        None,
+    );
+    let unrelated = drain_event(
+        "remote",
+        "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=videos&operation=delete-bucket&retryIntent=c",
+        1,
+        None,
+    );
+    let mut queue = vec![failed, current.clone(), unrelated.clone()];
+
+    assert_eq!(settle_site_replication_destructive_retry_events(&mut queue, &peer, &current.path), 2);
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].id, unrelated.id);
+}
+
+#[test]
+fn test_ordinary_retry_does_not_evict_destructive_liability() {
+    let mut queue = (0..SITE_REPLICATION_RETRY_QUEUE_LIMIT)
+        .map(|index| {
+            drain_event(
+                &format!("peer-{index}"),
+                &format!("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=bucket-{index}&operation=delete-bucket"),
+                1,
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    let ordinary = peer("ordinary", "https://ordinary.example.com");
+
+    upsert_site_replication_retry_event(&mut queue, &ordinary, SITE_REPLICATION_PEER_EDIT_PATH, "failed (connect)", None);
+
+    assert_eq!(queue.len(), SITE_REPLICATION_RETRY_QUEUE_LIMIT);
+    assert!(queue.iter().all(retry_event_is_destructive_bucket_op));
+}
+
+#[test]
 fn test_retry_snapshot_fingerprint_detects_concurrent_iam_change() {
     let old = SRIAMItem {
         r#type: "policy".to_string(),

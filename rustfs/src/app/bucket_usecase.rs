@@ -75,7 +75,7 @@ use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::shared_types::RemoteAddr;
 use crate::site_replication::{
-    cancel_site_replication_delete_bucket_hook, finish_site_replication_delete_bucket_hook,
+    SITE_REPLICATION_BUCKET_OP_LOCK, cancel_site_replication_delete_bucket_hook, finish_site_replication_delete_bucket_hook,
     prepare_site_replication_delete_bucket_hook, site_replication_bucket_meta_hook, site_replication_make_bucket_hook,
 };
 use crate::storage::storage_api::lock_bucket_targets_metadata;
@@ -1398,6 +1398,7 @@ impl DefaultBucketUsecase {
             authorize_request(&mut req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
         }
 
+        let bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
         let replication_delete_intent = prepare_site_replication_delete_bucket_hook(&input.bucket, force).await?;
         let delete_result = store
             .delete_bucket(
@@ -1415,6 +1416,7 @@ impl DefaultBucketUsecase {
             }
             return Err(err.into());
         }
+        drop(bucket_op_guard);
 
         // Drop every cached object body for the now-deleted bucket so dead
         // bytes do not sit resident until TTL. Covers both the normal and the

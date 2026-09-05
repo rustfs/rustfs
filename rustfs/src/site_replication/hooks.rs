@@ -409,7 +409,7 @@ async fn broadcast_site_replication_destructive_bucket_op(
         .await;
         match result {
             Ok(_) => {
-                dequeue_site_replication_retry_event(peer, path).await;
+                dequeue_site_replication_destructive_retry_events(peer, path).await;
                 None
             }
             Err(err) => {
@@ -456,8 +456,6 @@ pub(crate) async fn prepare_site_replication_delete_bucket_hook(
     let Some(runtime) = runtime_site_replication_targets().await? else {
         return Ok(None);
     };
-    let store =
-        current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
     let peers = runtime
         .state
         .peers
@@ -468,17 +466,7 @@ pub(crate) async fn prepare_site_replication_delete_bucket_hook(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let reserve_peers = peers.clone();
-    let reserve_path = path.clone();
-    let result =
-        with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
-            prequeue_site_replication_destructive_events(&reserve_peers, &reserve_path).await
-        })
-        .await;
-    let reserved_peers = match result {
-        Ok(result) => result?,
-        Err(err) => return Err(ApiError::from(err).into()),
-    };
+    let reserved_peers = prequeue_site_replication_destructive_events(&peers, &path).await?;
     Ok(Some(SiteReplicationDeleteBucketIntent {
         runtime,
         peers,

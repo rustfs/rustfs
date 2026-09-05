@@ -1824,7 +1824,7 @@ async fn site_replication_reconcile_prerequisites_ready() -> bool {
 
 fn reconcile_site_replication_retry_drain() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async {
-        let Some(_lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
+        let Some(lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
             return;
         };
         if !site_replication_reconcile_prerequisites_ready().await {
@@ -1839,6 +1839,10 @@ fn reconcile_site_replication_retry_drain() -> std::pin::Pin<Box<dyn std::future
             }
             Err(_) => return,
         }
+        // Retry sends re-check membership under the bucket-op read lock for
+        // each bounded peer request. Do not hold the lifecycle guard across
+        // an arbitrarily large snapshot replay.
+        drop(lifecycle);
         drain_site_replication_retry_queue().await;
     })
 }
@@ -9572,10 +9576,6 @@ mod tests {
         assert!(
             SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT >= SITE_REPLICATION_PEER_REQUEST_TIMEOUT,
             "a waiter must not give up before the holder's single wedged peer probe can finish"
-        );
-        assert!(
-            crate::site_replication::SITE_REPLICATION_RETRY_DRAIN_BATCH_TIMEOUT < SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT,
-            "the retry drainer must release the lifecycle guard before operator waiters time out"
         );
     }
 
