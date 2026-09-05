@@ -52,6 +52,112 @@ pub enum ScannerDirtyUsageAckError {
     ProcessChanged,
     #[error("scanner dirty usage generation cannot be acknowledged")]
     InvalidGeneration,
+    #[error("scanner dirty usage bucket incarnation fence is unavailable")]
+    IncarnationUnavailable,
+}
+
+/// A scoped ACK requires storage-owned lifecycle and incarnation fences.
+/// Callers must only send ACKs backed by durable per-bucket publication.
+pub fn acknowledge_scoped_dirty_usage(
+    instance_id: &str,
+    entries: &[(&crate::storage_api::EcstoreBucketMetadataMutationGuard, u64)],
+    probe_only: bool,
+) -> std::result::Result<u64, ScannerDirtyUsageAckError> {
+    // Lock order: sorted bucket lifecycle/metadata fences (caller), then dirty map.
+    // No await or storage operation occurs while the dirty map is locked.
+    let (cleared, pending) = {
+        let mut dirty = dirty_usage_buckets();
+        let checked = entries
+            .iter()
+            .map(|(guard, generation)| {
+                guard
+                    .checked_bucket_incarnation()
+                    .map(|(bucket, _)| (bucket, *generation))
+                    .map_err(|_| ScannerDirtyUsageAckError::IncarnationUnavailable)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let cleared = apply_scoped_dirty_usage_ack(
+            instance_id,
+            scanner_activity_epoch(),
+            DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire),
+            &mut dirty,
+            &checked,
+            probe_only,
+        )?;
+        if cleared > 0 {
+            advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
+        }
+        (cleared, dirty.len())
+    };
+    if !probe_only {
+        global_metrics().record_scanner_dirty_usage_cycle_clear(usize_to_u64_saturated(cleared), usize_to_u64_saturated(pending));
+    }
+    Ok(usize_to_u64_saturated(cleared))
+}
+
+fn apply_scoped_dirty_usage_ack(
+    instance_id: &str,
+    current_instance: &str,
+    current_generation: u64,
+    dirty: &mut DirtyUsageBuckets,
+    entries: &[(&str, u64)],
+    probe_only: bool,
+) -> std::result::Result<usize, ScannerDirtyUsageAckError> {
+    if instance_id != current_instance {
+        return Err(ScannerDirtyUsageAckError::ProcessChanged);
+    }
+    if current_generation == u64::MAX
+        || entries
+            .iter()
+            .any(|(_, generation)| *generation == 0 || *generation == u64::MAX || *generation > current_generation)
+    {
+        return Err(ScannerDirtyUsageAckError::InvalidGeneration);
+    }
+    let mut cleared = 0;
+    if !probe_only {
+        for (bucket, generation) in entries {
+            if dirty.get(*bucket) == Some(generation) {
+                dirty.remove(*bucket);
+                cleared += 1;
+            }
+        }
+    }
+    Ok(cleared)
+}
+
+#[cfg(test)]
+mod scoped_dirty_usage_tests {
+    use super::*;
+
+    #[test]
+    fn scoped_dirty_usage_preserves_uncovered_newer_and_replayed_generations() {
+        let mut dirty = HashMap::from([("hot".to_string(), 7), ("cold".to_string(), 8)]);
+        assert_eq!(apply_scoped_dirty_usage_ack("p", "p", 8, &mut dirty, &[("cold", 8)], true), Ok(0));
+        assert_eq!(dirty.len(), 2);
+        assert_eq!(apply_scoped_dirty_usage_ack("p", "p", 8, &mut dirty, &[("cold", 8)], false), Ok(1));
+        assert_eq!(dirty.get("hot"), Some(&7));
+        assert_eq!(apply_scoped_dirty_usage_ack("p", "p", 8, &mut dirty, &[("cold", 8)], false), Ok(0));
+        dirty.insert("cold".to_string(), 9);
+        assert_eq!(apply_scoped_dirty_usage_ack("p", "p", 9, &mut dirty, &[("cold", 8)], false), Ok(0));
+        assert_eq!(dirty.get("cold"), Some(&9));
+    }
+
+    #[test]
+    fn scoped_dirty_usage_rejects_restart_and_invalid_batch_before_clearing() {
+        let original = HashMap::from([("hot".to_string(), 7), ("cold".to_string(), 8)]);
+        let mut dirty = original.clone();
+        assert_eq!(
+            apply_scoped_dirty_usage_ack("old", "new", 8, &mut dirty, &[("cold", 8)], false),
+            Err(ScannerDirtyUsageAckError::ProcessChanged)
+        );
+        for generation in [0, 9, u64::MAX] {
+            assert_eq!(
+                apply_scoped_dirty_usage_ack("p", "p", 8, &mut dirty, &[("cold", 8), ("hot", generation)], false),
+                Err(ScannerDirtyUsageAckError::InvalidGeneration)
+            );
+            assert_eq!(dirty, original);
+        }
+    }
 }
 
 pub(super) fn dirty_usage_buckets() -> MutexGuard<'static, DirtyUsageBuckets> {

@@ -999,7 +999,7 @@ impl HealTask {
         let items = match since {
             None => result_items.iter().map(|(_, item)| item.clone()).collect::<Vec<_>>(),
             Some(cursor) => {
-                if cursor + 1 < min_seq {
+                if cursor.saturating_add(1) < min_seq {
                     lagged = true;
                 }
                 result_items

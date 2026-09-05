@@ -2050,6 +2050,53 @@ impl PeerRestClient {
         .await
     }
 
+    /// Probe only: scoped ACK production requires a durable per-bucket proof.
+    pub async fn scanner_scoped_dirty_usage_capability(
+        &self,
+        owner_id: String,
+        instance_id: String,
+        entries: Vec<rustfs_protos::proto_gen::node_service::ScannerScopedDirtyUsageEntry>,
+    ) -> Result<bool> {
+        use rustfs_protos::scoped_dirty_usage::*;
+        let payload = rustfs_protos::proto_gen::node_service::ScannerScopedDirtyUsageAckRequest {
+            challenge: Uuid::new_v4().as_bytes().to_vec().into(),
+            protocol_version: SCOPED_DIRTY_USAGE_PROTOCOL_VERSION,
+            owner_id,
+            instance_id,
+            scope: SCOPED_DIRTY_USAGE_BUCKET_SCOPE,
+            probe_only: true,
+            entries,
+        };
+        let canonical = canonical_scoped_dirty_usage_request(&payload).map_err(|err| Error::other(err.to_string()))?;
+        self.finalize_result(
+            async {
+                let mut client = super::client::scanner_control_time_out_client(
+                    &self.grid_host,
+                    TonicInterceptor::Signature(gen_tonic_signature_interceptor()),
+                )
+                .await?;
+                let mut request = Request::new(payload.clone());
+                set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                let response = client.scanner_scoped_dirty_usage_ack(request).await?.into_inner();
+                let body = canonical_scoped_dirty_usage_response(&canonical, &response)
+                    .map_err(|_| Error::other("scoped dirty usage capability response is too large"))?;
+                verify_tonic_rpc_response_proof(&body, response.response_proof.as_ref())?;
+                if response.protocol_version != SCOPED_DIRTY_USAGE_PROTOCOL_VERSION
+                    || response.owner_id != payload.owner_id
+                    || response.instance_id != payload.instance_id
+                    || response.max_entries != SCOPED_DIRTY_USAGE_MAX_ENTRIES
+                    || response.max_request_bytes != SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES
+                    || response.cleared != 0
+                {
+                    return Err(Error::other("scoped dirty usage capability response does not match request"));
+                }
+                Ok(response.supported)
+            }
+            .await,
+        )
+        .await
+    }
+
     pub async fn acknowledge_scanner_dirty_usage(&self, instance_id: String, generation: u64) -> Result<ScannerPeerActivity> {
         let result = self
             .scanner_activity_request_with_protocol(instance_id.clone(), generation, SCANNER_ACTIVITY_PROTOCOL_VERSION)
