@@ -189,8 +189,8 @@ pub enum SourceListPlan {
     /// delimiter — the source's own roll-up boundary matches the request's.
     Page { prefix: String },
     /// `filter.prefix` reaches past a delimiter, so every key the source could
-    /// contribute rolls into this one common prefix. One bounded probe listing
-    /// decides whether it exists; there is nothing to paginate.
+    /// contribute rolls into this one common prefix. Bounded probes follow
+    /// empty progressing pages until a key proves existence or the source ends.
     Folded { probe_prefix: String, common_prefix: String },
 }
 
