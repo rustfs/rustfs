@@ -269,6 +269,7 @@ jobs:
           CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}
         run: |
           mkdir -p artifacts/test-and-lint
+          rm -f target/nextest/ci/junit.xml
           ./scripts/ci/resource_sampler.sh start nextest
           trap './scripts/ci/resource_sampler.sh stop' EXIT
           set +e
