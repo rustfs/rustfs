@@ -477,6 +477,18 @@ impl BucketMetadata {
         !self.table_bucket_config_json.is_empty()
     }
 
+    /// `bucket-targets.json` is stored for this bucket but this build cannot
+    /// decode it.
+    ///
+    /// Keeps "no replication targets configured" and "the target
+    /// configuration cannot be read" apart, the same distinction the
+    /// `fabricated` marker draws for the bucket metadata as a whole. Only
+    /// meaningful after [`Self::parse_all_configs`] has run; readers must fail
+    /// closed on `true` instead of serving an empty target set.
+    pub fn bucket_targets_unreadable(&self) -> bool {
+        !self.bucket_targets_config_json.is_empty() && self.bucket_target_config.is_none()
+    }
+
     /// Parsed per-bucket durability override, if a valid one is stored.
     ///
     /// Absent/empty/unparsable payloads all mean "no override" (the bucket
@@ -964,7 +976,32 @@ impl BucketMetadata {
         Ok(())
     }
 
-    fn parse_all_configs(&mut self) -> Result<()> {
+    /// Decode every stored sub-configuration into its typed field.
+    ///
+    /// A decode failure never fails the whole load: this runs on every bucket
+    /// metadata read, including startup and peer reload, so one bucket's
+    /// corrupt sub-configuration must not make the bucket — or the node —
+    /// unloadable. Instead the failure is *retained*: the raw bytes stay
+    /// untouched and the typed field stays `None`, so `!raw.is_empty() &&
+    /// typed.is_none()` is the durable "exists but cannot be read" signal that
+    /// each accessor keys off. Which accessors must fail closed on it:
+    ///
+    /// | Config | Verdict |
+    /// |---|---|
+    /// | policy | Fails closed: `get_bucket_policy` re-parses the raw JSON and propagates the error; `get_bucket_policy_raw` returns the stored bytes. |
+    /// | object lock | Fails closed in `object_lock_config_state_from_authoritative_metadata`; a retention decision may never be taken on a guess. |
+    /// | versioning | Fails closed in `get_versioning_config`; guessing Unversioned would make delete markers and version ids diverge from what is on disk. |
+    /// | replication | Fails closed in `get_replication_config`. |
+    /// | bucket targets | Fails closed in `get_bucket_targets_config`, and `sync_bucket_target_sys` marks the bucket unreadable in `BucketTargetSys` instead of publishing an empty target set (rustfs/backlog#2282). |
+    /// | encryption | Fails closed in `get_sse_config`: degrading to "no default encryption" stores plaintext objects the operator required to be encrypted. |
+    /// | public access block | Fails closed in `get_public_access_block_config`: degrading grants the anonymous access the operator asked to block. |
+    /// | quota | Fails closed in `get_quota_config`; the enforcement path in `quota::checker` already re-parses the raw JSON and refuses on error. |
+    /// | lifecycle | Safe to degrade: no rules means no expiration and no transition, so nothing is deleted or moved on the strength of an unreadable rule set. The bucket keeps serving reads and writes. |
+    /// | notification | Safe to degrade: events are an outbound side channel; no consumer draws a durability or authorization conclusion from their absence. |
+    /// | tagging | Safe to degrade: bucket tags are cost-allocation labels here; object-level tag conditions come from object metadata, not this blob. |
+    /// | CORS | Safe to degrade: an absent CORS configuration rejects cross-origin browser requests, which is already the restrictive direction. |
+    /// | logging, website, accelerate, request payment, bucket ACL | Safe to degrade: each only shapes an optional response or an optional side channel, and none of them authorizes an action or decides whether data is retained. |
+    pub(super) fn parse_all_configs(&mut self) -> Result<()> {
         if let Err(e) = self.parse_policy_config() {
             tracing::warn!(
                 event = "bucket_metadata_parse_failed",
@@ -1088,20 +1125,26 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        // A stored targets blob that cannot be decoded must not collapse into
+        // the empty target set: that is indistinguishable from "no replication
+        // configured", so replication stops and no caller ever sees an error
+        // (rustfs/backlog#2282). Leaving the typed field `None` while the raw
+        // bytes stay non-empty is the retained parse failure every targets
+        // reader keys off; the bytes are preserved so the configuration is
+        // still recoverable.
+        self.bucket_target_config = None;
         if !self.bucket_targets_config_json.is_empty() {
-            if let Err(e) = serde_json::from_slice::<BucketTargets>(&self.bucket_targets_config_json)
-                .map(|t| self.bucket_target_config = Some(t))
-            {
-                tracing::warn!(
+            match serde_json::from_slice::<BucketTargets>(&self.bucket_targets_config_json) {
+                Ok(targets) => self.bucket_target_config = Some(targets),
+                Err(e) => tracing::error!(
                     event = "bucket_metadata_parse_failed",
                     component = "ecstore",
                     subsystem = "bucket_metadata",
                     bucket = %self.name,
                     config = "bucket_targets",
                     error = %e,
-                    "Failed to parse bucket metadata config"
-                );
-                self.bucket_target_config = Some(BucketTargets::default());
+                    "Bucket replication targets are unreadable; replication for this bucket fails closed"
+                ),
             }
         } else {
             self.bucket_target_config = Some(BucketTargets::default());
@@ -1533,6 +1576,117 @@ mod test {
         assert_eq!(bucket_targets.targets.len(), 1);
         assert_eq!(bucket_targets.targets[0].endpoint, "s3.amazonaws.com");
         assert_eq!(bucket_targets.targets[0].target_bucket, "target-bucket");
+    }
+
+    /// rustfs/backlog#2282: a stored targets blob this build cannot decode
+    /// must not become the empty target set, and must stay distinguishable
+    /// from a bucket that never configured a target.
+    #[test]
+    fn unreadable_bucket_targets_never_degrade_to_an_empty_target_set() {
+        let truncated = br#"{"targets":[{"endpoint":"s3.example.com","#.to_vec();
+        let mut corrupt = BucketMetadata::new("corrupt-targets");
+        corrupt.bucket_targets_config_json = truncated.clone();
+
+        corrupt
+            .parse_all_configs()
+            .expect("one unreadable sub-config must not fail the whole metadata load");
+
+        assert!(
+            corrupt.bucket_target_config.is_none(),
+            "an undecodable targets blob must not produce a target set at all"
+        );
+        assert!(corrupt.bucket_targets_unreadable());
+        assert_eq!(
+            corrupt.bucket_targets_config_json, truncated,
+            "the raw bytes must survive so the configuration stays recoverable"
+        );
+
+        // The genuinely-absent case is unchanged, and the two now diverge.
+        let mut absent = BucketMetadata::new("no-targets");
+        absent.parse_all_configs().expect("absent targets parse");
+        assert!(
+            absent.bucket_target_config.as_ref().is_some_and(BucketTargets::is_empty),
+            "a bucket that configured no target still reads as an empty target set"
+        );
+        assert!(!absent.bucket_targets_unreadable());
+    }
+
+    /// `Credentials` carries no struct-level `serde(default)`, so one target
+    /// missing `secretKey` is a hard parse error for the whole document. That
+    /// must surface as "unreadable", never as "no targets configured".
+    #[test]
+    fn bucket_targets_missing_secret_key_are_unreadable_not_empty() {
+        let mut bm = BucketMetadata::new("missing-secret-key");
+        bm.bucket_targets_config_json = br#"{"targets":[{"endpoint":"s3.example.com","targetbucket":"remote","arn":"arn:rustfs:replication:us-east-1:src:1","credentials":{"accessKey":"AKIAEXAMPLE"}}]}"#.to_vec();
+
+        bm.parse_all_configs()
+            .expect("a rejected targets document must not fail the whole metadata load");
+
+        assert!(
+            bm.bucket_targets_unreadable(),
+            "a targets document rejected for a missing secretKey is unreadable, not empty"
+        );
+        assert!(bm.bucket_target_config.is_none());
+    }
+
+    /// The invariant every branch of `parse_all_configs` shares: a stored but
+    /// undecodable payload keeps its raw bytes and leaves the typed field
+    /// `None`, so no branch fabricates a value. What a reader may then do with
+    /// that state is decided per config; see the table on `parse_all_configs`.
+    #[test]
+    fn every_config_branch_retains_its_parse_failure_instead_of_defaulting() {
+        let malformed_xml = b"<not-a-valid-document".to_vec();
+        let malformed_json = b"{not-json".to_vec();
+
+        let mut bm = BucketMetadata::new("all-configs-malformed");
+        bm.policy_config_json = malformed_json.clone();
+        bm.quota_config_json = malformed_json.clone();
+        bm.bucket_targets_config_json = malformed_json.clone();
+        bm.notification_config_xml = malformed_xml.clone();
+        bm.lifecycle_config_xml = malformed_xml.clone();
+        bm.object_lock_config_xml = malformed_xml.clone();
+        bm.versioning_config_xml = malformed_xml.clone();
+        bm.encryption_config_xml = malformed_xml.clone();
+        bm.tagging_config_xml = malformed_xml.clone();
+        bm.replication_config_xml = malformed_xml.clone();
+        bm.cors_config_xml = malformed_xml.clone();
+        bm.logging_config_xml = malformed_xml.clone();
+        bm.website_config_xml = malformed_xml.clone();
+        bm.accelerate_config_xml = malformed_xml.clone();
+        bm.request_payment_config_xml = malformed_xml.clone();
+        bm.public_access_block_config_xml = malformed_xml.clone();
+        // `bucket_acl_config_json` is only checked for UTF-8, so only invalid
+        // UTF-8 exercises its failure branch.
+        bm.bucket_acl_config_json = vec![0xff, 0xfe];
+
+        bm.parse_all_configs()
+            .expect("a bucket whose every config is corrupt must still load its metadata");
+
+        let cleared: [(&str, bool); 17] = [
+            ("policy", bm.policy_config.is_none()),
+            ("quota", bm.quota_config.is_none()),
+            ("bucket_targets", bm.bucket_target_config.is_none()),
+            ("notification", bm.notification_config.is_none()),
+            ("lifecycle", bm.lifecycle_config.is_none()),
+            ("object_lock", bm.object_lock_config.is_none()),
+            ("versioning", bm.versioning_config.is_none()),
+            ("encryption", bm.sse_config.is_none()),
+            ("tagging", bm.tagging_config.is_none()),
+            ("replication", bm.replication_config.is_none()),
+            ("cors", bm.cors_config.is_none()),
+            ("logging", bm.logging_config.is_none()),
+            ("website", bm.website_config.is_none()),
+            ("accelerate", bm.accelerate_config.is_none()),
+            ("request_payment", bm.request_payment_config.is_none()),
+            ("public_access_block", bm.public_access_block_config.is_none()),
+            ("bucket_acl", bm.bucket_acl_config.is_none()),
+        ];
+        for (config, is_cleared) in cleared {
+            assert!(is_cleared, "{config}: a corrupt payload must not be replaced by a default");
+        }
+
+        assert_eq!(bm.bucket_targets_config_json, malformed_json, "raw bytes are retained");
+        assert_eq!(bm.lifecycle_config_xml, malformed_xml, "raw bytes are retained");
     }
 
     #[test]

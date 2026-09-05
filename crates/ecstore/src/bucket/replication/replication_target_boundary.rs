@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::bucket::bucket_target_sys::{BucketTargetError, BucketTargetSys};
+pub(crate) use crate::bucket::bucket_target_sys::BucketTargetError;
+use crate::bucket::bucket_target_sys::BucketTargetSys;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::types::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
 use http::HeaderMap;
