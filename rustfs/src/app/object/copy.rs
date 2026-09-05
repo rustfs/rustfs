@@ -394,7 +394,7 @@ impl DefaultObjectUsecase {
         // Bucket metadata uses the bucket name as its namespace-lock key. Load
         // every copy-time bucket snapshot before a same-object key can collide
         // with that key (for example, copying `bucket/bucket` onto itself).
-        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
+        let bucket_sse_config = load_bucket_default_sse_config(&bucket).await?;
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
         if cp_src_dst_same && key == bucket {
             dst_opts.object_lock_config_snapshot =
@@ -1387,5 +1387,49 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_copy_object_refuses_a_bucket_whose_encryption_config_is_unreadable() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("copy-sse-unreadable-{}", Uuid::new_v4());
+        let source = "source.bin";
+        let destination = "destination.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("unreadable-encryption copy bucket must be created");
+        let mut reader = PutObjReader::from_vec(b"copied while the bucket still had a readable configuration".to_vec());
+        store
+            .put_object(&bucket, source, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("copy source object must be written");
+        install_unreadable_bucket_sse_config(&bucket).await;
+
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: bucket.clone().into(),
+                key: source.into(),
+                version_id: None,
+            })
+            .bucket(bucket.clone())
+            .key(destination.to_string())
+            .build()
+            .expect("copy input must build");
+        let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+
+        let err = Box::pin(usecase.execute_copy_object(build_request(input, Method::PUT)))
+            .await
+            .expect_err("an unreadable bucket encryption configuration must refuse the copy");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        let lookup_err = store
+            .get_object_info(&bucket, destination, &ObjectOptions::default())
+            .await
+            .expect_err("a refused copy must not leave a destination object behind");
+        assert!(is_err_object_not_found(&lookup_err), "{lookup_err}");
     }
 }

@@ -425,7 +425,7 @@ pub(crate) mod init_format;
 pub(crate) mod list_objects;
 mod multipart;
 mod object;
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 pub use object::DeleteAfterObjectLockSnapshotBarrier;
 pub(crate) use object::{
     DecommissionFixedReadAnchor, ObjectLockDiagGuard, RemoteTuplePublicationCommitGuard, RemoteTuplePublicationFence,

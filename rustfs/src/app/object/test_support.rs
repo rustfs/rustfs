@@ -96,3 +96,36 @@ pub(super) fn real_cold_fill_plan(
     };
     plan
 }
+
+/// A store with an ambient `AppContext`, for tests that drive a handler end to
+/// end without the object-data-cache overrides of
+/// [`real_cold_fill_test_context`].
+pub(super) async fn real_store_test_context() -> (Arc<ECStore>, Arc<AppContext>) {
+    let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+    if current_app_context().is_none() {
+        crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+    }
+    let ambient = current_app_context().expect("real-store tests require an ambient AppContext");
+    let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+    (store, context)
+}
+
+/// Leave the bucket in the state a damaged encryption blob produces: the raw
+/// document is retained and the typed configuration stays `None`, which is the
+/// durable "exists but cannot be read" signal `get_sse_config` fails closed on
+/// (rustfs/rustfs#7172).
+pub(super) async fn install_unreadable_bucket_sse_config(bucket: &str) {
+    use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
+
+    let sys = get_global_bucket_metadata_sys().expect("bucket metadata system must be initialized");
+    let metadata = {
+        let sys = sys.read().await;
+        sys.get(bucket).await.expect("bucket metadata must be cached")
+    };
+    let mut metadata = (*metadata).clone();
+    metadata.encryption_config_xml = b"<ServerSideEncryptionConfiguration>truncated".to_vec();
+    metadata.sse_config = None;
+    set_bucket_metadata(bucket.to_string(), metadata)
+        .await
+        .expect("unreadable bucket encryption configuration must be installed");
+}
