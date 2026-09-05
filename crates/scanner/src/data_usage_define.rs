@@ -567,6 +567,11 @@ pub struct DataUsageCacheInfo {
     pub snapshot_complete: bool,
     #[serde(default)]
     pub scan_plan_digest: Option<DataUsageScanPlanDigest>,
+    /// Full activity and inventory scope of a set scan; only a complete
+    /// snapshot proves coverage. Bucket caches bind this scope into their
+    /// opaque scan plan digest instead.
+    #[serde(default)]
+    pub scan_coverage_digest: Option<DataUsageScanPlanDigest>,
     #[serde(default)]
     pub cache_key_format: u16,
     /// Registry generation used for the completed/partial scan. This is
@@ -602,6 +607,7 @@ impl Serialize for DataUsageCacheInfo {
             + usize::from(self.scan_identity.is_some())
             + usize::from(self.scan_progress.is_some())
             + usize::from(self.scan_coverage_receipt.is_some())
+            + usize::from(self.scan_coverage_digest.is_some())
             + usize::from(self.tier_registry_generation.is_some())
             + usize::from(!self.size_reconciliation.is_empty())
             + usize::from(self.lkg_snapshot_complete)
@@ -634,6 +640,9 @@ impl Serialize for DataUsageCacheInfo {
         state.serialize_entry("source", &self.source)?;
         state.serialize_entry("snapshot_complete", &self.snapshot_complete)?;
         state.serialize_entry("scan_plan_digest", &self.scan_plan_digest)?;
+        if let Some(coverage) = self.scan_coverage_digest {
+            state.serialize_entry("scan_coverage_digest", &coverage)?;
+        }
         state.serialize_entry("cache_key_format", &self.cache_key_format)?;
         if let Some(generation) = self.tier_registry_generation {
             state.serialize_entry("tier_registry_generation", &generation)?;

@@ -8586,6 +8586,62 @@ fn scanner_node_activity(epoch: &str, namespace_generation: u64, maintenance_gen
 }
 
 #[test]
+fn scoped_scan_remote_dirty_coverage_invalidates_local_bucket_current() {
+    let before = BTreeMap::from([("remote".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+    let mut after = before.clone();
+    let remote = after.get_mut("remote").expect("remote activity should exist");
+    remote.dirty_usage_generation += 1;
+    remote.dirty_usage_pending = true;
+    assert_eq!(scanner_activity_structural_digest(&before), scanner_activity_structural_digest(&after));
+    let old_plan = crate::scanner_io::checkpoint_fixture_bucket_digest(
+        DataUsageScanPlanDigest(scanner_activity_snapshot_digest(&before)),
+        None,
+    );
+    let new_plan = crate::scanner_io::checkpoint_fixture_bucket_digest(
+        DataUsageScanPlanDigest(scanner_activity_snapshot_digest(&after)),
+        None,
+    );
+    assert_ne!(
+        old_plan, new_plan,
+        "remote dirty changes must fence Current even without a local bucket hint"
+    );
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            leader_epoch: 11,
+            source: Some(source),
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH),
+            snapshot_complete: true,
+            scan_plan_digest: Some(old_plan),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace("bucket", "", DataUsageEntry::default());
+    assert!(matches!(
+        crate::scanner_io::current_cache_root_or_prepare_with_generation(
+            &mut cache,
+            "bucket",
+            source,
+            7,
+            11,
+            new_plan,
+            crate::scanner_io::DataUsageCacheReuseOptions {
+                require_source: true,
+                tier_registry_generation: None
+            },
+        ),
+        crate::scanner_io::DataUsageCacheScanState::Prepared {
+            outcome: DataUsageCachePrepareOutcome::Reset,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn scanner_activity_snapshot_digest_fences_storage_topology() {
     let first = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
     let mut changed = first.clone();

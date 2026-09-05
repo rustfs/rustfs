@@ -125,8 +125,8 @@ impl ScannerIOCache for SetDisks {
             pending_maintenance_work,
             cache_cycle_floor,
         } = scan_plan;
-        let bucket_work_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
         let scan_plan_digest = scanner_bucket_work_digest(scan_plan_digest, scan_mode, requires_full_scan);
+        let bucket_work_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
         let pool_label = self.pool_index.to_string();
         let set_label = self.set_index.to_string();
 
@@ -165,8 +165,9 @@ impl ScannerIOCache for SetDisks {
                 scan_plan_digest,
             },
         );
-        let mut scoped_cache = scoped_scan.map(|prepared| {
+        let mut scoped_cache = scoped_scan.map(|mut prepared| {
             buckets = prepared.buckets;
+            prepared.cache.info.scan_coverage_digest = Some(bucket_coverage_digest);
             prepared.cache
         });
         if buckets.is_empty() {
@@ -182,6 +183,7 @@ impl ScannerIOCache for SetDisks {
                             tier_registry_generation: Some(tier_registry_generation),
                             source: Some(source),
                             scan_plan_digest: Some(scan_plan_digest),
+                            scan_coverage_digest: Some(bucket_coverage_digest),
                             cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
                             ..Default::default()
                         },
@@ -469,6 +471,7 @@ impl ScannerIOCache for SetDisks {
                     source: Some(source),
                     snapshot_complete: false,
                     scan_plan_digest: Some(scan_plan_digest),
+                    scan_coverage_digest: Some(bucket_coverage_digest),
                     cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
                     lkg_snapshot_complete: old_cache.info.lkg_snapshot_complete,
                     lkg_next_cycle: old_cache.info.lkg_next_cycle,

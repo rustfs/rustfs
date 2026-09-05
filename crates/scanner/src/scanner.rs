@@ -3438,7 +3438,6 @@ use cycle_state::*;
 use leadership::*;
 use usage_store::*;
 
-#[cfg(test)]
 pub(crate) use activity::scanner_activity_snapshot_digest;
 pub use activity::scanner_topology_digest;
 pub(crate) use activity::{

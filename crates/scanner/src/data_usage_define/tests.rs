@@ -29,6 +29,31 @@ use tokio::sync::Mutex;
 
 const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([3; 32]);
 
+#[test]
+fn scoped_scan_coverage_metadata_preserves_map_compatibility() {
+    #[derive(serde::Deserialize)]
+    struct LegacyInfo {
+        name: String,
+        next_cycle: u64,
+    }
+    let mut info = DataUsageCacheInfo {
+        name: DATA_USAGE_ROOT.to_string(),
+        next_cycle: 7,
+        ..Default::default()
+    };
+    let old = serde_json::to_value(&info).expect("legacy metadata should encode");
+    assert!(old.get("scan_coverage_digest").is_none());
+    let old: DataUsageCacheInfo = serde_json::from_value(old).expect("missing coverage must remain readable");
+    assert!(old.scan_coverage_digest.is_none());
+    info.scan_coverage_digest = Some(TEST_PLAN_DIGEST);
+    let encoded = rmp_serde::to_vec(&info).expect("coverage metadata should remain map encoded");
+    let legacy: LegacyInfo = rmp_serde::from_slice(&encoded).expect("old map readers should ignore additive proof fields");
+    assert_eq!(legacy.name, DATA_USAGE_ROOT);
+    assert_eq!(legacy.next_cycle, 7);
+    let decoded: DataUsageCacheInfo = rmp_serde::from_slice(&encoded).expect("new reader should restore the coverage proof");
+    assert_eq!(decoded.scan_coverage_digest, Some(TEST_PLAN_DIGEST));
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct CachePutRecord {
     object: String,
