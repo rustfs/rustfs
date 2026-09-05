@@ -180,6 +180,8 @@ impl RemoteS3EndpointSpec {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteS3ClientError {
+    #[error("the {0} backend is not included in this build")]
+    BackendNotCompiled(&'static str),
     #[error("remote endpoint requires credentials")]
     MissingCredentials,
     #[error("{0}")]
