@@ -125,3 +125,108 @@ The manifest records a minimum set of invariants: write quorum, metadata rollbac
 The checked-in MinIO corpus is pinned by file SHA256 and its documented source release. The static wiring guard and the CI selection check both reject missing or changed fixtures. These are metadata fixtures, not a legacy shard-body corpus or proof of crash durability. Optional `legacy_bitrot_read_test` runs may still skip when their external corpus is absent; they do not satisfy a required compatibility lane. Real encrypted fixture reads remain in `minio-interop.yml`, and multi-node fault schedules remain in the existing nightly cluster lane. In-process reopen tests do not establish power-loss durability.
 
 Run `python3 scripts/check_test_wiring.py --self-test` to exercise the negative cases: removed/ignored/filtered tests, malformed listing, absent fixtures, and wrong fixture hashes. Do not update hashes merely to silence the guard; a fixture change needs source/provenance and compatibility review.
+## Scanner/Heal Evidence Receipts
+
+The existing `scripts/check_test_wiring.py` also validates Scanner/Heal case
+evidence registered in `.config/scanner-heal-required-tests.json`. It records
+already-built binaries and checks existing nextest output; it does not build,
+run tests, deploy servers, inject faults, or start another CI lane.
+
+The initial case is `background-target-restart`, emitted by
+`heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_remote_shards_after_background_target_restart`.
+That test already runs in `e2e-nightly`. When `RUSTFS_SCANNER_HEAL_RUN_DIR` is set,
+it checks the actual server and test-executable hashes against `run.json`, pins
+the same server binary for all node starts, and writes its oracle only after
+the real assertions pass. The artifact contains the actual pre/post target
+PIDs, per-node S3 listings, expected and downloaded complete-body hashes/lengths,
+and target-disk `VersionShardCensus` fingerprints. Existing baseline objects
+must match their pre-fault physical manifests; the object created during the
+outage has no pre-fault target shard and is checked for complete physical parts
+and exact S3 content.
+
+This case is a **four-node, one-drive-per-node process-restart test**. It is not
+power-loss validation, a 3x4 EC8+4 experiment, an all-version inventory, or proof
+of scanner enumeration, exact MRF disposition, legacy migration, or rollback.
+The registry keeps all G01-G14/P1-P4 and R-E/R-D/R-L release requirements pending
+until their actual feature-specific oracles and required topologies exist.
+Missing cases cannot be supplied by synthetic W20 results. W20's bounded JSON
+and file-hash helpers are reused; its ABBA performance contracts remain in
+`docs/operations/scanner-benchmark-runbook.md`.
+
+### Recording One Case
+
+Use a committed source tree, independently built current binaries, sufficient
+free disk space, and a task-owned artifact directory that does not yet exist.
+Set `SERVER_BINARY` and `TEST_BINARY` to those exact executable paths. The begin
+command requires the server's embedded `--version` commit to match the clean
+checkout and its embedded Git status to be clean. The E2E crate's build script
+embeds its build-time Git revision/dirty state, lockfile Git blob, enabled crate
+features, target, profile and encoded Rust flags. It tracks the crate/dependency
+trees, Cargo inputs and Git HEAD/ref/index, including `common.rs` restart logic.
+The producer checks this compiled identity against the receipt; it does not
+copy a current source revision into an older test binary's identity. The E2E
+uses its existing temporary cluster directories and cleanup. `CARGO_TARGET_DIR`
+controls compilation output; nextest's default report store remains the
+workspace's `target/nextest`. Execute the existing selected case as follows:
+
+```bash
+CASE=background-target-restart
+FILTER='test(test_cluster_root_heal_recovers_remote_shards_after_background_target_restart)'
+RUN_DIR="$PWD/artifacts/scanner-heal-run"
+export RUSTFS_E2E_EXPECTED_FEATURES=default
+scripts/python_bin.sh scripts/check_test_wiring.py \
+  --begin-scanner-heal "$RUN_DIR" "$SERVER_BINARY" "$TEST_BINARY"
+export RUSTFS_SCANNER_HEAL_RUN_DIR="$RUN_DIR"
+export CARGO_BIN_EXE_rustfs="$SERVER_BINARY"
+cargo nextest list --profile e2e-nightly -p e2e_test -E "$FILTER" \
+  --message-format json > "$RUN_DIR/listing.json"
+rm -f target/nextest/e2e-nightly/junit.xml
+set +e
+cargo nextest run --profile e2e-nightly -p e2e_test -E "$FILTER"
+test_exit=$?
+set -e
+cp target/nextest/e2e-nightly/junit.xml "$RUN_DIR/junit.xml"
+scripts/python_bin.sh scripts/check_test_wiring.py --finish-scanner-heal "$RUN_DIR" "$test_exit"
+scripts/python_bin.sh scripts/check_test_wiring.py --check-scanner-heal "$RUN_DIR" "$CASE"
+```
+
+Set `RUSTFS_E2E_EXPECTED_FEATURES` to the actual intended e2e crate feature set,
+including `default` for a default-feature build, comma-separated for extra
+features, or empty for `--no-default-features`. It is mandatory when beginning
+a run. Crate features are distinct from the spawned server's build features.
+
+Do not replace a nonzero command exit with zero. Missing JUnit or an oracle
+emission failure also fails acceptance. Each retry needs a new run directory;
+the producer refuses to overwrite an existing oracle. Keep failed-run logs and
+artifacts. The receipt pins source revision, actual binary hashes, run identity,
+start/finish times, and the artifact hashes. `listing.json`, `junit.xml`, and
+each oracle are limited to 1 MiB; object evidence has the fixture's 9..65 object
+bound. Credentials are not included in the receipt.
+
+The checker binds nextest's flattened suite `binary-id`/`binary-path` to the
+actual test executable and requires the JUnit testcase's embedded execution
+timestamp to fall inside the receipt window (with millisecond precision).
+Copying an old JUnit file and refreshing its mtime does not make it new evidence.
+Schema versions, topology counts, PIDs, EC geometry and shard indices require
+actual integers: booleans and fractional values are rejected, and an index must
+fit the physical data-plus-parity geometry.
+
+The checker rejects unselected/ignored tests, zero/duplicate JUnit cases,
+failures, skipped tests, retry/flaky records, stale or changed artifacts,
+different builds or run IDs, unchanged process IDs, wrong topology, missing
+shard parts, and mismatched S3 content/listings. The raw oracle JSON is emitted
+by the real E2E producer, not accepted from an adapter copying expectations.
+
+`--check-scanner-heal "$RUN_DIR" release` checks available case evidence and
+returns nonzero for every pending release requirement. A focused case pass
+does not approve release. In particular, R-E requires fixed-budget real
+restarts without an unbudgeted final sweep, R-D requires the full
+manager/event/ledger disposition chain, and R-L requires source-conflict and
+crash/retirement evidence. Reader-only or unit fixtures cannot substitute for
+these. The external `rustfs/auto-testing` functional workflows propagate suite
+failures. Their workflow status does not establish this registry's required
+case coverage, build provenance, or object-level oracles.
+
+Run parser/receipt regressions with
+`scripts/python_bin.sh scripts/check_test_wiring.py --self-test`. Those fixtures
+validate the checker only and produce no runtime or performance evidence.

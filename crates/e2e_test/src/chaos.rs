@@ -55,18 +55,20 @@ type ChaosResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 /// A successful S3 GET only proves that a quorum can serve an object. Replacement
 /// tests need this lower-level record to prove that the rebuilt target holds the
 /// `xl.meta` selected for a specific version and every `part.N` it declares.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct VersionShardCensus {
     pub version_id: Option<String>,
     pub has_xl_meta: bool,
     pub data_dir: Option<String>,
     pub erasure_index: Option<usize>,
+    pub data_blocks: Option<usize>,
+    pub parity_blocks: Option<usize>,
     pub expected_part_numbers: BTreeSet<usize>,
     pub present_part_fingerprints: BTreeMap<usize, PartShardFingerprint>,
     pub inline_data_fingerprint: Option<PartShardFingerprint>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct PartShardFingerprint {
     pub size: u64,
     pub sha256: String,
@@ -88,13 +90,15 @@ impl VersionShardCensus {
             && manifest.is_complete()
             && self.data_dir == manifest.data_dir
             && self.erasure_index == manifest.erasure_index
+            && self.data_blocks == manifest.data_blocks
+            && self.parity_blocks == manifest.parity_blocks
             && self.expected_part_numbers == manifest.expected_part_numbers
             && self.present_part_fingerprints == manifest.present_part_fingerprints
             && self.inline_data_fingerprint == manifest.inline_data_fingerprint
     }
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -313,6 +317,8 @@ pub(crate) fn census_object_version_on_disk(
             has_xl_meta: false,
             data_dir: None,
             erasure_index: None,
+            data_blocks: None,
+            parity_blocks: None,
             expected_part_numbers: BTreeSet::new(),
             present_part_fingerprints: BTreeMap::new(),
             inline_data_fingerprint: None,
@@ -360,6 +366,8 @@ pub(crate) fn census_object_version_on_disk(
         has_xl_meta: true,
         data_dir,
         erasure_index,
+        data_blocks: Some(file_info.erasure.data_blocks),
+        parity_blocks: Some(file_info.erasure.parity_blocks),
         expected_part_numbers,
         present_part_fingerprints,
         inline_data_fingerprint,
@@ -413,6 +421,8 @@ mod tests {
             has_xl_meta: true,
             data_dir: Some("data-dir".to_string()),
             erasure_index: Some(3),
+            data_blocks: Some(2),
+            parity_blocks: Some(2),
             expected_part_numbers: BTreeSet::from([1]),
             present_part_fingerprints: BTreeMap::from([(1, shard_fingerprint(b"part").unwrap())]),
             inline_data_fingerprint: None,
