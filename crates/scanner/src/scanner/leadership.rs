@@ -191,6 +191,7 @@ pub(super) async fn initialize_usage_baseline_bootstrap(
         expected_epoch,
         None,
         ScannerUsageBootstrapPublishContext::Initial,
+        || true,
     )
     .await
 }
@@ -201,9 +202,10 @@ pub(super) async fn fence_scanner_usage_epoch_with_expected_epoch(
     claimed_epoch: u64,
     expected_publication_epoch: Option<u64>,
     allow_bootstrap_pending: bool,
+    owns_fence: impl Fn() -> bool,
 ) -> Result<(), ScannerError> {
     for retry in 0..=SCANNER_PERSIST_CAS_RETRIES {
-        if ctx.is_cancelled() {
+        if ctx.is_cancelled() || !owns_fence() {
             return Err(ScannerError::Other("scanner leadership was cancelled before usage fencing".to_string()));
         }
 
@@ -264,6 +266,9 @@ pub(super) async fn fence_scanner_usage_epoch_with_expected_epoch(
                     "scanner usage epoch fence changed while preparing its conditional write".to_string(),
                 ));
             };
+            if ctx.is_cancelled() || !owns_fence() {
+                return Err(ScannerError::Other("scanner leadership was lost before usage fencing".to_string()));
+            }
             save_config_with_preconditions(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), data, revision.preconditions())
                 .await
         };
@@ -319,6 +324,7 @@ pub(super) async fn complete_scanner_leadership_claim(
         claimed_epoch,
         expected_publication_epoch,
         allow_bootstrap_pending,
+        || true,
     )
     .await
     {
