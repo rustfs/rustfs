@@ -359,8 +359,6 @@ fi
                 self.assertEqual(initialized.returncode, 0, initialized.stderr)
                 suite = self.directory / "auto-testing/rustfs-replication-test.sh"
                 suite.write_text('#!/bin/sh\nprintf "suite failed\\n" >> "$EXECUTED"\nexit 17\n')
-                initialized = self.run_step("Initialize functional evidence")
-                self.assertEqual(initialized.returncode, 0, initialized.stderr)
                 failed = self.run_step("Run replication suite")
                 self.assertEqual(failed.returncode, 17, failed.stderr)
                 cleaned = self.run_step("Cleanup environment (after)")

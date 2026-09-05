@@ -447,11 +447,13 @@ mod tests {
         FilterConfig, MAX_LIST_NO_PROGRESS_PAGES, OnDemandMigrationConfig, PathStyle, PolicyConfig, Provider, SourceConfig,
         SourceCredentials, TlsConfig,
     };
-    use crate::app::storage_api::bucket_usecase::s3::{ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response};
+    use crate::app::storage_api::bucket_usecase::bucket::utils::serialize;
+    use crate::app::storage_api::bucket_usecase::s3::{
+        ListObjectsInput, ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response,
+    };
     use crate::app::storage_api::test::StoragePutObjReader;
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::app::storage_api::test::contract::object::ObjectIO as _;
-    use s3s::dto::ListObjectsInput;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -863,9 +865,7 @@ mod tests {
                             assert_eq!(output.is_truncated, Some(index == 0));
                             assert_eq!(output.next_marker.as_deref(), (index == 0).then_some(expected_key));
 
-                            let mut xml = Vec::new();
-                            s3s::xml::Serialize::serialize(&output, &mut s3s::xml::Serializer::new(&mut xml))
-                                .expect("serialize the real v1 response");
+                            let xml = serialize(&output).expect("serialize the real v1 response");
                             assert!(!xml.contains(&0), "XML 1.0 forbids NUL in NextMarker");
                             let mut reader = quick_xml::Reader::from_reader(xml.as_slice());
                             loop {
