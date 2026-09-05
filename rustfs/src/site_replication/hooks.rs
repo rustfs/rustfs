@@ -385,32 +385,26 @@ pub(crate) fn site_replication_bootstrap_plan(info: &SRInfo) -> S3Result<SiteRep
 /// that on a 30-second recovery cadence would make lifecycle admission scale
 /// with the whole site instead of the one queued bucket.
 pub(crate) fn site_replication_bucket_retry_plan_for(
-    bucket: &str,
-    created_at: Option<OffsetDateTime>,
-    lock_enabled: bool,
-) -> SiteReplicationBootstrapPlan {
-    let bucket = SRBucketInfo {
-        bucket: bucket.to_string(),
-        created_at,
-        object_lock_config: lock_enabled.then(String::new),
-        ..Default::default()
-    };
-    SiteReplicationBootstrapPlan {
-        bucket_make_ops: vec![bootstrap_bucket_make_op_path(&bucket)],
+    bucket: &SRBucketInfo,
+    replicate_ilm_expiry: bool,
+) -> S3Result<SiteReplicationBootstrapPlan> {
+    let mut plan = SiteReplicationBootstrapPlan {
+        bucket_make_ops: vec![bootstrap_bucket_make_op_path(bucket)],
         bucket_configure_ops: vec![bootstrap_bucket_op_path(
             &bucket.bucket,
             SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION,
         )],
         ..Default::default()
-    }
+    };
+    append_bootstrap_bucket_items(&mut plan, bucket, replicate_ilm_expiry)?;
+    Ok(plan)
 }
 
 pub(crate) fn site_replication_bucket_retry_plan_from_info(
     bucket: &SRBucketInfo,
     replicate_ilm_expiry: bool,
 ) -> S3Result<SiteReplicationBootstrapPlan> {
-    let mut plan = site_replication_bucket_retry_plan_for(&bucket.bucket, bucket.created_at, bucket.object_lock_config.is_some());
-    append_bootstrap_bucket_items(&mut plan, bucket, replicate_ilm_expiry)?;
+    let mut plan = site_replication_bucket_retry_plan_for(bucket, replicate_ilm_expiry)?;
     // Omit only metadata the make/configure operations can reproduce exactly.
     // Non-default versioning fields and operator-authored replication rules
     // remain in the plan; their extra request cost intentionally defers the
@@ -443,7 +437,10 @@ fn retry_bucket_metadata_is_redundant(item: &SRBucketMeta) -> bool {
     }
 }
 
-pub(crate) async fn site_replication_bucket_retry_plan(bucket: &str) -> S3Result<SiteReplicationBootstrapPlan> {
+pub(crate) async fn site_replication_bucket_retry_plan(
+    bucket: &str,
+    replicate_ilm_expiry: bool,
+) -> S3Result<SiteReplicationBootstrapPlan> {
     let Some(store) = current_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
@@ -465,8 +462,7 @@ pub(crate) async fn site_replication_bucket_retry_plan(bucket: &str) -> S3Result
     if lock_enabled && bucket_info.object_lock_config.is_none() {
         bucket_info.object_lock_config = Some(String::new());
     }
-    let state = load_site_replication_state().await?;
-    site_replication_bucket_retry_plan_from_info(&bucket_info, site_replication_state_replicates_ilm_expiry(&state))
+    site_replication_bucket_retry_plan_from_info(&bucket_info, replicate_ilm_expiry)
 }
 
 pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {

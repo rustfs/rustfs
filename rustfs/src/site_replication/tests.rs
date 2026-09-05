@@ -862,6 +862,11 @@ fn test_retry_drain_bounds_each_peer_round_to_one_small_request_chain() {
         bucket_configure_ops: vec![
             "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=configure-replication".to_string(),
         ],
+        bucket_items: vec![SRBucketMeta {
+            bucket: "photos".to_string(),
+            r#type: "tags".to_string(),
+            ..Default::default()
+        }],
         ..Default::default()
     };
     let make = RetryDrainAction::BucketOpReplay {
@@ -872,7 +877,7 @@ fn test_retry_drain_bounds_each_peer_round_to_one_small_request_chain() {
     assert!(is_lightweight_retry_drain_action(&make));
     assert!(!is_lightweight_retry_drain_action(&RetryDrainAction::IamSnapshot));
     assert!(!is_lightweight_retry_drain_action(&RetryDrainAction::PeerEdit));
-    assert_eq!(retry_drain_request_count(&make, Some(&plan)), 2);
+    assert_eq!(retry_drain_request_count(&make, Some(&plan)), 3);
     assert!(retry_drain_request_count(&make, Some(&plan)) <= SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER);
     assert!(
         retry_drain_request_count(&RetryDrainAction::IamSnapshot, Some(&plan))
@@ -906,16 +911,33 @@ fn test_lightweight_retry_peer_rotation_covers_all_queued_peers() {
 #[test]
 fn test_lightweight_bucket_retry_plan_is_targeted_and_preserves_make_options() {
     let created_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
-    let plan = site_replication_bucket_retry_plan_for("photos", Some(created_at), true);
+    let bucket = SRBucketInfo {
+        bucket: "photos".to_string(),
+        created_at: Some(created_at),
+        object_lock_config: Some(String::new()),
+        tags: Some("dGFncy14bWw=".to_string()),
+        tag_config_updated_at: Some(created_at),
+        ..Default::default()
+    };
+    let plan = site_replication_bucket_retry_plan_for(&bucket, false).expect("targeted retry plan");
 
     assert!(plan.iam_items.is_empty());
-    assert!(plan.bucket_items.is_empty());
     assert_eq!(plan.bucket_make_ops.len(), 1);
     assert!(plan.bucket_make_ops[0].contains("bucket=photos"));
     assert!(plan.bucket_make_ops[0].contains("lockEnabled=true"));
     assert!(plan.bucket_make_ops[0].contains("createdAt="));
+    assert_eq!(plan.bucket_items.len(), 2);
+    assert_eq!(plan.bucket_items[0].r#type, "tags");
+    assert_eq!(plan.bucket_items[1].r#type, "object-lock-config");
     assert_eq!(plan.bucket_configure_ops.len(), 1);
     assert!(plan.bucket_configure_ops[0].contains("operation=configure-replication"));
+
+    let tasks =
+        bucket_op_retry_replay_tasks(&plan, SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING, "photos").expect("retry task chain");
+    assert!(matches!(tasks[0], SiteReplicationRepairTask::BucketMake(_)));
+    assert!(matches!(tasks[1], SiteReplicationRepairTask::BucketMetadata(_)));
+    assert!(matches!(tasks[2], SiteReplicationRepairTask::BucketMetadata(_)));
+    assert!(matches!(tasks[3], SiteReplicationRepairTask::Replication(_)));
 }
 
 #[test]
@@ -942,7 +964,10 @@ fn test_lightweight_bucket_retry_plan_orders_real_metadata_and_counts_it() {
             .all(|task| matches!(task, SiteReplicationRepairTask::BucketMetadata(_)))
     );
     assert_eq!(tasks.len(), 4, "make + policy + tags + configure must all count against the budget");
-    assert!(tasks.len() > SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER);
+    assert!(
+        tasks.len() <= SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER,
+        "the complete metadata chain must fit the bounded lightweight replay"
+    );
 
     let mut operator_replication = site_repl_config("remote-dep");
     operator_replication.rules.push(operator_rule("operator-backup"));
