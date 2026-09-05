@@ -159,8 +159,9 @@ features, target, profile and encoded Rust flags. It tracks the crate/dependency
 trees, Cargo inputs and Git HEAD/ref/index, including `common.rs` restart logic.
 The producer checks this compiled identity against the receipt; it does not
 copy a current source revision into an older test binary's identity. The E2E
-uses its existing temporary cluster directories and cleanup. With a dedicated
-`CARGO_TARGET_DIR`, execute the existing selected case as follows:
+uses its existing temporary cluster directories and cleanup. `CARGO_TARGET_DIR`
+controls compilation output; nextest's default report store remains the
+workspace's `target/nextest`. Execute the existing selected case as follows:
 
 ```bash
 CASE=background-target-restart
@@ -173,12 +174,12 @@ export RUSTFS_SCANNER_HEAL_RUN_DIR="$RUN_DIR"
 export CARGO_BIN_EXE_rustfs="$SERVER_BINARY"
 cargo nextest list --profile e2e-nightly -p e2e_test -E "$FILTER" \
   --message-format json > "$RUN_DIR/listing.json"
-rm -f "$CARGO_TARGET_DIR/nextest/e2e-nightly/junit.xml"
+rm -f target/nextest/e2e-nightly/junit.xml
 set +e
 cargo nextest run --profile e2e-nightly -p e2e_test -E "$FILTER"
 test_exit=$?
 set -e
-cp "$CARGO_TARGET_DIR/nextest/e2e-nightly/junit.xml" "$RUN_DIR/junit.xml"
+cp target/nextest/e2e-nightly/junit.xml "$RUN_DIR/junit.xml"
 scripts/python_bin.sh scripts/check_test_wiring.py --finish-scanner-heal "$RUN_DIR" "$test_exit"
 scripts/python_bin.sh scripts/check_test_wiring.py --check-scanner-heal "$RUN_DIR" "$CASE"
 ```
