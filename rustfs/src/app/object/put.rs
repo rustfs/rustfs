@@ -1485,8 +1485,9 @@ impl DefaultObjectUsecase {
         };
 
         let sse_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
-        let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
+        let bucket_sse_config = load_bucket_default_sse_config(&bucket).await;
         rustfs_io_metrics::record_put_object_stage_duration_from("app_sse_config_lookup", sse_config_stage_start);
+        let bucket_sse_config = bucket_sse_config?;
         debug!(
             target: "rustfs::app::object_usecase",
             component = "app",
@@ -3911,5 +3912,122 @@ mod tests {
             .await
             .expect_err("writes after the zero-byte quota update must be denied");
         assert!(matches!(err, StorageError::QuotaExceeded { current: 4096, limit: 0 }));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_put_object_refuses_a_bucket_whose_encryption_config_is_unreadable() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("put-sse-unreadable-{}", Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("unreadable-encryption PUT bucket must be created");
+        install_unreadable_bucket_sse_config(&bucket).await;
+
+        let payload = Bytes::from_static(b"an operator mandated encryption for this bucket");
+        let input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
+            .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
+            .build()
+            .expect("PUT input must build");
+        let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+
+        let err = Box::pin(usecase.execute_put_object(&FS::new(), build_request(input, Method::PUT)))
+            .await
+            .expect_err("an unreadable bucket encryption configuration must refuse the write");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        let lookup_err = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("a refused PUT must not leave an object behind");
+        assert!(is_err_object_not_found(&lookup_err), "{lookup_err}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_put_object_still_writes_plaintext_without_bucket_encryption() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("put-sse-absent-{}", Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("plaintext PUT bucket must be created");
+
+        let payload = Bytes::from_static(b"no default encryption is configured for this bucket");
+        let input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
+            .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
+            .build()
+            .expect("PUT input must build");
+        let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+
+        Box::pin(usecase.execute_put_object(&FS::new(), build_request(input, Method::PUT)))
+            .await
+            .expect("a bucket without default encryption must still accept a plaintext write");
+
+        let stored = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("the plaintext object must be readable");
+        assert_eq!(stored.size, i64::try_from(payload.len()).expect("test payload length must fit i64"));
+        assert!(
+            !stored
+                .user_defined
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case(AMZ_SERVER_SIDE_ENCRYPTION)
+                    || key.starts_with("x-rustfs-encryption-")
+                    || key.starts_with("x-minio-encryption-")),
+            "the object must carry no encryption metadata: {:?}",
+            stored.user_defined
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_put_object_extract_refuses_a_bucket_whose_encryption_config_is_unreadable() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("extract-sse-unreadable-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("unreadable-encryption extract bucket must be created");
+        install_unreadable_bucket_sse_config(&bucket).await;
+
+        let payload = Bytes::from_static(b"archive bytes that must never be unpacked in plaintext");
+        let input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key("archive.tar".to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
+            .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
+            .build()
+            .expect("extract PUT input must build");
+        let mut req = build_request(input, Method::PUT);
+        req.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
+        let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+
+        let err = Box::pin(usecase.execute_put_object(&FS::new(), req))
+            .await
+            .expect_err("an unreadable bucket encryption configuration must refuse the extract upload");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        let lookup_err = store
+            .get_object_info(&bucket, "archive.tar", &ObjectOptions::default())
+            .await
+            .expect_err("a refused extract upload must not leave an object behind");
+        assert!(is_err_object_not_found(&lookup_err), "{lookup_err}");
     }
 }
