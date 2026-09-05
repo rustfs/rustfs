@@ -71,6 +71,7 @@ where
         leader_epoch,
         scan_mode,
         scan_scope: ScannerBucketScanScope::default(),
+        persisted_usage_baseline: None,
     };
     nsscanner_with_storage_status_scoped(store, request).await
 }
@@ -83,6 +84,79 @@ pub(crate) struct ScannerCycleRequest {
     pub(crate) leader_epoch: u64,
     pub(crate) scan_mode: HealScanMode,
     pub(crate) scan_scope: ScannerBucketScanScope,
+    pub(crate) persisted_usage_baseline: Option<Bytes>,
+}
+
+struct ScannerBucketScopeResolution<'a> {
+    requested_scope: ScannerBucketScanScope,
+    baseline_proof: ScannerCacheBaselineProof<'a>,
+    activity_before: &'a crate::scanner::ScannerActivitySnapshot,
+    dirty_usage_snapshot: &'a DirtyUsageSnapshot,
+    all_buckets: &'a [BucketInfo],
+}
+
+async fn resolve_scanner_bucket_scan_scope<S>(
+    store: &S,
+    distributed: bool,
+    resolution: ScannerBucketScopeResolution<'_>,
+) -> ScannerBucketScanScope
+where
+    S: ScannerStorage,
+{
+    if !resolution.requested_scope.is_default()
+        || !resolution.dirty_usage_snapshot.covers_all_pending
+        || resolution.dirty_usage_snapshot.generation == u64::MAX
+        || resolution.dirty_usage_snapshot.buckets.len() > crate::SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES
+    {
+        return resolution.requested_scope;
+    }
+
+    let mut dirty_buckets = resolution
+        .dirty_usage_snapshot
+        .buckets
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    if distributed {
+        let Some(notification_system) = store.scanner_notification_system() else {
+            return resolution.requested_scope;
+        };
+        let Ok(peer_snapshots) = notification_system.scanner_dirty_usage_snapshots().await else {
+            return resolution.requested_scope;
+        };
+        let mut expected_peers = HashMap::new();
+        for (host, lease_instance_id, _) in crate::scanner::scanner_activity_publication_lease_targets(resolution.activity_before)
+        {
+            let Some((activity_instance_id, generation, pending)) =
+                crate::scanner::scanner_activity_dirty_usage_state_for_host(resolution.activity_before, &host)
+            else {
+                return resolution.requested_scope;
+            };
+            if activity_instance_id != lease_instance_id || expected_peers.contains_key(&host) {
+                return resolution.requested_scope;
+            }
+            expected_peers.insert(
+                host,
+                ScannerPeerDirtyUsageExpectation {
+                    instance_id: activity_instance_id.to_string(),
+                    generation,
+                    pending,
+                },
+            );
+        }
+        let Some(remote_dirty_buckets) = verified_remote_dirty_usage_buckets(&expected_peers, peer_snapshots) else {
+            return resolution.requested_scope;
+        };
+        dirty_buckets.extend(remote_dirty_buckets);
+    }
+
+    scoped_scan_scope_from_dirty_buckets(
+        resolution.requested_scope,
+        dirty_buckets,
+        true,
+        resolution.all_buckets,
+        resolution.baseline_proof,
+    )
 }
 
 pub(crate) async fn nsscanner_with_storage_status_scoped<S>(store: &S, request: ScannerCycleRequest) -> Result<ScannerCycleResult>
@@ -97,6 +171,7 @@ where
         leader_epoch,
         scan_mode,
         scan_scope,
+        persisted_usage_baseline,
     } = request;
     let child_token = ctx.child_token();
     let _tier_cycle_guard = begin_tier_registry_cycle(want_cycle, leader_epoch);
@@ -186,8 +261,27 @@ where
     }
     bucket_plan_complete &= buckets_by_source.keys().copied().collect::<HashSet<_>>() == *expected_sources;
     let activity_digest = crate::scanner::scanner_activity_snapshot_digest(&activity_before);
-    let scan_plan_digest = scanner_bucket_plan_digest(&all_buckets, activity_digest);
+    let scan_plan_digest =
+        scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_structural_digest(&activity_before));
     let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets(&all_buckets, dirty_generation_before_bucket_list));
+    let scan_scope = resolve_scanner_bucket_scan_scope(
+        store,
+        distributed,
+        ScannerBucketScopeResolution {
+            requested_scope: scan_scope,
+            baseline_proof: ScannerCacheBaselineProof {
+                data: persisted_usage_baseline.as_ref(),
+                expected_sources: &expected_sources,
+                leader_epoch,
+                want_cycle,
+                scan_plan_digest,
+            },
+            activity_before: &activity_before,
+            dirty_usage_snapshot: &dirty_usage_snapshot,
+            all_buckets: &all_buckets,
+        },
+    )
+    .await;
     let cache_cycle_floor = Arc::new(AtomicU64::new(want_cycle));
     let tier_registry = runtime_tier_registry_for_cycle(want_cycle, leader_epoch).await;
     let tier_registry_generation = tier_registry.generation;

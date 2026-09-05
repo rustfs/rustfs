@@ -33,6 +33,18 @@ use temp_env::with_var;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+#[test]
+fn test_bucket_mutation_lock_path_is_bucket_scoped() {
+    assert_eq!(
+        site_replication_bucket_mutation_lock_path("photos"),
+        "config/site-replication/bucket-mutation/photos.lock"
+    );
+    assert_ne!(
+        site_replication_bucket_mutation_lock_path("photos"),
+        site_replication_bucket_mutation_lock_path("videos")
+    );
+}
+
 fn valid_test_ca_pem(name: &str) -> String {
     rcgen::generate_simple_self_signed(vec![name.to_string()])
         .expect("generate test CA")
@@ -381,6 +393,30 @@ async fn peer_clients_do_not_follow_redirects() {
     assert!(tls_server.await.expect("custom redirect TLS server task"));
 }
 
+#[tokio::test]
+async fn peer_http_error_body_cannot_spoof_an_unreachable_peer() {
+    let (endpoint, ca_pem, server) = spawn_test_tls_server_with_response(
+        b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 27\r\nconnection: close\r\n\r\ndownstream failed (connect)",
+    )
+    .await;
+    let connection = validate_peer_connection_inner(&endpoint, false, &ca_pem, true).expect("custom CA peer connection");
+    let client =
+        build_custom_site_replication_peer_client(&empty_outbound_tls_state(), &connection).expect("custom CA peer client");
+    let err = PeerAdminRequest::post(&connection, SITE_REPLICATION_PEER_DEVNULL_PATH, "access-key")
+        .with_client(&client)
+        .send("secret-key", &serde_json::json!({}))
+        .await
+        .expect_err("HTTP 500 must fail");
+    let detail = err.to_string();
+
+    assert!(detail.contains("downstream failed (connect)"));
+    assert!(
+        !retry_error_indicates_peer_unreachable(&detail),
+        "an untrusted response body must not enable the fast reachability probe"
+    );
+    assert!(server.await.expect("HTTP error TLS server task"));
+}
+
 fn peer(name: &str, endpoint: &str) -> PeerInfo {
     PeerInfo {
         name: name.to_string(),
@@ -419,6 +455,7 @@ fn drain_event(peer: &str, path: &str, retry_count: u32, updated_at: Option<Offs
         last_error: "remote-operation-failed".to_string(),
         updated_at,
         edit_generation: None,
+        peer_unreachable: false,
         deletions_recorded: false,
     }
 }
@@ -532,25 +569,25 @@ fn test_record_failed_iam_delivery_records_deletions_and_flags_entry() {
     // Non-deletion failure: entry flagged, no record.
     let mut user_update = user_delete_item("alice");
     user_update.iam_user.as_mut().expect("iam user").is_delete_req = false;
-    record_failed_iam_delivery(&mut state, &target, &user_update, "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &user_update, "peer offline").expect("record failure");
     assert_eq!(state.retry_queue.len(), 1);
     assert_eq!(state.retry_queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
     assert!(state.retry_queue[0].deletions_recorded);
     assert!(state.iam_deletion_replays.is_empty());
 
     // Deletion failure: recorded for replay, entry stays flagged.
-    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline").expect("record failure");
     assert_eq!(state.iam_deletion_replays.len(), 1);
     assert_eq!(state.iam_deletion_replays[0].entity, "iam-user:alice");
     assert!(state.retry_queue[0].deletions_recorded);
     assert_eq!(state.retry_queue.len(), 1, "IAM failures stay collapsed per peer");
 
     // Same entity again: newest body replaces the record.
-    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline").expect("record failure");
     assert_eq!(state.iam_deletion_replays.len(), 1);
 
     // Different entity: second record.
-    record_failed_iam_delivery(&mut state, &target, &policy_delete_item("readonly"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &policy_delete_item("readonly"), "peer offline").expect("record failure");
     assert_eq!(state.iam_deletion_replays.len(), 2);
 
     // A legacy entry (created without recording) is never stamped.
@@ -565,8 +602,9 @@ fn test_record_failed_iam_delivery_records_deletions_and_flags_entry() {
         SITE_REPLICATION_PEER_IAM_ITEM_WIRE_PATH,
         "peer offline",
         None,
-    );
-    record_failed_iam_delivery(&mut state, &legacy, &user_delete_item("bob"), "peer offline");
+    )
+    .expect("upsert retry event");
+    record_failed_iam_delivery(&mut state, &legacy, &user_delete_item("bob"), "peer offline").expect("record failure");
     let legacy_event = state
         .retry_queue
         .iter()
@@ -589,12 +627,13 @@ fn test_record_failed_iam_delivery_overflow_degrades_to_escalation() {
     };
     let mut state = deletion_replay_state(&target);
     for index in 0..SITE_REPLICATION_IAM_DELETION_REPLAY_LIMIT_PER_PEER {
-        record_failed_iam_delivery(&mut state, &target, &policy_delete_item(&format!("p{index}")), "peer offline");
+        record_failed_iam_delivery(&mut state, &target, &policy_delete_item(&format!("p{index}")), "peer offline")
+            .expect("record failure");
     }
     assert!(state.retry_queue[0].deletions_recorded);
     assert_eq!(state.iam_deletion_replays.len(), SITE_REPLICATION_IAM_DELETION_REPLAY_LIMIT_PER_PEER);
 
-    record_failed_iam_delivery(&mut state, &target, &policy_delete_item("one-too-many"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &policy_delete_item("one-too-many"), "peer offline").expect("record failure");
     assert_eq!(
         state.iam_deletion_replays.len(),
         SITE_REPLICATION_IAM_DELETION_REPLAY_LIMIT_PER_PEER,
@@ -620,33 +659,23 @@ fn test_settle_replayed_iam_retry_events_settles_or_escalates() {
 
     // Fully recorded: settles.
     let mut state = deletion_replay_state(&target);
-    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline").expect("record failure");
     state.retry_queue[0].updated_at = Some(snapshot_at);
+    let observed = state.retry_queue[0].clone();
     let replayed: Vec<String> = state.iam_deletion_replays.iter().map(|record| record.id.clone()).collect();
-    assert!(settle_replayed_iam_retry_events(
-        &mut state,
-        &target,
-        SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
-        Some(snapshot_at),
-        &replayed,
-    ));
+    assert!(settle_replayed_iam_retry_events(&mut state, &target, &observed, &replayed));
     assert!(state.retry_queue.is_empty());
     assert!(state.iam_deletion_replays.is_empty());
 
     // Not fully recorded: replayed records are still removed, but the entry
     // escalates instead of settling.
     let mut state = deletion_replay_state(&target);
-    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline").expect("record failure");
     state.retry_queue[0].updated_at = Some(snapshot_at);
     state.retry_queue[0].deletions_recorded = false;
+    let observed = state.retry_queue[0].clone();
     let replayed: Vec<String> = state.iam_deletion_replays.iter().map(|record| record.id.clone()).collect();
-    assert!(!settle_replayed_iam_retry_events(
-        &mut state,
-        &target,
-        SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
-        Some(snapshot_at),
-        &replayed,
-    ));
+    assert!(!settle_replayed_iam_retry_events(&mut state, &target, &observed, &replayed));
     assert!(state.iam_deletion_replays.is_empty());
     assert_eq!(state.retry_queue.len(), 1);
     assert_eq!(state.retry_queue[0].last_error, SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER);
@@ -654,17 +683,13 @@ fn test_settle_replayed_iam_retry_events_settles_or_escalates() {
     // Newer failure since the snapshot: entry untouched and drain-eligible,
     // residual (unreplayed) record kept for the next pass.
     let mut state = deletion_replay_state(&target);
-    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline").expect("record failure");
+    state.retry_queue[0].updated_at = Some(snapshot_at);
+    let observed = state.retry_queue[0].clone();
     let replayed: Vec<String> = state.iam_deletion_replays.iter().map(|record| record.id.clone()).collect();
-    record_failed_iam_delivery(&mut state, &target, &user_delete_item("bob"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("bob"), "peer offline").expect("record failure");
     state.retry_queue[0].updated_at = Some(snapshot_at + time::Duration::seconds(5));
-    assert!(!settle_replayed_iam_retry_events(
-        &mut state,
-        &target,
-        SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
-        Some(snapshot_at),
-        &replayed,
-    ));
+    assert!(!settle_replayed_iam_retry_events(&mut state, &target, &observed, &replayed));
     assert_eq!(state.retry_queue.len(), 1);
     assert_ne!(state.retry_queue[0].last_error, SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER);
     assert!(
@@ -673,6 +698,24 @@ fn test_settle_replayed_iam_retry_events_settles_or_escalates() {
     );
     assert_eq!(state.iam_deletion_replays.len(), 1);
     assert_eq!(state.iam_deletion_replays[0].entity, "iam-user:bob");
+
+    // A newer deletion of the same entity gets a fresh replay-record id. An
+    // older settlement therefore removes neither its body nor its queue
+    // revision, even if the persisted timestamps happen to be equal.
+    let mut state = deletion_replay_state(&target);
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "first failure").expect("record failure");
+    state.retry_queue[0].updated_at = Some(snapshot_at);
+    let observed = state.retry_queue[0].clone();
+    let replayed = vec![state.iam_deletion_replays[0].id.clone()];
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "newer failure").expect("record newer failure");
+    state.retry_queue[0].updated_at = Some(snapshot_at);
+    assert_ne!(state.iam_deletion_replays[0].id, replayed[0]);
+
+    assert!(!settle_replayed_iam_retry_events(&mut state, &target, &observed, &replayed));
+    assert_eq!(state.retry_queue.len(), 1);
+    assert_ne!(state.retry_queue[0].id, observed.id);
+    assert_eq!(state.iam_deletion_replays.len(), 1);
+    assert_eq!(state.iam_deletion_replays[0].entity, "iam-user:alice");
 }
 
 /// Merging legacy wire-path rows into the collapsed entry must not launder an
@@ -746,6 +789,281 @@ fn test_classify_site_replication_retry_event_actions() {
     assert_eq!(classify(SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH), None);
     assert_eq!(classify("internal:some-future-marker"), None);
     assert_eq!(classify("/rustfs/admin/v3/site-replication/peer/unknown"), None);
+}
+
+#[test]
+fn test_bucket_make_retry_replays_matching_configure_before_settlement() {
+    let make_photos =
+        "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning".to_string();
+    let configure_photos =
+        "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=configure-replication".to_string();
+    let plan = SiteReplicationBootstrapPlan {
+        bucket_make_ops: vec![
+            make_photos.clone(),
+            "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=videos&operation=make-with-versioning".to_string(),
+        ],
+        bucket_configure_ops: vec![
+            "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=videos&operation=configure-replication".to_string(),
+            configure_photos.clone(),
+        ],
+        bucket_items: vec![
+            SRBucketMeta {
+                bucket: "videos".to_string(),
+                r#type: "tags".to_string(),
+                ..Default::default()
+            },
+            SRBucketMeta {
+                bucket: "photos".to_string(),
+                r#type: "policy".to_string(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let tasks = bucket_op_retry_replay_tasks(&plan, SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING, "photos")
+        .expect("make retry plan should include its configure follow-up");
+    assert_eq!(
+        tasks.iter().map(SiteReplicationRepairTask::path).collect::<Vec<_>>(),
+        vec![
+            make_photos.as_str(),
+            "/rustfs/admin/v3/site-replication/peer/bucket-meta",
+            configure_photos.as_str()
+        ]
+    );
+    assert!(matches!(tasks[0], SiteReplicationRepairTask::BucketMake(_)));
+    assert!(matches!(&tasks[1], SiteReplicationRepairTask::BucketMetadata(item) if item.bucket == "photos"));
+    assert!(matches!(tasks[2], SiteReplicationRepairTask::Replication(_)));
+}
+
+#[test]
+fn test_bucket_make_retry_without_matching_configure_fails_closed() {
+    let plan = SiteReplicationBootstrapPlan {
+        bucket_make_ops: vec![
+            "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning".to_string(),
+        ],
+        ..Default::default()
+    };
+
+    let err = match bucket_op_retry_replay_tasks(&plan, SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING, "photos") {
+        Ok(_) => panic!("make retry must not settle without a matching configure operation"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code(), &S3ErrorCode::InternalError);
+}
+
+#[test]
+fn test_retry_drain_bounds_each_peer_round_to_one_small_request_chain() {
+    let plan = SiteReplicationBootstrapPlan {
+        iam_items: vec![SRIAMItem::default(); 3],
+        bucket_make_ops: vec![
+            "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning".to_string(),
+        ],
+        bucket_configure_ops: vec![
+            "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=configure-replication".to_string(),
+        ],
+        bucket_items: vec![SRBucketMeta {
+            bucket: "photos".to_string(),
+            r#type: "tags".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let make = RetryDrainAction::BucketOpReplay {
+        operation: SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING.to_string(),
+        bucket: "photos".to_string(),
+    };
+
+    assert!(is_lightweight_retry_drain_action(&make));
+    assert!(!is_lightweight_retry_drain_action(&RetryDrainAction::IamSnapshot));
+    assert!(!is_lightweight_retry_drain_action(&RetryDrainAction::PeerEdit));
+    assert_eq!(retry_drain_request_count(&make, Some(&plan)), 3);
+    assert!(retry_drain_request_count(&make, Some(&plan)) <= SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER);
+    assert!(
+        retry_drain_request_count(&RetryDrainAction::IamSnapshot, Some(&plan))
+            > SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER
+    );
+    assert!(
+        retry_drain_request_count(&RetryDrainAction::PeerEdit, Some(&plan)) > SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER
+    );
+}
+
+#[test]
+fn test_lightweight_retry_peer_rotation_covers_all_queued_peers() {
+    let limit = SITE_REPLICATION_RETRY_DRAIN_PEER_CONCURRENCY;
+    for peer_count in 1..=(limit * 3 + 1) {
+        let rounds = peer_count.div_ceil(limit);
+        let mut seen = HashSet::new();
+        for round in 7..(7 + rounds as i64) {
+            let start = lightweight_retry_peer_rotation(peer_count, round);
+            for offset in 0..limit.min(peer_count) {
+                seen.insert((start + offset) % peer_count);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            peer_count,
+            "every peer must enter the bounded lightweight window within {rounds} rounds"
+        );
+    }
+}
+
+#[test]
+fn test_lightweight_bucket_retry_plan_is_targeted_and_preserves_make_options() {
+    let created_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let bucket = SRBucketInfo {
+        bucket: "photos".to_string(),
+        created_at: Some(created_at),
+        object_lock_config: Some(String::new()),
+        tags: Some("dGFncy14bWw=".to_string()),
+        tag_config_updated_at: Some(created_at),
+        ..Default::default()
+    };
+    let plan = site_replication_bucket_retry_plan_for(&bucket, false).expect("targeted retry plan");
+
+    assert!(plan.iam_items.is_empty());
+    assert_eq!(plan.bucket_make_ops.len(), 1);
+    assert!(plan.bucket_make_ops[0].contains("bucket=photos"));
+    assert!(plan.bucket_make_ops[0].contains("lockEnabled=true"));
+    assert!(plan.bucket_make_ops[0].contains("createdAt="));
+    assert_eq!(plan.bucket_items.len(), 2);
+    assert_eq!(plan.bucket_items[0].r#type, "tags");
+    assert_eq!(plan.bucket_items[1].r#type, "object-lock-config");
+    assert_eq!(plan.bucket_configure_ops.len(), 1);
+    assert!(plan.bucket_configure_ops[0].contains("operation=configure-replication"));
+
+    let tasks =
+        bucket_op_retry_replay_tasks(&plan, SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING, "photos").expect("retry task chain");
+    assert!(matches!(tasks[0], SiteReplicationRepairTask::BucketMake(_)));
+    assert!(matches!(tasks[1], SiteReplicationRepairTask::BucketMetadata(_)));
+    assert!(matches!(tasks[2], SiteReplicationRepairTask::BucketMetadata(_)));
+    assert!(matches!(tasks[3], SiteReplicationRepairTask::Replication(_)));
+}
+
+#[test]
+fn test_lightweight_bucket_retry_plan_orders_real_metadata_and_counts_it() {
+    let versioning = bucket_versioning_xml().expect("canonical versioning config");
+    let replication = serialize(&site_repl_config("remote-dep")).expect("derived replication config");
+    let bucket = SRBucketInfo {
+        bucket: "photos".to_string(),
+        policy: Some(serde_json::json!({"Version":"2012-10-17","Statement":[]})),
+        tags: Some(BASE64_STANDARD.encode_to_string("<Tagging/>")),
+        versioning: Some(BASE64_STANDARD.encode_to_string(&versioning)),
+        replication_config: Some(BASE64_STANDARD.encode_to_string(&replication)),
+        ..Default::default()
+    };
+    let plan = site_replication_bucket_retry_plan_from_info(&bucket, false).expect("targeted retry plan");
+    let tasks = bucket_op_retry_replay_tasks(&plan, SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING, "photos")
+        .expect("bucket replay tasks");
+
+    assert!(matches!(tasks.first(), Some(SiteReplicationRepairTask::BucketMake(_))));
+    assert!(matches!(tasks.last(), Some(SiteReplicationRepairTask::Replication(_))));
+    assert!(
+        tasks[1..tasks.len() - 1]
+            .iter()
+            .all(|task| matches!(task, SiteReplicationRepairTask::BucketMetadata(_)))
+    );
+    assert_eq!(tasks.len(), 4, "make + policy + tags + configure must all count against the budget");
+    assert!(
+        tasks.len() <= SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER,
+        "the complete metadata chain must fit the bounded lightweight replay"
+    );
+
+    let mut operator_replication = site_repl_config("remote-dep");
+    operator_replication.rules.push(operator_rule("operator-backup"));
+    let mut bucket_with_operator_rule = bucket;
+    bucket_with_operator_rule.replication_config =
+        Some(BASE64_STANDARD.encode_to_string(&serialize(&operator_replication).expect("operator replication config")));
+    let plan = site_replication_bucket_retry_plan_from_info(&bucket_with_operator_rule, false).expect("targeted retry plan");
+    assert!(
+        plan.bucket_items.iter().any(|item| item.r#type == "replication-config"),
+        "operator-authored replication rules cannot be replaced by configure-replication"
+    );
+}
+
+#[test]
+fn test_delete_bucket_broadcast_fences_target_membership_through_delivery() {
+    let hooks = include_str!("hooks.rs");
+    let delete_broadcast = hooks
+        .split("async fn broadcast_site_replication_delete_bucket")
+        .nth(1)
+        .and_then(|rest| rest.split("pub(crate) async fn commit_site_replication_delete_bucket").next())
+        .expect("delete-bucket broadcast should exist");
+    assert!(
+        delete_broadcast.contains("with_site_replication_state_read_lock(move |state| async move {")
+            && delete_broadcast.contains("state.peers.get(&fallback_peer.deployment_id)")
+            && delete_broadcast.contains("site_replicator_service_account_secret(&state.service_account_access_key)")
+            && delete_broadcast
+                .contains("PeerAdminRequest::put(&transport.connection, &delivery_path, &state.service_account_access_key)"),
+        "a destructive bucket delivery must resolve current topology and credentials under the distributed state read lock"
+    );
+    assert!(
+        delete_broadcast.contains("enqueue_site_replication_retry_event(&current_peer, &request_path, &err).await"),
+        "a failed destructive delivery must remain visible for operator repair"
+    );
+
+    let usecase = include_str!("../app/bucket_usecase.rs");
+    let delete = usecase
+        .split("async fn execute_delete_bucket_inner")
+        .nth(1)
+        .and_then(|rest| rest.split("pub async fn execute_head_bucket").next())
+        .expect("delete bucket usecase");
+    assert!(
+        delete
+            .find("prepare_site_replication_delete_bucket")
+            .expect("durable reservation")
+            < delete.find(".delete_bucket(").expect("local delete"),
+        "destructive peer liabilities must be persisted before the local bucket is deleted"
+    );
+}
+
+#[test]
+fn test_bucket_retry_settlement_preserves_a_newer_same_path_failure() {
+    let peer = peer("remote", "https://remote.example.com");
+    let path = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=configure-replication";
+    let observed_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let observed = drain_event("remote", path, 1, Some(observed_at));
+    let mut queue = vec![observed.clone()];
+
+    queue[0].id = "evt-remote-new-revision".to_string();
+    queue[0].retry_count += 1;
+    assert_eq!(settle_observed_site_replication_retry_event(&mut queue, &peer, &observed), 0);
+    assert_eq!(queue.len(), 1, "a newer same-timestamp failure must survive stale settlement");
+
+    let current = queue[0].clone();
+    assert_eq!(settle_observed_site_replication_retry_event(&mut queue, &peer, &current), 1);
+    assert!(queue.is_empty());
+}
+
+#[test]
+fn test_reachable_probe_promotion_is_fenced_by_the_observed_event() {
+    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let path = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning";
+    let mut event = drain_event("remote", path, 3, Some(now));
+    event.peer_unreachable = true;
+    let recovered = event.clone();
+    let mut state = SiteReplicationState {
+        retry_queue: vec![event],
+        ..Default::default()
+    };
+    state
+        .peers
+        .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
+
+    assert_eq!(mark_reachable_deferred_retry_events(&mut state, &[recovered.clone()]), 1);
+    assert_eq!(state.retry_queue[0].updated_at, None);
+    assert!(!state.retry_queue[0].peer_unreachable);
+    assert_eq!(
+        actionable_site_replication_retry_events(&state, now).len(),
+        1,
+        "a successful probe must make the event replayable in the same drain tick"
+    );
+
+    state.retry_queue[0].updated_at = Some(now + time::Duration::seconds(1));
+    state.retry_queue[0].peer_unreachable = true;
+    assert_eq!(mark_reachable_deferred_retry_events(&mut state, &[recovered]), 0);
+    assert_eq!(state.retry_queue[0].updated_at, Some(now + time::Duration::seconds(1)));
+    assert!(state.retry_queue[0].peer_unreachable);
 }
 
 #[test]
@@ -826,6 +1144,100 @@ fn test_site_replication_retry_backoff_schedule() {
     // Ceiling: a long-dead peer is still probed daily, never less often.
     assert!(!elapsed(30, 86_000));
     assert!(elapsed(30, 86_401));
+}
+
+#[test]
+fn test_retry_error_marks_peer_unreachable_only_for_connection_failures() {
+    let mut queue = Vec::new();
+    let peer = peer("remote", "https://remote.example.com");
+    let bucket_make = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning";
+
+    upsert_site_replication_retry_event(
+        &mut queue,
+        &peer,
+        bucket_make,
+        "peer request to https://remote.example.com failed (connect): connection refused",
+        None,
+    )
+    .expect("upsert retry event");
+    assert!(queue[0].peer_unreachable);
+
+    upsert_site_replication_retry_event(
+        &mut queue,
+        &peer,
+        bucket_make,
+        "peer request to https://remote.example.com failed (timeout): request exceeded 10 seconds",
+        None,
+    )
+    .expect("upsert retry event");
+    assert!(
+        !queue[0].peer_unreachable,
+        "a whole-request timeout does not prove the peer is unreachable"
+    );
+
+    upsert_site_replication_retry_event(
+        &mut queue,
+        &peer,
+        bucket_make,
+        "peer request to https://remote.example.com failed with 500 Internal Server Error: downstream failed (connect)",
+        None,
+    )
+    .expect("upsert retry event");
+    assert!(
+        !queue[0].peer_unreachable,
+        "application failures and their untrusted bodies must keep the normal replay backoff"
+    );
+
+    upsert_site_replication_retry_event(
+        &mut queue,
+        &peer,
+        bucket_make,
+        "peer request to https://remote.example.com failed with 500 Internal Server Error: backend failed (connect): spoofed",
+        None,
+    )
+    .expect("upsert retry event");
+    assert!(!queue[0].peer_unreachable, "peer response bodies must not spoof transport failures");
+}
+
+#[test]
+fn test_connect_timeout_is_classified_as_a_connection_failure() {
+    assert_eq!(classify_peer_transport_error(true, true, "tcp connect timed out"), "connect");
+    assert_eq!(classify_peer_transport_error(false, true, "request timed out"), "timeout");
+    assert_eq!(
+        classify_peer_transport_error(false, true, "request timed out for https://tls-gateway.example"),
+        "timeout"
+    );
+    assert_eq!(classify_peer_transport_error(true, false, "tls handshake failed"), "tls handshake");
+}
+
+#[test]
+fn test_retry_event_peer_unreachable_is_legacy_serde_default() {
+    let json = r#"{
+        "id":"evt-legacy",
+        "peer_deployment_id":"remote",
+        "peer_endpoint":"https://remote.example.com",
+        "path":"/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning",
+        "retry_count":1,
+        "failed":false,
+        "last_error":"peer request to https://remote.example.com failed (connect): connection refused"
+    }"#;
+
+    let mut event: SiteReplicationRetryEvent = serde_json::from_str(json).expect("legacy retry event decodes");
+    assert!(!event.peer_unreachable);
+
+    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    event.updated_at = Some(now - time::Duration::seconds(30));
+    let mut state = SiteReplicationState::default();
+    state
+        .peers
+        .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
+    state.retry_queue.push(event);
+
+    assert_eq!(
+        deferred_site_replication_retry_events(&state, now).len(),
+        1,
+        "rolling-upgrade records must retain fast recovery from their trusted outer error shape"
+    );
 }
 
 /// The actionable subset respects classification, peer membership and
@@ -915,6 +1327,51 @@ fn test_deferred_site_replication_retry_events_partition() {
     assert_eq!(actionable[0].path, "/rustfs/admin/v3/site-replication/peer/bucket-meta");
 }
 
+#[test]
+fn test_deferred_retry_events_probe_fresh_peer_transport_failures() {
+    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let mut state = SiteReplicationState::default();
+    state
+        .peers
+        .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
+
+    let bucket_make = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning";
+    let mut fresh_transport_failure = drain_event("remote", bucket_make, 1, Some(now - time::Duration::seconds(30)));
+    fresh_transport_failure.peer_unreachable = true;
+    state.retry_queue.push(fresh_transport_failure);
+
+    let deferred = deferred_site_replication_retry_events(&state, now);
+    assert_eq!(
+        deferred.len(),
+        1,
+        "fresh transport failures must be eligible for a cheap reachability probe"
+    );
+    assert_eq!(deferred[0].path, bucket_make);
+
+    let actionable = actionable_site_replication_retry_events(&state, now);
+    assert!(actionable.is_empty(), "the event is still protected from direct replay by normal backoff");
+}
+
+#[test]
+fn test_deferred_retry_events_do_not_probe_fresh_application_failures() {
+    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let mut state = SiteReplicationState::default();
+    state
+        .peers
+        .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
+
+    let bucket_make = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning";
+    state
+        .retry_queue
+        .push(drain_event("remote", bucket_make, 1, Some(now - time::Duration::seconds(30))));
+
+    assert!(
+        deferred_site_replication_retry_events(&state, now).is_empty(),
+        "reachable peers that reject an operation must keep the base replay backoff"
+    );
+    assert!(actionable_site_replication_retry_events(&state, now).is_empty());
+}
+
 /// The drain settles a peer-edit success under a freshly allocated
 /// generation; legacy queue entries carry `edit_generation: None` and
 /// must be cleared by that generation-scoped settlement (`(Some, None)`
@@ -996,7 +1453,7 @@ fn test_escalate_up_to_marks_snapshot_replayed_and_keeps_newer_failures() {
     // successful Bob update on the shared wire path cannot erase it even
     // before the drain runs.
     let mut queue = Vec::new();
-    upsert_site_replication_retry_event(&mut queue, &target, path, "alice delete failed", None);
+    upsert_site_replication_retry_event(&mut queue, &target, path, "alice delete failed", None).expect("upsert retry event");
     assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
     assert_eq!(dequeue_site_replication_retry_events(&mut queue, &target, path), 0);
     assert_eq!(queue.len(), 1);
@@ -1005,7 +1462,7 @@ fn test_escalate_up_to_marks_snapshot_replayed_and_keeps_newer_failures() {
     // A later hook failure overwrites the marker and re-arms the drain.
     let mut queue = vec![drain_event("remote", path, 2, Some(snapshot_at))];
     escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at));
-    upsert_site_replication_retry_event(&mut queue, &target, path, "peer offline", None);
+    upsert_site_replication_retry_event(&mut queue, &target, path, "peer offline", None).expect("upsert retry event");
     assert!(classify_site_replication_retry_event(&queue[0]).is_some());
 
     // Legacy entry without a timestamp: escalated.
@@ -1781,15 +2238,83 @@ fn test_retry_event_upsert_marks_repeated_failures() {
     };
     let mut queue = Vec::new();
 
-    upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "first", None);
-    upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "second", None);
-    upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "third", None);
+    upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "first", None)
+        .expect("upsert retry event");
+    let first_revision = queue[0].id.clone();
+    upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "second", None)
+        .expect("upsert retry event");
+    let second_revision = queue[0].id.clone();
+    upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "third", None)
+        .expect("upsert retry event");
 
     assert_eq!(queue.len(), 1);
+    assert_ne!(first_revision, second_revision);
+    assert_ne!(second_revision, queue[0].id, "each failure must advance the settlement revision");
     assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
     assert_eq!(queue[0].retry_count, SITE_REPLICATION_RETRY_FAILED_AFTER);
     assert!(queue[0].failed);
     assert_eq!(queue[0].last_error, "third");
+}
+
+#[test]
+fn retry_queue_capacity_never_evicts_destructive_bucket_liabilities() {
+    let target = PeerInfo {
+        deployment_id: "remote-dep".to_string(),
+        ..peer("remote", "https://remote.example.com")
+    };
+    let destructive = |index: usize| SiteReplicationRetryEvent {
+        id: format!("delete-{index}"),
+        peer_deployment_id: target.deployment_id.clone(),
+        peer_endpoint: target.endpoint.clone(),
+        path: format!("{SITE_REPLICATION_PEER_BUCKET_OPS_PATH}?bucket=bucket-{index}&operation=delete-bucket"),
+        ..Default::default()
+    };
+    let mut queue = (0..SITE_REPLICATION_RETRY_QUEUE_LIMIT).map(destructive).collect::<Vec<_>>();
+    let original_ids = queue.iter().map(|event| event.id.clone()).collect::<HashSet<_>>();
+    let new_path = format!("{SITE_REPLICATION_PEER_BUCKET_OPS_PATH}?bucket=overflow&operation=force-delete-bucket");
+
+    let err = upsert_site_replication_retry_event(&mut queue, &target, &new_path, "reserve delete", None)
+        .expect_err("an all-destructive full queue must fail closed");
+    assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+    assert_eq!(queue.len(), SITE_REPLICATION_RETRY_QUEUE_LIMIT);
+    assert_eq!(queue.iter().map(|event| event.id.clone()).collect::<HashSet<_>>(), original_ids);
+
+    queue[0] = SiteReplicationRetryEvent {
+        id: "iam-snapshot".to_string(),
+        peer_deployment_id: target.deployment_id.clone(),
+        peer_endpoint: target.endpoint.clone(),
+        path: SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH.to_string(),
+        deletions_recorded: true,
+        ..Default::default()
+    };
+    upsert_site_replication_retry_event(&mut queue, &target, &new_path, "reserve delete", None)
+        .expect_err("a collapsed IAM liability may contain a deletion and must not be evicted");
+    assert!(queue.iter().any(|event| event.id == "iam-snapshot"));
+
+    queue[0] = SiteReplicationRetryEvent {
+        id: "rebuildable".to_string(),
+        peer_deployment_id: target.deployment_id.clone(),
+        peer_endpoint: target.endpoint.clone(),
+        path: SITE_REPLICATION_PEER_EDIT_PATH.to_string(),
+        ..Default::default()
+    };
+    let preserved_delete_ids = queue
+        .iter()
+        .filter(|event| is_destructive_bucket_retry_path(&event.path))
+        .map(|event| event.id.clone())
+        .collect::<HashSet<_>>();
+    let evicted = upsert_site_replication_retry_event(&mut queue, &target, &new_path, "reserve delete", None)
+        .expect("a rebuildable row may make room for a destructive liability");
+
+    assert_eq!(evicted.len(), 1);
+    assert_eq!(evicted[0].id, "rebuildable");
+    assert_eq!(queue.len(), SITE_REPLICATION_RETRY_QUEUE_LIMIT);
+    assert!(
+        preserved_delete_ids
+            .iter()
+            .all(|id| queue.iter().any(|event| &event.id == id))
+    );
+    assert!(queue.iter().any(|event| event.path == new_path));
 }
 
 /// P1-15 review follow-up: a successful peer-edit delivery only proves the
@@ -1807,7 +2332,8 @@ fn retry_settlement_must_not_erase_a_newer_generation_failure() {
     // Edit A (generation 5) delivered successfully and is stalled before
     // settling. Edit B (generation 6) commits meanwhile, fails delivery to
     // the same peer, and enqueues.
-    upsert_site_replication_retry_event(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, "peer offline", Some(6));
+    upsert_site_replication_retry_event(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, "peer offline", Some(6))
+        .expect("upsert retry event");
 
     // A resumes: its own settlement must leave B's retry alone.
     assert_eq!(
@@ -1818,7 +2344,8 @@ fn retry_settlement_must_not_erase_a_newer_generation_failure() {
     assert_eq!(queue[0].edit_generation, Some(6));
 
     // An even older delivery failing afterwards must not lower the fence.
-    upsert_site_replication_retry_event(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, "still offline", Some(4));
+    upsert_site_replication_retry_event(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, "still offline", Some(4))
+        .expect("upsert retry event");
     assert_eq!(queue[0].edit_generation, Some(6));
 
     // B's own delivery succeeding is what clears it.
@@ -1831,7 +2358,7 @@ fn retry_settlement_must_not_erase_a_newer_generation_failure() {
     // Collapsed broadcast failures live under an internal snapshot path;
     // an unrelated success on their shared wire path cannot settle them.
     let iam_path = "/rustfs/admin/v3/site-replication/peer/iam-item";
-    upsert_site_replication_retry_event(&mut queue, &peer, iam_path, "peer offline", None);
+    upsert_site_replication_retry_event(&mut queue, &peer, iam_path, "peer offline", None).expect("upsert retry event");
     assert_eq!(dequeue_site_replication_retry_events(&mut queue, &peer, iam_path), 0);
     assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
 }

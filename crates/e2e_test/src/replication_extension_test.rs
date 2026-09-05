@@ -6743,6 +6743,99 @@ async fn test_site_replication_replicates_object_with_bucket_versioning_real_dua
     Ok(())
 }
 
+#[tokio::test]
+async fn test_site_replication_replays_bucket_created_during_peer_outage_real_dual_node() -> TestResult {
+    init_logging();
+
+    // Keep compilation outside the scenario timeout. Recovery itself waits
+    // for the production 30-second lightweight retry tick.
+    let _rustfs_binary = rustfs_binary_path();
+
+    match timeout(Duration::from_secs(150), async {
+        let mut site_env = replication_fast_env();
+        site_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+
+        let mut site_a_env = RustFSTestEnvironment::new().await?;
+        site_a_env.start_rustfs_server_with_env(vec![], &site_env).await?;
+
+        let mut site_b_env = RustFSTestEnvironment::new().await?;
+        site_b_env.start_rustfs_server_without_cleanup_with_env(&site_env).await?;
+
+        let site_a_client = site_a_env.create_s3_client();
+        let site_b_client = site_b_env.create_s3_client();
+        let bucket = "site-repl-peer-outage";
+        let key = "after-recovery.txt";
+        let payload = b"site replication recovered the missed bucket".to_vec();
+
+        let add_status = site_replication_add(
+            &site_a_env,
+            &[
+                PeerSite {
+                    name: "outage-site-a".to_string(),
+                    endpoint: site_a_env.url.clone(),
+                    access_key: site_a_env.access_key.clone(),
+                    secret_key: site_a_env.secret_key.clone(),
+                    ..Default::default()
+                },
+                PeerSite {
+                    name: "outage-site-b".to_string(),
+                    endpoint: site_b_env.url.clone(),
+                    access_key: site_b_env.access_key.clone(),
+                    secret_key: site_b_env.secret_key.clone(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await?;
+        assert!(add_status.success, "unexpected site add result: {add_status:?}");
+        wait_for_site_replication_enabled(&site_a_env, 2).await?;
+        wait_for_site_replication_enabled(&site_b_env, 2).await?;
+
+        site_b_env.stop_server();
+        site_a_client.create_bucket().bucket(bucket).send().await?;
+        site_a_client.head_bucket().bucket(bucket).send().await?;
+
+        let queued = site_replication_info(&site_a_env)
+            .await?
+            .retry_stats
+            .ok_or("peer outage did not persist a site replication retry event")?;
+        assert!(queued.pending + queued.failed > 0, "peer outage retry queue was unexpectedly empty");
+
+        site_b_env.restart_server_preserving_data(vec![], &site_env).await?;
+        let recovery_deadline = tokio::time::Instant::now() + Duration::from_secs(75);
+        loop {
+            let bucket_recovered = site_b_client.head_bucket().bucket(bucket).send().await.is_ok();
+            let queue_empty = site_replication_info(&site_a_env).await?.retry_stats.is_none();
+            if bucket_recovered && queue_empty {
+                break;
+            }
+            if tokio::time::Instant::now() >= recovery_deadline {
+                return Err(format!(
+                    "site replication retry did not settle after peer recovery; bucket_recovered={bucket_recovered}, queue_empty={queue_empty}"
+                )
+                .into());
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+
+        site_a_client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(payload.clone()))
+            .send()
+            .await?;
+        assert_eq!(wait_for_object_on_target(&site_b_client, bucket, key).await?, payload);
+
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err("site replication peer-outage recovery timed out after 150 seconds".into()),
+    }
+}
+
 /// Re-applying a site's own replication config must not disable the peer's reverse direction.
 ///
 /// `PutBucketReplication` broadcasts the config to every peer — the console's replication

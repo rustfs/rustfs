@@ -74,10 +74,23 @@ env:
 jobs:
   security-test:
     runs-on: smoke-testing
-    continue-on-error: true
     timeout-minutes: 360
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
+      - name: Checkout repository (for the OIDC live gate script)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Initialize security evidence
+        id: evidence
+        run: |
+          set -euo pipefail
+          umask 077
+          SECURITY_ARTIFACTS_DIR="${RUNNER_TEMP}/rustfs-security-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -- "${SECURITY_ARTIFACTS_DIR}"
+          printf 'SECURITY_ARTIFACTS_DIR=%s\n' "${SECURITY_ARTIFACTS_DIR}" >> "${GITHUB_ENV}"
+
       # auto-testing is private: clone it with the dedicated PF token (not
       # GITHUB_TOKEN) and retry transient GitHub/network failures.
       - name: Checkout auto-testing scripts (with retry)
@@ -97,11 +110,6 @@ jobs:
           done
           echo "ERROR: unable to clone rustfs/auto-testing after 5 attempts" >&2
           exit 1
-
-      - name: Checkout repository (for the OIDC live gate script)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          persist-credentials: false
 
       - name: Show environment
         run: |
@@ -135,7 +143,8 @@ jobs:
         id: test
         continue-on-error: true
         env:
-          REPORT_FILE: /tmp/rustfs-security-report.md
+          REPORT_FILE: ${{ env.SECURITY_ARTIFACTS_DIR }}/suite-report.md
+          TMPDIR: ${{ env.SECURITY_ARTIFACTS_DIR }}
           RUSTFS_SECURITY_OIDC_LIVE_SCRIPT: ${{ github.workspace }}/scripts/test/oidc_keycloak_live.sh
         run: |
           set -euo pipefail
@@ -159,29 +168,48 @@ jobs:
           else
             ARGS+=(--package-url "${RUSTFS_NIGHTLY_PACKAGE_URL}")
           fi
-          ./auto-testing/rustfs-security-test.sh "${ARGS[@]}"
+          GITHUB_STEP_SUMMARY=/dev/null ./auto-testing/rustfs-security-test.sh "${ARGS[@]}"
 
       - name: Generate report
-        if: always()
+        id: report
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
+        env:
+          TEST_OUTCOME: ${{ steps.test.outcome }}
         run: |
           set -euo pipefail
-          if [ ! -f /tmp/rustfs-security-report.md ]; then
-            {
-              echo "# RustFS security test report"
-              echo ""
-              echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-              echo "- Trigger: ${{ github.event_name }}"
-              echo "- Test Step Outcome: failure (suite did not produce a report)"
-            } > /tmp/rustfs-security-report.md
+          RESULT=failure
+          if [ "${TEST_OUTCOME}" = "success" ] && [ -s "${SECURITY_ARTIFACTS_DIR}/suite-report.md" ]; then
+            RESULT=success
           fi
-          cat /tmp/rustfs-security-report.md >> "${GITHUB_STEP_SUMMARY}"
+          {
+            echo "# RustFS security test report"
+            echo ""
+            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- Attempt: ${GITHUB_RUN_ATTEMPT}"
+            echo "- Workflow Commit: ${GITHUB_SHA}"
+            echo "- Trigger: ${GITHUB_EVENT_NAME}"
+            echo "- Test Step Outcome: ${RESULT}"
+            echo "- Suite Step Outcome: ${TEST_OUTCOME}"
+            echo ""
+            # The dashboard prioritizes case rows over the step outcome.
+            # Keep partial case results in the artifact when the suite fails.
+            if [ "${RESULT}" = "success" ]; then
+              cat "${SECURITY_ARTIFACTS_DIR}/suite-report.md"
+            elif [ -s "${SECURITY_ARTIFACTS_DIR}/suite-report.md" ]; then
+              echo "The suite did not complete successfully. See suite-report.md in this run's artifact for diagnostics."
+            else
+              echo "The suite did not produce a non-empty report."
+            fi
+          } > "${SECURITY_ARTIFACTS_DIR}/report.md"
+          cat "${SECURITY_ARTIFACTS_DIR}/report.md" >> "${GITHUB_STEP_SUMMARY}"
+          [ "${RESULT}" = "success" ]
 
       - name: Upload functional report to dashboard
-        if: always()
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
-          REPORT_FILE: /tmp/rustfs-security-report.md
+          REPORT_FILE: ${{ env.SECURITY_ARTIFACTS_DIR }}/report.md
           SUITE: security
         run: |
           set -euo pipefail
@@ -210,8 +238,9 @@ jobs:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
           SUITE: 'security'
           SUITE_LABEL: 'Security'
+          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          REPORT_FILE: '/tmp/rustfs-security-report.md'
+          REPORT_FILE: ${{ env.SECURITY_ARTIFACTS_DIR }}/report.md
           LOG_FILE: ''
         run: |
           set -euo pipefail
@@ -245,7 +274,7 @@ jobs:
             echo ""
             echo "## Report (errors and symptoms)"
             echo ""
-            if [ -s "${REPORT_FILE}" ]; then
+            if [ "${EVIDENCE_OUTCOME}" = "success" ] && [ -s "${REPORT_FILE}" ]; then
               redact < "${REPORT_FILE}"
             elif [ -s "${LOG_FILE:-}" ]; then
               echo "(report file missing; log tail below)"
@@ -263,14 +292,12 @@ jobs:
           echo "filed backlog issue for suite ${SUITE}"
 
       - name: Upload report and logs
-        if: always()
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: rustfs-security-test-${{ github.run_id }}
-          path: |
-            /tmp/rustfs-security-report.md
-            /tmp/rustfs-security.*/*
-          if-no-files-found: ignore
+          name: rustfs-security-test-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.SECURITY_ARTIFACTS_DIR }}/
+          if-no-files-found: error
           retention-days: 3
 
       - name: Cleanup environment (after)

@@ -649,7 +649,9 @@ pub(crate) async fn persist_site_replication_repair_task(
     let path = path.to_string();
     update_site_replication_state(move |state| {
         match failure.as_deref() {
-            Some(error) => upsert_site_replication_retry_event(&mut state.retry_queue, &peer, &path, error, None),
+            Some(error) => {
+                upsert_site_replication_retry_event(&mut state.retry_queue, &peer, &path, error, None)?;
+            }
             None => {
                 dequeue_site_replication_retry_events_including_escalated(&mut state.retry_queue, &peer, &path);
                 // A repair is the operator's accountability transfer for the
