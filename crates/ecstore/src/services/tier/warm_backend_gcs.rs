@@ -15,8 +15,6 @@
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -146,11 +144,11 @@ pub struct WarmBackendGCS {
 
 impl WarmBackendGCS {
     pub async fn new(conf: &TierGCS, tier: &str) -> Result<Self, std::io::Error> {
-        if conf.creds == "" {
+        if conf.creds.is_empty() {
             return Err(std::io::Error::other("both access and secret keys are required"));
         }
 
-        if conf.bucket == "" {
+        if conf.bucket.is_empty() {
             return Err(std::io::Error::other("no bucket name was provided"));
         }
 
@@ -195,11 +193,11 @@ impl WarmBackendGCS {
     }
 
     pub fn get_dest(&self, object: &str) -> String {
-        let mut dest_obj = object.to_string();
-        if self.prefix != "" {
-            dest_obj = format!("{}/{}", &self.prefix, object);
+        if self.prefix.is_empty() {
+            object.to_string()
+        } else {
+            format!("{}/{}", self.prefix, object)
         }
-        return dest_obj;
     }
 }
 
@@ -223,7 +221,7 @@ impl WarmBackend for WarmBackendGCS {
         let bucket = gcs_bucket_resource_name(&self.bucket);
         let Ok(res) = Box::pin(
             self.client
-                .write_object(&bucket, &self.get_dest(object), Bytes::from(d))
+                .write_object(&bucket, self.get_dest(object), Bytes::from(d))
                 .send_buffered(),
         )
         .await
@@ -240,7 +238,7 @@ impl WarmBackend for WarmBackendGCS {
 
     async fn get(&self, object: &str, rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
         let bucket = gcs_bucket_resource_name(&self.bucket);
-        let mut req = self.client.read_object(&bucket, &self.get_dest(object));
+        let mut req = self.client.read_object(&bucket, self.get_dest(object));
         let mut max_response_bytes = None;
         if let Some(generation) = parse_generation(rv)? {
             req = req.set_generation(generation);
