@@ -191,17 +191,22 @@ jobs:
           fi
           DATE="$(date -u +%Y-%m-%d)"
           REPORT_PATH="functional-reports/${SUITE}/${DATE}.md"
-          CONTENT="$(python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}")"
+          # Base64-encode the report into a temp file and feed it to jq via
+          # --rawfile: large reports (e.g. pool) exceed the OS argv limit and
+          # make `jq --arg content "${CONTENT}"` fail with "Argument list too long".
+          B64_FILE="$(mktemp)"
+          python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}" > "${B64_FILE}"
           SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
           if [ -n "${SHA}" ]; then
-            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" --arg sha "${SHA}" \
-              '{message:$msg, content:$content, sha:$sha}' \
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --rawfile content "${B64_FILE}" --arg sha "${SHA}" \
+              '{message:$msg, content:($content|rtrimstr("\n")), sha:$sha}' \
               | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
           else
-            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" \
-              '{message:$msg, content:$content}' \
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --rawfile content "${B64_FILE}" \
+              '{message:$msg, content:($content|rtrimstr("\n"))}' \
               | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
           fi
+          rm -f "${B64_FILE}"
 
       - name: File failure issue in rustfs/backlog
         if: ${{ always() && (failure() || steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled') }}
