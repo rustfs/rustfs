@@ -72,6 +72,9 @@ where
         scan_mode,
         scan_scope: ScannerBucketScanScope::default(),
         persisted_usage_baseline: None,
+        requires_full_scan: true,
+        #[cfg(test)]
+        resolved_scope_observer: None,
     };
     nsscanner_with_storage_status_scoped(store, request).await
 }
@@ -85,6 +88,10 @@ pub(crate) struct ScannerCycleRequest {
     pub(crate) scan_mode: HealScanMode,
     pub(crate) scan_scope: ScannerBucketScanScope,
     pub(crate) persisted_usage_baseline: Option<Bytes>,
+    /// Scheduled maintenance must visit clean buckets even with a valid dirty scope.
+    pub(crate) requires_full_scan: bool,
+    #[cfg(test)]
+    pub(crate) resolved_scope_observer: Option<tokio::sync::oneshot::Sender<ScannerBucketScanScope>>,
 }
 
 struct ScannerBucketScopeResolution<'a> {
@@ -93,6 +100,7 @@ struct ScannerBucketScopeResolution<'a> {
     activity_before: &'a crate::scanner::ScannerActivitySnapshot,
     dirty_usage_snapshot: &'a DirtyUsageSnapshot,
     all_buckets: &'a [BucketInfo],
+    requires_full_scan: bool,
 }
 
 async fn resolve_scanner_bucket_scan_scope<S>(
@@ -103,6 +111,9 @@ async fn resolve_scanner_bucket_scan_scope<S>(
 where
     S: ScannerStorage,
 {
+    if resolution.requires_full_scan {
+        return ScannerBucketScanScope::default();
+    }
     if !resolution.requested_scope.is_default()
         || !resolution.dirty_usage_snapshot.covers_all_pending
         || resolution.dirty_usage_snapshot.generation == u64::MAX
@@ -172,6 +183,9 @@ where
         scan_mode,
         scan_scope,
         persisted_usage_baseline,
+        requires_full_scan,
+        #[cfg(test)]
+        resolved_scope_observer,
     } = request;
     let child_token = ctx.child_token();
     let _tier_cycle_guard = begin_tier_registry_cycle(want_cycle, leader_epoch);
@@ -281,9 +295,14 @@ where
             activity_before: &activity_before,
             dirty_usage_snapshot: &dirty_usage_snapshot,
             all_buckets: &all_buckets,
+            requires_full_scan: requires_full_scan || scan_mode == HealScanMode::Deep,
         },
     )
     .await;
+    #[cfg(test)]
+    if let Some(observer) = resolved_scope_observer {
+        let _ = observer.send(scan_scope.clone());
+    }
     let cache_cycle_floor = Arc::new(AtomicU64::new(want_cycle));
     let tier_registry = runtime_tier_registry_for_cycle(want_cycle, leader_epoch).await;
     let tier_registry_generation = tier_registry.generation;

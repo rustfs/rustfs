@@ -1564,7 +1564,7 @@ where
     S: ScannerStorage,
 {
     let cycle_budget = ScannerCycleBudget::new(ctx, scanner_cycle_budget_config());
-    run_data_scanner_cycle_with_budget(ctx, storeapi, cycle_info, cycle_revision, leader_epoch, cycle_budget).await
+    run_data_scanner_cycle_with_budget(ctx, storeapi, cycle_info, cycle_revision, leader_epoch, cycle_budget, true).await
 }
 
 #[instrument(skip_all)]
@@ -1576,6 +1576,7 @@ async fn run_data_scanner_cycle_with_budget<S>(
     cycle_revision: &mut DataUsageCacheRevision,
     leader_epoch: u64,
     cycle_budget: Arc<ScannerCycleBudget>,
+    requires_full_scan: bool,
 ) -> ScannerCycleOutcome
 where
     S: ScannerStorage,
@@ -1714,6 +1715,9 @@ where
             scan_mode,
             scan_scope: crate::scanner_io::ScannerBucketScanScope::default(),
             persisted_usage_baseline: usage_persist_baseline.data.clone(),
+            requires_full_scan,
+            #[cfg(test)]
+            resolved_scope_observer: None,
         },
     )
     .await;
@@ -2772,6 +2776,7 @@ where
                 &mut cycle_revision,
                 leader_epoch,
                 cycle_budget.clone(),
+                true,
             ),
             guard.lock_lost_notified(),
         )
@@ -3062,6 +3067,9 @@ where
                 &mut cycle_revision,
                 leader_epoch,
                 cycle_budget.clone(),
+                maintenance_features.needs_regular_cycle()
+                    || maintenance_generation_seen != Some(scanner_maintenance_generation())
+                    || !matches!(wake_reason, ScannerCycleWakeReason::DirtyUsage | ScannerCycleWakeReason::ClusterActivity),
             ),
             guard.lock_lost_notified(),
         )

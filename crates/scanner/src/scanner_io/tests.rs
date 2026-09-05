@@ -318,6 +318,104 @@ async fn scanner_cycle_is_deferred_while_terminal_decommission_is_blocked() {
 }
 
 #[tokio::test]
+#[serial]
+async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work() {
+    let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+    clear_dirty_usage_buckets_for_tests();
+    for bucket in ["hot-bucket", "cold-bucket"] {
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = ScannerPutObjReader::from_vec(b"initial".to_vec());
+        store.pools[0].disk_set[0]
+            .put_object(bucket, "initial", &mut reader, &ScannerObjectOptions::default())
+            .await
+            .expect("initial object should persist");
+    }
+    let mut baseline = None;
+    for (index, (scan_mode, requires_full_scan, explicit_scope)) in [
+        (HealScanMode::Normal, true, false),
+        (HealScanMode::Normal, false, false),
+        (HealScanMode::Deep, false, false),
+        (HealScanMode::Normal, true, false),
+        (HealScanMode::Deep, false, true),
+        (HealScanMode::Normal, true, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            let mut reader = ScannerPutObjReader::from_vec(b"maintenance".to_vec());
+            store.pools[0].disk_set[0]
+                .put_object("cold-bucket", &format!("added-{index}"), &mut reader, &ScannerObjectOptions::default())
+                .await
+                .expect("cold bucket mutation should persist");
+            // Only the hot bucket is in the usage hint. The cold result must
+            // come from this cycle's storage walk, not its previous baseline.
+            record_dirty_usage_bucket("hot-bucket");
+        }
+        let requested_scope = if explicit_scope {
+            ScannerBucketScanScope::from_dirty_buckets(
+                HashSet::from(["hot-bucket".to_string()]),
+                DataUsageScanPlanDigest([7; 32]),
+            )
+        } else {
+            ScannerBucketScanScope::default()
+        };
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+        let (updates, mut receiver) = mpsc::channel(1);
+        let (observer, observed_scope) = tokio::sync::oneshot::channel();
+        let cycle = u64::try_from(index + 1).expect("test cycle should fit");
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            nsscanner_with_storage_status_scoped(
+                store.as_ref(),
+                ScannerCycleRequest {
+                    ctx,
+                    budget,
+                    updates,
+                    want_cycle: cycle,
+                    leader_epoch: 11,
+                    scan_mode,
+                    scan_scope: requested_scope,
+                    persisted_usage_baseline: baseline,
+                    requires_full_scan,
+                    resolved_scope_observer: Some(observer),
+                },
+            ),
+        )
+        .await
+        .expect("cycle should finish within the test deadline")
+        .expect("cycle should succeed");
+        assert_eq!(result.status, ScannerCycleStatus::Complete, "cycle {cycle}");
+        let resolved = observed_scope.await.expect("production resolver should report its scope");
+        if index == 1 {
+            assert_eq!(
+                resolved.selected_buckets.as_deref(),
+                Some(&HashSet::from(["hot-bucket".to_string()])),
+                "ordinary dirty work must retain the existing planner"
+            );
+        } else {
+            assert!(resolved.is_default(), "cycle {cycle} must visit the full maintenance scope");
+        }
+        let mut snapshot = receiver.recv().await.expect("cycle should publish a snapshot");
+        assert!(snapshot.usage_snapshot_complete, "cycle {cycle}");
+        assert_eq!(
+            snapshot.buckets_usage["cold-bucket"].objects_count,
+            u64::try_from(index + 1).expect("count should fit")
+        );
+        assert_eq!(snapshot.buckets_usage["hot-bucket"].objects_count, 1);
+        assert_eq!(snapshot.scanner_cycle, Some(cycle));
+        assert_eq!(snapshot.scanner_epoch, Some(11));
+        snapshot.usage_snapshot_converged = Some(true);
+        baseline = Some(Bytes::from(serde_json::to_vec(&snapshot).expect("complete baseline should encode")));
+    }
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[tokio::test]
 async fn data_usage_publish_fails_when_receiver_is_closed() {
     let (updates, receiver) = mpsc::channel(1);
     drop(receiver);
