@@ -234,7 +234,9 @@ impl SourceBackend for GcsNativeSourceBackend {
         url.query_pairs_mut().append_pair("maxResults", "1");
         let request = self.request(Method::GET, url, HeaderMap::new()).await?;
         let response = self.http.send(request, NO_ERROR_CODE_HEADER).await?;
-        read_text(response, MAX_JSON_BYTES).await.and_then(|body| parse_objects_list(&body))?;
+        read_text(response, MAX_JSON_BYTES)
+            .await
+            .and_then(|body| parse_objects_list(&body))?;
         Ok(())
     }
 }
