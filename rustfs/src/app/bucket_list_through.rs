@@ -101,32 +101,29 @@ fn invalid_continuation_token(err: &ListThroughTokenError) -> S3Error {
 /// bucket has no source, `list_through` is off, or the request carries the
 /// `source-proxy-request` anti-loop marker and therefore comes from a peer
 /// that must be answered locally.
-pub(crate) async fn list_through_state(
+pub(crate) async fn list_through_state<T>(
     store: &ECStore,
     bucket: &str,
-    headers: &HeaderMap,
-    expected_incarnation: Option<uuid::Uuid>,
+    req: &s3s::S3Request<T>,
 ) -> S3Result<Option<Arc<BucketOdmState>>> {
-    if get_header(headers, SUFFIX_SOURCE_PROXY_REQUEST).is_some() {
+    if get_header(&req.headers, SUFFIX_SOURCE_PROXY_REQUEST).is_some() {
         return Ok(None);
     }
     let sys = OnDemandMigrationSys::get();
     if !sys.is_module_enabled() {
         return Ok(None);
     }
-    let Some(expected_incarnation) = expected_incarnation else {
+    let Some(state) = sys.state(bucket).filter(|state| state.config().policy.list_through) else {
         return Ok(None);
     };
-    let Some(state) = sys.state(bucket) else {
+    let Some(expected_incarnation) = super::storage_api::bucket_usecase::access::odm_read_generation(req, bucket)? else {
         return Ok(None);
     };
     let incarnation = store.bucket_incarnation_id(bucket).await.map_err(ApiError::from)?;
     if incarnation != expected_incarnation {
         return Ok(None);
     }
-    Ok(state
-        .filter_incarnation(incarnation)
-        .filter(|state| state.config().policy.list_through))
+    Ok(state.filter_incarnation(incarnation))
 }
 
 /// A merged page plus whether the source had to be left out of it.
@@ -469,7 +466,6 @@ mod tests {
         FilterConfig, MAX_LIST_NO_PROGRESS_PAGES, OnDemandMigrationConfig, PathStyle, PolicyConfig, Provider, SourceConfig,
         SourceCredentials, TlsConfig,
     };
-    use s3s::dto::ListObjectsInput;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -883,17 +879,25 @@ mod tests {
                         .await
                         .expect("replacement identity");
                     assert_ne!(replacement, old.incarnation_id());
+                    sys.remove(&input.bucket);
+                    let mut without_source = get.clone();
+                    super::super::storage_api::bucket_usecase::access::prepare_odm_read_generation(
+                        &store,
+                        &mut without_source,
+                        &input.bucket,
+                    )
+                    .await;
                     for state_incarnation in [old.incarnation_id(), replacement] {
                         sys.apply_for_incarnation(&input.bucket, state_incarnation, Some(old.config()))
                             .await;
                         // Both a stale runtime and a newly published replacement must reject
                         // requests already authorized for the deleted incarnation.
-                        for authorized in [false, true] {
-                            if !authorized && state_incarnation == replacement {
+                        for capture in 0..3 {
+                            if capture == 0 && state_incarnation == replacement {
                                 continue;
                             }
-                            let mut get = get.clone();
-                            if authorized {
+                            let mut get = if capture == 2 { without_source.clone() } else { get.clone() };
+                            if capture == 1 {
                                 get.extensions.insert(authorized_generation.clone());
                             }
                             let mut head = get.clone().map_input(|_| s3s::dto::HeadObjectInput {

@@ -288,6 +288,68 @@ async fn load_bucket_generation<T>(fs: &FS, req: &S3Request<T>, bucket: &str) ->
     load_bucket_generation_from_store(store.as_ref(), req, bucket).await
 }
 
+/// A read may consult only the source admitted before its authorization.
+/// Capture failures are deferred until a local miss actually needs that source.
+#[derive(Clone, Debug)]
+enum OdmReadGenerationGuard {
+    Unavailable,
+    Ready(BucketGenerationGuard),
+    Failed { code: S3ErrorCode, message: String },
+}
+
+impl OdmReadGenerationGuard {
+    fn from_result(result: S3Result<BucketGenerationGuard>) -> Self {
+        match result {
+            Ok(guard) => Self::Ready(guard),
+            Err(err) => Self::Failed {
+                code: err.code().clone(),
+                message: err.message().unwrap_or_else(|| err.code().as_str()).to_string(),
+            },
+        }
+    }
+}
+
+fn odm_read_source_configured(bucket: &str) -> bool {
+    let sys = crate::on_demand_migration::OnDemandMigrationSys::get();
+    sys.is_module_enabled() && sys.state(bucket).is_some()
+}
+
+async fn capture_odm_read_generation<T>(fs: &FS, req: &S3Request<T>, bucket: &str) -> OdmReadGenerationGuard {
+    if !odm_read_source_configured(bucket) {
+        return OdmReadGenerationGuard::Unavailable;
+    }
+    OdmReadGenerationGuard::from_result(load_bucket_generation(fs, req, bucket).await)
+}
+
+/// Direct usecase callers have no access middleware; capture at their entry.
+/// A server request without the access marker must never bind to a later source.
+pub(crate) async fn prepare_odm_read_generation<T>(
+    store: &crate::storage::storage_api::ECStore,
+    req: &mut S3Request<T>,
+    bucket: &str,
+) {
+    if req.extensions.get::<OdmReadGenerationGuard>().is_some() {
+        return;
+    }
+    let guard = if req.extensions.get::<std::sync::Arc<ServerContextSlot>>().is_some() || !odm_read_source_configured(bucket) {
+        OdmReadGenerationGuard::Unavailable
+    } else {
+        OdmReadGenerationGuard::from_result(load_bucket_generation_from_store(store, req, bucket).await)
+    };
+    req.extensions.insert(guard);
+}
+
+pub(crate) fn odm_read_generation<T>(req: &S3Request<T>, bucket: &str) -> S3Result<Option<uuid::Uuid>> {
+    match req.extensions.get::<OdmReadGenerationGuard>() {
+        Some(OdmReadGenerationGuard::Ready(guard)) if guard.bucket == bucket => Ok(Some(guard.incarnation_id)),
+        Some(OdmReadGenerationGuard::Ready(_)) => {
+            Err(s3_error!(InternalError, "source generation guard does not match request bucket"))
+        }
+        Some(OdmReadGenerationGuard::Failed { code, message }) => Err(S3Error::with_message(code.clone(), message.clone())),
+        Some(OdmReadGenerationGuard::Unavailable) | None => Ok(None),
+    }
+}
+
 async fn load_copy_source_bucket_generation(fs: &FS, bucket: &str) -> S3Result<CopySourceBucketGenerationGuard> {
     let store = fs
         .server_ctx()
@@ -2366,7 +2428,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn get_object(&self, req: &mut S3Request<GetObjectInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let source_generation = capture_odm_read_generation(self, req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -2375,7 +2437,7 @@ impl S3Access for FS {
         // GHSA-3ppv: a versioned read (?versionId=...) must authorize against
         // s3:GetObjectVersion, not s3:GetObject.
         authorize_request(req, versioned_read_action(req.input.version_id.as_deref())).await?;
-        req.extensions.insert(bucket_generation?);
+        req.extensions.insert(source_generation);
         Ok(())
     }
 
@@ -2489,7 +2551,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn head_object(&self, req: &mut S3Request<HeadObjectInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let source_generation = capture_odm_read_generation(self, req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -2502,12 +2564,12 @@ impl S3Access for FS {
         if get_header(&req.headers, SUFFIX_SOURCE_REPLICATION_CHECK).as_deref() == Some("true") {
             authorize_request(req, Action::S3Action(S3Action::ReplicateObjectAction)).await?;
             req_info_mut(req)?.replication_request_authorized = true;
-            req.extensions.insert(bucket_generation?);
+            req.extensions.insert(source_generation);
             return Ok(());
         }
 
         authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
-        req.extensions.insert(bucket_generation?);
+        req.extensions.insert(source_generation);
         Ok(())
     }
 
@@ -2598,12 +2660,12 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn list_objects_v2(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let source_generation = capture_odm_read_generation(self, req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await?;
-        req.extensions.insert(bucket_generation?);
+        req.extensions.insert(source_generation);
         Ok(())
     }
 
@@ -3869,6 +3931,222 @@ mod tests {
         let req_info = req.extensions.get::<ReqInfo>().expect("request info should remain available");
         assert_eq!(req_info.bucket.as_deref(), Some("test-bucket"));
         assert_eq!(req_info.object.as_deref(), Some("test-key"));
+    }
+
+    #[test]
+    #[serial]
+    fn odm_read_capture_preserves_access_and_parameter_error_order() {
+        crate::app::gating_test_env::run_large_stack_test("odm-access-order", || async {
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let iam = rustfs_iam::init_iam_sys(Arc::clone(&store))
+                .await
+                .expect("initialize request IAM");
+            let context = Arc::new(AppContext::with_default_interfaces(
+                Arc::clone(&store),
+                iam,
+                Arc::new(KmsServiceManager::new()),
+            ));
+            let server_ctx = ServerContextSlot::new();
+            assert!(server_ctx.install(Arc::clone(&context)));
+            let fs = FS::with_server_ctx(server_ctx);
+            let sys = crate::on_demand_migration::OnDemandMigrationSys::get();
+            let enabled_before = sys.is_module_enabled();
+            let bucket = format!("odm-access-missing-{}", uuid::Uuid::new_v4());
+            for enabled in [false, true] {
+                sys.set_module_enabled(enabled);
+                let mut get = build_request(
+                    GetObjectInput {
+                        bucket: bucket.clone(),
+                        key: "key".into(),
+                        part_number: Some(0),
+                        ..Default::default()
+                    },
+                    Method::GET,
+                );
+                get.extensions.insert(ReqInfo {
+                    cred: Some(rustfs_credentials::Credentials::default()),
+                    is_owner: true,
+                    ..Default::default()
+                });
+                get.extensions.insert(fs.server_ctx().clone());
+                let mut head = get.clone().map_input(|_| HeadObjectInput {
+                    bucket: bucket.clone(),
+                    key: "key".into(),
+                    part_number: Some(1),
+                    range: Some(s3s::dto::Range::Int { first: 0, last: Some(1) }),
+                    ..Default::default()
+                });
+                head.method = Method::HEAD;
+                let mut list = get.clone().map_input(|_| ListObjectsV2Input {
+                    bucket: bucket.clone(),
+                    max_keys: Some(-1),
+                    ..Default::default()
+                });
+                fs.get_object(&mut get)
+                    .await
+                    .expect("ordinary GET access must not require bucket identity");
+                fs.head_object(&mut head)
+                    .await
+                    .expect("ordinary HEAD access must not require bucket identity");
+                fs.list_objects_v2(&mut list)
+                    .await
+                    .expect("ordinary LIST access must not require bucket identity");
+                assert!(matches!(
+                    get.extensions.get::<super::OdmReadGenerationGuard>(),
+                    Some(super::OdmReadGenerationGuard::Unavailable)
+                ));
+                assert!(matches!(
+                    head.extensions.get::<super::OdmReadGenerationGuard>(),
+                    Some(super::OdmReadGenerationGuard::Unavailable)
+                ));
+                assert!(matches!(
+                    list.extensions.get::<super::OdmReadGenerationGuard>(),
+                    Some(super::OdmReadGenerationGuard::Unavailable)
+                ));
+                let usecase = crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+                assert_eq!(
+                    usecase.execute_get_object(get).await.expect_err("bad GET part number").code(),
+                    &S3ErrorCode::InvalidArgument
+                );
+                assert_eq!(
+                    usecase
+                        .execute_head_object(head)
+                        .await
+                        .expect_err("range and part number conflict")
+                        .code(),
+                    &S3ErrorCode::InvalidArgument
+                );
+                assert_eq!(
+                    crate::app::bucket_usecase::DefaultBucketUsecase::with_context(Some(Arc::clone(&context)))
+                        .execute_list_objects_v2(list)
+                        .await
+                        .expect_err("negative max keys")
+                        .code(),
+                    &S3ErrorCode::InvalidArgument
+                );
+            }
+            sys.set_module_enabled(enabled_before);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn odm_read_capture_failure_is_deferred_until_source_miss() {
+        crate::app::gating_test_env::run_large_stack_test("odm-access-failure", || async {
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let iam = rustfs_iam::init_iam_sys(Arc::clone(&store))
+                .await
+                .expect("initialize request IAM");
+            let context = Arc::new(AppContext::with_default_interfaces(
+                Arc::clone(&store),
+                iam,
+                Arc::new(KmsServiceManager::new()),
+            ));
+            let server_ctx = ServerContextSlot::new();
+            assert!(server_ctx.install(Arc::clone(&context)));
+            let fs = FS::with_server_ctx(server_ctx);
+            let sys = crate::on_demand_migration::OnDemandMigrationSys::get();
+            let enabled_before = sys.is_module_enabled();
+            sys.set_module_enabled(true);
+            let bucket = format!("odm-capture-failure-{}", uuid::Uuid::new_v4());
+            let mut config: crate::on_demand_migration::OnDemandMigrationConfig = serde_json::from_str(r#"{"source":{"provider":"minio","endpoint":"https://source.example.com","bucket":"source","credentials":{"access_key":"test","secret_key":"test"}}}"#).expect("source config");
+            config.policy.list_through = true;
+            sys.apply_for_incarnation(&bucket, uuid::Uuid::new_v4(), Some(&config)).await;
+            let mut get = build_request(
+                GetObjectInput {
+                    bucket: bucket.clone(),
+                    key: "local".into(),
+                    ..Default::default()
+                },
+                Method::GET,
+            );
+            get.extensions.insert(ReqInfo {
+                cred: Some(rustfs_credentials::Credentials::default()),
+                is_owner: true,
+                ..Default::default()
+            });
+            get.extensions.insert(fs.server_ctx().clone());
+            let mut head = get.clone().map_input(|_| HeadObjectInput {
+                bucket: bucket.clone(),
+                key: "local".into(),
+                ..Default::default()
+            });
+            head.method = Method::HEAD;
+            let mut list = get.clone().map_input(|_| ListObjectsV2Input {
+                bucket: bucket.clone(),
+                ..Default::default()
+            });
+            fs.list_objects_v2(&mut list)
+                .await
+                .expect("capture failure must not preempt LIST authorization");
+            fs.get_object(&mut get)
+                .await
+                .expect("capture failure must not preempt GET authorization");
+            fs.head_object(&mut head)
+                .await
+                .expect("capture failure must not preempt HEAD authorization");
+            assert!(matches!(
+                get.extensions.get::<super::OdmReadGenerationGuard>(),
+                Some(super::OdmReadGenerationGuard::Failed { .. })
+            ));
+            assert!(matches!(
+                head.extensions.get::<super::OdmReadGenerationGuard>(),
+                Some(super::OdmReadGenerationGuard::Failed { .. })
+            ));
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket after capture");
+            store
+                .put_object(
+                    &bucket,
+                    "local",
+                    &mut crate::storage::PutObjReader::from_vec(b"local".to_vec()),
+                    &crate::storage::ObjectOptions::default(),
+                )
+                .await
+                .expect("create local hit");
+            // Publishing a usable source later must not repair a failed capture.
+            let incarnation = store.bucket_incarnation_id(&bucket).await.expect("created identity");
+            sys.apply_for_incarnation(&bucket, incarnation, Some(&config)).await;
+            let usecase = crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+            usecase
+                .execute_get_object(get.clone())
+                .await
+                .expect("a local GET hit ignores source capture failure");
+            usecase
+                .execute_head_object(head.clone())
+                .await
+                .expect("a local HEAD hit ignores source capture failure");
+            get.input.key = "missing".into();
+            head.input.key = "missing".into();
+            assert_eq!(
+                usecase
+                    .execute_get_object(get)
+                    .await
+                    .expect_err("failed capture cannot rebind on GET miss")
+                    .code(),
+                &S3ErrorCode::NoSuchBucket
+            );
+            assert_eq!(
+                usecase
+                    .execute_head_object(head)
+                    .await
+                    .expect_err("failed capture cannot rebind on HEAD miss")
+                    .code(),
+                &S3ErrorCode::NoSuchBucket
+            );
+            assert_eq!(
+                crate::app::bucket_usecase::DefaultBucketUsecase::with_context(Some(context))
+                    .execute_list_objects_v2(list)
+                    .await
+                    .expect_err("failed capture cannot rebind on LIST")
+                    .code(),
+                &S3ErrorCode::NoSuchBucket
+            );
+            sys.remove(&bucket);
+            sys.set_module_enabled(enabled_before);
+        });
     }
 
     #[tokio::test]

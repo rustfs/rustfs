@@ -3843,7 +3843,15 @@ impl DefaultObjectUsecase {
         if !odm_get_may_consult_source(opts, part_number) {
             return None;
         }
-        let expected_incarnation = opts.expected_bucket_incarnation_id?;
+        let sys = OnDemandMigrationSys::get();
+        if !sys.is_module_enabled() || sys.state(bucket).is_none() {
+            return None;
+        }
+        let expected_incarnation = match odm_read_generation(req, bucket) {
+            Ok(Some(incarnation)) => incarnation,
+            Ok(None) => return None,
+            Err(err) => return Some(OdmGetOutcome::Respond(Err(err))),
+        };
         match store.bucket_incarnation_id(bucket).await {
             Ok(current) if current == expected_incarnation => {}
             Ok(_) => return None,
@@ -3980,25 +3988,15 @@ impl DefaultObjectUsecase {
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BUCKET_VALIDATION, bucket_validation_start);
 
         let request_context_start = stage_metrics_enabled.then(std::time::Instant::now);
-        let mut request_context = match Self::prepare_get_object_request_context(validated, &req.headers).await {
+        let request_context = match Self::prepare_get_object_request_context(validated, &req.headers).await {
             Ok(request_context) => request_context,
             Err(err) => {
                 lifecycle.finish_err();
                 return Self::complete_get_object_error(helper, err);
             }
         };
-        if OnDemandMigrationSys::get().is_module_enabled() && OnDemandMigrationSys::get().state(&req.input.bucket).is_some() {
-            match load_bucket_generation_from_store(&store, &req, &req.input.bucket).await {
-                Ok(guard) => {
-                    req.extensions.insert(guard);
-                    apply_bucket_generation_guard(&req, &req.input.bucket, &mut request_context.opts)?;
-                }
-                Err(err) => {
-                    lifecycle.finish_err();
-                    return Self::complete_get_object_error(helper, err);
-                }
-            }
-        }
+        let bucket = req.input.bucket.clone();
+        prepare_odm_read_generation(&store, &mut req, &bucket).await;
         if let Some(request_context_start) = request_context_start {
             rustfs_io_metrics::record_get_object_stage_duration(
                 "s3_handler",

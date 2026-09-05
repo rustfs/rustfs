@@ -146,6 +146,7 @@ impl DefaultObjectUsecase {
     /// `None` means the runtime does not intervene and the caller keeps its
     /// original 404. The source answer is never written back or queued.
     async fn on_demand_migration_head(
+        req: &S3Request<HeadObjectInput>,
         store: &ECStore,
         bucket: &str,
         key: &str,
@@ -155,7 +156,15 @@ impl DefaultObjectUsecase {
         if !odm_request_may_consult_source(opts) {
             return None;
         }
-        let expected_incarnation = opts.expected_bucket_incarnation_id?;
+        let sys = OnDemandMigrationSys::get();
+        if !sys.is_module_enabled() || sys.state(bucket).is_none() {
+            return None;
+        }
+        let expected_incarnation = match odm_read_generation(req, bucket) {
+            Ok(Some(incarnation)) => incarnation,
+            Ok(None) => return None,
+            Err(err) => return Some(Err(err)),
+        };
         match store.bucket_incarnation_id(bucket).await {
             Ok(current) if current == expected_incarnation => {}
             Ok(_) => return None,
@@ -317,15 +326,11 @@ impl DefaultObjectUsecase {
         };
         validate_bucket_exists(&store, &bucket).await?;
 
-        let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
+        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
             .await
             .map_err(ApiError::from)?;
 
-        if OnDemandMigrationSys::get().is_module_enabled() && OnDemandMigrationSys::get().state(&bucket).is_some() {
-            let guard = load_bucket_generation_from_store(&store, &req, &bucket).await?;
-            req.extensions.insert(guard);
-            apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
-        }
+        prepare_odm_read_generation(&store, &mut req, &bucket).await;
 
         // Modification Points: Explicitly handles get_object_info errors, distinguishing between object absence and other errors
         let lookup = store.get_object_info(&bucket, &key, &opts).await;
@@ -360,7 +365,7 @@ impl DefaultObjectUsecase {
                         return result;
                     }
                     if let Some(miss) = odm_miss
-                        && let Some(result) = Self::on_demand_migration_head(&store, &bucket, &key, &opts, miss).await
+                        && let Some(result) = Self::on_demand_migration_head(&req, &store, &bucket, &key, &opts, miss).await
                     {
                         return Self::finish_on_demand_migration_head(&req, &bucket, helper, result?).await;
                     }
@@ -375,7 +380,7 @@ impl DefaultObjectUsecase {
                 // A latest delete marker is a local miss the source may still
                 // answer when the bucket policy says so.
                 if let Some(miss) = odm_miss
-                    && let Some(result) = Self::on_demand_migration_head(&store, &bucket, &key, &opts, miss).await
+                    && let Some(result) = Self::on_demand_migration_head(&req, &store, &bucket, &key, &opts, miss).await
                 {
                     return Self::finish_on_demand_migration_head(&req, &bucket, helper, result?).await;
                 }
