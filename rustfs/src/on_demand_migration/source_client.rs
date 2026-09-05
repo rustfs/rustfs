@@ -26,12 +26,13 @@
 //! forwarded: v1 rejects SSE-C source objects outright.
 
 use super::azure::AzureSourceBackend;
+#[cfg(feature = "gcs")]
 use super::gcs::GcsNativeSourceBackend;
 use super::list_through::{ListPageError, validate_list_page};
-use crate::bucket::remote_s3_client::{
+use super::storage_api::HTTPRangeSpec;
+use super::storage_api::remote_s3_client::{
     PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, RemoteS3RetryPolicy, build_remote_s3_config,
 };
-use crate::storage_api_contracts::range::HTTPRangeSpec;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
@@ -334,8 +335,9 @@ const THROTTLE_CODES: &[&str] = &[
     "RequestLimitExceeded",
     "TooManyRequests",
     "RequestThrottled",
+    "ServerBusy",
 ];
-const NOT_FOUND_CODES: &[&str] = &["NoSuchKey"];
+const NOT_FOUND_CODES: &[&str] = &["NoSuchKey", "BlobNotFound"];
 const ACCESS_DENIED_CODES: &[&str] = &[
     "AccessDenied",
     "InvalidAccessKeyId",
@@ -343,6 +345,7 @@ const ACCESS_DENIED_CODES: &[&str] = &[
     "AllAccessDisabled",
     "ExpiredToken",
     "InvalidToken",
+    "AuthorizationPermissionMismatch",
 ];
 
 pub(super) fn classify_status(status: u16, code: Option<&str>, message: String) -> SourceError {
@@ -720,6 +723,9 @@ impl SourceClient {
                 )?;
                 Ok(Self::from_backend(Box::new(backend), spec))
             }
+            #[cfg(not(feature = "gcs"))]
+            SourceBackendSpec::Gcs(_) => Err(RemoteS3ClientError::BackendNotCompiled("gcs_native")),
+            #[cfg(feature = "gcs")]
             SourceBackendSpec::Gcs(gcs) => {
                 let backend = GcsNativeSourceBackend::new(
                     &spec.endpoint,
@@ -989,7 +995,7 @@ fn s3_source_object(object: SdkObject) -> Result<SourceObject, SourceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bucket::on_demand_migration::backend_contract::{BackendCapabilities, OBJECT_MD5, assert_backend_contract};
+    use crate::on_demand_migration::backend_contract::{BackendCapabilities, OBJECT_MD5, assert_backend_contract};
     use aws_smithy_runtime_api::client::http::{HttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn};
     use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
     use aws_smithy_runtime_api::client::result::ConnectorError;
@@ -1109,6 +1115,28 @@ mod tests {
             bandwidth_limit: NonZeroU64::new(1_000_000),
             backend: SourceBackendSpec::S3,
         }
+    }
+
+    #[cfg(not(feature = "gcs"))]
+    #[tokio::test]
+    async fn gcs_backend_not_compiled_keeps_hmac_s3_available() {
+        let mut native = spec(None);
+        native.provider = SourceProvider::GcsNative;
+        native.credentials = None;
+        native.backend = SourceBackendSpec::Gcs(GcsSourceSpec {
+            service_account_json: "{}".to_string(),
+        });
+        assert!(matches!(
+            SourceClient::new(&native).await,
+            Err(RemoteS3ClientError::BackendNotCompiled("gcs_native"))
+        ));
+
+        let mut hmac = spec(None);
+        hmac.provider = SourceProvider::Gcs;
+        hmac.endpoint = "https://storage.googleapis.com".to_string();
+        SourceClient::new(&hmac)
+            .await
+            .expect("GCS HMAC uses the always-available S3 backend");
     }
 
     async fn scripted_client(spec: &SourceClientSpec, responses: Vec<Scripted>) -> (SourceClient, Recorded) {
@@ -1817,6 +1845,7 @@ mod tests {
             ok(Vec::new(), CONTRACT_TAGGING),
             ok(Vec::new(), ""),
             status(404, ""),
+            ok(Vec::new(), ""),
             status(403, ACCESS_DENIED_BODY),
         ])
         .await;

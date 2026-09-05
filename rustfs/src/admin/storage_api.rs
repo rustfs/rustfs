@@ -20,8 +20,8 @@ use time::OffsetDateTime;
 
 mod ecstore_bucket {
     pub(crate) use crate::storage::storage_api::ecstore_bucket::{
-        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, object_lock, on_demand_migration, quota,
-        remote_s3_client, replication, target, utils, versioning, versioning_sys,
+        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, object_lock, quota, remote_s3_client,
+        replication, target, utils, versioning, versioning_sys,
     };
 }
 
@@ -285,35 +285,6 @@ pub(crate) mod durability {
     pub(crate) type BucketDurabilityConfig = super::ecstore_bucket::durability::BucketDurabilityConfig;
 }
 
-pub(crate) mod on_demand_migration {
-    pub(crate) type OdmBucketSnapshot = super::ecstore_bucket::on_demand_migration::OdmBucketSnapshot;
-    pub(crate) type OnDemandMigrationConfig = super::ecstore_bucket::on_demand_migration::OnDemandMigrationConfig;
-    pub(crate) type OnDemandMigrationConfigError = super::ecstore_bucket::on_demand_migration::OnDemandMigrationConfigError;
-    pub(crate) type OnDemandMigrationSys = super::ecstore_bucket::on_demand_migration::OnDemandMigrationSys;
-    pub(crate) type PathStyle = super::ecstore_bucket::on_demand_migration::PathStyle;
-    pub(crate) type Provider = super::ecstore_bucket::on_demand_migration::Provider;
-    pub(crate) type ValidationContext<'a> = super::ecstore_bucket::on_demand_migration::ValidationContext<'a>;
-    pub(crate) use super::ecstore_bucket::on_demand_migration::source_backend_spec;
-
-    pub(crate) mod backfill {
-        pub(crate) type BackfillCheckpoint = super::super::ecstore_bucket::on_demand_migration::backfill::BackfillCheckpoint;
-        pub(crate) type BackfillError = super::super::ecstore_bucket::on_demand_migration::backfill::BackfillError;
-        pub(crate) type BackfillRequest = super::super::ecstore_bucket::on_demand_migration::backfill::BackfillRequest;
-        pub(crate) type BackfillState = super::super::ecstore_bucket::on_demand_migration::backfill::BackfillState;
-        pub(crate) type SkipExisting = super::super::ecstore_bucket::on_demand_migration::backfill::SkipExisting;
-        pub(crate) use super::super::ecstore_bucket::on_demand_migration::backfill::global_backfill_runner;
-    }
-
-    pub(crate) mod source_client {
-        pub(crate) type SourceClient = super::super::ecstore_bucket::on_demand_migration::source_client::SourceClient;
-        pub(crate) type SourceClientSpec = super::super::ecstore_bucket::on_demand_migration::source_client::SourceClientSpec;
-        pub(crate) type SourceError = super::super::ecstore_bucket::on_demand_migration::source_client::SourceError;
-        pub(crate) type SourceProbe = super::super::ecstore_bucket::on_demand_migration::source_client::SourceProbe;
-        pub(crate) type SourceProvider = super::super::ecstore_bucket::on_demand_migration::source_client::SourceProvider;
-        pub(crate) type SourceTimeouts = super::super::ecstore_bucket::on_demand_migration::source_client::SourceTimeouts;
-    }
-}
-
 pub(crate) mod remote_s3_client {
     pub(crate) type PathStyle = super::ecstore_bucket::remote_s3_client::PathStyle;
     pub(crate) type RemoteCredentials = super::ecstore_bucket::remote_s3_client::RemoteCredentials;
@@ -454,12 +425,6 @@ pub(crate) mod metadata_sys {
         bucket: &str,
     ) -> Result<(Option<super::durability::BucketDurabilityConfig>, OffsetDateTime)> {
         super::ecstore_bucket::metadata_sys::get_durability_config(bucket).await
-    }
-
-    pub(crate) async fn get_on_demand_migration_config(
-        bucket: &str,
-    ) -> Result<Option<(super::on_demand_migration::OnDemandMigrationConfig, OffsetDateTime)>> {
-        super::ecstore_bucket::metadata_sys::get_on_demand_migration_config(bucket).await
     }
 
     pub(crate) async fn get_quota_config(bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
@@ -914,7 +879,6 @@ pub(crate) mod bucket {
     pub(crate) use super::lifecycle;
     pub(crate) use super::metadata;
     pub(crate) use super::metadata_sys;
-    pub(crate) use super::on_demand_migration;
     pub(crate) use super::quota;
     pub(crate) use super::remote_s3_client;
     pub(crate) use super::replication;

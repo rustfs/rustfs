@@ -15,9 +15,7 @@
 //! Cross-cutting helpers shared by the object use-case modules.
 
 use super::*;
-use crate::app::storage_api::object_usecase::bucket::on_demand_migration::{
-    OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead,
-};
+use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead};
 
 pub(super) const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 
@@ -992,7 +990,7 @@ pub(crate) fn odm_source_error_response(policy: &PolicyConfig, class: &'static s
 /// Metrics/message label for a bucket whose source client could not be built.
 pub(crate) fn odm_state_error_class(error: &OdmStateError) -> &'static str {
     match error {
-        OdmStateError::AnonymousUnsupported => "unsupported",
+        OdmStateError::AnonymousUnsupported | OdmStateError::BackendNotCompiled(_) => "unsupported",
         OdmStateError::ClientBuild(_) => "client_build",
     }
 }
@@ -2035,6 +2033,7 @@ mod on_demand_migration_tests {
     #[test]
     fn odm_state_error_class_is_stable() {
         assert_eq!(odm_state_error_class(&OdmStateError::AnonymousUnsupported), "unsupported");
+        assert_eq!(odm_state_error_class(&OdmStateError::BackendNotCompiled("gcs_native")), "unsupported");
         assert_eq!(odm_state_error_class(&OdmStateError::ClientBuild("tls".to_string())), "client_build");
     }
 

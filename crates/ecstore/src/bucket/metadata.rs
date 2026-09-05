@@ -489,28 +489,17 @@ impl BucketMetadata {
         !self.bucket_targets_config_json.is_empty() && self.bucket_target_config.is_none()
     }
 
-    /// Parsed per-bucket durability override, if a valid one is stored.
-    ///
-    /// Absent/empty/unparsable payloads all mean "no override" (the bucket
-    /// follows the global durability mode); a parse failure is logged so a
-    /// corrupted entry cannot silently change fsync behavior.
-    /// Parsed on-demand migration config, if one is stored.
-    ///
-    /// `Ok(None)` means no config (absent or cleared). A stored payload that
-    /// does not parse is an error, never a default: the runtime must not
-    /// pull from a source it cannot describe.
-    pub fn on_demand_migration_config(
-        &self,
-    ) -> std::result::Result<
-        Option<super::on_demand_migration::OnDemandMigrationConfig>,
-        super::on_demand_migration::OnDemandMigrationConfigError,
-    > {
-        if self.on_demand_migration_config_json.is_empty() {
-            return Ok(None);
-        }
-        super::on_demand_migration::OnDemandMigrationConfig::from_json(&self.on_demand_migration_config_json).map(Some)
+    /// Opaque application-owned configuration with its persisted update time.
+    /// Empty bytes mean absent or cleared; decoding belongs to the consumer.
+    pub fn on_demand_migration_config(&self) -> Option<(&[u8], OffsetDateTime)> {
+        (!self.on_demand_migration_config_json.is_empty()).then_some((
+            self.on_demand_migration_config_json.as_slice(),
+            self.on_demand_migration_config_updated_at,
+        ))
     }
 
+    /// Parsed per-bucket durability override, if a valid one is stored.
+    /// Invalid payloads follow the global mode after logging a parse failure.
     pub fn durability_config(&self) -> Option<super::durability::BucketDurabilityConfig> {
         if self.durability_config_json.is_empty() {
             return None;
@@ -916,13 +905,6 @@ impl BucketMetadata {
                 self.durability_config_updated_at = updated;
             }
             BUCKET_ON_DEMAND_MIGRATION_CONFIG => {
-                // Structural check only (shape, unknown fields); the
-                // deployment-relative rules run in the admin handler with a
-                // `ValidationContext`. A blob this build cannot read must not
-                // be persisted for every later reader to trip over.
-                if !data.is_empty() {
-                    super::on_demand_migration::OnDemandMigrationConfig::from_json(&data).map_err(Error::other)?;
-                }
                 self.on_demand_migration_config_json = data;
                 self.on_demand_migration_config_updated_at = updated;
             }
@@ -2006,51 +1988,30 @@ mod test {
 
     const ODM_JSON: &[u8] = br#"{"version":1,"enabled":true,"source":{"provider":"minio","endpoint":"https://legacy.example.com:9000","region":"auto","bucket":"legacy-bucket","credentials":{"access_key":"AK","secret_key":"SK"}}}"#;
 
-    /// rustfs/backlog#2148: the on-demand migration config is a RustFS
-    /// extension entry that round-trips through `update_config` and the
-    /// msgpack codec, clears on delete, and never parses corruption into a
-    /// default.
+    /// The metadata codec preserves application-owned bytes and timestamps.
     #[test]
     fn on_demand_migration_config_round_trips_and_tracks_updates() {
-        use crate::bucket::on_demand_migration::{OnDemandMigrationConfig, OnDemandMigrationConfigError};
-
         let mut bm = BucketMetadata::new("odm-bucket");
-        assert_eq!(bm.on_demand_migration_config(), Ok(None), "fresh metadata carries no config");
-
-        let expected = OnDemandMigrationConfig::from_json(ODM_JSON).unwrap();
+        assert_eq!(bm.on_demand_migration_config(), None, "fresh metadata carries no config");
         bm.update_config(BUCKET_ON_DEMAND_MIGRATION_CONFIG, ODM_JSON.to_vec())
-            .expect("valid config is accepted");
-        assert_ne!(bm.on_demand_migration_config_updated_at, OffsetDateTime::UNIX_EPOCH);
-        assert_eq!(bm.on_demand_migration_config(), Ok(Some(expected.clone())));
-
+            .expect("opaque config is accepted");
+        let stamped = bm.on_demand_migration_config_updated_at;
+        assert_ne!(stamped, OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(bm.on_demand_migration_config(), Some((ODM_JSON, stamped)));
         let back = BucketMetadata::unmarshal(&bm.marshal_msg().unwrap()).unwrap();
         assert_eq!(back.on_demand_migration_config_json, bm.on_demand_migration_config_json);
-        assert_eq!(
-            back.on_demand_migration_config_updated_at.unix_timestamp(),
-            bm.on_demand_migration_config_updated_at.unix_timestamp()
-        );
-        assert_eq!(back.on_demand_migration_config(), Ok(Some(expected)));
-
-        // A blob this build cannot read is rejected at the write boundary
-        // rather than persisted for every reader to trip over.
-        let before = bm.on_demand_migration_config_json.clone();
-        assert!(
-            bm.update_config(BUCKET_ON_DEMAND_MIGRATION_CONFIG, br#"{"source":{"provider":"s3"},"bogus":1}"#.to_vec())
-                .is_err()
-        );
-        assert_eq!(bm.on_demand_migration_config_json, before, "a rejected update leaves the blob untouched");
-
-        // Delete clears the entry.
-        let stamped = bm.on_demand_migration_config_updated_at;
+        assert_eq!(back.on_demand_migration_config_updated_at.unix_timestamp(), stamped.unix_timestamp());
         bm.update_config(BUCKET_ON_DEMAND_MIGRATION_CONFIG, Vec::new()).unwrap();
         assert!(bm.on_demand_migration_config_json.is_empty());
-        assert_eq!(bm.on_demand_migration_config(), Ok(None));
+        assert_eq!(bm.on_demand_migration_config(), None);
         assert!(bm.on_demand_migration_config_updated_at >= stamped);
-
-        // Corruption that bypassed `update_config` (disk, another writer)
-        // is a typed error, never a default.
-        bm.on_demand_migration_config_json = b"not-json".to_vec();
-        assert!(matches!(bm.on_demand_migration_config(), Err(OnDemandMigrationConfigError::Malformed(_))));
+        bm.update_config(BUCKET_ON_DEMAND_MIGRATION_CONFIG, b"not-json".to_vec())
+            .unwrap();
+        let back = BucketMetadata::unmarshal(&bm.marshal_msg().unwrap()).unwrap();
+        assert_eq!(
+            back.on_demand_migration_config_json, b"not-json",
+            "metadata must not reinterpret application bytes"
+        );
     }
 
     /// rustfs/backlog#2148: a `.metadata.bin` written before the on-demand
@@ -2062,7 +2023,7 @@ mod test {
         let mut bm = BucketMetadata::unmarshal(&blob[4..]).expect("unmarshal MinIO bucket metadata");
         assert!(bm.on_demand_migration_config_json.is_empty());
         assert_eq!(bm.on_demand_migration_config_updated_at, OffsetDateTime::UNIX_EPOCH);
-        assert_eq!(bm.on_demand_migration_config(), Ok(None));
+        assert_eq!(bm.on_demand_migration_config(), None);
 
         bm.default_timestamps();
         assert_ne!(bm.created, OffsetDateTime::UNIX_EPOCH, "fixture must carry a real creation time");
