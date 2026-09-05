@@ -1028,6 +1028,21 @@ pub async fn site_replication_iam_change_hook(item: SRIAMItem) -> S3Result<()> {
     let Some(runtime) = runtime_site_replication_targets().await? else {
         return Ok(());
     };
+    // A local revoke must out-rank a stale grant a peer delivers later, so its
+    // mark is committed before the broadcast (backlog#2291). The broadcast
+    // still goes out when the mark cannot be persisted: the peers' own records
+    // remain the primary gate, the mark only covers the deleted case.
+    if let Err(err) = record_iam_deletion_marks_for_item(&item).await {
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            item_type = %item.r#type,
+            result = "iam_deletion_mark_not_recorded",
+            error = ?err,
+            "failed to record local IAM deletion mark before broadcast"
+        );
+    }
     let mut first_error: Option<S3Error> = None;
     for peer in runtime.state.peers.values() {
         if peer.deployment_id == runtime.local_peer.deployment_id

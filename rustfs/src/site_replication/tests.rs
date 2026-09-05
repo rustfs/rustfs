@@ -554,6 +554,121 @@ fn test_iam_item_deletion_entity_shapes() {
     assert!(iam_item_deletion_entity(&policy_set).is_none());
 }
 
+/// Deletion marks (backlog#2291) key on the same entities as the replay
+/// records, except that a group member removal is marked per member (so a
+/// stale re-add of one member can be judged) and a group delete marks the
+/// group itself. Creates and updates leave no mark.
+#[test]
+fn test_iam_item_deletion_mark_entities_shapes() {
+    assert_eq!(
+        iam_item_deletion_mark_entities(&user_delete_item("alice")),
+        vec!["iam-user:alice".to_string()]
+    );
+    assert_eq!(
+        iam_item_deletion_mark_entities(&policy_delete_item("readonly")),
+        vec!["policy:readonly".to_string()]
+    );
+
+    let mut group_remove = SRIAMItem {
+        r#type: "group-info".to_string(),
+        group_info: Some(SRGroupInfo {
+            update_req: GroupAddRemove {
+                group: "devs".to_string(),
+                members: vec!["bob".to_string(), "alice".to_string()],
+                status: GroupStatus::Enabled,
+                is_remove: true,
+            },
+            api_version: None,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        iam_item_deletion_mark_entities(&group_remove),
+        vec!["group-member:devs:bob".to_string(), "group-member:devs:alice".to_string()]
+    );
+    group_remove
+        .group_info
+        .as_mut()
+        .expect("group info")
+        .update_req
+        .members
+        .clear();
+    assert_eq!(
+        iam_item_deletion_mark_entities(&group_remove),
+        vec!["group:devs".to_string()],
+        "a removal without members deletes the group"
+    );
+    group_remove.group_info.as_mut().expect("group info").update_req.is_remove = false;
+    assert!(iam_item_deletion_mark_entities(&group_remove).is_empty());
+
+    let mapping_clear = SRIAMItem {
+        r#type: "policy-mapping".to_string(),
+        policy_mapping: Some(SRPolicyMapping {
+            user_or_group: "alice".to_string(),
+            user_type: 0,
+            is_group: false,
+            policy: String::new(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        iam_item_deletion_mark_entities(&mapping_clear),
+        vec!["policy-mapping:alice:0:false".to_string()]
+    );
+
+    let mut user_create = user_delete_item("alice");
+    user_create.iam_user.as_mut().expect("iam user").is_delete_req = false;
+    assert!(iam_item_deletion_mark_entities(&user_create).is_empty());
+}
+
+/// Newest wins per entity, the map stays bounded by evicting the oldest
+/// mark, and the timestamps survive the state object as RFC 3339.
+#[test]
+fn test_record_iam_deletion_marks_newest_wins_and_stays_bounded() {
+    let at = |seconds: i64| OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds);
+    let mut state = SiteReplicationState::default();
+    let alice = vec!["iam-user:alice".to_string()];
+
+    assert!(record_iam_deletion_marks(&mut state, &alice, at(20)));
+    assert!(
+        !record_iam_deletion_marks(&mut state, &alice, at(10)),
+        "an older deletion does not move the mark"
+    );
+    assert!(
+        !record_iam_deletion_marks(&mut state, &alice, at(20)),
+        "a replayed deletion is not a change"
+    );
+    assert_eq!(iam_deletion_mark(&state, &alice), Some(at(20)));
+    assert!(record_iam_deletion_marks(&mut state, &alice, at(30)));
+    assert_eq!(iam_deletion_mark(&state, &alice), Some(at(30)));
+    assert_eq!(iam_deletion_mark(&state, &["iam-user:bob".to_string()]), None);
+    assert!(!record_iam_deletion_marks(&mut state, &[], at(40)));
+
+    // Fill past the bound with marks older than alice's; the oldest go first.
+    let members: Vec<String> = (0..SITE_REPLICATION_IAM_DELETION_MARK_LIMIT)
+        .map(|index| format!("group-member:devs:user-{index:04}"))
+        .collect();
+    for (index, member) in members.iter().enumerate() {
+        record_iam_deletion_marks(&mut state, std::slice::from_ref(member), at(index as i64 - 2000));
+    }
+    assert_eq!(state.iam_deletion_marks.len(), SITE_REPLICATION_IAM_DELETION_MARK_LIMIT);
+    assert_eq!(iam_deletion_mark(&state, &alice), Some(at(30)), "the newest mark survives eviction");
+    assert_eq!(iam_deletion_mark(&state, &members[..1]), None, "the oldest mark is evicted first");
+    assert_eq!(iam_deletion_mark(&state, &members[1..2]), Some(at(-1999)));
+
+    let json = serde_json::to_value(&state).expect("serialize state");
+    assert_eq!(json["iam_deletion_marks"]["iam-user:alice"], serde_json::json!("1970-01-01T00:00:30Z"));
+    let reloaded = parse_site_replication_state(&serde_json::to_vec(&state).expect("serialize state")).expect("parse state");
+    assert_eq!(reloaded.iam_deletion_marks, state.iam_deletion_marks);
+    assert!(
+        parse_site_replication_state(br#"{"name":"a","service_account_access_key":"","service_account_parent":"","peers":{},"updated_at":null,"resync_status":{}}"#)
+            .expect("state without marks")
+            .iam_deletion_marks
+            .is_empty()
+    );
+}
+
 /// A failed deletion delivery persists a replay record next to the collapsed
 /// retry entry; a fresh entry is stamped `deletions_recorded` so a later
 /// replay can settle it, and a repeated deletion of the same entity keeps the

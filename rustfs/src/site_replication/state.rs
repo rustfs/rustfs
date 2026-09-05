@@ -64,6 +64,86 @@ pub(crate) struct SiteReplicationState {
     /// newer edit that already landed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) applied_edit_generations: BTreeMap<String, u64>,
+    /// Source timestamp of the newest IAM deletion committed on this site,
+    /// keyed by the deleted entity (`iam_item_deletion_mark_entities`). A
+    /// deletion leaves no local record to judge a later item against, so this
+    /// is what lets the receive-side staleness gate reject a grant that is
+    /// older than the revoke it would otherwise undo (backlog#2291). Bounded
+    /// by [`SITE_REPLICATION_IAM_DELETION_MARK_LIMIT`]; the oldest mark is
+    /// evicted first.
+    #[serde(default, with = "rfc3339_map", skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) iam_deletion_marks: BTreeMap<String, OffsetDateTime>,
+}
+
+/// Upper bound on [`SiteReplicationState::iam_deletion_marks`].
+pub(crate) const SITE_REPLICATION_IAM_DELETION_MARK_LIMIT: usize = 1024;
+
+/// Record that deletions of `entities` with source timestamp `deleted_at`
+/// were committed here. Newest wins per entity: an older deletion never
+/// lowers a mark. Returns whether the state changed.
+pub(crate) fn record_iam_deletion_marks(
+    state: &mut SiteReplicationState,
+    entities: &[String],
+    deleted_at: OffsetDateTime,
+) -> bool {
+    let mut changed = false;
+    for entity in entities {
+        if state
+            .iam_deletion_marks
+            .get(entity)
+            .is_some_and(|existing| *existing >= deleted_at)
+        {
+            continue;
+        }
+        state.iam_deletion_marks.insert(entity.clone(), deleted_at);
+        changed = true;
+    }
+    while state.iam_deletion_marks.len() > SITE_REPLICATION_IAM_DELETION_MARK_LIMIT {
+        let Some(oldest) = state
+            .iam_deletion_marks
+            .iter()
+            .min_by_key(|(_, deleted_at)| **deleted_at)
+            .map(|(entity, _)| entity.clone())
+        else {
+            break;
+        };
+        state.iam_deletion_marks.remove(&oldest);
+    }
+    changed
+}
+
+/// Newest deletion mark among `entities`, or `None` when no deletion of any
+/// of them was recorded here. The receive-side staleness gate feeds this in
+/// as the local timestamp when the targeted record is absent.
+pub(crate) fn iam_deletion_mark(state: &SiteReplicationState, entities: &[String]) -> Option<OffsetDateTime> {
+    entities
+        .iter()
+        .filter_map(|entity| state.iam_deletion_marks.get(entity).copied())
+        .max()
+}
+
+/// RFC 3339 map values, matching the other timestamps in the state object
+/// (`time::serde::rfc3339` only applies to a single field).
+mod rfc3339_map {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+    use time::OffsetDateTime;
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(transparent)]
+    struct Stamp(#[serde(with = "time::serde::rfc3339")] OffsetDateTime);
+
+    pub(super) fn serialize<S: Serializer>(map: &BTreeMap<String, OffsetDateTime>, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(map.iter().map(|(entity, deleted_at)| (entity, Stamp(*deleted_at))))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<String, OffsetDateTime>, D::Error> {
+        let map = BTreeMap::<String, Stamp>::deserialize(deserializer)?;
+        Ok(map
+            .into_iter()
+            .map(|(entity, Stamp(deleted_at))| (entity, deleted_at))
+            .collect())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
