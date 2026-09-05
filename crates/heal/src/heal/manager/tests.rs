@@ -103,6 +103,7 @@ struct MockStorage;
 
 fn completed_retention_fixture(completed_at: SystemTime) -> CompletedHealStatus {
     CompletedHealStatus {
+        outcome: None,
         heal_type: HealType::Cluster,
         status: HealTaskStatus::Completed,
         progress: Some(HealProgress {
@@ -325,6 +326,10 @@ async fn completed_retention_cancel_wins_over_a_prepared_retry_snapshot() {
     for token in [&task_id, &alias] {
         let report = manager.get_task_report(token).await.expect("cancelled token retained");
         assert_eq!(report.status, HealTaskStatus::Cancelled);
+        assert_eq!(
+            report.outcome.as_ref().expect("cancelled outcome retained").execution,
+            crate::heal::outcome::HealExecutionOutcome::Aborted(crate::heal::outcome::HealAbortReason::Cancelled)
+        );
         assert_eq!(report.progress.expect("frozen progress").objects_scanned, 1);
     }
     assert!(!manager.retrying_heals.lock().await.contains_key(&task_id));
@@ -391,6 +396,7 @@ async fn completed_retention_scheduler_preserves_progress_aliases_and_atomic_han
             .expect("scheduler archives terminal");
         assert!(!manager.active_heals.lock().await.contains_key(&task_id));
         let expected = task.get_progress().await;
+        let expected_outcome = task.get_outcome().await;
         for token in [&task_id, &alias] {
             assert_eq!(manager.get_task_progress(token).await.expect("terminal progress query"), expected);
             let report = manager
@@ -398,6 +404,7 @@ async fn completed_retention_scheduler_preserves_progress_aliases_and_atomic_han
                 .await
                 .expect("terminal token remains queryable at handoff");
             assert_eq!(report.progress.as_ref(), Some(&expected));
+            assert_eq!(report.outcome.as_deref(), Some(&expected_outcome));
             assert!(report.result_items.is_empty());
             match outcome {
                 "success" => assert_eq!(report.status, HealTaskStatus::Completed),
@@ -1976,6 +1983,7 @@ async fn insert_retrying_request(manager: &HealManager, request: HealRequest) ->
         task_id,
         Arc::new(CompletedHealStatus {
             progress: None,
+            outcome: None,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: request.heal_type,
             status: HealTaskStatus::Retrying {
@@ -2700,6 +2708,7 @@ async fn test_retrying_completion_outranks_the_queue_for_the_same_id() {
         task_id.clone(),
         Arc::new(CompletedHealStatus {
             progress: None,
+            outcome: None,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: request.heal_type.clone(),
             status: HealTaskStatus::Retrying {
@@ -2737,6 +2746,7 @@ async fn test_get_task_status_reads_recent_completed_status() {
         "completed-token".to_string(),
         Arc::new(CompletedHealStatus {
             progress: None,
+            outcome: None,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: HealType::Bucket {
                 bucket: "bucket".to_string(),
@@ -2768,6 +2778,7 @@ async fn test_get_task_report_for_path_reads_completed_items() {
         "completed-token".to_string(),
         Arc::new(CompletedHealStatus {
             progress: None,
+            outcome: None,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: HealType::Object {
                 bucket: "bucket".to_string(),

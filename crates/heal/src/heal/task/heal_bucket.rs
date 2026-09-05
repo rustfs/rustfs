@@ -214,6 +214,7 @@ impl HealTask {
                             continue;
                         }
                         failed = failed.saturating_add(1);
+                        self.outcome.write().await.mark_untraversable();
                         if err.is_recoverable_heal() {
                             retryable = retryable.saturating_add(1);
                         } else {
@@ -260,6 +261,7 @@ impl HealTask {
 
     #[hotpath::measure]
     async fn heal_bucket_objects(&self, bucket: &str, prefix: &str) -> Result<()> {
+        let previous_progress = self.get_progress().await;
         let mut scanned = 0u64;
         let mut healed = 0u64;
         let mut failed = 0u64;
@@ -338,6 +340,14 @@ impl HealTask {
                         self.check_control_flags().await?;
                         let mut telemetry_unknown = false;
                         let object = item.name.as_str();
+                        let identity =
+                            self.outcome_identity(bucket, object, item.version_id.as_deref(), heal_opts.pool, heal_opts.set);
+                        let mut disposition = if heal_opts.dry_run {
+                            HealObjectDisposition::DryRunObserved
+                        } else {
+                            HealObjectDisposition::Unknown
+                        };
+                        let mut detail = None;
                         {
                             let mut progress = self.progress.write().await;
                             progress.set_current_object(Some(format!("{bucket}/{object}")));
@@ -380,7 +390,31 @@ impl HealTask {
                         };
 
                         if let Some(err) = error {
+                            match err {
+                                Error::TaskCancelled | Error::TaskTimeout => {
+                                    let disposition = if matches!(err, Error::TaskCancelled) {
+                                        HealObjectDisposition::Cancelled
+                                    } else {
+                                        HealObjectDisposition::Deferred {
+                                            reason: HealDeferredReason::Deadline,
+                                            retry_not_before: None,
+                                        }
+                                    };
+                                    self.outcome.write().await.record(HealObjectOutcome {
+                                        identity,
+                                        disposition,
+                                        detail: None,
+                                    });
+                                    return Err(err);
+                                }
+                                _ => self.outcome.write().await.attempt_failed(),
+                            }
+                            detail = Some(err.to_string());
                             if Self::is_dangling_delete_grace_error(&err) {
+                                disposition = HealObjectDisposition::Deferred {
+                                    reason: HealDeferredReason::DanglingDeleteGrace,
+                                    retry_not_before: None,
+                                };
                                 telemetry_unknown |= !increment_counter(&mut skipped);
                                 warn!(
                                     target: "rustfs::heal::task",
@@ -395,6 +429,10 @@ impl HealTask {
                                     "Heal bucket object dangling cleanup deferred by grace window"
                                 );
                             } else if Self::should_skip_data_usage_cache_heal_error(bucket, object, &err) {
+                                disposition = HealObjectDisposition::Deferred {
+                                    reason: HealDeferredReason::TransientUsageCache,
+                                    retry_not_before: None,
+                                };
                                 telemetry_unknown |= !increment_counter(&mut skipped);
                                 warn!(
                                     target: "rustfs::heal::task",
@@ -425,6 +463,11 @@ impl HealTask {
                                 );
                                 retry.push(item);
                             } else {
+                                disposition = HealObjectDisposition::Failed(if err.is_recoverable_heal() {
+                                    HealFailureClass::RetryExhausted
+                                } else {
+                                    HealFailureClass::Permanent
+                                });
                                 telemetry_unknown |= !increment_counter(&mut failed);
                                 if err.is_recoverable_heal() {
                                     retryable_failed = retryable_failed.saturating_add(1);
@@ -459,8 +502,20 @@ impl HealTask {
                             continue;
                         }
 
+                        self.outcome.write().await.record(HealObjectOutcome {
+                            identity,
+                            disposition,
+                            detail,
+                        });
+
                         let mut progress = self.progress.write().await;
-                        progress.update_object_progress(scanned, healed, failed, skipped, bytes);
+                        progress.update_object_progress(
+                            previous_progress.objects_scanned.saturating_add(scanned),
+                            previous_progress.objects_healed.saturating_add(healed),
+                            previous_progress.objects_failed.saturating_add(failed),
+                            previous_progress.skipped_objects.saturating_add(skipped),
+                            previous_progress.bytes_processed.saturating_add(bytes),
+                        );
                         if telemetry_unknown {
                             progress.mark_unknown();
                         }
@@ -475,7 +530,7 @@ impl HealTask {
 
                 continuation_token = next_heal_listing_token(bucket, prefix, next_token, is_truncated)?;
                 if continuation_token.is_none() {
-                    // Truncated but no continuation token: end of listing.
+                    self.outcome.write().await.mark_untraversable();
                     break;
                 }
             }
