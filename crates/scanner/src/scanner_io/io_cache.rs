@@ -39,6 +39,12 @@ pub(super) fn prepare_scoped_set_scan(
     else {
         return None;
     };
+    // The existing cache does not bind each bucket to a durable incarnation.
+    // Listing creation times can come from volume metadata, so even Some(time)
+    // cannot prove that an unselected same-name bucket is the cached bucket.
+    if all_buckets.iter().any(|bucket| !selected_buckets.contains(&bucket.name)) {
+        return None;
+    }
     if selected_buckets.is_empty()
         || !old_cache.info.snapshot_complete
         || old_cache.info.last_update.is_none()
@@ -49,7 +55,7 @@ pub(super) fn prepare_scoped_set_scan(
         || old_cache.info.source != Some(generation.source)
         || old_cache.info.scan_plan_digest != Some(baseline_scan_plan_digest)
         || old_cache.info.cache_key_format != DATA_USAGE_CACHE_KEY_FORMAT
-        || old_cache.checked_flatten_complete_scope(DATA_USAGE_ROOT).is_none()
+        || !old_cache.has_complete_root_inventory(&old_cache.find(DATA_USAGE_ROOT)?.children)
     {
         return None;
     }
@@ -74,21 +80,12 @@ pub(super) fn prepare_scoped_set_scan(
         cache: HashMap::new(),
     };
     cache.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
-    let root_hash = crate::hash_path(DATA_USAGE_ROOT);
     let mut current_bucket_names = HashSet::with_capacity(all_buckets.len());
     for bucket in all_buckets {
         if !current_bucket_names.insert(bucket.name.as_str()) {
             return None;
         }
-        if selected_buckets.contains(&bucket.name) {
-            cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
-            continue;
-        }
-
-        let bucket_hash = crate::hash_path(&bucket.name);
-        old_cache.find(&bucket.name)?;
-        cache.copy_with_children(old_cache, &bucket_hash, &Some(root_hash.clone()));
-        cache.find(&bucket.name)?;
+        cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
     }
 
     Some(PreparedScopedSetScan {

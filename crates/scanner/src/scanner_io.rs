@@ -312,6 +312,30 @@ fn scanner_bucket_plan_digest(buckets: &[BucketInfo], activity_digest: [u8; 32])
     DataUsageScanPlanDigest(hasher.finalize().into())
 }
 
+fn scanner_bucket_inventory_is_complete(
+    all_buckets: &[BucketInfo],
+    buckets_by_source: &HashMap<DataUsageCacheSource, Vec<BucketInfo>>,
+) -> bool {
+    let inventory = all_buckets
+        .iter()
+        .map(|bucket| (bucket.name.as_str(), bucket.created))
+        .collect::<HashMap<_, _>>();
+    if inventory.len() != all_buckets.len() || inventory.keys().any(|name| name.is_empty() || *name == DATA_USAGE_ROOT) {
+        return false;
+    }
+    let mut covered = HashSet::with_capacity(inventory.len());
+    for buckets in buckets_by_source.values() {
+        let mut set_names = HashSet::with_capacity(buckets.len());
+        for bucket in buckets {
+            if !set_names.insert(bucket.name.as_str()) || inventory.get(bucket.name.as_str()) != Some(&bucket.created) {
+                return false;
+            }
+            covered.insert(bucket.name.as_str());
+        }
+    }
+    covered.len() == inventory.len()
+}
+
 fn scanner_bucket_cache_digest(
     scan_plan_digest: DataUsageScanPlanDigest,
     dirty_generation: Option<u64>,
