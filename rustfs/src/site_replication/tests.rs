@@ -811,6 +811,70 @@ fn test_bucket_make_retry_without_matching_configure_fails_closed() {
 }
 
 #[test]
+fn test_retry_drain_bounds_each_peer_round_to_one_small_request_chain() {
+    let plan = SiteReplicationBootstrapPlan {
+        iam_items: vec![SRIAMItem::default(); 3],
+        bucket_make_ops: vec![
+            "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning".to_string(),
+        ],
+        bucket_configure_ops: vec![
+            "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=configure-replication".to_string(),
+        ],
+        ..Default::default()
+    };
+    let make = RetryDrainAction::BucketOpReplay {
+        operation: SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING.to_string(),
+        bucket: "photos".to_string(),
+    };
+
+    assert!(is_lightweight_retry_drain_action(&make));
+    assert!(!is_lightweight_retry_drain_action(&RetryDrainAction::IamSnapshot));
+    assert!(!is_lightweight_retry_drain_action(&RetryDrainAction::PeerEdit));
+    assert_eq!(retry_drain_request_count(&make, Some(&plan)), 2);
+    assert!(retry_drain_request_count(&make, Some(&plan)) <= SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER);
+    assert!(
+        retry_drain_request_count(&RetryDrainAction::IamSnapshot, Some(&plan))
+            > SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER
+    );
+    assert!(
+        retry_drain_request_count(&RetryDrainAction::PeerEdit, Some(&plan)) > SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER
+    );
+}
+
+#[test]
+fn test_lightweight_bucket_retry_plan_is_targeted_and_preserves_make_options() {
+    let created_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let plan = site_replication_bucket_retry_plan_for("photos", Some(created_at), true);
+
+    assert!(plan.iam_items.is_empty());
+    assert!(plan.bucket_items.is_empty());
+    assert_eq!(plan.bucket_make_ops.len(), 1);
+    assert!(plan.bucket_make_ops[0].contains("bucket=photos"));
+    assert!(plan.bucket_make_ops[0].contains("lockEnabled=true"));
+    assert!(plan.bucket_make_ops[0].contains("createdAt="));
+    assert_eq!(plan.bucket_configure_ops.len(), 1);
+    assert!(plan.bucket_configure_ops[0].contains("operation=configure-replication"));
+}
+
+#[test]
+fn test_bucket_retry_settlement_preserves_a_newer_same_path_failure() {
+    let peer = peer("remote", "https://remote.example.com");
+    let path = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=configure-replication";
+    let observed_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let observed = drain_event("remote", path, 1, Some(observed_at));
+    let mut queue = vec![observed.clone()];
+
+    queue[0].updated_at = Some(observed_at + time::Duration::seconds(1));
+    queue[0].retry_count += 1;
+    assert_eq!(settle_observed_site_replication_retry_event(&mut queue, &peer, &observed), 0);
+    assert_eq!(queue.len(), 1, "a newer failure must survive stale settlement");
+
+    let current = queue[0].clone();
+    assert_eq!(settle_observed_site_replication_retry_event(&mut queue, &peer, &current), 1);
+    assert!(queue.is_empty());
+}
+
+#[test]
 fn test_reachable_probe_promotion_is_fenced_by_the_observed_event() {
     let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
     let path = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning";

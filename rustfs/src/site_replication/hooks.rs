@@ -329,6 +329,47 @@ pub(crate) fn site_replication_bootstrap_plan(info: &SRInfo) -> S3Result<SiteRep
     Ok(plan)
 }
 
+/// Build only the two bucket operations needed by the lightweight retry
+/// drain. The full bootstrap plan scans every bucket and IAM record; doing
+/// that on a 30-second recovery cadence would make lifecycle admission scale
+/// with the whole site instead of the one queued bucket.
+pub(crate) fn site_replication_bucket_retry_plan_for(
+    bucket: &str,
+    created_at: Option<OffsetDateTime>,
+    lock_enabled: bool,
+) -> SiteReplicationBootstrapPlan {
+    let bucket = SRBucketInfo {
+        bucket: bucket.to_string(),
+        created_at,
+        object_lock_config: lock_enabled.then(String::new),
+        ..Default::default()
+    };
+    SiteReplicationBootstrapPlan {
+        bucket_make_ops: vec![bootstrap_bucket_make_op_path(&bucket)],
+        bucket_configure_ops: vec![bootstrap_bucket_op_path(
+            &bucket.bucket,
+            SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION,
+        )],
+        ..Default::default()
+    }
+}
+
+pub(crate) async fn site_replication_bucket_retry_plan(bucket: &str) -> S3Result<SiteReplicationBootstrapPlan> {
+    let Some(store) = current_object_store_handle() else {
+        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+    };
+    let bucket_info = match store.get_bucket_info(bucket, &BucketOptions::default()).await {
+        Ok(bucket_info) => bucket_info,
+        Err(err) if is_err_bucket_not_found(&err) => return Ok(SiteReplicationBootstrapPlan::default()),
+        Err(err) => return Err(ApiError::from(err).into()),
+    };
+    Ok(site_replication_bucket_retry_plan_for(
+        bucket,
+        bucket_info.created,
+        bucket_info.object_locking,
+    ))
+}
+
 pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {
     let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
     let runtime = {

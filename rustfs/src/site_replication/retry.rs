@@ -209,6 +209,20 @@ pub(crate) fn settle_site_replication_retry_events(
     before.saturating_sub(queue.len())
 }
 
+pub(crate) fn settle_observed_site_replication_retry_event(
+    queue: &mut Vec<SiteReplicationRetryEvent>,
+    peer: &PeerInfo,
+    observed: &SiteReplicationRetryEvent,
+) -> usize {
+    let before = queue.len();
+    queue.retain(|current| {
+        !(retry_event_matches(current, peer, &observed.path)
+            && current.id == observed.id
+            && current.updated_at == observed.updated_at)
+    });
+    before.saturating_sub(queue.len())
+}
+
 pub(crate) fn upsert_site_replication_retry_event(
     queue: &mut Vec<SiteReplicationRetryEvent>,
     peer: &PeerInfo,
@@ -809,8 +823,16 @@ pub(crate) const SITE_REPLICATION_RETRY_DRAIN_BASE_BACKOFF_SECS: i64 = 600;
 /// converges at the next tick instead of waiting out this ceiling.
 pub(crate) const SITE_REPLICATION_RETRY_DRAIN_MAX_BACKOFF_SECS: i64 = 86_400;
 
-/// What the background drain may do for one retry event. Everything not
-/// representable here is operator territory (manual repair).
+/// Keep a background drain round below the lifecycle lock's 30-second wait
+/// bound. Peer requests may each consume the full 10-second request timeout,
+/// so a round may automatically replay only a small, indivisible request
+/// chain. Larger snapshots and topology edits remain queued for operator
+/// repair instead of monopolizing lifecycle admission.
+pub(crate) const SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER: usize = 2;
+
+/// A replay shape the retry machinery can derive from persisted state. The
+/// lightweight 30-second scheduler admits only bounded bucket-op chains;
+/// snapshot and topology-wide work remains operator territory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RetryDrainAction {
     /// Constant-path IAM item deliveries collapse into one queue entry per
@@ -825,6 +847,10 @@ pub(crate) enum RetryDrainAction {
     BucketOpReplay { operation: String, bucket: String },
     /// Re-send the current peer records under a fresh edit generation.
     PeerEdit,
+}
+
+pub(crate) fn is_lightweight_retry_drain_action(action: &RetryDrainAction) -> bool {
+    matches!(action, RetryDrainAction::BucketOpReplay { .. })
 }
 
 #[derive(Clone)]
@@ -1148,6 +1174,15 @@ pub(crate) fn bucket_op_retry_replay_tasks<'a>(
     }
 }
 
+pub(crate) fn retry_drain_request_count(action: &RetryDrainAction, plan: Option<&SiteReplicationBootstrapPlan>) -> usize {
+    match action {
+        RetryDrainAction::BucketOpReplay { operation, bucket } => plan
+            .and_then(|plan| bucket_op_retry_replay_tasks(plan, operation, bucket).ok())
+            .map_or(0, |tasks| tasks.len()),
+        RetryDrainAction::IamSnapshot | RetryDrainAction::BucketMetadataSnapshot | RetryDrainAction::PeerEdit => usize::MAX,
+    }
+}
+
 /// A collapsed retry event after a stable snapshot resend is escalated with
 /// this marker instead of being cleared: the snapshot contains no task for a
 /// failed deletion, so remote absence remains operator-visible. Collapsed
@@ -1457,6 +1492,86 @@ pub(crate) async fn drain_site_replication_retry_queue() {
     }
 }
 
+/// Fast outage-recovery pass used by the 30-second scheduler. It limits work
+/// to one bounded bucket-op chain per peer, builds no site-wide snapshot, and
+/// runs reachability probes concurrently with replay for other peers.
+pub(crate) async fn drain_site_replication_retry_queue_lightweight() {
+    if let Err(err) = drain_site_replication_retry_queue_lightweight_inner().await {
+        warn!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "retry_drain_failed",
+            error = ?err,
+            "admin site replication state"
+        );
+    }
+}
+
+async fn drain_site_replication_retry_queue_lightweight_inner() -> S3Result<()> {
+    let Some(runtime) = runtime_site_replication_targets().await? else {
+        return Ok(());
+    };
+    log_site_replication_retry_liabilities(&runtime.state);
+    let now = OffsetDateTime::now_utc();
+    let mut actionable = actionable_site_replication_retry_events(&runtime.state, now);
+    let mut deferred = deferred_site_replication_retry_events(&runtime.state, now);
+    actionable.retain(|event| {
+        classify_site_replication_retry_event(event).is_some_and(|action| is_lightweight_retry_drain_action(&action))
+    });
+    deferred.retain(|event| {
+        classify_site_replication_retry_event(event).is_some_and(|action| is_lightweight_retry_drain_action(&action))
+    });
+    if actionable.is_empty() && deferred.is_empty() {
+        return Ok(());
+    }
+    let Some(store) = current_object_store_handle() else {
+        return Ok(());
+    };
+    if runtime.state.pending_endpoint_refresh.is_some()
+        || runtime.state.pending_remove.is_some()
+        || runtime.state.pending_rotation.is_some()
+    {
+        return Ok(());
+    }
+
+    with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
+        let Some(runtime) = runtime_site_replication_targets().await? else {
+            return Ok(());
+        };
+        if runtime.state.pending_endpoint_refresh.is_some()
+            || runtime.state.pending_remove.is_some()
+            || runtime.state.pending_rotation.is_some()
+        {
+            return Ok(());
+        }
+        let now = OffsetDateTime::now_utc();
+        let mut actionable = actionable_site_replication_retry_events(&runtime.state, now);
+        let mut deferred = deferred_site_replication_retry_events(&runtime.state, now);
+        actionable.retain(|event| {
+            classify_site_replication_retry_event(event).is_some_and(|action| is_lightweight_retry_drain_action(&action))
+        });
+        deferred.retain(|event| {
+            classify_site_replication_retry_event(event).is_some_and(|action| is_lightweight_retry_drain_action(&action))
+        });
+
+        let runtime = Arc::new(runtime);
+        match (actionable.is_empty(), deferred.is_empty()) {
+            (true, true) => Ok(()),
+            (true, false) => promote_reachable_deferred_retry_events(&runtime, &actionable, deferred).await,
+            (false, true) => drain_site_replication_retry_queue_lightweight_locked(runtime, actionable).await,
+            (false, false) => {
+                let probe = promote_reachable_deferred_retry_events(&runtime, &actionable, deferred);
+                let replay = drain_site_replication_retry_queue_lightweight_locked(Arc::clone(&runtime), actionable.clone());
+                tokio::try_join!(probe, replay)?;
+                Ok(())
+            }
+        }
+    })
+    .await
+    .map_err(ApiError::from)?
+}
+
 pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
     let Some(runtime) = runtime_site_replication_targets().await? else {
         return Ok(());
@@ -1516,6 +1631,82 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
     })
     .await
     .map_err(ApiError::from)?
+}
+
+async fn drain_site_replication_retry_queue_lightweight_locked(
+    runtime: Arc<SiteReplicationRuntime>,
+    events: Vec<SiteReplicationRetryEvent>,
+) -> S3Result<()> {
+    let mut events_by_peer: BTreeMap<String, Vec<SiteReplicationRetryEvent>> = BTreeMap::new();
+    for event in events {
+        events_by_peer
+            .entry(event.peer_deployment_id.clone())
+            .or_default()
+            .push(event);
+    }
+
+    let peer_replays = events_by_peer.into_iter().filter_map(|(deployment_id, peer_events)| {
+        let peer = runtime.state.peers.get(&deployment_id)?.clone();
+        if deployment_id == runtime.local_peer.deployment_id
+            || same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
+        {
+            return None;
+        }
+        let runtime = Arc::clone(&runtime);
+        Some(async move {
+            let Some((event, action, bucket)) = peer_events.into_iter().find_map(|event| {
+                let action = classify_site_replication_retry_event(&event)?;
+                let bucket = match &action {
+                    RetryDrainAction::BucketOpReplay { bucket, .. } => bucket.clone(),
+                    _ => return None,
+                };
+                Some((event, action, bucket))
+            }) else {
+                return (0, 0);
+            };
+            let plan = match site_replication_bucket_retry_plan(&bucket).await {
+                Ok(plan) => plan,
+                Err(err) => {
+                    enqueue_site_replication_retry_event(&peer, &event.path, &err).await;
+                    return (0, 1);
+                }
+            };
+            if retry_drain_request_count(&action, Some(&plan)) > SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER {
+                return (0, 0);
+            }
+            let transport = match PeerTransport::for_runtime_peer(&peer).await {
+                Ok(transport) => transport,
+                Err(err) => {
+                    enqueue_site_replication_retry_event(&peer, &event.path, &err).await;
+                    return (0, 1);
+                }
+            };
+            match drain_one_site_replication_retry_event(&runtime, &peer, &transport, &event, action, Some(&plan)).await {
+                Ok(true) => (1, 0),
+                Ok(false) => (0, 0),
+                Err(_) => (0, 1),
+            }
+        })
+    });
+
+    let mut settled = 0usize;
+    let mut failures = 0usize;
+    for (peer_settled, peer_failures) in futures::future::join_all(peer_replays).await {
+        settled += peer_settled;
+        failures += peer_failures;
+    }
+    if settled > 0 || failures > 0 {
+        info!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "retry_drain_settled",
+            settled,
+            failures,
+            "admin site replication state"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) async fn drain_site_replication_retry_queue_locked(
@@ -1703,8 +1894,7 @@ pub(crate) async fn drain_one_site_replication_retry_event(
             if tasks.is_empty() {
                 // The bucket left the plan (deleted, or replication no longer
                 // configured): the recorded intent is stale, settle it.
-                dequeue_site_replication_retry_event(peer, &event.path).await;
-                return Ok(true);
+                return Ok(dequeue_observed_site_replication_retry_event(peer, event).await);
             }
             for task in &tasks {
                 match send_retry_task_if_peer_current(peer, task, transport, access_key, secret_key).await {
@@ -1716,8 +1906,7 @@ pub(crate) async fn drain_one_site_replication_retry_event(
                     }
                 }
             }
-            dequeue_site_replication_retry_event(peer, &event.path).await;
-            Ok(true)
+            Ok(dequeue_observed_site_replication_retry_event(peer, event).await)
         }
         RetryDrainAction::PeerEdit => {
             // The recorded generation is stale by definition — the receiver
@@ -1771,6 +1960,39 @@ pub(crate) async fn drain_one_site_replication_retry_event(
 /// avoiding unnecessary I/O on the common path.
 pub(crate) async fn dequeue_site_replication_retry_event(peer: &PeerInfo, path: &str) {
     dequeue_site_replication_retry_event_for_generation(peer, path, None).await
+}
+
+pub(crate) async fn dequeue_observed_site_replication_retry_event(peer: &PeerInfo, observed: &SiteReplicationRetryEvent) -> bool {
+    let result = async {
+        let mut probe = load_site_replication_state().await?;
+        if settle_observed_site_replication_retry_event(&mut probe.retry_queue, peer, observed) == 0 {
+            return Ok(false);
+        }
+        let peer_owned = peer.clone();
+        let observed_owned = observed.clone();
+        update_site_replication_state(move |state| {
+            Ok(settle_observed_site_replication_retry_event(&mut state.retry_queue, &peer_owned, &observed_owned) > 0)
+        })
+        .await
+    }
+    .await;
+
+    match result {
+        Ok(settled) => settled,
+        Err(err) => {
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                peer = %peer.endpoint,
+                deployment_id = %peer.deployment_id,
+                path = %observed.path,
+                error = ?err,
+                "failed to dequeue observed site replication retry event"
+            );
+            false
+        }
+    }
 }
 
 pub(crate) async fn dequeue_site_replication_retry_event_for_generation(peer: &PeerInfo, path: &str, generation: Option<u64>) {

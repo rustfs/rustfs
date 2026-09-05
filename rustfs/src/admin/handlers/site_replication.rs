@@ -1839,11 +1839,13 @@ fn reconcile_site_replication_retry_drain() -> std::pin::Pin<Box<dyn std::future
             }
             Err(_) => return,
         }
-        // Retry sends re-check membership under the bucket-op read lock for
-        // each bounded peer request. Do not hold the lifecycle guard across
-        // an arbitrarily large snapshot replay.
+        // Admission above observes a lifecycle-stable state. The lightweight
+        // drain itself handles only idempotent bucket setup, reloads state
+        // under the distributed repair lock, and shares that lock with bucket
+        // deletion. Do not hold this process-local guard across peer I/O: an
+        // outage recovery must not make admin add/edit/remove time out.
         drop(lifecycle);
-        drain_site_replication_retry_queue().await;
+        drain_site_replication_retry_queue_lightweight().await;
     })
 }
 
