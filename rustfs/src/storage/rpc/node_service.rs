@@ -4535,7 +4535,7 @@ mod tests {
         use crate::storage::storage_api::{
             ECStore,
             ecstore_disk::{DiskAPI, RUSTFS_META_BUCKET, ReadOptions},
-            init_local_disks_with_instance_ctx, new_instance_ctx,
+            init_local_disks_with_instance_ctx, new_instance_ctx, read_config_no_lock,
         };
         use rustfs_filemeta::{FileInfo, ObjectPartInfo};
         use tokio_util::sync::CancellationToken;
@@ -4585,6 +4585,30 @@ mod tests {
             ))
         }
 
+        async fn internal_snapshot(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+            let mut snapshot = std::collections::BTreeMap::new();
+            let mut directories = (0..4)
+                .map(|index| std::path::PathBuf::from(format!("disk{index}/{RUSTFS_META_BUCKET}")))
+                .collect::<Vec<_>>();
+            while let Some(relative) = directories.pop() {
+                let mut entries = tokio::fs::read_dir(root.join(&relative))
+                    .await
+                    .expect("read internal snapshot directory");
+                snapshot.insert(relative.clone(), None);
+                while let Some(entry) = entries.next_entry().await.expect("read internal snapshot entry") {
+                    let path = relative.join(entry.file_name());
+                    let file_type = entry.file_type().await.expect("read internal snapshot entry type");
+                    if file_type.is_dir() {
+                        directories.push(path);
+                    } else {
+                        assert!(file_type.is_file(), "fixture snapshot must contain only directories and regular files");
+                        snapshot.insert(path, Some(tokio::fs::read(entry.path()).await.expect("read snapshot file bytes")));
+                    }
+                }
+            }
+            snapshot
+        }
+
         fn file_info(object: &str, version: Uuid, body: Bytes) -> FileInfo {
             let mut fi = FileInfo::new(object, 1, 0);
             fi.erasure.index = 1;
@@ -4617,19 +4641,48 @@ mod tests {
             let published = crate::runtime_sources::publish_test_app_context(context_b.clone());
             assert!(Arc::ptr_eq(&published, &context_b), "B must win the process AppContext publication");
 
-            // Copy the actual initialized format set, without editing IDs. The
-            // request UUID must identify an active physical disk in BOTH stores.
-            for index in 0..4 {
-                let relative = format!("disk{index}/{RUSTFS_META_BUCKET}/format.json");
-                let target = root_a.path().join(&relative);
-                tokio::fs::create_dir_all(target.parent().expect("format parent"))
-                    .await
-                    .expect("create A format directory");
-                tokio::fs::copy(root_b.path().join(&relative), target)
-                    .await
-                    .expect("copy the real disk format to A");
+            // Existing formats require their committed pool metadata on restart.
+            // Copy the complete internal trees, including erasure part data,
+            // without editing disk IDs, cluster identity, epochs or pool topology.
+            super::timeout(Duration::from_secs(10), async {
+                while store_b.scanner_data_usage_publication_blocked().await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("B startup namespace commits must drain before its snapshot");
+            let snapshot_generation = store_b.scanner_namespace_mutation_generation();
+            let pool_config = read_config_no_lock(store_b.clone(), "pool.bin")
+                .await
+                .expect("read B's actually committed pool metadata");
+            let pool_identity = read_config_no_lock(store_b.clone(), "pool.bin.identity")
+                .await
+                .expect("read B's actually committed pool identity");
+            let snapshot = internal_snapshot(root_b.path()).await;
+            for (relative, contents) in &snapshot {
+                let target = root_a.path().join(relative);
+                match contents {
+                    None => tokio::fs::create_dir_all(target).await.expect("copy internal directory"),
+                    Some(bytes) => tokio::fs::write(target, bytes).await.expect("copy complete internal file"),
+                }
             }
+            assert_eq!(internal_snapshot(root_a.path()).await, snapshot, "A must receive the complete physical snapshot");
+            assert_eq!(internal_snapshot(root_b.path()).await, snapshot, "B's source snapshot must remain unchanged");
+            assert!(!store_b.scanner_data_usage_publication_blocked().await);
+            assert_eq!(store_b.scanner_namespace_mutation_generation(), snapshot_generation);
             let store_a = build_store(root_a.path()).await;
+            assert_eq!(
+                read_config_no_lock(store_a.clone(), "pool.bin").await.expect("read A's restarted pool metadata"),
+                pool_config,
+                "A must load the same committed topology without a bootstrap rewrite"
+            );
+            assert_eq!(
+                read_config_no_lock(store_a.clone(), "pool.bin.identity")
+                    .await
+                    .expect("read A's restarted pool identity"),
+                pool_identity,
+                "A must preserve the initialized cluster identity and epoch"
+            );
             let service = make_server_for_context(Some(context(&store_a).await));
             assert!(Arc::ptr_eq(&service.resolve_object_store().expect("captured store"), &store_a));
             assert!(Arc::ptr_eq(
