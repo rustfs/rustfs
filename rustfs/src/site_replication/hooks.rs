@@ -434,30 +434,33 @@ pub(crate) async fn broadcast_site_replication_make_bucket(
     broadcast_site_replication_json_using_runtime(runtime, &configure_path, &serde_json::json!({})).await
 }
 
-async fn broadcast_site_replication_destructive_bucket_op(
-    runtime: &SiteReplicationRuntime,
-    peers: &[PeerInfo],
-    path: &str,
-) -> S3Result<()> {
-    let sends = peers.iter().map(|peer| async move {
-        let result = async {
-            let transport = PeerTransport::for_runtime_peer(peer).await?;
-            PeerAdminRequest::put(&transport.connection, path, &runtime.state.service_account_access_key)
-                .with_client(&transport.client)
-                .send(&runtime.service_account_secret_key, &serde_json::json!({}))
-                .await
+async fn broadcast_site_replication_destructive_bucket_op(runtime: &SiteReplicationRuntime, path: &str) -> S3Result<()> {
+    let sends = runtime.state.peers.values().filter_map(|peer| {
+        if peer.deployment_id == runtime.local_peer.deployment_id
+            || same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
+        {
+            return None;
         }
-        .await;
-        match result {
-            Ok(_) => {
-                dequeue_site_replication_destructive_retry_events(peer, path).await;
-                None
+        Some(async move {
+            let result = async {
+                let transport = PeerTransport::for_runtime_peer(peer).await?;
+                PeerAdminRequest::put(&transport.connection, path, &runtime.state.service_account_access_key)
+                    .with_client(&transport.client)
+                    .send(&runtime.service_account_secret_key, &serde_json::json!({}))
+                    .await
             }
-            Err(err) => {
-                enqueue_site_replication_retry_event(peer, path, &err).await;
-                Some(err)
+            .await;
+            match result {
+                Ok(_) => {
+                    dequeue_site_replication_retry_event(peer, path).await;
+                    None
+                }
+                Err(err) => {
+                    enqueue_site_replication_retry_event(peer, path, &err).await;
+                    Some(err)
+                }
             }
-        }
+        })
     });
     futures::future::join_all(sends)
         .await
@@ -467,43 +470,25 @@ async fn broadcast_site_replication_destructive_bucket_op(
         .map_or(Ok(()), Err)
 }
 
-pub(crate) struct SiteReplicationDeleteBucketIntent {
-    runtime: SiteReplicationRuntime,
-    peers: Vec<PeerInfo>,
-    reserved_peers: Vec<PeerInfo>,
-    path: String,
-}
-
-impl SiteReplicationDeleteBucketIntent {
-    pub(crate) fn topology_updated_at(&self) -> Option<OffsetDateTime> {
-        self.runtime.state.updated_at
-    }
-}
-
-pub(crate) async fn prepare_site_replication_delete_bucket_hook(
-    bucket: &str,
-    force_delete: bool,
-) -> S3Result<Option<SiteReplicationDeleteBucketIntent>> {
+pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: bool) -> S3Result<()> {
     let operation = if force_delete {
         "force-delete-bucket"
     } else {
         "delete-bucket"
     };
-    // Keep concurrent delete reservations independent so rolling back one
-    // failed local delete cannot clear another request's durable intent.
-    let retry_intent = Uuid::new_v4().to_string();
     let path = format!(
         "/rustfs/admin/v3/site-replication/peer/bucket-ops?{}",
         form_urlencoded::Serializer::new(String::new())
             .append_pair("bucket", bucket)
             .append_pair("operation", operation)
-            .append_pair("retryIntent", &retry_intent)
             .finish()
     );
     let Some(runtime) = runtime_site_replication_targets().await? else {
-        return Ok(None);
+        return Ok(());
     };
-    let peers = runtime
+    let store =
+        current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
+    let retry_peers = runtime
         .state
         .peers
         .values()
@@ -513,33 +498,22 @@ pub(crate) async fn prepare_site_replication_delete_bucket_hook(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let reserved_peers = prequeue_site_replication_destructive_events(&peers, &path).await?;
-    Ok(Some(SiteReplicationDeleteBucketIntent {
-        runtime,
-        peers,
-        reserved_peers,
-        path,
-    }))
-}
-
-pub(crate) async fn cancel_site_replication_delete_bucket_hook(intent: &SiteReplicationDeleteBucketIntent) {
-    for peer in &intent.reserved_peers {
-        dequeue_site_replication_retry_event(peer, &intent.path).await;
+    let retry_path = path.clone();
+    let result =
+        with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
+            broadcast_site_replication_destructive_bucket_op(&runtime, &path).await
+        })
+        .await;
+    match result {
+        Ok(result) => result,
+        Err(err) => {
+            let err: S3Error = ApiError::from(err).into();
+            for peer in &retry_peers {
+                enqueue_site_replication_retry_event(peer, &retry_path, &err).await;
+            }
+            Err(err)
+        }
     }
-}
-
-pub(crate) async fn commit_site_replication_delete_bucket_hook(intent: &SiteReplicationDeleteBucketIntent) -> S3Result<()> {
-    commit_site_replication_destructive_events(&intent.peers, &intent.path).await
-}
-
-pub(crate) async fn finish_site_replication_delete_bucket_hook(intent: SiteReplicationDeleteBucketIntent) -> S3Result<()> {
-    let store =
-        current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
-    with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
-        broadcast_site_replication_destructive_bucket_op(&intent.runtime, &intent.peers, &intent.path).await
-    })
-    .await
-    .map_err(ApiError::from)?
 }
 
 pub async fn site_replication_bucket_meta_hook(mut item: SRBucketMeta) -> S3Result<()> {

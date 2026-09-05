@@ -61,13 +61,6 @@ pub(crate) fn retry_event_matches(event: &SiteReplicationRetryEvent, peer: &Peer
     (event.peer_deployment_id == peer.deployment_id || event.peer_endpoint == peer.endpoint) && event.path == path
 }
 
-pub(crate) fn retry_event_is_destructive_bucket_op(event: &SiteReplicationRetryEvent) -> bool {
-    matches!(
-        retry_bucket_operation(&event.path).as_deref(),
-        Some("delete-bucket" | "force-delete-bucket" | "purge-deleted-bucket")
-    )
-}
-
 pub(crate) const SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH: &str = "internal:retry-snapshot:iam";
 
 pub(crate) const SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH: &str = "internal:retry-snapshot:bucket-metadata";
@@ -260,12 +253,8 @@ pub(crate) fn upsert_site_replication_retry_event(
         deletions_recorded: false,
     });
     if queue.len() > SITE_REPLICATION_RETRY_QUEUE_LIMIT {
-        while queue.len() > SITE_REPLICATION_RETRY_QUEUE_LIMIT {
-            let Some(index) = queue.iter().position(|event| !retry_event_is_destructive_bucket_op(event)) else {
-                break;
-            };
-            queue.remove(index);
-        }
+        let overflow = queue.len() - SITE_REPLICATION_RETRY_QUEUE_LIMIT;
+        queue.drain(0..overflow);
     }
 }
 
@@ -294,138 +283,6 @@ pub(crate) fn retry_stats_for_state(state: &SiteReplicationState) -> Option<SRRe
 
 pub(crate) async fn enqueue_site_replication_retry_event(peer: &PeerInfo, path: &str, error: &S3Error) {
     enqueue_site_replication_retry_event_for_generation(peer, path, error, None).await
-}
-
-pub(crate) fn prequeue_site_replication_destructive_events_in_state(
-    state: &mut SiteReplicationState,
-    peers: &[PeerInfo],
-    path: &str,
-) -> S3Result<Vec<PeerInfo>> {
-    let missing = peers
-        .iter()
-        .filter(|peer| {
-            state.peers.contains_key(&peer.deployment_id)
-                && !state.retry_queue.iter().any(|event| retry_event_matches(event, peer, path))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if state.retry_queue.len().saturating_add(missing.len()) > SITE_REPLICATION_RETRY_QUEUE_LIMIT {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InternalError,
-            "site replication retry queue is full; destructive operation was not reserved".to_string(),
-        ));
-    }
-    for peer in &missing {
-        upsert_site_replication_retry_event(
-            &mut state.retry_queue,
-            peer,
-            path,
-            "destructive site replication bucket operation pending delivery",
-            None,
-        );
-        if let Some(event) = state
-            .retry_queue
-            .iter_mut()
-            .find(|event| retry_event_matches(event, peer, path))
-        {
-            // Zero is a durable reservation that has not yet crossed the
-            // local-delete commit point. A successful older delete must not
-            // settle it.
-            event.edit_generation = Some(0);
-        }
-    }
-    Ok(missing)
-}
-
-pub(crate) fn settle_site_replication_destructive_retry_events(
-    queue: &mut Vec<SiteReplicationRetryEvent>,
-    peer: &PeerInfo,
-    path: &str,
-) -> usize {
-    let Some(bucket) = retry_bucket_name(path) else {
-        return 0;
-    };
-    let Some(fence) = queue
-        .iter()
-        .find(|event| retry_event_matches(event, peer, path))
-        .and_then(|event| event.edit_generation)
-        .filter(|generation| *generation > 0)
-    else {
-        return 0;
-    };
-    let before = queue.len();
-    queue.retain(|event| {
-        let within_fence = event
-            .edit_generation
-            .is_none_or(|generation| generation > 0 && generation <= fence);
-        let remove = within_fence
-            && retry_event_matches_peer(event, peer)
-            && retry_event_is_destructive_bucket_op(event)
-            && retry_bucket_name(&event.path).as_deref() == Some(bucket.as_str());
-        !remove
-    });
-    before.saturating_sub(queue.len())
-}
-
-pub(crate) async fn commit_site_replication_destructive_events(peers: &[PeerInfo], path: &str) -> S3Result<()> {
-    let peers = peers.to_vec();
-    let path = path.to_string();
-    update_site_replication_state(move |state| {
-        let generation = next_peer_edit_generation(state);
-        for peer in &peers {
-            let event = state
-                .retry_queue
-                .iter_mut()
-                .find(|event| retry_event_matches(event, peer, &path))
-                .ok_or_else(|| {
-                    S3Error::with_message(
-                        S3ErrorCode::InternalError,
-                        "destructive site replication reservation is missing at local commit".to_string(),
-                    )
-                })?;
-            event.edit_generation = Some(generation);
-        }
-        Ok(())
-    })
-    .await
-}
-
-fn retry_event_matches_peer(event: &SiteReplicationRetryEvent, peer: &PeerInfo) -> bool {
-    event.peer_deployment_id == peer.deployment_id || event.peer_endpoint == peer.endpoint
-}
-
-pub(crate) async fn dequeue_site_replication_destructive_retry_events(peer: &PeerInfo, path: &str) {
-    let peer_owned = peer.clone();
-    let path_owned = path.to_string();
-    let result = update_site_replication_state_when_changed(move |state| {
-        let removed = settle_site_replication_destructive_retry_events(&mut state.retry_queue, &peer_owned, &path_owned);
-        Ok(if removed == 0 {
-            StateCommit::Unchanged(())
-        } else {
-            StateCommit::Changed(())
-        })
-    })
-    .await;
-    if let Err(err) = result {
-        warn!(
-            component = LOG_COMPONENT_ADMIN,
-            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-            peer = %peer.endpoint,
-            path,
-            error = ?err,
-            "failed to settle destructive site replication retry events"
-        );
-    }
-}
-
-pub(crate) async fn prequeue_site_replication_destructive_events(peers: &[PeerInfo], path: &str) -> S3Result<Vec<PeerInfo>> {
-    if peers.is_empty() {
-        return Ok(Vec::new());
-    }
-    let peers = peers.to_vec();
-    let path = path.to_string();
-    update_site_replication_state(move |state| prequeue_site_replication_destructive_events_in_state(state, &peers, &path)).await
 }
 
 pub(crate) async fn enqueue_site_replication_retry_event_for_generation(

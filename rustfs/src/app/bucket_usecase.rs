@@ -75,9 +75,7 @@ use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::shared_types::RemoteAddr;
 use crate::site_replication::{
-    cancel_site_replication_delete_bucket_hook, commit_site_replication_delete_bucket_hook,
-    finish_site_replication_delete_bucket_hook, prepare_site_replication_delete_bucket_hook, site_replication_bucket_meta_hook,
-    site_replication_make_bucket_hook, with_site_replication_state_read_lock,
+    site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
 };
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::StatusCode;
@@ -1399,69 +1397,16 @@ impl DefaultBucketUsecase {
             authorize_request(&mut req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
         }
 
-        let replication_delete_intent = prepare_site_replication_delete_bucket_hook(&input.bucket, force).await?;
-        let delete_result = if let Some(intent) = replication_delete_intent.as_ref() {
-            let expected_topology = intent.topology_updated_at();
-            let delete_store = store.clone();
-            let delete_bucket = input.bucket.clone();
-            with_site_replication_state_read_lock(move |state| async move {
-                if state.updated_at != expected_topology {
-                    return Err(s3_error!(
-                        ServiceUnavailable,
-                        "site replication topology changed during bucket deletion; retry"
-                    ));
-                }
-                delete_store
-                    .delete_bucket(
-                        &delete_bucket,
-                        &DeleteBucketOptions {
-                            force,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(ApiError::from)
-                    .map_err(Into::into)
-            })
+        store
+            .delete_bucket(
+                &input.bucket,
+                &DeleteBucketOptions {
+                    force,
+                    ..Default::default()
+                },
+            )
             .await
-        } else {
-            store
-                .delete_bucket(
-                    &input.bucket,
-                    &DeleteBucketOptions {
-                        force,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(ApiError::from)
-                .map_err(Into::into)
-        };
-        if let Err(err) = delete_result {
-            if let Some(intent) = replication_delete_intent.as_ref() {
-                cancel_site_replication_delete_bucket_hook(intent).await;
-            }
-            return Err(err.into());
-        }
-
-        let replication_delete_intent = if let Some(intent) = replication_delete_intent {
-            match commit_site_replication_delete_bucket_hook(&intent).await {
-                Ok(()) => Some(intent),
-                Err(err) => {
-                    warn!(
-                        component = LOG_COMPONENT_APP,
-                        subsystem = LOG_SUBSYSTEM_BUCKET,
-                        result = "site_replication_delete_intent_commit_failed",
-                        bucket = %input.bucket,
-                        error = ?err,
-                        "bucket deletion completed with a pending site replication intent"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+            .map_err(ApiError::from)?;
 
         // Drop every cached object body for the now-deleted bucket so dead
         // bytes do not sit resident until TTL. Covers both the normal and the
@@ -1476,9 +1421,7 @@ impl DefaultBucketUsecase {
         // Re-evaluate lifecycle and replication after bucket removal.
         rustfs_scanner::record_scanner_maintenance_change(&input.bucket);
 
-        if let Some(intent) = replication_delete_intent
-            && let Err(err) = finish_site_replication_delete_bucket_hook(intent).await
-        {
+        if let Err(err) = site_replication_delete_bucket_hook(&input.bucket, force).await {
             warn!(bucket = %input.bucket, error = ?err, "site replication delete bucket hook failed");
         }
 
