@@ -30,6 +30,10 @@ pub const ON_DEMAND_MIGRATION_CONFIG_VERSION: u32 = 1;
 const REDACTED: &str = "REDACTED";
 const AUTO_REGION: &str = "auto";
 const AUTO_REGION_FALLBACK: &str = "us-east-1";
+/// Public Azure Blob host suffix; the account name is the first label.
+pub const AZURE_BLOB_SUFFIX: &str = "blob.core.windows.net";
+/// Public Google Cloud Storage endpoint for the native provider.
+pub const GCS_DEFAULT_ENDPOINT: &str = "https://storage.googleapis.com";
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
@@ -75,14 +79,25 @@ pub struct SourceConfig {
     pub bucket: String,
     #[serde(default)]
     pub path_style: PathStyle,
-    /// `None` means anonymous access to a public source bucket.
+    /// `None` means anonymous access to a public source bucket. Only the
+    /// SigV4 providers read it; `azure` and `gcs_native` carry their own
+    /// credentials in `azure` / `gcs`.
     #[serde(default)]
     pub credentials: Option<SourceCredentials>,
     #[serde(default)]
     pub tls: TlsConfig,
+    /// Required for [`Provider::Azure`] and rejected for every other
+    /// provider.
+    #[serde(default)]
+    pub azure: Option<AzureSourceConfig>,
+    /// Required for [`Provider::GcsNative`] and rejected for every other
+    /// provider. [`Provider::Gcs`] keeps using `credentials` because it
+    /// speaks the S3 interoperability API.
+    #[serde(default)]
+    pub gcs: Option<GcsSourceConfig>,
 }
 
-/// Source vendor family. `azure` is deliberately absent from this version.
+/// Source vendor family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
@@ -94,6 +109,12 @@ pub enum Provider {
     R2,
     /// GCS XML interoperability API with HMAC keys.
     Gcs,
+    /// Native Azure Blob service; parameters in `source.azure`.
+    Azure,
+    /// Native GCS JSON API with a service-account key; parameters in
+    /// `source.gcs`.
+    #[serde(rename = "gcs_native")]
+    GcsNative,
 }
 
 impl Provider {
@@ -105,13 +126,22 @@ impl Provider {
             Provider::Rustfs => "rustfs",
             Provider::R2 => "r2",
             Provider::Gcs => "gcs",
+            Provider::Azure => "azure",
+            Provider::GcsNative => "gcs_native",
         }
     }
 
+    /// Providers that do not speak S3 and therefore ignore `region`,
+    /// `path_style` and `credentials`.
+    pub fn is_native(&self) -> bool {
+        matches!(self, Provider::Azure | Provider::GcsNative)
+    }
+
     /// Providers whose SDKs accept `region = "auto"`; RustFS maps it to
-    /// `us-east-1` for signing.
+    /// `us-east-1` for signing. The native providers never sign with a
+    /// region, so they accept it as well.
     fn accepts_auto_region(&self) -> bool {
-        matches!(self, Provider::R2 | Provider::Minio | Provider::Rustfs)
+        matches!(self, Provider::R2 | Provider::Minio | Provider::Rustfs) || self.is_native()
     }
 }
 
@@ -160,6 +190,73 @@ impl fmt::Debug for SourceCredentials {
             .field("access_key", &self.access_key)
             .field("secret_key", &REDACTED)
             .field("session_token", &self.session_token.as_ref().map(|_| REDACTED))
+            .finish()
+    }
+}
+
+/// Native Azure Blob source parameters. The container is `source.bucket`,
+/// so a config never carries two names for the same container. Exactly one
+/// of `account_key` and `sas_token` must be set: the account key signs with
+/// Shared Key, the SAS token is appended to every request URL.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AzureSourceConfig {
+    /// Storage account name; also derives the default `blob.core.windows.net`
+    /// endpoint when `source.endpoint` is absent.
+    pub account: String,
+    /// Base64 shared key of the storage account.
+    #[serde(default)]
+    pub account_key: Option<String>,
+    /// SAS query string without the leading `?`.
+    #[serde(default)]
+    pub sas_token: Option<String>,
+}
+
+impl AzureSourceConfig {
+    /// A copy safe to return to admin clients or log: both secrets are
+    /// replaced by `REDACTED`, and whether each is set stays visible.
+    pub fn redacted(&self) -> Self {
+        Self {
+            account: self.account.clone(),
+            account_key: self.account_key.as_ref().map(|_| REDACTED.to_string()),
+            sas_token: self.sas_token.as_ref().map(|_| REDACTED.to_string()),
+        }
+    }
+}
+
+impl fmt::Debug for AzureSourceConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AzureSourceConfig")
+            .field("account", &self.account)
+            .field("account_key", &self.account_key.as_ref().map(|_| REDACTED))
+            .field("sas_token", &self.sas_token.as_ref().map(|_| REDACTED))
+            .finish()
+    }
+}
+
+/// Native Google Cloud Storage source parameters. The bucket is
+/// `source.bucket`; only the service-account key lives here.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcsSourceConfig {
+    /// Service-account key JSON, verbatim as downloaded from Google Cloud.
+    pub service_account_json: String,
+}
+
+impl GcsSourceConfig {
+    /// A copy safe to return to admin clients or log: the whole key JSON is
+    /// a secret (it embeds the private key), so it is replaced wholesale.
+    pub fn redacted(&self) -> Self {
+        Self {
+            service_account_json: REDACTED.to_string(),
+        }
+    }
+}
+
+impl fmt::Debug for GcsSourceConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GcsSourceConfig")
+            .field("service_account_json", &REDACTED)
             .finish()
     }
 }
@@ -354,6 +451,14 @@ pub enum OnDemandMigrationConfigError {
     InvalidBucket(&'static str),
     #[error("source credentials field {0} must not be empty")]
     EmptyCredential(&'static str),
+    #[error("source.{0} is required for provider {1}")]
+    MissingProviderBlock(&'static str, Provider),
+    #[error("source.{0} is not valid for provider {1}")]
+    UnexpectedProviderBlock(&'static str, Provider),
+    /// Carries only the reason: the block holds account keys, SAS tokens and
+    /// service-account JSON, so no value of it is ever echoed.
+    #[error("source.{0} is invalid: {1}")]
+    InvalidProviderBlock(&'static str, &'static str),
     #[error("source tls.ca_cert_pem is not a PEM certificate")]
     InvalidCaCert,
     #[error("filter.{0} must be null or a non-empty string")]
@@ -388,6 +493,8 @@ impl OnDemandMigrationConfig {
     pub fn redacted(&self) -> Self {
         let mut copy = self.clone();
         copy.source.credentials = self.source.credentials.as_ref().map(SourceCredentials::redacted);
+        copy.source.azure = self.source.azure.as_ref().map(AzureSourceConfig::redacted);
+        copy.source.gcs = self.source.gcs.as_ref().map(GcsSourceConfig::redacted);
         copy
     }
 
@@ -433,6 +540,12 @@ impl SourceConfig {
         match (&self.endpoint, self.provider) {
             (Some(endpoint), _) => endpoint.clone(),
             (None, Provider::Aws) => format!("https://s3.{}.amazonaws.com", self.region),
+            (None, Provider::Azure) => self
+                .azure
+                .as_ref()
+                .map(|azure| format!("https://{}.{AZURE_BLOB_SUFFIX}", azure.account))
+                .unwrap_or_default(),
+            (None, Provider::GcsNative) => GCS_DEFAULT_ENDPOINT.to_string(),
             (None, _) => String::new(),
         }
     }
@@ -448,6 +561,8 @@ impl SourceConfig {
     }
 
     fn validate(&self) -> Result<(), OnDemandMigrationConfigError> {
+        self.validate_provider_block()?;
+
         if self.region.is_empty() {
             return Err(OnDemandMigrationConfigError::EmptyRegion);
         }
@@ -466,6 +581,9 @@ impl SourceConfig {
                     ));
                 }
             }
+            // Both native providers derive a fixed endpoint; Azure's is built
+            // from the account name, already checked by `validate_provider_block`.
+            None if self.provider.is_native() => {}
             None => return Err(OnDemandMigrationConfigError::MissingEndpoint(self.provider)),
         }
 
@@ -492,6 +610,84 @@ impl SourceConfig {
             && !pem.contains("-----BEGIN CERTIFICATE-----")
         {
             return Err(OnDemandMigrationConfigError::InvalidCaCert);
+        }
+
+        Ok(())
+    }
+
+    /// The provider-specific block must be present for exactly its own
+    /// provider: a stray `azure` block on an `s3` source would otherwise be
+    /// accepted, stored, and silently ignored by the client builder.
+    fn validate_provider_block(&self) -> Result<(), OnDemandMigrationConfigError> {
+        let missing = OnDemandMigrationConfigError::MissingProviderBlock;
+        let unexpected = OnDemandMigrationConfigError::UnexpectedProviderBlock;
+        let invalid = OnDemandMigrationConfigError::InvalidProviderBlock;
+
+        if self.provider != Provider::Azure && self.azure.is_some() {
+            return Err(unexpected("azure", self.provider));
+        }
+        if self.provider != Provider::GcsNative && self.gcs.is_some() {
+            return Err(unexpected("gcs", self.provider));
+        }
+
+        match self.provider {
+            Provider::Azure => {
+                let azure = self.azure.as_ref().ok_or(missing("azure", self.provider))?;
+                if azure.account.is_empty() {
+                    return Err(invalid("azure", "account must not be empty"));
+                }
+                // The account feeds a hostname when the endpoint is derived:
+                // keep it to label characters so it cannot rewrite the host.
+                if !azure.account.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                    return Err(invalid("azure", "account contains characters outside [A-Za-z0-9-]"));
+                }
+                match (azure.account_key.as_deref(), azure.sas_token.as_deref()) {
+                    (Some(_), Some(_)) => return Err(invalid("azure", "account_key and sas_token are mutually exclusive")),
+                    (None, None) => return Err(invalid("azure", "one of account_key and sas_token is required")),
+                    (Some(key), None) => {
+                        if key.is_empty() {
+                            return Err(invalid("azure", "account_key must not be empty"));
+                        }
+                        // Decoded here so a mistyped key fails at the admin
+                        // boundary instead of on the first source request.
+                        if base64_simd::STANDARD.decode_to_vec(key.as_bytes()).is_err() {
+                            return Err(invalid("azure", "account_key is not base64"));
+                        }
+                    }
+                    (None, Some(sas)) => {
+                        if sas.is_empty() {
+                            return Err(invalid("azure", "sas_token must not be empty"));
+                        }
+                        if sas.starts_with('?') {
+                            return Err(invalid("azure", "sas_token must not start with '?'"));
+                        }
+                        if sas.chars().any(char::is_whitespace) {
+                            return Err(invalid("azure", "sas_token must not contain whitespace"));
+                        }
+                    }
+                }
+            }
+            Provider::GcsNative => {
+                let gcs = self.gcs.as_ref().ok_or(missing("gcs", self.provider))?;
+                let key: serde_json::Value = serde_json::from_str(&gcs.service_account_json)
+                    .map_err(|_| invalid("gcs", "service_account_json is not valid JSON"))?;
+                let Some(object) = key.as_object() else {
+                    return Err(invalid("gcs", "service_account_json is not a JSON object"));
+                };
+                if object.get("type").and_then(serde_json::Value::as_str) != Some("service_account") {
+                    return Err(invalid("gcs", "service_account_json is not a service_account key"));
+                }
+                for field in ["client_email", "private_key"] {
+                    if object
+                        .get(field)
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(str::is_empty)
+                    {
+                        return Err(invalid("gcs", "service_account_json is missing client_email or private_key"));
+                    }
+                }
+            }
+            Provider::S3 | Provider::Aws | Provider::Minio | Provider::Rustfs | Provider::R2 | Provider::Gcs => {}
         }
 
         Ok(())
@@ -699,7 +895,15 @@ mod tests {
             ),
             (
                 "provider enum",
-                r#"{"source":{"provider":"azure","endpoint":"https://h","region":"r","bucket":"b"}}"#,
+                r#"{"source":{"provider":"swift","endpoint":"https://h","region":"r","bucket":"b"}}"#,
+            ),
+            (
+                "azure block",
+                r#"{"source":{"provider":"azure","region":"auto","bucket":"b","azure":{"account":"acct","account_key":"a2V5","extra":1}}}"#,
+            ),
+            (
+                "gcs block",
+                r#"{"source":{"provider":"gcs_native","region":"auto","bucket":"b","gcs":{"service_account_json":"{}","extra":1}}}"#,
             ),
         ] {
             let err = OnDemandMigrationConfig::from_json(json.as_bytes()).expect_err(label);
@@ -820,7 +1024,199 @@ mod tests {
                 "{provider}"
             );
         }
+        // The native providers never sign with a region, so "auto" is the
+        // honest value to write for them.
+        for cfg in [azure_cfg(), gcs_native_cfg()] {
+            assert_eq!(cfg.source.region, "auto");
+            cfg.validate(empty_ctx())
+                .unwrap_or_else(|err| panic!("{}: {err}", cfg.source.provider));
+        }
         assert_eq!(sample().source.effective_region(), "us-west-1");
+    }
+
+    const SERVICE_ACCOUNT_JSON: &str = r#"{"type":"service_account","project_id":"p","client_email":"a@b.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"}"#;
+
+    fn azure_cfg() -> OnDemandMigrationConfig {
+        let mut cfg = sample();
+        cfg.source.provider = Provider::Azure;
+        cfg.source.endpoint = None;
+        cfg.source.region = "auto".to_string();
+        cfg.source.credentials = None;
+        cfg.source.azure = Some(AzureSourceConfig {
+            account: "legacyaccount".to_string(),
+            account_key: Some("c2VjcmV0LWtleQ==".to_string()),
+            sas_token: None,
+        });
+        cfg
+    }
+
+    fn gcs_native_cfg() -> OnDemandMigrationConfig {
+        let mut cfg = sample();
+        cfg.source.provider = Provider::GcsNative;
+        cfg.source.endpoint = None;
+        cfg.source.region = "auto".to_string();
+        cfg.source.credentials = None;
+        cfg.source.gcs = Some(GcsSourceConfig {
+            service_account_json: SERVICE_ACCOUNT_JSON.to_string(),
+        });
+        cfg
+    }
+
+    #[test]
+    fn native_providers_derive_their_endpoint_and_round_trip_on_the_wire() {
+        let azure = azure_cfg();
+        assert_eq!(azure.source.effective_endpoint(), "https://legacyaccount.blob.core.windows.net");
+        let gcs = gcs_native_cfg();
+        assert_eq!(gcs.source.effective_endpoint(), "https://storage.googleapis.com");
+
+        for cfg in [azure_cfg(), gcs_native_cfg()] {
+            let json = cfg.to_json().expect("config must serialize");
+            assert_eq!(OnDemandMigrationConfig::from_json(&json).expect("config must parse"), cfg);
+        }
+        // The wire labels are part of the admin contract.
+        assert!(
+            String::from_utf8(azure_cfg().to_json().expect("json"))
+                .expect("utf8")
+                .contains(r#""provider":"azure""#)
+        );
+        assert!(
+            String::from_utf8(gcs_native_cfg().to_json().expect("json"))
+                .expect("utf8")
+                .contains(r#""provider":"gcs_native""#)
+        );
+    }
+
+    #[test]
+    fn an_explicit_endpoint_overrides_the_derived_native_one() {
+        // Azurite and fake-gcs-server are addressed this way.
+        let mut cfg = azure_cfg();
+        cfg.source.endpoint = Some("http://azurite.example.com:10000".to_string());
+        cfg.validate(empty_ctx()).expect("an explicit native endpoint is allowed");
+        assert_eq!(cfg.source.effective_endpoint(), "http://azurite.example.com:10000");
+
+        cfg.source.endpoint = Some("http://azurite.example.com:10000/devstoreaccount1".to_string());
+        assert!(
+            matches!(cfg.validate(empty_ctx()), Err(OnDemandMigrationConfigError::InvalidEndpoint(_))),
+            "a native endpoint is still an origin"
+        );
+    }
+
+    #[test]
+    fn a_provider_block_belongs_to_exactly_its_own_provider() {
+        let mut cfg = sample();
+        cfg.source.azure = azure_cfg().source.azure;
+        assert_eq!(
+            cfg.validate(empty_ctx()),
+            Err(OnDemandMigrationConfigError::UnexpectedProviderBlock("azure", Provider::S3))
+        );
+
+        let mut cfg = sample();
+        cfg.source.gcs = gcs_native_cfg().source.gcs;
+        assert_eq!(
+            cfg.validate(empty_ctx()),
+            Err(OnDemandMigrationConfigError::UnexpectedProviderBlock("gcs", Provider::S3))
+        );
+
+        let mut cfg = azure_cfg();
+        cfg.source.azure = None;
+        assert_eq!(
+            cfg.validate(empty_ctx()),
+            Err(OnDemandMigrationConfigError::MissingProviderBlock("azure", Provider::Azure))
+        );
+
+        let mut cfg = gcs_native_cfg();
+        cfg.source.gcs = None;
+        assert_eq!(
+            cfg.validate(empty_ctx()),
+            Err(OnDemandMigrationConfigError::MissingProviderBlock("gcs", Provider::GcsNative))
+        );
+    }
+
+    #[test]
+    fn azure_block_rules() {
+        let with = |account: &str, key: Option<&str>, sas: Option<&str>| {
+            let mut cfg = azure_cfg();
+            cfg.source.azure = Some(AzureSourceConfig {
+                account: account.to_string(),
+                account_key: key.map(str::to_string),
+                sas_token: sas.map(str::to_string),
+            });
+            cfg.validate(empty_ctx())
+        };
+
+        with("legacyaccount", None, Some("sv=2021-08-06&sig=abc%3D")).expect("a SAS token is a complete credential");
+        with("legacyaccount", Some("c2VjcmV0LWtleQ=="), None).expect("an account key is a complete credential");
+
+        for (label, result) in [
+            ("empty account", with("", Some("c2VjcmV0LWtleQ=="), None)),
+            // The account becomes the first label of the derived hostname.
+            ("account with a dot", with("legacy.account", Some("c2VjcmV0LWtleQ=="), None)),
+            ("account with a slash", with("legacy/account", Some("c2VjcmV0LWtleQ=="), None)),
+            ("no credential", with("legacyaccount", None, None)),
+            ("both credentials", with("legacyaccount", Some("c2VjcmV0LWtleQ=="), Some("sv=1"))),
+            ("empty key", with("legacyaccount", Some(""), None)),
+            ("key that is not base64", with("legacyaccount", Some("not base64!"), None)),
+            ("empty sas", with("legacyaccount", None, Some(""))),
+            ("sas with a leading question mark", with("legacyaccount", None, Some("?sv=1"))),
+            ("sas with whitespace", with("legacyaccount", None, Some("sv=1 &sig=a"))),
+        ] {
+            assert!(
+                matches!(result, Err(OnDemandMigrationConfigError::InvalidProviderBlock("azure", _))),
+                "{label}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gcs_native_block_requires_a_usable_service_account_key() {
+        let with = |json: &str| {
+            let mut cfg = gcs_native_cfg();
+            cfg.source.gcs = Some(GcsSourceConfig {
+                service_account_json: json.to_string(),
+            });
+            cfg.validate(empty_ctx())
+        };
+
+        with(SERVICE_ACCOUNT_JSON).expect("a service-account key is accepted");
+        for (label, json) in [
+            ("empty", ""),
+            ("not json", "not json"),
+            ("not an object", "[]"),
+            ("wrong type", r#"{"type":"authorized_user","client_email":"a@b","private_key":"k"}"#),
+            ("no private key", r#"{"type":"service_account","client_email":"a@b"}"#),
+            ("empty client email", r#"{"type":"service_account","client_email":"","private_key":"k"}"#),
+        ] {
+            let result = with(json);
+            assert!(
+                matches!(result, Err(OnDemandMigrationConfigError::InvalidProviderBlock("gcs", _))),
+                "{label}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_secrets_never_survive_redaction_or_debug() {
+        let mut azure = azure_cfg();
+        azure.source.azure.as_mut().expect("block").sas_token = Some("sv=2021-08-06&sig=top-secret".to_string());
+        azure.source.azure.as_mut().expect("block").account_key = None;
+        let gcs = gcs_native_cfg();
+
+        for rendered in [
+            format!("{:?}", azure.redacted()),
+            format!("{azure:?}"),
+            String::from_utf8(azure.redacted().to_json().expect("json")).expect("utf8"),
+        ] {
+            assert!(!rendered.contains("top-secret"), "{rendered}");
+            assert!(rendered.contains("legacyaccount"), "the account name is not a secret: {rendered}");
+        }
+        for rendered in [
+            format!("{:?}", gcs.redacted()),
+            format!("{gcs:?}"),
+            String::from_utf8(gcs.redacted().to_json().expect("json")).expect("utf8"),
+        ] {
+            assert!(!rendered.contains("PRIVATE KEY-----"), "{rendered}");
+            assert!(!rendered.contains("gserviceaccount"), "{rendered}");
+        }
     }
 
     #[test]
