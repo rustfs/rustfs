@@ -21,6 +21,7 @@ use crate::{
     DataUsageCacheSource, DataUsageEntry, DataUsageEntryInfo, DataUsageInfo, DataUsageScanPlanDigest, DataUsageSnapshotSetState,
     ScannerError, SizeSummary, TierStats,
 };
+use bytes::Bytes;
 use futures::future::join_all;
 use metrics::counter;
 use rand::seq::SliceRandom as _;
@@ -54,6 +55,7 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, warn};
 
 use crate::ScannerObjectInfo as ObjectInfo;
+use crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot;
 use crate::storage_api::ScannerStorage;
 use crate::storage_api::scan::NamespaceLocking as _;
 use crate::storage_api::scanner_io::{BucketInfo, BucketOptions};
@@ -109,6 +111,121 @@ struct DirtyUsageSnapshot {
 pub(crate) struct ScannerBucketScanScope {
     selected_buckets: Option<Arc<HashSet<String>>>,
     baseline_scan_plan_digest: Option<DataUsageScanPlanDigest>,
+}
+
+impl ScannerBucketScanScope {
+    fn is_default(&self) -> bool {
+        self.selected_buckets.is_none() && self.baseline_scan_plan_digest.is_none()
+    }
+
+    fn from_dirty_buckets(selected_buckets: HashSet<String>, baseline_scan_plan_digest: DataUsageScanPlanDigest) -> Self {
+        Self {
+            selected_buckets: Some(Arc::new(selected_buckets)),
+            baseline_scan_plan_digest: Some(baseline_scan_plan_digest),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ScannerCacheBaselineProof<'a> {
+    pub(super) data: Option<&'a Bytes>,
+    pub(super) expected_sources: &'a HashSet<DataUsageCacheSource>,
+    pub(super) leader_epoch: u64,
+    pub(super) want_cycle: u64,
+    pub(super) scan_plan_digest: DataUsageScanPlanDigest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScannerPeerDirtyUsageExpectation {
+    instance_id: String,
+    generation: u64,
+    pending: bool,
+}
+
+fn verified_remote_dirty_usage_buckets(
+    expected_peers: &HashMap<String, ScannerPeerDirtyUsageExpectation>,
+    peer_snapshots: Vec<(String, EcstoreScannerPeerDirtyUsageSnapshot)>,
+) -> Option<HashSet<String>> {
+    if expected_peers.is_empty() || peer_snapshots.len() != expected_peers.len() {
+        return None;
+    }
+
+    let mut received_peers = HashSet::with_capacity(peer_snapshots.len());
+    let mut dirty_buckets = HashSet::new();
+    for (host, snapshot) in peer_snapshots {
+        let expected = expected_peers.get(&host)?;
+        if !received_peers.insert(host)
+            || snapshot.instance_id != expected.instance_id
+            || snapshot.generation != expected.generation
+            || snapshot.generation == u64::MAX
+            || snapshot.protocol_version != crate::SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION
+            || !snapshot.complete
+            || snapshot.pending_bucket_count != u64::try_from(snapshot.buckets.len()).unwrap_or(u64::MAX)
+            || (expected.pending && snapshot.pending_bucket_count == 0)
+        {
+            return None;
+        }
+        dirty_buckets.extend(snapshot.buckets.into_keys());
+    }
+
+    (received_peers.len() == expected_peers.len()).then_some(dirty_buckets)
+}
+
+fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<'_>) -> Option<DataUsageScanPlanDigest> {
+    let data = proof.data?;
+    let baseline = serde_json::from_slice::<DataUsageInfo>(data).ok()?;
+    if !baseline.is_complete_bucket_usage_snapshot()
+        || baseline.usage_snapshot_partial
+        || baseline.usage_snapshot_converged != Some(true)
+        || baseline.scanner_epoch != Some(proof.leader_epoch)
+        || baseline.usage_snapshot_set_states.len() != proof.expected_sources.len()
+    {
+        return None;
+    }
+
+    let mut states = HashSet::with_capacity(baseline.usage_snapshot_set_states.len());
+    for state in &baseline.usage_snapshot_set_states {
+        let source = DataUsageCacheSource::new(usize::try_from(state.pool_index).ok()?, usize::try_from(state.set_index).ok()?);
+        if !proof.expected_sources.contains(&source)
+            || !states.insert(source)
+            || !state.complete
+            || state.tombstone
+            || state.scanner_epoch != Some(proof.leader_epoch)
+            || state.scanner_cycle.is_none_or(|cycle| cycle > proof.want_cycle)
+            || state.scan_plan_digest != Some(proof.scan_plan_digest.0)
+        {
+            return None;
+        }
+    }
+
+    (states == *proof.expected_sources).then_some(proof.scan_plan_digest)
+}
+
+fn scoped_scan_scope_from_dirty_buckets(
+    requested_scope: ScannerBucketScanScope,
+    dirty_buckets: HashSet<String>,
+    dirty_snapshot_complete: bool,
+    all_buckets: &[BucketInfo],
+    baseline_proof: ScannerCacheBaselineProof<'_>,
+) -> ScannerBucketScanScope {
+    if !requested_scope.is_default() || !dirty_snapshot_complete {
+        return requested_scope;
+    }
+
+    let current_buckets = all_buckets.iter().map(|bucket| bucket.name.as_str()).collect::<HashSet<_>>();
+    let selected_buckets = dirty_buckets
+        .into_iter()
+        .filter(|bucket| current_buckets.contains(bucket.as_str()))
+        .collect::<HashSet<_>>();
+    if selected_buckets.is_empty() {
+        return requested_scope;
+    }
+
+    let Some(baseline_scan_plan_digest) = complete_scanner_cache_baseline_plan_digest(baseline_proof) else {
+        return requested_scope;
+    };
+
+    ScannerBucketScanScope::from_dirty_buckets(selected_buckets, baseline_scan_plan_digest)
 }
 
 pub(crate) fn is_scanner_metadata_corrupt_error(err: &StorageError) -> bool {
@@ -749,7 +866,7 @@ mod io_cache;
 mod io_cycle;
 #[cfg(test)]
 use io_cache::{ScannerSetCacheGeneration, prepare_scoped_set_scan};
-pub(crate) use io_cycle::nsscanner_with_storage_status;
+pub(crate) use io_cycle::{ScannerCycleRequest, nsscanner_with_storage_status_scoped};
 mod io_disk;
 #[cfg(test)]
 mod publish_gate_tests;
@@ -766,8 +883,9 @@ pub(crate) use cache::{
 };
 pub use dirty_usage::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageSnapshot, ScannerDirtyUsageState,
-    acknowledge_dirty_usage_generation, clear_dirty_usage_bucket, record_dirty_usage_bucket, record_scanner_maintenance_change,
-    scanner_activity_epoch, scanner_dirty_usage_snapshot, scanner_dirty_usage_state, scanner_maintenance_generation,
+    acknowledge_dirty_usage_generation, acknowledge_scoped_dirty_usage, clear_dirty_usage_bucket, record_dirty_usage_bucket,
+    record_scanner_maintenance_change, scanner_activity_epoch, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
+    scanner_maintenance_generation,
 };
 #[cfg(test)]
 pub(crate) use dirty_usage::{clear_dirty_usage_buckets_for_tests, dirty_usage_buckets_for_tests};

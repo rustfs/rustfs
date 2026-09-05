@@ -903,6 +903,36 @@ message ScannerDirtyUsageSnapshotResponse {
   bytes response_proof = 7;
 }
 
+// Receiver-only protocol. Producers must retain whole-cycle ACK until they
+// have a durable per-bucket publication proof.
+message ScannerScopedDirtyUsageEntry {
+  string bucket = 1;
+  bytes bucket_incarnation = 2;
+  uint64 generation = 3;
+}
+
+message ScannerScopedDirtyUsageAckRequest {
+  bytes challenge = 1;
+  uint32 protocol_version = 2;
+  string owner_id = 3;
+  string instance_id = 4;
+  // Only scope 1 (a complete bucket) is supported; zero is invalid.
+  uint32 scope = 5;
+  bool probe_only = 6;
+  repeated ScannerScopedDirtyUsageEntry entries = 7;
+}
+
+message ScannerScopedDirtyUsageAckResponse {
+  uint32 protocol_version = 1;
+  string owner_id = 2;
+  string instance_id = 3;
+  bool supported = 4;
+  uint32 max_entries = 5;
+  uint32 max_request_bytes = 6;
+  uint64 cleared = 7;
+  bytes response_proof = 8;
+}
+
 // A short-lived storage-owned read admission used only around a final
 // scanner metadata publication.  It is intentionally separate from the
 // ScannerActivity observation wire so v6/v7 rolling compatibility remains
@@ -1243,6 +1273,10 @@ service NodeService {
   rpc LoadTransitionTierConfig(LoadTransitionTierConfigRequest) returns (LoadTransitionTierConfigResponse) {}; // auth-policy: body-bound
   rpc TierDailyStats(TierDailyStatsRequest) returns (TierDailyStatsResponse) {}; // auth-policy: read-only
   rpc GetLiveEvents(GetLiveEventsRequest) returns (GetLiveEventsResponse) {}; // auth-policy: read-only
+}
+
+service ScannerControlService {
+  rpc ScannerScopedDirtyUsageAck(ScannerScopedDirtyUsageAckRequest) returns (ScannerScopedDirtyUsageAckResponse) {}; // auth-policy: body-bound
 }
 
 service HealControlService {
