@@ -430,10 +430,12 @@ pub(crate) mod on_demand_migration {
 
     #[cfg(test)]
     pub(crate) mod test_support {
+        pub(crate) use crate::storage::storage_api::contract::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, BucketOperations};
         pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::{
             BUCKET_ON_DEMAND_MIGRATION_CONFIG, BucketMetadata,
         };
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::BucketMetadataSys;
         pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{BucketMetadataSys, init_bucket_metadata_sys};
+        pub(crate) use crate::storage::storage_api::ecstore_set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
     }
 }

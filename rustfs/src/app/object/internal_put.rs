@@ -48,6 +48,8 @@ use http::HeaderName;
 /// other internal provenance is written verbatim.
 pub(crate) struct InternalPutContext {
     pub(crate) bucket: String,
+    /// Pins background work to its original bucket across deletion and recreation.
+    pub(crate) expected_bucket_incarnation_id: Option<Uuid>,
     pub(crate) key: String,
     /// Plaintext object length. The single-object path requires it, exactly
     /// like S3 PutObject rejects an unknown `Content-Length`.
@@ -239,6 +241,7 @@ impl DefaultObjectUsecase {
         let start_time = Instant::now();
         let InternalPutContext {
             bucket,
+            expected_bucket_incarnation_id,
             key,
             size,
             expected_md5_hex,
@@ -296,6 +299,7 @@ impl DefaultObjectUsecase {
                 principal_id,
                 emit_events,
                 preserve_delete_marker,
+                expected_bucket_incarnation_id,
             },
         };
         let committed = self
@@ -367,6 +371,8 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        opts.expected_bucket_incarnation_id = ctx.expected_bucket_incarnation_id;
+
         let dsc = must_replicate_object(
             &ctx.bucket,
             &ctx.key,
@@ -428,7 +434,10 @@ impl DefaultObjectUsecase {
         let bucket = ctx.bucket.as_str();
         let key = ctx.key.as_str();
         let store = self.object_store().ok_or_else(not_initialized)?;
-        let mut opts = ObjectOptions::default();
+        let mut opts = ObjectOptions {
+            expected_bucket_incarnation_id: ctx.expected_bucket_incarnation_id,
+            ..Default::default()
+        };
         let session = store
             .get_multipart_info(bucket, key, upload_id, &opts)
             .await
@@ -542,6 +551,7 @@ impl DefaultObjectUsecase {
         }
         let mut opts =
             get_complete_multipart_upload_opts_with_replication_authorization(&headers, false).map_err(ApiError::from)?;
+        opts.expected_bucket_incarnation_id = ctx.expected_bucket_incarnation_id;
         opts.preserve_etag = ctx.preserve_etag.clone();
         opts.preserve_delete_marker = ctx.preserve_delete_marker;
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
@@ -699,10 +709,24 @@ impl DefaultObjectUsecase {
     }
 
     /// Discard an internal multipart upload and its staged parts.
-    pub(crate) async fn internal_abort_multipart_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<(), ApiError> {
+    pub(crate) async fn internal_abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        expected_bucket_incarnation_id: Option<Uuid>,
+    ) -> Result<(), ApiError> {
         let store = self.object_store().ok_or_else(not_initialized)?;
         store
-            .abort_multipart_upload(bucket, key, upload_id, &ObjectOptions::default())
+            .abort_multipart_upload(
+                bucket,
+                key,
+                upload_id,
+                &ObjectOptions {
+                    expected_bucket_incarnation_id,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(ApiError::from)?;
         rustfs_scanner::record_dirty_usage_bucket(bucket);
@@ -756,6 +780,7 @@ mod tests {
     fn internal_context(bucket: &str, key: &str, body: &[u8]) -> InternalPutContext {
         InternalPutContext {
             bucket: bucket.to_string(),
+            expected_bucket_incarnation_id: None,
             key: key.to_string(),
             size: Some(body.len() as u64),
             expected_md5_hex: Some(md5_hex(body)),
@@ -1138,9 +1163,14 @@ mod tests {
         ))
         .await
         .expect("part of the aborted upload must stage");
-        Box::pin(usecase.internal_abort_multipart_upload(&bucket, &ctx.key, &aborted_upload_id))
-            .await
-            .expect("internal abort must succeed");
+        Box::pin(usecase.internal_abort_multipart_upload(
+            &bucket,
+            &ctx.key,
+            &aborted_upload_id,
+            ctx.expected_bucket_incarnation_id,
+        ))
+        .await
+        .expect("internal abort must succeed");
         let uploads = Box::pin(store.list_multipart_uploads(&bucket, &ctx.key, None, None, None, 100))
             .await
             .expect("list multipart uploads after abort");

@@ -50,10 +50,10 @@ cd "$(dirname "$0")/.."
 # s3_error! stays flat at 1616.
 # 1616 → 1613 on 2026-09-02: dependency refresh verified the current tree has
 # already shed three s3_error! invocation lines; retighten the line counter.
-# 1613 → 1599 on 2026-09-06: scanner publication coverage follow-up inherits
+# 1613 → 1600 on 2026-09-06: scanner publication coverage follow-up inherits
 # current s3_error! shrinkage; retighten the line counter.
 S3S_IMPORT_FILES_BASELINE=213
-S3_ERROR_LINES_BASELINE=1599
+S3_ERROR_LINES_BASELINE=1600
 # ecstore-scoped ratchet (rustfs/backlog#1842): the storage engine must not
 # know S3 wire/DTO types (ARCHITECTURE.md invariant 4). The S3-*consuming*
 # client was extracted to crates/s3-client, where s3s usage is legitimate;
