@@ -285,6 +285,7 @@ async fn read_staging_lineage(disks: &[EcstoreDiskStore], limits: MigrationLimit
     let mut identities = std::collections::BTreeMap::new();
     let mut orphaned_payloads = Vec::new();
     let mut committed_payloads = BTreeSet::new();
+    let mut mismatched_manifests = Vec::new();
     for disk in disks {
         for slot in 0..2 {
             let result = async {
@@ -295,22 +296,20 @@ async fn read_staging_lineage(disks: &[EcstoreDiskStore], limits: MigrationLimit
                     }
                     return Ok(None);
                 };
-                let manifest = match Manifest::decode(&bytes, limits.max_bytes) {
-                    Ok(manifest) => manifest,
-                    Err(SnapshotError::Unsupported) => return Err(SnapshotError::Unsupported.into()),
-                    Err(error) => {
-                        if let Some(payload) = payload.as_deref() {
-                            orphaned_payloads.push(payload_identity(payload));
-                            return Ok(None);
-                        }
-                        return Err(error.into());
-                    }
-                };
+                let manifest = Manifest::decode(&bytes, limits.max_bytes)?;
+                let identity = (manifest.owner, manifest.payload_digest);
+                if identities
+                    .insert(manifest.sequence, identity)
+                    .is_some_and(|old| old != identity)
+                {
+                    return Err(MigrationError::Conflict);
+                }
                 let payload = payload.ok_or(MigrationError::Invalid)?;
                 if payload.len() != manifest.payload_len || payload_identity(&payload).1 != manifest.payload_digest {
                     // A reused slot can hold the next retry payload while the
                     // old manifest still names the previous generation.
                     orphaned_payloads.push(payload_identity(&payload));
+                    mismatched_manifests.push(manifest);
                     return Ok(None);
                 }
                 let candidate: PendingMigration = serde_json::from_slice(&payload).map_err(|_| MigrationError::Invalid)?;
@@ -327,13 +326,6 @@ async fn read_staging_lineage(disks: &[EcstoreDiskStore], limits: MigrationLimit
             match result {
                 Ok(Some(next)) => {
                     committed_payloads.insert((next.manifest.payload_len, next.manifest.payload_digest));
-                    let identity = (next.manifest.owner, next.manifest.payload_digest);
-                    if identities
-                        .insert(next.manifest.sequence, identity)
-                        .is_some_and(|old| old != identity)
-                    {
-                        return Err(MigrationError::Conflict);
-                    }
                     if selected
                         .as_ref()
                         .is_none_or(|old| old.manifest.sequence < next.manifest.sequence)
@@ -345,6 +337,16 @@ async fn read_staging_lineage(disks: &[EcstoreDiskStore], limits: MigrationLimit
                 Err(error) => return Err(error),
             }
         }
+    }
+    // Only a validated successor can supersede an unmatched older manifest.
+    // A newer or unordered manifest may still name responsibilities absent from
+    // the remaining payload, even if that payload matches another valid slot.
+    if mismatched_manifests.iter().any(|manifest| {
+        selected
+            .as_ref()
+            .is_none_or(|latest| latest.manifest.owner != manifest.owner || latest.manifest.sequence <= manifest.sequence)
+    }) {
+        return Err(MigrationError::Invalid);
     }
     Ok(StagingLineage {
         latest: selected,
@@ -1416,5 +1418,33 @@ mod tests {
             assert!(replayed.contains(record));
         }
         assert!(!replayed.contains(&records[3]));
+    }
+
+    #[tokio::test]
+    async fn migration_newer_manifest_with_stale_payload_fails_closed() {
+        let root = TempDir::new().expect("test directory");
+        let disk = disk(&root, "disk").await;
+        let disks = [Some(disk.clone())];
+        let owner = Uuid::new_v4();
+        for name in ["a", "b"] {
+            source(&disk, &record(name, MrfKind::PartialWrite, None)).await;
+            let candidate = capture_legacy_migration(&disks, LIMITS).await.expect("capture");
+            stage_legacy_migration(&disks, &candidate, owner, LIMITS)
+                .await
+                .expect("commit");
+        }
+        let old = read_bounded(&disk, PAYLOADS[0], LIMITS.max_bytes)
+            .await
+            .expect("old read")
+            .expect("old payload");
+        install(&disk, PAYLOADS[1], &old, LIMITS.max_bytes)
+            .await
+            .expect("stale payload corruption");
+        source(&disk, &record("a", MrfKind::PartialWrite, None)).await;
+        let recovery = recover_pending_migration(&disks, LIMITS).await;
+        assert!(
+            recovery.is_err(),
+            "newer manifest must prevent fallback to old responsibilities: {recovery:?}"
+        );
     }
 }
