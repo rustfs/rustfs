@@ -37,7 +37,6 @@ env:
 jobs:
   s3-compat-test:
     runs-on: smoke-testing
-    continue-on-error: true
     timeout-minutes: 360
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
@@ -88,7 +87,6 @@ jobs:
 
       - name: Run S3 compatibility suite
         id: test
-        continue-on-error: true
         env:
           LOG_FILE: /tmp/rustfs-s3-compat.log
         run: |
