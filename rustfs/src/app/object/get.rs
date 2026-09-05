@@ -3844,8 +3844,22 @@ impl DefaultObjectUsecase {
             return None;
         }
         let sys = OnDemandMigrationSys::get();
-        if !sys.is_module_enabled() || sys.state(bucket).is_none() {
+        if !sys.is_module_enabled() {
             return None;
+        }
+        let state = sys.state(bucket).filter(|state| state.matches_prefix(key))?;
+        let policy = &state.config().policy;
+        // The read path reports a latest delete marker as a plain 404, so the
+        // marker is classified here, and only where one can exist.
+        if policy.respect_local_delete_marker && (opts.versioned || opts.version_suspended) {
+            let lookup = store.get_object_info(bucket, key, opts).await;
+            match odm_local_miss(lookup.as_ref()) {
+                Some(miss) if odm_policy_admits_miss(policy, miss) => {}
+                Some(_) => return None,
+                // The object appeared meanwhile, or the lookup failed for a
+                // reason the source cannot answer: the local read decides.
+                None => return Some(OdmGetOutcome::RetryLocal),
+            }
         }
         let expected_incarnation = match odm_read_generation(req, bucket) {
             Ok(Some(incarnation)) => incarnation,
@@ -3862,19 +3876,6 @@ impl DefaultObjectUsecase {
             OdmGetVerdict::Fail(err) => return Some(OdmGetOutcome::Respond(Err(err))),
             OdmGetVerdict::Consult { state, client } => (state, client),
         };
-        let policy = &state.config().policy;
-        // The read path reports a latest delete marker as a plain 404, so the
-        // marker is classified here, and only where one can exist.
-        if policy.respect_local_delete_marker && (opts.versioned || opts.version_suspended) {
-            let lookup = store.get_object_info(bucket, key, opts).await;
-            match odm_local_miss(lookup.as_ref()) {
-                Some(miss) if odm_policy_admits_miss(policy, miss) => {}
-                Some(_) => return None,
-                // The object appeared meanwhile, or the lookup failed for a
-                // reason the source cannot answer: the local read decides.
-                None => return Some(OdmGetOutcome::RetryLocal),
-            }
-        }
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let reply = odm_get_from_source(&state, client.as_ref(), &req.headers, key, range, request_context).await;
         Some(match reply {

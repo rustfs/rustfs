@@ -28,7 +28,7 @@ use super::storage_api::bucket_usecase::StorageObjectOptions;
 use super::storage_api::bucket_usecase::bucket::versioning_sys::BucketVersioningSys;
 use super::storage_api::bucket_usecase::contract::list::{ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as _};
 use super::storage_api::bucket_usecase::contract::object::ObjectOperations as _;
-use super::storage_api::bucket_usecase::s3::{S3Error, S3ErrorCode, S3Result};
+use super::storage_api::bucket_usecase::s3::{S3Error, S3ErrorCode, S3Request, S3Result};
 use super::storage_api::bucket_usecase::s3_api::bucket::ListObjectsV2Params;
 use crate::app::object::shared::{odm_source_unavailable_error, odm_state_error_class};
 use crate::error::ApiError;
@@ -104,7 +104,8 @@ fn invalid_continuation_token(err: &ListThroughTokenError) -> S3Error {
 pub(crate) async fn list_through_state<T>(
     store: &ECStore,
     bucket: &str,
-    req: &s3s::S3Request<T>,
+    req: &S3Request<T>,
+    params: &ListObjectsV2Params,
 ) -> S3Result<Option<Arc<BucketOdmState>>> {
     if get_header(&req.headers, SUFFIX_SOURCE_PROXY_REQUEST).is_some() {
         return Ok(None);
@@ -116,6 +117,14 @@ pub(crate) async fn list_through_state<T>(
     let Some(state) = sys.state(bucket).filter(|state| state.config().policy.list_through) else {
         return Ok(None);
     };
+    if params.max_keys == 0
+        || matches!(
+            source_list_plan(&params.prefix, state.config().filter.prefix.as_deref(), params.delimiter.as_deref()),
+            SourceListPlan::Skip,
+        )
+    {
+        return Ok(None);
+    }
     let Some(expected_incarnation) = super::storage_api::bucket_usecase::access::odm_read_generation(req, bucket)? else {
         return Ok(None);
     };
@@ -457,7 +466,8 @@ mod tests {
     use crate::app::bucket_usecase::DefaultBucketUsecase;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ecstore};
     use crate::app::storage_api::bucket_usecase::s3::{
-        ListObjectsInput, ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response, XmlSerialize, XmlSerializer,
+        GetObjectInput, HeadObjectInput, ListObjectsInput, ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response,
+        XmlSerialize, XmlSerializer,
     };
     use crate::app::storage_api::test::StoragePutObjReader;
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
@@ -838,7 +848,7 @@ mod tests {
                     let old = sys.state(&input.bucket).expect("original source state");
                     let store = shared_gating_ecstore().await;
                     let get = S3Request {
-                        input: s3s::dto::GetObjectInput {
+                        input: GetObjectInput {
                             bucket: input.bucket.clone(),
                             key: "missing".into(),
                             ..Default::default()
@@ -900,7 +910,7 @@ mod tests {
                             if capture == 1 {
                                 get.extensions.insert(authorized_generation.clone());
                             }
-                            let mut head = get.clone().map_input(|_| s3s::dto::HeadObjectInput {
+                            let mut head = get.clone().map_input(|_| HeadObjectInput {
                                 bucket: input.bucket.clone(),
                                 key: "missing".into(),
                                 ..Default::default()

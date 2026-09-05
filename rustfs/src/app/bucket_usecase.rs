@@ -2763,7 +2763,7 @@ impl DefaultBucketUsecase {
         let (merged_token, source_state) = if allow_list_through {
             (
                 list_through::decode_list_cursor(params.decoded_continuation_token.as_deref())?,
-                list_through::list_through_state(&store, &bucket, &req).await?,
+                list_through::list_through_state(&store, &bucket, &req, &params).await?,
             )
         } else {
             (None, None)

@@ -157,7 +157,16 @@ impl DefaultObjectUsecase {
             return None;
         }
         let sys = OnDemandMigrationSys::get();
-        if !sys.is_module_enabled() || sys.state(bucket).is_none() {
+        if !sys.is_module_enabled() {
+            return None;
+        }
+        let state = sys.state(bucket).filter(|state| state.matches_prefix(key))?;
+        let policy = &state.config().policy;
+        if !odm_policy_admits_miss(policy, miss) {
+            return None;
+        }
+        if policy.head == HeadPolicy::LocalOnly {
+            state.stats().record_request(OdmOp::Head, OdmOutcome::Filtered);
             return None;
         }
         let expected_incarnation = match odm_read_generation(req, bucket) {

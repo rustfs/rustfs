@@ -3937,15 +3937,7 @@ mod tests {
     #[serial]
     fn odm_read_capture_preserves_access_and_parameter_error_order() {
         crate::app::gating_test_env::run_large_stack_test("odm-access-order", || async {
-            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
-            let iam = rustfs_iam::init_iam_sys(Arc::clone(&store))
-                .await
-                .expect("initialize request IAM");
-            let context = Arc::new(AppContext::with_default_interfaces(
-                Arc::clone(&store),
-                iam,
-                Arc::new(KmsServiceManager::new()),
-            ));
+            let context = crate::app::gating_test_env::shared_gating_ambient().await;
             let server_ctx = ServerContextSlot::new();
             assert!(server_ctx.install(Arc::clone(&context)));
             let fs = FS::with_server_ctx(server_ctx);
@@ -4033,15 +4025,8 @@ mod tests {
     #[serial]
     fn odm_read_capture_failure_is_deferred_until_source_miss() {
         crate::app::gating_test_env::run_large_stack_test("odm-access-failure", || async {
-            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
-            let iam = rustfs_iam::init_iam_sys(Arc::clone(&store))
-                .await
-                .expect("initialize request IAM");
-            let context = Arc::new(AppContext::with_default_interfaces(
-                Arc::clone(&store),
-                iam,
-                Arc::new(KmsServiceManager::new()),
-            ));
+            let context = crate::app::gating_test_env::shared_gating_ambient().await;
+            let store = context.object_store();
             let server_ctx = ServerContextSlot::new();
             assert!(server_ctx.install(Arc::clone(&context)));
             let fs = FS::with_server_ctx(server_ctx);
@@ -4094,7 +4079,13 @@ mod tests {
                 Some(super::OdmReadGenerationGuard::Failed { .. })
             ));
             store
-                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
                 .await
                 .expect("create bucket after capture");
             store
@@ -4122,7 +4113,7 @@ mod tests {
             head.input.key = "missing".into();
             assert_eq!(
                 usecase
-                    .execute_get_object(get)
+                    .execute_get_object(get.clone())
                     .await
                     .expect_err("failed capture cannot rebind on GET miss")
                     .code(),
@@ -4130,19 +4121,91 @@ mod tests {
             );
             assert_eq!(
                 usecase
-                    .execute_head_object(head)
+                    .execute_head_object(head.clone())
                     .await
                     .expect_err("failed capture cannot rebind on HEAD miss")
                     .code(),
                 &S3ErrorCode::NoSuchBucket
             );
             assert_eq!(
-                crate::app::bucket_usecase::DefaultBucketUsecase::with_context(Some(context))
-                    .execute_list_objects_v2(list)
+                crate::app::bucket_usecase::DefaultBucketUsecase::with_context(Some(Arc::clone(&context)))
+                    .execute_list_objects_v2(list.clone())
                     .await
                     .expect_err("failed capture cannot rebind on LIST")
                     .code(),
                 &S3ErrorCode::NoSuchBucket
+            );
+            config.filter.prefix = Some("remote/".into());
+            sys.apply_for_incarnation(&bucket, incarnation, Some(&config)).await;
+            assert_eq!(
+                usecase
+                    .execute_get_object(get.clone())
+                    .await
+                    .expect_err("filtered GET remains local")
+                    .code(),
+                &S3ErrorCode::NoSuchKey
+            );
+            assert_eq!(
+                usecase
+                    .execute_head_object(head.clone())
+                    .await
+                    .expect_err("filtered HEAD remains local")
+                    .code(),
+                &S3ErrorCode::NoSuchKey
+            );
+            list.input.prefix = Some("local/".into());
+            let listing = crate::app::bucket_usecase::DefaultBucketUsecase::with_context(Some(Arc::clone(&context)))
+                .execute_list_objects_v2(list.clone())
+                .await
+                .expect("disjoint prefix needs no source identity");
+            assert_eq!(listing.output.key_count, Some(0));
+            list.input.prefix = Some("remote/".into());
+            list.input.max_keys = Some(0);
+            let listing = crate::app::bucket_usecase::DefaultBucketUsecase::with_context(Some(Arc::clone(&context)))
+                .execute_list_objects_v2(list)
+                .await
+                .expect("an empty page needs no source identity");
+            assert_eq!(listing.output.key_count, Some(0));
+
+            config.filter.prefix = None;
+            config.policy.head = crate::on_demand_migration::HeadPolicy::LocalOnly;
+            sys.apply_for_incarnation(&bucket, incarnation, Some(&config)).await;
+            assert_eq!(
+                usecase
+                    .execute_head_object(head.clone())
+                    .await
+                    .expect_err("local-only HEAD needs no source identity")
+                    .code(),
+                &S3ErrorCode::NoSuchKey
+            );
+            config.policy.head = crate::on_demand_migration::HeadPolicy::Proxy;
+            sys.apply_for_incarnation(&bucket, incarnation, Some(&config)).await;
+            store
+                .delete_object(
+                    &bucket,
+                    "missing",
+                    crate::storage::ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create local delete marker");
+            assert_eq!(
+                usecase
+                    .execute_get_object(get)
+                    .await
+                    .expect_err("GET respects the delete marker before capture failure")
+                    .code(),
+                &S3ErrorCode::NoSuchKey
+            );
+            assert_eq!(
+                usecase
+                    .execute_head_object(head)
+                    .await
+                    .expect_err("HEAD respects the delete marker before capture failure")
+                    .code(),
+                &S3ErrorCode::NoSuchKey
             );
             sys.remove(&bucket);
             sys.set_module_enabled(enabled_before);
