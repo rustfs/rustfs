@@ -253,16 +253,22 @@ struct Staged {
     slot: usize,
 }
 
+type PayloadIdentity = (usize, [u8; 32]);
+
 struct StagingLineage {
     latest: Option<Staged>,
     // Each collection has at most two identities per configured disk.
-    committed_payloads: BTreeSet<(usize, [u8; 32])>,
-    orphaned_payloads: Vec<(usize, [u8; 32])>,
+    committed_payloads: BTreeSet<PayloadIdentity>,
+    orphaned_payloads: Vec<PayloadIdentity>,
+}
+
+fn payload_identity(payload: &[u8]) -> PayloadIdentity {
+    (payload.len(), Sha256::digest(payload).into())
 }
 
 impl StagingLineage {
     fn validate_orphans(&self, retry_payload: Option<&[u8]>) -> Result<(), MigrationError> {
-        let retry_identity = retry_payload.map(|payload| (payload.len(), <[u8; 32]>::from(Sha256::digest(payload))));
+        let retry_identity = retry_payload.map(payload_identity);
         if self
             .orphaned_payloads
             .iter()
@@ -282,19 +288,30 @@ async fn read_staging_lineage(disks: &[EcstoreDiskStore], limits: MigrationLimit
     for disk in disks {
         for slot in 0..2 {
             let result = async {
+                let payload = read_bounded(disk, PAYLOADS[slot], limits.max_bytes).await?;
                 let Some(bytes) = read_bounded(disk, COMMITS[slot], MANIFEST_LEN).await? else {
-                    if let Some(payload) = read_bounded(disk, PAYLOADS[slot], limits.max_bytes).await? {
-                        orphaned_payloads.push((payload.len(), <[u8; 32]>::from(Sha256::digest(&payload))));
+                    if let Some(payload) = payload.as_deref() {
+                        orphaned_payloads.push(payload_identity(payload));
                     }
                     return Ok(None);
                 };
-                let manifest = Manifest::decode(&bytes, limits.max_bytes)?;
-                let payload = read_bounded(disk, PAYLOADS[slot], manifest.payload_len)
-                    .await?
-                    .ok_or(MigrationError::Invalid)?;
-                if payload.len() != manifest.payload_len || <[u8; 32]>::from(Sha256::digest(&payload)) != manifest.payload_digest
-                {
-                    return Err(MigrationError::Invalid);
+                let manifest = match Manifest::decode(&bytes, limits.max_bytes) {
+                    Ok(manifest) => manifest,
+                    Err(SnapshotError::Unsupported) => return Err(SnapshotError::Unsupported.into()),
+                    Err(error) => {
+                        if let Some(payload) = payload.as_deref() {
+                            orphaned_payloads.push(payload_identity(payload));
+                            return Ok(None);
+                        }
+                        return Err(error.into());
+                    }
+                };
+                let payload = payload.ok_or(MigrationError::Invalid)?;
+                if payload.len() != manifest.payload_len || payload_identity(&payload).1 != manifest.payload_digest {
+                    // A reused slot can hold the next retry payload while the
+                    // old manifest still names the previous generation.
+                    orphaned_payloads.push(payload_identity(&payload));
+                    return Ok(None);
                 }
                 let candidate: PendingMigration = serde_json::from_slice(&payload).map_err(|_| MigrationError::Invalid)?;
                 if candidate.encode(limits)? != payload || candidate.replay_records(limits)?.is_empty() {
@@ -533,8 +550,10 @@ mod tests {
     static INTERRUPTIONS: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeMap<Uuid, Boundary>>> =
         std::sync::LazyLock::new(Default::default);
 
-    static SOURCE_CHANGES: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeMap<Uuid, (EcstoreDiskStore, Vec<u8>)>>> =
-        std::sync::LazyLock::new(Default::default);
+    type SourceChange = (EcstoreDiskStore, Vec<u8>);
+    type SourceChangeMap = std::collections::BTreeMap<Uuid, SourceChange>;
+
+    static SOURCE_CHANGES: std::sync::LazyLock<std::sync::Mutex<SourceChangeMap>> = std::sync::LazyLock::new(Default::default);
 
     pub(super) async fn interrupt_at(owner: Uuid, boundary: Boundary) -> Result<(), MigrationError> {
         if boundary == Boundary::AfterPayload {
@@ -1288,6 +1307,57 @@ mod tests {
             let after = slot_bytes(&disk).await;
             assert_eq!(after[0], old_slot[0]);
             assert_eq!(after[2], old_slot[2]);
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_third_generation_retry_keeps_reused_slot_recoverable() {
+        for boundary in [Boundary::AfterPayload, Boundary::BeforeManifest] {
+            let root = TempDir::new().expect("test directory");
+            let disk = disk(&root, "disk").await;
+            let disks = [Some(disk.clone())];
+            let owner = Uuid::new_v4();
+            let records = ["a", "b", "c"]
+                .into_iter()
+                .map(|name| record(name, MrfKind::PartialWrite, None))
+                .collect::<Vec<_>>();
+
+            for bytes in &records[..2] {
+                source(&disk, bytes).await;
+                let candidate = capture_legacy_migration(&disks, LIMITS)
+                    .await
+                    .expect("capture committed generation");
+                stage_legacy_migration(&disks, &candidate, owner, LIMITS)
+                    .await
+                    .expect("stage committed generation");
+            }
+
+            source(&disk, &records[2]).await;
+            let third = capture_legacy_migration(&disks, LIMITS)
+                .await
+                .expect("capture third generation");
+            INTERRUPTIONS.lock().expect("fault map").insert(owner, boundary);
+            assert!(stage_legacy_migration(&disks, &third, owner, LIMITS).await.is_err());
+            assert!(matches!(recover_pending_migration(&disks, LIMITS).await, Err(MigrationError::Conflict)));
+
+            let retry = capture_legacy_migration(&disks, LIMITS)
+                .await
+                .expect("recapture third generation");
+            assert_eq!(
+                stage_legacy_migration(&disks, &retry, owner, LIMITS)
+                    .await
+                    .expect("retry third generation"),
+                3
+            );
+            let recovered = recover_pending_migration(&disks, LIMITS)
+                .await
+                .expect("recover after third retry")
+                .expect("third generation");
+            let replayed = recovered.replay_records(LIMITS).expect("all staged responsibilities");
+            assert_eq!(replayed.len(), 3);
+            for record in &records {
+                assert!(replayed.contains(record));
+            }
         }
     }
 }
