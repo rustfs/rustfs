@@ -185,6 +185,7 @@ where
         }
     }
     bucket_plan_complete &= buckets_by_source.keys().copied().collect::<HashSet<_>>() == *expected_sources;
+    bucket_plan_complete &= scanner_bucket_inventory_is_complete(&all_buckets, &buckets_by_source);
     let scan_plan_digest =
         scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_snapshot_digest(&activity_before));
     let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets(&all_buckets, dirty_generation_before_bucket_list));
@@ -443,8 +444,16 @@ where
     let all_bucket_names = all_buckets.iter().map(|bucket| bucket.name.clone()).collect::<Vec<_>>();
     let completed_usage = completed_data_usage_info(
         &results,
-        &expected_sources,
-        &all_bucket_names,
+        &ScannerSnapshotScope {
+            sources: &expected_sources,
+            buckets: &all_bucket_names,
+            identity: ScannerSnapshotIdentity {
+                cycle: want_cycle,
+                leader_epoch,
+                plan_digest: scan_plan_digest,
+                tier_registry_generation: Some(tier_registry_generation),
+            },
+        },
         &tier_registry.names,
         bucket_plan_complete,
         budget_elapsed,

@@ -4748,6 +4748,28 @@ async fn usage_bootstrap_does_not_overwrite_concurrent_replacement() {
 #[serial]
 async fn scanner_usage_state_reset_publishes_fenced_bootstrap_marker() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let quota_ledger_path = "config/quota-ledger/reserved-bucket.json";
+    let quota_ledger = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "bucket_incarnation": "00000000-0000-0000-0000-000000000001",
+        "quota_revision_unix_nanos": 1,
+        "accounted_usage": 100,
+        "reservations": {
+            "00000000-0000-0000-0000-000000000002": {
+                "object": "pending-object",
+                "old_size": 0,
+                "new_size": 64,
+                "created_at": 1,
+                "pool_index": 0,
+                "set_index": 0,
+                "commit_started": true
+            }
+        }
+    }))
+    .expect("quota ledger fixture should encode");
+    save_config(store.clone(), quota_ledger_path, quota_ledger.clone())
+        .await
+        .expect("independent quota reservations should persist");
     let cycle = CurrentCycle {
         current: 41,
         next: 42,
@@ -4805,6 +4827,14 @@ async fn scanner_usage_state_reset_publishes_fenced_bootstrap_marker() {
     assert!(data_usage_info_is_bootstrap_pending(&usage));
     assert!(!data_usage_info_has_persisted_baseline_identity(&usage));
     assert_eq!(usage.scanner_epoch, Some(9));
+
+    assert_eq!(
+        read_config(store.clone(), quota_ledger_path)
+            .await
+            .expect("quota ledger must remain readable after scanner reset"),
+        quota_ledger,
+        "scanner reset must preserve incarnation and outstanding reserved bytes exactly"
+    );
 
     for path in [
         usage_backup_path.as_str(),
