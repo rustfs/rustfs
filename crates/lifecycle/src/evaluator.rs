@@ -116,13 +116,10 @@ impl Evaluator {
                             break 'top_loop;
                         }
                     }
-                    IlmAction::DeleteAction
-                    | IlmAction::DeleteRestoredAction
-                    | IlmAction::DeleteVersionAction
-                    | IlmAction::DeleteRestoredVersionAction
-                        if self.is_object_locked(obj) =>
-                    {
-                        event = Event::default();
+                    // Restore expiry removes only the temporary local copy; the
+                    // retained logical version and its remote data remain intact.
+                    IlmAction::DeleteAction | IlmAction::DeleteVersionAction if self.is_object_locked(obj) => {
+                        event = obj.restored_copy_expiry(now).unwrap_or_default();
                     }
                     _ => {}
                 }
@@ -251,6 +248,48 @@ mod tests {
             expected,
             "expiring a restored local copy preserves the retained logical version and remote object"
         );
+
+        let mut expiring_policy = (*latest_expiration_lifecycle()).clone();
+        expiring_policy.rules[0].noncurrent_version_expiration = Some(NoncurrentVersionExpiration {
+            noncurrent_days: Some(1),
+            newer_noncurrent_versions: None,
+        });
+        let expiring_evaluator =
+            Evaluator::new(Arc::new(expiring_policy)).with_lock_retention(Some(lock_enabled_without_default_retention()));
+        let locked = expiring_evaluator
+            .eval(&objects)
+            .await
+            .expect("locked expired versions should evaluate");
+        assert_eq!(
+            locked.iter().map(|event| event.action).collect::<Vec<_>>(),
+            expected,
+            "blocked logical expiration must still allow an eligible restore-copy cleanup"
+        );
+
+        for status in [ReplicationStatusType::Pending, ReplicationStatusType::Failed] {
+            for object in &mut objects {
+                object.replication_status = status.clone();
+            }
+            for evaluator in [&evaluator, &expiring_evaluator] {
+                let events = evaluator.eval(&objects).await.expect("pending replication should evaluate");
+                assert!(events.iter().all(|event| event.action == IlmAction::NoneAction));
+            }
+        }
+        for object in &mut objects {
+            object.replication_status = ReplicationStatusType::Completed;
+        }
+        for transition_status in ["", crate::TRANSITION_PENDING, "unknown"] {
+            for object in &mut objects {
+                object.transition_status = transition_status.to_string();
+            }
+            for evaluator in [&evaluator, &expiring_evaluator] {
+                let events = evaluator.eval(&objects).await.expect("incomplete transition should evaluate");
+                assert!(
+                    events.iter().all(|event| event.action == IlmAction::NoneAction),
+                    "restore metadata cannot authorize cleanup without a completed transition"
+                );
+            }
+        }
     }
 
     fn expired_marker_lifecycle() -> Arc<BucketLifecycleConfiguration> {
