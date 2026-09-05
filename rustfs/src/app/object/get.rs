@@ -4821,6 +4821,8 @@ mod on_demand_migration_tests {
                     session_token: None,
                 }),
                 tls: TlsConfig::default(),
+                azure: None,
+                gcs: None,
             },
             filter: FilterConfig {
                 prefix: None,

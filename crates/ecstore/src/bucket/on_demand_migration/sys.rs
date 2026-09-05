@@ -643,7 +643,7 @@ fn source_provider(provider: Provider) -> SourceProvider {
 /// falls back to the S3 spec, where the builder reports the missing
 /// credentials: the config layer already refuses to store that shape, so this
 /// only covers a config written by an older or hand-edited build.
-pub(crate) fn source_backend_spec(source: &SourceConfig) -> SourceBackendSpec {
+pub fn source_backend_spec(source: &SourceConfig) -> SourceBackendSpec {
     match (source.provider, source.azure.as_ref(), source.gcs.as_ref()) {
         (Provider::Azure, Some(azure), _) => SourceBackendSpec::Azure(AzureSourceSpec {
             account: azure.account.clone(),

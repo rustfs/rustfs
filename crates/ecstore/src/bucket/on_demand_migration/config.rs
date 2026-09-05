@@ -1024,7 +1024,199 @@ mod tests {
                 "{provider}"
             );
         }
+        // The native providers never sign with a region, so "auto" is the
+        // honest value to write for them.
+        for cfg in [azure_cfg(), gcs_native_cfg()] {
+            assert_eq!(cfg.source.region, "auto");
+            cfg.validate(empty_ctx())
+                .unwrap_or_else(|err| panic!("{}: {err}", cfg.source.provider));
+        }
         assert_eq!(sample().source.effective_region(), "us-west-1");
+    }
+
+    const SERVICE_ACCOUNT_JSON: &str = r#"{"type":"service_account","project_id":"p","client_email":"a@b.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n"}"#;
+
+    fn azure_cfg() -> OnDemandMigrationConfig {
+        let mut cfg = sample();
+        cfg.source.provider = Provider::Azure;
+        cfg.source.endpoint = None;
+        cfg.source.region = "auto".to_string();
+        cfg.source.credentials = None;
+        cfg.source.azure = Some(AzureSourceConfig {
+            account: "legacyaccount".to_string(),
+            account_key: Some("c2VjcmV0LWtleQ==".to_string()),
+            sas_token: None,
+        });
+        cfg
+    }
+
+    fn gcs_native_cfg() -> OnDemandMigrationConfig {
+        let mut cfg = sample();
+        cfg.source.provider = Provider::GcsNative;
+        cfg.source.endpoint = None;
+        cfg.source.region = "auto".to_string();
+        cfg.source.credentials = None;
+        cfg.source.gcs = Some(GcsSourceConfig {
+            service_account_json: SERVICE_ACCOUNT_JSON.to_string(),
+        });
+        cfg
+    }
+
+    #[test]
+    fn native_providers_derive_their_endpoint_and_round_trip_on_the_wire() {
+        let azure = azure_cfg();
+        assert_eq!(azure.source.effective_endpoint(), "https://legacyaccount.blob.core.windows.net");
+        let gcs = gcs_native_cfg();
+        assert_eq!(gcs.source.effective_endpoint(), "https://storage.googleapis.com");
+
+        for cfg in [azure_cfg(), gcs_native_cfg()] {
+            let json = cfg.to_json().expect("config must serialize");
+            assert_eq!(OnDemandMigrationConfig::from_json(&json).expect("config must parse"), cfg);
+        }
+        // The wire labels are part of the admin contract.
+        assert!(
+            String::from_utf8(azure_cfg().to_json().expect("json"))
+                .expect("utf8")
+                .contains(r#""provider":"azure""#)
+        );
+        assert!(
+            String::from_utf8(gcs_native_cfg().to_json().expect("json"))
+                .expect("utf8")
+                .contains(r#""provider":"gcs_native""#)
+        );
+    }
+
+    #[test]
+    fn an_explicit_endpoint_overrides_the_derived_native_one() {
+        // Azurite and fake-gcs-server are addressed this way.
+        let mut cfg = azure_cfg();
+        cfg.source.endpoint = Some("http://azurite.example.com:10000".to_string());
+        cfg.validate(empty_ctx()).expect("an explicit native endpoint is allowed");
+        assert_eq!(cfg.source.effective_endpoint(), "http://azurite.example.com:10000");
+
+        cfg.source.endpoint = Some("http://azurite.example.com:10000/devstoreaccount1".to_string());
+        assert!(
+            matches!(cfg.validate(empty_ctx()), Err(OnDemandMigrationConfigError::InvalidEndpoint(_))),
+            "a native endpoint is still an origin"
+        );
+    }
+
+    #[test]
+    fn a_provider_block_belongs_to_exactly_its_own_provider() {
+        let mut cfg = sample();
+        cfg.source.azure = azure_cfg().source.azure;
+        assert_eq!(
+            cfg.validate(empty_ctx()),
+            Err(OnDemandMigrationConfigError::UnexpectedProviderBlock("azure", Provider::S3))
+        );
+
+        let mut cfg = sample();
+        cfg.source.gcs = gcs_native_cfg().source.gcs;
+        assert_eq!(
+            cfg.validate(empty_ctx()),
+            Err(OnDemandMigrationConfigError::UnexpectedProviderBlock("gcs", Provider::S3))
+        );
+
+        let mut cfg = azure_cfg();
+        cfg.source.azure = None;
+        assert_eq!(
+            cfg.validate(empty_ctx()),
+            Err(OnDemandMigrationConfigError::MissingProviderBlock("azure", Provider::Azure))
+        );
+
+        let mut cfg = gcs_native_cfg();
+        cfg.source.gcs = None;
+        assert_eq!(
+            cfg.validate(empty_ctx()),
+            Err(OnDemandMigrationConfigError::MissingProviderBlock("gcs", Provider::GcsNative))
+        );
+    }
+
+    #[test]
+    fn azure_block_rules() {
+        let with = |account: &str, key: Option<&str>, sas: Option<&str>| {
+            let mut cfg = azure_cfg();
+            cfg.source.azure = Some(AzureSourceConfig {
+                account: account.to_string(),
+                account_key: key.map(str::to_string),
+                sas_token: sas.map(str::to_string),
+            });
+            cfg.validate(empty_ctx())
+        };
+
+        with("legacyaccount", None, Some("sv=2021-08-06&sig=abc%3D")).expect("a SAS token is a complete credential");
+        with("legacyaccount", Some("c2VjcmV0LWtleQ=="), None).expect("an account key is a complete credential");
+
+        for (label, result) in [
+            ("empty account", with("", Some("c2VjcmV0LWtleQ=="), None)),
+            // The account becomes the first label of the derived hostname.
+            ("account with a dot", with("legacy.account", Some("c2VjcmV0LWtleQ=="), None)),
+            ("account with a slash", with("legacy/account", Some("c2VjcmV0LWtleQ=="), None)),
+            ("no credential", with("legacyaccount", None, None)),
+            ("both credentials", with("legacyaccount", Some("c2VjcmV0LWtleQ=="), Some("sv=1"))),
+            ("empty key", with("legacyaccount", Some(""), None)),
+            ("key that is not base64", with("legacyaccount", Some("not base64!"), None)),
+            ("empty sas", with("legacyaccount", None, Some(""))),
+            ("sas with a leading question mark", with("legacyaccount", None, Some("?sv=1"))),
+            ("sas with whitespace", with("legacyaccount", None, Some("sv=1 &sig=a"))),
+        ] {
+            assert!(
+                matches!(result, Err(OnDemandMigrationConfigError::InvalidProviderBlock("azure", _))),
+                "{label}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gcs_native_block_requires_a_usable_service_account_key() {
+        let with = |json: &str| {
+            let mut cfg = gcs_native_cfg();
+            cfg.source.gcs = Some(GcsSourceConfig {
+                service_account_json: json.to_string(),
+            });
+            cfg.validate(empty_ctx())
+        };
+
+        with(SERVICE_ACCOUNT_JSON).expect("a service-account key is accepted");
+        for (label, json) in [
+            ("empty", ""),
+            ("not json", "not json"),
+            ("not an object", "[]"),
+            ("wrong type", r#"{"type":"authorized_user","client_email":"a@b","private_key":"k"}"#),
+            ("no private key", r#"{"type":"service_account","client_email":"a@b"}"#),
+            ("empty client email", r#"{"type":"service_account","client_email":"","private_key":"k"}"#),
+        ] {
+            let result = with(json);
+            assert!(
+                matches!(result, Err(OnDemandMigrationConfigError::InvalidProviderBlock("gcs", _))),
+                "{label}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_secrets_never_survive_redaction_or_debug() {
+        let mut azure = azure_cfg();
+        azure.source.azure.as_mut().expect("block").sas_token = Some("sv=2021-08-06&sig=top-secret".to_string());
+        azure.source.azure.as_mut().expect("block").account_key = None;
+        let gcs = gcs_native_cfg();
+
+        for rendered in [
+            format!("{:?}", azure.redacted()),
+            format!("{azure:?}"),
+            String::from_utf8(azure.redacted().to_json().expect("json")).expect("utf8"),
+        ] {
+            assert!(!rendered.contains("top-secret"), "{rendered}");
+            assert!(rendered.contains("legacyaccount"), "the account name is not a secret: {rendered}");
+        }
+        for rendered in [
+            format!("{:?}", gcs.redacted()),
+            format!("{gcs:?}"),
+            String::from_utf8(gcs.redacted().to_json().expect("json")).expect("utf8"),
+        ] {
+            assert!(!rendered.contains("BEGIN PRIVATE KEY"), "{rendered}");
+            assert!(!rendered.contains("gserviceaccount"), "{rendered}");
+        }
     }
 
     #[test]

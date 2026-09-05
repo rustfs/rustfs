@@ -190,6 +190,14 @@ pub(super) async fn read_text(response: reqwest::Response, max_bytes: usize) -> 
     String::from_utf8(body).map_err(|_| SourceError::Other("source listing response is not valid UTF-8".to_string()))
 }
 
+/// Base64 digest (`Content-MD5`, `md5Hash`, `x-goog-hash`) as lowercase hex.
+/// `None` when the value is not a 16-byte digest, so a CRC32C never passes as
+/// an MD5.
+pub(super) fn base64_md5_to_hex(value: &str) -> Option<String> {
+    let raw = base64_simd::STANDARD.decode_to_vec(value.trim().as_bytes()).ok()?;
+    (raw.len() == 16).then(|| faster_hex::hex_string(&raw))
+}
+
 pub(super) fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok()).map(str::trim)
 }
@@ -368,6 +376,17 @@ mod tests {
             .expect("head should map");
             assert_eq!(head.is_multipart_etag, expected, "opaque = {opaque}");
         }
+    }
+
+    #[test]
+    fn base64_md5_converts_only_sixteen_byte_digests() {
+        assert_eq!(
+            base64_md5_to_hex("1B2M2Y8AsgTpgAmY7PhCfg==").as_deref(),
+            Some("d41d8cd98f00b204e9800998ecf8427e")
+        );
+        assert_eq!(base64_md5_to_hex("not base64!").as_deref(), None);
+        // A CRC32C digest is four bytes: it must not pass as an MD5.
+        assert_eq!(base64_md5_to_hex("AAAAAA==").as_deref(), None);
     }
 
     #[test]

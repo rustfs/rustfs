@@ -115,6 +115,12 @@ pub(super) fn expected_md5_hex(head: &SourceHead) -> Option<String> {
     if head.sse.is_some() {
         return None;
     }
+    // Azure stamps an opaque concurrency token in the ETag slot. It is
+    // recorded as provenance, but reading it as a digest would compare the
+    // pulled bytes against a value that never described them.
+    if head.etag_is_opaque {
+        return None;
+    }
     let etag = head.etag.as_deref()?;
     if etag.len() != 32 || is_multipart_etag(etag) || !etag.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -874,6 +880,12 @@ mod tests {
         head.sse = None;
         head.etag = None;
         assert_eq!(expected_md5_hex(&head), None);
+
+        // An Azure ETag can be any string the service chooses; even one that
+        // happens to look like an MD5 must not be checked against the bytes.
+        let mut head = source_head(b"abc");
+        head.etag_is_opaque = true;
+        assert_eq!(expected_md5_hex(&head), None, "opaque provider ETag");
     }
 
     #[test]

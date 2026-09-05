@@ -26,6 +26,7 @@
 //! forwarded: v1 rejects SSE-C source objects outright.
 
 use super::azure::AzureSourceBackend;
+use super::gcs::GcsNativeSourceBackend;
 use crate::bucket::remote_s3_client::{
     PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, RemoteS3RetryPolicy, build_remote_s3_config,
 };
@@ -716,8 +717,16 @@ impl SourceClient {
                 )?;
                 Ok(Self::from_backend(Box::new(backend), spec))
             }
-            SourceBackendSpec::Gcs(_) => {
-                Err(RemoteS3ClientError::Credentials("the native gcs source backend is not implemented yet"))
+            SourceBackendSpec::Gcs(gcs) => {
+                let backend = GcsNativeSourceBackend::new(
+                    &spec.endpoint,
+                    &spec.bucket,
+                    gcs,
+                    spec.timeouts,
+                    spec.skip_tls_verify,
+                    spec.ca_cert_pem.as_deref(),
+                )?;
+                Ok(Self::from_backend(Box::new(backend), spec))
             }
         }
     }
@@ -975,6 +984,7 @@ fn s3_source_object(object: SdkObject) -> Option<SourceObject> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::on_demand_migration::backend_contract::{BackendCapabilities, OBJECT_MD5, assert_backend_contract};
     use aws_smithy_runtime_api::client::http::{HttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn};
     use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
     use aws_smithy_runtime_api::client::result::ConnectorError;
@@ -1600,6 +1610,98 @@ mod tests {
         assert_eq!(SourceProvider::from_label(" Azure "), Some(Azure));
         assert_eq!(SourceProvider::from_label("gcs_native"), Some(GcsNative));
         assert_eq!(SourceProvider::from_label("swift"), None);
+    }
+
+    const CONTRACT_LIST_PAGE_ONE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>source-bucket</Name>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>cursor-1</NextContinuationToken>
+  <Contents>
+    <Key>dir/a.txt</Key>
+    <LastModified>2015-10-21T07:28:00.000Z</LastModified>
+    <ETag>&quot;5d41402abc4b2a76b9719d911017c592&quot;</ETag>
+    <Size>5</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+  <CommonPrefixes><Prefix>dir/sub/</Prefix></CommonPrefixes>
+</ListBucketResult>"#;
+
+    const CONTRACT_LIST_PAGE_TWO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>source-bucket</Name>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>dir/b.txt</Key>
+    <LastModified>2015-10-21T07:28:00.000Z</LastModified>
+    <ETag>&quot;7d41402abc4b2a76b9719d911017c592&quot;</ETag>
+    <Size>7</Size>
+  </Contents>
+</ListBucketResult>"#;
+
+    const CONTRACT_TAGGING: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet>
+  <Tag><Key>env</Key><Value>prod</Value></Tag>
+</TagSet></Tagging>"#;
+
+    fn contract_object_headers(content_length: u64) -> Vec<(&'static str, String)> {
+        vec![
+            ("etag", format!("\"{OBJECT_MD5}\"")),
+            ("content-length", content_length.to_string()),
+            ("content-type", "text/plain".to_string()),
+            ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+            ("x-amz-meta-owner", "alice".to_string()),
+            ("x-amz-storage-class", "STANDARD".to_string()),
+        ]
+    }
+
+    /// The S3 backend behind the scripted connector, without the prefix-mapping
+    /// client on top: the contract is a property of the backend itself.
+    async fn scripted_s3_backend(responses: Vec<Scripted>) -> S3SourceBackend {
+        let spec = spec(None);
+        let connector = SharedHttpConnector::new(ScriptedConnector {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+        });
+        let http_client = http_client_fn(move |_settings, _components| connector.clone());
+        let endpoint = spec.endpoint_spec().expect("test spec endpoint should parse");
+        let config = build_remote_s3_config(&endpoint)
+            .await
+            .expect("test spec should build")
+            .http_client(http_client)
+            .interceptor(SourceProxyMarkerInterceptor::new());
+        S3SourceBackend {
+            client: S3Client::from_conf(config.build()),
+            bucket: spec.bucket.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_backend_satisfies_the_shared_backend_contract() {
+        let mut ranged = contract_object_headers(3);
+        ranged.push(("content-range", "bytes 1-3/5".to_string()));
+        let backend = scripted_s3_backend(vec![
+            ok(contract_object_headers(5), ""),
+            ok(contract_object_headers(5), "hello"),
+            ok(ranged, "ell"),
+            ok(Vec::new(), CONTRACT_LIST_PAGE_ONE),
+            ok(Vec::new(), CONTRACT_LIST_PAGE_TWO),
+            ok(Vec::new(), CONTRACT_TAGGING),
+            ok(Vec::new(), ""),
+            status(404, ""),
+            status(403, ACCESS_DENIED_BODY),
+        ])
+        .await;
+
+        assert_backend_contract(
+            &backend,
+            BackendCapabilities {
+                etag_is_opaque: false,
+                supports_start_after: true,
+                supports_tagging: true,
+            },
+        )
+        .await;
     }
 
     fn prefix_client(prefix: Option<String>) -> SourceClient {

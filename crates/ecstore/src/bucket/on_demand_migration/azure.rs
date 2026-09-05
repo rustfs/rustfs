@@ -543,10 +543,9 @@ fn leaf_text(reader: &mut Reader<&[u8]>, end: quick_xml::name::QName<'_>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::on_demand_migration::backend_contract::{BackendCapabilities, assert_backend_contract};
     use crate::bucket::on_demand_migration::source_client::SourceError;
-    use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use crate::bucket::on_demand_migration::test_http_fixture::{ScriptedResponse, scripted_server};
 
     const LIST_PAGE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <EnumerationResults ServiceEndpoint="https://acct.blob.core.windows.net/" ContainerName="legacy">
@@ -693,72 +692,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Debug)]
-    struct Recorded {
-        method: String,
-        target: String,
-        headers: Vec<(String, String)>,
-    }
-
-    impl Recorded {
-        fn header(&self, name: &str) -> Option<&str> {
-            self.headers
-                .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(name))
-                .map(|(_, value)| value.as_str())
-        }
-    }
-
-    /// One canned HTTP/1.1 response per connection. `Connection: close` keeps
-    /// every request on its own socket so the script order is deterministic.
-    async fn scripted_server(responses: Vec<(u16, Vec<(&'static str, String)>, String)>) -> (Url, Arc<Mutex<Vec<Recorded>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("fixture listener should bind");
-        let port = listener.local_addr().expect("fixture address").port();
-        let recorded: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&recorded);
-
-        tokio::spawn(async move {
-            for (status, headers, body) in responses {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 2048];
-                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    match stream.read(&mut buffer).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(read) => request.extend_from_slice(&buffer[..read]),
-                    }
-                }
-                let text = String::from_utf8_lossy(&request).into_owned();
-                let mut lines = text.lines();
-                let start = lines.next().unwrap_or_default().to_string();
-                let mut parts = start.split_whitespace();
-                let recorded = Recorded {
-                    method: parts.next().unwrap_or_default().to_string(),
-                    target: parts.next().unwrap_or_default().to_string(),
-                    headers: lines
-                        .take_while(|line| !line.is_empty())
-                        .filter_map(|line| line.split_once(':'))
-                        .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
-                        .collect(),
-                };
-                sink.lock().expect("recorder lock").push(recorded);
-
-                let mut response = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());
-                for (name, value) in headers {
-                    response.push_str(&format!("{name}: {value}\r\n"));
-                }
-                response.push_str("\r\n");
-                response.push_str(&body);
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.flush().await;
-            }
-        });
-
-        (Url::parse(&format!("http://127.0.0.1:{port}")).expect("fixture endpoint"), recorded)
-    }
-
     fn blob_headers() -> Vec<(&'static str, String)> {
         vec![
             ("ETag", "\"0x8D2F1B0A1B2C3D4\"".to_string()),
@@ -774,7 +707,7 @@ mod tests {
 
     #[tokio::test]
     async fn head_signs_the_request_and_maps_azure_metadata() {
-        let (endpoint, recorded) = scripted_server(vec![(200, blob_headers(), String::new())]).await;
+        let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(200, blob_headers(), String::new())]).await;
         let backend = backend(&endpoint, Credential::SharedKey(b"0123456789abcdef0123456789abcdef".to_vec()));
 
         let head = backend.head("photos/a b.jpg").await.expect("HEAD should map");
@@ -806,7 +739,7 @@ mod tests {
 
     #[tokio::test]
     async fn sas_credentials_travel_in_the_query_and_never_sign() {
-        let (endpoint, recorded) = scripted_server(vec![(200, blob_headers(), String::new())]).await;
+        let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(200, blob_headers(), String::new())]).await;
         let backend = backend(
             &endpoint,
             Credential::Sas(vec![
@@ -831,7 +764,7 @@ mod tests {
     async fn get_passes_the_range_through_and_streams_the_body() {
         let mut headers = blob_headers();
         headers.push(("Content-Range", "bytes 10-14/100".to_string()));
-        let (endpoint, recorded) = scripted_server(vec![(206, headers, "hello".to_string())]).await;
+        let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(206, headers, "hello".to_string())]).await;
         let backend = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]));
 
         let range = HTTPRangeSpec {
@@ -854,7 +787,7 @@ mod tests {
     async fn customer_key_blobs_are_refused() {
         let mut headers = blob_headers();
         headers.push(("x-ms-encryption-key-sha256", "abc".to_string()));
-        let (endpoint, _) = scripted_server(vec![(200, headers, String::new())]).await;
+        let (endpoint, _) = scripted_server(vec![ScriptedResponse::new(200, headers, String::new())]).await;
         let backend = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]));
 
         let err = backend.head("a.txt").await.expect_err("customer-key blobs are unsupported");
@@ -866,8 +799,8 @@ mod tests {
     #[tokio::test]
     async fn list_requests_the_container_and_pages_with_the_marker() {
         let (endpoint, recorded) = scripted_server(vec![
-            (200, Vec::new(), LIST_PAGE.to_string()),
-            (200, Vec::new(), LAST_PAGE.to_string()),
+            ScriptedResponse::new(200, Vec::new(), LIST_PAGE.to_string()),
+            ScriptedResponse::new(200, Vec::new(), LAST_PAGE.to_string()),
         ])
         .await;
         let backend = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]));
@@ -931,8 +864,11 @@ mod tests {
 
     #[tokio::test]
     async fn tagging_and_probe_address_the_right_resources() {
-        let (endpoint, recorded) =
-            scripted_server(vec![(200, Vec::new(), TAGS.to_string()), (200, Vec::new(), String::new())]).await;
+        let (endpoint, recorded) = scripted_server(vec![
+            ScriptedResponse::new(200, Vec::new(), TAGS.to_string()),
+            ScriptedResponse::new(200, Vec::new(), String::new()),
+        ])
+        .await;
         let backend = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]));
 
         let tags = backend.tagging("a.txt").await.expect("tags should parse");
@@ -958,12 +894,96 @@ mod tests {
             let headers = code
                 .map(|code| vec![(HEADER_ERROR_CODE, code.to_string())])
                 .unwrap_or_default();
-            let (endpoint, _) = scripted_server(vec![(status, headers, String::new())]).await;
+            let (endpoint, _) = scripted_server(vec![ScriptedResponse::new(status, headers, String::new())]).await;
             let backend = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]));
             let err = backend.head("a.txt").await.expect_err("{status} must fail");
             assert_eq!(err.class_label(), expected, "status {status} -> {err:?}");
             assert_eq!(err.is_retryable(), retryable, "status {status} -> {err:?}");
         }
+    }
+
+    const CONTRACT_LIST_PAGE_ONE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ContainerName="legacy">
+  <Blobs>
+    <Blob>
+      <Name>dir/a.txt</Name>
+      <Properties>
+        <Last-Modified>Wed, 21 Oct 2015 07:28:00 GMT</Last-Modified>
+        <Etag>0x8D2F1B0A1B2C3D4</Etag>
+        <Content-Length>5</Content-Length>
+        <AccessTier>Hot</AccessTier>
+      </Properties>
+    </Blob>
+    <BlobPrefix><Name>dir/sub/</Name></BlobPrefix>
+  </Blobs>
+  <NextMarker>cursor-1</NextMarker>
+</EnumerationResults>"#;
+
+    const CONTRACT_LIST_PAGE_TWO: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ContainerName="legacy">
+  <Blobs>
+    <Blob>
+      <Name>dir/b.txt</Name>
+      <Properties>
+        <Last-Modified>Wed, 21 Oct 2015 07:28:00 GMT</Last-Modified>
+        <Content-Length>7</Content-Length>
+      </Properties>
+    </Blob>
+  </Blobs>
+  <NextMarker />
+</EnumerationResults>"#;
+
+    const CONTRACT_TAGS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<Tags><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tags>"#;
+
+    fn contract_blob_headers() -> Vec<(&'static str, String)> {
+        vec![
+            ("ETag", "\"0x8D2F1B0A1B2C3D4\"".to_string()),
+            ("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+            ("Content-Type", "text/plain".to_string()),
+            ("x-ms-meta-owner", "alice".to_string()),
+            ("x-ms-access-tier", "Hot".to_string()),
+            ("x-ms-blob-type", "BlockBlob".to_string()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn azure_backend_satisfies_the_shared_backend_contract() {
+        let mut ranged = contract_blob_headers();
+        ranged.push(("Content-Range", "bytes 1-3/5".to_string()));
+        // A HEAD reports the object size with no body, exactly as Azure does.
+        let mut head_only = contract_blob_headers();
+        head_only.push(("Content-Length", "5".to_string()));
+        let (endpoint, _) = scripted_server(vec![
+            ScriptedResponse::new(200, head_only, String::new()),
+            ScriptedResponse::new(200, contract_blob_headers(), "hello".to_string()),
+            ScriptedResponse::new(206, ranged, "ell".to_string()),
+            ScriptedResponse::new(200, Vec::new(), CONTRACT_LIST_PAGE_ONE.to_string()),
+            ScriptedResponse::new(200, Vec::new(), CONTRACT_LIST_PAGE_TWO.to_string()),
+            ScriptedResponse::new(200, Vec::new(), CONTRACT_TAGS.to_string()),
+            ScriptedResponse::new(200, Vec::new(), String::new()),
+            ScriptedResponse::new(404, vec![(HEADER_ERROR_CODE, "BlobNotFound".to_string())], String::new()),
+            ScriptedResponse::new(
+                403,
+                vec![(HEADER_ERROR_CODE, "AuthorizationPermissionMismatch".to_string())],
+                String::new(),
+            ),
+        ])
+        .await;
+        let backend = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]));
+
+        assert_backend_contract(
+            &backend,
+            BackendCapabilities {
+                // Azure's ETag is a concurrency token; the contract requires it
+                // to be carried but never read as a digest.
+                etag_is_opaque: true,
+                // Azure paginates only with an opaque marker.
+                supports_start_after: false,
+                supports_tagging: true,
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
