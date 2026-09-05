@@ -471,7 +471,7 @@ impl BackfillContext for BucketBackfillContext {
 
     async fn config_updated_at(&self) -> Result<Option<OffsetDateTime>, StorageError> {
         Ok(
-            super::config::decode_stored_config(get_on_demand_migration_config_in(&self.api.ctx, self.state.bucket()).await?)?
+            super::config::decode_stored_config(get_on_demand_migration_config_in(&self.api, self.state.bucket()).await?)?
                 .map(|(_, updated_at)| updated_at),
         )
     }
@@ -1472,7 +1472,7 @@ impl Job {
 /// Spawns [`run_backfill_recovery_loop`] on the store's shutdown token;
 /// `false` (nothing spawned) when the store has no background token.
 pub fn spawn_backfill_recovery_loop(runner: Arc<BackfillRunner>) -> bool {
-    let Some(cancel) = runner.api.ctx.background_cancel_token() else {
+    let Some(cancel) = runner.api.background_cancel_token() else {
         return false;
     };
     tokio::spawn(run_backfill_recovery_loop(runner, cancel));
