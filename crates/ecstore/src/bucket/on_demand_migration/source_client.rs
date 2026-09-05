@@ -334,8 +334,9 @@ const THROTTLE_CODES: &[&str] = &[
     "RequestLimitExceeded",
     "TooManyRequests",
     "RequestThrottled",
+    "ServerBusy",
 ];
-const NOT_FOUND_CODES: &[&str] = &["NoSuchKey"];
+const NOT_FOUND_CODES: &[&str] = &["NoSuchKey", "BlobNotFound"];
 const ACCESS_DENIED_CODES: &[&str] = &[
     "AccessDenied",
     "InvalidAccessKeyId",
@@ -343,6 +344,7 @@ const ACCESS_DENIED_CODES: &[&str] = &[
     "AllAccessDisabled",
     "ExpiredToken",
     "InvalidToken",
+    "AuthorizationPermissionMismatch",
 ];
 
 pub(super) fn classify_status(status: u16, code: Option<&str>, message: String) -> SourceError {
@@ -1817,6 +1819,7 @@ mod tests {
             ok(Vec::new(), CONTRACT_TAGGING),
             ok(Vec::new(), ""),
             status(404, ""),
+            ok(Vec::new(), ""),
             status(403, ACCESS_DENIED_BODY),
         ])
         .await;
