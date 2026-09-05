@@ -380,6 +380,10 @@ impl HealTask {
                         };
 
                         if let Some(err) = error {
+                            // An interrupted await is not a terminal object repair result.
+                            if matches!(err, Error::TaskTimeout | Error::TaskCancelled) {
+                                return Err(err);
+                            }
                             if Self::is_dangling_delete_grace_error(&err) {
                                 telemetry_unknown |= !increment_counter(&mut skipped);
                                 warn!(
