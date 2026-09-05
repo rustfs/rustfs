@@ -956,6 +956,9 @@ pub struct ObjectOptions {
     pub preserve_etag: Option<String>,
     pub metadata_chg: bool,
     pub http_preconditions: Option<HTTPPreconditions>,
+    /// Internal create-only writes may also preserve an acknowledged deletion.
+    /// Evaluated with `http_preconditions` under the namespace commit lock.
+    pub preserve_delete_marker: bool,
 
     pub delete_replication: Option<ReplicationState>,
     pub delete_replication_config_snapshot: Option<Arc<DeleteReplicationConfigSnapshot>>,
