@@ -3367,3 +3367,130 @@ fn test_retry_snapshot_tombstones_removed_service_accounts() {
     assert!(change.create.is_none());
     assert_eq!(tombstone.updated_at, Some(observed_at));
 }
+
+/// Spawns a one-shot HTTP peer that answers 200 and flips the returned flag
+/// once a request head has arrived.
+async fn spawn_reached_probe_peer() -> (String, Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind healthy peer");
+    let endpoint = format!("http://{}", listener.local_addr().expect("healthy peer address"));
+    let reached = Arc::new(AtomicBool::new(false));
+    let reached_by_server = reached.clone();
+    let server = tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let Ok(read) = stream.read(&mut buffer).await else {
+                return;
+            };
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        reached_by_server.store(true, Ordering::SeqCst);
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+            .await;
+    });
+    (endpoint, reached, server)
+}
+
+/// Three-peer runtime whose local peer is `local`; BTreeMap order visits the
+/// failing peer `b` before the healthy peer `c`.
+fn broadcast_runtime_with_failing_peer_before_healthy(failing_endpoint: &str, healthy_endpoint: &str) -> SiteReplicationRuntime {
+    let local_peer = PeerInfo {
+        deployment_id: "local".to_string(),
+        ..peer("local", "http://127.0.0.1:9")
+    };
+    let mut state = SiteReplicationState {
+        name: "local".to_string(),
+        service_account_access_key: "site-replicator-0".to_string(),
+        ..Default::default()
+    };
+    state.peers.insert("local".to_string(), local_peer.clone());
+    state.peers.insert(
+        "b".to_string(),
+        PeerInfo {
+            deployment_id: "b".to_string(),
+            ..peer("b", failing_endpoint)
+        },
+    );
+    state.peers.insert(
+        "c".to_string(),
+        PeerInfo {
+            deployment_id: "c".to_string(),
+            ..peer("c", healthy_endpoint)
+        },
+    );
+    SiteReplicationRuntime {
+        state,
+        local_peer,
+        service_account_secret_key: "site-replicator-secret".to_string(),
+    }
+}
+
+const BROADCAST_PROBE_DELETE_BUCKET_PATH: &str =
+    "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket";
+
+/// The generic JSON broadcast (bucket make/delete, bucket-meta hook, bucket
+/// ops) attempts every remote peer: a peer whose request fails must not stop
+/// delivery to the peers that follow it in deployment-id order, and the
+/// failure is still reported to the caller (backlog#2293).
+#[tokio::test]
+#[serial]
+async fn test_broadcast_json_reaches_healthy_peers_after_a_failed_peer() {
+    // Peer "b": nothing listens on the port, so the connect is refused.
+    let refused = TcpListener::bind("127.0.0.1:0").await.expect("bind refused-peer probe");
+    let refused_endpoint = format!("http://{}", refused.local_addr().expect("refused-peer address"));
+    drop(refused);
+
+    let (healthy_endpoint, reached, server) = spawn_reached_probe_peer().await;
+    let runtime = broadcast_runtime_with_failing_peer_before_healthy(&refused_endpoint, &healthy_endpoint);
+
+    let result = temp_env::async_with_vars([(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV, Some("true"))], async {
+        broadcast_site_replication_json_with_runtime(&runtime, BROADCAST_PROBE_DELETE_BUCKET_PATH, &serde_json::json!({})).await
+    })
+    .await;
+
+    let err = result.expect_err("peer b refuses connections, the broadcast must report it");
+    assert!(
+        reached.load(Ordering::SeqCst),
+        "peer c never received the broadcast once peer b failed: {err}"
+    );
+    server.abort();
+}
+
+/// Same guarantee when the failing peer never gets a transport: an endpoint
+/// that `PeerTransport::for_runtime_peer` rejects must be skipped past (and
+/// reported), not abort the broadcast before the healthy peers (backlog#2293).
+#[tokio::test]
+#[serial]
+async fn test_broadcast_json_reaches_healthy_peers_after_a_peer_without_transport() {
+    // Peer "b": a scheme the peer connection validator refuses outright.
+    let forbidden_endpoint = "ftp://peer-b.example.com";
+
+    let (healthy_endpoint, reached, server) = spawn_reached_probe_peer().await;
+    let runtime = broadcast_runtime_with_failing_peer_before_healthy(forbidden_endpoint, &healthy_endpoint);
+
+    let result = temp_env::async_with_vars([(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV, Some("true"))], async {
+        broadcast_site_replication_json_with_runtime(&runtime, BROADCAST_PROBE_DELETE_BUCKET_PATH, &serde_json::json!({})).await
+    })
+    .await;
+
+    let err = result.expect_err("peer b has no usable transport, the broadcast must report it");
+    assert!(
+        err.to_string().contains("invalid persisted site replication peer"),
+        "the reported error must be peer b's transport failure: {err}"
+    );
+    assert!(
+        reached.load(Ordering::SeqCst),
+        "peer c never received the broadcast once peer b failed to get a transport: {err}"
+    );
+    server.abort();
+}
