@@ -707,10 +707,6 @@ impl std::fmt::Debug for ECStore {
 /// These delegate to the process-global statics. No local state — the globals
 /// remain the single source of truth until the migration is complete.
 impl ECStore {
-    pub fn instance_ctx(&self) -> &Arc<InstanceContext> {
-        &self.ctx
-    }
-
     /// Every erasure set across all pools, pool-major order.
     ///
     /// Read-only queries that must consult each set's own copy of a

@@ -276,6 +276,7 @@ rcgen = { workspace = true }
 # Async Runtime and Networking
 async-trait = { workspace = true }
 axum.workspace = true
+faster-hex.workspace = true
 futures.workspace = true
 futures-lite.workspace = true
 futures-util.workspace = true
@@ -291,7 +292,6 @@ tokio-rustls = { workspace = true, default-features = false, features = ["loggin
 aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
 aws-smithy-types = { workspace = true }
 google-cloud-auth = { workspace = true, optional = true }
-faster-hex = { workspace = true }
 moka = { workspace = true, features = ["sync"] }
 xxhash-rust = { workspace = true, features = ["xxh3"] }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
