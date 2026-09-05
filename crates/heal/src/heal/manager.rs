@@ -45,6 +45,11 @@ use tracing::{debug, error, info, warn};
 use super::{DiskError, Endpoint, HealDiskExt as _, local_disk_map_read};
 
 const KEEP_HEAL_TASK_STATUS_DURATION: Duration = Duration::from_secs(10 * 60);
+// Each cache includes alias tokens in its count and byte budget. Eviction
+// removes every token sharing a snapshot; neither cache retains repair state.
+const MAX_COMPLETED_HEAL_TOKENS: usize = 1024;
+const MAX_COMPLETED_HEAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_COMPLETED_HEAL_RESULT_BYTES: usize = 1024 * 1024;
 const DISPLACED_HEAL_REASON: &str = "reason=displaced; retry_hint=submit_again";
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_DISK_SCANNER: &str = "disk_scanner";
@@ -180,6 +185,8 @@ fn record_displaced_terminal(
     request: &HealRequest,
 ) -> Arc<CompletedHealStatus> {
     let terminal = Arc::new(CompletedHealStatus {
+        progress: None,
+        retained_bytes: std::sync::OnceLock::new(),
         heal_type: request.heal_type.clone(),
         status: HealTaskStatus::Failed {
             error: format!("heal task displaced by a higher-priority request ({DISPLACED_HEAL_REASON})"),
@@ -193,6 +200,7 @@ fn record_displaced_terminal(
     let mut terminals = lock_displaced_terminals(registry);
     prune_completed_heal_statuses(&mut terminals);
     terminals.insert(request.id.clone(), Arc::clone(&terminal));
+    prune_completed_heal_statuses(&mut terminals);
     terminal
 }
 
@@ -209,9 +217,15 @@ async fn remove_displaced_task_aliases(
         .collect::<Vec<_>>();
     let mut displaced_terminals = lock_displaced_terminals(terminals);
     prune_completed_heal_statuses(&mut displaced_terminals);
-    for alias_id in alias_ids {
-        displaced_terminals.insert(alias_id, Arc::clone(terminal));
+    if displaced_terminals
+        .get(task_id)
+        .is_some_and(|current| Arc::ptr_eq(current, terminal))
+    {
+        for alias_id in alias_ids {
+            displaced_terminals.insert(alias_id, Arc::clone(terminal));
+        }
     }
+    prune_completed_heal_statuses(&mut displaced_terminals);
     aliases.retain(|alias_id, alias| alias_id != task_id && alias.task_id != task_id);
 }
 
@@ -220,6 +234,36 @@ async fn remove_task_aliases_for_task(registry: &Arc<Mutex<HashMap<String, HealT
         .lock()
         .await
         .retain(|alias_id, alias| alias_id != task_id && alias.task_id != task_id);
+}
+
+// Callers hold active ownership until publication. Lock order is active ->
+// retrying (when needed) -> aliases -> completed; queries release aliases
+// before looking up active state. Publishing aliases before removing their
+// mapping keeps both an already-resolved token and a new lookup valid.
+async fn publish_completed_heal(
+    completed_heals: &Mutex<HashMap<String, Arc<CompletedHealStatus>>>,
+    task_aliases: &Mutex<HashMap<String, HealTaskAlias>>,
+    task_id: &str,
+    completed: CompletedHealStatus,
+    terminal: bool,
+) {
+    let completed = Arc::new(completed);
+    completed.retained_bytes();
+    let mut aliases = task_aliases.lock().await;
+    let mut retained = completed_heals.lock().await;
+    if let Some(previous) = retained.get(task_id).cloned() {
+        for entry in retained.values_mut().filter(|entry| Arc::ptr_eq(entry, &previous)) {
+            *entry = Arc::clone(&completed);
+        }
+    }
+    retained.insert(task_id.to_owned(), Arc::clone(&completed));
+    if terminal {
+        for (alias_id, _) in aliases.iter().filter(|(_, alias)| alias.task_id == task_id) {
+            retained.insert(alias_id.clone(), Arc::clone(&completed));
+        }
+        aliases.retain(|alias_id, alias| alias_id != task_id && alias.task_id != task_id);
+    }
+    prune_completed_heal_statuses(&mut retained);
 }
 
 #[derive(Debug, Clone)]
@@ -268,7 +312,7 @@ fn completed_task_report(completed: &CompletedHealStatus, since: Option<u64>) ->
     let result_items = match since {
         None => completed.seqed_items.iter().map(|(_, item)| item.clone()).collect(),
         Some(cursor) => {
-            if cursor + 1 < completed.min_seq {
+            if cursor.saturating_add(1) < completed.min_seq {
                 lagged = true;
             }
             completed
@@ -283,7 +327,7 @@ fn completed_task_report(completed: &CompletedHealStatus, since: Option<u64>) ->
         status: completed.status.clone(),
         result_items,
         result_items_truncated: completed.result_items_truncated || lagged,
-        progress: None,
+        progress: completed.progress.clone(),
         next_seq: completed.next_seq,
         min_seq: completed.min_seq,
     }
@@ -1847,14 +1891,14 @@ impl HealManager {
 
     pub async fn get_task_progress(&self, task_id: &str) -> Result<HealProgress> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        let active_heals = self.active_heals.lock().await;
-        if let Some(task) = active_heals.get(&canonical_task_id) {
-            Ok(task.get_progress().await)
-        } else {
-            Err(Error::TaskNotFound {
-                task_id: task_id.to_string(),
-            })
-        }
+        let progress = match self.lookup_task_state(&canonical_task_id, None).await {
+            TaskStateLookup::Active(task) => Some(task.get_progress().await),
+            TaskStateLookup::Completed(completed) => completed.progress.clone(),
+            _ => None,
+        };
+        progress.ok_or_else(|| Error::TaskNotFound {
+            task_id: task_id.to_string(),
+        })
     }
 
     /// Cancel task
@@ -1864,6 +1908,8 @@ impl HealManager {
             let mut active_heals = self.active_heals.lock().await;
             if let Some(task) = active_heals.get(&canonical_task_id) {
                 task.cancel().await?;
+                let completed = CompletedHealStatus::snapshot(task, HealTaskStatus::Cancelled).await;
+                publish_completed_heal(&self.completed_heals, &self.task_aliases, &canonical_task_id, completed, true).await;
                 active_heals.remove(&canonical_task_id);
                 publish_active_heal_count(&active_heals);
                 info!(
@@ -1940,6 +1986,8 @@ impl HealManager {
             for task_id in &task_ids {
                 if let Some(task) = active_heals.get(task_id) {
                     task.cancel().await?;
+                    let completed = CompletedHealStatus::snapshot(task, HealTaskStatus::Cancelled).await;
+                    publish_completed_heal(&self.completed_heals, &self.task_aliases, task_id, completed, true).await;
                 }
                 active_heals.remove(task_id);
                 cancelled += 1;

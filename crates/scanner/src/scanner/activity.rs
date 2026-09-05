@@ -902,6 +902,7 @@ where
     observation
 }
 
+#[cfg(test)]
 pub(crate) fn scanner_activity_snapshot_digest(snapshot: &ScannerActivitySnapshot) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(u64::try_from(snapshot.len()).unwrap_or(u64::MAX).to_be_bytes());
@@ -919,6 +920,30 @@ pub(crate) fn scanner_activity_snapshot_digest(snapshot: &ScannerActivitySnapsho
         hasher.update([u8::from(activity.data_movement_active)]);
         hasher.update(activity.dirty_usage_generation.to_be_bytes());
         hasher.update([u8::from(activity.dirty_usage_pending)]);
+        hasher.update(activity.movement_generation.to_be_bytes());
+        hasher.update([u8::from(activity.publication_blocked)]);
+    }
+    hasher.finalize().into()
+}
+
+/// Hash the activity inputs that make an existing scanner cache unsafe to
+/// reuse. Regular namespace writes and dirty-usage generations are omitted:
+/// their affected buckets are tracked separately and may be refreshed from a
+/// complete authoritative cache baseline.
+pub(crate) fn scanner_activity_structural_digest(snapshot: &ScannerActivitySnapshot) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(u64::try_from(snapshot.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for (host, activity) in snapshot {
+        let host = host.as_bytes();
+        let instance_id = activity.instance_id.as_bytes();
+        hasher.update(u64::try_from(host.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(host);
+        hasher.update(u64::try_from(instance_id.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(instance_id);
+        hasher.update(activity.maintenance_generation.to_be_bytes());
+        hasher.update(activity.protocol_version.to_be_bytes());
+        hasher.update(activity.topology_digest);
+        hasher.update([u8::from(activity.data_movement_active)]);
         hasher.update(activity.movement_generation.to_be_bytes());
         hasher.update([u8::from(activity.publication_blocked)]);
     }
@@ -953,6 +978,22 @@ pub(crate) fn scanner_dirty_usage_acknowledgements(snapshot: &ScannerActivitySna
             generation: activity.dirty_usage_generation,
         })
         .collect()
+}
+
+pub(crate) fn scanner_activity_dirty_usage_state_for_host<'a>(
+    snapshot: &'a ScannerActivitySnapshot,
+    host: &str,
+) -> Option<(&'a str, u64, bool)> {
+    snapshot
+        .get(host)
+        .filter(|_| host != LOCAL_SCANNER_ACTIVITY_NODE)
+        .map(|activity| {
+            (
+                activity.instance_id.as_str(),
+                activity.dirty_usage_generation,
+                activity.dirty_usage_pending,
+            )
+        })
 }
 
 pub fn scanner_topology_digest(storeapi: &ECStore) -> [u8; 32] {

@@ -1,0 +1,51 @@
+{
+  "generator": "github.com/minio/minio-go/v7.Client.PutObjectsSnowball",
+  "minio_go": "v7.3.0",
+  "generated_at": "2026-09-05T00:00:00Z",
+  "objects": [
+    {
+      "key": "alpha.txt",
+      "body": "alpha-body",
+      "mod_time": "2024-01-02T03:04:05Z",
+      "version_id": "018cc251-f400-7c22-9e8d-8b1800000001",
+      "headers": {
+        "Content-Type": [
+          "text/plain"
+        ],
+        "X-Amz-Meta-Owner": [
+          "snowball-fixture"
+        ],
+        "X-Amz-Tagging": [
+          "project=rustfs\u0026source=minio-go"
+        ]
+      }
+    },
+    {
+      "key": "nested/世界.txt",
+      "body": "bravo-body",
+      "mod_time": "2024-01-02T03:05:05Z",
+      "headers": {
+        "Content-Language": [
+          "zh-CN"
+        ],
+        "X-Amz-Meta-Note": [
+          "unicode-path"
+        ]
+      }
+    }
+  ],
+  "archives": [
+    {
+      "file": "snowball.tar",
+      "compressed": false,
+      "length": 4096,
+      "sha256": "f00f2789dcb65b567f722f49cfdac9705e7bdac6c0badae75194327c32193d2e"
+    },
+    {
+      "file": "snowball.tar.s2",
+      "compressed": true,
+      "length": 528,
+      "sha256": "f8a9d9aa9b9ccdfae24ded1bff3741aacb935f1457a252efc9266674ff13c992"
+    }
+  ]
+}

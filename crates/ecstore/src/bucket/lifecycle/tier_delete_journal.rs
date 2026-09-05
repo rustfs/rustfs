@@ -1733,6 +1733,7 @@ async fn save_config_if_none_fenced(
         data.clone(),
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_none_match: Some("*".to_string()),
                 ..Default::default()
@@ -1832,6 +1833,7 @@ async fn save_decommission_manifest_checkpoint_if_match(
 
         let mut opts = ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             no_lock: true,
             http_preconditions: Some(HTTPPreconditions {
                 if_match: Some(observed_etag),
@@ -1960,6 +1962,7 @@ async fn save_config_if_match_fenced(
         data.clone(),
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_match: Some(etag.to_string()),
                 ..Default::default()
@@ -3780,6 +3783,7 @@ where
                 data.clone(),
                 &ObjectOptions {
                     max_parity: true,
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
                     http_preconditions: Some(HTTPPreconditions {
                         if_none_match: Some("*".to_string()),
                         ..Default::default()
@@ -3869,6 +3873,7 @@ where
                 data.clone(),
                 &ObjectOptions {
                     max_parity: true,
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
                     http_preconditions: Some(HTTPPreconditions {
                         if_match: Some(etag),
                         ..Default::default()
@@ -3893,6 +3898,7 @@ where
                 data.clone(),
                 &ObjectOptions {
                     max_parity: true,
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
                     http_preconditions: Some(HTTPPreconditions {
                         if_none_match: Some("*".to_string()),
                         ..Default::default()

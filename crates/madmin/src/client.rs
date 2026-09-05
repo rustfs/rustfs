@@ -182,12 +182,31 @@ pub struct BackgroundHealStatus {
     pub heal_active_tasks: u64,
     #[serde(default)]
     pub cluster_status_complete: bool,
+    /// Missing on older servers; absent coverage or counts mean unknown.
+    #[serde(default)]
+    pub coverage: Option<BackgroundHealCoverage>,
     #[serde(default)]
     pub progress: Option<serde_json::Value>,
     /// Remaining wire fields (flattened `BackgroundHealInfo` plus the
     /// priority-by-source operations matrix), carried verbatim.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Node coverage of a background heal status snapshot. Counters describe only
+/// nodes with usable snapshots; unknown peers may still be running heal work.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundHealCoverage {
+    #[serde(default)]
+    pub expected: Option<usize>,
+    #[serde(default)]
+    pub responded: Option<usize>,
+    #[serde(default)]
+    pub unknown: Option<usize>,
+    /// Stable reason codes; unknown future codes are preserved verbatim.
+    #[serde(default)]
+    pub reasons: Vec<String>,
 }
 
 /// `GET /v3/scanner/status` response, typed at the fields operators branch
@@ -630,7 +649,37 @@ mod tests {
         assert_eq!(status.state, "active");
         assert_eq!(status.heal_queue_length, 3);
         assert!(status.cluster_status_complete);
+        assert!(status.coverage.is_none(), "legacy payloads have unknown coverage");
         assert!(status.extra.contains_key("healOperations"), "unknown nested payloads must pass through");
+    }
+
+    #[test]
+    fn background_heal_status_missing_coverage_fields_remain_unknown() {
+        for raw in [json!({"state": "degraded"}), json!({"state": "degraded", "coverage": {}})] {
+            let status: BackgroundHealStatus = serde_json::from_value(raw).expect("partial legacy payload decodes");
+            assert!(!status.cluster_status_complete);
+            if let Some(coverage) = status.coverage {
+                assert_eq!(coverage.expected, None);
+                assert_eq!(coverage.responded, None);
+                assert_eq!(coverage.unknown, None);
+            }
+        }
+    }
+
+    #[test]
+    fn background_heal_status_preserves_future_fields_and_reasons() {
+        let raw = json!({
+            "state": "degraded", "clusterStatusComplete": false,
+            "coverage": {"expected": 3, "responded": 1, "unknown": 2, "reasons": ["future_reason"], "futureCoverage": true},
+            "futureStatus": {"value": 7}
+        });
+        let status: BackgroundHealStatus = serde_json::from_value(raw).expect("future additive fields decode");
+        assert_eq!(status.extra["futureStatus"]["value"], 7);
+        let coverage = status.coverage.expect("coverage supplied");
+        assert_eq!(coverage.expected, Some(3));
+        assert_eq!(coverage.responded, Some(1));
+        assert_eq!(coverage.unknown, Some(2));
+        assert_eq!(coverage.reasons, ["future_reason"]);
     }
 
     #[test]
@@ -721,11 +770,34 @@ mod tests {
 
         let status = client.background_heal_status().await.expect("status decodes");
         assert_eq!(status.state, "idle");
+        assert!(status.coverage.is_none(), "older HTTP responses retain unknown coverage");
         let request = server.recorded();
         // The server registers this route POST-only; a GET here answers 405.
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/rustfs/admin/v3/background-heal/status");
         assert_eq!(request.query, "");
+    }
+
+    #[tokio::test]
+    async fn background_heal_status_decodes_partial_coverage_over_http() {
+        let body = r#"{"state":"degraded","healQueueLength":0,"healActiveTasks":0,"clusterStatusComplete":false,"coverage":{"expected":3,"responded":1,"unknown":2,"reasons":["notification_system_unavailable"]},"futureStatus":true}"#;
+        let server = TestServer::spawn(body, 200).await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").expect("client builds");
+        let status = client
+            .background_heal_status()
+            .await
+            .expect("partial status is a successful response");
+        assert_eq!(status.state, "degraded");
+        assert!(!status.cluster_status_complete);
+        assert_eq!(status.extra["futureStatus"], true);
+        let coverage = status.coverage.expect("partial coverage supplied");
+        assert_eq!(coverage.expected, Some(3));
+        assert_eq!(coverage.responded, Some(1));
+        assert_eq!(coverage.unknown, Some(2));
+        assert_eq!(coverage.reasons, ["notification_system_unavailable"]);
+        let request = server.recorded();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.query, "", "reading status must not send heal control parameters");
     }
 
     #[tokio::test]

@@ -176,7 +176,7 @@ pub(crate) mod server {
                 heal_topology_fingerprint, make_heal_control_server_for_source,
             };
             pub(crate) use crate::storage::storage_api::tonic_service_consumer::{
-                make_heal_control_server_with_cache, make_server, make_tier_mutation_control_server,
+                make_heal_control_server_with_cache, make_scanner_control_server, make_server, make_tier_mutation_control_server,
             };
         }
     }
@@ -244,8 +244,8 @@ pub(crate) mod site_replication {
     pub(crate) use crate::storage::storage_api::{Endpoint, Endpoints, PoolEndpoints};
 
     pub(crate) use crate::storage::storage_api::{
-        ECStore, EndpointServerPools, StorageError, delete_config_no_lock, lock_bucket_targets_metadata, read_config,
-        read_config_no_lock, save_config_no_lock, with_config_object_read_lock, with_config_object_write_lock,
+        ECStore, EndpointServerPools, StorageError, delete_config_no_lock, is_err_bucket_not_found, lock_bucket_targets_metadata,
+        read_config, read_config_no_lock, save_config_no_lock, with_config_object_read_lock, with_config_object_write_lock,
     };
 
     pub(crate) mod metadata_sys {

@@ -86,7 +86,12 @@ impl BreakerVerdict {
             Some(SourceError::Throttled | SourceError::Timeout | SourceError::Connect(_) | SourceError::ServerError(_)) => {
                 BreakerVerdict::Failure
             }
-            Some(SourceError::AccessDenied | SourceError::Unsupported(_) | SourceError::Other(_)) => BreakerVerdict::Neutral,
+            Some(
+                SourceError::AccessDenied
+                | SourceError::Unsupported(_)
+                | SourceError::InvalidPagination(_)
+                | SourceError::Other(_),
+            ) => BreakerVerdict::Neutral,
         }
     }
 }

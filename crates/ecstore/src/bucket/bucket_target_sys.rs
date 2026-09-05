@@ -59,7 +59,7 @@ use rustfs_utils::http::{
     insert_header,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::str::FromStr as _;
@@ -376,6 +376,11 @@ pub struct BucketTargetSys {
     /// [`SsecPassthroughCapability`]; reset alongside `arn_remotes_map`.
     ssec_passthrough_map: Arc<RwLock<HashMap<String, SsecPassthroughRecord>>>,
     pub targets_map: Arc<RwLock<HashMap<String, Vec<BucketTarget>>>>,
+    /// Buckets whose persisted `bucket-targets.json` exists but cannot be
+    /// decoded (rustfs/backlog#2282). Written under the bucket's update mutex
+    /// alongside `targets_map`, and read before it so an unreadable
+    /// configuration surfaces as a typed error instead of an empty target set.
+    unreadable_targets: Arc<RwLock<HashSet<String>>>,
     pub h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
     target_h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
     pub hc_client: Arc<HttpClient>,
@@ -419,6 +424,7 @@ impl BucketTargetSys {
             arn_remotes_map: Arc::new(RwLock::new(HashMap::new())),
             ssec_passthrough_map: Arc::new(RwLock::new(HashMap::new())),
             targets_map: Arc::new(RwLock::new(HashMap::new())),
+            unreadable_targets: Arc::new(RwLock::new(HashSet::new())),
             h_mutex: Arc::new(RwLock::new(HashMap::new())),
             target_h_mutex: Arc::new(RwLock::new(HashMap::new())),
             hc_client: Arc::new(build_health_check_client()),
@@ -628,30 +634,40 @@ impl BucketTargetSys {
         health_map.clone()
     }
 
-    pub async fn list_targets(&self, bucket: &str, arn_type: &str) -> Vec<BucketTarget> {
+    /// Targets of one bucket, or of every bucket when `bucket` is empty.
+    ///
+    /// A bucket that simply has no targets yields an empty list; a bucket
+    /// whose persisted configuration cannot be decoded is an error, so an
+    /// admin listing reports the fault instead of an empty list that reads as
+    /// "replication is not configured" (rustfs/backlog#2282).
+    pub async fn list_targets(&self, bucket: &str, arn_type: &str) -> Result<Vec<BucketTarget>, BucketTargetError> {
         let health_stats = self.target_health_stats().await;
         let mut targets = Vec::new();
 
         if !bucket.is_empty() {
-            if let Ok(bucket_targets) = self.list_bucket_targets(bucket).await {
-                for mut target in bucket_targets.targets {
-                    if arn_type.is_empty() || target.target_type.to_string() == arn_type {
-                        if let Some(health) = health_stats.get(&target.arn) {
-                            target.total_downtime = health.offline_duration;
-                            target.online = health.online;
-                            target.last_online = health.last_online;
-                            target.latency = target::LatencyStat {
-                                curr: health.latency.curr,
-                                avg: health.latency.avg,
-                                max: health.latency.peak,
-                            };
-                            target.offline_count = health.offline_count;
+            match self.list_bucket_targets(bucket).await {
+                Ok(bucket_targets) => {
+                    for mut target in bucket_targets.targets {
+                        if arn_type.is_empty() || target.target_type.to_string() == arn_type {
+                            if let Some(health) = health_stats.get(&target.arn) {
+                                target.total_downtime = health.offline_duration;
+                                target.online = health.online;
+                                target.last_online = health.last_online;
+                                target.latency = target::LatencyStat {
+                                    curr: health.latency.curr,
+                                    avg: health.latency.avg,
+                                    max: health.latency.peak,
+                                };
+                                target.offline_count = health.offline_count;
+                            }
+                            targets.push(target);
                         }
-                        targets.push(target);
                     }
                 }
+                Err(BucketTargetError::BucketRemoteTargetNotFound { .. }) => {}
+                Err(err) => return Err(err),
             }
-            return targets;
+            return Ok(targets);
         }
 
         let targets_map = self.targets_map.read().await;
@@ -674,10 +690,16 @@ impl BucketTargetSys {
             }
         }
 
-        targets
+        Ok(targets)
     }
 
     pub async fn list_bucket_targets(&self, bucket: &str) -> Result<BucketTargets, BucketTargetError> {
+        if self.unreadable_targets.read().await.contains(bucket) {
+            return Err(BucketTargetError::BucketRemoteTargetsUnreadable {
+                bucket: bucket.to_string(),
+            });
+        }
+
         let targets_map = self.targets_map.read().await;
         if let Some(targets) = targets_map.get(bucket) {
             Ok(BucketTargets {
@@ -690,13 +712,30 @@ impl BucketTargetSys {
         }
     }
 
+    /// Record that this bucket's persisted targets configuration exists but
+    /// cannot be decoded (rustfs/backlog#2282).
+    ///
+    /// Any snapshot published from an earlier readable load is deliberately
+    /// left in place: withdrawing it would produce exactly the silent "no
+    /// targets configured" state this marker exists to prevent. The marker is
+    /// cleared by the next successful publish, which is what makes a repaired
+    /// configuration take effect without a restart.
+    pub async fn mark_targets_unreadable(&self, bucket: &str) {
+        let update_mutex = self.target_update_mutex(bucket).await;
+        let _update_guard = update_mutex.lock().await;
+
+        self.unreadable_targets.write().await.insert(bucket.to_string());
+    }
+
     pub async fn delete(&self, bucket: &str) {
         let update_mutex = self.target_update_mutex(bucket).await;
         let _update_guard = update_mutex.lock().await;
 
-        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex,
-        // then ssec_passthrough_map (always last; also taken standalone by the
-        // capability accessors).
+        // Lock order: unreadable_targets, then targets_map, then
+        // arn_remotes_map, then target_h_mutex, then ssec_passthrough_map
+        // (always last; also taken standalone by the capability accessors).
+        self.unreadable_targets.write().await.remove(bucket);
+
         let mut targets_map = self.targets_map.write().await;
         let mut arn_remotes_map = self.arn_remotes_map.write().await;
         let mut health_map = self.target_h_mutex.write().await;
@@ -1093,6 +1132,11 @@ impl BucketTargetSys {
     /// Keeping persisted-config reads under the same mutex prevents a stale
     /// reload from overwriting a concurrent credential rotation.
     async fn update_all_targets_locked(&self, bucket: &str, targets: Option<&BucketTargets>) {
+        // Reaching here means the persisted configuration decoded, so the
+        // unreadable marker (if any) is stale. Cleared before the maps below
+        // so `unreadable_targets` stays the outermost of this module's locks.
+        self.unreadable_targets.write().await.remove(bucket);
+
         let mut clients = Vec::new();
         if let Some(new_targets) = targets {
             for target in &new_targets.targets {
@@ -1100,9 +1144,9 @@ impl BucketTargetSys {
             }
         }
 
-        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex,
-        // then ssec_passthrough_map (always last; also taken standalone by the
-        // capability accessors).
+        // Lock order: unreadable_targets (above), then targets_map, then
+        // arn_remotes_map, then target_h_mutex, then ssec_passthrough_map
+        // (always last; also taken standalone by the capability accessors).
         let mut targets_map = self.targets_map.write().await;
         let mut arn_remotes_map = self.arn_remotes_map.write().await;
         let mut health_map = self.target_h_mutex.write().await;
@@ -1161,6 +1205,11 @@ impl BucketTargetSys {
     }
 
     pub async fn set(&self, bucket: &str, meta: &BucketMetadata) {
+        if meta.bucket_targets_unreadable() {
+            self.mark_targets_unreadable(bucket).await;
+            return;
+        }
+
         let Some(config) = &meta.bucket_target_config else {
             return;
         };
@@ -2276,6 +2325,13 @@ pub enum BucketTargetError {
     BucketRemoteTargetNotFound {
         bucket: String,
     },
+    /// The bucket's persisted targets configuration exists but cannot be
+    /// decoded. Distinct from `BucketRemoteTargetNotFound`, which means the
+    /// bucket genuinely has no targets: callers must not degrade this one to
+    /// an empty target set (rustfs/backlog#2282).
+    BucketRemoteTargetsUnreadable {
+        bucket: String,
+    },
     BucketRemoteArnTypeInvalid {
         bucket: String,
     },
@@ -2308,6 +2364,9 @@ impl fmt::Display for BucketTargetError {
         match self {
             BucketTargetError::BucketRemoteTargetNotFound { bucket } => {
                 write!(f, "Remote target not found for bucket: {bucket}")
+            }
+            BucketTargetError::BucketRemoteTargetsUnreadable { bucket } => {
+                write!(f, "Persisted replication target configuration is unreadable for bucket: {bucket}")
             }
             BucketTargetError::BucketRemoteArnTypeInvalid { bucket } => {
                 write!(f, "Invalid ARN type for bucket: {bucket}")
@@ -3256,7 +3315,7 @@ mod tests {
             }],
         );
 
-        let targets = sys.list_targets("", "").await;
+        let targets = sys.list_targets("", "").await.expect("listing every bucket's targets");
 
         assert_eq!(targets.len(), 1);
         assert!(!targets[0].online);

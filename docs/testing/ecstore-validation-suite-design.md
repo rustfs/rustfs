@@ -54,6 +54,22 @@ Fail-closed invariants every row enforces:
 
 Fault injection is explicit and deterministic: local disk mocks for unit tests, process-level disk manipulation (`crates/e2e_test/src/chaos.rs`) for e2e tests. Property tests replay a fixed seed for payload, range, and missing-shard selection.
 
+### PUT completion fixtures
+
+`ObjectOptions::default()` uses `WriteCompletion::Quorum`: a namespace-lock-owning PUT may acknowledge write quorum while its rename tail retains the lock. A fixture that immediately inspects every disk or primes a metadata generation must set `write_completion: WriteCompletion::TailDrained` and keep normal locking. TailDrained waits for the existing rename fan-out; it does not require every disk to succeed or change fsync policy. Codec-only `no_lock` fixtures do not cover namespace locking.
+
+The object tests reuse `rename_fanout_barrier::arm(object, disk_slot, phase)` and `observe_tasks(object)`. Wait for the barrier with a deadline, observe actual metadata quorum with `wait_for_paused_tail_metadata_quorum`, then release or cancel. The metadata check distinguishes a real quorum from disk tasks that have not started. Assert zero remaining rename tasks after the owned coordinator releases its lock; cancellation tests also wait for staging cleanup.
+
+| Fixture | Completion boundary |
+|---|---|
+| `early_ack_tail_drain_retains_namespace_lock_until_background_rename_finishes` | Default PUT returns before the parked tail; a second writer remains blocked. |
+| `tail_drained_put_*` | Explicit full-tail PUT retains its guard, preserves quorum success with a failed minority, rejects quorum-minus-one, and survives ACK waiter cancellation. |
+| `transition_and_restore_reclaim_prior_metadata_generations` | Both source fixtures use TailDrained before cache priming, with normal namespace locks. |
+| `object_transaction_fencing_persists_epoch_on_multipart_commit` | Multipart completion already always drains rename before inspecting all per-disk transaction UUIDs. |
+| `decommission_durable_ilm_receipt_pagination_fails_closed_on_second_page`, `dispatch_completion_cas_is_bounded_and_reaches_the_tail` | Durable receipt, journal, and manifest writers choose TailDrained; the pagination fixture also drains deliberate receipt replacement writes. |
+
+Select these checks with `cargo nextest list -p rustfs-ecstore --features test-util -E 'test(tail_drained_put) | test(early_ack_tail_drain) | test(no_lock_put_waits_for_rename_tail) | test(object_transaction_fencing_persists_epoch_on_multipart_commit) | test(transition_and_restore_reclaim) | test(decommission_durable_ilm_receipt_pagination) | test(dispatch_completion_cas)'`, then run the same expression under the default and CI profiles without retries. Remaining crash, reopen, rollback, and lock-loss schedules use the existing domain tests; this completion fixture is not a replacement for those checks.
+
 ### Coverage gate
 
 `full` and `destructive` run `cargo llvm-cov -p rustfs-ecstore --lib` and fail when line coverage of the gate scope is below `--unit-coverage-min`. The default minimum and the 100% target for EC read, write, decode, heal, metadata-quorum, and rollback paths are the `UNIT_COVERAGE_*` constants at the top of the runner. `cargo-llvm-cov` must be installed unless `--skip-coverage` is passed explicitly. The default scope `ec-critical` is:
