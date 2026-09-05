@@ -1055,6 +1055,22 @@ impl<T: Store> IamSys<T> {
         self.store.get_group_description(group).await
     }
 
+    /// The stored group record itself (see `IamCache::get_group_info`).
+    pub async fn get_group_info(&self, group: &str) -> Option<GroupInfo> {
+        self.store.get_group_info(group).await
+    }
+
+    /// The stored policy document, `Error::NoSuchPolicy` when absent.
+    pub async fn get_policy_doc(&self, name: &str) -> Result<PolicyDoc> {
+        self.store.get_policy_doc(name).await
+    }
+
+    /// The stored mapping record for one user or group (see
+    /// `IamCache::get_mapped_policy_record`).
+    pub async fn get_mapped_policy_record(&self, name: &str, user_type: UserType, is_group: bool) -> Option<MappedPolicy> {
+        self.store.get_mapped_policy_record(name, user_type, is_group).await
+    }
+
     pub async fn list_groups_load(&self) -> Result<Vec<String>> {
         self.store.update_groups().await
     }

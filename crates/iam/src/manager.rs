@@ -429,6 +429,27 @@ where
         }
     }
 
+    /// The cached mapping record for one user or group, looked up in the same
+    /// cache partition `policy_db_set` writes it to (group / STS / regular+service
+    /// user). `None` when no mapping is stored.
+    pub async fn get_mapped_policy_record(&self, name: &str, user_type: UserType, is_group: bool) -> Option<MappedPolicy> {
+        let cache = self.cache.snapshot();
+        if is_group {
+            cache.group_policies.get(name).cloned()
+        } else if user_type == UserType::Sts {
+            cache.sts_policies.get(name).cloned()
+        } else {
+            cache.user_policies.get(name).cloned()
+        }
+    }
+
+    /// The cached group record (members, status, own timestamp) without the
+    /// mapped-policy overlay `get_group_description` applies. `None` when the
+    /// group does not exist.
+    pub async fn get_group_info(&self, name: &str) -> Option<GroupInfo> {
+        self.cache.snapshot().groups.get(name).cloned()
+    }
+
     pub async fn get_policy(&self, name: &str) -> Result<Policy> {
         if name.is_empty() {
             return Err(Error::InvalidArgument);
@@ -1693,6 +1714,10 @@ where
             }
         }
 
+        // The group's own timestamp moves with every membership or status
+        // change: site replication judges an incoming group item against it
+        // (backlog#2291), so it must reflect the last change, not creation.
+        let now = OffsetDateTime::now_utc();
         let gi = match cache.groups.get(group) {
             Some(res) => {
                 let mut gi = res.clone();
@@ -1701,6 +1726,7 @@ where
                 uniq_set.extend(members.iter().cloned());
 
                 gi.members = uniq_set.into_iter().collect();
+                gi.update_at = Some(now);
                 gi
             }
             None => GroupInfo::new(members.clone()),
@@ -1709,8 +1735,7 @@ where
 
         self.api.save_group_info(group, gi.clone()).await?;
 
-        let now = self.cache.with_write_lock(|cache| {
-            let now = OffsetDateTime::now_utc();
+        self.cache.with_write_lock(|cache| {
             cache.add_or_update_group(group, &gi, now);
 
             let user_group_memberships = Arc::clone(&cache.state().user_group_memberships);
@@ -1719,7 +1744,6 @@ where
                 m.insert(group.to_string());
                 cache.add_or_update_user_group_membership(member, &m, now);
             });
-            now
         });
 
         Ok(now)
@@ -1743,12 +1767,14 @@ where
         } else {
             gi.status = STATUS_DISABLED.to_owned();
         }
+        let now = OffsetDateTime::now_utc();
+        gi.update_at = Some(now);
 
         self.api.save_group_info(name, gi.clone()).await?;
 
-        self.cache.add_or_update_group(name, &gi, OffsetDateTime::now_utc());
+        self.cache.add_or_update_group(name, &gi, now);
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(now)
     }
 
     pub async fn get_group_description(&self, name: &str) -> Result<GroupDesc> {
@@ -1830,13 +1856,14 @@ where
         let s: HashSet<&String> = HashSet::from_iter(gi.members.iter());
         let d: HashSet<&String> = HashSet::from_iter(members.iter());
         gi.members = s.difference(&d).map(|v| v.to_string()).collect::<Vec<String>>();
+        let now = OffsetDateTime::now_utc();
+        gi.update_at = Some(now);
 
         if !update_cache_only {
             self.api.save_group_info(name, gi.clone()).await?;
         }
 
-        let now = self.cache.with_write_lock(|cache| {
-            let now = OffsetDateTime::now_utc();
+        self.cache.with_write_lock(|cache| {
             cache.add_or_update_group(name, &gi, now);
 
             let user_group_memberships = Arc::clone(&cache.state().user_group_memberships);
@@ -1847,7 +1874,6 @@ where
                     cache.add_or_update_user_group_membership(member, &m, now);
                 }
             });
-            now
         });
 
         Ok(now)

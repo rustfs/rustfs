@@ -5385,6 +5385,38 @@ fn is_stale_update(local_updated_at: OffsetDateTime, incoming_updated_at: Option
     incoming_updated_at.is_some_and(|incoming_updated_at| incoming_updated_at < local_updated_at)
 }
 
+/// Verdict for an incoming IAM item judged against the local record it would
+/// overwrite or delete (backlog#2291).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IamItemVerdict {
+    /// Apply the item: there is no local record, the item carries no source
+    /// timestamp (older peer), or it is at least as new as the local record.
+    Apply,
+    /// The local record was written from a newer source change; acknowledge the
+    /// item without touching the record. Covers both directions: a delayed
+    /// grant must not undo a newer revoke, and a delayed revoke must not undo a
+    /// newer grant.
+    SkipStale,
+}
+
+/// Ordering rule shared by the `policy`, `policy-mapping` and `group-info`
+/// item paths (and matching `iam-user` / `service-account`).
+///
+/// `local_record_updated_at` is `None` when the targeted record does not
+/// exist locally: nothing can be stale relative to an absent record, so a
+/// create is applied and a delete falls through to the idempotent no-op paths
+/// (backlog#2071). A record that exists but predates timestamps passes
+/// `Some(UNIX_EPOCH)` and therefore never rejects an item.
+fn judge_iam_item_staleness(
+    local_record_updated_at: Option<OffsetDateTime>,
+    incoming_updated_at: Option<OffsetDateTime>,
+) -> IamItemVerdict {
+    match local_record_updated_at {
+        Some(local_updated_at) if is_stale_update(local_updated_at, incoming_updated_at) => IamItemVerdict::SkipStale,
+        _ => IamItemVerdict::Apply,
+    }
+}
+
 fn bucket_meta_local_updated_at(
     bucket_meta: &crate::admin::storage_api::bucket::metadata::BucketMetadata,
     config_file: &str,
@@ -5728,9 +5760,9 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
     let incoming_updated_at = item.updated_at;
 
     match item.r#type.as_str() {
-        "policy" => apply_iam_policy_item(&iam_sys, &item.name, item.policy).await,
-        "policy-mapping" => apply_iam_policy_mapping_item(&iam_sys, item.policy_mapping).await,
-        "group-info" => apply_iam_group_info_item(&iam_sys, item.group_info).await,
+        "policy" => apply_iam_policy_item(&iam_sys, &item.name, item.policy, incoming_updated_at).await,
+        "policy-mapping" => apply_iam_policy_mapping_item(&iam_sys, item.policy_mapping, incoming_updated_at).await,
+        "group-info" => apply_iam_group_info_item(&iam_sys, item.group_info, incoming_updated_at).await,
         // MinIO madmin-go sends `SRIAMItemSTSAcc = "sts-account"`. The legacy alias
         // `sts-credential` (emitted by older RustFS releases) stays accepted permanently
         // so mixed-version RustFS sites keep replicating STS credentials during rolling
@@ -5746,7 +5778,22 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
     }
 }
 
-async fn apply_iam_policy_item(iam_sys: &IamSys<ObjectStore>, name: &str, policy: Option<Value>) -> S3Result<()> {
+async fn apply_iam_policy_item(
+    iam_sys: &IamSys<ObjectStore>,
+    name: &str,
+    policy: Option<Value>,
+    incoming_updated_at: Option<OffsetDateTime>,
+) -> S3Result<()> {
+    // Judge the item against the local document's own timestamp so a delayed
+    // older body (or delete) cannot overwrite a newer edit (backlog#2291).
+    let local_updated_at = match iam_sys.get_policy_doc(name).await {
+        Ok(doc) => Some(doc.update_date.unwrap_or(OffsetDateTime::UNIX_EPOCH)),
+        Err(err) if rustfs_iam::error::is_err_no_such_policy(&err) => None,
+        Err(err) => return Err(ApiError::from(err).into()),
+    };
+    if judge_iam_item_staleness(local_updated_at, incoming_updated_at) == IamItemVerdict::SkipStale {
+        return Ok(());
+    }
     if let Some(policy) = policy {
         let policy: Policy =
             serde_json::from_value(policy).map_err(|e| s3_error!(InvalidRequest, "invalid policy body: {}", e))?;
@@ -5764,11 +5811,26 @@ async fn apply_iam_policy_item(iam_sys: &IamSys<ObjectStore>, name: &str, policy
     Ok(())
 }
 
-async fn apply_iam_policy_mapping_item(iam_sys: &IamSys<ObjectStore>, policy_mapping: Option<SRPolicyMapping>) -> S3Result<()> {
+async fn apply_iam_policy_mapping_item(
+    iam_sys: &IamSys<ObjectStore>,
+    policy_mapping: Option<SRPolicyMapping>,
+    incoming_updated_at: Option<OffsetDateTime>,
+) -> S3Result<()> {
     let Some(mapping) = policy_mapping else {
         return Err(s3_error!(InvalidRequest, "policyMapping is required"));
     };
     let user_type = user_type_from_sr_wire(mapping.user_type).ok_or_else(|| s3_error!(InvalidRequest, "invalid userType"))?;
+    // Judge the item against the stored mapping's timestamp so a delayed older
+    // attach (or an older detach, `policy == ""`) cannot overwrite a newer one
+    // (backlog#2291). A detach that already removed the mapping leaves no
+    // record, and an item targeting an absent mapping is applied as before.
+    let local_updated_at = iam_sys
+        .get_mapped_policy_record(&mapping.user_or_group, user_type, mapping.is_group)
+        .await
+        .map(|record| record.update_at);
+    if judge_iam_item_staleness(local_updated_at, incoming_updated_at) == IamItemVerdict::SkipStale {
+        return Ok(());
+    }
     iam_sys
         .policy_db_set(&mapping.user_or_group, user_type, mapping.is_group, &mapping.policy)
         .await
@@ -5776,11 +5838,26 @@ async fn apply_iam_policy_mapping_item(iam_sys: &IamSys<ObjectStore>, policy_map
     Ok(())
 }
 
-async fn apply_iam_group_info_item(iam_sys: &IamSys<ObjectStore>, group_info: Option<SRGroupInfo>) -> S3Result<()> {
+async fn apply_iam_group_info_item(
+    iam_sys: &IamSys<ObjectStore>,
+    group_info: Option<SRGroupInfo>,
+    incoming_updated_at: Option<OffsetDateTime>,
+) -> S3Result<()> {
     let Some(group_info) = group_info else {
         return Err(s3_error!(InvalidRequest, "groupInfo is required"));
     };
     let update = group_info.update_req;
+    // The record is the group itself: its own timestamp moves on every
+    // membership or status change, so a delayed older add cannot re-add a
+    // member a newer removal took out, and a delayed older removal (or group
+    // delete) cannot undo a newer add (backlog#2291).
+    let local_updated_at = iam_sys
+        .get_group_info(&update.group)
+        .await
+        .map(|group| group.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH));
+    if judge_iam_item_staleness(local_updated_at, incoming_updated_at) == IamItemVerdict::SkipStale {
+        return Ok(());
+    }
     if !group_info_requires_upsert(&update) {
         // Idempotent removal: a replayed deletion may find the group or a
         // member already gone (deleted here earlier, or the user tombstone
@@ -12173,6 +12250,144 @@ mod tests {
         assert!(!is_stale_update(local, Some(local)));
         assert!(!is_stale_update(local, Some(fresh)));
         assert!(!is_stale_update(local, None));
+    }
+
+    /// Minimal model of one replicated IAM record (a policy document body, a
+    /// user/group mapping, or a group's member set) as the apply paths treat
+    /// it: `None` is "absent", `Some((content, stamp))` is the local record
+    /// with the timestamp of the change that last wrote it. Applying an item
+    /// goes through `judge_iam_item_staleness` exactly like the three apply
+    /// functions do; a delete (`incoming == None`) on an absent record is the
+    /// idempotent no-op of backlog#2071.
+    fn apply_iam_item_to_model(
+        record: &mut Option<(&'static str, OffsetDateTime)>,
+        incoming: Option<&'static str>,
+        incoming_updated_at: Option<OffsetDateTime>,
+    ) -> IamItemVerdict {
+        let verdict = judge_iam_item_staleness(record.map(|(_, stamp)| stamp), incoming_updated_at);
+        if verdict == IamItemVerdict::Apply {
+            *record = incoming.map(|content| (content, incoming_updated_at.unwrap_or(OffsetDateTime::UNIX_EPOCH)));
+        }
+        verdict
+    }
+
+    fn at(seconds: i64) -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds)
+    }
+
+    /// backlog#2291: a revoke (narrowed policy body, detached mapping, member
+    /// removed from the group) followed by the delayed delivery of the older
+    /// grant must leave the revoke in place.
+    #[test]
+    fn test_iam_item_stale_grant_after_revoke_is_not_applied() {
+        let mut record = None;
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("grant"), Some(at(10))), IamItemVerdict::Apply);
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("revoke"), Some(at(20))), IamItemVerdict::Apply);
+
+        // The older grant is redelivered (retry drain, slow peer) after the revoke.
+        assert_eq!(
+            apply_iam_item_to_model(&mut record, Some("grant"), Some(at(10))),
+            IamItemVerdict::SkipStale,
+            "a grant older than the local revoke must be acknowledged without being applied"
+        );
+        assert_eq!(record, Some(("revoke", at(20))), "the revoke must survive the stale grant");
+    }
+
+    /// backlog#2291: the mirror image — a grant followed by the delayed delivery
+    /// of an older revoke (older body, older detach, older member removal, or
+    /// an older delete) must leave the grant in place.
+    #[test]
+    fn test_iam_item_stale_revoke_after_grant_is_not_applied() {
+        let mut record = None;
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("revoke"), Some(at(10))), IamItemVerdict::Apply);
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("grant"), Some(at(20))), IamItemVerdict::Apply);
+
+        assert_eq!(
+            apply_iam_item_to_model(&mut record, Some("revoke"), Some(at(10))),
+            IamItemVerdict::SkipStale,
+            "a revoke older than the local grant must not be applied"
+        );
+        assert_eq!(
+            apply_iam_item_to_model(&mut record, None, Some(at(15))),
+            IamItemVerdict::SkipStale,
+            "a delete older than the local record must not remove it"
+        );
+        assert_eq!(record, Some(("grant", at(20))));
+    }
+
+    /// backlog#2291: an item at least as new as the local record is applied,
+    /// including a newer delete; equal timestamps are not stale (same rule as
+    /// `iam-user`).
+    #[test]
+    fn test_iam_item_newer_than_local_record_is_applied() {
+        let mut record = Some(("grant", at(20)));
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("revoke"), Some(at(20))), IamItemVerdict::Apply);
+        assert_eq!(record, Some(("revoke", at(20))));
+
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("grant"), Some(at(30))), IamItemVerdict::Apply);
+        assert_eq!(record, Some(("grant", at(30))));
+
+        assert_eq!(apply_iam_item_to_model(&mut record, None, Some(at(40))), IamItemVerdict::Apply);
+        assert_eq!(record, None, "a newer delete removes the record");
+    }
+
+    /// backlog#2291: peers that predate item timestamps keep today's
+    /// last-writer-wins behaviour — an item without `updatedAt` is applied even
+    /// over a newer local record.
+    #[test]
+    fn test_iam_item_without_source_timestamp_is_applied() {
+        let mut record = Some(("grant", at(20)));
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("revoke"), None), IamItemVerdict::Apply);
+        assert_eq!(record.map(|(content, _)| content), Some("revoke"));
+
+        assert_eq!(judge_iam_item_staleness(Some(at(20)), None), IamItemVerdict::Apply);
+        assert_eq!(judge_iam_item_staleness(None, None), IamItemVerdict::Apply);
+    }
+
+    /// backlog#2291: nothing is stale relative to an absent record. A create
+    /// with any timestamp is applied, and a delete falls through to the
+    /// idempotent no-op paths (backlog#2071) instead of being judged.
+    #[test]
+    fn test_iam_item_targeting_absent_record_is_applied() {
+        assert_eq!(judge_iam_item_staleness(None, Some(at(1))), IamItemVerdict::Apply);
+
+        let mut record = None;
+        assert_eq!(apply_iam_item_to_model(&mut record, None, Some(at(1))), IamItemVerdict::Apply);
+        assert_eq!(record, None);
+        assert_eq!(apply_iam_item_to_model(&mut record, Some("grant"), Some(at(1))), IamItemVerdict::Apply);
+        assert_eq!(record, Some(("grant", at(1))));
+
+        // A record that predates timestamps is reported as UNIX_EPOCH by the
+        // apply paths and therefore never rejects an item.
+        assert_eq!(
+            judge_iam_item_staleness(Some(OffsetDateTime::UNIX_EPOCH), Some(at(1))),
+            IamItemVerdict::Apply
+        );
+    }
+
+    /// Cheap wiring guard for backlog#2291: every one of the `policy`,
+    /// `policy-mapping` and `group-info` apply paths must route through the
+    /// shared staleness verdict before it writes or deletes anything. The
+    /// ordering rule itself is covered by the `test_iam_item_*` behaviour
+    /// tests above; this only pins that no path bypasses it again.
+    #[test]
+    fn test_iam_policy_mapping_and_group_items_gate_on_incoming_updated_at() {
+        let source = include_str!("site_replication.rs");
+        for (start, end) in [
+            ("async fn apply_iam_policy_item(", "async fn apply_iam_policy_mapping_item("),
+            ("async fn apply_iam_policy_mapping_item(", "async fn apply_iam_group_info_item("),
+            ("async fn apply_iam_group_info_item(", "async fn apply_iam_sts_account_item("),
+        ] {
+            let body = source
+                .split(start)
+                .nth(1)
+                .and_then(|rest| rest.split(end).next())
+                .expect(start);
+            assert!(
+                body.contains("judge_iam_item_staleness(local_updated_at, incoming_updated_at)"),
+                "{start} must judge the item against the local record before applying it"
+            );
+        }
     }
 
     #[test]
