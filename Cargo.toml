@@ -234,8 +234,11 @@ tokio-postgres-rustls = "0.14.0"
 # Utilities and Tools
 anyhow = "1.0.104"
 arc-swap = "1.9.2"
-# RUSTFS_COMPAT_TODO(tokio-tar-extension-limits): keep the fork pin until every parser hardening used by Snowball is released upstream. Remove after astral-sh/tokio-tar#118 is merged and a published release includes extension, physical-entry, and sparse limits, cancellation-safe sparse parsing, and error-fused entry streams.
+# RUSTFS_COMPAT_TODO(tokio-tar-extension-limits): keep the fork pin while Snowball and Swift still depend on it. Remove after Snowball uses a released tar-codec/tar-framing API that exposes precedence-resolved MinIO vendor records, RustFS preserves cancellation-safe ownership of large streamed members, footerless minio-go input is accepted only at an authenticated complete request boundary, the existing resource-limit, cancellation, and error-fuse regressions pass, and Swift no longer needs this fork.
 astral-tokio-tar = { git = "https://github.com/cxymds/tokio-tar.git", rev = "603756478b7668436e464519c77ccac22a99ba96" }
+# Candidate Snowball parser versions exercised by rustfs-zip compatibility fixtures.
+tar-codec = "0.0.14"
+tar-framing = "0.0.14"
 atoi = "3.1.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.11.0" }

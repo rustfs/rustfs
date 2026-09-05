@@ -33,6 +33,7 @@ profile.json
 *.zst
 .secrets
 *.go
+!crates/zip/tests/fixtures/snowball/**/generate/*.go
 *.pb
 *.svg
 deploy/logs/*.log.*
