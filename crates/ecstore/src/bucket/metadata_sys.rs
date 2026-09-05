@@ -4375,10 +4375,12 @@ mod tests {
 
     const ODM_JSON: &[u8] = br#"{"source":{"provider":"minio","endpoint":"https://legacy.example.com:9000","region":"auto","bucket":"legacy-bucket","credentials":{"access_key":"AK","secret_key":"SK"}}}"#;
 
+    type RecordedOdmConfig = Option<(Vec<u8>, OffsetDateTime, Uuid)>;
+    type RecordedOdmHookCall = (String, RecordedOdmConfig);
+
     /// Every `(bucket, config)` the recording hook has seen. Tests filter by
     /// their own bucket name; the hook is process-wide and set once.
-    static ODM_HOOK_CALLS: std::sync::Mutex<Vec<(String, Option<(Vec<u8>, OffsetDateTime, Uuid)>)>> =
-        std::sync::Mutex::new(Vec::new());
+    static ODM_HOOK_CALLS: std::sync::Mutex<Vec<RecordedOdmHookCall>> = std::sync::Mutex::new(Vec::new());
 
     fn install_recording_odm_hook() {
         BUCKET_CONFIG_PUBLISH_HOOK.get_or_init(|| {
@@ -4392,7 +4394,7 @@ mod tests {
         });
     }
 
-    fn odm_hook_calls(bucket: &str) -> Vec<Option<(Vec<u8>, OffsetDateTime, Uuid)>> {
+    fn odm_hook_calls(bucket: &str) -> Vec<RecordedOdmConfig> {
         ODM_HOOK_CALLS
             .lock()
             .unwrap()
