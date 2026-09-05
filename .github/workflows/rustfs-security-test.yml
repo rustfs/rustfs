@@ -92,7 +92,7 @@ jobs:
           set -euo pipefail
           umask 077
           SECURITY_ARTIFACTS_DIR="${RUNNER_TEMP}/rustfs-security-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -- "${SECURITY_ARTIFACTS_DIR}"
+          mkdir -- "${SECURITY_ARTIFACTS_DIR}" "${SECURITY_ARTIFACTS_DIR}-scratch"
           printf 'SECURITY_ARTIFACTS_DIR=%s\n' "${SECURITY_ARTIFACTS_DIR}" >> "${GITHUB_ENV}"
 
       # auto-testing is private: clone it with the dedicated PF token (not
@@ -148,7 +148,7 @@ jobs:
         continue-on-error: true
         env:
           REPORT_FILE: ${{ env.SECURITY_ARTIFACTS_DIR }}/suite-report.md
-          TMPDIR: ${{ env.SECURITY_ARTIFACTS_DIR }}
+          TMPDIR: ${{ env.SECURITY_ARTIFACTS_DIR }}-scratch
           RUSTFS_SECURITY_OIDC_LIVE_SCRIPT: ${{ github.workspace }}/rustfs-repo/scripts/test/oidc_keycloak_live.sh
         run: |
           set -euo pipefail
@@ -172,7 +172,7 @@ jobs:
           else
             ARGS+=(--package-url "${RUSTFS_NIGHTLY_PACKAGE_URL}")
           fi
-          GITHUB_STEP_SUMMARY=/dev/null ./auto-testing/rustfs-security-test.sh "${ARGS[@]}"
+          GITHUB_STEP_SUMMARY=/dev/null ./auto-testing/rustfs-security-test.sh "${ARGS[@]}" 2>&1 | tee "${SECURITY_ARTIFACTS_DIR}/suite.log"
 
       - name: Generate report
         id: report
@@ -305,7 +305,10 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rustfs-security-test-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.SECURITY_ARTIFACTS_DIR }}/
+          path: |
+            ${{ env.SECURITY_ARTIFACTS_DIR }}/report.md
+            ${{ env.SECURITY_ARTIFACTS_DIR }}/suite.log
+            ${{ env.SECURITY_ARTIFACTS_DIR }}/suite-report.md
           if-no-files-found: error
           retention-days: 3
 
