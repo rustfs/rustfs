@@ -1,0 +1,72 @@
+{
+  "lane": "ci/test-and-lint",
+  "tests": [
+    {
+      "invariant": "write-quorum",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::ops::object::inline_put_commit_path_tests::inline_put_direct_commit_accepts_exact_quorum_and_rejects_quorum_minus_one"
+    },
+    {
+      "invariant": "metadata-rollback",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::core::io_primitives::tests::write_unique_file_info_reverts_metadata_when_write_quorum_fails"
+    },
+    {
+      "invariant": "stale-writer",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::ops::object::put_object_tmp_cleanup_tests::put_object_no_lock_aborts_after_outer_namespace_lock_loss"
+    },
+    {
+      "invariant": "range-body",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::ops::object::transition_upload_integrity_tests::transitioned_compressed_object_range_get_returns_plaintext_slice"
+    },
+    {
+      "invariant": "multipart-cancellation",
+      "suite": "rustfs-ecstore",
+      "name": "set_disk::ops::multipart::tests::cancelled_complete_keeps_upload_lock_through_tail_cleanup"
+    },
+    {
+      "invariant": "list-uncommitted-version",
+      "suite": "rustfs-filemeta",
+      "name": "metacache::tests::resolve_with_write_quorum_slack_keeps_partial_latest_hidden_during_merge"
+    },
+    {
+      "invariant": "minio-object-fixture",
+      "suite": "rustfs-filemeta",
+      "name": "filemeta::test::parses_real_minio_object_xlmeta"
+    },
+    {
+      "invariant": "corrupt-part-arrays",
+      "suite": "rustfs-filemeta",
+      "name": "filemeta::test::crc_valid_but_part_arrays_corrupt_into_fileinfo_errors_not_panics"
+    }
+  ],
+  "fixtures": [
+    {
+      "path": "crates/filemeta/tests/fixtures/minio/object_large_bin.xlmeta.hex",
+      "sha256": "e8093767806d701e639b48d023190e858fbc4cde69bcfd83c22af8cba8452ce5",
+      "source": "MinIO RELEASE.2025-07-23T15-54-02Z; crates/ecstore/tests/fixtures/minio/README.md"
+    },
+    {
+      "path": "crates/filemeta/tests/fixtures/minio/object_small_txt.xlmeta.hex",
+      "sha256": "2a415ad3a3be5a9440035d4026ff880e0e8c1ec1701be9f4e077734e8dce03da",
+      "source": "MinIO RELEASE.2025-07-23T15-54-02Z; crates/ecstore/tests/fixtures/minio/README.md"
+    },
+    {
+      "path": "crates/filemeta/tests/fixtures/minio/object_versioned_txt.xlmeta.hex",
+      "sha256": "7f21f50c326dd8b0228deb6dbdb7052b3d0a3f8ee6c85d43486f0e6bb7a97261",
+      "source": "MinIO RELEASE.2025-07-23T15-54-02Z; crates/ecstore/tests/fixtures/minio/README.md"
+    },
+    {
+      "path": "crates/ecstore/tests/fixtures/minio/bucket_metadata.blob.hex",
+      "sha256": "f2b6e260aff106adf6039feb1c645686e84e75404ff725491fb18668be5db203",
+      "source": "MinIO RELEASE.2025-07-23T15-54-02Z; crates/ecstore/tests/fixtures/minio/README.md"
+    },
+    {
+      "path": "crates/ecstore/tests/fixtures/minio/bucket_metadata_full.xlmeta.hex",
+      "sha256": "3b6de589519c08a1614c8bd409bb8199c17d42043861b07bce513075e6fbfc12",
+      "source": "MinIO RELEASE.2025-07-23T15-54-02Z; crates/ecstore/tests/fixtures/minio/README.md"
+    }
+  ]
+}

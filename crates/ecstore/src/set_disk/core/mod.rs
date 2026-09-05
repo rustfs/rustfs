@@ -18,3 +18,4 @@
 //! duplicating read/write/erasure logic.
 
 pub(crate) mod io_primitives;
+mod metadata_quorum;

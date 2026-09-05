@@ -190,7 +190,8 @@ fn site_replicator_service_account_policy() -> S3Result<Policy> {
     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("parse site replicator policy failed: {e}")))
 }
 
-// Lock order: lifecycle -> bucket operation -> repair admission -> state -> per-bucket metadata.
+// Lock order: lifecycle -> bucket-mutation admission -> per-bucket mutation
+// -> bucket operation -> repair admission -> state -> per-bucket metadata.
 // "state" is the distributed state-object lock in
 // crate::site_replication::state_lock, entered through
 // update_site_replication_state (P1-15). There is no process-local state
@@ -434,6 +435,7 @@ pub fn register_site_replication_route(r: &mut S3Router<AdminOperation>) -> std:
     // into this module: startup sits below this layer and must not depend upwards. The admin
     // router is built before startup reconciles, so the hook is always installed in time.
     crate::site_replication_reconcile::register_site_replication_reconciler(reconcile_site_replication_wiring);
+    crate::site_replication_reconcile::register_site_replication_retry_drainer(reconcile_site_replication_retry_drain);
 
     for (method, path, operation) in [
         (Method::PUT, "/v3/site-replication/add", AdminOperation(&SiteReplicationAddHandler {})),
@@ -1803,28 +1805,61 @@ async fn reconcile_site_replication_buckets() -> S3Result<()> {
 /// (`SiteReplicationEditHandler`), so a tick landing between them would rewrite the targets
 /// from the stale endpoint. The pending marker in the persisted state closes that window.
 /// Skipping costs nothing — the timer comes back.
+async fn site_replication_reconcile_prerequisites_ready() -> bool {
+    if current_iam_handle().is_none() || current_object_store_handle().is_none() {
+        return false;
+    }
+    if let Err(err) = migrate_collapsed_retry_queue_paths().await {
+        warn!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "retry_queue_migration_failed",
+            error = ?err,
+            "admin site replication state"
+        );
+        return false;
+    }
+    true
+}
+
+fn reconcile_site_replication_retry_drain() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async {
+        let Some(lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
+            return;
+        };
+        if !site_replication_reconcile_prerequisites_ready().await {
+            return;
+        }
+        match load_site_replication_state().await {
+            Ok(state) => {
+                if state.pending_endpoint_refresh.is_some() || state.pending_rotation.is_some() || state.pending_remove.is_some()
+                {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+        // Admission above observes a lifecycle-stable state. The lightweight
+        // drain itself handles only idempotent bucket setup, reloads state
+        // under the distributed repair lock, and shares that lock with bucket
+        // deletion. Do not hold this process-local guard across peer I/O: an
+        // outage recovery must not make admin add/edit/remove time out.
+        drop(lifecycle);
+        drain_site_replication_retry_queue_lightweight().await;
+    })
+}
+
 fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async {
         // The scheduler starts before IAM and the object store are guaranteed ready (IAM
         // bootstrap may still be recovering), so an early tick returns quietly instead of
         // logging a failure for every reconciler.
-        if current_iam_handle().is_none() || current_object_store_handle().is_none() {
-            return;
-        }
-
-        let Some(_lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
+        let Some(lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
             return;
         };
 
-        if let Err(err) = migrate_collapsed_retry_queue_paths().await {
-            warn!(
-                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                result = "retry_queue_migration_failed",
-                error = ?err,
-                "admin site replication state"
-            );
+        if !site_replication_reconcile_prerequisites_ready().await {
             return;
         }
 
@@ -1878,8 +1913,9 @@ fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Fut
                 "admin site replication state"
             );
         }
-        // Failed peer deliveries recorded in the retry queue; runs behind the
-        // same lifecycle guard and pending_* gates as the reconcilers above.
+        // The retry path re-checks membership from distributed state before
+        // each request; release lifecycle before a potentially large replay.
+        drop(lifecycle);
         drain_site_replication_retry_queue().await;
     })
 }
@@ -3046,6 +3082,7 @@ fn set_pending_endpoint_refresh(state: &mut SiteReplicationState, pending: Pendi
         last_error: "endpoint target refresh pending".to_string(),
         updated_at: Some(OffsetDateTime::now_utc()),
         edit_generation: None,
+        peer_unreachable: false,
         deletions_recorded: false,
     });
     state.pending_endpoint_refresh = Some(pending);
@@ -3592,16 +3629,15 @@ const PEER_EDIT_FENCE_STALENESS_WINDOW_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000
 /// must be a site this state currently replicates with — the same membership
 /// rule the load-time mark pruning applies, so every mark recorded behind
 /// this check is one a reload would keep — and not this site itself, which
-/// never delivers edits to itself. The caller IGNORES an inadmissible fence
-/// rather than failing the request: the delivery applies exactly as an
-/// unstamped (pre-fence) delivery would, no high-water mark is read or
-/// written, and the worst a forged fence achieves is forfeiting an ordering
-/// guarantee its sender was never owed. The generation itself is NOT
-/// bounded here: a genuine origin whose hybrid clock persisted a wall-clock
-/// excursion allocates arbitrarily far in the future, and refusing to
-/// record its marks would strip the ordering fence from exactly the
-/// deliveries that still race — the staleness window on the read side is
-/// what defuses forged marks instead.
+/// never delivers edits to itself. The caller acknowledges an inadmissible
+/// fenced request without applying it: after a remove commits, an older
+/// in-flight retry from the departed origin must not recreate topology. Old
+/// peers remain compatible because their unstamped edits still follow the
+/// pre-fence path. The generation itself is NOT bounded here: a genuine
+/// origin whose hybrid clock persisted a wall-clock excursion allocates
+/// arbitrarily far in the future, and refusing to record its marks would
+/// strip the ordering fence from exactly the deliveries that still race —
+/// the staleness window on the read side is what defuses forged marks instead.
 fn peer_edit_fence_is_admissible(state: &SiteReplicationState, local_deployment_id: &str, fence: &(String, u64)) -> bool {
     let (origin, generation) = fence;
     if origin != local_deployment_id && state.peers.contains_key(origin) {
@@ -4791,105 +4827,135 @@ async fn backfill_existing_buckets_after_add(
 
     let resync_id = Uuid::new_v4().to_string();
     for bucket in &buckets {
-        let name = &bucket.name;
+        let operation_name = bucket.name.clone();
+        let lock_bucket = operation_name.clone();
+        let operation_state = state.clone();
+        let operation_local_peer = local_peer.clone();
+        let operation_resync_id = resync_id.clone();
+        let operation_bootstrap_token = bootstrap_token.map(str::to_owned);
+        let bucket_errors = with_site_replication_bucket_mutation_lock(store.clone(), &lock_bucket, move || async move {
+            let mut errors = SiteReplicationErrorSummary::default();
+            let name = &operation_name;
 
-        if let Err(err) = ensure_site_replication_bucket_versioning(name).await {
-            warn!(
-                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                bucket = %name,
-                result = "backfill_versioning_setup_failed",
-                error = ?err,
-                "admin site replication state"
-            );
-            errors.push(format!("{name}: versioning setup failed: {err}"));
-            continue;
-        }
-        match ensure_site_replication_bucket_setup(name).await {
-            Ok(true) => {}
-            Ok(false) => {
-                // Runtime targets unavailable: the setup silently no-ops, which would make the
-                // downstream make-bucket broadcast and resync fail. Record it and skip so the
-                // operator sees this bucket was not propagated instead of an unqualified success.
+            if let Err(err) = ensure_site_replication_bucket_versioning(name).await {
                 warn!(
                     event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
                     bucket = %name,
-                    result = "backfill_bucket_setup_skipped",
-                    "admin site replication state"
-                );
-                errors.push(format!("{name}: replication setup skipped (site replication runtime unavailable)"));
-                continue;
-            }
-            Err(err) => {
-                warn!(
-                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                    bucket = %name,
-                    result = "backfill_bucket_setup_failed",
+                    result = "backfill_versioning_setup_failed",
                     error = ?err,
                     "admin site replication state"
                 );
-                errors.push(format!("{name}: bucket setup failed: {err}"));
+                errors.push(format!("{name}: versioning setup failed: {err}"));
+                return errors;
             }
-        }
-        // Broadcast the bucket to peers so they create it too (idempotent on the peer side).
-        // Read the real lock_enabled flag so peers recreate the bucket with the same object-lock
-        // setting — object lock cannot be added after bucket creation.
-        let lock_enabled = match metadata_sys::get(name).await {
-            Ok(bm) => bm.lock_enabled,
-            Err(err) => {
-                warn!(
-                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                    bucket = %name,
-                    result = "backfill_bucket_metadata_read_failed",
-                    fallback = "lock_enabled=false",
-                    error = ?err,
-                    "admin site replication state"
-                );
-                false
+            match ensure_site_replication_bucket_setup(name).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Runtime targets unavailable: the setup silently no-ops, which would make the
+                    // downstream make-bucket broadcast and resync fail. Record it and skip so the
+                    // operator sees this bucket was not propagated instead of an unqualified success.
+                    warn!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        bucket = %name,
+                        result = "backfill_bucket_setup_skipped",
+                        "admin site replication state"
+                    );
+                    errors.push(format!("{name}: replication setup skipped (site replication runtime unavailable)"));
+                    return errors;
+                }
+                Err(err) => {
+                    warn!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        bucket = %name,
+                        result = "backfill_bucket_setup_failed",
+                        error = ?err,
+                        "admin site replication state"
+                    );
+                    errors.push(format!("{name}: bucket setup failed: {err}"));
+                }
             }
-        };
-        if let Err(err) = broadcast_site_replication_make_bucket(name, lock_enabled, None, bootstrap_token).await {
-            warn!(
-                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                bucket = %name,
-                result = "backfill_make_bucket_broadcast_failed",
-                error = ?err,
-                "admin site replication state"
-            );
-            errors.push(format!("{name}: make-bucket broadcast failed: {err}"));
-        }
-        // Kick a resync toward every remote peer so existing objects travel across.
-        for peer in state.peers.values() {
-            if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
-                continue;
-            }
-            let manifest = site_bucket_resync_manifest_entry(name, peer, OffsetDateTime::now_utc()).await;
-            let result = if manifest.target_arn.is_empty() {
-                manifest
-            } else {
-                start_site_bucket_resync(name, &manifest.target_arn, &resync_id).await
+            // Broadcast the bucket to peers so they create it too (idempotent on the peer side).
+            // Read the real lock_enabled flag so peers recreate the bucket with the same object-lock
+            // setting — object lock cannot be added after bucket creation.
+            let lock_enabled = match metadata_sys::get(name).await {
+                Ok(bm) => bm.lock_enabled,
+                Err(err) => {
+                    warn!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        bucket = %name,
+                        result = "backfill_bucket_metadata_read_failed",
+                        fallback = "lock_enabled=false",
+                        error = ?err,
+                        "admin site replication state"
+                    );
+                    false
+                }
             };
-            if result.status == "failed" {
+            if let Err(err) =
+                broadcast_site_replication_make_bucket(name, lock_enabled, None, operation_bootstrap_token.as_deref()).await
+            {
                 warn!(
                     event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
                     bucket = %name,
-                    peer = %peer.endpoint,
-                    result = "backfill_resync_kick_failed",
-                    detail = %result.err_detail,
+                    result = "backfill_make_bucket_broadcast_failed",
+                    error = ?err,
                     "admin site replication state"
                 );
-                errors.push(format!("{name} -> {}: resync kick failed: {}", peer.endpoint, result.err_detail));
+                errors.push(format!("{name}: make-bucket broadcast failed: {err}"));
+            }
+            // Kick a resync toward every remote peer so existing objects travel across.
+            for peer in operation_state.peers.values() {
+                if peer.deployment_id == operation_local_peer.deployment_id
+                    || same_identity_endpoint(&peer.endpoint, &operation_local_peer.endpoint)
+                {
+                    continue;
+                }
+                let manifest = site_bucket_resync_manifest_entry(name, peer, OffsetDateTime::now_utc()).await;
+                let result = if manifest.target_arn.is_empty() {
+                    manifest
+                } else {
+                    start_site_bucket_resync(name, &manifest.target_arn, &operation_resync_id).await
+                };
+                if result.status == "failed" {
+                    warn!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        bucket = %name,
+                        peer = %peer.endpoint,
+                        result = "backfill_resync_kick_failed",
+                        detail = %result.err_detail,
+                        "admin site replication state"
+                    );
+                    errors.push(format!("{name} -> {}: resync kick failed: {}", peer.endpoint, result.err_detail));
+                }
+            }
+            errors
+        })
+        .await;
+        match bucket_errors {
+            Ok(bucket_errors) => errors.extend(bucket_errors),
+            Err(err) => {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    bucket = %lock_bucket,
+                    result = "backfill_bucket_mutation_lock_failed",
+                    error = ?err,
+                    "admin site replication state"
+                );
+                errors.push(format!("{lock_bucket}: bucket mutation lock failed: {err}"));
             }
         }
     }
@@ -6072,146 +6138,204 @@ fn parse_peer_join_response(body: &[u8], fallback_peer: PeerInfo) -> Result<SRPe
     serde_json::from_slice(body)
 }
 
+fn ensure_add_bucket_set_matches_preflight(expected: &HashSet<String>, present: &HashSet<String>) -> S3Result<()> {
+    let mut missing = expected.difference(present).cloned().collect::<Vec<_>>();
+    if !missing.is_empty() {
+        missing.sort_unstable();
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!(
+                "bucket `{}` disappeared while site replication was being added; peers may already be joined — re-run replicate add",
+                missing[0]
+            ),
+        ));
+    }
+
+    let mut unexpected = present.difference(expected).cloned().collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        unexpected.sort_unstable();
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!(
+                "bucket `{}` appeared while site replication was being added; peers may already be joined — re-run replicate add",
+                unexpected[0]
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl Operation for SiteReplicationAddHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let replicate_ilm_expiry = sr_add_replicate_ilm_expiry(&req.uri);
+        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
         let lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
-        // Everything up to the commit below is preflight: peer probes, IAM
-        // work and the join fan-out all talk to the network, so none of it may
-        // run inside the state transaction. The snapshot read here is what the
-        // `updated_at` CAS in the commit validates.
-        let current_state = load_site_replication_state().await?;
-        if pending_endpoint_refresh(&current_state).is_some() {
-            return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
-        }
-        let local_peer = current_local_peer(&req, &current_state);
         let mut sites: Vec<PeerSite> = read_site_replication_json(req, &cred.secret_key, true).await?;
-        // The web console's "Set Up Site Replication" omits the local deployment from the payload;
-        // inject it so the add preflight (which requires the local deployment) succeeds. No-op for `mc`.
-        ensure_local_site_present(&mut sites, &local_peer);
-        validate_add_sites(&sites, &local_peer)?;
-        let preflight_infos = add_preflight_infos(&sites, &current_state, &local_peer).await?;
-        validate_add_preflight_topology(&preflight_infos, &local_peer)?;
-        let expected_updated_at = current_state.updated_at;
-        require_add_peer_tls_capability(&sites, &local_peer).await?;
-        // Early exit on a state that moved under the preflight probes, BEFORE
-        // the IAM write and the join fan-out change anything remote. Advisory
-        // only — the binding check is the CAS inside the commit — but it fences
-        // the common race off the side-effect path and refreshes the merge
-        // base so the CAS window is only the join round trips.
-        let latest_state = load_site_replication_state().await?;
-        ensure_edit_precondition(&latest_state, expected_updated_at, None, "add preflight")?;
-        let current_state = latest_state;
-        let (service_account_access_key, service_account_secret_key) =
-            ensure_site_replicator_service_account(&cred.access_key, false).await?;
-        let bootstrap_buckets = preflight_infos
-            .iter()
-            .filter(|info| !same_identity_endpoint(&info.endpoint, &local_peer.endpoint))
-            .flat_map(|info| info.buckets.keys().cloned())
-            .collect();
-        let add_in_progress_guard = SiteReplicationAddInProgressGuard::start(lifecycle_guard, bootstrap_buckets)?;
-        let mut state = merge_add_sites(
-            current_state,
-            local_peer.clone(),
-            sites.clone(),
-            service_account_access_key.clone(),
-            cred.access_key.clone(),
-            replicate_ilm_expiry,
-        );
-        state.sync_state_initialized = true;
-        let join_req = SRPeerJoinEnvelope {
-            request: SRPeerJoinReq {
-                svc_acct_access_key: service_account_access_key,
-                svc_acct_secret_key: service_account_secret_key.clone(),
-                svc_acct_parent: String::new(),
-                peers: state.peers.clone(),
-                updated_at: state.updated_at,
-            },
-            defer_sync_state_enable: true,
-        };
-        let peer_join_path =
-            with_site_replication_bootstrap_token(SITE_REPLICATION_PEER_JOIN_PATH, &add_in_progress_guard.token.to_string());
+        let admin_access_key = cred.access_key.clone();
+        let admission_store = current_object_store_handle()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
+        let list_store = admission_store.clone();
+        let (state, edit_generation, local_peer, service_account_secret_key, mut initial_sync_errors, _add_guard) =
+            with_site_replication_bucket_mutation_admission_lock(admission_store, move || async move {
+                // The writer starts before the local bucket snapshot and stays
+                // held through every peer join and the topology commit. A
+                // delete followed by a same-name create therefore cannot hide
+                // behind an unchanged final name set. Peer bootstrap callbacks
+                // use their internal path and do not acquire this public-
+                // mutation admission lock.
+                let current_state = load_site_replication_state().await?;
+                if pending_endpoint_refresh(&current_state).is_some() {
+                    return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
+                }
+                let local_peer = local_peer_at_endpoint(local_endpoint, &current_state);
+                // The web console's "Set Up Site Replication" omits the local deployment from the payload;
+                // inject it so the add preflight (which requires the local deployment) succeeds. No-op for `mc`.
+                ensure_local_site_present(&mut sites, &local_peer);
+                validate_add_sites(&sites, &local_peer)?;
+                let preflight_infos = add_preflight_infos(&sites, &current_state, &local_peer).await?;
+                validate_add_preflight_topology(&preflight_infos, &local_peer)?;
+                let expected_updated_at = current_state.updated_at;
+                require_add_peer_tls_capability(&sites, &local_peer).await?;
+                // Early exit on a state that moved under the preflight probes, BEFORE
+                // the IAM write and the join fan-out change anything remote. Advisory
+                // only — the binding check is the CAS inside the commit — but it fences
+                // the common race off the side-effect path and refreshes the merge
+                // base so the CAS window is only the join round trips.
+                let latest_state = load_site_replication_state().await?;
+                ensure_edit_precondition(&latest_state, expected_updated_at, None, "add preflight")?;
+                let current_state = latest_state;
+                let (service_account_access_key, service_account_secret_key) =
+                    ensure_site_replicator_service_account(&admin_access_key, false).await?;
+                let expected_buckets: HashSet<String> =
+                    preflight_infos.iter().flat_map(|info| info.buckets.keys().cloned()).collect();
+                let bootstrap_buckets: HashSet<String> = preflight_infos
+                    .iter()
+                    .filter(|info| !same_identity_endpoint(&info.endpoint, &local_peer.endpoint))
+                    .flat_map(|info| info.buckets.keys().cloned())
+                    .collect();
+                let add_in_progress_guard =
+                    SiteReplicationAddInProgressGuard::start(lifecycle_guard, bootstrap_buckets.clone())?;
+                let mut state = merge_add_sites(
+                    current_state,
+                    local_peer.clone(),
+                    sites.clone(),
+                    service_account_access_key.clone(),
+                    admin_access_key,
+                    replicate_ilm_expiry,
+                );
+                state.sync_state_initialized = true;
+                let join_req = SRPeerJoinEnvelope {
+                    request: SRPeerJoinReq {
+                        svc_acct_access_key: service_account_access_key,
+                        svc_acct_secret_key: service_account_secret_key.clone(),
+                        svc_acct_parent: String::new(),
+                        peers: state.peers.clone(),
+                        updated_at: state.updated_at,
+                    },
+                    defer_sync_state_enable: true,
+                };
+                let peer_join_path = with_site_replication_bootstrap_token(
+                    SITE_REPLICATION_PEER_JOIN_PATH,
+                    &add_in_progress_guard.token.to_string(),
+                );
 
-        let mut joined_endpoints = HashSet::new();
-        let mut initial_sync_errors = SiteReplicationErrorSummary::default();
-        for (site, preflight) in sites.iter().zip(preflight_infos.iter()) {
-            if same_identity_endpoint(&site.endpoint, &local_peer.endpoint)
-                || !joined_endpoints.insert(site_identity_key(&site.endpoint))
-            {
-                continue;
-            }
+                let mut joined_endpoints = HashSet::new();
+                let mut initial_sync_errors = SiteReplicationErrorSummary::default();
+                for (site, preflight) in sites.iter().zip(preflight_infos.iter()) {
+                    if same_identity_endpoint(&site.endpoint, &local_peer.endpoint)
+                        || !joined_endpoints.insert(site_identity_key(&site.endpoint))
+                    {
+                        continue;
+                    }
 
-            let mut peer_join_req = join_req.clone();
-            peer_join_req.request.svc_acct_parent = site.access_key.clone();
-            let connection = PeerConnection::try_from(site)?;
-            let body = PeerAdminRequest::put(&connection, &peer_join_path, &site.access_key)
-                .send(&site.secret_key, &peer_join_req)
+                    let mut peer_join_req = join_req.clone();
+                    peer_join_req.request.svc_acct_parent = site.access_key.clone();
+                    let connection = PeerConnection::try_from(site)?;
+                    let body = PeerAdminRequest::put(&connection, &peer_join_path, &site.access_key)
+                        .send(&site.secret_key, &peer_join_req)
+                        .await?;
+
+                    let mut fallback_peer = existing_peer_for_endpoint(&state, &site.endpoint)
+                        .unwrap_or_else(|| normalize_peer_site(site.clone(), replicate_ilm_expiry));
+                    fallback_peer.deployment_id = preflight.deployment_id.clone();
+                    let join_response = parse_peer_join_response(&body, fallback_peer).map_err(|e| {
+                        S3Error::with_message(
+                            S3ErrorCode::InternalError,
+                            format!("parse peer join response from {} failed: {e}", site.endpoint),
+                        )
+                    })?;
+                    if !join_response.initial_sync_error_message.is_empty() {
+                        initial_sync_errors.push(format!("{}: {}", site.endpoint, join_response.initial_sync_error_message));
+                    }
+                    // An explicit no-op join. The peer answered 200 but wrote nothing —
+                    // its persisted state is already newer than the snapshot it was
+                    // sent — so the add is only PARTIALLY configured and saying
+                    // "configured successfully" would be a lie (rustfs/rustfs#5963).
+                    // `None` (a MinIO peer, or one older than the field) is not a
+                    // no-op signal and is deliberately not reported.
+                    if join_response.applied == Some(false) {
+                        initial_sync_errors.push(format!(
+                            "{}: peer did not apply the join (its site replication state is newer than the snapshot it was sent); \
+                             the site is not configured against this peer",
+                            site.endpoint
+                        ));
+                    }
+                    state = reconcile_peer_with_actual_identity(state, join_response.peer);
+                    let reconciled_peer = existing_peer_for_endpoint(&state, &site.endpoint).ok_or_else(|| {
+                        S3Error::with_message(
+                            S3ErrorCode::InternalError,
+                            format!("peer join response from {} did not identify the requested site", site.endpoint),
+                        )
+                    })?;
+                    validate_proposed_peer(&reconciled_peer).map_err(|err| {
+                        S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            format!("invalid peer join response from {}: {err}", site.endpoint),
+                        )
+                    })?;
+                }
+
+                mark_unknown_peer_sync_enabled(&mut state.peers);
+
+                // Commit. The state transaction's CAS still fences topology
+                // writers that do not use bucket admission. By this point
+                // remote sites may already have accepted their joins, so a
+                // mismatch asks the operator to re-run add and reconverge.
+                let next_state = state;
+                let present = list_store
+                    .list_bucket(&BucketOptions::default())
+                    .await
+                    .map_err(ApiError::from)?
+                    .into_iter()
+                    .map(|bucket| bucket.name)
+                    .collect::<HashSet<_>>();
+                ensure_add_bucket_set_matches_preflight(&expected_buckets, &present)?;
+                let (state, edit_generation) = update_site_replication_state(move |state| {
+                    if state.updated_at != expected_updated_at || pending_endpoint_refresh(state).is_some() {
+                        return Err(s3_error!(
+                            InvalidRequest,
+                            "site replication state changed during peer join; the peers may already be joined — re-run replicate add"
+                        ));
+                    }
+                    adopt_add_commit_state(state, next_state);
+                    let edit_generation = next_peer_edit_generation(state);
+                    Ok((state.clone(), edit_generation))
+                })
                 .await?;
-
-            let mut fallback_peer = existing_peer_for_endpoint(&state, &site.endpoint)
-                .unwrap_or_else(|| normalize_peer_site(site.clone(), replicate_ilm_expiry));
-            fallback_peer.deployment_id = preflight.deployment_id.clone();
-            let join_response = parse_peer_join_response(&body, fallback_peer).map_err(|e| {
-                S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!("parse peer join response from {} failed: {e}", site.endpoint),
-                )
-            })?;
-            if !join_response.initial_sync_error_message.is_empty() {
-                initial_sync_errors.push(format!("{}: {}", site.endpoint, join_response.initial_sync_error_message));
-            }
-            // An explicit no-op join. The peer answered 200 but wrote nothing —
-            // its persisted state is already newer than the snapshot it was
-            // sent — so the add is only PARTIALLY configured and saying
-            // "configured successfully" would be a lie (rustfs/rustfs#5963).
-            // `None` (a MinIO peer, or one older than the field) is not a
-            // no-op signal and is deliberately not reported.
-            if join_response.applied == Some(false) {
-                initial_sync_errors.push(format!(
-                    "{}: peer did not apply the join (its site replication state is newer than the snapshot it was sent); \
-                     the site is not configured against this peer",
-                    site.endpoint
-                ));
-            }
-            state = reconcile_peer_with_actual_identity(state, join_response.peer);
-            let reconciled_peer = existing_peer_for_endpoint(&state, &site.endpoint).ok_or_else(|| {
-                S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!("peer join response from {} did not identify the requested site", site.endpoint),
-                )
-            })?;
-            validate_proposed_peer(&reconciled_peer).map_err(|err| {
-                S3Error::with_message(
-                    S3ErrorCode::InvalidRequest,
-                    format!("invalid peer join response from {}: {err}", site.endpoint),
-                )
-            })?;
-        }
-
-        mark_unknown_peer_sync_enabled(&mut state.peers);
-
-        // Commit. The CAS runs inside the transaction, against the state the
-        // transaction itself loaded — the peer round trips above took however
-        // long they took, and only this check can tell whether the topology
-        // this add was planned against is still the current one. The error
-        // says so: by this point the remote sites already accepted their
-        // joins, and re-running the add is what reconverges the local side.
-        let next_state = state;
-        let (state, edit_generation) = update_site_replication_state(move |state| {
-            if state.updated_at != expected_updated_at || pending_endpoint_refresh(state).is_some() {
-                return Err(s3_error!(
-                    InvalidRequest,
-                    "site replication state changed during peer join; the peers may already be joined — re-run replicate add"
-                ));
-            }
-            adopt_add_commit_state(state, next_state);
-            let edit_generation = next_peer_edit_generation(state);
-            Ok((state.clone(), edit_generation))
-        })
-        .await?;
+                Ok((
+                    state,
+                    edit_generation,
+                    local_peer,
+                    service_account_secret_key,
+                    initial_sync_errors,
+                    add_in_progress_guard,
+                ))
+            })
+            .await?;
 
         // The finalize fan-out delivers peer-edit payloads, so it carries the
         // generation allocated in the commit above: the receiving site orders
@@ -7185,8 +7309,14 @@ impl Operation for SRPeerEditHandler {
             // The fence is self-reported — the shared service account means
             // the sender cannot be identified — so it is honoured only after
             // the admissibility check, against the same state it will gate.
-            let commit_fence =
-                commit_fence.filter(|fence| peer_edit_fence_is_admissible(state, &local_peer.deployment_id, fence));
+            let commit_fence = match commit_fence {
+                Some(fence) if peer_edit_fence_is_admissible(state, &local_peer.deployment_id, &fence) => Some(fence),
+                // A fenced edit can only come from a current remote peer. If
+                // that origin left while the retry was in flight, applying
+                // its body here would resurrect the removed topology.
+                Some(_) => return Ok(StateCommit::Unchanged(PeerEditOutcome::Acked)),
+                None => None,
+            };
             // Ordering fence: the sending site allocates the generation under
             // its state-object lock, so a delivery that lost the race carries
             // a generation this site has already passed. Applying it would
@@ -8887,6 +9017,41 @@ mod tests {
     }
 
     #[test]
+    fn add_admission_starts_before_preflight_and_rejects_bucket_set_changes() {
+        let expected = HashSet::from(["remote-owned".to_string(), "shared".to_string()]);
+        let present = HashSet::from(["shared".to_string()]);
+
+        let err = ensure_add_bucket_set_matches_preflight(&expected, &present)
+            .expect_err("a missing bootstrap bucket must reject the topology commit");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        let present = HashSet::from([
+            "remote-owned".to_string(),
+            "shared".to_string(),
+            "created-during-add".to_string(),
+        ]);
+        let err = ensure_add_bucket_set_matches_preflight(&expected, &present)
+            .expect_err("a bucket created during add must reject the topology commit");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        let src = include_str!("site_replication.rs");
+        let add = src
+            .split("impl Operation for SiteReplicationAddHandler")
+            .nth(1)
+            .and_then(|rest| rest.split("pub struct SiteReplicationRemoveHandler").next())
+            .expect("add handler block");
+        let admission = add
+            .find("with_site_replication_bucket_mutation_admission_lock")
+            .expect("distributed mutation admission");
+        let preflight = add.find("add_preflight_infos").expect("bucket preflight");
+        let validation = add
+            .find("ensure_add_bucket_set_matches_preflight")
+            .expect("bucket-set validation");
+        let commit = add.find("adopt_add_commit_state").expect("topology commit");
+        assert!(admission < preflight && preflight < validation && validation < commit);
+    }
+
+    #[test]
     fn test_tls_capability_gates_run_before_add_or_edit_state_side_effects() {
         let src = include_str!("site_replication.rs");
         let add = src
@@ -9182,12 +9347,18 @@ mod tests {
         );
         // Fence hardening: origin and generation are self-reported by a
         // caller the shared service account cannot identify, so the handler
-        // must pass the fence through the admissibility check — against the
-        // same state the fence gates, i.e. inside the transaction — before
-        // reading or raising any high-water mark.
+        // must admit the fence against the same state it gates. An origin
+        // removed while a retry was in flight is acknowledged without
+        // applying the stale body; otherwise it could recreate topology.
         assert!(
-            handler_block.contains(".filter(|fence| peer_edit_fence_is_admissible(state, &local_peer.deployment_id, fence))"),
+            handler_block.contains(
+                "Some(fence) if peer_edit_fence_is_admissible(state, &local_peer.deployment_id, &fence) => Some(fence)"
+            ),
             "SRPeerEditHandler must admit a fence only through peer_edit_fence_is_admissible inside the state transaction"
+        );
+        assert!(
+            handler_block.contains("Some(_) => return Ok(StateCommit::Unchanged(PeerEditOutcome::Acked))"),
+            "SRPeerEditHandler must not apply a fenced edit after its origin leaves the current topology"
         );
         // P1-15 PR2: both halves of the fence and the edit they fence share
         // ONE transaction. Checking the fence against a state read outside the
@@ -10352,8 +10523,9 @@ mod tests {
     /// A fence is self-reported: every site authenticates peer traffic with
     /// the same site-replicator credential, so a compromised peer can stamp
     /// ANY origin with ANY generation. An origin the receiver does not
-    /// replicate with — or the receiver itself — is ignored and plants no
-    /// mark; a mark a compromised peer plants for a CURRENT origin cannot
+    /// replicate with — or the receiver itself — is inadmissible and plants
+    /// no mark; the handler acknowledges such a request without applying its
+    /// body. A mark a compromised peer plants for a CURRENT origin cannot
     /// silence that origin, because the staleness window refuses to fence on
     /// a mark implausibly far above the genuine deliveries.
     #[test]
@@ -12791,6 +12963,7 @@ mod tests {
                 last_error: "site replication is not enabled".to_string(),
                 updated_at: Some(OffsetDateTime::now_utc()),
                 edit_generation: None,
+                peer_unreachable: false,
                 deletions_recorded: false,
             }],
             ..Default::default()
@@ -12989,6 +13162,7 @@ mod tests {
                 last_error: "peer offline".to_string(),
                 updated_at: Some(OffsetDateTime::now_utc()),
                 edit_generation: None,
+                peer_unreachable: false,
                 deletions_recorded: false,
             }],
             ..Default::default()
