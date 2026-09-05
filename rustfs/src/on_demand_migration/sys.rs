@@ -19,13 +19,12 @@
 //! [`SourceClient`], a circuit breaker, a negative cache, a per-key
 //! singleflight table, a pull concurrency limit and counters. Its lifecycle
 //! follows the bucket metadata cache through the publish hook registered in
-//! [`ON_DEMAND_MIGRATION_CONFIG_HOOK`]; the hook fires on every cache install
+//! [`BUCKET_CONFIG_PUBLISH_HOOK`]; the hook fires on every cache install
 //! path (initial load, admin update, peer reload, refresh loop, lazy load).
 //!
 //! Change detection compares the config by value (`PartialEq`) rather than
-//! by `updated_at`: the hook does not carry the timestamp, fetching it would
-//! re-enter the metadata system from inside its own publish path, and a
-//! byte-identical config never needs a new client anyway.
+//! by `updated_at`. The bucket incarnation is part of this comparison:
+//! recreating a bucket must cancel old work even with identical configuration.
 //!
 //! Client construction is async (TLS material may be read from disk), so
 //! the hook does not build inline: `publish` removes state synchronously and
@@ -41,9 +40,7 @@
 
 use super::backfill::{PriorityPullPermits, PullPermit, PullPriority};
 use super::breaker::{Breaker, BreakerState, BreakerTransition, BreakerVerdict};
-use super::config::{
-    ON_DEMAND_MIGRATION_CONFIG_HOOK, OnDemandMigrationConfig, PathStyle as ConfigPathStyle, Provider, SourceConfig,
-};
+use super::config::{OnDemandMigrationConfig, PathStyle as ConfigPathStyle, Provider, SourceConfig};
 use super::list_through::{SOURCE_LIST_RATE_PER_SEC, SourceListRateLimiter};
 use super::negative_cache::NegativeCache;
 use super::pull::{OdmWriteBack, PullQueue};
@@ -52,9 +49,10 @@ use super::source_client::{
     SourceTimeouts,
 };
 use super::stats::{GaugeGuard, OdmStats, OdmStatsSnapshot, PullFailureReason};
-use crate::bucket::remote_s3_client::{
+use super::storage_api::remote_s3_client::{
     PathStyle as ClientPathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3RetryPolicy,
 };
+use super::storage_api::{BUCKET_CONFIG_PUBLISH_HOOK, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -271,6 +269,7 @@ impl Drop for InflightEntryGuard<'_> {
 /// config change (counters excepted), removed when the config goes away.
 pub struct BucketOdmState {
     bucket: String,
+    incarnation_id: uuid::Uuid,
     config: OnDemandMigrationConfig,
     applied_at: OffsetDateTime,
     endpoint_host: String,
@@ -308,6 +307,7 @@ impl BucketOdmState {
     async fn build(
         bucket: &str,
         config: &OnDemandMigrationConfig,
+        incarnation_id: uuid::Uuid,
         stats: Arc<OdmStats>,
         write_back: Option<Arc<dyn OdmWriteBack>>,
     ) -> Arc<Self> {
@@ -324,6 +324,7 @@ impl BucketOdmState {
         let policy = &config.policy;
         Arc::new(Self {
             bucket: bucket.to_string(),
+            incarnation_id,
             endpoint_host: endpoint_host(&config.source),
             config: config.clone(),
             applied_at: OffsetDateTime::now_utc(),
@@ -341,8 +342,16 @@ impl BucketOdmState {
         })
     }
 
+    pub fn filter_incarnation(self: Arc<Self>, incarnation_id: uuid::Uuid) -> Option<Arc<Self>> {
+        (self.incarnation_id == incarnation_id && !self.is_cancelled()).then_some(self)
+    }
+
     pub fn bucket(&self) -> &str {
         &self.bucket
+    }
+
+    pub fn incarnation_id(&self) -> uuid::Uuid {
+        self.incarnation_id
     }
 
     pub fn config(&self) -> &OnDemandMigrationConfig {
@@ -740,22 +749,51 @@ impl OnDemandMigrationSys {
     /// Registers `publish` as the bucket-metadata publish hook. Returns
     /// `false` when a hook was already registered.
     pub fn register_config_hook(&'static self) -> bool {
-        ON_DEMAND_MIGRATION_CONFIG_HOOK
-            .set(Box::new(move |bucket, config| self.publish(bucket, config)))
+        BUCKET_CONFIG_PUBLISH_HOOK
+            .set(Box::new(move |bucket, config_file, stored| {
+                if config_file == BUCKET_ON_DEMAND_MIGRATION_CONFIG {
+                    self.publish_stored(bucket, stored.map(|(bytes, _, incarnation)| (bytes, incarnation)));
+                }
+            }))
             .is_ok()
+    }
+
+    /// Corrupt persisted bytes withdraw state synchronously, just like deletion.
+    fn publish_stored(&'static self, bucket: &str, stored: Option<(&[u8], uuid::Uuid)>) {
+        let incarnation_id = stored.map(|(_, id)| id).unwrap_or_default();
+        match stored.map(|(bytes, _)| OnDemandMigrationConfig::from_json(bytes)).transpose() {
+            Ok(config) => self.publish_for_incarnation(bucket, incarnation_id, config.as_ref()),
+            Err(err) => {
+                warn!(
+                    event = EVENT_ODM_BUCKET_STATE_APPLIED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_ON_DEMAND_MIGRATION,
+                    result = "invalid",
+                    bucket = %bucket,
+                    error = %err,
+                    "Failed to parse on-demand migration config"
+                );
+                self.publish_for_incarnation(bucket, incarnation_id, None);
+            }
+        }
     }
 
     /// Hook entry point: removals apply immediately, installs are spawned
     /// (client construction is async). Requires a Tokio runtime for the
     /// install path; without one the config is logged and skipped.
-    pub fn publish(&'static self, bucket: &str, config: Option<&OnDemandMigrationConfig>) {
-        let config = self.desired(config);
+    pub fn publish_for_incarnation(
+        &'static self,
+        bucket: &str,
+        incarnation_id: uuid::Uuid,
+        config: Option<&OnDemandMigrationConfig>,
+    ) {
+        let config = self.desired(config).filter(|_| !incarnation_id.is_nil());
         let generation = self.reserve_generation(bucket, config.is_some());
         let Some(config) = config else {
             self.remove_with_generation(bucket, generation);
             return;
         };
-        if self.is_unchanged(bucket, config, generation) {
+        if self.is_unchanged(bucket, incarnation_id, config, generation) {
             return;
         }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -774,32 +812,49 @@ impl OnDemandMigrationSys {
         let bucket = bucket.to_string();
         let config = config.clone();
         handle.spawn(async move {
-            self.apply_with_generation(&bucket, Some(&config), generation).await;
+            self.apply_with_generation(&bucket, incarnation_id, Some(&config), generation)
+                .await;
         });
     }
 
     /// Installs, rebuilds, or removes the bucket state for `config`.
     /// Idempotent: the same config on an installed bucket is a no-op.
+    #[cfg(test)]
     pub async fn apply(&self, bucket: &str, config: Option<&OnDemandMigrationConfig>) -> ApplyOutcome {
-        let config = self.desired(config);
+        self.apply_for_incarnation(bucket, uuid::Uuid::from_u128(1), config).await
+    }
+
+    #[cfg(test)]
+    pub fn publish(&'static self, bucket: &str, config: Option<&OnDemandMigrationConfig>) {
+        self.publish_for_incarnation(bucket, uuid::Uuid::from_u128(1), config);
+    }
+
+    pub async fn apply_for_incarnation(
+        &self,
+        bucket: &str,
+        incarnation_id: uuid::Uuid,
+        config: Option<&OnDemandMigrationConfig>,
+    ) -> ApplyOutcome {
+        let config = self.desired(config).filter(|_| !incarnation_id.is_nil());
         let generation = self.reserve_generation(bucket, config.is_some());
-        self.apply_with_generation(bucket, config, generation).await
+        self.apply_with_generation(bucket, incarnation_id, config, generation).await
     }
 
     async fn apply_with_generation(
         &self,
         bucket: &str,
+        incarnation_id: uuid::Uuid,
         config: Option<&OnDemandMigrationConfig>,
         generation: u64,
     ) -> ApplyOutcome {
         let Some(config) = self.desired(config) else {
             return self.remove_with_generation(bucket, generation);
         };
-        if self.is_unchanged(bucket, config, generation) {
+        if self.is_unchanged(bucket, incarnation_id, config, generation) {
             return ApplyOutcome::Unchanged;
         }
         let stats = self.state(bucket).map(|state| Arc::clone(&state.stats)).unwrap_or_default();
-        let state = BucketOdmState::build(bucket, config, stats, self.write_back()).await;
+        let state = BucketOdmState::build(bucket, config, incarnation_id, stats, self.write_back()).await;
 
         let (outcome, previous) = {
             let mut buckets = self.buckets.write();
@@ -849,11 +904,19 @@ impl OnDemandMigrationSys {
 
     /// One-shot lookup: module switch, bucket state, prefix filter,
     /// client availability, negative cache, breaker, in that order.
+    #[cfg(test)]
     pub fn resolve(&self, bucket: &str, key: &str) -> Option<OdmLookup> {
         if !self.is_module_enabled() {
             return None;
         }
         self.state(bucket)?.resolve_key(key)
+    }
+
+    pub fn resolve_for_incarnation(&self, bucket: &str, key: &str, incarnation_id: uuid::Uuid) -> Option<OdmLookup> {
+        if !self.is_module_enabled() {
+            return None;
+        }
+        self.state(bucket)?.filter_incarnation(incarnation_id)?.resolve_key(key)
     }
 
     pub fn state(&self, bucket: &str) -> Option<Arc<BucketOdmState>> {
@@ -903,15 +966,26 @@ impl OnDemandMigrationSys {
 
     /// Claims `generation` for the bucket when the installed state already
     /// matches `config` and has a usable client.
-    fn is_unchanged(&self, bucket: &str, config: &OnDemandMigrationConfig, generation: u64) -> bool {
+    fn is_unchanged(&self, bucket: &str, incarnation_id: uuid::Uuid, config: &OnDemandMigrationConfig, generation: u64) -> bool {
         let mut buckets = self.buckets.write();
         let Some(slot) = buckets.get_mut(bucket) else {
             return false;
         };
+        if slot.generation > generation {
+            return false;
+        }
+        if slot
+            .state
+            .as_ref()
+            .is_some_and(|state| state.incarnation_id != incarnation_id)
+            && let Some(previous) = slot.state.take()
+        {
+            previous.cancel.cancel();
+        }
         let unchanged = slot
             .state
             .as_ref()
-            .is_some_and(|state| state.client.is_ok() && state.config == *config);
+            .is_some_and(|state| state.client.is_ok() && state.incarnation_id == incarnation_id && state.config == *config);
         if unchanged && slot.generation < generation {
             slot.generation = generation;
         }
@@ -951,8 +1025,8 @@ impl OnDemandMigrationSys {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bucket::on_demand_migration::breaker::BREAKER_FAILURE_THRESHOLD;
-    use crate::bucket::on_demand_migration::config::{FilterConfig, PolicyConfig, SourceCredentials, SourceTimeout, TlsConfig};
+    use crate::on_demand_migration::breaker::BREAKER_FAILURE_THRESHOLD;
+    use crate::on_demand_migration::config::{FilterConfig, PolicyConfig, SourceCredentials, SourceTimeout, TlsConfig};
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::Barrier;
 
@@ -1345,6 +1419,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identical_config_on_recreated_bucket_cancels_old_state() {
+        let sys = enabled_sys();
+        let cfg = config(None);
+        let old_id = uuid::Uuid::new_v4();
+        let new_id = uuid::Uuid::new_v4();
+        sys.apply_for_incarnation("recreated", old_id, Some(&cfg)).await;
+        let old = sys.state("recreated").expect("old state installed");
+        assert!(sys.resolve_for_incarnation("recreated", "key", new_id).is_none());
+        sys.apply_for_incarnation("recreated", new_id, Some(&cfg)).await;
+        let replacement = sys.state("recreated").expect("replacement state installed");
+        assert!(old.is_cancelled());
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        assert_eq!(replacement.incarnation_id(), new_id);
+        assert!(sys.resolve_for_incarnation("recreated", "key", old_id).is_none());
+        assert!(sys.resolve_for_incarnation("recreated", "key", new_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn changed_delete_marker_policy_withdraws_the_captured_lookup() {
+        let sys = enabled_sys();
+        let incarnation = uuid::Uuid::new_v4();
+        let mut cfg = config(None);
+        cfg.policy.respect_local_delete_marker = false;
+        sys.apply_for_incarnation("policy-snapshot", incarnation, Some(&cfg)).await;
+        let captured = sys.state("policy-snapshot").expect("policy A installed");
+        assert!(!captured.config().policy.respect_local_delete_marker);
+
+        cfg.policy.respect_local_delete_marker = true;
+        sys.apply_for_incarnation("policy-snapshot", incarnation, Some(&cfg)).await;
+        let replacement = sys.state("policy-snapshot").expect("policy B installed");
+        assert!(replacement.config().policy.respect_local_delete_marker);
+        assert!(captured.is_cancelled());
+        assert!(
+            captured
+                .filter_incarnation(incarnation)
+                .and_then(|state| state.resolve_key("key"))
+                .is_none(),
+            "a request that evaluated policy A cannot continue through policy B"
+        );
+        assert!(
+            replacement
+                .clone()
+                .filter_incarnation(incarnation)
+                .and_then(|state| state.resolve_key("key"))
+                .is_some()
+        );
+        assert_eq!(
+            replacement
+                .stats()
+                .snapshot(replacement.breaker().state())
+                .source_latency
+                .count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_incarnation_cannot_install_or_retain_source_state() {
+        let sys: &'static OnDemandMigrationSys = Box::leak(Box::new(enabled_sys()));
+        let cfg = config(None);
+        assert_eq!(
+            sys.apply_for_incarnation("missing", uuid::Uuid::nil(), Some(&cfg)).await,
+            ApplyOutcome::NotDesired
+        );
+        sys.publish_for_incarnation("missing", uuid::Uuid::nil(), Some(&cfg));
+        assert!(sys.state("missing").is_none());
+
+        sys.apply_for_incarnation("missing", uuid::Uuid::new_v4(), Some(&cfg)).await;
+        let state = sys.state("missing").expect("valid identity installed");
+        sys.publish_for_incarnation("missing", uuid::Uuid::nil(), Some(&cfg));
+        assert!(sys.state("missing").is_none());
+        assert!(state.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn corrupt_stored_config_withdraws_runtime_state() {
+        let sys: &'static OnDemandMigrationSys = Box::leak(Box::new(enabled_sys()));
+        let cfg = config(None);
+        assert_eq!(sys.apply("corrupt", Some(&cfg)).await, ApplyOutcome::Installed);
+        let state = sys.state("corrupt").expect("state installed");
+        sys.publish_stored("corrupt", Some((b"not-json", uuid::Uuid::from_u128(1))));
+        assert!(sys.state("corrupt").is_none(), "corruption cannot keep an older source active");
+        assert!(state.is_cancelled(), "corruption cancels in-flight work");
+    }
+
+    #[tokio::test]
     async fn absent_config_updates_do_not_allocate_bucket_slots() {
         let sys = enabled_sys();
         for index in 0..1000 {
@@ -1362,7 +1522,11 @@ mod tests {
         let older = sys.reserve_generation("b", true);
         let newer = sys.reserve_generation("b", false);
         assert_eq!(sys.remove_with_generation("b", newer), ApplyOutcome::NotDesired);
-        assert_eq!(sys.apply_with_generation("b", Some(&cfg), older).await, ApplyOutcome::Superseded);
+        assert_eq!(
+            sys.apply_with_generation("b", uuid::Uuid::from_u128(1), Some(&cfg), older)
+                .await,
+            ApplyOutcome::Superseded
+        );
         assert!(sys.state("b").is_none(), "removal must supersede an in-flight first install");
 
         assert_eq!(sys.apply("b", Some(&cfg)).await, ApplyOutcome::Installed);
@@ -1371,7 +1535,11 @@ mod tests {
         let newer = sys.reserve_generation("b", false);
         assert_eq!(sys.remove_with_generation("b", newer), ApplyOutcome::Removed);
         assert!(installed.is_cancelled());
-        assert_eq!(sys.apply_with_generation("b", Some(&cfg), older).await, ApplyOutcome::Superseded);
+        assert_eq!(
+            sys.apply_with_generation("b", uuid::Uuid::from_u128(1), Some(&cfg), older)
+                .await,
+            ApplyOutcome::Superseded
+        );
         assert!(sys.state("b").is_none(), "the stale install is discarded");
     }
 

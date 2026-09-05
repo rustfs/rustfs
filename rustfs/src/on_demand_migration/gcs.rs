@@ -43,8 +43,8 @@ use super::source_client::{
     GcsSourceSpec, SourceBackend, SourceError, SourceGet, SourceHead, SourceListRequest, SourceObject, SourcePage,
     SourceTimeouts, range_header_value,
 };
-use crate::bucket::remote_s3_client::RemoteS3ClientError;
-use crate::storage_api_contracts::range::HTTPRangeSpec;
+use super::storage_api::HTTPRangeSpec;
+use super::storage_api::remote_s3_client::RemoteS3ClientError;
 use google_cloud_auth::credentials::service_account::{AccessSpecifier, Builder as ServiceAccountBuilder};
 use google_cloud_auth::credentials::{CacheableResource, Credentials};
 use http::{HeaderMap, HeaderValue, Method};
@@ -318,8 +318,8 @@ fn parse_objects_list(body: &str) -> Result<SourcePage, SourceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bucket::on_demand_migration::backend_contract::{BackendCapabilities, assert_backend_contract};
-    use crate::bucket::on_demand_migration::test_http_fixture::{ScriptedResponse, scripted_server};
+    use crate::on_demand_migration::backend_contract::{BackendCapabilities, assert_backend_contract};
+    use crate::on_demand_migration::test_http_fixture::{ScriptedResponse, scripted_server};
     use google_cloud_auth::credentials::anonymous::Builder as AnonymousBuilder;
 
     const LIST_PAGE_ONE: &str = r#"{

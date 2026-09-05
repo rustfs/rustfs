@@ -63,3 +63,10 @@ Lifecycle, replication, and `SetDisks` split blockers, extracted contracts, and 
 4. Do not replace `SetDisks` with multiple runtime structs in one change; move one operation family only after contracts and focused tests exist.
 5. Remove or narrow one facade group per change so rollback preserves object IO, quorum, lifecycle/replication queues, scanner repair, notification/audit events, and metadata compatibility.
 6. Keep `api::bucket`, `api::config`, `api::disk`, and `api::tier` on explicit submodules and symbol lists; do not restore `pub use crate::<owner>::{...}` whole-module passthroughs for those groups.
+
+### On-Demand Migration
+
+`rustfs/src/on_demand_migration/storage_api.rs` owns the service's storage facade
+imports: opaque bucket configuration, shared remote S3 client construction,
+namespace locking, object options and metadata-object persistence. ODM types
+are owned by the application and are no longer exported through ECStore.

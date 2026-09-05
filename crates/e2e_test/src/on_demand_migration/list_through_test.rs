@@ -265,16 +265,13 @@ async fn list_through_rejects_a_tampered_continuation_token() -> TestResult {
     let decoded = String::from_utf8(base64_simd::STANDARD.decode_to_vec(token.as_bytes())?)?;
     assert!(decoded.contains("\"t\":\"odm-list\""), "the merged token is an envelope: {decoded}");
 
-    let tampered = base64_simd::STANDARD.encode_to_string(decoded.replace("\"v\":1", "\"v\":2").as_bytes());
-    let rejected = env
-        .raw_list_objects_v2(bucket, &format!("continuation-token={tampered}"))
-        .await?;
-    assert_eq!(
-        rejected.status,
-        400,
-        "a bumped token version is a client error: {}",
-        String::from_utf8_lossy(&rejected.body)
-    );
+    let tampered = base64_simd::STANDARD.encode_to_string(decoded.replace("\"v\":1", "\"v\":3").as_bytes());
+    assert_ne!(tampered, token, "the test must change the token version");
+    let query = serde_urlencoded::to_string([("continuation-token", tampered.as_str())])?;
+    let rejected = env.raw_list_objects_v2(bucket, &query).await?;
+    let error_body = String::from_utf8_lossy(&rejected.body);
+    assert_eq!(rejected.status, 400, "a bumped token version is a client error: {}", error_body);
+    assert!(error_body.contains("<Code>InvalidArgument</Code>"), "{error_body}");
     Ok(())
 }
 

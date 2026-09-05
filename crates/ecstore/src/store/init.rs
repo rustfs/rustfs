@@ -353,6 +353,11 @@ async fn resume_rebalance_after_init(store: Arc<ECStore>, rx: CancellationToken)
 }
 
 impl ECStore {
+    /// Shutdown token owned by this store instance.
+    pub fn background_cancel_token(&self) -> Option<CancellationToken> {
+        self.ctx.background_cancel_token()
+    }
+
     /// Validate topology and process storage-class overrides before any disk is opened.
     pub fn validate_startup_storage_class(endpoint_pools: &EndpointServerPools) -> Result<()> {
         let drive_counts = startup_pool_drive_counts(endpoint_pools);
