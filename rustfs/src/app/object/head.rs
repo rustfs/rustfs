@@ -146,6 +146,7 @@ impl DefaultObjectUsecase {
     /// `None` means the runtime does not intervene and the caller keeps its
     /// original 404. The source answer is never written back or queued.
     async fn on_demand_migration_head(
+        store: &ECStore,
         bucket: &str,
         key: &str,
         opts: &ObjectOptions,
@@ -154,7 +155,13 @@ impl DefaultObjectUsecase {
         if !odm_request_may_consult_source(opts) {
             return None;
         }
-        let lookup = OnDemandMigrationSys::get().resolve(bucket, key)?;
+        let expected_incarnation = opts.expected_bucket_incarnation_id?;
+        match store.bucket_incarnation_id(bucket).await {
+            Ok(current) if current == expected_incarnation => {}
+            Ok(_) => return None,
+            Err(err) => return Some(Err(ApiError::from(err).into())),
+        }
+        let lookup = OnDemandMigrationSys::get().resolve_for_incarnation(bucket, key, expected_incarnation)?;
         match odm_head_verdict(lookup, miss) {
             OdmHeadVerdict::Ignore => None,
             OdmHeadVerdict::Fail(err) => Some(Err(err)),
@@ -269,7 +276,7 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
+    pub async fn execute_head_object(&self, mut req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
@@ -310,9 +317,15 @@ impl DefaultObjectUsecase {
         };
         validate_bucket_exists(&store, &bucket).await?;
 
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
+        let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
             .await
             .map_err(ApiError::from)?;
+
+        if OnDemandMigrationSys::get().is_module_enabled() && OnDemandMigrationSys::get().state(&bucket).is_some() {
+            let guard = load_bucket_generation_from_store(&store, &req, &bucket).await?;
+            req.extensions.insert(guard);
+            apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
+        }
 
         // Modification Points: Explicitly handles get_object_info errors, distinguishing between object absence and other errors
         let lookup = store.get_object_info(&bucket, &key, &opts).await;
@@ -347,7 +360,7 @@ impl DefaultObjectUsecase {
                         return result;
                     }
                     if let Some(miss) = odm_miss
-                        && let Some(result) = Self::on_demand_migration_head(&bucket, &key, &opts, miss).await
+                        && let Some(result) = Self::on_demand_migration_head(&store, &bucket, &key, &opts, miss).await
                     {
                         return Self::finish_on_demand_migration_head(&req, &bucket, helper, result?).await;
                     }
@@ -362,7 +375,7 @@ impl DefaultObjectUsecase {
                 // A latest delete marker is a local miss the source may still
                 // answer when the bucket policy says so.
                 if let Some(miss) = odm_miss
-                    && let Some(result) = Self::on_demand_migration_head(&bucket, &key, &opts, miss).await
+                    && let Some(result) = Self::on_demand_migration_head(&store, &bucket, &key, &opts, miss).await
                 {
                     return Self::finish_on_demand_migration_head(&req, &bucket, helper, result?).await;
                 }
@@ -1053,7 +1066,12 @@ mod tests {
             head: HeadPolicy::LocalOnly,
             ..Default::default()
         });
-        sys.apply(&bucket, Some(&cfg)).await;
+        sys.apply_for_incarnation(
+            &bucket,
+            store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+            Some(&cfg),
+        )
+        .await;
         let state = sys.state(&bucket).expect("bucket runtime installed");
 
         // Local hit: served locally, the runtime is never entered.
@@ -1109,7 +1127,12 @@ mod tests {
         );
 
         cfg.policy.respect_local_delete_marker = false;
-        sys.apply(&bucket, Some(&cfg)).await;
+        sys.apply_for_incarnation(
+            &bucket,
+            store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+            Some(&cfg),
+        )
+        .await;
         let err = Box::pin(usecase.execute_head_object(head_input(&bucket, "present", None)))
             .await
             .expect_err("local_only still answers 404");

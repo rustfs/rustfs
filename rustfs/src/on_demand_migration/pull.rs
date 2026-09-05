@@ -243,6 +243,8 @@ impl PullSource for SourceClient {
 #[derive(Clone, Debug)]
 pub struct WriteBackRequest {
     pub bucket: String,
+    /// Identity captured with the source configuration, retained through cleanup.
+    pub bucket_incarnation_id: uuid::Uuid,
     pub key: String,
     /// Source HEAD/GET of the whole object.
     pub head: SourceHead,
@@ -263,6 +265,7 @@ impl WriteBackRequest {
         let config = state.config();
         Self {
             bucket: state.bucket().to_string(),
+            bucket_incarnation_id: state.incarnation_id(),
             key: key.to_string(),
             head,
             source_label: format!("{}:{}", config.source.provider.as_str(), config.source.bucket),
@@ -357,7 +360,7 @@ pub trait OdmWriteBack: Send + Sync {
         parts: Vec<WriteBackPart>,
     ) -> Result<WriteBackOutcome, WriteBackError>;
 
-    async fn abort_multipart_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<(), WriteBackError>;
+    async fn abort_multipart_upload(&self, request: &WriteBackRequest, upload_id: &str) -> Result<(), WriteBackError>;
 }
 
 /// Why the pump stopped feeding the write-back before EOF.
@@ -662,9 +665,7 @@ async fn write_multipart(
         Err(err) => Err(err),
     };
     if completed.is_err()
-        && let Err(abort_err) = write_back
-            .abort_multipart_upload(&request.bucket, &request.key, &upload_id)
-            .await
+        && let Err(abort_err) = write_back.abort_multipart_upload(request, &upload_id).await
     {
         debug!(
             event = EVENT_ODM_PULL_FAILED,
@@ -1340,7 +1341,7 @@ mod tests {
             })
         }
 
-        async fn abort_multipart_upload(&self, _bucket: &str, _key: &str, upload_id: &str) -> Result<(), WriteBackError> {
+        async fn abort_multipart_upload(&self, _request: &WriteBackRequest, upload_id: &str) -> Result<(), WriteBackError> {
             self.aborted.lock().push(upload_id.to_string());
             Ok(())
         }

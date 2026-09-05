@@ -14,13 +14,12 @@
 
 //! Bucket application use-case contracts.
 
-use super::storage_api::bucket_usecase::ECStore;
 use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
 #[cfg(test)]
 use super::storage_api::bucket_usecase::access::ReqInfo;
 use super::storage_api::bucket_usecase::access::{
-    authorize_request, bucket_config_mutation_incarnation, log_list_buckets_iam_implicit_deny,
-    prepare_list_buckets_iam_authorization, req_info_ref,
+    apply_bucket_generation_guard, authorize_request, bucket_config_mutation_incarnation, load_bucket_generation_from_store,
+    log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization, req_info_ref,
 };
 #[cfg(test)]
 use super::storage_api::bucket_usecase::bucket::target::BucketTarget;
@@ -60,6 +59,7 @@ use super::storage_api::bucket_usecase::s3_api::bucket::{
     build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
     rustfs_owner,
 };
+use super::storage_api::bucket_usecase::{ECStore, StorageObjectOptions};
 use super::storage_api::bucket_usecase::{
     get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
     request_context, validate_list_object_unordered_with_delimiter,
@@ -2729,7 +2729,7 @@ impl DefaultBucketUsecase {
 
     async fn execute_list_objects_v2_inner(
         &self,
-        req: S3Request<ListObjectsV2Input>,
+        mut req: S3Request<ListObjectsV2Input>,
         allow_list_through: bool,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         let ListObjectsV2Input {
@@ -2742,7 +2742,7 @@ impl DefaultBucketUsecase {
             prefix,
             start_after,
             ..
-        } = req.input;
+        } = req.input.clone();
 
         let params = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
 
@@ -2757,10 +2757,24 @@ impl DefaultBucketUsecase {
         // The on-demand migration envelope is decoded whether or not this
         // bucket still merges: a token handed out under `list_through` must keep
         // paginating after the policy is turned off (rustfs/backlog#2164).
+        let expected_incarnation = if allow_list_through
+            && crate::on_demand_migration::OnDemandMigrationSys::get().is_module_enabled()
+            && crate::on_demand_migration::OnDemandMigrationSys::get()
+                .state(&bucket)
+                .is_some()
+        {
+            let guard = load_bucket_generation_from_store(&store, &req, &bucket).await?;
+            req.extensions.insert(guard);
+            let mut opts = StorageObjectOptions::default();
+            apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
+            opts.expected_bucket_incarnation_id
+        } else {
+            None
+        };
         let (merged_token, source_state) = if allow_list_through {
             (
                 list_through::decode_list_cursor(params.decoded_continuation_token.as_deref())?,
-                list_through::list_through_state(&bucket, &req.headers),
+                list_through::list_through_state(&store, &bucket, &req.headers, expected_incarnation).await?,
             )
         } else {
             (None, None)

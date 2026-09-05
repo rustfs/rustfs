@@ -2365,6 +2365,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object(&self, req: &mut S3Request<GetObjectInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -2372,7 +2374,9 @@ impl S3Access for FS {
 
         // GHSA-3ppv: a versioned read (?versionId=...) must authorize against
         // s3:GetObjectVersion, not s3:GetObject.
-        authorize_request(req, versioned_read_action(req.input.version_id.as_deref())).await
+        authorize_request(req, versioned_read_action(req.input.version_id.as_deref())).await?;
+        req.extensions.insert(bucket_generation?);
+        Ok(())
     }
 
     /// Checks whether the GetObjectAcl request has accesses to the resources.
@@ -2484,6 +2488,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn head_object(&self, req: &mut S3Request<HeadObjectInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -2496,10 +2502,13 @@ impl S3Access for FS {
         if get_header(&req.headers, SUFFIX_SOURCE_REPLICATION_CHECK).as_deref() == Some("true") {
             authorize_request(req, Action::S3Action(S3Action::ReplicateObjectAction)).await?;
             req_info_mut(req)?.replication_request_authorized = true;
+            req.extensions.insert(bucket_generation?);
             return Ok(());
         }
 
-        authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
+        authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
+        req.extensions.insert(bucket_generation?);
+        Ok(())
     }
 
     /// Checks whether the ListBucketAnalyticsConfigurations request has accesses to the resources.
@@ -2588,10 +2597,14 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn list_objects_v2(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
+        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await
+        authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await?;
+        req.extensions.insert(bucket_generation?);
+        Ok(())
     }
 
     /// Checks whether the ListParts request has accesses to the resources.
