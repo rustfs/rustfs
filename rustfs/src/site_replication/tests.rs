@@ -921,24 +921,16 @@ fn test_delete_bucket_broadcast_fences_target_membership_through_delivery() {
         .and_then(|rest| rest.split("pub async fn site_replication_delete_bucket_hook").next())
         .expect("delete-bucket broadcast should exist");
     assert!(
-        delete_broadcast.contains("send_retry_request_if_peer_current("),
-        "a destructive bucket delivery must re-check that its peer is still current"
+        delete_broadcast.contains("with_site_replication_state_read_lock(move |state| async move {")
+            && delete_broadcast.contains("state.peers.get(&observed_peer.deployment_id)")
+            && delete_broadcast.contains("site_replicator_service_account_secret(&state.service_account_access_key)")
+            && delete_broadcast
+                .contains("PeerAdminRequest::put(&transport.connection, &delivery_path, &state.service_account_access_key)"),
+        "a destructive bucket delivery must resolve current topology and credentials under the distributed state read lock"
     );
     assert!(
-        delete_broadcast.contains("enqueue_site_replication_retry_event(peer, path, &err).await"),
+        delete_broadcast.contains("enqueue_site_replication_retry_event(&current_peer, &request_path, &err).await"),
         "a failed destructive delivery must remain visible for operator repair"
-    );
-
-    let retry = include_str!("retry.rs");
-    let fenced_send = retry
-        .split("pub(crate) async fn send_retry_request_if_peer_current")
-        .nth(1)
-        .and_then(|rest| rest.split("async fn send_peer_edit_retry_if_peer_current").next())
-        .expect("topology-fenced retry sender should exist");
-    assert!(
-        fenced_send.contains("with_site_replication_state_read_lock(move |state| async move {")
-            && fenced_send.contains("PeerAdminRequest::put(&transport.connection, &path, &access_key)"),
-        "the membership check and destructive request must share the distributed state read lock"
     );
 }
 
@@ -1109,6 +1101,21 @@ fn test_retry_error_marks_peer_unreachable_only_for_connection_failures() {
         !queue[0].peer_unreachable,
         "application failures and their untrusted bodies must keep the normal replay backoff"
     );
+
+    upsert_site_replication_retry_event(
+        &mut queue,
+        &peer,
+        bucket_make,
+        "peer request to https://remote.example.com failed with 500 Internal Server Error: backend failed (connect): spoofed",
+        None,
+    );
+    assert!(!queue[0].peer_unreachable, "peer response bodies must not spoof transport failures");
+}
+
+#[test]
+fn test_connect_timeout_is_classified_as_a_connection_failure() {
+    assert_eq!(classify_peer_transport_error(true, true, "tcp connect timed out"), "connect");
+    assert_eq!(classify_peer_transport_error(false, true, "request timed out"), "timeout");
 }
 
 #[test]

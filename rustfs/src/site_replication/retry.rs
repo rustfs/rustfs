@@ -899,7 +899,6 @@ async fn send_peer_edit_retry_if_peer_current(
     if !current {
         return Ok(false);
     }
-
     // A peer-edit handler takes its own site's state write lock. Releasing
     // this site's read lock before the request prevents simultaneous A -> B
     // and B -> A retries from waiting on each other's write lock. The edit

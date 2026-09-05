@@ -462,37 +462,59 @@ async fn broadcast_site_replication_delete_bucket(runtime: &SiteReplicationRunti
         {
             return None;
         }
+        let observed_peer = peer.clone();
+        let request_path = path.to_string();
         Some(async move {
-            let result = async {
-                let transport = PeerTransport::for_runtime_peer(peer).await?;
-                match send_retry_request_if_peer_current(
-                    peer,
-                    &transport,
-                    path,
-                    &runtime.state.service_account_access_key,
-                    &runtime.service_account_secret_key,
-                    serde_json::json!({}),
-                )
-                .await?
-                {
-                    true => Ok(()),
-                    false => Err(S3Error::with_message(
-                        S3ErrorCode::ServiceUnavailable,
-                        format!("site replication peer {} changed while broadcasting bucket deletion", peer.endpoint),
-                    )),
+            let fallback_peer = observed_peer.clone();
+            let delivery_path = request_path.clone();
+            let delivery = with_site_replication_state_read_lock(move |state| async move {
+                let Some(current_peer) = state.peers.get(&observed_peer.deployment_id).cloned() else {
+                    return Ok(None);
+                };
+                let service_account_secret_key =
+                    match site_replicator_service_account_secret(&state.service_account_access_key).await {
+                        Ok(secret) => secret,
+                        Err(err) => {
+                            let Some(secret) = legacy_site_replicator_state_secret(&state) else {
+                                return Err(err);
+                            };
+                            warn!(
+                                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                                component = LOG_COMPONENT_ADMIN,
+                                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                                result = "legacy_state_service_account_secret_fallback",
+                                error = ?err,
+                                "admin site replication state"
+                            );
+                            secret
+                        }
+                    };
+                let result = async {
+                    let transport = PeerTransport::for_runtime_peer(&current_peer).await?;
+                    PeerAdminRequest::put(&transport.connection, &delivery_path, &state.service_account_access_key)
+                        .with_client(&transport.client)
+                        .send(&service_account_secret_key, &serde_json::json!({}))
+                        .await
                 }
-            }
+                .await;
+                Ok(Some((current_peer, result)))
+            })
             .await;
-            match result {
-                Ok(()) => {
-                    dequeue_site_replication_retry_event(peer, path).await;
+            match delivery {
+                Ok(Some((current_peer, Ok(_)))) => {
+                    dequeue_site_replication_retry_event(&current_peer, &request_path).await;
                     None
                 }
-                Err(err) => {
+                Ok(Some((current_peer, Err(err)))) => {
                     // Keep the failed deletion operator-visible, but never
                     // replay it automatically: without a bucket-incarnation
                     // fence, a delayed delete could erase a recreated bucket.
-                    enqueue_site_replication_retry_event(peer, path, &err).await;
+                    enqueue_site_replication_retry_event(&current_peer, &request_path, &err).await;
+                    Some(err)
+                }
+                Ok(None) => None,
+                Err(err) => {
+                    enqueue_site_replication_retry_event(&fallback_peer, &request_path, &err).await;
                     Some(err)
                 }
             }
@@ -520,11 +542,11 @@ pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: boo
             .finish()
     );
     let runtime = {
-        // Capture the credentials and candidate targets before waiting for
-        // repair coordination. The per-bucket mutation lock held by the
-        // caller keeps a newer local create from overtaking this delete, and
-        // each send re-checks its target under the distributed state read
-        // lock so a concurrently removed peer never receives stale deletion.
+        // Capture candidate deployment ids for repair-lock failure
+        // bookkeeping. Each actual delivery resolves the current endpoint
+        // and service-account secret under the distributed state read lock.
+        // The caller's per-bucket mutation lock keeps a newer local create
+        // from overtaking this delete while it waits.
         let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
         let Some(runtime) = runtime_site_replication_targets().await? else {
             return Ok(());
