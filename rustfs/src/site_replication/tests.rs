@@ -794,65 +794,6 @@ fn test_bucket_make_retry_without_matching_configure_fails_closed() {
 }
 
 #[test]
-fn test_destructive_bucket_op_prequeues_every_remote_peer() {
-    let peer_b = PeerInfo {
-        deployment_id: "peer-b".to_string(),
-        ..peer("peer-b", "https://peer-b.example.com")
-    };
-    let peer_c = PeerInfo {
-        deployment_id: "peer-c".to_string(),
-        ..peer("peer-c", "https://peer-c.example.com")
-    };
-    let mut state = SiteReplicationState::default();
-    state.peers.insert(peer_b.deployment_id.clone(), peer_b.clone());
-    state.peers.insert(peer_c.deployment_id.clone(), peer_c.clone());
-    let path = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket";
-
-    prequeue_site_replication_destructive_events_in_state(&mut state, &[peer_b, peer_c], path);
-
-    assert_eq!(state.retry_queue.len(), 2);
-    assert!(state.retry_queue.iter().all(|event| event.path == path));
-    assert_eq!(
-        state
-            .retry_queue
-            .iter()
-            .map(|event| event.peer_deployment_id.as_str())
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["peer-b", "peer-c"])
-    );
-}
-
-#[test]
-fn test_destructive_retry_intents_survive_the_soft_queue_limit() {
-    let mut queue = (0..SITE_REPLICATION_RETRY_QUEUE_LIMIT)
-        .map(|index| {
-            drain_event(
-                &format!("peer-{index}"),
-                &format!("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=bucket-{index}&operation=delete-bucket"),
-                1,
-                None,
-            )
-        })
-        .collect::<Vec<_>>();
-    let ordinary_peer = PeerInfo {
-        deployment_id: "ordinary".to_string(),
-        ..peer("ordinary", "https://ordinary.example.com")
-    };
-    upsert_site_replication_retry_event(&mut queue, &ordinary_peer, SITE_REPLICATION_PEER_EDIT_PATH, "ordinary retry", None);
-    assert_eq!(queue.len(), SITE_REPLICATION_RETRY_QUEUE_LIMIT);
-    assert!(queue.iter().all(retry_event_is_destructive_bucket_op));
-
-    let extra_peer = PeerInfo {
-        deployment_id: "extra".to_string(),
-        ..peer("extra", "https://extra.example.com")
-    };
-    let extra_path = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=extra&operation=force-delete-bucket";
-    upsert_site_replication_retry_event(&mut queue, &extra_peer, extra_path, "pending destructive retry", None);
-    assert_eq!(queue.len(), SITE_REPLICATION_RETRY_QUEUE_LIMIT + 1);
-    assert!(queue.iter().any(|event| event.path == extra_path));
-}
-
-#[test]
 fn test_reachable_probe_promotion_is_fenced_by_the_observed_event() {
     let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
     let path = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning";

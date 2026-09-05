@@ -16,8 +16,6 @@ use super::*;
 
 pub(crate) const SITE_REPLICATION_RETRY_QUEUE_LIMIT: usize = 256;
 
-pub(crate) const SITE_REPLICATION_RETRY_DRAIN_BATCH_TIMEOUT: Duration = Duration::from_secs(25);
-
 /// Attempts before an entry reports as `failed` in retryStats. Visibility
 /// only: a `failed` entry stays drain-eligible, and the reachability probe
 /// short-circuits its backoff once the peer answers again — so an early
@@ -61,13 +59,6 @@ pub(crate) struct SiteReplicationRetryEvent {
 
 pub(crate) fn retry_event_matches(event: &SiteReplicationRetryEvent, peer: &PeerInfo, path: &str) -> bool {
     (event.peer_deployment_id == peer.deployment_id || event.peer_endpoint == peer.endpoint) && event.path == path
-}
-
-pub(crate) fn retry_event_is_destructive_bucket_op(event: &SiteReplicationRetryEvent) -> bool {
-    matches!(
-        retry_bucket_operation(&event.path).as_deref(),
-        Some("delete-bucket" | "force-delete-bucket" | "purge-deleted-bucket")
-    )
 }
 
 pub(crate) const SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH: &str = "internal:retry-snapshot:iam";
@@ -248,15 +239,8 @@ pub(crate) fn upsert_site_replication_retry_event(
         deletions_recorded: false,
     });
     if queue.len() > SITE_REPLICATION_RETRY_QUEUE_LIMIT {
-        while queue.len() > SITE_REPLICATION_RETRY_QUEUE_LIMIT {
-            let Some(index) = queue.iter().position(|event| !retry_event_is_destructive_bucket_op(event)) else {
-                // Destructive rows are a durable outbox, not a replay cache.
-                // Preserve every unacknowledged peer even if that temporarily
-                // exceeds the soft limit so none becomes a silent orphan.
-                break;
-            };
-            queue.remove(index);
-        }
+        let overflow = queue.len() - SITE_REPLICATION_RETRY_QUEUE_LIMIT;
+        queue.drain(0..overflow);
     }
 }
 
@@ -288,37 +272,6 @@ pub(crate) fn retry_stats_for_state(state: &SiteReplicationState) -> Option<SRRe
 
 pub(crate) async fn enqueue_site_replication_retry_event(peer: &PeerInfo, path: &str, error: &S3Error) {
     enqueue_site_replication_retry_event_for_generation(peer, path, error, None).await
-}
-
-pub(crate) fn prequeue_site_replication_destructive_events_in_state(
-    state: &mut SiteReplicationState,
-    peers: &[PeerInfo],
-    path: &str,
-) {
-    for peer in peers {
-        if state.peers.contains_key(&peer.deployment_id) {
-            upsert_site_replication_retry_event(
-                &mut state.retry_queue,
-                peer,
-                path,
-                "destructive site replication bucket operation pending delivery",
-                None,
-            );
-        }
-    }
-}
-
-pub(crate) async fn prequeue_site_replication_destructive_events(peers: &[PeerInfo], path: &str) -> S3Result<()> {
-    if peers.is_empty() {
-        return Ok(());
-    }
-    let peers = peers.to_vec();
-    let path = path.to_string();
-    update_site_replication_state(move |state| {
-        prequeue_site_replication_destructive_events_in_state(state, &peers, &path);
-        Ok(())
-    })
-    .await
 }
 
 pub(crate) async fn enqueue_site_replication_retry_event_for_generation(
@@ -1340,17 +1293,11 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
         let now = OffsetDateTime::now_utc();
         let actionable = actionable_site_replication_retry_events(&runtime.state, now);
         let deferred = deferred_site_replication_retry_events(&runtime.state, now);
-        let drain = async {
-            promote_reachable_deferred_retry_events(&runtime, &actionable, deferred).await?;
-            if actionable.is_empty() {
-                return Ok(());
-            }
-            drain_site_replication_retry_queue_locked(runtime, actionable).await
-        };
-        match tokio::time::timeout(SITE_REPLICATION_RETRY_DRAIN_BATCH_TIMEOUT, drain).await {
-            Ok(result) => result,
-            Err(_) => Ok(()),
+        promote_reachable_deferred_retry_events(&runtime, &actionable, deferred).await?;
+        if actionable.is_empty() {
+            return Ok(());
         }
+        drain_site_replication_retry_queue_locked(runtime, actionable).await
     })
     .await
     .map_err(ApiError::from)?
