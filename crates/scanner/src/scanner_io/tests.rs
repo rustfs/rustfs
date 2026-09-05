@@ -834,7 +834,8 @@ fn scoped_scan_requires_a_converged_complete_baseline_with_exact_set_provenance(
 
     assert_eq!(
         complete_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
-            data: Some(&baseline),
+            authoritative_data: Some(&baseline),
+            observed_candidate_data: None,
             expected_sources: &expected_sources,
             leader_epoch: 11,
             want_cycle: 8,
@@ -848,7 +849,8 @@ fn scoped_scan_requires_a_converged_complete_baseline_with_exact_set_provenance(
     let incomplete = bytes::Bytes::from(serde_json::to_vec(&incomplete).expect("test baseline should encode"));
     assert_eq!(
         complete_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
-            data: Some(&incomplete),
+            authoritative_data: Some(&incomplete),
+            observed_candidate_data: None,
             expected_sources: &expected_sources,
             leader_epoch: 11,
             want_cycle: 8,
@@ -862,10 +864,116 @@ fn scoped_scan_requires_a_converged_complete_baseline_with_exact_set_provenance(
     let wrong_provenance = bytes::Bytes::from(serde_json::to_vec(&wrong_provenance).expect("test baseline should encode"));
     assert_eq!(
         complete_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
-            data: Some(&wrong_provenance),
+            authoritative_data: Some(&wrong_provenance),
+            observed_candidate_data: None,
             expected_sources: &expected_sources,
             leader_epoch: 11,
             want_cycle: 8,
+            scan_plan_digest,
+        }),
+        None
+    );
+}
+
+#[test]
+fn scoped_scan_accepts_only_a_complete_observation_tied_to_the_authoritative_baseline() {
+    let source = DataUsageCacheSource::new(1, 2);
+    let expected_sources = HashSet::from([source]);
+    let scan_plan_digest = DataUsageScanPlanDigest([9; 32]);
+    let authoritative = complete_usage_baseline(source, scan_plan_digest, 7, 11);
+    let authoritative_info =
+        serde_json::from_slice::<DataUsageInfo>(&authoritative).expect("authoritative baseline should decode");
+    let bootstrap_authoritative_info =
+        crate::scanner::scanner_usage_bootstrap_marker(SystemTime::UNIX_EPOCH + Duration::from_secs(9), Some(11));
+    let bootstrap_authoritative =
+        bytes::Bytes::from(serde_json::to_vec(&bootstrap_authoritative_info).expect("bootstrap baseline should encode"));
+    let mut observed_info = authoritative_info.clone();
+    observed_info.last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(11));
+    observed_info.scanner_cycle = Some(8);
+    observed_info.usage_snapshot_converged = Some(false);
+    observed_info.usage_snapshot_authoritative_baseline = Some(bootstrap_authoritative_info.snapshot_identity());
+    observed_info.usage_snapshot_set_states[0].scanner_cycle = Some(8);
+    let observed = bytes::Bytes::from(serde_json::to_vec(&observed_info).expect("observation should encode"));
+
+    macro_rules! proof {
+        ($authoritative:expr, $candidate:expr) => {
+            ScannerCacheBaselineProof {
+                authoritative_data: Some($authoritative),
+                observed_candidate_data: $candidate,
+                expected_sources: &expected_sources,
+                leader_epoch: 11,
+                want_cycle: 9,
+                scan_plan_digest,
+            }
+        };
+    }
+    assert_eq!(
+        complete_scanner_cache_baseline_plan_digest(proof!(&bootstrap_authoritative, Some(&observed))),
+        Some(scan_plan_digest)
+    );
+
+    observed_info.usage_snapshot_authoritative_baseline = Some(DataUsageInfo::default().snapshot_identity());
+    let mismatched_baseline = bytes::Bytes::from(serde_json::to_vec(&observed_info).expect("observation should encode"));
+    assert_eq!(
+        complete_scanner_cache_baseline_plan_digest(proof!(&bootstrap_authoritative, Some(&mismatched_baseline))),
+        None
+    );
+
+    observed_info = serde_json::from_slice(&observed).expect("observation should decode");
+    observed_info.usage_snapshot_partial = true;
+    let partial = bytes::Bytes::from(serde_json::to_vec(&observed_info).expect("partial observation should encode"));
+    assert_eq!(
+        complete_scanner_cache_baseline_plan_digest(proof!(&bootstrap_authoritative, Some(&partial))),
+        None
+    );
+
+    observed_info = serde_json::from_slice(&observed).expect("observation should decode");
+    observed_info.usage_snapshot_converged = Some(true);
+    let converged = bytes::Bytes::from(serde_json::to_vec(&observed_info).expect("converged observation should encode"));
+    assert_eq!(
+        complete_scanner_cache_baseline_plan_digest(proof!(&bootstrap_authoritative, Some(&converged))),
+        None
+    );
+
+    let mut legacy_authoritative = authoritative_info.clone();
+    legacy_authoritative.usage_snapshot_converged = None;
+    let mut stale_info = serde_json::from_slice::<DataUsageInfo>(&observed).expect("observation should decode");
+    stale_info.scanner_cycle = Some(7);
+    stale_info.usage_snapshot_set_states[0].scanner_cycle = Some(7);
+    stale_info.usage_snapshot_authoritative_baseline = Some(legacy_authoritative.snapshot_identity());
+    let legacy_authoritative =
+        bytes::Bytes::from(serde_json::to_vec(&legacy_authoritative).expect("legacy baseline should encode"));
+    let stale = bytes::Bytes::from(serde_json::to_vec(&stale_info).expect("stale observation should encode"));
+    assert_eq!(
+        complete_scanner_cache_baseline_plan_digest(proof!(&legacy_authoritative, Some(&stale))),
+        None
+    );
+
+    let malformed = bytes::Bytes::from_static(b"not data usage json");
+    assert_eq!(
+        complete_scanner_cache_baseline_plan_digest(proof!(&bootstrap_authoritative, Some(&malformed))),
+        None
+    );
+
+    let mut nonconverged_authoritative = authoritative_info;
+    nonconverged_authoritative.usage_snapshot_converged = Some(false);
+    let mut observation_of_nonconverged_authoritative = nonconverged_authoritative.clone();
+    observation_of_nonconverged_authoritative.last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(12));
+    observation_of_nonconverged_authoritative.scanner_cycle = Some(8);
+    observation_of_nonconverged_authoritative.usage_snapshot_set_states[0].scanner_cycle = Some(8);
+    observation_of_nonconverged_authoritative.usage_snapshot_authoritative_baseline =
+        Some(nonconverged_authoritative.snapshot_identity());
+    let nonconverged_authoritative =
+        bytes::Bytes::from(serde_json::to_vec(&nonconverged_authoritative).expect("nonconverged baseline should encode"));
+    let observation_of_nonconverged_authoritative =
+        bytes::Bytes::from(serde_json::to_vec(&observation_of_nonconverged_authoritative).expect("observation should encode"));
+    assert_eq!(
+        complete_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
+            authoritative_data: Some(&nonconverged_authoritative),
+            observed_candidate_data: Some(&observation_of_nonconverged_authoritative),
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 9,
             scan_plan_digest,
         }),
         None
@@ -885,7 +993,8 @@ fn scoped_scan_selects_only_current_dirty_buckets_after_baseline_validation() {
         true,
         &[bucket_info("photos")],
         ScannerCacheBaselineProof {
-            data: Some(&baseline),
+            authoritative_data: Some(&baseline),
+            observed_candidate_data: None,
             expected_sources: &expected_sources,
             leader_epoch: 11,
             want_cycle: 8,
