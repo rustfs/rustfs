@@ -25,11 +25,6 @@
 use super::storage_api::bucket_usecase::ECStore;
 use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
 use super::storage_api::bucket_usecase::StorageObjectOptions;
-use super::storage_api::bucket_usecase::bucket::on_demand_migration::{
-    BucketOdmState, ListEntryKey, ListPageError, ListThroughCursor, ListThroughMerger, ListThroughToken, ListThroughTokenError,
-    MergeSide, OnDemandMigrationSys, SOURCE_LIST_MAX_RATE_WAIT, SourceClient, SourceError, SourceErrorPolicy, SourceListPlan,
-    SourceListRequest, SourceObject, SourcePage, decode_continuation_token, source_list_plan,
-};
 use super::storage_api::bucket_usecase::bucket::versioning_sys::BucketVersioningSys;
 use super::storage_api::bucket_usecase::contract::list::{ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as _};
 use super::storage_api::bucket_usecase::contract::object::ObjectOperations as _;
@@ -37,6 +32,11 @@ use super::storage_api::bucket_usecase::s3::{S3Error, S3ErrorCode, S3Result};
 use super::storage_api::bucket_usecase::s3_api::bucket::ListObjectsV2Params;
 use crate::app::object::shared::{odm_source_unavailable_error, odm_state_error_class};
 use crate::error::ApiError;
+use crate::on_demand_migration::{
+    BucketOdmState, ListEntryKey, ListPageError, ListThroughCursor, ListThroughMerger, ListThroughToken, ListThroughTokenError,
+    MergeSide, OnDemandMigrationSys, SOURCE_LIST_MAX_RATE_WAIT, SourceClient, SourceError, SourceErrorPolicy, SourceListPlan,
+    SourceListRequest, SourceObject, SourcePage, decode_continuation_token, source_list_plan,
+};
 use futures::StreamExt;
 use http::HeaderMap;
 use rustfs_utils::http::{SUFFIX_SOURCE_PROXY_REQUEST, get_header};
@@ -443,15 +443,15 @@ mod tests {
     use super::*;
     use crate::app::bucket_usecase::DefaultBucketUsecase;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ecstore};
-    use crate::app::storage_api::bucket_usecase::bucket::on_demand_migration::{
-        FilterConfig, MAX_LIST_NO_PROGRESS_PAGES, OnDemandMigrationConfig, PathStyle, PolicyConfig, Provider, SourceConfig,
-        SourceCredentials, TlsConfig,
-    };
     use crate::app::storage_api::bucket_usecase::s3::{ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response};
     use crate::app::storage_api::test::StoragePutObjReader;
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::app::storage_api::test::contract::object::ObjectIO as _;
     use s3s::dto::ListObjectsInput;
+    use crate::on_demand_migration::{
+        FilterConfig, MAX_LIST_NO_PROGRESS_PAGES, OnDemandMigrationConfig, PathStyle, PolicyConfig, Provider, SourceConfig,
+        SourceCredentials, TlsConfig,
+    };
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
