@@ -3843,11 +3843,11 @@ impl DefaultObjectUsecase {
         if !odm_get_may_consult_source(opts, part_number) {
             return None;
         }
-        let lookup = OnDemandMigrationSys::get().resolve(bucket, key)?;
-        let (state, client) = match odm_get_verdict(lookup) {
-            OdmGetVerdict::Fail(err) => return Some(OdmGetOutcome::Respond(Err(err))),
-            OdmGetVerdict::Consult { state, client } => (state, client),
-        };
+        let sys = OnDemandMigrationSys::get();
+        if !sys.is_module_enabled() {
+            return None;
+        }
+        let state = sys.state(bucket).filter(|state| state.matches_prefix(key))?;
         let policy = &state.config().policy;
         // The read path reports a latest delete marker as a plain 404, so the
         // marker is classified here, and only where one can exist.
@@ -3861,6 +3861,24 @@ impl DefaultObjectUsecase {
                 None => return Some(OdmGetOutcome::RetryLocal),
             }
         }
+        let expected_incarnation = match odm_read_generation(req, bucket) {
+            Ok(Some(incarnation)) => incarnation,
+            Ok(None) => return None,
+            Err(err) => return Some(OdmGetOutcome::Respond(Err(err))),
+        };
+        match store.bucket_incarnation_id(bucket).await {
+            Ok(current) if current == expected_incarnation => {}
+            Ok(_) => return None,
+            Err(err) => return Some(OdmGetOutcome::Respond(Err(ApiError::from(err).into()))),
+        }
+        if !sys.is_module_enabled() {
+            return None;
+        }
+        let lookup = state.filter_incarnation(expected_incarnation)?.resolve_key(key)?;
+        let (state, client) = match odm_get_verdict(lookup) {
+            OdmGetVerdict::Fail(err) => return Some(OdmGetOutcome::Respond(Err(err))),
+            OdmGetVerdict::Consult { state, client } => (state, client),
+        };
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let reply = odm_get_from_source(&state, client.as_ref(), &req.headers, key, range, request_context).await;
         Some(match reply {
@@ -3895,7 +3913,7 @@ impl DefaultObjectUsecase {
         result
     }
 
-    async fn execute_get_object_inner(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+    async fn execute_get_object_inner(&self, mut req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
 
         if let Some(context) = &self.context {
@@ -3981,6 +3999,8 @@ impl DefaultObjectUsecase {
                 return Self::complete_get_object_error(helper, err);
             }
         };
+        let bucket = req.input.bucket.clone();
+        prepare_odm_read_generation(&store, &mut req, &bucket).await;
         if let Some(request_context_start) = request_context_start {
             rustfs_io_metrics::record_get_object_stage_duration(
                 "s3_handler",
@@ -4919,7 +4939,7 @@ mod on_demand_migration_tests {
             Err(WriteBackError::Local("multipart is not part of the inline path".to_string()))
         }
 
-        async fn abort_multipart_upload(&self, _bucket: &str, _key: &str, _upload_id: &str) -> Result<(), WriteBackError> {
+        async fn abort_multipart_upload(&self, _request: &WriteBackRequest, _upload_id: &str) -> Result<(), WriteBackError> {
             Ok(())
         }
     }
