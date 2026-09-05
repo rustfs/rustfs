@@ -8045,10 +8045,15 @@ mod tests {
         );
         assert!(com::read_config(store.pools[0].clone(), &second_page_path).await.is_ok());
 
-        com::save_config(store.pools[target_pool_idx].clone(), &second_page_path, receipt_bytes.clone())
+        let full_tail = ObjectOptions {
+            max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        com::save_config_with_opts(store.pools[target_pool_idx].clone(), &second_page_path, receipt_bytes.clone(), &full_tail)
             .await
             .expect("second page receipt should restore");
-        com::save_config(store.pools[target_pool_idx].clone(), &second_page_path, b"{corrupt".to_vec())
+        com::save_config_with_opts(store.pools[target_pool_idx].clone(), &second_page_path, b"{corrupt".to_vec(), &full_tail)
             .await
             .expect("second page receipt should corrupt deterministically");
         let corrupt = store

@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Single-disk object rename publication and rollback. The caller retains the
-//! DiskAPI instrumentation; mutation leases and commit guards follow the syscall.
+//! Single-disk object rename publication and rollback. The shared execution core
+//! retains instrumentation, mutation leases, and commit guards through the syscall.
 
 #[cfg(all(test, windows))]
 use super::run_destination_commit_directory_preparation;
@@ -226,15 +226,23 @@ async fn restore_published_data_source(
     restore_renamed_data_source(src_volume_dir, src_data_path, dst_data_path, publication_root, mutation_lease).await
 }
 
+/// Proof produced only when the local rename returns at an existing access
+/// preflight, before metadata, backups, or object data can be published.
+#[derive(Debug)]
+pub(in crate::disk) struct LocalRenamePreflightRejection(());
+
 impl LocalDisk {
-    pub(super) async fn rename_data_commit(
+    #[tracing::instrument(name = "rename_data", target = "rustfs_ecstore::disk::local", level = "trace", skip_all)]
+    pub(super) async fn rename_data_inner(
         &self,
         src_volume: &str,
         src_path: &str,
         fi: FileInfo,
         dst_volume: &str,
         dst_path: &str,
+        preflight_rejection: &mut Option<LocalRenamePreflightRejection>,
     ) -> Result<RenameDataResp> {
+        crate::hp_guard!("LocalDisk::rename_data");
         let mut fi = fi;
         // A non-force DeleteBucket must not remove a directory while a local
         // object commit is publishing into it. The peer's empty scan remains
@@ -294,6 +302,7 @@ impl LocalDisk {
                 error = %e,
                 "Disk local access check failed"
             );
+            *preflight_rejection = Some(LocalRenamePreflightRejection(()));
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
@@ -311,6 +320,7 @@ impl LocalDisk {
                 error = %e,
                 "Disk local access check failed"
             );
+            *preflight_rejection = Some(LocalRenamePreflightRejection(()));
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
@@ -1200,6 +1210,24 @@ impl LocalDisk {
                 sign: version_signature,
                 old_current_size,
             })
+        }
+    }
+
+    pub(in crate::disk) async fn rename_data_observed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> super::super::RenameDataObservation {
+        let mut preflight_rejection = None;
+        let result = self
+            .rename_data_inner(src_volume, src_path, fi.clone(), dst_volume, dst_path, &mut preflight_rejection)
+            .await;
+        super::super::RenameDataObservation {
+            result,
+            preflight_rejection,
         }
     }
 }
