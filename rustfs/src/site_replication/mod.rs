@@ -47,6 +47,7 @@ use self::identity::{
     canonical_endpoint, deployment_id_for_endpoint, mark_unknown_peer_sync_enabled, normalize_peer_map_by_identity_with,
     same_identity_endpoint,
 };
+pub(crate) use self::state_lock::with_site_replication_state_read_lock;
 use self::state_lock::{SITE_REPLICATION_STATE_PATH, with_site_replication_state_lock};
 use crate::auth::constant_time_eq;
 use crate::config::get_config_snapshot;
@@ -64,12 +65,12 @@ use crate::storage_api::site_replication::s3::{
 #[cfg(test)]
 use crate::storage_api::site_replication::save_config as save_admin_config;
 use crate::storage_api::site_replication::{
-    ARN, BUCKET_REPLICATION_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BucketOperations, BucketOptions, BucketTarget,
-    BucketTargetSys, BucketTargetType, BucketTargets, Credentials, ECStore, OperatorRuleContract, StorageError,
-    VersioningApi as _, assign_site_replication_rule_priorities, delete_config_no_lock, deserialize, is_site_replication_role,
-    lock_bucket_targets_metadata, metadata_sys, read_config as read_admin_config, read_config_no_lock,
-    replication_target_arn_deployment_id, save_config_no_lock, serialize, site_replication_rule_deployment_id,
-    with_config_object_read_lock, with_config_object_write_lock,
+    ARN, BUCKET_REPLICATION_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BucketMetadata, BucketOperations,
+    BucketOptions, BucketTarget, BucketTargetSys, BucketTargetType, BucketTargets, Credentials, ECStore, OperatorRuleContract,
+    StorageError, VersioningApi as _, assign_site_replication_rule_priorities, delete_config_no_lock, deserialize,
+    is_err_bucket_not_found, is_site_replication_role, lock_bucket_targets_metadata, metadata_sys,
+    read_config as read_admin_config, read_config_no_lock, replication_target_arn_deployment_id, save_config_no_lock, serialize,
+    site_replication_rule_deployment_id, with_config_object_read_lock, with_config_object_write_lock,
 };
 use base64_simd::STANDARD as BASE64_STANDARD;
 use base64_simd::URL_SAFE_NO_PAD;

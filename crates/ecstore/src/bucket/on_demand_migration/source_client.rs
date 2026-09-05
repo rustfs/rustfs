@@ -27,6 +27,7 @@
 
 use super::azure::AzureSourceBackend;
 use super::gcs::GcsNativeSourceBackend;
+use super::list_through::{ListPageError, validate_list_page};
 use crate::bucket::remote_s3_client::{
     PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, RemoteS3RetryPolicy, build_remote_s3_config,
 };
@@ -296,6 +297,8 @@ pub enum SourceError {
     ServerError(u16),
     #[error("unsupported source object: {0}")]
     Unsupported(String),
+    #[error("invalid source listing: {0}")]
+    InvalidPagination(#[from] ListPageError),
     #[error("source request failed: {0}")]
     Other(String),
 }
@@ -318,6 +321,7 @@ impl SourceError {
             SourceError::Connect(_) => "connect",
             SourceError::ServerError(_) => "server_error",
             SourceError::Unsupported(_) => "unsupported",
+            SourceError::InvalidPagination(_) => "invalid_pagination",
             SourceError::Other(_) => "other",
         }
     }
@@ -832,6 +836,7 @@ impl SourceClient {
                 ..*request
             })
             .await?;
+        validate_list_page(page.is_truncated, request.continuation_token, page.next_continuation_token.as_deref())?;
         page.objects = page
             .objects
             .into_iter()
@@ -918,11 +923,6 @@ impl SourceBackend for S3SourceBackend {
 
         let is_truncated = output.is_truncated.unwrap_or(false);
         let next_continuation_token = output.next_continuation_token;
-        if is_truncated && next_continuation_token.is_none() {
-            return Err(SourceError::Other(
-                "source reported a truncated listing without a continuation token".to_string(),
-            ));
-        }
         let objects = output
             .contents
             .unwrap_or_default()
@@ -1394,7 +1394,9 @@ mod tests {
 <CommonPrefixes><Prefix>data/photos/</Prefix></CommonPrefixes>
 <CommonPrefixes><Prefix>outside/</Prefix></CommonPrefixes>
 </ListBucketResult>"#;
-        let (client, requests) = scripted_client(&spec(Some("data/")), vec![ok(Vec::new(), body), ok(Vec::new(), body)]).await;
+        let next_body = body.replace("data/opaque", "data/next");
+        let (client, requests) =
+            scripted_client(&spec(Some("data/")), vec![ok(Vec::new(), body), ok(Vec::new(), &next_body)]).await;
         let first = client
             .list_page(&SourceListRequest {
                 prefix: Some("photos/"),
@@ -1456,7 +1458,104 @@ mod tests {
             .list_objects_v2(None, None, 10)
             .await
             .expect_err("truncated page without token is corrupt");
-        assert!(matches!(err, SourceError::Other(_)), "{err:?}");
+        assert!(matches!(err, SourceError::InvalidPagination(ListPageError::Missing)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn list_page_validates_s3_cursor_progress_before_mapping_entries() {
+        for contents in ["", "<Contents><Key>data/a</Key><Size>1</Size></Contents>"] {
+            for (truncated, next, expected) in [
+                (true, None, Some(ListPageError::Missing)),
+                (true, Some(""), Some(ListPageError::Empty)),
+                (true, Some("stuck"), Some(ListPageError::Repeated)),
+                (true, Some("opaque-next"), None),
+                (false, None, None),
+                (false, Some("stuck"), None),
+            ] {
+                let next_xml = next
+                    .map(|next| format!("<NextContinuationToken>{next}</NextContinuationToken>"))
+                    .unwrap_or_default();
+                let body = format!(
+                    "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>{truncated}</IsTruncated>{next_xml}{contents}</ListBucketResult>"
+                );
+                let (client, requests) = scripted_client(&spec(Some("data/")), vec![ok(Vec::new(), &body)]).await;
+                let result = client
+                    .list_page(&SourceListRequest {
+                        continuation_token: Some("stuck"),
+                        max_keys: 2,
+                        ..Default::default()
+                    })
+                    .await;
+                match expected {
+                    Some(expected) => {
+                        let error = result.expect_err("malformed pagination must fail at the provider boundary");
+                        assert!(
+                            matches!(&error, SourceError::InvalidPagination(actual) if *actual == expected),
+                            "{error:?}"
+                        );
+                        assert_eq!(error.class_label(), "invalid_pagination");
+                        assert!(!error.is_retryable());
+                        assert!(!error.to_string().contains("stuck"), "errors must not echo opaque tokens");
+                    }
+                    None => {
+                        let page = result.expect("progressing empty/nonempty pages and EOF are valid");
+                        assert_eq!(page.is_truncated, truncated);
+                        assert_eq!(page.next_continuation_token.as_deref(), next);
+                        assert_eq!(page.objects.len(), usize::from(!contents.is_empty()));
+                        if let Some(object) = page.objects.first() {
+                            assert_eq!(object.key, "a");
+                        }
+                    }
+                }
+                let requests = recorded(&requests);
+                assert_eq!(requests.len(), 1, "invalid pagination must not be retried");
+                assert!(requests[0].uri.contains("continuation-token=stuck"));
+            }
+        }
+    }
+
+    struct ListOnlyBackend(SourcePage);
+
+    #[async_trait::async_trait]
+    impl SourceBackend for ListOnlyBackend {
+        async fn list(&self, request: &SourceListRequest<'_>) -> Result<SourcePage, SourceError> {
+            assert_eq!(request.continuation_token, Some("stuck"), "opaque cursors reach every provider unchanged");
+            Ok(self.0.clone())
+        }
+
+        async fn head(&self, _key: &str) -> Result<SourceHead, SourceError> {
+            panic!("unexpected HEAD in list test")
+        }
+        async fn get(&self, _key: &str, _range: Option<&HTTPRangeSpec>) -> Result<SourceGet, SourceError> {
+            panic!("unexpected GET in list test")
+        }
+        async fn tagging(&self, _key: &str) -> Result<HashMap<String, String>, SourceError> {
+            panic!("unexpected tagging in list test")
+        }
+        async fn probe(&self) -> Result<(), SourceError> {
+            panic!("unexpected probe in list test")
+        }
+    }
+
+    #[tokio::test]
+    async fn list_page_validates_non_s3_provider_cursors_at_the_common_boundary() {
+        for (next, expected) in [
+            (None, ListPageError::Missing),
+            (Some(""), ListPageError::Empty),
+            (Some("stuck"), ListPageError::Repeated),
+        ] {
+            let mut client = prefix_client(Some("data/".into()));
+            client.backend = Box::new(ListOnlyBackend(SourcePage {
+                is_truncated: true,
+                next_continuation_token: next.map(str::to_string),
+                ..Default::default()
+            }));
+            let error = client
+                .list_objects_v2(None, Some("stuck"), 2)
+                .await
+                .expect_err("all providers must advance pagination");
+            assert!(matches!(error, SourceError::InvalidPagination(actual) if actual == expected));
+        }
     }
 
     const TAGGING_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>

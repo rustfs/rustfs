@@ -331,6 +331,7 @@ pub(crate) fn runtime_peer_connection(peer: &PeerInfo) -> S3Result<PeerConnectio
     })
 }
 
+#[derive(Clone)]
 pub(crate) struct PeerTransport {
     pub(crate) connection: PeerConnection,
     pub(crate) client: reqwest::Client,
@@ -697,19 +698,7 @@ impl<'a> PeerAdminRequest<'a> {
         }
 
         let response = req.send().await.map_err(|e| {
-            let classify = if e.is_timeout() {
-                "timeout"
-            } else if e.is_connect() && e.to_string().to_ascii_lowercase().contains("dns") {
-                "dns resolution"
-            } else if e.to_string().to_ascii_lowercase().contains("certificate")
-                || e.to_string().to_ascii_lowercase().contains("tls")
-            {
-                "tls handshake"
-            } else if e.is_connect() {
-                "connect"
-            } else {
-                "request"
-            };
+            let classify = classify_peer_transport_error(e.is_connect(), e.is_timeout(), &e.to_string());
             S3Error::with_message(S3ErrorCode::InternalError, format!("peer request to {url} failed ({classify}): {e}"))
         })?;
 
@@ -822,6 +811,21 @@ impl<'a> PeerAdminRequest<'a> {
                 Err(err)
             }
         }
+    }
+}
+
+pub(crate) fn classify_peer_transport_error(is_connect: bool, is_timeout: bool, detail: &str) -> &'static str {
+    let detail = detail.to_ascii_lowercase();
+    if is_connect && detail.contains("dns") {
+        "dns resolution"
+    } else if is_connect && (detail.contains("certificate") || detail.contains("tls")) {
+        "tls handshake"
+    } else if is_connect {
+        "connect"
+    } else if is_timeout {
+        "timeout"
+    } else {
+        "request"
     }
 }
 

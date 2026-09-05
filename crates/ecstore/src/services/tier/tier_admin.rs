@@ -15,8 +15,6 @@
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
@@ -145,7 +143,7 @@ mod tests {
 
         assert_eq!(creds.access_key, "access");
         assert_eq!(creds.secret_key, "secret");
-        assert_eq!(creds.creds_json.as_slice(), &service_account[..]);
+        assert_eq!(creds.creds_json.as_slice(), service_account);
 
         let wire = serde_json::to_value(&creds).expect("madmin tier credentials should encode");
         assert_eq!(wire["access"], "access");
@@ -162,7 +160,7 @@ mod tests {
         .expect("the former RustFS field names and byte-array encoding should remain readable");
         assert_eq!(legacy.access_key, "legacy-access");
         assert_eq!(legacy.secret_key, "legacy-secret");
-        assert_eq!(legacy.creds_json.as_slice(), &service_account[..]);
+        assert_eq!(legacy.creds_json.as_slice(), service_account);
     }
 
     #[test]

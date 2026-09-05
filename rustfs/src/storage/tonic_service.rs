@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub(crate) use crate::storage::rpc::node_service::make_heal_control_server_with_cache;
+pub(crate) use crate::storage::rpc::node_service::make_scanner_control_server;
 #[cfg(test)]
 pub(crate) use crate::storage::rpc::node_service::{heal::heal_topology_fingerprint, make_heal_control_server_for_source};
 pub use crate::storage::rpc::{make_heal_control_server, make_server, make_tier_mutation_control_server};

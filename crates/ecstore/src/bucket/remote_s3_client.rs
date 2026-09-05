@@ -652,9 +652,10 @@ async fn build_aws_s3_http_client_from_tls_path() -> Option<SharedHttpClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_smithy_async::time::TimeSource;
     use aws_smithy_runtime_api::http::StatusCode as SmithyStatusCode;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     fn spec(endpoint: &str, secure: bool) -> RemoteS3EndpointSpec {
         RemoteS3EndpointSpec {
@@ -822,6 +823,174 @@ mod tests {
             1,
             "a zero attempt budget is clamped to the initial request"
         );
+    }
+
+    #[derive(Clone, Debug)]
+    struct ClockSkewTimeSource(Arc<AtomicU64>);
+
+    impl TimeSource for ClockSkewTimeSource {
+        fn now(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ClockSkewConnector {
+        request_headers: RecordedHeaders,
+        error_code: &'static str,
+        skew_seconds: i64,
+        clock: ClockSkewTimeSource,
+    }
+
+    fn recorded_header<'a>(headers: &'a [(String, String)], name: &str) -> &'a str {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+            .unwrap_or_else(|| panic!("signed request must contain {name}"))
+    }
+
+    fn signing_time(headers: &[(String, String)]) -> chrono::NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str(recorded_header(headers, "x-amz-date"), "%Y%m%dT%H%M%SZ")
+            .expect("SDK signing timestamp must use the SigV4 format")
+    }
+
+    impl SmithyHttpConnector for ClockSkewConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let mut headers = self.request_headers.lock().expect("clock skew request capture lock");
+            assert!(headers.len() < 3, "clock skew fixture must not exceed two GET attempts and one HEAD");
+            headers.push(
+                request
+                    .headers()
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            );
+            let server_time = chrono::DateTime::<chrono::Utc>::from(self.clock.now()).naive_utc()
+                + chrono::Duration::seconds(self.skew_seconds);
+            let (status, body) = if headers.len() == 1 {
+                (
+                    403,
+                    format!("<Error><Code>{}</Code><Message>Clock skew fixture</Message></Error>", self.error_code),
+                )
+            } else {
+                (200, String::new())
+            };
+            let response = http::Response::builder()
+                .status(status)
+                .header("date", server_time.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+                .header("content-type", "application/xml")
+                .header("content-length", body.len())
+                .body(SdkBody::from(body))
+                .expect("clock skew fixture response");
+            HttpConnectorFuture::ready(Ok(HttpResponse::try_from(response).expect("Smithy fixture response")))
+        }
+    }
+
+    async fn clock_skew_client(
+        error_code: &'static str,
+        skew_seconds: i64,
+        retry: RemoteS3RetryPolicy,
+    ) -> (S3Client, RecordedHeaders, ClockSkewTimeSource) {
+        let headers: RecordedHeaders = Arc::new(Mutex::new(Vec::new()));
+        let clock = ClockSkewTimeSource(Arc::new(AtomicU64::new(1_700_000_000)));
+        let connector = SharedHttpConnector::new(ClockSkewConnector {
+            request_headers: Arc::clone(&headers),
+            error_code,
+            skew_seconds,
+            clock: clock.clone(),
+        });
+        let mut spec = spec("s3.example.com", true);
+        spec.retry = retry;
+        let config = build_remote_s3_config(&spec)
+            .await
+            .expect("clock skew fixture uses the production outbound configuration")
+            .http_client(http_client_fn(move |_settings, _components| connector.clone()))
+            .time_source(clock.clone())
+            .build();
+        (S3Client::from_conf(config), headers, clock)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_s3_clock_skew_retries_resign_and_seed_next_operation() {
+        for error_code in ["RequestTimeTooSkewed", "SignatureDoesNotMatch"] {
+            for skew_seconds in [-600, 600] {
+                let (client, headers, clock) = clock_skew_client(error_code, skew_seconds, REPLICATION_TARGET_RETRY_POLICY).await;
+                let initial = chrono::DateTime::<chrono::Utc>::from(clock.now()).naive_utc();
+                client
+                    .get_object()
+                    .bucket("bucket")
+                    .key("object")
+                    .send()
+                    .await
+                    .expect("clock skew GET must retry successfully");
+                assert_eq!(
+                    headers.lock().expect("captured requests").len(),
+                    2,
+                    "{error_code}: GET needs exactly one retry"
+                );
+                clock.0.fetch_add(17, Ordering::SeqCst);
+                // SDK signing time is independent of Tokio's retry/scheduler clock.
+                tokio::time::advance(Duration::from_secs(61)).await;
+                client
+                    .head_bucket()
+                    .bucket("bucket")
+                    .send()
+                    .await
+                    .expect("subsequent HEAD must use the client's cached skew");
+                let headers = headers.lock().expect("captured signed requests");
+                assert_eq!(headers.len(), 3, "subsequent operation must succeed on its first attempt");
+                assert_eq!(signing_time(&headers[0]), initial, "the first attempt must use the injected clock");
+                assert_eq!(
+                    signing_time(&headers[1]),
+                    initial + chrono::Duration::seconds(skew_seconds),
+                    "{error_code}: retry must apply the measured offset exactly"
+                );
+                assert_eq!(
+                    signing_time(&headers[2]),
+                    initial + chrono::Duration::seconds(skew_seconds + 17),
+                    "{error_code}: the next operation must apply cached skew to the advanced signing clock"
+                );
+                let signature = |index: usize| {
+                    recorded_header(&headers[index], "authorization")
+                        .rsplit_once("Signature=")
+                        .expect("SigV4 authorization contains a signature")
+                        .1
+                };
+                assert_ne!(
+                    signature(0),
+                    signature(1),
+                    "{error_code}: retry must be signed again after adjusting its date"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_s3_clock_skew_respects_one_attempt_policy() {
+        use aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+        for error_code in ["RequestTimeTooSkewed", "SignatureDoesNotMatch"] {
+            for retry in [
+                RemoteS3RetryPolicy::Disabled,
+                RemoteS3RetryPolicy::Standard { max_attempts: 1 },
+            ] {
+                let (client, headers, _clock) = clock_skew_client(error_code, 600, retry).await;
+                let error = client
+                    .get_object()
+                    .bucket("bucket")
+                    .key("object")
+                    .send()
+                    .await
+                    .expect_err("clock skew must not override the caller's one-attempt budget");
+                assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some(error_code));
+                assert_eq!(
+                    headers.lock().expect("captured requests").len(),
+                    1,
+                    "{error_code}: {retry:?} must send exactly one request"
+                );
+            }
+        }
     }
 
     #[test]
