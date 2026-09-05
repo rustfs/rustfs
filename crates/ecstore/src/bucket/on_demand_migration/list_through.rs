@@ -25,13 +25,21 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
-/// The only continuation-token envelope version this build reads and writes.
+/// The continuation-token version used by ordinary progressing pages.
 pub const LIST_THROUGH_TOKEN_VERSION: u32 = 1;
+const LIST_THROUGH_PROGRESS_TOKEN_VERSION: u32 = 2;
+
+/// The sixteenth consecutive merged page without a key or new EOF fails.
+/// This also bounds legitimate sparse listings; it is not a cycle detector.
+pub const MAX_LIST_NO_PROGRESS_PAGES: u8 = 16;
 
 /// Envelope marker. A bucket that is *not* merging hands out the local
 /// listing's own marker, so the decoder needs a positive signal before it
 /// treats an opaque token as a merged one.
 const LIST_THROUGH_TOKEN_TAG: &str = "odm-list";
+// Object keys cannot contain NUL (bucket::utils::is_valid_object_prefix),
+// so this framing cannot collide with a local key used as an opaque marker.
+const LIST_THROUGH_TOKEN_PREFIX: &str = "\0odm-list:";
 
 /// Pages fetched per side per request: the first page, plus at most one refill
 /// when the first one was mostly consumed by the previous page. Two pages of
@@ -86,8 +94,7 @@ pub struct MergePick {
 }
 
 /// The continuation-token envelope. Opaque to clients: it is serialized as
-/// JSON and then base64-encoded by the same helper that encodes a plain local
-/// marker, so the wire shape is `base64(json)`.
+/// framed JSON and then base64-encoded by the same helper as a local marker.
 ///
 /// A `null` cursor with `done = false` means "list that side from the start";
 /// `done = true` means the side is finished and must not be listed again.
@@ -111,6 +118,10 @@ pub struct ListThroughToken {
     /// common prefix compares as itself, never as its members.
     #[serde(default)]
     pub last_key: Option<String>,
+    /// Consecutive empty truncated merged pages, present only in v2 tokens.
+    /// Ordinary v1 tokens retain their original serialized shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_progress: Option<u8>,
 }
 
 impl ListThroughToken {
@@ -123,13 +134,14 @@ impl ListThroughToken {
             source: source.token,
             source_done: source.done,
             last_key,
+            no_progress: None,
         }
     }
 
     pub fn encode(&self) -> String {
         // The envelope is built here from owned strings, so serialization
         // cannot fail; the fallback keeps the signature infallible.
-        serde_json::to_string(self).unwrap_or_default()
+        format!("{LIST_THROUGH_TOKEN_PREFIX}{}", serde_json::to_string(self).unwrap_or_default())
     }
 }
 
@@ -153,24 +165,35 @@ pub enum ListThroughTokenError {
 
 /// Classifies an already base64-decoded continuation token.
 ///
-/// Only a JSON object carrying the envelope marker is read as a merged token;
+/// Only a framed JSON object is read as a merged token;
 /// anything else is a local marker, so a bucket that turns `list_through` off
 /// keeps paginating with the tokens it handed out. A token that *is* an
 /// envelope but was tampered with (unknown version, unknown field, truncated
 /// JSON) is an error, never a silent fallback.
 pub fn decode_continuation_token(decoded: &str) -> Result<ListThroughCursor, ListThroughTokenError> {
-    if !decoded.starts_with('{') {
-        return Ok(ListThroughCursor::Local(decoded.to_string()));
-    }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(decoded) else {
-        // Not JSON at all: an object key may legitimately start with '{'.
+    let Some(payload) = decoded.strip_prefix(LIST_THROUGH_TOKEN_PREFIX) else {
         return Ok(ListThroughCursor::Local(decoded.to_string()));
     };
+    let value = serde_json::from_str::<serde_json::Value>(payload).map_err(|_| ListThroughTokenError::Malformed)?;
     if value.get("t").and_then(serde_json::Value::as_str) != Some(LIST_THROUGH_TOKEN_TAG) {
-        return Ok(ListThroughCursor::Local(decoded.to_string()));
+        return Err(ListThroughTokenError::Malformed);
     }
     match value.get("v").and_then(serde_json::Value::as_u64) {
-        Some(version) if version == u64::from(LIST_THROUGH_TOKEN_VERSION) => {}
+        Some(version) if version == u64::from(LIST_THROUGH_TOKEN_VERSION) => {
+            // v1 readers reject this field even when it is null or zero.
+            if value.get("no_progress").is_some() {
+                return Err(ListThroughTokenError::Malformed);
+            }
+        }
+        Some(version) if version == u64::from(LIST_THROUGH_PROGRESS_TOKEN_VERSION) => {
+            if !value
+                .get("no_progress")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|count| (1..u64::from(MAX_LIST_NO_PROGRESS_PAGES)).contains(&count))
+            {
+                return Err(ListThroughTokenError::Malformed);
+            }
+        }
         Some(version) => return Err(ListThroughTokenError::UnsupportedVersion(version.min(u64::from(u32::MAX)) as u32)),
         None => return Err(ListThroughTokenError::Malformed),
     }
@@ -288,6 +311,8 @@ pub enum ListPageError {
     Empty,
     #[error("truncated listing repeats a continuation token")]
     Repeated,
+    #[error("listing exhausted its consecutive no-progress page budget")]
+    NoProgress(MergeSide),
 }
 
 pub(crate) fn validate_list_page(is_truncated: bool, token: Option<&str>, next_token: Option<&str>) -> Result<(), ListPageError> {
@@ -352,6 +377,7 @@ pub struct MergeOutcome {
 #[derive(Debug)]
 pub struct ListThroughMerger {
     max_keys: usize,
+    no_progress: Option<u8>,
     last_key: Option<String>,
     local: SideState,
     source: SideState,
@@ -371,6 +397,7 @@ impl ListThroughMerger {
         };
         Self {
             max_keys,
+            no_progress: token.and_then(|token| token.no_progress),
             last_key,
             local,
             source,
@@ -436,13 +463,18 @@ impl ListThroughMerger {
         Ok(())
     }
 
-    pub fn finish(self) -> MergeOutcome {
+    /// `issue_progress_tokens` allows a v1 chain to start carrying a budget.
+    /// An existing v2 budget is always enforced, including on reader-only nodes.
+    /// Borrowing lets a source failure re-merge the fetched local buffers.
+    pub fn finish(&self, issue_progress_tokens: bool) -> Result<MergeOutcome, ListPageError> {
         let Self {
             max_keys,
+            no_progress,
             last_key,
             local,
             source,
         } = self;
+        let max_keys = *max_keys;
 
         // A side with more pages behind it can only be trusted up to the last
         // key it handed over: past that horizon the other side's entries could
@@ -508,12 +540,44 @@ impl ListThroughMerger {
         let source_left = !source.disabled && (!source_cursor.done || consumed_source < source.entries.len());
         let is_truncated = local_left || source_left;
 
-        let last_key = consumed_key.or(last_key);
-        MergeOutcome {
+        let reached_eof = (!local.start.done && local_cursor.done) || (!source.start.done && source_cursor.done);
+        let next_no_progress = if !is_truncated || !picks.is_empty() || reached_eof {
+            None
+        } else if max_keys == 0 {
+            // A zero-sized request cannot consume entries. Preserve an existing
+            // budget without spending it or starting a new one.
+            *no_progress
+        } else if issue_progress_tokens || no_progress.is_some() {
+            let count = no_progress.unwrap_or(0).saturating_add(1);
+            if count >= MAX_LIST_NO_PROGRESS_PAGES {
+                // An empty truncated side closes the merge horizon. Local
+                // failure takes precedence; disabling the source cannot fix it.
+                let side = if local.more && local.entries.is_empty() {
+                    MergeSide::Local
+                } else if !source.disabled && source.more && source.entries.is_empty() {
+                    MergeSide::Source
+                } else {
+                    MergeSide::Local
+                };
+                return Err(ListPageError::NoProgress(side));
+            }
+            Some(count)
+        } else {
+            None
+        };
+        let last_key = consumed_key.or_else(|| last_key.clone());
+        Ok(MergeOutcome {
             picks,
             is_truncated,
-            next_token: is_truncated.then(|| ListThroughToken::new(local_cursor, source_cursor, last_key)),
-        }
+            next_token: is_truncated.then(|| {
+                let mut token = ListThroughToken::new(local_cursor, source_cursor, last_key);
+                if let Some(count) = next_no_progress {
+                    token.v = LIST_THROUGH_PROGRESS_TOKEN_VERSION;
+                    token.no_progress = Some(count);
+                }
+                token
+            }),
+        })
     }
 }
 
@@ -641,7 +705,7 @@ mod tests {
                     .push_page(fetch.side, kept, truncated, next)
                     .expect("reference provider pages must advance");
             }
-            let outcome = merger.finish();
+            let outcome = merger.finish(false).expect("valid merge outcome");
             assert_eq!(outcome.is_truncated, outcome.next_token.is_some());
             if outcome.is_truncated {
                 assert_ne!(outcome.next_token, token, "every truncated merged page must make progress");
@@ -724,7 +788,7 @@ mod tests {
             .push_page(MergeSide::Local, vec![ListEntryKey::object("a")], false, None)
             .expect("local EOF is valid");
         assert_eq!(merger.next_fetch(), None);
-        let outcome = merger.finish();
+        let outcome = merger.finish(false).expect("valid merge outcome");
         assert_eq!(outcome.picks.len(), 1);
         assert!(!outcome.is_truncated);
         assert!(outcome.next_token.is_none());
@@ -740,6 +804,7 @@ mod tests {
             source: Some("source-1".to_string()),
             source_done: false,
             last_key: Some("a".to_string()),
+            no_progress: None,
         };
         let mut merger = ListThroughMerger::new(1, Some(&resume));
         merger.disable_source();
@@ -751,7 +816,7 @@ mod tests {
                 Some("local-2".to_string()),
             )
             .expect("local cursor advances");
-        let outcome = merger.finish();
+        let outcome = merger.finish(false).expect("valid merge outcome");
         assert!(outcome.is_truncated);
         let token = outcome.next_token.expect("truncated page carries a token");
         assert_eq!(token.source.as_deref(), Some("source-1"), "the source cursor must not move");
@@ -830,7 +895,7 @@ mod tests {
                 .expect("opaque cursor advances regardless of sort order");
         }
         assert!(merger.next_fetch().is_none(), "two source fetches exhaust the request budget");
-        let outcome = merger.finish();
+        let outcome = merger.finish(false).expect("valid merge outcome");
         assert!(outcome.picks.is_empty());
         assert!(outcome.is_truncated);
         let token = outcome.next_token.expect("empty progressing page has a cursor");
@@ -840,7 +905,7 @@ mod tests {
         merger
             .push_page(MergeSide::Source, vec![ListEntryKey::object("result")], false, None)
             .expect("source EOF");
-        let outcome = merger.finish();
+        let outcome = merger.finish(false).expect("valid merge outcome");
         assert_eq!(
             outcome.picks,
             vec![MergePick {
@@ -887,7 +952,7 @@ mod tests {
             Err(ListPageError::Repeated)
         );
         merger.disable_source();
-        let outcome = merger.finish();
+        let outcome = merger.finish(false).expect("valid merge outcome");
         assert_eq!(
             outcome.picks,
             vec![MergePick {
@@ -979,21 +1044,279 @@ mod tests {
         let encoded = token.encode();
         assert_eq!(decode_continuation_token(&encoded), Ok(ListThroughCursor::Merged(Box::new(token))));
 
-        let bumped = encoded.replace("\"v\":1", "\"v\":2");
-        assert_eq!(decode_continuation_token(&bumped), Err(ListThroughTokenError::UnsupportedVersion(2)));
+        let bumped = encoded.replace("\"v\":1", "\"v\":3");
+        assert_eq!(decode_continuation_token(&bumped), Err(ListThroughTokenError::UnsupportedVersion(3)));
 
         let extra = encoded.replace("{", "{\"x\":1,");
         assert_eq!(decode_continuation_token(&extra), Err(ListThroughTokenError::Malformed));
 
         let truncated = &encoded[..encoded.len() - 3];
-        assert_eq!(decode_continuation_token(truncated), Ok(ListThroughCursor::Local(truncated.to_string())));
+        assert_eq!(decode_continuation_token(truncated), Err(ListThroughTokenError::Malformed));
 
-        let no_version = "{\"t\":\"odm-list\"}";
+        let no_version = "\0odm-list:{\"t\":\"odm-list\"}";
         assert_eq!(decode_continuation_token(no_version), Err(ListThroughTokenError::Malformed));
+    }
+
+    fn progress_token(count: Option<u8>, local_done: bool, source_done: bool) -> ListThroughToken {
+        let mut token = ListThroughToken::new(
+            SideCursor {
+                token: None,
+                done: local_done,
+            },
+            SideCursor {
+                token: Some("A".into()),
+                done: source_done,
+            },
+            Some("last-key".into()),
+        );
+        if let Some(count) = count {
+            token.v = LIST_THROUGH_PROGRESS_TOKEN_VERSION;
+            token.no_progress = Some(count);
+        }
+        token
+    }
+
+    fn push_empty_pages(merger: &mut ListThroughMerger, side: MergeSide) {
+        for _ in 0..MAX_LIST_FETCHES_PER_SIDE {
+            let fetch = merger.next_fetch().expect("empty truncated side must be fetched");
+            assert_eq!(fetch.side, side);
+            let next = format!("{}:next", fetch.token.unwrap_or_default());
+            merger
+                .push_page(side, vec![], true, Some(next))
+                .expect("opaque cursor advances");
+        }
+    }
+
+    #[test]
+    fn progress_tokens_preserve_v1_bytes_and_validate_v2_counts() {
+        let token = progress_token(None, true, false);
+        assert_eq!(
+            token.encode(),
+            r#"{"t":"odm-list","v":1,"local":null,"local_done":true,"source":"A","source_done":false,"last_key":"last-key"}"#
+        );
+        for count in 1..MAX_LIST_NO_PROGRESS_PAGES {
+            let token = progress_token(Some(count), true, false);
+            assert_eq!(decode_continuation_token(&token.encode()), Ok(ListThroughCursor::Merged(Box::new(token))));
+        }
+        for version in [1, 2] {
+            for value in ["null", "0", "16", "-1", "1.5", "256", "18446744073709551616", "\"1\""] {
+                let encoded = format!(r#"{{"t":"odm-list","v":{version},"no_progress":{value}}}"#);
+                assert_eq!(decode_continuation_token(&encoded), Err(ListThroughTokenError::Malformed), "{encoded}");
+            }
+        }
+        for encoded in [
+            r#"{"t":"odm-list","v":1,"no_progress":1}"#,
+            r#"{"t":"odm-list","v":2}"#,
+            r#"{"t":"odm-list","v":2,"no_progress":1,"extra":true}"#,
+        ] {
+            assert_eq!(decode_continuation_token(encoded), Err(ListThroughTokenError::Malformed), "{encoded}");
+        }
+    }
+
+    #[test]
+    fn reader_only_nodes_do_not_start_a_budget_but_mixed_readers_preserve_one() {
+        let mut token = progress_token(None, true, false);
+        for _ in 0..MAX_LIST_NO_PROGRESS_PAGES {
+            let mut merger = ListThroughMerger::new(2, Some(&token));
+            push_empty_pages(&mut merger, MergeSide::Source);
+            token = merger
+                .finish(false)
+                .expect("reader-only v1 behavior")
+                .next_token
+                .expect("truncated cursor");
+            assert_eq!(token.v, 1);
+            assert_eq!(token.no_progress, None);
+        }
+        for count in 1..=MAX_LIST_NO_PROGRESS_PAGES {
+            let mut merger = ListThroughMerger::new(2, Some(&token));
+            push_empty_pages(&mut merger, MergeSide::Source);
+            assert!(merger.next_fetch().is_none(), "the per-request two-fetch limit stays intact");
+            let outcome = merger.finish(count % 2 == 1);
+            if count == MAX_LIST_NO_PROGRESS_PAGES {
+                assert_eq!(outcome, Err(ListPageError::NoProgress(MergeSide::Source)));
+                break;
+            }
+            token = outcome.expect("budget not exhausted").next_token.expect("truncated cursor");
+            assert_eq!(token.no_progress, Some(count));
+            let ListThroughCursor::Merged(decoded) = decode_continuation_token(&token.encode()).expect("round-trip v2") else {
+                panic!("merged cursor expected");
+            };
+            token = *decoded;
+        }
+    }
+
+    #[test]
+    fn objects_and_common_prefixes_reset_a_budget_at_the_boundary() {
+        for entry in [ListEntryKey::object("result"), ListEntryKey::prefix("result/")] {
+            for issue_tokens in [false, true] {
+                let resume = progress_token(Some(MAX_LIST_NO_PROGRESS_PAGES - 1), true, false);
+                let mut merger = ListThroughMerger::new(2, Some(&resume));
+                merger
+                    .push_page(MergeSide::Source, vec![], true, Some("B".into()))
+                    .expect("empty advancing page");
+                merger
+                    .push_page(MergeSide::Source, vec![entry.clone()], true, Some("C".into()))
+                    .expect("real progress");
+                let outcome = merger
+                    .finish(issue_tokens)
+                    .expect("real progress does not exhaust the budget");
+                assert_eq!(
+                    outcome.picks,
+                    vec![MergePick {
+                        side: MergeSide::Source,
+                        index: 0
+                    }]
+                );
+                let next = outcome.next_token.expect("source remains truncated");
+                assert_eq!(next.last_key.as_deref(), Some(entry.name.as_str()));
+                assert_eq!(next.v, 1);
+                assert_eq!(next.no_progress, None);
+                assert!(!next.encode().contains("no_progress"));
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_new_eof_transition_resets_the_empty_page_budget() {
+        for finished_side in [MergeSide::Local, MergeSide::Source] {
+            let resume = progress_token(Some(MAX_LIST_NO_PROGRESS_PAGES - 1), false, false);
+            let mut merger = ListThroughMerger::new(2, Some(&resume));
+            if finished_side == MergeSide::Local {
+                merger
+                    .push_page(MergeSide::Local, vec![], false, None)
+                    .expect("new local EOF");
+                push_empty_pages(&mut merger, MergeSide::Source);
+            } else {
+                push_empty_pages(&mut merger, MergeSide::Local);
+                merger
+                    .push_page(MergeSide::Source, vec![], false, None)
+                    .expect("new source EOF");
+            }
+            let next = merger
+                .finish(false)
+                .expect("new EOF is progress")
+                .next_token
+                .expect("other side truncated");
+            assert_eq!(next.no_progress, None);
+            assert_eq!(next.v, 1);
+            assert_eq!(next.local_done, finished_side == MergeSide::Local);
+            assert_eq!(next.source_done, finished_side == MergeSide::Source);
+            let mut merger = ListThroughMerger::new(2, Some(&next));
+            let remaining = if finished_side == MergeSide::Local {
+                MergeSide::Source
+            } else {
+                MergeSide::Local
+            };
+            push_empty_pages(&mut merger, remaining);
+            let next = merger
+                .finish(true)
+                .expect("a new budget starts")
+                .next_token
+                .expect("truncated");
+            assert_eq!(next.no_progress, Some(1), "an already-done side cannot reset every page");
+        }
+        let resume = progress_token(Some(MAX_LIST_NO_PROGRESS_PAGES - 1), true, false);
+        let mut merger = ListThroughMerger::new(2, Some(&resume));
+        merger.push_page(MergeSide::Source, vec![], false, None).expect("final EOF");
+        let outcome = merger.finish(false).expect("EOF succeeds at the budget boundary");
+        assert!(!outcome.is_truncated);
+        assert!(outcome.next_token.is_none());
+    }
+
+    #[test]
+    fn filtered_duplicates_cannot_reset_the_no_progress_budget() {
+        let resume = progress_token(Some(MAX_LIST_NO_PROGRESS_PAGES - 1), true, false);
+        let mut merger = ListThroughMerger::new(2, Some(&resume));
+        for next in ["B", "C"] {
+            let entries = [ListEntryKey::object("last-key"), ListEntryKey::object("earlier")]
+                .into_iter()
+                .filter(|entry| merger.accepts(&entry.name))
+                .collect::<Vec<_>>();
+            assert!(entries.is_empty(), "both provider entries were already consumed");
+            merger
+                .push_page(MergeSide::Source, entries, true, Some(next.into()))
+                .expect("advancing cursor");
+        }
+        assert_eq!(merger.finish(false), Err(ListPageError::NoProgress(MergeSide::Source)));
+    }
+
+    #[test]
+    fn no_progress_is_attributed_to_local_when_source_cannot_unblock_it() {
+        for source_mode in ["disabled", "done", "empty", "data"] {
+            let resume = progress_token(Some(MAX_LIST_NO_PROGRESS_PAGES - 1), false, source_mode == "done");
+            let mut merger = ListThroughMerger::new(2, Some(&resume));
+            if source_mode == "disabled" {
+                merger.disable_source();
+            }
+            push_empty_pages(&mut merger, MergeSide::Local);
+            match source_mode {
+                "empty" => push_empty_pages(&mut merger, MergeSide::Source),
+                "data" => merger
+                    .push_page(MergeSide::Source, vec![ListEntryKey::object("source")], false, None)
+                    .expect("source data"),
+                _ => {}
+            }
+            assert_eq!(merger.finish(false), Err(ListPageError::NoProgress(MergeSide::Local)), "{source_mode}");
+        }
+    }
+
+    #[test]
+    fn source_budget_failure_remerges_local_objects_and_prefixes_without_refetching() {
+        let resume = progress_token(Some(MAX_LIST_NO_PROGRESS_PAGES - 1), false, false);
+        let mut merger = ListThroughMerger::new(2, Some(&resume));
+        merger
+            .push_page(MergeSide::Local, vec![ListEntryKey::object("local")], true, Some("L1".into()))
+            .expect("local object");
+        merger
+            .push_page(MergeSide::Local, vec![ListEntryKey::prefix("prefix/")], true, Some("L2".into()))
+            .expect("local prefix");
+        push_empty_pages(&mut merger, MergeSide::Source);
+        assert_eq!(merger.finish(false), Err(ListPageError::NoProgress(MergeSide::Source)));
+        merger.disable_source();
+        assert!(merger.next_fetch().is_none(), "fallback does not perform another fetch");
+        let outcome = merger.finish(false).expect("local data makes progress");
+        assert_eq!(
+            outcome.picks,
+            vec![
+                MergePick {
+                    side: MergeSide::Local,
+                    index: 0
+                },
+                MergePick {
+                    side: MergeSide::Local,
+                    index: 1
+                }
+            ]
+        );
+        let token = outcome.next_token.expect("remaining local page");
+        assert_eq!(token.local.as_deref(), Some("L2"));
+        assert_eq!(token.source.as_deref(), Some("A"));
+        assert_eq!(token.last_key.as_deref(), Some("prefix/"));
+        assert_eq!(token.no_progress, None);
+        assert_eq!(token.v, 1);
+    }
+
+    #[test]
+    fn a_zero_sized_merge_preserves_an_existing_budget() {
+        let resume = progress_token(Some(MAX_LIST_NO_PROGRESS_PAGES - 1), true, false);
+        let mut merger = ListThroughMerger::new(0, Some(&resume));
+        merger
+            .push_page(MergeSide::Source, vec![ListEntryKey::object("result")], true, Some("B".into()))
+            .expect("source page");
+        let outcome = merger.finish(false).expect("a zero-sized request cannot consume entries");
+        assert!(outcome.picks.is_empty());
+        assert_eq!(outcome.next_token.expect("unconsumed source").no_progress, resume.no_progress);
     }
 
     #[test]
     fn a_plain_local_marker_stays_local() {
+        for marker in [
+            r#"{"t":"odm-list","v":1}"#,
+            r#"{"t":"odm-list","v":2,"local_done":true}"#,
+            r#"{"t":"odm-list"}"#,
+        ] {
+            assert_eq!(decode_continuation_token(marker), Ok(ListThroughCursor::Local(marker.to_string())));
+        }
         assert_eq!(
             decode_continuation_token("photos/2024/01.jpg"),
             Ok(ListThroughCursor::Local("photos/2024/01.jpg".to_string()))

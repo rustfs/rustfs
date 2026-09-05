@@ -292,6 +292,7 @@ pub(crate) mod on_demand_migration {
     pub(crate) type PathStyle = super::ecstore_bucket::on_demand_migration::PathStyle;
     pub(crate) type Provider = super::ecstore_bucket::on_demand_migration::Provider;
     pub(crate) type ValidationContext<'a> = super::ecstore_bucket::on_demand_migration::ValidationContext<'a>;
+    pub(crate) use super::ecstore_bucket::on_demand_migration::source_backend_spec;
 
     pub(crate) mod backfill {
         pub(crate) type BackfillCheckpoint = super::super::ecstore_bucket::on_demand_migration::backfill::BackfillCheckpoint;
