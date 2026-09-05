@@ -49,17 +49,16 @@ on:
         type: boolean
         default: true
   repository_dispatch:
-    # Chain entry: dispatched by rustfs-functional-chain.yml (runs on its own
-    # pf-testing runner, in parallel with the shared-VM chain).
+    # Chain handoff: dispatched when the replication suite finishes.
     types: [rustfs-chain-performance]
 
 permissions:
   contents: read
 
-# Dedicated pf-testing runner/environment: own concurrency group so perf runs
-# never block (or are blocked by) the pool-expansion / heal tests.
+# The default performance nodes overlap the other suites' remote VMs, even
+# though the runner differs. Hold the shared lock through cleanup as well.
 concurrency:
-  group: rustfs-performance-test
+  group: rustfs-shared-functional-tests
   cancel-in-progress: false
 
 defaults:
