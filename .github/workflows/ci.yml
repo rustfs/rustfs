@@ -277,6 +277,12 @@ jobs:
             --status-level all --final-status-level all \
             2>&1 | tee artifacts/test-and-lint/nextest.log
           status=${PIPESTATUS[0]}
+          if [[ "${status}" -eq 0 ]]; then
+            cargo nextest list --profile ci --all --exclude e2e_test --message-format json \
+              > artifacts/test-and-lint/core-test-listing.json \
+              && python3 scripts/check_test_wiring.py --check-core artifacts/test-and-lint/core-test-listing.json \
+              && test -s target/nextest/ci/junit.xml || status=$?
+          fi
           {
             echo "command=cargo nextest run --profile ci --all --exclude e2e_test"
             echo "exit_status=${status}"
