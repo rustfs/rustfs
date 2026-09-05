@@ -91,11 +91,17 @@ impl AzureSourceBackend {
         ca_cert_pem: Option<&str>,
     ) -> Result<Self, RemoteS3ClientError> {
         let credential = match &spec.auth {
-            AzureAuth::SharedKey(key) => Credential::SharedKey(
-                base64_simd::STANDARD
+            AzureAuth::SharedKey(key) => {
+                let key = base64_simd::STANDARD
                     .decode_to_vec(key.as_bytes())
-                    .map_err(|_| RemoteS3ClientError::Credentials("azure account key is not base64"))?,
-            ),
+                    .map_err(|_| RemoteS3ClientError::Credentials("azure account key is not base64"))?;
+                // HMAC accepts a zero-length key, so an absent one would sign
+                // every request with nothing rather than fail here.
+                if key.is_empty() {
+                    return Err(RemoteS3ClientError::Credentials("azure account key is empty"));
+                }
+                Credential::SharedKey(key)
+            }
             AzureAuth::Sas(sas) => {
                 let pairs: Vec<(String, String)> = url::form_urlencoded::parse(sas.trim_start_matches('?').as_bytes())
                     .into_owned()
@@ -703,6 +709,44 @@ mod tests {
             ("x-ms-version-id", "2026-01-01T00:00:00.0000000Z".to_string()),
             ("x-ms-blob-type", "BlockBlob".to_string()),
         ]
+    }
+
+    #[test]
+    fn an_absent_or_malformed_account_key_is_refused_before_any_request() {
+        for key in ["", "not base64!"] {
+            let spec = AzureSourceSpec {
+                account: "acct".to_string(),
+                auth: AzureAuth::SharedKey(key.to_string()),
+            };
+            let built = AzureSourceBackend::new(
+                "https://acct.blob.core.windows.net",
+                "legacy",
+                &spec,
+                SourceTimeouts::default(),
+                false,
+                None,
+            );
+            assert!(
+                matches!(built, Err(RemoteS3ClientError::Credentials(_))),
+                "{key:?} must not build a client"
+            );
+        }
+        let spec = AzureSourceSpec {
+            account: "acct".to_string(),
+            auth: AzureAuth::Sas(String::new()),
+        };
+        assert!(
+            AzureSourceBackend::new(
+                "https://acct.blob.core.windows.net",
+                "legacy",
+                &spec,
+                SourceTimeouts::default(),
+                false,
+                None
+            )
+            .is_err(),
+            "an empty SAS token carries no parameters"
+        );
     }
 
     #[tokio::test]
