@@ -357,6 +357,41 @@ fn every_challenge_accept_vector_verifies_and_exposes_the_signed_fields() {
     );
 }
 
+#[test]
+fn malformed_top_level_signature_members_keep_the_frozen_reason() {
+    let vector = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let now = unix(field(&vector, "evaluationTime"));
+
+    for (member, malformed) in [
+        ("algorithm", serde_json::json!(1)),
+        ("keyId", serde_json::Value::Null),
+        ("value", serde_json::json!([])),
+    ] {
+        let mut document = vector["document"].clone();
+        document["signature"][member] = malformed;
+
+        let error = OfflineEnrollment::verify_challenge(&envelope(&document), now)
+            .expect_err(&format!("a malformed top-level signature {member} must be refused"));
+        assert_eq!(
+            error.reason(),
+            "SIGNATURE_MALFORMED",
+            "a malformed top-level signature {member} keeps the frozen classifier"
+        );
+    }
+}
+
+#[test]
+fn duplicate_top_level_signature_members_are_refused() {
+    let vector = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let document = String::from_utf8(envelope(&vector["document"])).expect("envelope is UTF-8 JSON");
+    let duplicate = document.replacen("\"algorithm\":\"ES256\"", "\"algorithm\":\"ES384\",\"algorithm\":\"ES256\"", 1);
+    assert_ne!(duplicate, document, "the accepted vector carries the expected algorithm");
+
+    let error = OfflineEnrollment::verify_challenge(duplicate.as_bytes(), unix(field(&vector, "evaluationTime")))
+        .expect_err("a duplicate top-level signature member must be refused");
+    assert_eq!(error.reason(), "DOCUMENT_MALFORMED");
+}
+
 #[cfg(feature = "offline-enrollment-e2e-root")]
 #[test]
 fn e2e_root_is_fixed_and_disjoint_from_the_hosted_root() {

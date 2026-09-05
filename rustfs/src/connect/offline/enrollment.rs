@@ -271,6 +271,21 @@ struct SignedDocument {
     signature: DocumentSignature,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnverifiedSignedDocument {
+    bytes: String,
+    signature: UnverifiedDocumentSignature,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnverifiedDocumentSignature {
+    algorithm: Option<serde_json::Value>,
+    key_id: Option<serde_json::Value>,
+    value: Option<serde_json::Value>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DocumentSignature {
@@ -364,7 +379,8 @@ impl OfflineEnrollment {
         now_unix: i64,
         root: EnrollmentRoot,
     ) -> Result<VerifiedChallenge, EnrollmentError> {
-        let envelope: SignedDocument = serde_json::from_slice(document).map_err(|_| EnrollmentError::MalformedDocument)?;
+        let envelope: UnverifiedSignedDocument =
+            serde_json::from_slice(document).map_err(|_| EnrollmentError::MalformedDocument)?;
 
         // Decode the exact transmitted octets before reading any routing field.
         // Standard padded base64 is canonical in this protocol: accepting an
@@ -385,7 +401,17 @@ impl OfflineEnrollment {
         // parsing any trust-link envelope or routing fields. Otherwise a
         // malformed link could mask a malformed artifact signature with
         // DOCUMENT_MALFORMED.
-        let signature = decode_signature(&envelope.signature)?;
+        let signature_member = |value: Option<serde_json::Value>| {
+            value
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .ok_or(EnrollmentError::SignatureMalformed)
+        };
+        let signature_document = DocumentSignature {
+            algorithm: signature_member(envelope.signature.algorithm)?,
+            key_id: signature_member(envelope.signature.key_id)?,
+            value: signature_member(envelope.signature.value)?,
+        };
+        let signature = decode_signature(&signature_document)?;
 
         let first = routing.trust_chain.first().ok_or(EnrollmentError::MalformedDocument)?;
         let first_bytes = first
@@ -413,7 +439,7 @@ impl OfflineEnrollment {
         // Step 6. The detached signature must name the same chained key whose
         // public key verifies it. A different well-formed key id is a signature
         // failure, not an opportunity to ignore the binding.
-        if envelope.signature.key_id != routing.connect_key_id || !verifies(&connect_key, TAG_CHALLENGE, &bytes, &signature) {
+        if signature_document.key_id != routing.connect_key_id || !verifies(&connect_key, TAG_CHALLENGE, &bytes, &signature) {
             return Err(EnrollmentError::SignatureInvalid);
         }
 
@@ -438,7 +464,7 @@ impl OfflineEnrollment {
             issued_at: challenge.issued_at,
             expires_at: challenge.expires_at,
             connect_key_id: challenge.connect_key_id,
-            challenge_proof: envelope.signature.value,
+            challenge_proof: signature_document.value,
         })
     }
 
