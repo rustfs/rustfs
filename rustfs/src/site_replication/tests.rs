@@ -622,40 +622,64 @@ fn test_iam_item_deletion_mark_entities_shapes() {
     assert!(iam_item_deletion_mark_entities(&user_create).is_empty());
 }
 
-/// Newest wins per entity, the map stays bounded by evicting the oldest
-/// mark, and the timestamps survive the state object as RFC 3339.
+/// Newest wins per entity, marks are pruned by age only (never by count: a
+/// count bound would drop a mark still inside the delivery window as soon as
+/// enough newer deletions happen), and the timestamps survive the state
+/// object as RFC 3339.
 #[test]
-fn test_record_iam_deletion_marks_newest_wins_and_stays_bounded() {
+fn test_record_iam_deletion_marks_newest_wins_and_expires_by_age_only() {
     let at = |seconds: i64| OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds);
+    let now = at(1_000_000);
     let mut state = SiteReplicationState::default();
     let alice = vec!["iam-user:alice".to_string()];
 
-    assert!(record_iam_deletion_marks(&mut state, &alice, at(20)));
+    assert!(record_iam_deletion_marks_at(&mut state, &alice, at(20), now));
     assert!(
-        !record_iam_deletion_marks(&mut state, &alice, at(10)),
+        !record_iam_deletion_marks_at(&mut state, &alice, at(10), now),
         "an older deletion does not move the mark"
     );
     assert!(
-        !record_iam_deletion_marks(&mut state, &alice, at(20)),
+        !record_iam_deletion_marks_at(&mut state, &alice, at(20), now),
         "a replayed deletion is not a change"
     );
     assert_eq!(iam_deletion_mark(&state, &alice), Some(at(20)));
-    assert!(record_iam_deletion_marks(&mut state, &alice, at(30)));
+    assert!(record_iam_deletion_marks_at(&mut state, &alice, at(30), now));
     assert_eq!(iam_deletion_mark(&state, &alice), Some(at(30)));
     assert_eq!(iam_deletion_mark(&state, &["iam-user:bob".to_string()]), None);
-    assert!(!record_iam_deletion_marks(&mut state, &[], at(40)));
+    assert!(!record_iam_deletion_marks_at(&mut state, &[], at(40), now));
 
-    // Fill past the bound with marks older than alice's; the oldest go first.
-    let members: Vec<String> = (0..SITE_REPLICATION_IAM_DELETION_MARK_LIMIT)
-        .map(|index| format!("group-member:devs:user-{index:04}"))
-        .collect();
+    // Many newer deletions never evict an older mark that is still within the retention.
+    let members: Vec<String> = (0..4096).map(|index| format!("group-member:devs:user-{index:04}")).collect();
     for (index, member) in members.iter().enumerate() {
-        record_iam_deletion_marks(&mut state, std::slice::from_ref(member), at(index as i64 - 2000));
+        record_iam_deletion_marks_at(&mut state, std::slice::from_ref(member), at(100 + index as i64), now);
     }
-    assert_eq!(state.iam_deletion_marks.len(), SITE_REPLICATION_IAM_DELETION_MARK_LIMIT);
-    assert_eq!(iam_deletion_mark(&state, &alice), Some(at(30)), "the newest mark survives eviction");
-    assert_eq!(iam_deletion_mark(&state, &members[..1]), None, "the oldest mark is evicted first");
-    assert_eq!(iam_deletion_mark(&state, &members[1..2]), Some(at(-1999)));
+    assert_eq!(state.iam_deletion_marks.len(), members.len() + 1);
+    assert_eq!(iam_deletion_mark(&state, &alice), Some(at(30)), "no count-based eviction");
+
+    // Marks older than the retention are pruned, on the pass that records a
+    // newer one and on a pass that changes nothing else; younger ones stay.
+    let later = at(100) + SITE_REPLICATION_IAM_DELETION_MARK_RETENTION;
+    assert!(
+        record_iam_deletion_marks_at(&mut state, &["iam-user:carol".to_string()], at(200_000), later),
+        "pruning alone is a change"
+    );
+    assert_eq!(iam_deletion_mark(&state, &alice), None, "alice's mark aged out");
+    assert_eq!(
+        iam_deletion_mark(&state, &members[..1]),
+        Some(at(100)),
+        "a mark exactly at the retention edge stays, and so do the younger ones"
+    );
+    assert_eq!(state.iam_deletion_marks.len(), members.len() + 1);
+    assert_eq!(iam_deletion_mark(&state, &["iam-user:carol".to_string()]), Some(at(200_000)));
+    let mut state = SiteReplicationState::default();
+    record_iam_deletion_marks_at(&mut state, &alice, at(30), now);
+    let past_edge = at(30) + SITE_REPLICATION_IAM_DELETION_MARK_RETENTION + time::Duration::seconds(1);
+    assert!(
+        record_iam_deletion_marks_at(&mut state, &[], at(0), past_edge),
+        "a pass that only prunes reports the change"
+    );
+    assert_eq!(iam_deletion_mark(&state, &alice), None);
+    record_iam_deletion_marks_at(&mut state, &alice, at(30), now);
 
     let json = serde_json::to_value(&state).expect("serialize state");
     assert_eq!(json["iam_deletion_marks"]["iam-user:alice"], serde_json::json!("1970-01-01T00:00:30Z"));

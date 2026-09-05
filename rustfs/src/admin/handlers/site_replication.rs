@@ -87,7 +87,7 @@ use std::sync::{LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use url::Url;
 use url::form_urlencoded;
 use uuid::Uuid;
@@ -1478,6 +1478,7 @@ async fn set_site_replicator_service_account_secret(parent_user: &str, secret_ke
                     expiration: None,
                     allow_site_replicator_account: true,
                     claims: None,
+                    status: None,
                 },
             )
             .await
@@ -1720,6 +1721,7 @@ async fn reconcile_site_replicator_service_account() -> S3Result<()> {
                         expiration: None,
                         allow_site_replicator_account: true,
                         claims: None,
+                        status: None,
                     },
                 )
                 .await
@@ -5620,10 +5622,11 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
     };
 
     // Persist the SOURCE `updated_at` as the stored `*_config_updated_at`
-    // stamp (backlog#2292). The staleness gate above compares the next item's
-    // source time against that stamp, so stamping the local apply time would
-    // reject a newer source edit that was merely delivered after this write
-    // (two quick edits under delivery delay, or a peer clock ahead of ours).
+    // stamp, on writes and on deletes alike (backlog#2292). The staleness
+    // gate above compares the next item's source time against that stamp, so
+    // stamping the local apply time would reject a newer source edit that was
+    // merely delivered after this write or delete (two quick edits under
+    // delivery delay, or a peer clock ahead of ours).
     // Items without a source time keep the local stamp; lc-config keeps it
     // too: its staleness axis is the in-document `expiry_updated_at` the merge
     // above records, and the whole-config time is only its deletion / legacy
@@ -5684,9 +5687,23 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
                     .await
                     .map_err(ApiError::from)?;
             } else {
-                metadata_sys::delete_if_incarnation(&item.bucket, config_file, expected_incarnation_id)
-                    .await
-                    .map_err(ApiError::from)?;
+                // A delete is stamped like a write: the source time survives
+                // as the config's `*_config_updated_at`, so a newer source
+                // re-create delivered later is not judged stale against the
+                // local time this delete landed (backlog#2292).
+                match source_updated_at {
+                    Some(source_updated_at) => {
+                        metadata_sys::delete_if_incarnation_at(
+                            &item.bucket,
+                            config_file,
+                            expected_incarnation_id,
+                            source_updated_at,
+                        )
+                        .await
+                    }
+                    None => metadata_sys::delete_if_incarnation(&item.bucket, config_file, expected_incarnation_id).await,
+                }
+                .map_err(ApiError::from)?;
             }
         }
     }
@@ -5801,26 +5818,18 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
     let Some(iam_sys) = current_iam_handle() else {
         return Err(s3_error!(InvalidRequest, "iam not init"));
     };
-    let incoming_updated_at = item.updated_at;
-    let deletion_mark_entities = iam_item_deletion_mark_entities(&item);
-
-    let verdict = match item.r#type.as_str() {
-        "policy" => apply_iam_policy_item(&iam_sys, &item.name, item.policy, incoming_updated_at).await?,
-        "policy-mapping" => apply_iam_policy_mapping_item(&iam_sys, item.policy_mapping, incoming_updated_at).await?,
-        "group-info" => apply_iam_group_info_item(&iam_sys, item.group_info, incoming_updated_at).await?,
+    match item.r#type.as_str() {
         // MinIO madmin-go sends `SRIAMItemSTSAcc = "sts-account"`. The legacy alias
         // `sts-credential` (emitted by older RustFS releases) stays accepted permanently
         // so mixed-version RustFS sites keep replicating STS credentials during rolling
         // upgrades; it is a compatibility layer, not temporary code.
+        //
+        // STS credentials carry no source revision and leave no deletion mark,
+        // so they stay outside the ordered transaction below.
         SR_IAM_ITEM_STS_ACC | SR_IAM_ITEM_STS_ACC_LEGACY => {
-            apply_iam_sts_account_item(&iam_sys, item.sts_credential).await?;
-            IamItemVerdict::Apply
+            return apply_iam_sts_account_item(&iam_sys, item.sts_credential).await;
         }
-        "iam-user" => apply_iam_user_item(&iam_sys, item.iam_user, incoming_updated_at).await?,
-        "service-account" => {
-            apply_iam_service_account_item(&iam_sys, item.svc_acc_change, incoming_updated_at).await?;
-            IamItemVerdict::Apply
-        }
+        "policy" | "policy-mapping" | "group-info" | "iam-user" | "service-account" => {}
         _ => {
             return Err(s3_error!(
                 NotImplemented,
@@ -5828,55 +5837,64 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
                 item.r#type
             ));
         }
-    };
-    // A committed deletion leaves no record for the gate to judge later items
-    // against, so its source timestamp is kept as a mark (backlog#2291). The
-    // mark is part of applying the deletion: failing here makes the sender
-    // retry the (idempotent) deletion rather than leave a revoke that a stale
-    // grant could still undo.
-    if verdict == IamItemVerdict::Apply
-        && let Some(deleted_at) = incoming_updated_at.filter(|_| !deletion_mark_entities.is_empty())
-    {
-        commit_iam_deletion_marks(deletion_mark_entities, deleted_at).await?;
     }
-    Ok(())
+
+    // One transaction per item (backlog#2291). The staleness verdict, the IAM
+    // write and the deletion-mark commit run under the distributed
+    // state-object lock, so an older grant and a newer revoke delivered
+    // concurrently — to this node or to a sibling node of this site — are
+    // applied one after the other, each judged against what the other left
+    // behind. The write stamps the record with the item's source
+    // `updated_at`, which is what the next item is judged against: stamping
+    // the local apply time would reject a newer source edit that was merely
+    // delivered later. A committed deletion leaves no record, so its source
+    // timestamp is kept as a mark in the same commit; failing to persist the
+    // mark fails the item, and the sender retries the (idempotent) deletion
+    // rather than leaving a revoke that a stale grant could still undo.
+    with_site_replication_state_transaction(move |mut state| async move {
+        let incoming_updated_at = item.updated_at;
+        let deletion_mark_entities = iam_item_deletion_mark_entities(&item);
+        let verdict = match item.r#type.as_str() {
+            "policy" => apply_iam_policy_item(&iam_sys, &state, &item.name, item.policy, incoming_updated_at).await?,
+            "policy-mapping" => apply_iam_policy_mapping_item(&iam_sys, &state, item.policy_mapping, incoming_updated_at).await?,
+            "group-info" => apply_iam_group_info_item(&iam_sys, &state, item.group_info, incoming_updated_at).await?,
+            "iam-user" => apply_iam_user_item(&iam_sys, &state, item.iam_user, incoming_updated_at).await?,
+            "service-account" => {
+                apply_iam_service_account_item(&iam_sys, &state, item.svc_acc_change, incoming_updated_at).await?
+            }
+            _ => unreachable!("unsupported IAM item types are rejected before the transaction"),
+        };
+        let changed = verdict == IamItemVerdict::Apply
+            && incoming_updated_at
+                .filter(|_| !deletion_mark_entities.is_empty())
+                .is_some_and(|deleted_at| record_iam_deletion_marks(&mut state, &deletion_mark_entities, deleted_at));
+        Ok(((), changed.then_some(state)))
+    })
+    .await
 }
 
-/// The deletion mark consulted by the staleness gate when the targeted record
-/// is absent: the newest recorded deletion of any of `entities`. An
-/// unreadable state falls back to today's behaviour (no mark, the item is
-/// applied) — the gate must not turn a state-object outage into rejected
-/// IAM replication.
-async fn local_iam_deletion_mark(entities: &[String]) -> Option<OffsetDateTime> {
-    match load_site_replication_state().await {
-        Ok(state) => iam_deletion_mark(&state, entities),
-        Err(err) => {
-            debug!(
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                result = "iam_deletion_mark_unavailable",
-                error = ?err,
-                "site replication state unreadable; applying IAM item without a deletion mark"
-            );
-            None
-        }
-    }
+/// The stamp a replicated write persists on the record: the item's source
+/// `updated_at`, or the local clock for an item from a peer that predates
+/// timestamps (those keep last-writer-wins, see [`judge_iam_item_staleness`]).
+fn replicated_write_stamp(incoming_updated_at: Option<OffsetDateTime>) -> OffsetDateTime {
+    incoming_updated_at.unwrap_or_else(OffsetDateTime::now_utc)
 }
 
 async fn apply_iam_policy_item(
     iam_sys: &IamSys<ObjectStore>,
+    marks: &SiteReplicationState,
     name: &str,
     policy: Option<Value>,
     incoming_updated_at: Option<OffsetDateTime>,
 ) -> S3Result<IamItemVerdict> {
-    // Judge the item against the local document's own timestamp so a delayed
-    // older body (or delete) cannot overwrite a newer edit; once the document
-    // is deleted, its deletion mark stands in for it (backlog#2291).
+    // Judge the item against the local document's own timestamp — the source
+    // time of the edit that wrote it — so a delayed older body (or delete)
+    // cannot overwrite a newer edit; once the document is deleted, its
+    // deletion mark stands in for it (backlog#2291).
     let local_updated_at = match iam_sys.get_policy_doc(name).await {
         Ok(doc) => Some(doc.update_date.unwrap_or(OffsetDateTime::UNIX_EPOCH)),
         Err(err) if rustfs_iam::error::is_err_no_such_policy(&err) => {
-            local_iam_deletion_mark(&[iam_policy_deletion_mark_entity(name)]).await
+            iam_deletion_mark(marks, &[iam_policy_deletion_mark_entity(name)])
         }
         Err(err) => return Err(ApiError::from(err).into()),
     };
@@ -5886,7 +5904,10 @@ async fn apply_iam_policy_item(
     if let Some(policy) = policy {
         let policy: Policy =
             serde_json::from_value(policy).map_err(|e| s3_error!(InvalidRequest, "invalid policy body: {}", e))?;
-        iam_sys.set_policy(name, policy).await.map_err(ApiError::from)?;
+        iam_sys
+            .set_policy_at(name, policy, replicated_write_stamp(incoming_updated_at))
+            .await
+            .map_err(ApiError::from)?;
     } else {
         // Idempotent delete: the retry drain replays recorded deletions, and
         // an entity already absent here IS the converged outcome — erroring
@@ -5902,6 +5923,7 @@ async fn apply_iam_policy_item(
 
 async fn apply_iam_policy_mapping_item(
     iam_sys: &IamSys<ObjectStore>,
+    marks: &SiteReplicationState,
     policy_mapping: Option<SRPolicyMapping>,
     incoming_updated_at: Option<OffsetDateTime>,
 ) -> S3Result<IamItemVerdict> {
@@ -5918,20 +5940,26 @@ async fn apply_iam_policy_mapping_item(
         .await
     {
         Some(record) => Some(record.update_at),
-        None => {
-            local_iam_deletion_mark(&[iam_policy_mapping_deletion_mark_entity(
+        None => iam_deletion_mark(
+            marks,
+            &[iam_policy_mapping_deletion_mark_entity(
                 &mapping.user_or_group,
                 mapping.user_type,
                 mapping.is_group,
-            )])
-            .await
-        }
+            )],
+        ),
     };
     if judge_iam_item_staleness(local_updated_at, incoming_updated_at) == IamItemVerdict::SkipStale {
         return Ok(IamItemVerdict::SkipStale);
     }
     iam_sys
-        .policy_db_set(&mapping.user_or_group, user_type, mapping.is_group, &mapping.policy)
+        .policy_db_set_at(
+            &mapping.user_or_group,
+            user_type,
+            mapping.is_group,
+            &mapping.policy,
+            replicated_write_stamp(incoming_updated_at),
+        )
         .await
         .map_err(ApiError::from)?;
     Ok(IamItemVerdict::Apply)
@@ -5939,6 +5967,7 @@ async fn apply_iam_policy_mapping_item(
 
 async fn apply_iam_group_info_item(
     iam_sys: &IamSys<ObjectStore>,
+    marks: &SiteReplicationState,
     group_info: Option<SRGroupInfo>,
     incoming_updated_at: Option<OffsetDateTime>,
 ) -> S3Result<IamItemVerdict> {
@@ -5963,12 +5992,13 @@ async fn apply_iam_group_info_item(
                         .map(|member| iam_group_member_deletion_mark_entity(&update.group, member)),
                 )
                 .collect();
-            local_iam_deletion_mark(&entities).await
+            iam_deletion_mark(marks, &entities)
         }
     };
     if judge_iam_item_staleness(local_updated_at, incoming_updated_at) == IamItemVerdict::SkipStale {
         return Ok(IamItemVerdict::SkipStale);
     }
+    let stamp = replicated_write_stamp(incoming_updated_at);
     if !group_info_requires_upsert(&update) {
         // Idempotent removal: a replayed deletion may find the group or a
         // member already gone (deleted here earlier, or the user tombstone
@@ -5985,7 +6015,7 @@ async fn apply_iam_group_info_item(
         if members.is_empty() && !update.members.is_empty() {
             return Ok(IamItemVerdict::Apply);
         }
-        match iam_sys.remove_users_from_group(&update.group, members).await {
+        match iam_sys.remove_users_from_group_at(&update.group, members, stamp).await {
             Ok(_) => {}
             Err(err) if rustfs_iam::error::is_err_no_such_group(&err) => {}
             Err(err) => return Err(ApiError::from(err).into()),
@@ -5994,11 +6024,11 @@ async fn apply_iam_group_info_item(
     }
 
     iam_sys
-        .add_users_to_group(&update.group, update.members)
+        .add_users_to_group_at(&update.group, update.members, stamp)
         .await
         .map_err(ApiError::from)?;
     iam_sys
-        .set_group_status(&update.group, matches!(update.status, GroupStatus::Enabled))
+        .set_group_status_at(&update.group, matches!(update.status, GroupStatus::Enabled), stamp)
         .await
         .map_err(ApiError::from)?;
     Ok(IamItemVerdict::Apply)
@@ -6041,6 +6071,7 @@ async fn apply_iam_sts_account_item(iam_sys: &IamSys<ObjectStore>, sts_credentia
 
 async fn apply_iam_user_item(
     iam_sys: &IamSys<ObjectStore>,
+    marks: &SiteReplicationState,
     iam_user: Option<SRIAMUser>,
     incoming_updated_at: Option<OffsetDateTime>,
 ) -> S3Result<IamItemVerdict> {
@@ -6051,11 +6082,12 @@ async fn apply_iam_user_item(
     // record so a stale re-create cannot resurrect it (backlog#2291).
     let local_updated_at = match iam_sys.get_user(&user.access_key).await {
         Some(local) => Some(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH)),
-        None => local_iam_deletion_mark(&[iam_user_deletion_mark_entity(&user.access_key)]).await,
+        None => iam_deletion_mark(marks, &[iam_user_deletion_mark_entity(&user.access_key)]),
     };
     if judge_iam_item_staleness(local_updated_at, incoming_updated_at) == IamItemVerdict::SkipStale {
         return Ok(IamItemVerdict::SkipStale);
     }
+    let stamp = replicated_write_stamp(incoming_updated_at);
     if user.is_delete_req {
         iam_sys.delete_user(&user.access_key, true).await.map_err(ApiError::from)?;
     } else {
@@ -6065,12 +6097,12 @@ async fn apply_iam_user_item(
         let is_status_only_update = user_req.secret_key.is_empty() && user_req.policy.is_none();
         if is_status_only_update {
             iam_sys
-                .set_user_status(&user.access_key, user_req.status)
+                .set_user_status_at(&user.access_key, user_req.status, stamp)
                 .await
                 .map_err(ApiError::from)?;
         } else {
             iam_sys
-                .create_user(&user.access_key, &user_req)
+                .create_user_at(&user.access_key, &user_req, stamp)
                 .await
                 .map_err(ApiError::from)?;
         }
@@ -6080,13 +6112,15 @@ async fn apply_iam_user_item(
 
 async fn apply_iam_service_account_item(
     iam_sys: &IamSys<ObjectStore>,
+    marks: &SiteReplicationState,
     svc_acc_change: Option<SRSvcAccChange>,
     incoming_updated_at: Option<OffsetDateTime>,
-) -> S3Result<()> {
+) -> S3Result<IamItemVerdict> {
     let Some(change) = svc_acc_change else {
         return Err(s3_error!(InvalidRequest, "serviceAccountChange is required"));
     };
     let envelope = change.oidc_service_account_envelope;
+    let stamp = replicated_write_stamp(incoming_updated_at);
     if let Some(create) = change.create {
         // Like the user path: with the account already deleted here, the
         // recorded deletion mark is the timestamp a stale create/update
@@ -6094,11 +6128,11 @@ async fn apply_iam_service_account_item(
         let local_updated_at = match iam_sys.get_user(&create.access_key).await {
             Some(local) => Some(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH)),
             None if create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT => None,
-            None => local_iam_deletion_mark(&[format!("svc-acc:{}", create.access_key)]).await,
+            None => iam_deletion_mark(marks, &[format!("svc-acc:{}", create.access_key)]),
         };
         let replicated_policy = if create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
             if local_updated_at.is_some_and(|local_updated_at| is_stale_update(local_updated_at, incoming_updated_at)) {
-                return Ok(());
+                return Ok(IamItemVerdict::SkipStale);
             }
             ReplicatedServiceAccountPolicy {
                 policy: Some(site_replicator_service_account_policy()?),
@@ -6108,7 +6142,7 @@ async fn apply_iam_service_account_item(
             let Some(replicated_policy) =
                 decode_service_account_replication_policy(&create, envelope.as_ref(), incoming_updated_at, local_updated_at)?
             else {
-                return Ok(());
+                return Ok(IamItemVerdict::SkipStale);
             };
             replicated_policy
         };
@@ -6122,7 +6156,7 @@ async fn apply_iam_service_account_item(
                     ));
                 }
                 iam_sys
-                    .update_service_account(
+                    .update_service_account_at(
                         &create.access_key,
                         UpdateServiceAccountOpts {
                             name: replicated_policy.metadata_for_existing_account(create.name),
@@ -6134,15 +6168,19 @@ async fn apply_iam_service_account_item(
                             parent_user: None,
                             allow_site_replicator_account: create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
                         },
+                        stamp,
                     )
                     .await
                     .map_err(ApiError::from)?;
             }
             Err(err) if is_err_no_such_service_account(&err) => {
-                let access_key = create.access_key.clone();
-                let status = create.status.clone();
+                // A snapshot (bootstrap / repair / retry resend) carries the
+                // account's current status, and the account is created with
+                // it in the same write: a disabled account must never exist
+                // enabled here, not even between a create and a follow-up
+                // status write that might fail (backlog#2289).
                 iam_sys
-                    .new_service_account(
+                    .new_service_account_at(
                         &create.parent,
                         Some(create.groups),
                         NewServiceAccountOpts {
@@ -6154,43 +6192,23 @@ async fn apply_iam_service_account_item(
                             expiration: create.expiration,
                             allow_site_replicator_account: true,
                             claims: Some(create.claims),
+                            status: (!create.status.is_empty()).then_some(create.status),
                         },
+                        stamp,
                     )
                     .await
                     .map_err(ApiError::from)?;
-                // A snapshot (bootstrap / repair / retry resend) carries the
-                // account's current status; creation always enables, so a
-                // disabled account must be switched off in a second step or
-                // the peer keeps accepting credentials the source rejects.
-                if !status.is_empty() && status != "on" {
-                    iam_sys
-                        .update_service_account(
-                            &access_key,
-                            UpdateServiceAccountOpts {
-                                session_policy: None,
-                                secret_key: None,
-                                name: None,
-                                description: None,
-                                expiration: None,
-                                status: Some(status),
-                                parent_user: None,
-                                allow_site_replicator_account: false,
-                            },
-                        )
-                        .await
-                        .map_err(ApiError::from)?;
-                }
             }
             Err(err) => return Err(ApiError::from(err).into()),
         }
-        return Ok(());
+        return Ok(IamItemVerdict::Apply);
     }
 
     if let Some(update) = change.update {
         if let Some(local) = iam_sys.get_user(&update.access_key).await
             && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
         {
-            return Ok(());
+            return Ok(IamItemVerdict::SkipStale);
         }
         let allow_site_replicator_account = update.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT;
         let session_policy = if allow_site_replicator_account {
@@ -6199,7 +6217,7 @@ async fn apply_iam_service_account_item(
             update.session_policy.as_str().and_then(|raw| serde_json::from_str(raw).ok())
         };
         iam_sys
-            .update_service_account(
+            .update_service_account_at(
                 &update.access_key,
                 UpdateServiceAccountOpts {
                     session_policy,
@@ -6213,23 +6231,24 @@ async fn apply_iam_service_account_item(
                     parent_user: None,
                     allow_site_replicator_account,
                 },
+                stamp,
             )
             .await
             .map_err(ApiError::from)?;
-        return Ok(());
+        return Ok(IamItemVerdict::Apply);
     }
 
     if let Some(delete) = change.delete {
         if let Some(local) = iam_sys.get_user(&delete.access_key).await
             && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
         {
-            return Ok(());
+            return Ok(IamItemVerdict::SkipStale);
         }
         iam_sys
             .delete_service_account(&delete.access_key, true)
             .await
             .map_err(ApiError::from)?;
-        return Ok(());
+        return Ok(IamItemVerdict::Apply);
     }
 
     Err(s3_error!(InvalidRequest, "serviceAccountChange is empty"))
@@ -6892,6 +6911,7 @@ async fn apply_peer_join_service_account(join_req: SRPeerJoinReq) -> S3Result<()
                     expiration: None,
                     allow_site_replicator_account: join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
                     claims: None,
+                    status: None,
                 },
             )
             .await
@@ -8223,6 +8243,343 @@ mod tests {
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
             ..Default::default()
         }
+    }
+
+    // --- Review regressions on rustfs#7195 (backlog#2289 / #2291 / #2292):
+    // delivery order and concurrency through the real receiver.
+
+    /// Two-peer state so the apply transaction's persist keeps the state
+    /// object (a single-peer state is cleared on write) and the deletion
+    /// marks it records survive between items.
+    async fn seed_two_peer_state_for_iam_apply() {
+        let seed = SiteReplicationState {
+            peers: BTreeMap::from([
+                (
+                    "site-a".to_string(),
+                    PeerInfo {
+                        deployment_id: "site-a".to_string(),
+                        ..peer("site-a", "https://a.example:9000")
+                    },
+                ),
+                (
+                    "site-b".to_string(),
+                    PeerInfo {
+                        deployment_id: "site-b".to_string(),
+                        ..peer("site-b", "https://b.example:9000")
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        save_site_replication_state(&seed).await.expect("seed state");
+    }
+
+    async fn clear_seeded_state() {
+        save_site_replication_state(&SiteReplicationState::default())
+            .await
+            .expect("clear state");
+    }
+
+    fn sr_item(item_type: &str, updated_at: OffsetDateTime) -> SRIAMItem {
+        SRIAMItem {
+            r#type: item_type.to_string(),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn allow_actions_policy(actions: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": actions, "Resource": ["arn:aws:s3:::*"]}]
+        })
+    }
+
+    fn sr_policy_item(name: &str, body: serde_json::Value, updated_at: OffsetDateTime) -> SRIAMItem {
+        let mut item = sr_item("policy", updated_at);
+        item.name = name.to_string();
+        item.policy = Some(body);
+        item
+    }
+
+    fn sr_mapping_item(user: &str, policy: &str, updated_at: OffsetDateTime) -> SRIAMItem {
+        let mut item = sr_item("policy-mapping", updated_at);
+        item.policy_mapping = Some(SRPolicyMapping {
+            user_or_group: user.to_string(),
+            user_type: 0,
+            is_group: false,
+            policy: policy.to_string(),
+            ..Default::default()
+        });
+        item
+    }
+
+    fn sr_group_item(group: &str, members: &[&str], is_remove: bool, updated_at: OffsetDateTime) -> SRIAMItem {
+        let mut item = sr_item("group-info", updated_at);
+        item.group_info = Some(SRGroupInfo {
+            update_req: rustfs_madmin::GroupAddRemove {
+                group: group.to_string(),
+                members: members.iter().map(|member| member.to_string()).collect(),
+                status: rustfs_madmin::GroupStatus::Enabled,
+                is_remove,
+            },
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        });
+        item
+    }
+
+    fn sr_user_item(
+        access_key: &str,
+        user_req: Option<rustfs_madmin::AddOrUpdateUserReq>,
+        updated_at: OffsetDateTime,
+    ) -> SRIAMItem {
+        let mut item = sr_item("iam-user", updated_at);
+        item.iam_user = Some(SRIAMUser {
+            access_key: access_key.to_string(),
+            is_delete_req: user_req.is_none(),
+            user_req,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        });
+        item
+    }
+
+    fn user_req(secret_key: &str, status: rustfs_madmin::AccountStatus) -> rustfs_madmin::AddOrUpdateUserReq {
+        rustfs_madmin::AddOrUpdateUserReq {
+            secret_key: secret_key.to_string(),
+            policy: None,
+            status,
+        }
+    }
+
+    fn sr_service_account_create_item(parent: &str, access_key: &str, status: &str, updated_at: OffsetDateTime) -> SRIAMItem {
+        let mut item = sr_item("service-account", updated_at);
+        item.svc_acc_change = Some(SRSvcAccChange {
+            create: Some(SRSvcAccCreate {
+                parent: parent.to_string(),
+                access_key: access_key.to_string(),
+                secret_key: "replicated-svc-secret-123".to_string(),
+                groups: Vec::new(),
+                claims: HashMap::new(),
+                session_policy: rustfs_madmin::SRSessionPolicy::default(),
+                status: status.to_string(),
+                name: String::new(),
+                description: String::new(),
+                expiration: None,
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            ..Default::default()
+        });
+        item
+    }
+
+    async fn stored_policy_json(name: &str) -> (String, Option<OffsetDateTime>) {
+        let iam = current_iam_handle().expect("test IAM");
+        let doc = iam.get_policy_doc(name).await.expect("policy doc");
+        (serde_json::to_string(&doc.policy).expect("serialize policy"), doc.update_date)
+    }
+
+    /// Review finding on rustfs#7195 (P1): two source edits T1 < T2 that both
+    /// predate their delivery. The record T1 writes must carry T1 — not the
+    /// later receive time — or T2 is judged stale against it and the newer
+    /// revoke is silently dropped. Exercised through the real receiver for
+    /// every gated item type.
+    #[tokio::test]
+    #[serial]
+    async fn apply_iam_item_applies_delayed_in_order_updates_through_the_receiver() {
+        publish_ready_iam_context().await;
+        seed_two_peer_state_for_iam_apply().await;
+        let iam = current_iam_handle().expect("test IAM");
+        let t1 = OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let t2 = t1 + time::Duration::minutes(5);
+
+        // policy: the grant, then the narrower revision.
+        let policy = "sr-delayed-order-policy";
+        apply_iam_item(sr_policy_item(policy, allow_actions_policy(&["s3:GetObject", "s3:PutObject"]), t1))
+            .await
+            .expect("T1 grant");
+        apply_iam_item(sr_policy_item(policy, allow_actions_policy(&["s3:GetObject"]), t2))
+            .await
+            .expect("T2 narrowed body");
+        let (stored, stamp) = stored_policy_json(policy).await;
+        assert_eq!(stamp, Some(t2), "the stored stamp is the source time of the last applied edit");
+        assert!(
+            !stored.contains("s3:PutObject"),
+            "the narrower T2 body must replace the T1 grant: {stored}"
+        );
+
+        // policy-mapping: attach the wide policy, then the narrow one.
+        for (name, actions) in [
+            ("sr-delayed-order-wide", &["s3:*"][..]),
+            ("sr-delayed-order-narrow", &["s3:GetObject"][..]),
+        ] {
+            let body: rustfs_policy::policy::Policy = serde_json::from_value(allow_actions_policy(actions)).expect("policy body");
+            iam.set_policy(name, body).await.expect("local policy");
+        }
+        let user = "sr-delayed-order-user";
+        apply_iam_item(sr_mapping_item(user, "sr-delayed-order-wide", t1))
+            .await
+            .expect("T1 attach");
+        apply_iam_item(sr_mapping_item(user, "sr-delayed-order-narrow", t2))
+            .await
+            .expect("T2 attach");
+        let mapping = iam
+            .get_mapped_policy_record(user, rustfs_iam::store::UserType::Reg, false)
+            .await
+            .expect("mapping");
+        assert_eq!(mapping.policies, "sr-delayed-order-narrow");
+        assert_eq!(mapping.update_at, t2);
+
+        // group: add the member, then remove it.
+        let member = "sr-delayed-order-member";
+        iam.create_user(member, &user_req("member-secret-key-123", rustfs_madmin::AccountStatus::Enabled))
+            .await
+            .expect("member");
+        let group = "sr-delayed-order-group";
+        apply_iam_item(sr_group_item(group, &[member], false, t1))
+            .await
+            .expect("T1 add");
+        apply_iam_item(sr_group_item(group, &[member], true, t2))
+            .await
+            .expect("T2 remove");
+        let info = iam.get_group_info(group).await.expect("group");
+        assert!(info.members.is_empty(), "the T2 removal must land after the delayed T1 add");
+        assert_eq!(info.update_at, Some(t2));
+
+        // iam-user: create enabled, then the status-only disable.
+        let access_key = "sr-delayed-order-account";
+        apply_iam_item(sr_user_item(
+            access_key,
+            Some(user_req("account-secret-key-123", rustfs_madmin::AccountStatus::Enabled)),
+            t1,
+        ))
+        .await
+        .expect("T1 create");
+        apply_iam_item(sr_user_item(access_key, Some(user_req("", rustfs_madmin::AccountStatus::Disabled)), t2))
+            .await
+            .expect("T2 disable");
+        let identity = iam.get_user(access_key).await.expect("user");
+        assert_eq!(identity.credentials.status, "off", "the T2 disable must land after the delayed T1 create");
+        assert_eq!(identity.update_at, Some(t2));
+
+        clear_seeded_state().await;
+    }
+
+    /// Review finding on rustfs#7195: an older grant and a newer revoke for
+    /// the same record delivered concurrently must always leave the revoke,
+    /// whichever request reaches the transaction first — the verdict and
+    /// the write of one cannot interleave with the other's.
+    #[tokio::test]
+    #[serial]
+    async fn apply_iam_item_serializes_a_concurrent_older_grant_and_newer_revoke() {
+        publish_ready_iam_context().await;
+        seed_two_peer_state_for_iam_apply().await;
+        let t1 = OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let t2 = t1 + time::Duration::minutes(5);
+
+        for round in 0..6u32 {
+            let policy = format!("sr-race-policy-{round}");
+            let grant = tokio::spawn(apply_iam_item(sr_policy_item(
+                &policy,
+                allow_actions_policy(&["s3:GetObject", "s3:PutObject"]),
+                t1,
+            )));
+            let revoke = tokio::spawn(apply_iam_item(sr_policy_item(&policy, allow_actions_policy(&["s3:GetObject"]), t2)));
+            let (grant, revoke) = if round % 2 == 0 {
+                tokio::join!(grant, revoke)
+            } else {
+                let (revoke, grant) = tokio::join!(revoke, grant);
+                (grant, revoke)
+            };
+            grant.expect("join grant").expect("grant delivery is acknowledged");
+            revoke.expect("join revoke").expect("revoke delivery is acknowledged");
+            let (stored, stamp) = stored_policy_json(&policy).await;
+            assert!(
+                !stored.contains("s3:PutObject"),
+                "round {round}: the grant won over the newer revoke: {stored}"
+            );
+            assert_eq!(stamp, Some(t2), "round {round}");
+        }
+
+        clear_seeded_state().await;
+    }
+
+    /// Review finding on rustfs#7195: a replicated delete followed by the
+    /// delayed delivery of the older create must not resurrect the entity,
+    /// and the mark that fences it is committed by the same transaction that
+    /// applied the delete; a genuinely newer create still lands.
+    #[tokio::test]
+    #[serial]
+    async fn apply_iam_item_rejects_a_stale_recreate_after_a_replicated_delete() {
+        publish_ready_iam_context().await;
+        seed_two_peer_state_for_iam_apply().await;
+        let iam = current_iam_handle().expect("test IAM");
+        let t1 = OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let t3 = t1 + time::Duration::minutes(10);
+        let t4 = t3 + time::Duration::minutes(10);
+        let access_key = "sr-recreate-account";
+        let create = |at| {
+            sr_user_item(
+                access_key,
+                Some(user_req("recreate-secret-key-123", rustfs_madmin::AccountStatus::Enabled)),
+                at,
+            )
+        };
+
+        apply_iam_item(create(t1)).await.expect("T1 create");
+        assert!(iam.get_user(access_key).await.is_some());
+        apply_iam_item(sr_user_item(access_key, None, t3)).await.expect("T3 delete");
+        assert!(iam.get_user(access_key).await.is_none());
+        let state = load_site_replication_state().await.expect("state");
+        assert_eq!(
+            state.iam_deletion_marks.get(&iam_user_deletion_mark_entity(access_key)),
+            Some(&t3),
+            "the delete's mark is committed with the delete"
+        );
+
+        apply_iam_item(create(t1)).await.expect("the stale replay is acknowledged");
+        assert!(
+            iam.get_user(access_key).await.is_none(),
+            "a create older than the recorded deletion must not re-create the user"
+        );
+
+        apply_iam_item(create(t4)).await.expect("T4 create");
+        let identity = iam.get_user(access_key).await.expect("a newer create lands");
+        assert_eq!(identity.update_at, Some(t4));
+
+        clear_seeded_state().await;
+    }
+
+    /// Review finding on rustfs#7195 (backlog#2289): a replicated disabled
+    /// service account is created disabled in one write, never enabled and
+    /// then switched off, and carries the source stamp.
+    #[tokio::test]
+    #[serial]
+    async fn apply_iam_item_creates_a_replicated_service_account_with_its_status() {
+        publish_ready_iam_context().await;
+        seed_two_peer_state_for_iam_apply().await;
+        let iam = current_iam_handle().expect("test IAM");
+        let t1 = OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let parent = "sr-svc-parent";
+        iam.create_user(parent, &user_req("parent-secret-key-123", rustfs_madmin::AccountStatus::Enabled))
+            .await
+            .expect("parent");
+
+        for (access_key, status, expected) in [
+            ("sr-svc-disabled", "off", "off"),
+            ("sr-svc-enabled", "on", "on"),
+            ("sr-svc-default", "", "on"),
+        ] {
+            apply_iam_item(sr_service_account_create_item(parent, access_key, status, t1))
+                .await
+                .expect("service account create");
+            let (credentials, _) = iam.get_service_account(access_key).await.expect("service account");
+            assert_eq!(credentials.status, expected, "{access_key}");
+            let identity = iam.get_user(access_key).await.expect("identity");
+            assert_eq!(identity.update_at, Some(t1), "{access_key} carries the source stamp");
+        }
+
+        clear_seeded_state().await;
     }
 
     #[tokio::test]
@@ -12501,7 +12858,8 @@ mod tests {
             && incoming_is_delete
             && let Some(deleted_at) = incoming_updated_at
         {
-            record_iam_deletion_marks(marks, &entities, deleted_at);
+            // Pruning is judged from the deletion's own clock in the model.
+            record_iam_deletion_marks_at(marks, &entities, deleted_at, deleted_at);
         }
         verdict
     }
@@ -12593,8 +12951,8 @@ mod tests {
         let mut marks = SiteReplicationState::default();
         let bob = iam_group_member_deletion_mark_entity("devs", "bob");
         let group = iam_group_deletion_mark_entity("devs");
-        record_iam_deletion_marks(&mut marks, std::slice::from_ref(&bob), at(20));
-        record_iam_deletion_marks(&mut marks, std::slice::from_ref(&group), at(30));
+        record_iam_deletion_marks_at(&mut marks, std::slice::from_ref(&bob), at(20), at(20));
+        record_iam_deletion_marks_at(&mut marks, std::slice::from_ref(&group), at(30), at(30));
 
         // The gate for an add of `bob` to the (deleted) group.
         let add_bob = [group.clone(), bob.clone()];
@@ -12625,43 +12983,98 @@ mod tests {
     }
 
     /// Cheap wiring guard for backlog#2291: every one of the `policy`,
-    /// `policy-mapping`, `group-info` and `iam-user` apply paths must route
-    /// through the shared staleness verdict before it writes or deletes
-    /// anything, and must fall back to the deletion mark when the record is
-    /// absent; `apply_iam_item` must record the mark of a committed deletion.
-    /// The ordering rule itself is covered by the `test_iam_item_*` behaviour
-    /// tests above; this only pins that no path bypasses it again.
+    /// `policy-mapping`, `group-info`, `iam-user` and `service-account` apply
+    /// paths must judge the item against the local record (falling back to
+    /// the deletion marks of the transaction's state when the record is
+    /// absent) before it writes or deletes anything, must stamp every write
+    /// with the item's source time, and `apply_iam_item` must run verdict,
+    /// write and mark commit inside one state transaction. The ordering rule
+    /// itself is covered by the `test_iam_item_*` model tests above and the
+    /// `apply_iam_item_*` receiver tests; this only pins that no path bypasses
+    /// it again.
     #[test]
     fn test_iam_policy_mapping_and_group_items_gate_on_incoming_updated_at() {
         let source = include_str!("site_replication.rs");
-        for (start, end) in [
-            ("async fn apply_iam_policy_item(", "async fn apply_iam_policy_mapping_item("),
-            ("async fn apply_iam_policy_mapping_item(", "async fn apply_iam_group_info_item("),
-            ("async fn apply_iam_group_info_item(", "async fn apply_iam_sts_account_item("),
-            ("async fn apply_iam_user_item(", "async fn apply_iam_service_account_item("),
+        let locally_stamped_writes = [
+            ".set_policy(",
+            ".policy_db_set(",
+            ".add_users_to_group(",
+            ".remove_users_from_group(",
+            ".set_group_status(",
+            ".create_user(",
+            ".set_user_status(",
+            ".new_service_account(",
+            ".update_service_account(",
+        ];
+        for (start, end, judged_by_shared_verdict) in [
+            ("async fn apply_iam_policy_item(", "async fn apply_iam_policy_mapping_item(", true),
+            ("async fn apply_iam_policy_mapping_item(", "async fn apply_iam_group_info_item(", true),
+            ("async fn apply_iam_group_info_item(", "async fn apply_iam_sts_account_item(", true),
+            ("async fn apply_iam_user_item(", "async fn apply_iam_service_account_item(", true),
+            ("async fn apply_iam_service_account_item(", "fn claims_unix_timestamp(", false),
         ] {
             let body = source
                 .split(start)
                 .nth(1)
                 .and_then(|rest| rest.split(end).next())
                 .expect(start);
+            if judged_by_shared_verdict {
+                assert!(
+                    body.contains("judge_iam_item_staleness(local_updated_at, incoming_updated_at)"),
+                    "{start} must judge the item against the local record before applying it"
+                );
+            } else {
+                assert!(
+                    body.contains("is_stale_update(local_updated_at, incoming_updated_at)"),
+                    "{start} must judge the item against the local record before applying it"
+                );
+            }
             assert!(
-                body.contains("judge_iam_item_staleness(local_updated_at, incoming_updated_at)"),
-                "{start} must judge the item against the local record before applying it"
+                body.contains("iam_deletion_mark("),
+                "{start} must fall back to the deletion marks of the transaction's state when the record is absent"
             );
             assert!(
-                body.contains("local_iam_deletion_mark("),
-                "{start} must fall back to the deletion mark when the record is absent"
+                body.contains("replicated_write_stamp(incoming_updated_at)"),
+                "{start} must stamp its writes with the item's source time"
             );
+            for write in locally_stamped_writes {
+                assert!(
+                    !body.contains(write),
+                    "{start} must not stamp a replicated write with the local clock ({write})"
+                );
+            }
         }
         let dispatch = source
             .split("async fn apply_iam_item(")
             .nth(1)
-            .and_then(|rest| rest.split("async fn local_iam_deletion_mark(").next())
+            .and_then(|rest| rest.split("fn replicated_write_stamp(").next())
             .expect("apply_iam_item");
         assert!(
-            dispatch.contains("commit_iam_deletion_marks(deletion_mark_entities, deleted_at)"),
-            "apply_iam_item must record the mark of a deletion it committed"
+            dispatch.contains("with_site_replication_state_transaction(move |mut state| async move {"),
+            "apply_iam_item must run verdict, write and mark commit in one state transaction"
+        );
+        assert!(
+            dispatch.contains("record_iam_deletion_marks(&mut state, &deletion_mark_entities, deleted_at)"),
+            "apply_iam_item must record the mark of a deletion it committed in the same transaction"
+        );
+        assert!(
+            !dispatch.contains("commit_iam_deletion_marks("),
+            "the mark must not be committed in a second transaction"
+        );
+        // backlog#2289: a replicated service account is created with its
+        // status; a second status write could fail and leave it enabled.
+        let create_branch = source
+            .split("Err(err) if is_err_no_such_service_account(&err) => {")
+            .nth(1)
+            .and_then(|rest| rest.split("Err(err) => return Err(ApiError::from(err).into()),").next())
+            .expect("service account create branch");
+        assert!(
+            create_branch.contains("status: (!create.status.is_empty()).then_some(create.status),"),
+            "the service account must be created with the source status"
+        );
+        assert!(
+            !create_branch.contains("update_service_account"),
+            "the created service account's status must not depend on a second write"
         );
     }
 
@@ -14259,6 +14672,10 @@ mod tests {
             "durable quota must carry the source stamp"
         );
         assert!(apply.contains("update_if_incarnation_at("), "bucket configs must carry the source stamp");
+        assert!(
+            apply.contains("delete_if_incarnation_at("),
+            "bucket config deletes must carry the source stamp too, or a newer re-create is judged stale"
+        );
         assert!(
             !apply.contains("metadata_sys::update_if_incarnation(&item.bucket"),
             "no replicated config write may bypass the source stamp"

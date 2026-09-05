@@ -455,6 +455,18 @@ pub(crate) mod metadata_sys {
         super::ecstore_bucket::metadata_sys::delete_if_incarnation(bucket, config_file, expected_incarnation_id).await
     }
 
+    /// [`delete_if_incarnation`] stamping the cleared config with a replicated
+    /// deletion's source `updated_at` instead of the local clock (backlog#2292).
+    pub(crate) async fn delete_if_incarnation_at(
+        bucket: &str,
+        config_file: &str,
+        expected_incarnation_id: uuid::Uuid,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::delete_if_incarnation_at(bucket, config_file, expected_incarnation_id, updated_at)
+            .await
+    }
+
     pub(crate) async fn get_bucket_policy(bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
         super::ecstore_bucket::metadata_sys::get_bucket_policy(bucket).await
     }

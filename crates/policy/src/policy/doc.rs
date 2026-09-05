@@ -45,18 +45,33 @@ pub struct PolicyDoc {
 
 impl PolicyDoc {
     pub fn new(policy: Policy) -> Self {
+        Self::new_at(policy, OffsetDateTime::now_utc())
+    }
+
+    /// [`Self::new`] with an explicit `UpdateDate` (and `CreateDate`).
+    ///
+    /// A replicated document keeps the edit's source time: the receiver
+    /// judges the next incoming revision against the stored stamp, so a
+    /// local stamp would reject a newer source edit that was merely
+    /// delivered later.
+    pub fn new_at(policy: Policy, at: OffsetDateTime) -> Self {
         Self {
             version: 1,
             policy,
-            create_date: Some(OffsetDateTime::now_utc()),
-            update_date: Some(OffsetDateTime::now_utc()),
+            create_date: Some(at),
+            update_date: Some(at),
         }
     }
 
     pub fn update(&mut self, policy: Policy) {
+        self.update_at(policy, OffsetDateTime::now_utc());
+    }
+
+    /// [`Self::update`] with an explicit `UpdateDate`; see [`Self::new_at`].
+    pub fn update_at(&mut self, policy: Policy, at: OffsetDateTime) {
         self.version += 1;
         self.policy = policy;
-        self.update_date = Some(OffsetDateTime::now_utc());
+        self.update_date = Some(at);
 
         if self.create_date.is_none() {
             self.create_date = self.update_date;
