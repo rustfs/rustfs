@@ -44,9 +44,10 @@ mod tests {
 
     #[derive(serde::Deserialize)]
     struct RestartEvidenceRun {
+        schema: u32,
         run_id: String,
         source_revision: String,
-        test_sources_sha256: String,
+        test_build: serde_json::Value,
         binary: EvidenceBuild,
         test_binary: EvidenceBuild,
     }
@@ -75,14 +76,13 @@ mod tests {
             return Err("oversized scanner/heal execution receipt".into());
         }
         let run: RestartEvidenceRun = serde_json::from_slice(&std::fs::read(receipt)?)?;
-        if run.run_id.len() != 32 || run.source_revision.len() != 40 {
+        if run.schema != 1 || run.run_id.len() != 32 || run.source_revision.len() != 40 {
             return Err("invalid scanner/heal execution identity".into());
         }
-        let mut sources = Sha256::new();
-        sources.update(include_bytes!("heal_erasure_disk_rebuild_test.rs"));
-        sources.update(include_bytes!("chaos.rs"));
-        let source_digest: String = sources.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
-        assert_eq!(source_digest, run.test_sources_sha256, "compiled test sources must match the receipt");
+        let built = compiled_test_identity();
+        for key in ["source_revision", "dirty", "lock_blob", "features"] {
+            assert_eq!(built[key], run.test_build[key], "compiled test identity differs for {key}");
+        }
         assert_eq!(file_sha256(binary)?, run.binary.sha256, "server binary must match the run receipt");
         assert_eq!(
             file_sha256(&std::env::current_exe()?)?,
@@ -93,6 +93,18 @@ mod tests {
             return Err("scanner/heal oracle already exists; create a new execution receipt".into());
         }
         Ok(Some((directory, run)))
+    }
+
+    fn compiled_test_identity() -> serde_json::Value {
+        serde_json::json!({
+            "source_revision": env!("RUSTFS_E2E_BUILD_COMMIT"),
+            "dirty": env!("RUSTFS_E2E_BUILD_DIRTY") != "false",
+            "lock_blob": env!("RUSTFS_E2E_BUILD_LOCK"),
+            "features": env!("RUSTFS_E2E_BUILD_FEATURES"),
+            "target": env!("RUSTFS_E2E_BUILD_TARGET"),
+            "profile": env!("RUSTFS_E2E_BUILD_PROFILE"),
+            "rustflags_hex": env!("RUSTFS_E2E_BUILD_RUSTFLAGS_HEX"),
+        })
     }
 
     struct TcpPortBlackhole {
@@ -1530,7 +1542,7 @@ mod tests {
             let evidence = serde_json::json!({
                 "schema": 1, "case": "background-target-restart", "evidence": "process-restart",
                 "run_id": run.run_id, "source_revision": run.source_revision,
-                "test_sources_sha256": run.test_sources_sha256,
+                "test_build": compiled_test_identity(),
                 "binary_sha256": run.binary.sha256, "test_binary_sha256": run.test_binary.sha256,
                 "topology": {"nodes": cluster.nodes.len(), "drives_per_node": cluster.nodes[0].data_dirs.len()},
                 "pid_before": target_pid, "pid_after": restarted_pid,

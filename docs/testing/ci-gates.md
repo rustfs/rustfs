@@ -153,9 +153,12 @@ Use a committed source tree, independently built current binaries, sufficient
 free disk space, and a task-owned artifact directory that does not yet exist.
 Set `SERVER_BINARY` and `TEST_BINARY` to those exact executable paths. The begin
 command requires the server's embedded `--version` commit to match the clean
-checkout and its embedded Git status to be clean. The producer also checks
-compile-time hashes of its two oracle source files, so a stale test executable
-cannot acquire current oracle semantics just by copying a receipt. The E2E
+checkout and its embedded Git status to be clean. The E2E crate's build script
+embeds its build-time Git revision/dirty state, lockfile Git blob, enabled crate
+features, target, profile and encoded Rust flags. It tracks the crate/dependency
+trees, Cargo inputs and Git HEAD/ref/index, including `common.rs` restart logic.
+The producer checks this compiled identity against the receipt; it does not
+copy a current source revision into an older test binary's identity. The E2E
 uses its existing temporary cluster directories and cleanup. With a dedicated
 `CARGO_TARGET_DIR`, execute the existing selected case as follows:
 
@@ -163,6 +166,7 @@ uses its existing temporary cluster directories and cleanup. With a dedicated
 CASE=background-target-restart
 FILTER='test(test_cluster_root_heal_recovers_remote_shards_after_background_target_restart)'
 RUN_DIR="$PWD/artifacts/scanner-heal-run"
+export RUSTFS_E2E_EXPECTED_FEATURES=default
 scripts/python_bin.sh scripts/check_test_wiring.py \
   --begin-scanner-heal "$RUN_DIR" "$SERVER_BINARY" "$TEST_BINARY"
 export RUSTFS_SCANNER_HEAL_RUN_DIR="$RUN_DIR"
@@ -179,6 +183,11 @@ scripts/python_bin.sh scripts/check_test_wiring.py --finish-scanner-heal "$RUN_D
 scripts/python_bin.sh scripts/check_test_wiring.py --check-scanner-heal "$RUN_DIR" "$CASE"
 ```
 
+Set `RUSTFS_E2E_EXPECTED_FEATURES` to the actual intended e2e crate feature set,
+including `default` for a default-feature build, comma-separated for extra
+features, or empty for `--no-default-features`. It is mandatory when beginning
+a run. Crate features are distinct from the spawned server's build features.
+
 Do not replace a nonzero command exit with zero. Missing JUnit or an oracle
 emission failure also fails acceptance. Each retry needs a new run directory;
 the producer refuses to overwrite an existing oracle. Keep failed-run logs and
@@ -186,6 +195,14 @@ artifacts. The receipt pins source revision, actual binary hashes, run identity,
 start/finish times, and the artifact hashes. `listing.json`, `junit.xml`, and
 each oracle are limited to 1 MiB; object evidence has the fixture's 9..65 object
 bound. Credentials are not included in the receipt.
+
+The checker binds nextest's flattened suite `binary-id`/`binary-path` to the
+actual test executable and requires the JUnit testcase's embedded execution
+timestamp to fall inside the receipt window (with millisecond precision).
+Copying an old JUnit file and refreshing its mtime does not make it new evidence.
+Schema versions, topology counts, PIDs, EC geometry and shard indices require
+actual integers: booleans and fractional values are rejected, and an index must
+fit the physical data-plus-parity geometry.
 
 The checker rejects unselected/ignored tests, zero/duplicate JUnit cases,
 failures, skipped tests, retry/flaky records, stale or changed artifacts,
