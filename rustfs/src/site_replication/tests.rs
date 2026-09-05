@@ -823,6 +823,59 @@ fn test_destructive_bucket_op_prequeues_every_remote_peer() {
 }
 
 #[test]
+fn test_destructive_retry_intents_survive_the_soft_queue_limit() {
+    let mut queue = (0..SITE_REPLICATION_RETRY_QUEUE_LIMIT)
+        .map(|index| {
+            drain_event(
+                &format!("peer-{index}"),
+                &format!("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=bucket-{index}&operation=delete-bucket"),
+                1,
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    let ordinary_peer = PeerInfo {
+        deployment_id: "ordinary".to_string(),
+        ..peer("ordinary", "https://ordinary.example.com")
+    };
+    upsert_site_replication_retry_event(&mut queue, &ordinary_peer, SITE_REPLICATION_PEER_EDIT_PATH, "ordinary retry", None);
+    assert_eq!(queue.len(), SITE_REPLICATION_RETRY_QUEUE_LIMIT);
+    assert!(queue.iter().all(retry_event_is_destructive_bucket_op));
+
+    let extra_peer = PeerInfo {
+        deployment_id: "extra".to_string(),
+        ..peer("extra", "https://extra.example.com")
+    };
+    let extra_path = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=extra&operation=force-delete-bucket";
+    upsert_site_replication_retry_event(&mut queue, &extra_peer, extra_path, "pending destructive retry", None);
+    assert_eq!(queue.len(), SITE_REPLICATION_RETRY_QUEUE_LIMIT + 1);
+    assert!(queue.iter().any(|event| event.path == extra_path));
+}
+
+#[test]
+fn test_reachable_probe_promotion_is_fenced_by_the_observed_event() {
+    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let path = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning";
+    let mut event = drain_event("remote", path, 3, Some(now));
+    event.peer_unreachable = true;
+    let recovered = event.clone();
+    let mut state = SiteReplicationState {
+        retry_queue: vec![event],
+        ..Default::default()
+    };
+
+    assert_eq!(mark_reachable_deferred_retry_events(&mut state, &[recovered.clone()]), 1);
+    assert_eq!(state.retry_queue[0].updated_at, None);
+    assert!(!state.retry_queue[0].peer_unreachable);
+
+    state.retry_queue[0].updated_at = Some(now + time::Duration::seconds(1));
+    state.retry_queue[0].peer_unreachable = true;
+    assert_eq!(mark_reachable_deferred_retry_events(&mut state, &[recovered]), 0);
+    assert_eq!(state.retry_queue[0].updated_at, Some(now + time::Duration::seconds(1)));
+    assert!(state.retry_queue[0].peer_unreachable);
+}
+
+#[test]
 fn test_retry_snapshot_fingerprint_detects_concurrent_iam_change() {
     let old = SRIAMItem {
         r#type: "policy".to_string(),

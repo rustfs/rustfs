@@ -393,20 +393,12 @@ pub(crate) async fn broadcast_site_replication_make_bucket(
     broadcast_site_replication_json_using_runtime(runtime, &configure_path, &serde_json::json!({})).await
 }
 
-async fn broadcast_site_replication_destructive_bucket_op(runtime: &SiteReplicationRuntime, path: &str) -> S3Result<()> {
-    let peers = runtime
-        .state
-        .peers
-        .values()
-        .filter(|peer| {
-            peer.deployment_id != runtime.local_peer.deployment_id
-                && !same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    prequeue_site_replication_destructive_events(&peers, path).await?;
-    let mut first_error = None;
-    for peer in &peers {
+async fn broadcast_site_replication_destructive_bucket_op(
+    runtime: &SiteReplicationRuntime,
+    peers: &[PeerInfo],
+    path: &str,
+) -> S3Result<()> {
+    let sends = peers.iter().map(|peer| async move {
         let result = async {
             let transport = PeerTransport::for_runtime_peer(peer).await?;
             PeerAdminRequest::put(&transport.connection, path, &runtime.state.service_account_access_key)
@@ -416,14 +408,22 @@ async fn broadcast_site_replication_destructive_bucket_op(runtime: &SiteReplicat
         }
         .await;
         match result {
-            Ok(_) => dequeue_site_replication_retry_event(peer, path).await,
+            Ok(_) => {
+                dequeue_site_replication_retry_event(peer, path).await;
+                None
+            }
             Err(err) => {
                 enqueue_site_replication_retry_event(peer, path, &err).await;
-                first_error.get_or_insert(err);
+                Some(err)
             }
         }
-    }
-    first_error.map_or(Ok(()), Err)
+    });
+    futures::future::join_all(sends)
+        .await
+        .into_iter()
+        .flatten()
+        .next()
+        .map_or(Ok(()), Err)
 }
 
 pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: bool) -> S3Result<()> {
@@ -454,19 +454,17 @@ pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: boo
         })
         .cloned()
         .collect::<Vec<_>>();
-    let retry_path = path.clone();
+    prequeue_site_replication_destructive_events(&retry_peers, &path).await?;
+    let locked_peers = retry_peers;
     let result =
         with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
-            broadcast_site_replication_destructive_bucket_op(&runtime, &path).await
+            broadcast_site_replication_destructive_bucket_op(&runtime, &locked_peers, &path).await
         })
         .await;
     match result {
         Ok(result) => result,
         Err(err) => {
             let err: S3Error = ApiError::from(err).into();
-            for peer in &retry_peers {
-                enqueue_site_replication_retry_event(peer, &retry_path, &err).await;
-            }
             Err(err)
         }
     }

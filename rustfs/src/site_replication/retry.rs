@@ -16,7 +16,7 @@ use super::*;
 
 pub(crate) const SITE_REPLICATION_RETRY_QUEUE_LIMIT: usize = 256;
 
-pub(crate) const SITE_REPLICATION_RETRY_DRAIN_BATCH_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const SITE_REPLICATION_RETRY_DRAIN_BATCH_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Attempts before an entry reports as `failed` in retryStats. Visibility
 /// only: a `failed` entry stays drain-eligible, and the reachability probe
@@ -61,6 +61,13 @@ pub(crate) struct SiteReplicationRetryEvent {
 
 pub(crate) fn retry_event_matches(event: &SiteReplicationRetryEvent, peer: &PeerInfo, path: &str) -> bool {
     (event.peer_deployment_id == peer.deployment_id || event.peer_endpoint == peer.endpoint) && event.path == path
+}
+
+pub(crate) fn retry_event_is_destructive_bucket_op(event: &SiteReplicationRetryEvent) -> bool {
+    matches!(
+        retry_bucket_operation(&event.path).as_deref(),
+        Some("delete-bucket" | "force-delete-bucket" | "purge-deleted-bucket")
+    )
 }
 
 pub(crate) const SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH: &str = "internal:retry-snapshot:iam";
@@ -241,8 +248,15 @@ pub(crate) fn upsert_site_replication_retry_event(
         deletions_recorded: false,
     });
     if queue.len() > SITE_REPLICATION_RETRY_QUEUE_LIMIT {
-        let overflow = queue.len() - SITE_REPLICATION_RETRY_QUEUE_LIMIT;
-        queue.drain(0..overflow);
+        while queue.len() > SITE_REPLICATION_RETRY_QUEUE_LIMIT {
+            let Some(index) = queue.iter().position(|event| !retry_event_is_destructive_bucket_op(event)) else {
+                // Destructive rows are a durable outbox, not a replay cache.
+                // Preserve every unacknowledged peer even if that temporarily
+                // exceeds the soft limit so none becomes a silent orphan.
+                break;
+            };
+            queue.remove(index);
+        }
     }
 }
 
@@ -1133,11 +1147,31 @@ pub(crate) async fn probe_site_replication_peer_reachable(runtime: &SiteReplicat
 /// every peer that answers. A probe failure advances nothing: retry counts
 /// only move on real delivery attempts, so the per-event backoff is intact
 /// when the peer is genuinely down.
+pub(crate) fn mark_reachable_deferred_retry_events(
+    state: &mut SiteReplicationState,
+    recovered: &[SiteReplicationRetryEvent],
+) -> usize {
+    let mut promoted = 0;
+    for recovered in recovered {
+        if let Some(current) = state.retry_queue.iter_mut().find(|current| {
+            current.id == recovered.id
+                && current.peer_deployment_id == recovered.peer_deployment_id
+                && current.path == recovered.path
+                && current.updated_at == recovered.updated_at
+        }) {
+            current.updated_at = None;
+            current.peer_unreachable = false;
+            promoted += 1;
+        }
+    }
+    promoted
+}
+
 pub(crate) async fn promote_reachable_deferred_retry_events(
     runtime: &SiteReplicationRuntime,
-    actionable: &mut Vec<SiteReplicationRetryEvent>,
+    actionable: &[SiteReplicationRetryEvent],
     deferred: Vec<SiteReplicationRetryEvent>,
-) {
+) -> S3Result<()> {
     let due_peers: HashSet<String> = actionable.iter().map(|event| event.peer_deployment_id.clone()).collect();
     let mut deferred_by_peer: BTreeMap<String, Vec<SiteReplicationRetryEvent>> = BTreeMap::new();
     for event in deferred {
@@ -1163,6 +1197,7 @@ pub(crate) async fn promote_reachable_deferred_retry_events(
             (deployment_id, peer.endpoint.clone(), events, reachable)
         })
     });
+    let mut recovered = Vec::new();
     for (deployment_id, peer_endpoint, events, reachable) in futures::future::join_all(probes).await {
         if reachable {
             info!(
@@ -1173,11 +1208,23 @@ pub(crate) async fn promote_reachable_deferred_retry_events(
                 deployment_id = %deployment_id,
                 promoted = events.len(),
                 result = "retry_backoff_probe_promoted",
-                "peer reachable again; replaying its backed-off retry events this tick"
+                "peer reachable again; promoting backed-off retry events for the next tick"
             );
-            actionable.extend(events);
+            recovered.extend(events);
         }
     }
+    if recovered.is_empty() {
+        return Ok(());
+    }
+    update_site_replication_state_when_changed(move |state| {
+        let promoted = mark_reachable_deferred_retry_events(state, &recovered);
+        Ok(if promoted == 0 {
+            StateCommit::Unchanged(())
+        } else {
+            StateCommit::Changed(())
+        })
+    })
+    .await
 }
 
 /// Operator-visible per-tick alert for retry entries that no longer converge
@@ -1291,10 +1338,10 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
             return Ok(());
         }
         let now = OffsetDateTime::now_utc();
-        let mut actionable = actionable_site_replication_retry_events(&runtime.state, now);
+        let actionable = actionable_site_replication_retry_events(&runtime.state, now);
         let deferred = deferred_site_replication_retry_events(&runtime.state, now);
         let drain = async {
-            promote_reachable_deferred_retry_events(&runtime, &mut actionable, deferred).await;
+            promote_reachable_deferred_retry_events(&runtime, &actionable, deferred).await?;
             if actionable.is_empty() {
                 return Ok(());
             }
@@ -1333,39 +1380,50 @@ pub(crate) async fn drain_site_replication_retry_queue_locked(
             .push(event);
     }
 
-    let mut settled = 0usize;
-    let mut failures = 0usize;
-    for (deployment_id, peer_events) in events_by_peer {
-        let Some(peer) = runtime.state.peers.get(&deployment_id) else {
-            continue;
-        };
+    let runtime = Arc::new(runtime);
+    let plan = plan.map(Arc::new);
+    let peer_replays = events_by_peer.into_iter().filter_map(|(deployment_id, peer_events)| {
+        let peer = runtime.state.peers.get(&deployment_id)?.clone();
         if deployment_id == runtime.local_peer.deployment_id
             || same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
         {
-            continue;
+            return None;
         }
-        let transport = match PeerTransport::for_runtime_peer(peer).await {
-            Ok(transport) => transport,
-            Err(err) => {
-                // Record the attempt so backoff advances for an unreachable
-                // peer instead of re-dialing it every tick.
-                for event in &peer_events {
-                    enqueue_site_replication_retry_event(peer, &event.path, &err).await;
+        let runtime = Arc::clone(&runtime);
+        let plan = plan.as_ref().map(Arc::clone);
+        Some(async move {
+            let mut settled = 0usize;
+            let mut failures = 0usize;
+            let transport = match PeerTransport::for_runtime_peer(&peer).await {
+                Ok(transport) => transport,
+                Err(err) => {
+                    // Record the attempt so backoff advances for an unreachable
+                    // peer instead of re-dialing it every tick.
+                    for event in &peer_events {
+                        enqueue_site_replication_retry_event(&peer, &event.path, &err).await;
+                    }
+                    return (0, peer_events.len());
                 }
-                failures += peer_events.len();
-                continue;
-            }
-        };
-        for event in peer_events {
-            let Some(action) = classify_site_replication_retry_event(&event) else {
-                continue;
             };
-            match drain_one_site_replication_retry_event(&runtime, peer, &transport, &event, action, plan.as_ref()).await {
-                Ok(true) => settled += 1,
-                Ok(false) => {}
-                Err(_) => failures += 1,
+            for event in peer_events {
+                let Some(action) = classify_site_replication_retry_event(&event) else {
+                    continue;
+                };
+                match drain_one_site_replication_retry_event(&runtime, &peer, &transport, &event, action, plan.as_deref()).await {
+                    Ok(true) => settled += 1,
+                    Ok(false) => {}
+                    Err(_) => failures += 1,
+                }
             }
-        }
+            (settled, failures)
+        })
+    });
+
+    let mut settled = 0usize;
+    let mut failures = 0usize;
+    for (peer_settled, peer_failures) in futures::future::join_all(peer_replays).await {
+        settled += peer_settled;
+        failures += peer_failures;
     }
 
     if settled > 0 || failures > 0 {
