@@ -35,11 +35,15 @@ where
 {
     let mut last_usage = DataUsageInfo::default();
     let mut last_query_error = None;
-    for _ in 0..45 {
+    for _ in 0..90 {
         match get_data_usage_info(env).await {
             Ok(usage) => {
                 last_query_error = None;
-                if usage.buckets_usage.contains_key(bucket) && predicate(&usage) {
+                if usage.is_complete_bucket_usage_snapshot()
+                    && usage.usage_snapshot_converged != Some(false)
+                    && usage.buckets_usage.contains_key(bucket)
+                    && predicate(&usage)
+                {
                     return Ok(usage);
                 }
                 last_usage = usage;
