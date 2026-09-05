@@ -99,6 +99,7 @@ impl NativeHttp {
     pub(super) fn for_test(endpoint: Url) -> Self {
         Self {
             client: reqwest::Client::builder()
+                .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("test http client should build"),
@@ -122,13 +123,13 @@ impl NativeHttp {
     }
 
     /// Sends the request and returns the response only for a 2xx status.
-    /// Non-2xx statuses are classified from the status and the provider's own
+    /// Non-2xx statuses are classified from the status and an optional provider
     /// error-code header; response bodies are not read, so no provider message
     /// can smuggle credentials or markup into a log line.
     pub(super) async fn send(
         &self,
         request: reqwest::Request,
-        error_code_header: &str,
+        error_code_header: Option<&str>,
     ) -> Result<reqwest::Response, SourceError> {
         self.send_classified(request, error_code_header, false).await
     }
@@ -137,7 +138,7 @@ impl NativeHttp {
     pub(super) async fn send_object(
         &self,
         request: reqwest::Request,
-        error_code_header: &str,
+        error_code_header: Option<&str>,
     ) -> Result<reqwest::Response, SourceError> {
         self.send_classified(request, error_code_header, true).await
     }
@@ -145,26 +146,42 @@ impl NativeHttp {
     async fn send_classified(
         &self,
         request: reqwest::Request,
-        error_code_header: &str,
+        error_code_header: Option<&str>,
         not_found_on_404_without_code: bool,
     ) -> Result<reqwest::Response, SourceError> {
-        let response = self.client.execute(request).await.map_err(classify_transport_error)?;
+        let response = self.execute(request).await?;
+        let status = response.status();
+        match Self::check_response(response, error_code_header) {
+            Err(SourceError::Other(_)) if not_found_on_404_without_code && status.as_u16() == 404 => Err(SourceError::NotFound),
+            result => result,
+        }
+    }
+
+    pub(super) async fn execute(&self, request: reqwest::Request) -> Result<reqwest::Response, SourceError> {
+        self.client.execute(request).await.map_err(classify_transport_error)
+    }
+
+    pub(super) fn check_response(
+        response: reqwest::Response,
+        error_code_header: Option<&str>,
+    ) -> Result<reqwest::Response, SourceError> {
         let status = response.status();
         if status.is_success() {
             return Ok(response);
         }
-        let code = response
-            .headers()
-            .get(error_code_header)
+        let code = error_code_header
+            .and_then(|header| response.headers().get(header))
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         let message = match &code {
             Some(code) => format!("source returned HTTP {status} ({code})"),
             None => format!("source returned HTTP {status}"),
         };
-        match classify_status(status.as_u16(), code.as_deref(), message) {
-            SourceError::Other(_) if not_found_on_404_without_code && status.as_u16() == 404 => Err(SourceError::NotFound),
-            err => Err(err),
+        match classify_status(status.as_u16(), code.as_deref(), message.clone()) {
+            // Native object absence needs provider-specific evidence or a
+            // successful bucket probe, never an alias from the S3 classifier.
+            SourceError::NotFound => Err(classify_status(status.as_u16(), None, message)),
+            error => Err(error),
         }
     }
 }

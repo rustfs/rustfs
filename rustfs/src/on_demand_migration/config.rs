@@ -106,12 +106,12 @@ pub struct SourceConfig {
     pub tls: TlsConfig,
     /// Required for [`Provider::Azure`] and rejected for every other
     /// provider.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azure: Option<AzureSourceConfig>,
     /// Required for [`Provider::GcsNative`] and rejected for every other
     /// provider. [`Provider::Gcs`] keeps using `credentials` because it
     /// speaks the S3 interoperability API.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gcs: Option<GcsSourceConfig>,
 }
 
@@ -808,6 +808,10 @@ impl EndpointKey {
 mod tests {
     use super::*;
 
+    mod before_native_sources {
+        include!("../../fixtures/on_demand_migration/source_config_e2a.rs");
+    }
+
     const FULL_JSON: &str = r#"{
   "version": 1,
   "enabled": true,
@@ -876,6 +880,32 @@ mod tests {
         assert_eq!(minimal.policy.inline_max_bytes, 16 * MIB);
         assert_eq!(minimal.policy.multipart_part_size_bytes, 64 * MIB);
         assert_eq!(minimal.policy.source_timeout.first_byte_ms, 15_000);
+    }
+
+    #[test]
+    fn s3_config_writes_remain_readable_by_the_strict_pre_native_reader() {
+        // FULL_JSON is the complete config fixture already present in e2a921bc.
+        for provider in ["s3", "aws", "minio", "rustfs", "r2", "gcs"] {
+            let mut old_wire: serde_json::Value = serde_json::from_str(FULL_JSON).expect("historical config fixture");
+            old_wire["source"]["provider"] = provider.into();
+            let config = OnDemandMigrationConfig::from_json(&serde_json::to_vec(&old_wire).expect("historical wire"))
+                .expect("current reader accepts the historical source");
+            let wire = config.to_json().expect("persist current config");
+            let actual: serde_json::Value = serde_json::from_slice(&wire).expect("persisted config JSON");
+            let old_source: before_native_sources::SourceConfig = serde_json::from_value(actual["source"].clone())
+                .expect("an existing S3 source must remain readable by the strict e2a source consumer");
+            assert_eq!(serde_json::to_value(old_source).expect("old reader wire"), old_wire["source"]);
+            assert_eq!(actual, old_wire, "provider={provider}: no existing config field or value may change");
+
+            for field in ["azure", "gcs"] {
+                let mut rejected = old_wire["source"].clone();
+                rejected[field] = serde_json::Value::Null;
+                assert!(
+                    serde_json::from_value::<before_native_sources::SourceConfig>(rejected).is_err(),
+                    "the frozen old reader must reject {field}, even when null"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1080,6 +1110,19 @@ mod tests {
         for cfg in [azure_cfg(), gcs_native_cfg()] {
             let json = cfg.to_json().expect("config must serialize");
             assert_eq!(OnDemandMigrationConfig::from_json(&json).expect("config must parse"), cfg);
+            let wire: serde_json::Value = serde_json::from_slice(&json).expect("native config JSON");
+            let (present, absent, expected) = match cfg.source.provider {
+                Provider::Azure => ("azure", "gcs", serde_json::to_value(&cfg.source.azure).expect("Azure block")),
+                Provider::GcsNative => ("gcs", "azure", serde_json::to_value(&cfg.source.gcs).expect("GCS block")),
+                _ => unreachable!("native fixture"),
+            };
+            assert!(expected.is_object(), "native credentials must be present");
+            assert_eq!(wire["source"][present], expected);
+            assert!(wire["source"].get(absent).is_none());
+            assert!(
+                serde_json::from_value::<before_native_sources::SourceConfig>(wire["source"].clone()).is_err(),
+                "native providers still require upgraded readers"
+            );
         }
         // The wire labels are part of the admin contract.
         assert!(

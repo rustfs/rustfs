@@ -85,10 +85,10 @@ pub struct OnDemandMigrationSource {
     #[serde(default)]
     pub tls: OnDemandMigrationTls,
     /// Required for `azure` and rejected for every other provider.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azure: Option<OnDemandMigrationAzure>,
     /// Required for `gcs_native` and rejected for every other provider.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gcs: Option<OnDemandMigrationGcs>,
 }
 
@@ -651,6 +651,10 @@ mod tests {
     use super::*;
     use crate::test_support::TestServer;
 
+    mod before_native_sources {
+        include!("../fixtures/on_demand_migration/source_config_e2a.rs");
+    }
+
     const SET_REQUEST_FIXTURE: &str = include_str!("../fixtures/on_demand_migration/set_request.json");
     const SET_RESPONSE_FIXTURE: &str = include_str!("../fixtures/on_demand_migration/set_response.json");
     const GET_RESPONSE_FIXTURE: &str = include_str!("../fixtures/on_demand_migration/get_response.json");
@@ -682,6 +686,20 @@ mod tests {
             "fixture policy is the documented default"
         );
         assert_eq!(config.source.tls, OnDemandMigrationTls::default());
+    }
+
+    #[test]
+    fn s3_admin_writes_remain_readable_by_the_strict_pre_native_server() {
+        for provider in ["s3", "aws", "minio", "rustfs", "r2", "gcs"] {
+            let historical = SET_REQUEST_FIXTURE.replace("\"provider\":\"minio\"", &format!("\"provider\":\"{provider}\""));
+            let config: OnDemandMigrationConfig = serde_json::from_str(&historical).expect("historical set request");
+            let wire = serde_json::to_string(&config).expect("current admin set request");
+            let actual: serde_json::Value = serde_json::from_str(&wire).expect("admin request JSON");
+            let old_source: before_native_sources::SourceConfig = serde_json::from_value(actual["source"].clone())
+                .expect("the strict e2a server must accept an ordinary S3 source from the new admin client");
+            assert_eq!(serde_json::to_value(old_source).expect("old source wire"), actual["source"]);
+            assert_eq!(wire, historical.trim(), "provider={provider}: preserve the historical request bytes");
+        }
     }
 
     #[test]
@@ -878,11 +896,11 @@ mod tests {
         for (label, json) in [
             (
                 "azure",
-                r#"{"provider":"azure","endpoint":null,"region":"auto","bucket":"legacy-photos","path_style":"auto","credentials":null,"tls":{"skip_verify":false,"ca_cert_pem":null},"azure":{"account":"legacyaccount","account_key":null,"sas_token":"sv=2021-08-06&sig=topsecret"},"gcs":null}"#,
+                r#"{"provider":"azure","endpoint":null,"region":"auto","bucket":"legacy-photos","path_style":"auto","credentials":null,"tls":{"skip_verify":false,"ca_cert_pem":null},"azure":{"account":"legacyaccount","account_key":null,"sas_token":"sv=2021-08-06&sig=topsecret"}}"#,
             ),
             (
                 "gcs_native",
-                r#"{"provider":"gcs_native","endpoint":null,"region":"auto","bucket":"legacy-photos","path_style":"auto","credentials":null,"tls":{"skip_verify":false,"ca_cert_pem":null},"azure":null,"gcs":{"service_account_json":"{\"type\":\"service_account\"}"}}"#,
+                r#"{"provider":"gcs_native","endpoint":null,"region":"auto","bucket":"legacy-photos","path_style":"auto","credentials":null,"tls":{"skip_verify":false,"ca_cert_pem":null},"gcs":{"service_account_json":"{\"type\":\"service_account\"}"}}"#,
             ),
         ] {
             let source: OnDemandMigrationSource = serde_json::from_str(json).unwrap_or_else(|err| panic!("{label}: {err}"));
@@ -890,6 +908,16 @@ mod tests {
                 serde_json::to_string(&source).expect("re-encodes"),
                 json,
                 "{label} must reproduce the server wire shape byte for byte"
+            );
+            let mut wire: serde_json::Value = serde_json::from_str(json).expect("native wire fixture");
+            assert!(
+                serde_json::from_value::<before_native_sources::SourceConfig>(wire.clone()).is_err(),
+                "native provider names and fields still require an upgraded server"
+            );
+            wire[if label == "azure" { "gcs" } else { "azure" }] = serde_json::Value::Null;
+            assert_eq!(
+                serde_json::from_value::<OnDemandMigrationSource>(wire).expect("the prior explicit-null wire still decodes"),
+                source
             );
         }
 
@@ -945,6 +973,10 @@ mod tests {
                 .is_some_and(|auth| auth.starts_with("AWS4-HMAC-SHA256"))
         );
         assert_eq!(request.body, SET_REQUEST_FIXTURE.trim(), "the body is the canonical config document");
+        let body: serde_json::Value = serde_json::from_str(&request.body).expect("signed admin request JSON");
+        let old_source: before_native_sources::SourceConfig = serde_json::from_value(body["source"].clone())
+            .expect("the strict pre-native server must accept the actual signed PUT source");
+        assert_eq!(old_source.provider, before_native_sources::Provider::Minio);
     }
 
     #[tokio::test]
