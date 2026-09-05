@@ -3,9 +3,10 @@
 .NOTPARALLEL: pre-commit pre-pr dev-check
 
 .PHONY: setup-hooks
-setup-hooks: ## Set up git hooks
+setup-hooks: ## Install the configured pre-commit hooks
 	@echo "🔧 Setting up git hooks..."
-	chmod +x .git/hooks/pre-commit
+	pre-commit validate-config
+	pre-commit install
 	@echo "✅ Git hooks setup complete!"
 
 .PHONY: doc-paths-check
