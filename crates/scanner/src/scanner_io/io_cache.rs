@@ -888,6 +888,7 @@ impl ScannerIOCache for SetDisks {
                         &bucket.name,
                         expected_publication_epoch_clone,
                         tier_registry_generation,
+                        scan_mode,
                     )
                     .await
                     .ok();
@@ -1057,6 +1058,7 @@ impl ScannerIOCache for SetDisks {
                             &bucket.name,
                             expected_publication_epoch_clone,
                             tier_registry_generation,
+                            scan_mode,
                         )
                         .await
                         .ok()

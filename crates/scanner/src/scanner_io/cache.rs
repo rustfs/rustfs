@@ -113,6 +113,9 @@ pub(crate) fn current_cache_root_entry_with_generation(
         && cache.info.source == Some(source)
         && cache.info.snapshot_complete
         && cache.info.scan_progress.is_none()
+        && cache.info.scan_checkpoint.is_none()
+        && cache.info.scan_resume_after.is_none()
+        && cache.info.scan_coverage_receipt.is_none()
         && cache.info.scan_plan_digest == Some(scan_plan_digest)
         && cache.info.last_update.is_some()
         && cache.info.next_cycle == next_cycle

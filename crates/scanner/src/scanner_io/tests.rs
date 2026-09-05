@@ -131,26 +131,28 @@ async fn checkpoint_fixture_bucket_identity_uses_its_set_instance_owner() {
         .make_bucket("checkpoint-identity", &MakeBucketOptions::default())
         .await
         .expect("first instance bucket");
-    let first_identity = scanner_bucket_checkpoint_identity(&first.pools[0].disk_set[0], "checkpoint-identity", 0, 7)
-        .await
-        .expect("first durable identity");
+    let first_identity =
+        scanner_bucket_checkpoint_identity(&first.pools[0].disk_set[0], "checkpoint-identity", 0, 7, HealScanMode::Normal)
+            .await
+            .expect("first durable identity");
     let (_second_dir, second) = setup_two_pool_scanner_store().await;
     second
         .make_bucket("checkpoint-identity", &MakeBucketOptions::default())
         .await
         .expect("second instance bucket");
-    let second_identity = scanner_bucket_checkpoint_identity(&second.pools[0].disk_set[0], "checkpoint-identity", 0, 7)
-        .await
-        .expect("second durable identity");
+    let second_identity =
+        scanner_bucket_checkpoint_identity(&second.pools[0].disk_set[0], "checkpoint-identity", 0, 7, HealScanMode::Normal)
+            .await
+            .expect("second durable identity");
     assert_ne!(first_identity.bucket_incarnation, second_identity.bucket_incarnation);
     assert_eq!(
-        scanner_bucket_checkpoint_identity(&first.pools[0].disk_set[0], "checkpoint-identity", 0, 7)
+        scanner_bucket_checkpoint_identity(&first.pools[0].disk_set[0], "checkpoint-identity", 0, 7, HealScanMode::Normal)
             .await
             .expect("first owner remains bound"),
         first_identity
     );
     assert!(
-        scanner_bucket_checkpoint_identity(&first.pools[0].disk_set[0], "missing-checkpoint-bucket", 0, 7)
+        scanner_bucket_checkpoint_identity(&first.pools[0].disk_set[0], "missing-checkpoint-bucket", 0, 7, HealScanMode::Normal)
             .await
             .is_err()
     );

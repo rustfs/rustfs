@@ -241,6 +241,7 @@ fn bound_checkpoint() -> (DataUsageCache, crate::DataUsageScanIdentity) {
         set_layout: DataUsageScanPlanDigest([41; 32]),
         publication_epoch: 0,
         tier_registry_generation: 7,
+        scan_mode: HealScanMode::Normal,
     };
     let mut cache = DataUsageCache::default();
     cache.prepare_bucket_checkpoint("bucket", 11, 7, SOURCE, PLAN, identity);
@@ -258,6 +259,9 @@ fn bound_checkpoint() -> (DataUsageCache, crate::DataUsageScanIdentity) {
         "bucket/static".into(),
         DataUsageScanCheckpointReason::Objects,
     ));
+    cache
+        .seal_scan_frontier(Some("bucket/static"))
+        .expect("completed fixture prefix receipt");
     (cache, identity)
 }
 
@@ -284,6 +288,7 @@ fn checkpoint_fixture_roundtrip_retains_verified_scope_but_old_reader_rebuilds()
     let old_info = old_wire["info"].as_object_mut().expect("cache info is a map");
     old_info.remove("scan_identity");
     old_info.remove("scan_progress");
+    old_info.remove("scan_coverage_receipt");
     let mut old_view: DataUsageCache = serde_json::from_value(old_wire).expect("old writer drops unknown metadata");
     assert_eq!(
         old_view.prepare_for_scan("bucket", 11, 7, SOURCE, next_plan, true),
@@ -300,6 +305,7 @@ fn checkpoint_fixture_unchanged_complete_plan_keeps_existing_rescan_policy() {
     cache.info.scan_plan_digest = Some(PLAN);
     cache.info.scan_resume_after = None;
     cache.info.scan_checkpoint = None;
+    cache.info.scan_coverage_receipt = None;
     cache.info.snapshot_complete = true;
     assert_eq!(
         cache.prepare_bucket_checkpoint("bucket", 12, 7, SOURCE, PLAN, identity),
@@ -336,6 +342,10 @@ fn checkpoint_fixture_identity_changes_and_future_state_fail_closed() {
         },
         crate::DataUsageScanIdentity {
             tier_registry_generation: 8,
+            ..identity
+        },
+        crate::DataUsageScanIdentity {
+            scan_mode: HealScanMode::Deep,
             ..identity
         },
     ] {
@@ -409,6 +419,332 @@ fn checkpoint_fixture_corrupt_cursor_restarts_validation_without_claiming_comple
     }
 }
 
+#[test]
+fn checkpoint_fixture_receipt_binds_covered_prefix_not_unvisited_suffix() {
+    let (mut cache, _) = bound_checkpoint();
+    cache.replace(
+        "bucket/z-unvisited",
+        "bucket",
+        DataUsageEntry {
+            objects: 99,
+            ..Default::default()
+        },
+    );
+    assert_eq!(cache.validated_scan_frontier(), Some("bucket/static"));
+    let saved = decode_fixture(&cache.marshal_msg().expect("persist receipt")).expect("load receipt");
+    assert_eq!(saved.validated_scan_frontier(), Some("bucket/static"));
+    cache.cache.get_mut("bucket/static").expect("covered prefix").objects = 100;
+    assert!(
+        cache.validated_scan_frontier().is_none(),
+        "altered covered content must invalidate the receipt"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn checkpoint_fixture_existing_uncovered_cursor_cannot_skip_to_complete() {
+    let (scanner, root) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    for (object, size) in [
+        ("a-done/object", 1),
+        ("b-pending/first", 7),
+        ("b-pending/second", 1),
+        ("z-stale/object", 2),
+    ] {
+        write_checkpoint_object(&root, object, &[(None, size)]).await;
+    }
+    let identity = crate::DataUsageScanIdentity {
+        tier_registry_generation: crate::runtime_tier_registry_for_cycle(11, 7).await.generation,
+        ..bound_checkpoint().1
+    };
+    for tamper_receipt_path in [false, true] {
+        let store = FixtureStore::new();
+        let mut cache = DataUsageCache::default();
+        let revisions = cache
+            .load_with_revisions(store.clone(), CACHE_NAME)
+            .await
+            .expect("empty fixture revisions");
+        cache.prepare_bucket_checkpoint("bucket", 11, 7, SOURCE, PLAN, identity);
+        cache.replace("bucket", "", DataUsageEntry::default());
+        for (prefix, objects) in [("a-done", 1), ("b-pending", 99), ("z-stale", 99)] {
+            cache.replace(
+                &format!("bucket/{prefix}"),
+                "bucket",
+                DataUsageEntry {
+                    objects,
+                    size: objects,
+                    compacted: true,
+                    ..Default::default()
+                },
+            );
+        }
+        cache
+            .seal_scan_frontier(Some("bucket/a-done"))
+            .expect("actual completed prefix receipt");
+        cache.info.scan_resume_after = Some("bucket/z-stale".into());
+        cache.info.scan_checkpoint = Some(DataUsageScanCheckpoint::new(
+            "bucket/z-stale".into(),
+            DataUsageScanCheckpointReason::Objects,
+        ));
+        if tamper_receipt_path {
+            cache.info.scan_coverage_receipt.as_mut().expect("receipt").through = "bucket/z-stale".into();
+        }
+        cache
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .await
+            .expect("persist corrupted existing cursor");
+        let mut loaded = store.strict_load().await;
+        let revisions = loaded
+            .load_with_revisions(store.clone(), CACHE_NAME)
+            .await
+            .expect("corrupt cursor CAS revision");
+        assert!(loaded.validated_scan_frontier().is_none());
+        loaded.prepare_bucket_checkpoint("bucket", 11, 7, SOURCE, PLAN, identity);
+        assert!(loaded.info.scan_resume_after.is_none());
+        loaded.info.skip_healing = true;
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new_with_progress_tracking(
+            &parent,
+            ScannerCycleBudgetConfig {
+                max_objects: Some(2),
+                ..Default::default()
+            },
+        );
+        let outcome = scanner
+            .local_disk
+            .clone()
+            .nsscanner_disk(
+                budget.token(),
+                budget.clone(),
+                vec![scanner.local_disk.clone()],
+                loaded,
+                None,
+                HealScanMode::Normal,
+            )
+            .await
+            .expect("scan must revisit the prefix");
+        let ScannerDiskScanOutcome::Partial(cache) = outcome else {
+            panic!("uncovered suffix must not become complete")
+        };
+        assert_eq!(budget.progress().0, 2);
+        assert_eq!(cache.checked_flatten("bucket/b-pending").expect("revisited prefix").size, 7);
+        assert!(!cache.info.snapshot_complete);
+        cache
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .await
+            .expect("persist verified partial");
+        assert!(!store.strict_load().await.info.snapshot_complete);
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn checkpoint_fixture_failed_child_prevents_receipt_advancing_past_gap() {
+    let (scanner, root) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    for object in ["a-good", "b-skipped", "c-later"] {
+        write_checkpoint_object(&root, object, &[(None, 1)]).await;
+    }
+    let identity = crate::DataUsageScanIdentity {
+        tier_registry_generation: crate::runtime_tier_registry_for_cycle(11, 7).await.generation,
+        ..bound_checkpoint().1
+    };
+    let mut cache = DataUsageCache::default();
+    cache.prepare_bucket_checkpoint("bucket", 11, 7, SOURCE, PLAN, identity);
+    cache.info.skip_healing = true;
+    cache.info.failed_objects.insert(
+        root.join("bucket/b-skipped/xl.meta").to_string_lossy().into_owned(),
+        FolderScanner::now_secs(),
+    );
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(
+        &parent,
+        ScannerCycleBudgetConfig {
+            max_objects: Some(2),
+            ..Default::default()
+        },
+    );
+    let result = scanner
+        .local_disk
+        .clone()
+        .nsscanner_disk(
+            budget.token(),
+            budget,
+            vec![scanner.local_disk.clone()],
+            cache,
+            None,
+            HealScanMode::Normal,
+        )
+        .await
+        .expect("scan with a known failed child");
+    let ScannerDiskScanOutcome::Partial(cache) = result else {
+        panic!("skipped failure is not complete")
+    };
+    assert_eq!(cache.validated_scan_frontier(), Some("bucket/a-good"));
+    assert!(!cache.info.failed_objects.is_empty());
+    assert!(!cache.info.snapshot_complete);
+}
+
+#[tokio::test]
+#[serial]
+async fn checkpoint_fixture_complete_sampling_partial_resumes_with_fixed_budget() {
+    check_complete_sampling_resumption(HealScanMode::Normal).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn checkpoint_fixture_normal_partial_reenters_prefix_for_deep_scan() {
+    check_complete_sampling_resumption(HealScanMode::Deep).await;
+}
+
+async fn check_complete_sampling_resumption(resume_mode: HealScanMode) {
+    let (scanner, root) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    for index in 0..9 {
+        write_checkpoint_object(&root, &format!("prefix/{index:04}"), &[(None, 1)]).await;
+    }
+    let identity = crate::DataUsageScanIdentity {
+        tier_registry_generation: crate::runtime_tier_registry_for_cycle(11, 7).await.generation,
+        ..bound_checkpoint().1
+    };
+    let mut cache = DataUsageCache::default();
+    cache.prepare_bucket_checkpoint("bucket", 11, 7, SOURCE, PLAN, identity);
+    cache.info.skip_healing = true;
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&parent, Default::default());
+    // Seed an existing complete baseline; every recovery attempt below is bounded.
+    let baseline = scanner
+        .local_disk
+        .clone()
+        .nsscanner_disk(
+            budget.token(),
+            budget,
+            vec![scanner.local_disk.clone()],
+            cache,
+            None,
+            HealScanMode::Normal,
+        )
+        .await
+        .expect("initial complete baseline");
+    let ScannerDiskScanOutcome::Complete(mut cache) = baseline else { panic!("baseline is complete") };
+    let mut deep_current = cache.clone();
+    let deep_identity = crate::DataUsageScanIdentity {
+        scan_mode: HealScanMode::Deep,
+        ..identity
+    };
+    let state = crate::scanner_io::current_cache_root_or_prepare_with_generation(
+        &mut deep_current,
+        "bucket",
+        SOURCE,
+        11,
+        7,
+        PLAN,
+        crate::scanner_io::DataUsageCacheReuseOptions {
+            checkpoint_identity: Some(deep_identity),
+            ..Default::default()
+        },
+    );
+    assert!(
+        matches!(state, crate::scanner_io::DataUsageCacheScanState::Prepared { .. }),
+        "Normal complete is not Deep Current"
+    );
+    cache.prepare_bucket_checkpoint("bucket", 12, 7, SOURCE, PLAN, identity);
+    assert!(cache.info.scan_progress.is_none(), "complete unchanged baseline uses existing sampling");
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(
+        &parent,
+        ScannerCycleBudgetConfig {
+            max_objects: Some(3),
+            ..Default::default()
+        },
+    );
+    let outcome = scanner
+        .local_disk
+        .clone()
+        .nsscanner_disk(
+            budget.token(),
+            budget,
+            vec![scanner.local_disk.clone()],
+            cache,
+            None,
+            HealScanMode::Normal,
+        )
+        .await
+        .expect("sampling interruption");
+    let ScannerDiskScanOutcome::Partial(cache) = outcome else {
+        panic!("sampling must exhaust the three-object budget")
+    };
+    assert!(cache.info.scan_progress.is_none());
+    assert_eq!(cache.info.scan_plan_digest, Some(PLAN));
+    assert!(cache.info.scan_checkpoint.is_some());
+    let store = FixtureStore::new();
+    let mut loaded = DataUsageCache::default();
+    let revisions = loaded
+        .load_with_revisions(store.clone(), CACHE_NAME)
+        .await
+        .expect("fixture revision");
+    cache
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .await
+        .expect("persist sampling partial");
+    if resume_mode == HealScanMode::Deep {
+        write_checkpoint_object(&root, "prefix/0000", &[(None, 7)]).await;
+    }
+    let resumed_identity = crate::DataUsageScanIdentity {
+        scan_mode: resume_mode,
+        ..identity
+    };
+    for round in 0..16 {
+        let mut loaded = DataUsageCache::default();
+        let revisions = loaded
+            .load_with_revisions(store.clone(), CACHE_NAME)
+            .await
+            .expect("reload partial each recovery round");
+        loaded.prepare_bucket_checkpoint("bucket", 12, 7, SOURCE, PLAN, resumed_identity);
+        assert!(loaded.info.scan_progress.is_some(), "sampling partial must enter forward validation");
+        loaded.info.skip_healing = true;
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new_with_progress_tracking(
+            &parent,
+            ScannerCycleBudgetConfig {
+                max_objects: Some(3),
+                ..Default::default()
+            },
+        );
+        let result = scanner
+            .local_disk
+            .clone()
+            .nsscanner_disk(budget.token(), budget, vec![scanner.local_disk.clone()], loaded, None, resume_mode)
+            .await
+            .expect("bounded recovery scan");
+        let (cache, complete) = match result {
+            ScannerDiskScanOutcome::Partial(cache) => (cache, false),
+            ScannerDiskScanOutcome::Complete(cache) => (cache, true),
+            _ => panic!("fixture namespace remains present"),
+        };
+        if round == 0 && resume_mode == HealScanMode::Deep {
+            assert_eq!(cache.find("bucket/prefix/0000").expect("Deep revisits earlier prefix").size, 7);
+        }
+        cache
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .await
+            .expect("save bounded recovery");
+        if complete {
+            let root = store.strict_load().await.checked_flatten("bucket").expect("certified root");
+            assert_eq!(root.objects, 9);
+            assert_eq!(root.size, if resume_mode == HealScanMode::Deep { 15 } else { 9 });
+            return;
+        }
+    }
+    panic!("sampling interruption must recover with the unchanged three-object budget");
+}
+
 #[tokio::test]
 #[serial]
 async fn checkpoint_fixture_save_reload_resume() {
@@ -449,6 +785,7 @@ async fn run_checkpoint_fixture(change_digest: bool) {
         set_layout: DataUsageScanPlanDigest([41; 32]),
         publication_epoch: 0,
         tier_registry_generation: crate::runtime_tier_registry_for_cycle(11, 7).await.generation,
+        scan_mode: HealScanMode::Normal,
     };
     let store = FixtureStore::new();
     let mut previous = 0;

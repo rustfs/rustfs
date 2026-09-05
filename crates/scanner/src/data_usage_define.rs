@@ -14,6 +14,7 @@
 
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
 use serde::{Deserialize, Serialize, ser::SerializeMap};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
@@ -409,23 +410,27 @@ pub struct DataUsageScanIdentity {
     pub set_layout: DataUsageScanPlanDigest,
     pub publication_epoch: u64,
     pub tier_registry_generation: u64,
+    pub scan_mode: HealScanMode,
 }
 
 impl Serialize for DataUsageScanIdentity {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(5))?;
+        let mut map = serializer.serialize_map(Some(6))?;
         map.serialize_entry("version", &self.version)?;
         map.serialize_entry("bucket_incarnation", &self.bucket_incarnation)?;
         map.serialize_entry("set_layout", &self.set_layout)?;
         map.serialize_entry("publication_epoch", &self.publication_epoch)?;
         map.serialize_entry("tier_registry_generation", &self.tier_registry_generation)?;
+        map.serialize_entry("scan_mode", &self.scan_mode)?;
         map.end()
     }
 }
 
 impl DataUsageScanIdentity {
     pub(crate) fn is_valid(&self) -> bool {
-        self.version == 1 && !self.bucket_incarnation.is_nil()
+        self.version == 1
+            && !self.bucket_incarnation.is_nil()
+            && matches!(self.scan_mode, HealScanMode::Normal | HealScanMode::Deep)
     }
 }
 
@@ -443,6 +448,35 @@ impl Serialize for DataUsageScanProgress {
         map.serialize_entry("started_plan", &self.started_plan)?;
         map.serialize_entry("requested_plan", &self.requested_plan)?;
         map.end()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DataUsageScanCoverageReceipt {
+    pub through: String,
+    pub digest: [u8; 32],
+}
+
+impl Serialize for DataUsageScanCoverageReceipt {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("through", &self.through)?;
+        map.serialize_entry("digest", &self.digest)?;
+        map.end()
+    }
+}
+
+struct CheckpointDigestWriter(Sha256);
+
+impl std::io::Write for CheckpointDigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -520,6 +554,8 @@ pub struct DataUsageCacheInfo {
     #[serde(default)]
     pub scan_progress: Option<DataUsageScanProgress>,
     #[serde(default)]
+    pub scan_coverage_receipt: Option<DataUsageScanCoverageReceipt>,
+    #[serde(default)]
     pub pending_heals: Vec<PendingScannerHeal>,
     #[serde(default)]
     pub object_lock: Option<Arc<ObjectLockConfiguration>>,
@@ -565,6 +601,7 @@ impl Serialize for DataUsageCacheInfo {
         let field_count = 16
             + usize::from(self.scan_identity.is_some())
             + usize::from(self.scan_progress.is_some())
+            + usize::from(self.scan_coverage_receipt.is_some())
             + usize::from(self.tier_registry_generation.is_some())
             + usize::from(!self.size_reconciliation.is_empty())
             + usize::from(self.lkg_snapshot_complete)
@@ -588,6 +625,9 @@ impl Serialize for DataUsageCacheInfo {
         }
         if let Some(progress) = self.scan_progress {
             state.serialize_entry("scan_progress", &progress)?;
+        }
+        if let Some(receipt) = &self.scan_coverage_receipt {
+            state.serialize_entry("scan_coverage_receipt", receipt)?;
         }
         state.serialize_entry("pending_heals", &self.pending_heals)?;
         state.serialize_entry("object_lock", &self.object_lock)?;
@@ -777,7 +817,14 @@ impl DataUsageCache {
             && self.info.scan_identity == Some(identity)
             && self.info.tier_registry_generation == Some(identity.tier_registry_generation)
             && (self.cache.is_empty() || self.checked_flatten_complete_scope(name).is_some());
-        if reusable && self.info.scan_progress.is_none() && self.info.scan_plan_digest == Some(scan_plan_digest) {
+        if reusable
+            && self.info.snapshot_complete
+            && self.info.scan_progress.is_none()
+            && self.info.scan_checkpoint.is_none()
+            && self.info.scan_resume_after.is_none()
+            && self.info.scan_coverage_receipt.is_none()
+            && self.info.scan_plan_digest == Some(scan_plan_digest)
+        {
             return self.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, true);
         }
         if !reusable {
@@ -798,16 +845,10 @@ impl DataUsageCache {
             self.info.pending_heals = pending_heals;
             self.info.size_reconciliation = size_reconciliation;
         }
-        let cursor_is_valid = match (&self.info.scan_checkpoint, &self.info.scan_resume_after) {
-            (None, None) => true,
-            (Some(checkpoint), Some(resume)) => {
-                checkpoint.version == DATA_USAGE_SCAN_CHECKPOINT_VERSION
-                    && checkpoint.resume_after == *resume
-                    && resume.strip_prefix(name).is_some_and(|suffix| suffix.starts_with('/'))
-                    && self.find(resume).is_some()
-            }
-            _ => false,
-        };
+        let cursor_is_valid = (self.info.scan_checkpoint.is_none()
+            && self.info.scan_resume_after.is_none()
+            && self.info.scan_coverage_receipt.is_none())
+            || self.validated_scan_frontier().is_some();
         if !cursor_is_valid {
             self.info.scan_progress = None;
         }
@@ -828,6 +869,7 @@ impl DataUsageCache {
             });
             self.info.scan_resume_after = None;
             self.info.scan_checkpoint = None;
+            self.info.scan_coverage_receipt = None;
         }
         // Old readers do not understand coverage sweeps. An absent plan makes
         // their existing prepare path rebuild instead of promoting mixed data.
@@ -837,6 +879,86 @@ impl DataUsageCache {
         } else {
             DataUsageCachePrepareOutcome::Reset
         }
+    }
+
+    fn coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
+        let mut writer = CheckpointDigestWriter(Sha256::new());
+        serde_json::to_writer(
+            &mut writer,
+            &(
+                &self.info.name,
+                self.info.scan_identity,
+                self.info.source,
+                self.info.leader_epoch,
+                self.info.cache_key_format,
+                self.info.scan_progress.map(|progress| progress.started_plan),
+                through,
+            ),
+        )?;
+        let mut prefix = self
+            .cache
+            .iter()
+            .filter(|(key, _)| {
+                let ancestor = through
+                    .strip_prefix(key.as_str())
+                    .is_some_and(|suffix| suffix.starts_with('/'));
+                let descendant = key.strip_prefix(through).is_some_and(|suffix| suffix.starts_with('/'));
+                (key.as_str() <= through && !ancestor) || descendant
+            })
+            .collect::<Vec<_>>();
+        prefix.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        for (key, entry) in prefix {
+            let mut value = serde_json::to_value(entry)?;
+            value.sort_all_objects();
+            if let Some(children) = value.get_mut("children").and_then(serde_json::Value::as_array_mut) {
+                children.sort_unstable_by(|left, right| left.as_str().cmp(&right.as_str()));
+            }
+            serde_json::to_writer(&mut writer, &(key, value))?;
+        }
+        Ok(writer.0.finalize().into())
+    }
+
+    pub(crate) fn validated_scan_frontier(&self) -> Option<&str> {
+        let receipt = self.info.scan_coverage_receipt.as_ref()?;
+        let checkpoint = self.info.scan_checkpoint.as_ref()?;
+        (self.info.scan_progress.is_some()
+            && self.info.scan_identity.is_some_and(|identity| identity.is_valid())
+            && self.info.source.is_some()
+            && receipt.through.len() <= 16 * 1024
+            && checkpoint.version == DATA_USAGE_SCAN_CHECKPOINT_VERSION
+            && checkpoint.resume_after == receipt.through
+            && self.info.scan_resume_after.as_deref() == Some(receipt.through.as_str())
+            && receipt
+                .through
+                .strip_prefix(&self.info.name)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+            && self.find(&receipt.through).is_some()
+            && self.coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest))
+        .then_some(receipt.through.as_str())
+    }
+
+    /// Seal only the frontier supplied by completed traversal, never a restored cursor.
+    pub(crate) fn seal_scan_frontier(&mut self, frontier: Option<&str>) -> Result<(), serde_json::Error> {
+        if self.info.scan_progress.is_none() {
+            self.info.scan_coverage_receipt = None;
+            return Ok(());
+        }
+        let frontier = frontier.filter(|path| path.len() <= 16 * 1024 && self.find(path).is_some());
+        self.info.scan_coverage_receipt = match frontier {
+            Some(through) => Some(DataUsageScanCoverageReceipt {
+                through: through.to_owned(),
+                digest: self.coverage_prefix_digest(through)?,
+            }),
+            None => None,
+        };
+        self.info.scan_resume_after = frontier.map(str::to_owned);
+        let reason = self
+            .info
+            .scan_checkpoint
+            .as_ref()
+            .map_or(DataUsageScanCheckpointReason::Unknown, |checkpoint| checkpoint.reason);
+        self.info.scan_checkpoint = frontier.map(|through| DataUsageScanCheckpoint::new(through.to_owned(), reason));
+        Ok(())
     }
 
     fn ensure_cache_save_metrics_registered() {

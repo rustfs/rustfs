@@ -733,6 +733,7 @@ async fn scan_and_persist_local_bucket(
                 &bucket,
                 expected_publication_epoch,
                 tier_registry_generation,
+                scan_mode,
             )
             .await
             .ok(),
@@ -835,6 +836,7 @@ async fn scan_and_persist_local_bucket(
             &bucket,
             expected_publication_epoch,
             tier_registry_generation,
+            scan_mode,
         )
         .await
         .ok()

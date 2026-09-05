@@ -737,6 +737,7 @@ pub(crate) async fn scanner_bucket_checkpoint_identity(
     bucket: &str,
     publication_epoch: u64,
     tier_registry_generation: u64,
+    scan_mode: HealScanMode,
 ) -> Result<crate::DataUsageScanIdentity> {
     let bucket_incarnation = set.bucket_incarnation_id_from_disk(bucket).await?;
     let disks = set
@@ -760,6 +761,7 @@ pub(crate) async fn scanner_bucket_checkpoint_identity(
         set_layout: crate::DataUsageScanPlanDigest(digest.finalize().into()),
         publication_epoch,
         tier_registry_generation,
+        scan_mode,
     })
 }
 
