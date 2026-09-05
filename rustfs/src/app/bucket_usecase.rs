@@ -75,8 +75,8 @@ use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::shared_types::RemoteAddr;
 use crate::site_replication::{
-    site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
-    with_site_replication_bucket_mutation_lock,
+    cancel_site_replication_delete_bucket, commit_site_replication_delete_bucket, prepare_site_replication_delete_bucket,
+    site_replication_bucket_meta_hook, site_replication_make_bucket_hook, with_site_replication_bucket_mutation_lock,
 };
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::StatusCode;
@@ -1410,7 +1410,8 @@ impl DefaultBucketUsecase {
         // same-name make while it waits for repair coordination.
         let operation_bucket = input.bucket.clone();
         let operation_store = store.clone();
-        let delete_result = with_site_replication_bucket_mutation_lock(store, &input.bucket, move || async move {
+        with_site_replication_bucket_mutation_lock(store, &input.bucket, move || async move {
+            let intent = prepare_site_replication_delete_bucket(&operation_bucket, force).await?;
             let delete_result = operation_store
                 .delete_bucket(
                     &operation_bucket,
@@ -1420,16 +1421,25 @@ impl DefaultBucketUsecase {
                     },
                 )
                 .await;
-            if delete_result.is_ok() {
-                crate::storage::invalidate_bucket_validation_cache(&operation_bucket);
-                if let Err(err) = site_replication_delete_bucket_hook(&operation_bucket, force).await {
-                    warn!(bucket = %operation_bucket, error = ?err, "site replication delete bucket hook failed");
+            match delete_result {
+                Ok(()) => {
+                    crate::storage::invalidate_bucket_validation_cache(&operation_bucket);
+                    if let Some(intent) = intent
+                        && let Err(err) = commit_site_replication_delete_bucket(&intent).await
+                    {
+                        warn!(bucket = %operation_bucket, error = ?err, "site replication delete bucket hook failed");
+                    }
+                    Ok::<(), S3Error>(())
+                }
+                Err(err) => {
+                    if let Some(intent) = intent {
+                        cancel_site_replication_delete_bucket(intent).await;
+                    }
+                    Err(S3Error::from(ApiError::from(err)))
                 }
             }
-            delete_result
         })
-        .await?;
-        delete_result.map_err(ApiError::from)?;
+        .await??;
 
         // Drop every cached object body for the now-deleted bucket so dead
         // bytes do not sit resident until TTL. Covers both the normal and the

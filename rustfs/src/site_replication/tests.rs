@@ -569,25 +569,25 @@ fn test_record_failed_iam_delivery_records_deletions_and_flags_entry() {
     // Non-deletion failure: entry flagged, no record.
     let mut user_update = user_delete_item("alice");
     user_update.iam_user.as_mut().expect("iam user").is_delete_req = false;
-    record_failed_iam_delivery(&mut state, &target, &user_update, "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &user_update, "peer offline").expect("record failure");
     assert_eq!(state.retry_queue.len(), 1);
     assert_eq!(state.retry_queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
     assert!(state.retry_queue[0].deletions_recorded);
     assert!(state.iam_deletion_replays.is_empty());
 
     // Deletion failure: recorded for replay, entry stays flagged.
-    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline").expect("record failure");
     assert_eq!(state.iam_deletion_replays.len(), 1);
     assert_eq!(state.iam_deletion_replays[0].entity, "iam-user:alice");
     assert!(state.retry_queue[0].deletions_recorded);
     assert_eq!(state.retry_queue.len(), 1, "IAM failures stay collapsed per peer");
 
     // Same entity again: newest body replaces the record.
-    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline").expect("record failure");
     assert_eq!(state.iam_deletion_replays.len(), 1);
 
     // Different entity: second record.
-    record_failed_iam_delivery(&mut state, &target, &policy_delete_item("readonly"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &policy_delete_item("readonly"), "peer offline").expect("record failure");
     assert_eq!(state.iam_deletion_replays.len(), 2);
 
     // A legacy entry (created without recording) is never stamped.
@@ -602,8 +602,9 @@ fn test_record_failed_iam_delivery_records_deletions_and_flags_entry() {
         SITE_REPLICATION_PEER_IAM_ITEM_WIRE_PATH,
         "peer offline",
         None,
-    );
-    record_failed_iam_delivery(&mut state, &legacy, &user_delete_item("bob"), "peer offline");
+    )
+    .expect("upsert retry event");
+    record_failed_iam_delivery(&mut state, &legacy, &user_delete_item("bob"), "peer offline").expect("record failure");
     let legacy_event = state
         .retry_queue
         .iter()
@@ -626,12 +627,13 @@ fn test_record_failed_iam_delivery_overflow_degrades_to_escalation() {
     };
     let mut state = deletion_replay_state(&target);
     for index in 0..SITE_REPLICATION_IAM_DELETION_REPLAY_LIMIT_PER_PEER {
-        record_failed_iam_delivery(&mut state, &target, &policy_delete_item(&format!("p{index}")), "peer offline");
+        record_failed_iam_delivery(&mut state, &target, &policy_delete_item(&format!("p{index}")), "peer offline")
+            .expect("record failure");
     }
     assert!(state.retry_queue[0].deletions_recorded);
     assert_eq!(state.iam_deletion_replays.len(), SITE_REPLICATION_IAM_DELETION_REPLAY_LIMIT_PER_PEER);
 
-    record_failed_iam_delivery(&mut state, &target, &policy_delete_item("one-too-many"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &policy_delete_item("one-too-many"), "peer offline").expect("record failure");
     assert_eq!(
         state.iam_deletion_replays.len(),
         SITE_REPLICATION_IAM_DELETION_REPLAY_LIMIT_PER_PEER,
@@ -657,7 +659,7 @@ fn test_settle_replayed_iam_retry_events_settles_or_escalates() {
 
     // Fully recorded: settles.
     let mut state = deletion_replay_state(&target);
-    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline").expect("record failure");
     state.retry_queue[0].updated_at = Some(snapshot_at);
     let replayed: Vec<String> = state.iam_deletion_replays.iter().map(|record| record.id.clone()).collect();
     assert!(settle_replayed_iam_retry_events(
@@ -673,7 +675,7 @@ fn test_settle_replayed_iam_retry_events_settles_or_escalates() {
     // Not fully recorded: replayed records are still removed, but the entry
     // escalates instead of settling.
     let mut state = deletion_replay_state(&target);
-    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline").expect("record failure");
     state.retry_queue[0].updated_at = Some(snapshot_at);
     state.retry_queue[0].deletions_recorded = false;
     let replayed: Vec<String> = state.iam_deletion_replays.iter().map(|record| record.id.clone()).collect();
@@ -691,9 +693,9 @@ fn test_settle_replayed_iam_retry_events_settles_or_escalates() {
     // Newer failure since the snapshot: entry untouched and drain-eligible,
     // residual (unreplayed) record kept for the next pass.
     let mut state = deletion_replay_state(&target);
-    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline").expect("record failure");
     let replayed: Vec<String> = state.iam_deletion_replays.iter().map(|record| record.id.clone()).collect();
-    record_failed_iam_delivery(&mut state, &target, &user_delete_item("bob"), "peer offline");
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("bob"), "peer offline").expect("record failure");
     state.retry_queue[0].updated_at = Some(snapshot_at + time::Duration::seconds(5));
     assert!(!settle_replayed_iam_retry_events(
         &mut state,
@@ -913,16 +915,41 @@ fn test_lightweight_bucket_retry_plan_is_targeted_and_preserves_make_options() {
 }
 
 #[test]
+fn test_lightweight_bucket_retry_plan_orders_real_metadata_and_counts_it() {
+    let bucket = SRBucketInfo {
+        bucket: "photos".to_string(),
+        policy: Some(serde_json::json!({"Version":"2012-10-17","Statement":[]})),
+        tags: Some(BASE64_STANDARD.encode_to_string("<Tagging/>")),
+        versioning: Some(BASE64_STANDARD.encode_to_string("<VersioningConfiguration/>")),
+        replication_config: Some(BASE64_STANDARD.encode_to_string("<ReplicationConfiguration/>")),
+        ..Default::default()
+    };
+    let plan = site_replication_bucket_retry_plan_from_info(&bucket, false).expect("targeted retry plan");
+    let tasks = bucket_op_retry_replay_tasks(&plan, SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING, "photos")
+        .expect("bucket replay tasks");
+
+    assert!(matches!(tasks.first(), Some(SiteReplicationRepairTask::BucketMake(_))));
+    assert!(matches!(tasks.last(), Some(SiteReplicationRepairTask::Replication(_))));
+    assert!(
+        tasks[1..tasks.len() - 1]
+            .iter()
+            .all(|task| matches!(task, SiteReplicationRepairTask::BucketMetadata(_)))
+    );
+    assert_eq!(tasks.len(), 4, "make + policy + tags + configure must all count against the budget");
+    assert!(tasks.len() > SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER);
+}
+
+#[test]
 fn test_delete_bucket_broadcast_fences_target_membership_through_delivery() {
     let hooks = include_str!("hooks.rs");
     let delete_broadcast = hooks
         .split("async fn broadcast_site_replication_delete_bucket")
         .nth(1)
-        .and_then(|rest| rest.split("pub async fn site_replication_delete_bucket_hook").next())
+        .and_then(|rest| rest.split("pub(crate) async fn commit_site_replication_delete_bucket").next())
         .expect("delete-bucket broadcast should exist");
     assert!(
         delete_broadcast.contains("with_site_replication_state_read_lock(move |state| async move {")
-            && delete_broadcast.contains("state.peers.get(&observed_peer.deployment_id)")
+            && delete_broadcast.contains("state.peers.get(&fallback_peer.deployment_id)")
             && delete_broadcast.contains("site_replicator_service_account_secret(&state.service_account_access_key)")
             && delete_broadcast
                 .contains("PeerAdminRequest::put(&transport.connection, &delivery_path, &state.service_account_access_key)"),
@@ -931,6 +958,20 @@ fn test_delete_bucket_broadcast_fences_target_membership_through_delivery() {
     assert!(
         delete_broadcast.contains("enqueue_site_replication_retry_event(&current_peer, &request_path, &err).await"),
         "a failed destructive delivery must remain visible for operator repair"
+    );
+
+    let usecase = include_str!("../app/bucket_usecase.rs");
+    let delete = usecase
+        .split("async fn execute_delete_bucket_inner")
+        .nth(1)
+        .and_then(|rest| rest.split("pub async fn execute_head_bucket").next())
+        .expect("delete bucket usecase");
+    assert!(
+        delete
+            .find("prepare_site_replication_delete_bucket")
+            .expect("durable reservation")
+            < delete.find(".delete_bucket(").expect("local delete"),
+        "destructive peer liabilities must be persisted before the local bucket is deleted"
     );
 }
 
@@ -1075,7 +1116,8 @@ fn test_retry_error_marks_peer_unreachable_only_for_connection_failures() {
         bucket_make,
         "peer request to https://remote.example.com failed (connect): connection refused",
         None,
-    );
+    )
+    .expect("upsert retry event");
     assert!(queue[0].peer_unreachable);
 
     upsert_site_replication_retry_event(
@@ -1084,7 +1126,8 @@ fn test_retry_error_marks_peer_unreachable_only_for_connection_failures() {
         bucket_make,
         "peer request to https://remote.example.com failed (timeout): request exceeded 10 seconds",
         None,
-    );
+    )
+    .expect("upsert retry event");
     assert!(
         !queue[0].peer_unreachable,
         "a whole-request timeout does not prove the peer is unreachable"
@@ -1096,7 +1139,8 @@ fn test_retry_error_marks_peer_unreachable_only_for_connection_failures() {
         bucket_make,
         "peer request to https://remote.example.com failed with 500 Internal Server Error: downstream failed (connect)",
         None,
-    );
+    )
+    .expect("upsert retry event");
     assert!(
         !queue[0].peer_unreachable,
         "application failures and their untrusted bodies must keep the normal replay backoff"
@@ -1108,7 +1152,8 @@ fn test_retry_error_marks_peer_unreachable_only_for_connection_failures() {
         bucket_make,
         "peer request to https://remote.example.com failed with 500 Internal Server Error: backend failed (connect): spoofed",
         None,
-    );
+    )
+    .expect("upsert retry event");
     assert!(!queue[0].peer_unreachable, "peer response bodies must not spoof transport failures");
 }
 
@@ -1361,7 +1406,7 @@ fn test_escalate_up_to_marks_snapshot_replayed_and_keeps_newer_failures() {
     // successful Bob update on the shared wire path cannot erase it even
     // before the drain runs.
     let mut queue = Vec::new();
-    upsert_site_replication_retry_event(&mut queue, &target, path, "alice delete failed", None);
+    upsert_site_replication_retry_event(&mut queue, &target, path, "alice delete failed", None).expect("upsert retry event");
     assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
     assert_eq!(dequeue_site_replication_retry_events(&mut queue, &target, path), 0);
     assert_eq!(queue.len(), 1);
@@ -1370,7 +1415,7 @@ fn test_escalate_up_to_marks_snapshot_replayed_and_keeps_newer_failures() {
     // A later hook failure overwrites the marker and re-arms the drain.
     let mut queue = vec![drain_event("remote", path, 2, Some(snapshot_at))];
     escalate_site_replication_retry_events_up_to(&mut queue, &target, path, Some(snapshot_at));
-    upsert_site_replication_retry_event(&mut queue, &target, path, "peer offline", None);
+    upsert_site_replication_retry_event(&mut queue, &target, path, "peer offline", None).expect("upsert retry event");
     assert!(classify_site_replication_retry_event(&queue[0]).is_some());
 
     // Legacy entry without a timestamp: escalated.
@@ -2146,11 +2191,14 @@ fn test_retry_event_upsert_marks_repeated_failures() {
     };
     let mut queue = Vec::new();
 
-    upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "first", None);
+    upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "first", None)
+        .expect("upsert retry event");
     let first_revision = queue[0].id.clone();
-    upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "second", None);
+    upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "second", None)
+        .expect("upsert retry event");
     let second_revision = queue[0].id.clone();
-    upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "third", None);
+    upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "third", None)
+        .expect("upsert retry event");
 
     assert_eq!(queue.len(), 1);
     assert_ne!(first_revision, second_revision);
@@ -2159,6 +2207,67 @@ fn test_retry_event_upsert_marks_repeated_failures() {
     assert_eq!(queue[0].retry_count, SITE_REPLICATION_RETRY_FAILED_AFTER);
     assert!(queue[0].failed);
     assert_eq!(queue[0].last_error, "third");
+}
+
+#[test]
+fn retry_queue_capacity_never_evicts_destructive_bucket_liabilities() {
+    let target = PeerInfo {
+        deployment_id: "remote-dep".to_string(),
+        ..peer("remote", "https://remote.example.com")
+    };
+    let destructive = |index: usize| SiteReplicationRetryEvent {
+        id: format!("delete-{index}"),
+        peer_deployment_id: target.deployment_id.clone(),
+        peer_endpoint: target.endpoint.clone(),
+        path: format!("{SITE_REPLICATION_PEER_BUCKET_OPS_PATH}?bucket=bucket-{index}&operation=delete-bucket"),
+        ..Default::default()
+    };
+    let mut queue = (0..SITE_REPLICATION_RETRY_QUEUE_LIMIT).map(destructive).collect::<Vec<_>>();
+    let original_ids = queue.iter().map(|event| event.id.clone()).collect::<HashSet<_>>();
+    let new_path = format!("{SITE_REPLICATION_PEER_BUCKET_OPS_PATH}?bucket=overflow&operation=force-delete-bucket");
+
+    let err = upsert_site_replication_retry_event(&mut queue, &target, &new_path, "reserve delete", None)
+        .expect_err("an all-destructive full queue must fail closed");
+    assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+    assert_eq!(queue.len(), SITE_REPLICATION_RETRY_QUEUE_LIMIT);
+    assert_eq!(queue.iter().map(|event| event.id.clone()).collect::<HashSet<_>>(), original_ids);
+
+    queue[0] = SiteReplicationRetryEvent {
+        id: "iam-snapshot".to_string(),
+        peer_deployment_id: target.deployment_id.clone(),
+        peer_endpoint: target.endpoint.clone(),
+        path: SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH.to_string(),
+        deletions_recorded: true,
+        ..Default::default()
+    };
+    upsert_site_replication_retry_event(&mut queue, &target, &new_path, "reserve delete", None)
+        .expect_err("a collapsed IAM liability may contain a deletion and must not be evicted");
+    assert!(queue.iter().any(|event| event.id == "iam-snapshot"));
+
+    queue[0] = SiteReplicationRetryEvent {
+        id: "rebuildable".to_string(),
+        peer_deployment_id: target.deployment_id.clone(),
+        peer_endpoint: target.endpoint.clone(),
+        path: SITE_REPLICATION_PEER_EDIT_PATH.to_string(),
+        ..Default::default()
+    };
+    let preserved_delete_ids = queue
+        .iter()
+        .filter(|event| is_destructive_bucket_retry_path(&event.path))
+        .map(|event| event.id.clone())
+        .collect::<HashSet<_>>();
+    let evicted = upsert_site_replication_retry_event(&mut queue, &target, &new_path, "reserve delete", None)
+        .expect("a rebuildable row may make room for a destructive liability");
+
+    assert_eq!(evicted.len(), 1);
+    assert_eq!(evicted[0].id, "rebuildable");
+    assert_eq!(queue.len(), SITE_REPLICATION_RETRY_QUEUE_LIMIT);
+    assert!(
+        preserved_delete_ids
+            .iter()
+            .all(|id| queue.iter().any(|event| &event.id == id))
+    );
+    assert!(queue.iter().any(|event| event.path == new_path));
 }
 
 /// P1-15 review follow-up: a successful peer-edit delivery only proves the
@@ -2176,7 +2285,8 @@ fn retry_settlement_must_not_erase_a_newer_generation_failure() {
     // Edit A (generation 5) delivered successfully and is stalled before
     // settling. Edit B (generation 6) commits meanwhile, fails delivery to
     // the same peer, and enqueues.
-    upsert_site_replication_retry_event(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, "peer offline", Some(6));
+    upsert_site_replication_retry_event(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, "peer offline", Some(6))
+        .expect("upsert retry event");
 
     // A resumes: its own settlement must leave B's retry alone.
     assert_eq!(
@@ -2187,7 +2297,8 @@ fn retry_settlement_must_not_erase_a_newer_generation_failure() {
     assert_eq!(queue[0].edit_generation, Some(6));
 
     // An even older delivery failing afterwards must not lower the fence.
-    upsert_site_replication_retry_event(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, "still offline", Some(4));
+    upsert_site_replication_retry_event(&mut queue, &peer, SITE_REPLICATION_PEER_EDIT_PATH, "still offline", Some(4))
+        .expect("upsert retry event");
     assert_eq!(queue[0].edit_generation, Some(6));
 
     // B's own delivery succeeding is what clears it.
@@ -2200,7 +2311,7 @@ fn retry_settlement_must_not_erase_a_newer_generation_failure() {
     // Collapsed broadcast failures live under an internal snapshot path;
     // an unrelated success on their shared wire path cannot settle them.
     let iam_path = "/rustfs/admin/v3/site-replication/peer/iam-item";
-    upsert_site_replication_retry_event(&mut queue, &peer, iam_path, "peer offline", None);
+    upsert_site_replication_retry_event(&mut queue, &peer, iam_path, "peer offline", None).expect("upsert retry event");
     assert_eq!(dequeue_site_replication_retry_events(&mut queue, &peer, iam_path), 0);
     assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
 }

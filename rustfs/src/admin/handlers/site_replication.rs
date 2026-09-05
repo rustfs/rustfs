@@ -190,7 +190,8 @@ fn site_replicator_service_account_policy() -> S3Result<Policy> {
     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("parse site replicator policy failed: {e}")))
 }
 
-// Lock order: lifecycle -> bucket operation -> repair admission -> state -> per-bucket metadata.
+// Lock order: lifecycle -> bucket-mutation admission -> per-bucket mutation
+// -> bucket operation -> repair admission -> state -> per-bucket metadata.
 // "state" is the distributed state-object lock in
 // crate::site_replication::state_lock, entered through
 // update_site_replication_state (P1-15). There is no process-local state
@@ -6137,6 +6138,30 @@ fn parse_peer_join_response(body: &[u8], fallback_peer: PeerInfo) -> Result<SRPe
     serde_json::from_slice(body)
 }
 
+fn ensure_add_bucket_set_matches_preflight(expected: &HashSet<String>, present: &HashSet<String>) -> S3Result<()> {
+    let mut missing = expected.difference(present).cloned().collect::<Vec<_>>();
+    if !missing.is_empty() {
+        missing.sort_unstable();
+        return Err(s3_error!(
+            InvalidRequest,
+            "bucket `{}` disappeared while site replication was being added; peers may already be joined — re-run replicate add",
+            missing[0]
+        ));
+    }
+
+    let mut unexpected = present.difference(expected).cloned().collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        unexpected.sort_unstable();
+        return Err(s3_error!(
+            InvalidRequest,
+            "bucket `{}` appeared while site replication was being added; peers may already be joined — re-run replicate add",
+            unexpected[0]
+        ));
+    }
+
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl Operation for SiteReplicationAddHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -6172,12 +6197,13 @@ impl Operation for SiteReplicationAddHandler {
         let current_state = latest_state;
         let (service_account_access_key, service_account_secret_key) =
             ensure_site_replicator_service_account(&cred.access_key, false).await?;
-        let bootstrap_buckets = preflight_infos
+        let expected_buckets: HashSet<String> = preflight_infos.iter().flat_map(|info| info.buckets.keys().cloned()).collect();
+        let bootstrap_buckets: HashSet<String> = preflight_infos
             .iter()
             .filter(|info| !same_identity_endpoint(&info.endpoint, &local_peer.endpoint))
             .flat_map(|info| info.buckets.keys().cloned())
             .collect();
-        let add_in_progress_guard = SiteReplicationAddInProgressGuard::start(lifecycle_guard, bootstrap_buckets)?;
+        let add_in_progress_guard = SiteReplicationAddInProgressGuard::start(lifecycle_guard, bootstrap_buckets.clone())?;
         let mut state = merge_add_sites(
             current_state,
             local_peer.clone(),
@@ -6265,16 +6291,35 @@ impl Operation for SiteReplicationAddHandler {
         // says so: by this point the remote sites already accepted their
         // joins, and re-running the add is what reconverges the local side.
         let next_state = state;
-        let (state, edit_generation) = update_site_replication_state(move |state| {
-            if state.updated_at != expected_updated_at || pending_endpoint_refresh(state).is_some() {
-                return Err(s3_error!(
-                    InvalidRequest,
-                    "site replication state changed during peer join; the peers may already be joined — re-run replicate add"
-                ));
-            }
-            adopt_add_commit_state(state, next_state);
-            let edit_generation = next_peer_edit_generation(state);
-            Ok((state.clone(), edit_generation))
+        let commit_store = current_object_store_handle()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
+        let list_store = commit_store.clone();
+        let (state, edit_generation) = with_site_replication_bucket_mutation_admission_lock(commit_store, move || async move {
+            // Join callbacks have completed before this write admission is
+            // taken. A local create/delete that finished while replication
+            // was still disabled changes the preflight union and aborts the
+            // commit; one that starts after admission waits until the
+            // committed state makes its hook active.
+            let present = list_store
+                .list_bucket(&BucketOptions::default())
+                .await
+                .map_err(ApiError::from)?
+                .into_iter()
+                .map(|bucket| bucket.name)
+                .collect::<HashSet<_>>();
+            ensure_add_bucket_set_matches_preflight(&expected_buckets, &present)?;
+            update_site_replication_state(move |state| {
+                if state.updated_at != expected_updated_at || pending_endpoint_refresh(state).is_some() {
+                    return Err(s3_error!(
+                        InvalidRequest,
+                        "site replication state changed during peer join; the peers may already be joined — re-run replicate add"
+                    ));
+                }
+                adopt_add_commit_state(state, next_state);
+                let edit_generation = next_peer_edit_generation(state);
+                Ok((state.clone(), edit_generation))
+            })
+            .await
         })
         .await?;
 
@@ -8955,6 +9000,40 @@ mod tests {
             !add.contains("SITE_REPLICATION_PEER_EDIT_PATH"),
             "the finalize fan-out must not fall back to the unstamped peer-edit path"
         );
+    }
+
+    #[test]
+    fn add_commit_fails_when_a_bootstrap_bucket_disappeared() {
+        let expected = HashSet::from(["remote-owned".to_string(), "shared".to_string()]);
+        let present = HashSet::from(["shared".to_string()]);
+
+        let err = ensure_add_bucket_set_matches_preflight(&expected, &present)
+            .expect_err("a missing bootstrap bucket must reject the topology commit");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        let present = HashSet::from([
+            "remote-owned".to_string(),
+            "shared".to_string(),
+            "created-during-add".to_string(),
+        ]);
+        let err = ensure_add_bucket_set_matches_preflight(&expected, &present)
+            .expect_err("a bucket created during add must reject the topology commit");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        let src = include_str!("site_replication.rs");
+        let add = src
+            .split("impl Operation for SiteReplicationAddHandler")
+            .nth(1)
+            .and_then(|rest| rest.split("pub struct SiteReplicationRemoveHandler").next())
+            .expect("add handler block");
+        let admission = add
+            .find("with_site_replication_bucket_mutation_admission_lock")
+            .expect("distributed mutation admission");
+        let validation = add
+            .find("ensure_add_bucket_set_matches_preflight")
+            .expect("bucket-set validation");
+        let commit = add.find("adopt_add_commit_state").expect("topology commit");
+        assert!(admission < validation && validation < commit);
     }
 
     #[test]

@@ -33,8 +33,10 @@
 //! delivery only when the receiver cannot write this state. Peer-edit
 //! delivery must run after the read lock is released.
 //!
-//! Lock order: lifecycle -> bucket operation -> repair admission
-//! -> state object lock -> per-bucket metadata.
+//! Lock order: lifecycle -> bucket-mutation admission -> per-bucket mutation
+//! -> bucket operation -> repair admission -> state object lock ->
+//! per-bucket metadata. A path may skip levels, but must not acquire an
+//! earlier level while holding a later one.
 
 use super::{S3Error, S3ErrorCode, S3Result, SiteReplicationState, load_site_replication_state_no_lock};
 use crate::storage_api::site_replication::{ECStore, with_config_object_read_lock, with_config_object_write_lock};

@@ -223,7 +223,7 @@ pub(crate) fn upsert_site_replication_retry_event(
     path: &str,
     error: &str,
     generation: Option<u64>,
-) {
+) -> S3Result<Vec<SiteReplicationRetryEvent>> {
     let path = collapsed_retry_queue_path(path).unwrap_or(path);
     let now = OffsetDateTime::now_utc();
     let detail = summarize_peer_error_detail(error);
@@ -241,9 +241,31 @@ pub(crate) fn upsert_site_replication_retry_event(
         // Keep the newest generation: an older delivery that fails afterwards
         // must not lower the fence and let its own success settle the event.
         event.edit_generation = event.edit_generation.max(generation);
-        return;
+        return Ok(Vec::new());
     }
 
+    let slots_needed = queue
+        .len()
+        .saturating_add(1)
+        .saturating_sub(SITE_REPLICATION_RETRY_QUEUE_LIMIT);
+    let mut evict_indices = queue
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| retry_event_is_safely_replayable(event).then_some(index))
+        .take(slots_needed)
+        .collect::<Vec<_>>();
+    if evict_indices.len() != slots_needed {
+        return Err(S3Error::with_message(
+            S3ErrorCode::ServiceUnavailable,
+            "site replication retry queue is full of non-evictable liabilities; repair them before recording more failures"
+                .to_string(),
+        ));
+    }
+    let mut evicted = Vec::with_capacity(evict_indices.len());
+    while let Some(index) = evict_indices.pop() {
+        evicted.push(queue.remove(index));
+    }
+    evicted.reverse();
     queue.push(SiteReplicationRetryEvent {
         id: Uuid::new_v4().to_string(),
         peer_deployment_id: peer.deployment_id.clone(),
@@ -257,10 +279,21 @@ pub(crate) fn upsert_site_replication_retry_event(
         peer_unreachable,
         deletions_recorded: false,
     });
-    if queue.len() > SITE_REPLICATION_RETRY_QUEUE_LIMIT {
-        let overflow = queue.len() - SITE_REPLICATION_RETRY_QUEUE_LIMIT;
-        queue.drain(0..overflow);
-    }
+    Ok(evicted)
+}
+
+pub(crate) fn is_destructive_bucket_retry_path(path: &str) -> bool {
+    matches!(
+        retry_bucket_operation(path).as_deref(),
+        Some("delete-bucket" | "force-delete-bucket" | "purge-deleted-bucket")
+    )
+}
+
+fn retry_event_is_safely_replayable(event: &SiteReplicationRetryEvent) -> bool {
+    matches!(
+        classify_site_replication_retry_event(event),
+        Some(RetryDrainAction::PeerEdit | RetryDrainAction::BucketOpReplay { .. })
+    )
 }
 
 pub(crate) fn retry_error_indicates_peer_unreachable(error: &str) -> bool {
@@ -310,7 +343,7 @@ pub(crate) async fn enqueue_site_replication_retry_event_for_generation(
         // (remove_sites already pruned them); recording a late failure for it
         // would only pollute retry_stats until the queue cap evicts it.
         if state.peers.contains_key(&peer_owned.deployment_id) {
-            upsert_site_replication_retry_event(&mut state.retry_queue, &peer_owned, &path_owned, &error_text, generation);
+            upsert_site_replication_retry_event(&mut state.retry_queue, &peer_owned, &path_owned, &error_text, generation)?;
         }
         Ok(())
     })
@@ -395,12 +428,17 @@ pub(crate) fn iam_item_deletion_entity(item: &SRIAMItem) -> Option<String> {
 /// live in the same state so the caller commits them in one transaction — a
 /// retry entry can never exist whose deletion body was lost to a separate
 /// failed write.
-pub(crate) fn record_failed_iam_delivery(state: &mut SiteReplicationState, peer: &PeerInfo, item: &SRIAMItem, error: &str) {
+pub(crate) fn record_failed_iam_delivery(
+    state: &mut SiteReplicationState,
+    peer: &PeerInfo,
+    item: &SRIAMItem,
+    error: &str,
+) -> S3Result<()> {
     let existed = state
         .retry_queue
         .iter()
         .any(|event| retry_event_matches(event, peer, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH));
-    upsert_site_replication_retry_event(&mut state.retry_queue, peer, SITE_REPLICATION_PEER_IAM_ITEM_WIRE_PATH, error, None);
+    upsert_site_replication_retry_event(&mut state.retry_queue, peer, SITE_REPLICATION_PEER_IAM_ITEM_WIRE_PATH, error, None)?;
     if !existed
         && let Some(event) = state
             .retry_queue
@@ -414,13 +452,13 @@ pub(crate) fn record_failed_iam_delivery(state: &mut SiteReplicationState, peer:
     }
 
     let Some(entity) = iam_item_deletion_entity(item) else {
-        return;
+        return Ok(());
     };
     let item_value = match serde_json::to_value(item) {
         Ok(value) => value,
         Err(_) => {
             degrade_iam_retry_event_to_escalation(state, peer);
-            return;
+            return Ok(());
         }
     };
     let now = OffsetDateTime::now_utc();
@@ -431,7 +469,7 @@ pub(crate) fn record_failed_iam_delivery(state: &mut SiteReplicationState, peer:
     {
         existing.item = item_value;
         existing.recorded_at = Some(now);
-        return;
+        return Ok(());
     }
 
     let per_peer = state
@@ -463,6 +501,7 @@ pub(crate) fn record_failed_iam_delivery(state: &mut SiteReplicationState, peer:
         item: item_value,
         recorded_at: Some(now),
     });
+    Ok(())
 }
 
 pub(crate) fn degrade_iam_retry_event_to_escalation(state: &mut SiteReplicationState, peer: &PeerInfo) {
@@ -506,7 +545,7 @@ pub(crate) async fn record_failed_site_replication_iam_delivery(peer: &PeerInfo,
         // A departed peer can never drain its entries again (remove_sites
         // already pruned them) — mirror enqueue_site_replication_retry_event.
         if state.peers.contains_key(&peer_owned.deployment_id) {
-            record_failed_iam_delivery(state, &peer_owned, &item_owned, &error_text);
+            record_failed_iam_delivery(state, &peer_owned, &item_owned, &error_text)?;
         }
         Ok(())
     })

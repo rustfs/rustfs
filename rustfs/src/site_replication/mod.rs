@@ -65,12 +65,12 @@ use crate::storage_api::site_replication::s3::{
 #[cfg(test)]
 use crate::storage_api::site_replication::save_config as save_admin_config;
 use crate::storage_api::site_replication::{
-    ARN, BUCKET_REPLICATION_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BucketOperations, BucketOptions, BucketTarget,
-    BucketTargetSys, BucketTargetType, BucketTargets, Credentials, ECStore, OperatorRuleContract, StorageError,
-    VersioningApi as _, assign_site_replication_rule_priorities, delete_config_no_lock, deserialize, is_err_bucket_not_found,
-    is_site_replication_role, lock_bucket_targets_metadata, metadata_sys, read_config as read_admin_config, read_config_no_lock,
-    replication_target_arn_deployment_id, save_config_no_lock, serialize, site_replication_rule_deployment_id,
-    with_config_object_read_lock, with_config_object_write_lock,
+    ARN, BUCKET_REPLICATION_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BucketMetadata, BucketOperations,
+    BucketOptions, BucketTarget, BucketTargetSys, BucketTargetType, BucketTargets, Credentials, ECStore, OperatorRuleContract,
+    StorageError, VersioningApi as _, assign_site_replication_rule_priorities, delete_config_no_lock, deserialize,
+    is_err_bucket_not_found, is_site_replication_role, lock_bucket_targets_metadata, metadata_sys,
+    read_config as read_admin_config, read_config_no_lock, replication_target_arn_deployment_id, save_config_no_lock, serialize,
+    site_replication_rule_deployment_id, with_config_object_read_lock, with_config_object_write_lock,
 };
 use base64_simd::STANDARD as BASE64_STANDARD;
 use base64_simd::URL_SAFE_NO_PAD;
