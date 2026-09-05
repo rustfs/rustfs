@@ -923,7 +923,7 @@ impl DataUsageCache {
                 (key.as_str() <= through && !ancestor) || descendant
             })
             .collect::<Vec<_>>();
-        prefix.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        prefix.sort_unstable_by_key(|(key, _)| *key);
         for (key, entry) in prefix {
             let mut value = serde_json::to_value(entry)?;
             value.sort_all_objects();
