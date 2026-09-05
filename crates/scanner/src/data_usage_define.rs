@@ -782,6 +782,29 @@ impl DataUsageCache {
         (visited == expected_entries).then_some(entry)
     }
 
+    pub(crate) fn has_complete_root_inventory(&self, bucket_keys: &HashSet<String>) -> bool {
+        let Some(root) = self.find(DATA_USAGE_ROOT) else {
+            return false;
+        };
+        // Set roots only connect bucket entries. Scalar data at the root, an
+        // extra bucket, or an orphan must not disappear during bucket folding.
+        root.children.len() == bucket_keys.len()
+            && bucket_keys.iter().all(|key| root.children.contains(key))
+            && root.size == 0
+            && root.objects == 0
+            && root.versions == 0
+            && root.delete_markers == 0
+            && root.failed_objects == 0
+            && !root.compacted
+            && root.obj_sizes.is_empty()
+            && root.obj_versions.is_empty()
+            && root.replication_stats.is_none()
+            && root.all_tier_stats.is_none()
+            && root.unknown_tier_stats.is_none()
+            && root.tier_accounting_proof.is_none()
+            && self.checked_flatten_complete(DATA_USAGE_ROOT).is_some()
+    }
+
     fn checked_flatten_inner(&self, path: &str) -> Option<(DataUsageEntry, usize)> {
         let root_key = hash_path(path).key();
         let (root_key, root) = self.cache.get_key_value(&root_key)?;

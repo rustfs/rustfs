@@ -213,10 +213,85 @@ pub(super) fn cache_snapshot_is_current(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ScannerSnapshotIdentity {
+    pub(super) cycle: u64,
+    pub(super) leader_epoch: u64,
+    pub(super) plan_digest: DataUsageScanPlanDigest,
+    pub(super) tier_registry_generation: Option<u64>,
+}
+
+pub(super) struct ScannerSnapshotScope<'a> {
+    pub(super) sources: &'a HashSet<DataUsageCacheSource>,
+    pub(super) buckets: &'a [String],
+    pub(super) identity: ScannerSnapshotIdentity,
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(super) enum ScannerSnapshotValidationError {
+    #[error("scanner snapshot does not cover the expected complete sets")]
+    IncompleteSets,
+    #[error("scanner snapshot does not match the requested generation")]
+    GenerationMismatch,
+    #[error("scanner snapshot bucket inventory is invalid")]
+    InvalidInventory,
+    #[error("scanner snapshot root is incomplete or corrupt")]
+    InvalidRoot,
+}
+
+struct ValidatedScannerSnapshot<'a> {
+    results: &'a [DataUsageCache],
+    last_update: SystemTime,
+}
+
+impl<'a> ValidatedScannerSnapshot<'a> {
+    fn validate(
+        results: &'a [DataUsageCache],
+        scope: &ScannerSnapshotScope<'_>,
+    ) -> std::result::Result<Self, ScannerSnapshotValidationError> {
+        if !scanner_results_form_complete_snapshot(results, scope.sources) {
+            return Err(ScannerSnapshotValidationError::IncompleteSets);
+        }
+        let bucket_keys = scope
+            .buckets
+            .iter()
+            .map(|bucket| crate::hash_path(bucket).key())
+            .collect::<HashSet<_>>();
+        if bucket_keys.len() != scope.buckets.len()
+            || scope
+                .buckets
+                .iter()
+                .any(|bucket| bucket.is_empty() || bucket == DATA_USAGE_ROOT)
+        {
+            return Err(ScannerSnapshotValidationError::InvalidInventory);
+        }
+        for result in results {
+            if result.info.next_cycle != scope.identity.cycle
+                || result.info.leader_epoch != scope.identity.leader_epoch
+                || result.info.scan_plan_digest != Some(scope.identity.plan_digest)
+                || result.info.tier_registry_generation != scope.identity.tier_registry_generation
+            {
+                return Err(ScannerSnapshotValidationError::GenerationMismatch);
+            }
+            if result.info.name != DATA_USAGE_ROOT
+                || result.info.cache_key_format != DATA_USAGE_CACHE_KEY_FORMAT
+                || !result.has_complete_root_inventory(&bucket_keys)
+            {
+                return Err(ScannerSnapshotValidationError::InvalidRoot);
+            }
+        }
+        let last_update = results
+            .iter()
+            .filter_map(|result| result.info.last_update)
+            .max()
+            .ok_or(ScannerSnapshotValidationError::IncompleteSets)?;
+        Ok(Self { results, last_update })
+    }
+}
+
 pub(super) fn completed_data_usage_info(
     results: &[DataUsageCache],
-    expected_sources: &HashSet<DataUsageCacheSource>,
-    all_buckets: &[String],
+    scope: &ScannerSnapshotScope<'_>,
     tier_registry_names: &[String],
     bucket_plan_complete: bool,
     budget_elapsed: bool,
@@ -229,26 +304,10 @@ pub(super) fn completed_data_usage_info(
     if !should_publish_completed_snapshot(completed_set_count, results.len(), budget_elapsed, cancelled) {
         return None;
     }
-    if !scanner_results_form_complete_snapshot(results, expected_sources) {
-        return None;
-    }
-
-    // A generation is comparable across nodes because it is derived from the
-    // frozen registry names. Cycle and leader fencing remain separate cache
-    // metadata. Legacy peers omit the generation; an all-legacy result remains
-    // readable, but mixing legacy and new (or two new generations) would make
-    // the per-tier accounting ambiguous.
-    let registry_generation = results.first()?.info.tier_registry_generation;
-    if results.iter().any(|result| match registry_generation {
-        Some(generation) => result.info.tier_registry_generation != Some(generation),
-        None => result.info.tier_registry_generation.is_some(),
-    }) {
-        return None;
-    }
-
-    if results.iter().any(|result| result.root().is_none()) {
-        return None;
-    }
+    let validated = ValidatedScannerSnapshot::validate(results, scope).ok()?;
+    let results = validated.results;
+    let all_buckets = scope.buckets;
+    let registry_generation = scope.identity.tier_registry_generation;
 
     let mut total = DataUsageEntry::default();
     let mut bucket_entries = HashMap::with_capacity(all_buckets.len());
@@ -273,7 +332,7 @@ pub(super) fn completed_data_usage_info(
         return None;
     }
 
-    let merged_last_update = results.iter().filter_map(|result| result.info.last_update).max()?;
+    let merged_last_update = validated.last_update;
     let buckets_usage = bucket_entries
         .iter()
         .map(|(bucket, entry)| Some((bucket.clone(), checked_bucket_usage_info(entry)?)))
@@ -300,8 +359,8 @@ pub(super) fn completed_data_usage_info(
     usage_snapshot_set_states.sort_by_key(|state| (state.pool_index, state.set_index));
     let data_usage_info = DataUsageInfo {
         last_update: Some(merged_last_update),
-        scanner_cycle: Some(results.first()?.info.next_cycle),
-        scanner_epoch: Some(results.first()?.info.leader_epoch),
+        scanner_cycle: Some(scope.identity.cycle),
+        scanner_epoch: Some(scope.identity.leader_epoch),
         objects_total_count: u64::try_from(total.objects).ok()?,
         versions_total_count: u64::try_from(total.versions).ok()?,
         delete_markers_total_count: u64::try_from(total.delete_markers).ok()?,
