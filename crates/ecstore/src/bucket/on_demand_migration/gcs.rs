@@ -164,7 +164,7 @@ impl GcsNativeSourceBackend {
 impl SourceBackend for GcsNativeSourceBackend {
     async fn head(&self, key: &str) -> Result<SourceHead, SourceError> {
         let request = self.request(Method::HEAD, self.object_url(key)?, HeaderMap::new()).await?;
-        let response = self.http.send(request, NO_ERROR_CODE_HEADER).await?;
+        let response = self.http.send_object(request, NO_ERROR_CODE_HEADER).await?;
         Self::head_from_response(response.headers())
     }
 
@@ -177,7 +177,7 @@ impl SourceBackend for GcsNativeSourceBackend {
             );
         }
         let request = self.request(Method::GET, self.object_url(key)?, headers).await?;
-        let response = self.http.send(request, NO_ERROR_CODE_HEADER).await?;
+        let response = self.http.send_object(request, NO_ERROR_CODE_HEADER).await?;
         let head = Self::head_from_response(response.headers())?;
         let content_range = header(response.headers(), "content-range").map(str::to_string);
         Ok(SourceGet {
@@ -502,5 +502,18 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn listing_404_is_not_an_object_not_found() {
+        let (endpoint, _) = scripted_server(vec![ScriptedResponse::new(404, Vec::new(), String::new())]).await;
+        let err = backend(&endpoint)
+            .list(&SourceListRequest {
+                max_keys: 1,
+                ..Default::default()
+            })
+            .await
+            .expect_err("a failed bucket listing is not a per-object miss");
+        assert_eq!(err.class_label(), "other", "{err:?}");
     }
 }
