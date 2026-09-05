@@ -777,6 +777,9 @@ impl DataUsageCache {
             && self.info.scan_identity == Some(identity)
             && self.info.tier_registry_generation == Some(identity.tier_registry_generation)
             && (self.cache.is_empty() || self.checked_flatten_complete_scope(name).is_some());
+        if reusable && self.info.scan_progress.is_none() && self.info.scan_plan_digest == Some(scan_plan_digest) {
+            return self.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, true);
+        }
         if !reusable {
             let keep_debts = self.info.name == name
                 && self

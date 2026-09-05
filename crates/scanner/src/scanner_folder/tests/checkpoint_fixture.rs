@@ -294,6 +294,31 @@ fn checkpoint_fixture_roundtrip_retains_verified_scope_but_old_reader_rebuilds()
 }
 
 #[test]
+fn checkpoint_fixture_unchanged_complete_plan_keeps_existing_rescan_policy() {
+    let (mut cache, identity) = bound_checkpoint();
+    cache.info.scan_progress = None;
+    cache.info.scan_plan_digest = Some(PLAN);
+    cache.info.scan_resume_after = None;
+    cache.info.scan_checkpoint = None;
+    cache.info.snapshot_complete = true;
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 12, 7, SOURCE, PLAN, identity),
+        crate::DataUsageCachePrepareOutcome::Reused
+    );
+    assert!(
+        cache.info.scan_progress.is_none(),
+        "unchanged complete coverage needs no forced verification sweep"
+    );
+    assert_eq!(cache.info.scan_plan_digest, Some(PLAN));
+    assert_eq!(retained(&cache), 3);
+    let next = DataUsageScanPlanDigest([44; 32]);
+    cache.prepare_bucket_checkpoint("bucket", 12, 7, SOURCE, next, identity);
+    assert_eq!(cache.info.scan_progress.expect("changed plan must be verified").started_plan, next);
+    assert!(cache.info.scan_plan_digest.is_none());
+    assert!(!cache.info.snapshot_complete);
+}
+
+#[test]
 fn checkpoint_fixture_identity_changes_and_future_state_fail_closed() {
     let (cache, identity) = bound_checkpoint();
     for next_identity in [
@@ -453,6 +478,7 @@ async fn run_checkpoint_fixture(change_digest: bool) {
             },
         );
         let prepared = retained(&cache);
+        cache.info.skip_healing = true;
         let parent = CancellationToken::new();
         let budget = ScannerCycleBudget::new_with_progress_tracking(
             &parent,
@@ -581,6 +607,7 @@ async fn run_checkpoint_fixture(change_digest: bool) {
                 checkpoint_identity: Some(identity),
             },
         );
+        cache.info.skip_healing = true;
         let parent = CancellationToken::new();
         let budget = ScannerCycleBudget::new_with_progress_tracking(
             &parent,
