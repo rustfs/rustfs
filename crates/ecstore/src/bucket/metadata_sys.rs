@@ -645,6 +645,12 @@ pub struct BucketMetadataMutationGuard {
 }
 
 impl BucketMetadataMutationGuard {
+    /// Returns the storage-verified identity while both incarnation fences remain valid.
+    pub fn checked_bucket_incarnation(&self) -> Result<(&str, Uuid)> {
+        self.ensure_valid(&self.bucket)?;
+        Ok((&self.bucket, self.incarnation_id))
+    }
+
     fn ensure_valid(&self, bucket: &str) -> Result<()> {
         if self.bucket != bucket {
             return Err(Error::other("bucket metadata mutation guard does not match bucket"));
@@ -665,19 +671,44 @@ async fn acquire_config_write_guard_for_incarnation(
     bucket: &str,
     expected_incarnation_id: Option<Uuid>,
 ) -> Result<BucketMetadataMutationGuard> {
+    acquire_config_write_guard_with_migration(sys, bucket, expected_incarnation_id, true).await
+}
+
+/// Scanner probes must not create an incarnation to make a capability available.
+pub async fn acquire_scanner_bucket_incarnation_fence(
+    bucket: &str,
+    expected_incarnation_id: Uuid,
+    expected_owner_id: Uuid,
+) -> Result<BucketMetadataMutationGuard> {
+    super::utils::check_valid_bucket_name(bucket)?;
+    let sys = get_bucket_metadata_sys()?;
+    if expected_owner_id.is_nil() || sys.read().await.api.id != expected_owner_id || expected_incarnation_id.is_nil() {
+        return Err(Error::other("scanner bucket incarnation owner does not match"));
+    }
+    acquire_config_write_guard_with_migration(sys, bucket, Some(expected_incarnation_id), false).await
+}
+
+async fn acquire_config_write_guard_with_migration(
+    sys: Arc<RwLock<BucketMetadataSys>>,
+    bucket: &str,
+    expected_incarnation_id: Option<Uuid>,
+    migrate: bool,
+) -> Result<BucketMetadataMutationGuard> {
     let metadata_sys = sys.read().await.clone();
     let lifecycle_guard = metadata_sys.api.acquire_bucket_lifecycle_read_lock(bucket).await?;
 
     // Legacy buckets are migrated while the lifecycle fence prevents a
     // same-name replacement. The second read under the write transaction is
     // the CAS source of truth for the actual rewrite.
-    await_bucket_namespace_operation(
-        Some(&lifecycle_guard),
-        bucket,
-        "bucket config incarnation migration",
-        metadata_sys.get_bucket_incarnation_id(bucket),
-    )
-    .await?;
+    if migrate {
+        await_bucket_namespace_operation(
+            Some(&lifecycle_guard),
+            bucket,
+            "bucket config incarnation migration",
+            metadata_sys.get_bucket_incarnation_id(bucket),
+        )
+        .await?;
+    }
     let transaction_guard = await_bucket_namespace_operation(
         Some(&lifecycle_guard),
         bucket,
@@ -3124,6 +3155,82 @@ mod tests {
                 .bucket_incarnation_id
                 .is_nil(),
             "a failed migration must not fabricate authority in memory or on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_dirty_usage_incarnation_probe_does_not_migrate_legacy_metadata() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let sys = Arc::new(RwLock::new(BucketMetadataSys::new(store.clone())));
+        let bucket = "scoped-ack-legacy";
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).expect("create legacy bucket");
+        }
+        let mut metadata = BucketMetadata::new(bucket);
+        metadata.bucket_incarnation_id = Uuid::nil();
+        sys.read()
+            .await
+            .persist_and_set(metadata)
+            .await
+            .expect("persist legacy metadata");
+        assert!(
+            acquire_config_write_guard_with_migration(sys.clone(), bucket, Some(Uuid::new_v4()), false)
+                .await
+                .is_err()
+        );
+        assert!(load_bucket_incarnation(store, bucket).await.expect("read sidecar").is_none());
+        assert!(
+            sys.read()
+                .await
+                .get_config_from_disk(bucket)
+                .await
+                .expect("read metadata")
+                .bucket_incarnation_id
+                .is_nil()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn scoped_dirty_usage_incarnation_rejects_deleted_and_recreated_bucket() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let sys = bucket_metadata_sys_of(&store.ctx).expect("metadata owner");
+        let bucket = "scoped-ack-recreated";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let old = store.bucket_incarnation_id_from_disk(bucket).await.expect("old incarnation");
+        let guard = acquire_config_write_guard_with_migration(sys.clone(), bucket, Some(old), false)
+            .await
+            .expect("trusted incarnation fence");
+        assert_eq!(guard.checked_bucket_incarnation().expect("valid fences"), (bucket, old));
+        drop(guard);
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete bucket");
+        assert!(
+            acquire_config_write_guard_with_migration(sys.clone(), bucket, Some(old), false)
+                .await
+                .is_err()
+        );
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate bucket");
+        let new = store.bucket_incarnation_id_from_disk(bucket).await.expect("new incarnation");
+        assert_ne!(old, new);
+        assert!(
+            acquire_config_write_guard_with_migration(sys.clone(), bucket, Some(old), false)
+                .await
+                .is_err()
+        );
+        assert!(
+            acquire_config_write_guard_with_migration(sys, bucket, Some(new), false)
+                .await
+                .is_ok()
         );
     }
 
