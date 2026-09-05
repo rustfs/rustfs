@@ -701,7 +701,9 @@ const EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED: &str = "disk_local_format_decode_fa
 /// to replace. Best effort — the rename that follows fails closed — but a
 /// recurring signal means heal is stuck on that drive.
 const EVENT_DISK_LOCAL_HEAL_PURGE_FAILED: &str = "disk_local_heal_purge_failed";
+#[cfg(unix)]
 const METRIC_GET_OBJECT_MMAP_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_mmap_page_faults_total";
+#[cfg(unix)]
 const METRIC_GET_OBJECT_DIRECT_READ_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_direct_read_page_faults_total";
 // io_uring read-backend gray-release observability (rustfs/backlog#1172).
 #[cfg(target_os = "linux")]
@@ -898,10 +900,15 @@ const ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE: &str = "RUSTFS_OBJECT_DIRECT_IO_
     reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
 )]
 const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE: bool = false;
+#[cfg(any(unix, test))]
 const ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE: &str = "RUSTFS_OBJECT_MMAP_POPULATE_ENABLE";
+#[cfg(any(unix, test))]
 const DEFAULT_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE: bool = false;
+#[cfg(any(unix, test))]
 const ENV_RUSTFS_OBJECT_MMAP_READ_METHOD: &str = "RUSTFS_OBJECT_MMAP_READ_METHOD";
+#[cfg(any(unix, test))]
 const RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY: &str = "mmap_copy";
+#[cfg(any(unix, test))]
 const RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY: &str = "direct_read_copy";
 
 /// Legacy binary switch for commit-point durability (fsync writes and renames).
@@ -917,6 +924,7 @@ const DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE: bool = true;
 /// See docs/operations/durability-modes.md for the power-loss guarantee matrix.
 const ENV_RUSTFS_DURABILITY_MODE: &str = "RUSTFS_DURABILITY_MODE";
 
+#[cfg(any(unix, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LocalReadCopyMethod {
     MmapCopy,
@@ -1325,15 +1333,18 @@ cached_read_env! {
 
 cached_read_env! {
     /// Whether mmap reads should fault the mapping in with `MAP_POPULATE`.
+    #[cfg(any(unix, test))]
     fn mmap_populate_enabled() -> bool =
         rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE, DEFAULT_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE);
 }
 
+#[cfg(any(unix, test))]
 fn should_populate_mmap_read(length: usize) -> bool {
     length > 0 && mmap_populate_enabled()
 }
 
 cached_read_env! {
+    #[cfg(any(unix, test))]
     fn local_read_copy_method() -> LocalReadCopyMethod = {
         let method = rustfs_utils::get_env_str(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY);
         match method.as_str() {
@@ -1976,7 +1987,7 @@ fn set_inline_preparation_before_backup(dst_path: &str, hook: impl FnOnce() + Se
         .insert(dst_path.to_string(), Box::new(hook));
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_inline_before_file_sync_admission(dst_path: &str, hook: impl FnOnce() + Send + 'static) {
     INLINE_BEFORE_FILE_SYNC_ADMISSION
         .lock()
@@ -2223,7 +2234,7 @@ fn should_remove_staged_meta_before_commit(_dst_path: &str) -> bool {
     false
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(windows)))]
 fn should_fail_local_inline_rollback_hardlink(_dst_path: &Path) -> bool {
     false
 }
@@ -3724,6 +3735,7 @@ struct FdKey {
 /// The generation fence and explicit mutation invalidation keep the snapshot
 /// tied to the inode held by `file`, allowing cache hits to avoid a repeated
 /// metadata syscall without weakening replacement/heal semantics.
+#[cfg(unix)]
 struct FdCacheEntry {
     /// An independently cloneable descriptor for the immutable shard inode.
     file: Arc<std::fs::File>,
@@ -5474,6 +5486,7 @@ impl LocalDisk {
         local_disk_bucket_path(&self.root, bucket)
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) fn get_object_path_for_io(&self, bucket: &str, key: &str) -> Result<PathBuf> {
         self.io_get_object_path(bucket, key)
     }
@@ -18709,11 +18722,17 @@ mod test {
             path_resolve_stage: "path",
             metadata_lookup_stage: "metadata_lookup",
             metadata_validate_stage: "metadata_validate",
+            #[cfg(unix)]
             blocking_wait_stage: "blocking_wait",
+            #[cfg(unix)]
             blocking_task_stage: "blocking_task",
+            #[cfg(unix)]
             file_open_stage: "file_open",
+            #[cfg(unix)]
             mmap_map_stage: "mmap_map",
+            #[cfg(unix)]
             mmap_copy_stage: "mmap_copy",
+            #[cfg(unix)]
             direct_read_copy_stage: "direct_read_copy",
         };
 

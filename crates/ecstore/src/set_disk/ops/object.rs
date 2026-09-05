@@ -5785,7 +5785,7 @@ pub(crate) async fn cleanup_rejected_transition_upload_durably(
 }
 
 async fn transition_cleanup_store(ctx: &Arc<crate::runtime::instance::InstanceContext>) -> Option<Arc<ECStore>> {
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(feature = "test-util")]
     pause_transition_cleanup_store().await;
 
     transition_object_store(ctx).await
@@ -6031,24 +6031,24 @@ async fn delete_transition_transaction_after_remote_cleanup(
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 #[derive(Default)]
 struct TransitionCleanupStoreBarrierState {
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 /// One-shot test barrier placed before transition cleanup resolves its ECStore.
 pub(crate) struct TransitionCleanupStoreBarrier {
     state: Arc<TransitionCleanupStoreBarrierState>,
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 static TRANSITION_CLEANUP_STORE_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<TransitionCleanupStoreBarrierState>>>> =
     std::sync::OnceLock::new();
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 impl TransitionCleanupStoreBarrier {
     /// Install the process-local barrier for the next cleanup-store resolution.
     pub(crate) fn install() -> Self {
@@ -6071,7 +6071,7 @@ impl TransitionCleanupStoreBarrier {
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 impl Drop for TransitionCleanupStoreBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -6085,7 +6085,7 @@ impl Drop for TransitionCleanupStoreBarrier {
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 async fn pause_transition_cleanup_store() {
     let barrier = TRANSITION_CLEANUP_STORE_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -6159,7 +6159,7 @@ async fn pause_after_transition_upload_candidate_recorded() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 struct TransitionUploadedCommitBarrierState {
     bucket: String,
     object: String,
@@ -6167,17 +6167,17 @@ struct TransitionUploadedCommitBarrierState {
     release: tokio::sync::Notify,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) struct TransitionUploadedCommitBarrier {
     state: Arc<TransitionUploadedCommitBarrierState>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 static TRANSITION_UPLOADED_COMMIT_BARRIER: std::sync::OnceLock<
     std::sync::Mutex<Option<Arc<TransitionUploadedCommitBarrierState>>>,
 > = std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl TransitionUploadedCommitBarrier {
     pub(crate) fn install(bucket: &str, object: &str) -> Self {
         let state = Arc::new(TransitionUploadedCommitBarrierState {
@@ -6210,7 +6210,7 @@ impl TransitionUploadedCommitBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl Drop for TransitionUploadedCommitBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -6224,7 +6224,7 @@ impl Drop for TransitionUploadedCommitBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 async fn pause_after_transition_uploaded_persisted(bucket: &str, object: &str) {
     let barrier = TRANSITION_UPLOADED_COMMIT_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -9154,7 +9154,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
         upload_cleanup.update_cleanup_transaction(&transaction);
 
-        #[cfg(test)]
+        #[cfg(all(test, feature = "test-util"))]
         pause_after_transition_uploaded_persisted(bucket, object).await;
 
         let commit_opts = opts.as_commit_opts();

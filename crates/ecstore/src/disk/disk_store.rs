@@ -1301,6 +1301,7 @@ impl LocalDiskWrapper {
         self.disk.get_object_path(volume, path)
     }
 
+    #[cfg(unix)]
     pub(crate) fn get_object_path_for_io(&self, volume: &str, path: &str) -> crate::disk::error::Result<std::path::PathBuf> {
         self.disk.get_object_path_for_io(volume, path)
     }

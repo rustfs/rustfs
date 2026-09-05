@@ -56,6 +56,7 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
+#[cfg(feature = "test-util")]
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -68,21 +69,28 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, Notify, RwLock};
 use uuid::Uuid;
 
+#[cfg(feature = "test-util")]
 use crate::disk::endpoint::Endpoint;
+#[cfg(feature = "test-util")]
 use crate::disk::format::FormatV3;
+#[cfg(feature = "test-util")]
 use crate::disk::{DiskAPI, DiskOption, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE, new_disk};
 use crate::services::tier::tier::TierConfigMgr;
 use crate::services::tier::tier_config::{TierConfig, TierMinIO, TierType};
 use crate::services::tier::warm_backend::{
     TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options,
 };
+#[cfg(feature = "test-util")]
 use rustfs_filemeta::FileMeta;
 use rustfs_s3_client::transition_api::{ReadCloser, ReaderImpl};
+#[cfg(feature = "test-util")]
 use rustfs_utils::path::path_join_buf;
 
 /// One-shot barrier before rejected transition cleanup resolves its ECStore.
+#[cfg(feature = "test-util")]
 pub struct TransitionCleanupStoreBarrier(crate::set_disk::SetDiskTransitionCleanupStoreBarrier);
 
+#[cfg(feature = "test-util")]
 impl TransitionCleanupStoreBarrier {
     /// Install the barrier for the next rejected transition cleanup.
     pub fn install() -> Self {
@@ -96,6 +104,7 @@ impl TransitionCleanupStoreBarrier {
 }
 
 /// Default polling cadence used by the `wait_for_*` helpers.
+#[cfg(feature = "test-util")]
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// A fault to inject into [`MockWarmBackend`] operations.
@@ -208,10 +217,12 @@ impl Drop for MockRemoveOperationGuard {
 }
 
 /// One-shot barrier that pauses a mock tier PUT after storing its remote body.
+#[cfg(feature = "test-util")]
 pub struct MockPutBarrier {
     state: Arc<MockPutBarrierState>,
 }
 
+#[cfg(feature = "test-util")]
 impl MockPutBarrier {
     /// Wait until the remote body is stored and the PUT is paused before returning.
     pub async fn wait_until_paused(&self) {
@@ -226,6 +237,7 @@ impl MockPutBarrier {
     }
 }
 
+#[cfg(feature = "test-util")]
 impl Drop for MockPutBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -258,10 +270,12 @@ impl Drop for MockGetBarrier {
 }
 
 /// One-shot barrier that pauses and then fails a mock tier DELETE.
+#[cfg(feature = "test-util")]
 pub struct MockRemoveBarrier {
     state: Arc<MockRemoveBarrierState>,
 }
 
+#[cfg(feature = "test-util")]
 impl MockRemoveBarrier {
     /// Wait until DELETE reaches the deterministic failure point.
     pub async fn wait_until_paused(&self) {
@@ -283,6 +297,7 @@ impl MockRemoveBarrier {
     }
 }
 
+#[cfg(feature = "test-util")]
 impl Drop for MockRemoveBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -306,6 +321,7 @@ impl MockWarmBackend {
     }
 
     /// Arm a one-shot pause after the next tier PUT stores its remote body.
+    #[cfg(feature = "test-util")]
     pub async fn arm_put_barrier(&self) -> MockPutBarrier {
         let state = Arc::new(MockPutBarrierState::default());
         *self.inner.put_barrier.lock().await = Some(Arc::clone(&state));
@@ -313,6 +329,7 @@ impl MockWarmBackend {
     }
 
     /// Pause and then fail the next DELETE after it reaches the backend.
+    #[cfg(feature = "test-util")]
     pub async fn arm_failing_remove_barrier(&self) -> MockRemoveBarrier {
         let state = Arc::new(MockRemoveBarrierState::default());
         let mut barrier = self.inner.remove_barrier.lock().await;
@@ -323,6 +340,7 @@ impl MockWarmBackend {
 
     /// Arm a one-shot pause before the next tier GET, then return an error
     /// after the test releases it.
+    #[cfg(feature = "test-util")]
     pub async fn arm_failing_get_barrier(&self) -> MockGetBarrier {
         let state = Arc::new(MockGetBarrierState {
             fail_after_release: true,
@@ -343,6 +361,7 @@ impl MockWarmBackend {
     // ---- fault injection -------------------------------------------------
 
     /// Replace the entire fault configuration.
+    #[cfg(feature = "test-util")]
     pub async fn set_faults(&self, faults: FaultConfig) {
         *self.inner.faults.lock().await = faults;
     }
@@ -353,6 +372,7 @@ impl MockWarmBackend {
     }
 
     /// Toggle "HTTP 5xx" server errors on every operation.
+    #[cfg(feature = "test-util")]
     pub async fn set_server_error(&self, server_error: bool) {
         self.inner.faults.lock().await.server_error = server_error;
     }
@@ -363,11 +383,13 @@ impl MockWarmBackend {
     }
 
     /// Set (or clear, with `None`) injected latency applied before each op.
+    #[cfg(feature = "test-util")]
     pub async fn set_latency(&self, latency: Option<Duration>) {
         self.inner.faults.lock().await.latency = latency;
     }
 
     /// Clear all injected faults, restoring healthy behaviour.
+    #[cfg(feature = "test-util")]
     pub async fn clear_faults(&self) {
         *self.inner.faults.lock().await = FaultConfig::default();
     }
@@ -375,6 +397,7 @@ impl MockWarmBackend {
     /// Limit how many body bytes a successful mock PUT consumes. `None` drains
     /// the complete body. This models a backend that incorrectly accepts a
     /// truncated stream while still returning success.
+    #[cfg(feature = "test-util")]
     pub async fn set_put_read_limit(&self, limit: Option<usize>) {
         *self.inner.put_read_limit.lock().await = limit;
     }
@@ -395,12 +418,14 @@ impl MockWarmBackend {
     }
 
     /// Reject non-empty remote versions before transition metadata is committed.
+    #[cfg(feature = "test-util")]
     pub fn set_reject_non_empty_remote_versions(&self, reject: bool) {
         self.inner.reject_non_empty_remote_versions.store(reject, Ordering::Release);
     }
 
     /// Reject the next non-empty remote version validation without changing
     /// subsequent exact-version backend cleanup behavior.
+    #[cfg(feature = "test-util")]
     pub fn reject_next_non_empty_remote_version_validation(&self) {
         self.inner
             .reject_non_empty_remote_version_validations
@@ -438,6 +463,7 @@ impl MockWarmBackend {
     }
 
     /// Clear the operation log without touching stored objects or faults.
+    #[cfg(feature = "test-util")]
     pub async fn clear_op_log(&self) {
         self.inner.op_log.lock().await.clear();
     }
@@ -459,11 +485,13 @@ impl MockWarmBackend {
     }
 
     /// Return the exact object/version pairs produced by successful tier PUTs.
+    #[cfg(feature = "test-util")]
     pub async fn put_versions(&self) -> Vec<(String, String)> {
         self.inner.put_versions.lock().await.clone()
     }
 
     /// Return the exact object/version pairs passed to successful tier removes.
+    #[cfg(feature = "test-util")]
     pub async fn remove_versions(&self) -> Vec<(String, String)> {
         self.inner.remove_versions.lock().await.clone()
     }
@@ -475,6 +503,7 @@ impl MockWarmBackend {
 
     /// Number of `get` calls recorded — useful to assert restore reads hit the
     /// local copy rather than the remote tier.
+    #[cfg(feature = "test-util")]
     pub async fn get_count(&self) -> usize {
         self.inner
             .op_log
@@ -486,6 +515,7 @@ impl MockWarmBackend {
     }
 
     /// Number of `put` calls recorded.
+    #[cfg(feature = "test-util")]
     pub async fn put_count(&self) -> usize {
         self.inner
             .op_log
@@ -499,6 +529,7 @@ impl MockWarmBackend {
     // ---- storage inspection ---------------------------------------------
 
     /// Whether the backend currently stores `object`.
+    #[cfg(feature = "test-util")]
     pub async fn contains(&self, object: &str) -> bool {
         self.inner.objects.lock().await.contains_key(object)
     }
@@ -509,11 +540,13 @@ impl MockWarmBackend {
     }
 
     /// A clone of the stored object, if present.
+    #[cfg(feature = "test-util")]
     pub async fn stored(&self, object: &str) -> Option<MockStoredObject> {
         self.inner.objects.lock().await.get(object).cloned()
     }
 
     /// A clone of the raw bytes stored for `object`, if present.
+    #[cfg(feature = "test-util")]
     pub async fn bytes(&self, object: &str) -> Option<Vec<u8>> {
         self.inner.objects.lock().await.get(object).map(|o| o.bytes.clone())
     }
@@ -538,6 +571,7 @@ impl MockWarmBackend {
 
     /// Poll until `object` is absent from the backend, or `timeout` elapses.
     /// Returns `true` if the object disappeared within the budget.
+    #[cfg(feature = "test-util")]
     pub async fn wait_for_remote_absence(&self, object: &str, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -553,6 +587,7 @@ impl MockWarmBackend {
 
     /// Poll until the backend holds exactly `expected` objects, or `timeout`
     /// elapses. Returns `true` if the count was reached within the budget.
+    #[cfg(feature = "test-util")]
     pub async fn wait_for_object_count(&self, expected: usize, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -847,6 +882,7 @@ pub async fn register_mock_tier_backend(handle: &Arc<RwLock<TierConfigMgr>>, tie
 /// The transition-state tuple read from an on-disk `xl.meta`, plus the object's
 /// free-version count.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(feature = "test-util")]
 pub struct TransitionMeta {
     /// `transition_status` (e.g. `"complete"`), empty when not transitioned.
     pub status: String,
@@ -860,6 +896,7 @@ pub struct TransitionMeta {
     pub free_version_count: usize,
 }
 
+#[cfg(feature = "test-util")]
 async fn open_disk(disk_path: &Path) -> Option<crate::disk::DiskStore> {
     // `LocalDisk::new` rejects an endpoint whose (set_idx, disk_idx) disagrees
     // with the position recorded in the disk's own format.json, so derive the
@@ -890,6 +927,7 @@ async fn open_disk(disk_path: &Path) -> Option<crate::disk::DiskStore> {
 /// The free-version metadata removal lands asynchronously after the remote
 /// object disappears, so callers typically poll via
 /// [`wait_for_free_version_absence`] instead of asserting a single read.
+#[cfg(feature = "test-util")]
 pub async fn free_version_count(disk_path: &Path, bucket: &str, object: &str) -> usize {
     let Some(disk) = open_disk(disk_path).await else {
         return 0;
@@ -914,6 +952,7 @@ pub async fn free_version_count(disk_path: &Path, bucket: &str, object: &str) ->
 /// fields are taken from the newest version that carries a transition record;
 /// if no version is transitioned, they are taken from the current version (and
 /// will be empty).
+#[cfg(feature = "test-util")]
 pub async fn read_transition_meta(disk_path: &Path, bucket: &str, object: &str) -> Option<TransitionMeta> {
     let disk = open_disk(disk_path).await?;
     let data = disk
@@ -947,6 +986,7 @@ pub async fn read_transition_meta(disk_path: &Path, bucket: &str, object: &str) 
 /// disk is missing the object or disagrees — this is the shard-consistency
 /// check required by ilm-6 (the `(status, tier, remote key, remote version id)`
 /// four-tuple plus free-version count must match across all erasure shards).
+#[cfg(feature = "test-util")]
 pub async fn assert_transition_meta_consistent<P: AsRef<Path>>(disk_paths: &[P], bucket: &str, object: &str) -> TransitionMeta {
     assert!(!disk_paths.is_empty(), "assert_transition_meta_consistent needs at least one disk");
 
@@ -972,6 +1012,7 @@ pub async fn assert_transition_meta_consistent<P: AsRef<Path>>(disk_paths: &[P],
 
 /// Poll until `object` retains no free versions on `disk_path`, or `timeout`
 /// elapses. Returns `true` if the free versions drained within the budget.
+#[cfg(feature = "test-util")]
 pub async fn wait_for_free_version_absence(disk_path: &Path, bucket: &str, object: &str, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -1038,6 +1079,44 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn mock_metadata_survives_put_and_external_delete_is_distinct() {
+        let backend = MockWarmBackend::new();
+        let metadata = HashMap::from([
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("project".to_string(), "archive".to_string()),
+        ]);
+        let version = backend
+            .put_with_meta("object", ReaderImpl::Body(Bytes::from_static(b"body")), 4, metadata.clone())
+            .await
+            .expect("mock PUT should preserve remote metadata");
+        assert_eq!(backend.metadata("object").await, Some(metadata));
+        assert_eq!(
+            backend
+                .probe_transition_candidate_state("object")
+                .await
+                .expect("probe stored object"),
+            TransitionCandidateProbe::VersionedPresent(version)
+        );
+
+        backend.external_remove("object").await;
+        assert_eq!(backend.metadata("object").await, None);
+        assert_eq!(
+            backend
+                .probe_transition_candidate_state("object")
+                .await
+                .expect("probe removed object"),
+            TransitionCandidateProbe::Missing
+        );
+        let operations = backend.op_log().await;
+        assert!(
+            operations
+                .iter()
+                .any(|op| matches!(op, MockWarmOp::ExternalRemove { object } if object == "object"))
+        );
+        assert!(!operations.iter().any(|op| matches!(op, MockWarmOp::Remove { .. })));
     }
 
     #[tokio::test]

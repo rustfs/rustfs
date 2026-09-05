@@ -190,11 +190,17 @@ pub struct MmapCopyStageMetrics {
     pub(crate) path_resolve_stage: &'static str,
     pub(crate) metadata_lookup_stage: &'static str,
     pub(crate) metadata_validate_stage: &'static str,
+    #[cfg(unix)]
     pub(crate) blocking_wait_stage: &'static str,
+    #[cfg(unix)]
     pub(crate) blocking_task_stage: &'static str,
+    #[cfg(unix)]
     pub(crate) file_open_stage: &'static str,
+    #[cfg(unix)]
     pub(crate) mmap_map_stage: &'static str,
+    #[cfg(unix)]
     pub(crate) mmap_copy_stage: &'static str,
+    #[cfg(unix)]
     pub(crate) direct_read_copy_stage: &'static str,
 }
 
@@ -922,6 +928,7 @@ impl Disk {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn get_object_path_for_io_if_local(
         &self,
         volume: &str,
