@@ -291,6 +291,8 @@ tokio-rustls = { workspace = true, default-features = false, features = ["loggin
 aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
 aws-smithy-types = { workspace = true }
 google-cloud-auth = { workspace = true, optional = true }
+moka = { workspace = true, features = ["sync"] }
+xxhash-rust = { workspace = true, features = ["xxh3"] }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 tokio-stream.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat", "time"] }
