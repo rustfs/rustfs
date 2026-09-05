@@ -54,9 +54,6 @@ env:
 jobs:
   heal-test:
     runs-on: smoke-testing
-    # Requirement: a failing suite must not fail the workflow; failures
-    # are filed to rustfs/backlog and the chain continues.
-    continue-on-error: true
     timeout-minutes: 480
     # Standalone manual run, or one link of the nightly functional chain
     # (storage -> heal -> pool). Pool expansion no longer re-runs heal.
