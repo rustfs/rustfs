@@ -7,7 +7,7 @@ For crate ownership, read [crate-boundaries.md](crate-boundaries.md): ECStore ow
 
 ## Model
 
-Heal and every foreground or background write path serialize on the same object-level namespace write lock (a quorum lock RPC in distributed mode, the in-process lock manager on a single node; granularity is the object, the version component is always `None`), and heal holds its guard across the whole rename commit. MinIO's `x-minio-healing` marker is an out-of-lock defence against version-cleanup logic inside `RenameData` interleaving with a heal commit; RustFS's commit model has no such interleaving, so no persistent marker exists (`x-minio-healing` does not occur in `crates/` or `rustfs/`) and none is needed. Three layers replace it:
+Heal and every foreground or background write path serialize on the same object-level namespace write lock (a quorum lock RPC in distributed mode, the in-process lock manager on a single node; granularity is the object, the version component is always `None`), and heal holds its guard across the whole rename commit. This describes the intended lock scope while the guard remains valid; it does not prove rejection of an already-dispatched disk syscall after distributed lease loss. The authority, delayed-mutation, and recovery boundary is specified in [unified-object-generation.md](unified-object-generation.md). MinIO's `x-minio-healing` marker is an out-of-lock defence against version-cleanup logic inside `RenameData` interleaving with a heal commit; RustFS's commit model has no such interleaving, so no persistent marker exists (`x-minio-healing` does not occur in `crates/` or `rustfs/`) and none is needed. Three layers replace it:
 
 | Layer | Mechanism | Owner |
 | --- | --- | --- |
