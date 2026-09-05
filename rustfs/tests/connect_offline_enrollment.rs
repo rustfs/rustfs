@@ -576,6 +576,25 @@ fn every_challenge_boundary_mutation_fails_with_its_frozen_reason() {
 }
 
 #[test]
+fn malformed_top_level_signature_precedes_malformed_first_link_routing() {
+    let source = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let now = unix(field(&source, "evaluationTime"));
+    let mut challenge_envelope = source["document"].clone();
+    challenge_envelope["signature"]["algorithm"] = Value::String("ES384".to_string());
+
+    let mut challenge = signed_document(&challenge_envelope);
+    let first_envelope = &mut challenge["trustChain"].as_array_mut().expect("challenge carries a chain")[0];
+    let mut first_link = signed_document(first_envelope);
+    first_link["issuerKeyId"] = Value::String("not-a-key-id".to_string());
+    first_envelope["bytes"] = Value::String(encoded_document(&first_link));
+    challenge_envelope["bytes"] = Value::String(encoded_document(&challenge));
+
+    let error = OfflineEnrollment::verify_challenge(&envelope(&challenge_envelope), now)
+        .expect_err("a malformed top-level signature and first-link issuer must not verify");
+    assert_eq!(error.reason(), "SIGNATURE_MALFORMED");
+}
+
+#[test]
 fn unpinned_root_precedes_a_malformed_chain_shape() {
     let source = accept_vector_named("challenge signed by a chained signing key under the pinned root");
     let now = unix(field(&source, "evaluationTime"));
