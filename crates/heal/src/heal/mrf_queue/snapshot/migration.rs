@@ -253,14 +253,32 @@ struct Staged {
     slot: usize,
 }
 
-async fn read_staged(
-    disks: &[EcstoreDiskStore],
-    limits: MigrationLimits,
-    retry_payload: Option<&[u8]>,
-) -> Result<Option<Staged>, MigrationError> {
+struct StagingLineage {
+    latest: Option<Staged>,
+    // Each collection has at most two identities per configured disk.
+    committed_payloads: BTreeSet<(usize, [u8; 32])>,
+    orphaned_payloads: Vec<(usize, [u8; 32])>,
+}
+
+impl StagingLineage {
+    fn validate_orphans(&self, retry_payload: Option<&[u8]>) -> Result<(), MigrationError> {
+        let retry_identity = retry_payload.map(|payload| (payload.len(), <[u8; 32]>::from(Sha256::digest(payload))));
+        if self
+            .orphaned_payloads
+            .iter()
+            .any(|identity| Some(*identity) != retry_identity && !self.committed_payloads.contains(identity))
+        {
+            return Err(MigrationError::Conflict);
+        }
+        Ok(())
+    }
+}
+
+async fn read_staging_lineage(disks: &[EcstoreDiskStore], limits: MigrationLimits) -> Result<StagingLineage, MigrationError> {
     let mut selected: Option<Staged> = None;
     let mut identities = std::collections::BTreeMap::new();
     let mut orphaned_payloads = Vec::new();
+    let mut committed_payloads = BTreeSet::new();
     for disk in disks {
         for slot in 0..2 {
             let result = async {
@@ -291,6 +309,7 @@ async fn read_staged(
             .await;
             match result {
                 Ok(Some(next)) => {
+                    committed_payloads.insert((next.manifest.payload_len, next.manifest.payload_digest));
                     let identity = (next.manifest.owner, next.manifest.payload_digest);
                     if identities
                         .insert(next.manifest.sequence, identity)
@@ -310,20 +329,11 @@ async fn read_staged(
             }
         }
     }
-    // A missing manifest is repairable only for the exact retry candidate or
-    // payload already validated through another committed replica. Unknown
-    // candidate bytes may contain additional obligations and block selection.
-    let retry_identity = retry_payload.map(|payload| (payload.len(), <[u8; 32]>::from(Sha256::digest(payload))));
-    let committed_identity = selected
-        .as_ref()
-        .map(|staged| (staged.manifest.payload_len, staged.manifest.payload_digest));
-    if orphaned_payloads
-        .into_iter()
-        .any(|identity| Some(identity) != retry_identity && Some(identity) != committed_identity)
-    {
-        return Err(MigrationError::Conflict);
-    }
-    Ok(selected)
+    Ok(StagingLineage {
+        latest: selected,
+        committed_payloads,
+        orphaned_payloads,
+    })
 }
 
 async fn install(disk: &EcstoreDiskStore, path: &str, bytes: &[u8], limit: usize) -> Result<(), MigrationError> {
@@ -404,9 +414,10 @@ async fn stage_claimed(
     limits: MigrationLimits,
 ) -> Result<u64, MigrationError> {
     candidate.revalidate(disks, limits).await?;
-    let captured_payload = candidate.encode(limits)?;
-    let previous = read_staged(disks, limits, Some(&captured_payload)).await?;
-    if previous.as_ref().is_some_and(|old| old.manifest.owner != owner) {
+    candidate.validate_limits(limits)?;
+    let lineage = read_staging_lineage(disks, limits).await?;
+    let previous = lineage.latest.as_ref();
+    if previous.is_some_and(|old| old.manifest.owner != owner) {
         return Err(MigrationError::Conflict);
     }
     let mut candidate = candidate.clone();
@@ -417,7 +428,7 @@ async fn stage_claimed(
             return Err(MigrationError::Invalid);
         }
     }
-    if let Some(old) = &previous {
+    if let Some(old) = previous {
         for source in old.candidate.sources.iter().chain(&old.candidate.inherited) {
             if let Some(index) = source_index.get(&key(source)).copied() {
                 let existing = if index < candidate.sources.len() {
@@ -441,8 +452,12 @@ async fn stage_claimed(
         return Err(MigrationError::Empty);
     }
     let payload = candidate.encode(limits)?;
+    // Exact retry comparison must include all inherited responsibilities.
+    // Validating only the freshly captured sources would reject our own
+    // interrupted successor payload before it can be completed.
+    lineage.validate_orphans(Some(&payload))?;
     let digest: [u8; 32] = Sha256::digest(&payload).into();
-    let (sequence, slot) = previous.as_ref().map_or((1, 0), |old| {
+    let (sequence, slot) = previous.map_or((1, 0), |old| {
         if old.manifest.payload_digest == digest {
             (old.manifest.sequence, old.slot)
         } else {
@@ -463,7 +478,9 @@ async fn stage_claimed(
     }
     #[cfg(test)]
     tests::interrupt_at(owner, tests::Boundary::AfterManifest).await?;
-    let recovered = read_staged(disks, limits, None).await?.ok_or(MigrationError::Invalid)?;
+    let readback = read_staging_lineage(disks, limits).await?;
+    readback.validate_orphans(None)?;
+    let recovered = readback.latest.ok_or(MigrationError::Invalid)?;
     if recovered.manifest.sequence != sequence || recovered.manifest.payload_digest != digest {
         return Err(MigrationError::Conflict);
     }
@@ -480,7 +497,9 @@ pub async fn recover_pending_migration(
     limits: MigrationLimits,
 ) -> Result<Option<PendingMigration>, MigrationError> {
     let disks = configured_disks(disks).await?;
-    let Some(staged) = read_staged(&disks, limits, None).await? else {
+    let lineage = read_staging_lineage(&disks, limits).await?;
+    lineage.validate_orphans(None)?;
+    let Some(staged) = lineage.latest else {
         return Ok(None);
     };
     staged.candidate.revalidate(&disks, limits).await?;
@@ -1171,5 +1190,104 @@ mod tests {
                 .expect("repaired manifest"),
             Some(committed)
         );
+    }
+
+    #[tokio::test]
+    async fn migration_old_payload_orphan_matches_any_validated_replica() {
+        let root = TempDir::new().expect("test directory");
+        let first = disk(&root, "first").await;
+        let second = disk(&root, "second").await;
+        let disks = [Some(first.clone()), Some(second)];
+        let owner = Uuid::new_v4();
+        for name in ["a", "b"] {
+            let bytes = record(name, MrfKind::PartialWrite, None);
+            for disk in disks.iter().flatten() {
+                source(disk, &bytes).await;
+            }
+            let candidate = capture_legacy_migration(&disks, LIMITS).await.expect("capture generation");
+            stage_legacy_migration(&disks, &candidate, owner, LIMITS)
+                .await
+                .expect("stage generation");
+        }
+        let old_manifest = read_bounded(&first, COMMITS[0], MANIFEST_LEN)
+            .await
+            .expect("old manifest")
+            .expect("gen1");
+        assert_eq!(
+            EcstoreDiskAPI::compare_and_update_file(
+                first.as_ref(),
+                RUSTFS_META_BUCKET,
+                COMMITS[0],
+                Some(old_manifest.into()),
+                None
+            )
+            .await
+            .expect("remove one old manifest"),
+            EcstoreConditionalFileUpdate::Updated
+        );
+        let before = slot_bytes(&first).await;
+        for ordered in [disks.clone(), [disks[1].clone(), disks[0].clone()]] {
+            let recovered = recover_pending_migration(&ordered, LIMITS)
+                .await
+                .expect("older orphan has independent proof")
+                .expect("gen2");
+            assert_eq!(recovered.replay_records(LIMITS).expect("A and B obligations").len(), 2);
+            let candidate = capture_legacy_migration(&ordered, LIMITS).await.expect("current B source");
+            assert_eq!(
+                stage_legacy_migration(&ordered, &candidate, owner, LIMITS)
+                    .await
+                    .expect("gen2 retry"),
+                2
+            );
+            assert_eq!(
+                slot_bytes(&first).await,
+                before,
+                "known older orphan must not cause fallback or overwrite"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_successor_retry_validates_orphan_after_inheriting_previous_records() {
+        for boundary in [Boundary::AfterPayload, Boundary::BeforeManifest] {
+            let root = TempDir::new().expect("test directory");
+            let disk = disk(&root, "disk").await;
+            let disks = [Some(disk.clone())];
+            let owner = Uuid::new_v4();
+            let a = record("a", MrfKind::PartialWrite, None);
+            let b = record("b", MrfKind::PartialWrite, None);
+            source(&disk, &a).await;
+            let original = capture_legacy_migration(&disks, LIMITS).await.expect("source A");
+            stage_legacy_migration(&disks, &original, owner, LIMITS).await.expect("gen1");
+            let old_slot = slot_bytes(&disk).await;
+            source(&disk, &b).await;
+            let next = capture_legacy_migration(&disks, LIMITS).await.expect("source B");
+            INTERRUPTIONS.lock().expect("fault map").insert(owner, boundary);
+            assert!(stage_legacy_migration(&disks, &next, owner, LIMITS).await.is_err());
+            assert!(
+                matches!(recover_pending_migration(&disks, LIMITS).await, Err(MigrationError::Conflict)),
+                "uncommitted AB is not silently accepted as A"
+            );
+            let captured_again = capture_legacy_migration(&disks, LIMITS)
+                .await
+                .expect("restart source capture contains only B");
+            assert_eq!(captured_again.replay_records(LIMITS).expect("current source"), vec![b.clone()]);
+            assert_eq!(
+                stage_legacy_migration(&disks, &captured_again, owner, LIMITS)
+                    .await
+                    .expect("retry must compare inherited AB"),
+                2
+            );
+            let recovered = recover_pending_migration(&disks, LIMITS)
+                .await
+                .expect("committed restart")
+                .expect("gen2");
+            let records = recovered.replay_records(LIMITS).expect("retained A and B");
+            assert_eq!(records.len(), 2);
+            assert!(records.contains(&a) && records.contains(&b));
+            let after = slot_bytes(&disk).await;
+            assert_eq!(after[0], old_slot[0]);
+            assert_eq!(after[2], old_slot[2]);
+        }
     }
 }
