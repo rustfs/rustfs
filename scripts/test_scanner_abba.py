@@ -63,8 +63,19 @@ def fake_adapter():
             result["convergence"]["walk_objects"] = 121
         elif fault == "latency-regression" and request["leg"].startswith("B"):
             result["metrics"]["p99_ms"] = 12
+        elif fault == "exact-thresholds" and request["leg"].startswith("B"):
+            result["metrics"].update(p99_ms=10.5, throughput_ops=97)
+        elif fault == "just-over-threshold" and request["comparison"] == "build" and request["leg"].startswith("B"):
+            result["metrics"]["p99_ms"] = 10.500001
         elif fault == "p1-regression" and not baseline:
             result["metrics"]["walk_objects"] = 30
+        elif fault == "unstable-p1-control" and request["comparison"] == "build":
+            if request["leg"] == "A1":
+                result["metrics"].update(walk_objects=1000, cold_walk_objects=1000)
+            elif request["leg"] == "A2":
+                result["metrics"].update(walk_objects=10, cold_walk_objects=10)
+            elif request["leg"].startswith("B"):
+                result["metrics"].update(walk_objects=100, cold_walk_objects=0)
         elif fault == "missing-metric":
             del result["metrics"]["save_bytes"]
         elif fault == "incomplete-repair":
@@ -135,6 +146,21 @@ class ScannerAbbaTest(unittest.TestCase):
                 self.root = Path(directory)
                 with patch.object(harness, "SCENARIOS", ("cold-hot",)):
                     self.assertEqual(self.run_harness(fault), 1)
+
+    def test_exact_threshold_boundaries_pass(self):
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)):
+            self.assertEqual(self.run_harness("exact-thresholds"), 0)
+
+    def test_just_over_threshold_fails(self):
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)):
+            self.assertEqual(self.run_harness("just-over-threshold"), 1)
+
+    def test_unstable_p1_work_control_is_inconclusive(self):
+        with patch.object(harness, "SCENARIOS", ("cold-hot",)):
+            self.assertEqual(self.run_harness("unstable-p1-control"), 3)
+        comparison = harness.read_json(self.root / "out/report.json")["comparisons"][0]
+        self.assertEqual(comparison["status"], "inconclusive")
+        self.assertGreater(comparison["p1"]["repeatability_drift"], 0.05)
 
     def test_manifest_rejects_missing_build_or_oracle(self):
         for section, key in (("baseline", "binary"), ("oracles", "cold-hot")):
