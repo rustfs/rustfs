@@ -634,8 +634,8 @@ pub(crate) mod bucket {
         };
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
-            BREAKER_FAILURE_THRESHOLD, BreakerState, FilterConfig, OnDemandMigrationConfig, PathStyle, Provider, SourceConfig,
-            SourceCredentials, TlsConfig,
+            BREAKER_FAILURE_THRESHOLD, BreakerState, FilterConfig, MAX_LIST_NO_PROGRESS_PAGES, OnDemandMigrationConfig,
+            PathStyle, Provider, SourceConfig, SourceCredentials, TlsConfig,
         };
         pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
             BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OdmStateError, OnDemandMigrationSys, PolicyConfig,
@@ -643,8 +643,8 @@ pub(crate) mod bucket {
             commit_inline, idle_guarded_body,
         };
         pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
-            ListEntryKey, ListThroughCursor, ListThroughMerger, ListThroughToken, ListThroughTokenError, MergeSide,
-            SOURCE_LIST_MAX_RATE_WAIT, SourceListPlan, decode_continuation_token, source_list_plan,
+            ListEntryKey, ListPageError, ListThroughCursor, ListThroughMerger, ListThroughToken, ListThroughTokenError,
+            MergeSide, SOURCE_LIST_MAX_RATE_WAIT, SourceListPlan, decode_continuation_token, source_list_plan,
         };
     }
 
