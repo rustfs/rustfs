@@ -859,6 +859,7 @@ fn completed_data_usage_info_publishes_confirmed_empty_namespace() {
             source: Some(DataUsageCacheSource::new(0, 0)),
             snapshot_complete: true,
             scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            scan_coverage_digest: Some(TEST_COVERAGE_DIGEST),
             cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
             ..Default::default()
         },

@@ -8607,7 +8607,7 @@ fn scoped_scan_remote_dirty_coverage_invalidates_local_bucket_current() {
     );
     let source = DataUsageCacheSource::new(0, 0);
     let mut cache = DataUsageCache {
-        info: DataUsageCacheInfo {
+        info: crate::DataUsageCacheInfo {
             name: "bucket".to_string(),
             next_cycle: 7,
             leader_epoch: 11,
