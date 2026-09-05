@@ -280,6 +280,9 @@ struct ListedObject {
 fn parse_objects_list(body: &str) -> Result<SourcePage, SourceError> {
     let listing: ObjectsList =
         serde_json::from_str(body).map_err(|err| SourceError::Other(format!("source listing is not valid JSON: {err}")))?;
+    if listing.prefixes.iter().any(|prefix| prefix.is_empty()) {
+        return Err(SourceError::Other("source listing prefix has no name".to_string()));
+    }
     let next_continuation_token = listing.next_page_token.filter(|token| !token.is_empty());
     let objects = listing
         .items

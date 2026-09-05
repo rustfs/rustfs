@@ -177,7 +177,12 @@ impl NativeHttp {
             Some(code) => format!("source returned HTTP {status} ({code})"),
             None => format!("source returned HTTP {status}"),
         };
-        Err(classify_status(status.as_u16(), code.as_deref(), message))
+        match classify_status(status.as_u16(), code.as_deref(), message.clone()) {
+            // Native object absence needs provider-specific evidence or a
+            // successful bucket probe, never an alias from the S3 classifier.
+            SourceError::NotFound => Err(classify_status(status.as_u16(), None, message)),
+            error => Err(error),
+        }
     }
 }
 

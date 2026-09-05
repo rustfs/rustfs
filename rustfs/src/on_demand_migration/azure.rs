@@ -393,6 +393,9 @@ fn parse_list_blobs(xml: &str) -> Result<AzureListing, SourceError> {
         match reader.read_event() {
             Ok(Event::Start(start)) => {
                 let name = local_name(start.name().as_ref());
+                if matches!(name.as_str(), "blob" | "blobprefix") && (blob.is_some() || in_blob_prefix) {
+                    return Err(SourceError::Other("source listing entries must not be nested".to_string()));
+                }
                 match name.as_str() {
                     "blob" => {
                         depth += 1;
@@ -478,8 +481,14 @@ fn apply_list_field(
     match name {
         "name" => {
             if in_blob_prefix {
+                if blob_prefix.is_some() {
+                    return Err(SourceError::Other("source listing prefix has duplicate names".to_string()));
+                }
                 *blob_prefix = Some(text);
             } else if let Some(entry) = blob.as_mut() {
+                if entry.name.is_some() {
+                    return Err(SourceError::Other("source listing object has duplicate names".to_string()));
+                }
                 entry.name = Some(text);
             }
         }
@@ -491,6 +500,9 @@ fn apply_list_field(
         }
         "content-length" => {
             if let Some(entry) = blob.as_mut() {
+                if entry.size.is_some() {
+                    return Err(SourceError::Other("source listing object has duplicate sizes".to_string()));
+                }
                 entry.size = Some(
                     text.trim()
                         .parse()
