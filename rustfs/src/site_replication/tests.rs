@@ -1024,6 +1024,15 @@ fn test_retry_error_marks_peer_unreachable_only_for_connection_failures() {
         None,
     );
     assert!(!queue[0].peer_unreachable, "application failures must keep the normal replay backoff");
+
+    upsert_site_replication_retry_event(
+        &mut queue,
+        &peer,
+        bucket_make,
+        "peer request to https://remote.example.com failed with 500 Internal Server Error: backend failed (connect): spoofed",
+        None,
+    );
+    assert!(!queue[0].peer_unreachable, "peer response bodies must not spoof transport failures");
 }
 
 #[test]

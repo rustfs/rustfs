@@ -260,7 +260,10 @@ pub(crate) fn upsert_site_replication_retry_event(
 
 pub(crate) fn retry_error_indicates_peer_unreachable(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
-    error.contains("failed (connect)") || error.contains("failed (dns resolution)") || error.contains("failed (tls handshake)")
+    let Some((_, failure)) = error.split_once(" failed ") else {
+        return false;
+    };
+    failure.starts_with("(connect):") || failure.starts_with("(dns resolution):") || failure.starts_with("(tls handshake):")
 }
 
 pub(crate) fn retry_stats_for_state(state: &SiteReplicationState) -> Option<SRRetryStats> {
