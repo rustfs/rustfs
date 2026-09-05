@@ -3845,6 +3845,7 @@ pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
     write_quorum: usize,
     scanner_publication_lease_tokens: Option<&'a HashMap<String, Uuid>>,
     scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
+    namespace_commit_guard: Option<Arc<crate::runtime::instance::NamespaceCommitGuard>>,
 }
 
 impl<'a> RenameDataFenceOptions<'a> {
@@ -3856,6 +3857,7 @@ impl<'a> RenameDataFenceOptions<'a> {
             write_quorum,
             scanner_publication_lease_tokens,
             scanner_publication_commit_scope: None,
+            namespace_commit_guard: None,
         }
     }
 
@@ -3864,6 +3866,14 @@ impl<'a> RenameDataFenceOptions<'a> {
         scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
     ) -> Self {
         self.scanner_publication_commit_scope = scanner_publication_commit_scope;
+        self
+    }
+
+    pub(in crate::set_disk) fn with_namespace_commit_guard(
+        mut self,
+        namespace_commit_guard: Option<Arc<crate::runtime::instance::NamespaceCommitGuard>>,
+    ) -> Self {
+        self.namespace_commit_guard = namespace_commit_guard;
         self
     }
 }
@@ -4224,6 +4234,7 @@ impl SetDisks {
             write_quorum,
             scanner_publication_lease_tokens,
             scanner_publication_commit_scope: _scanner_publication_commit_scope,
+            namespace_commit_guard,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4268,7 +4279,9 @@ impl SetDisks {
                     let dst_object = fanout_dst_object.clone();
                     let file_info = file_info.clone();
                     let successful_rename_completion_rank = successful_rename_completion_rank.clone();
+                    let namespace_commit_guard = namespace_commit_guard.clone();
                     tasks.spawn(async move {
+                        let _namespace_commit_guard = namespace_commit_guard;
                         let result = std::panic::AssertUnwindSafe(async move {
                             #[allow(clippy::let_unit_value)]
                             let _fanout_task_guard = Self::rename_fanout_task_guard(&dst_object);
@@ -4582,6 +4595,7 @@ impl SetDisks {
             write_quorum,
             scanner_publication_lease_tokens,
             scanner_publication_commit_scope,
+            namespace_commit_guard,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4614,6 +4628,7 @@ impl SetDisks {
         let fanout_dst_bucket = dst_bucket.clone();
         let fanout_dst_object = dst_object.clone();
         let fanout_publication_scope = scanner_publication_commit_scope.clone();
+        let fanout_namespace_commit_guard = namespace_commit_guard.clone();
         // Keep one coordinator task so a cancelled caller cannot drop partially
         // completed disk mutations. Per-disk futures stay ordered in `join_all`,
         // preserving slot-indexed quorum and convergence accounting without a
@@ -4622,6 +4637,7 @@ impl SetDisks {
             // Keep the storage-owned movement permit attached to the actual
             // fan-out owner, even if the caller future is cancelled.
             let _fanout_publication_scope = fanout_publication_scope;
+            let _namespace_commit_guard = fanout_namespace_commit_guard;
             let successful_rename_completion_rank =
                 rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
             let futures = fanout_disks
@@ -4807,6 +4823,8 @@ impl SetDisks {
                     let dst_bucket = dst_bucket.clone();
                     let dst_object = dst_object.clone();
                     futures.push(tokio::spawn(async move {
+                        #[cfg(test)]
+                        rename_fanout_barrier::checkpoint(&dst_object, i, rename_fanout_barrier::PHASE_ROLLBACK).await;
                         disk.delete_version(
                             &dst_bucket,
                             &dst_object,
@@ -6565,9 +6583,9 @@ impl SetDisks {
         match oi {
             Ok(oi) => {
                 // Ordinary writes may proceed past a top-level delete marker;
-                // data movement must not replace an acknowledged deletion.
+                // data movement and guarded internal writes must preserve it.
                 if oi.delete_marker {
-                    return opts.data_movement.then_some(StorageError::PreconditionFailed);
+                    return (opts.data_movement || opts.preserve_delete_marker).then_some(StorageError::PreconditionFailed);
                 }
                 let if_none_match = http_preconditions.if_none_match_value().map(str::to_owned);
                 let if_match = http_preconditions.if_match_value().map(str::to_owned);
@@ -6960,6 +6978,7 @@ pub(crate) mod rename_fanout_barrier {
     pub use super::rename_fanout_barrier_phase::{
         CLEANUP as PHASE_CLEANUP, READ_VERSION as PHASE_READ_VERSION, RENAME as PHASE_RENAME,
     };
+    pub const PHASE_ROLLBACK: &str = "rollback";
 
     /// One armed barrier: the fan-out task matching `(disk_index, phase)` pauses.
     struct Armed {
@@ -10534,9 +10553,35 @@ mod tests {
         let mut file_infos = rename_commit_fileinfos(object, DISKS, "fresh-rollback-etag");
         file_infos[3] = FileInfo::default();
 
-        SetDisks::rename_data(&disks, RUSTFS_META_TMP_BUCKET, "source", &file_infos, bucket, object, 4)
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        ctx.set_scanner_publication_state(false);
+        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_ROLLBACK);
+        let rename = SetDisks::rename_data_owned_with_fence(
+            &disks,
+            (RUSTFS_META_TMP_BUCKET, "source"),
+            file_infos,
+            (bucket, object),
+            false,
+            RenameDataFenceOptions::new(4, None).with_namespace_commit_guard(Some(ctx.begin_namespace_commit())),
+        );
+        let control = async {
+            barrier.wait_until_paused().await;
+            assert!(ctx.namespace_commits_pending(), "rollback must retain namespace publication ownership");
+            assert!(ctx.scanner_publication_state_allowed(), "rollback must not disable namespace walks");
+            assert_eq!(ctx.namespace_commit_generation(), 1);
+            barrier.release();
+        };
+        let (result, ()) = tokio::time::timeout(BARRIER_PAUSE_GUARD, async { tokio::join!(rename, control) })
             .await
-            .expect_err("three successful disks must fail a strict write quorum of four");
+            .expect("rename rollback must reach its barrier and finish after release");
+        assert_eq!(
+            result.err(),
+            Some(DiskError::ErasureWriteQuorum),
+            "three successful disks must fail a strict write quorum of four"
+        );
+        assert!(!ctx.namespace_commits_pending());
+        assert!(ctx.scanner_publication_state_allowed());
+        assert_eq!(ctx.namespace_commit_generation(), 2);
 
         for (idx, dir) in dirs.iter().enumerate() {
             let reopened = reopen_local_disk(dir).await;

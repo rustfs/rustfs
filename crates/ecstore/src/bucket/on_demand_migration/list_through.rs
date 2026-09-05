@@ -32,6 +32,9 @@ pub const LIST_THROUGH_TOKEN_VERSION: u32 = 1;
 /// listing's own marker, so the decoder needs a positive signal before it
 /// treats an opaque token as a merged one.
 const LIST_THROUGH_TOKEN_TAG: &str = "odm-list";
+// Object keys cannot contain NUL (bucket::utils::is_valid_object_prefix),
+// so this framing cannot collide with a local key used as an opaque marker.
+const LIST_THROUGH_TOKEN_PREFIX: &str = "\0odm-list:";
 
 /// Pages fetched per side per request: the first page, plus at most one refill
 /// when the first one was mostly consumed by the previous page. Two pages of
@@ -86,8 +89,7 @@ pub struct MergePick {
 }
 
 /// The continuation-token envelope. Opaque to clients: it is serialized as
-/// JSON and then base64-encoded by the same helper that encodes a plain local
-/// marker, so the wire shape is `base64(json)`.
+/// framed JSON and then base64-encoded by the same helper as a local marker.
 ///
 /// A `null` cursor with `done = false` means "list that side from the start";
 /// `done = true` means the side is finished and must not be listed again.
@@ -129,7 +131,7 @@ impl ListThroughToken {
     pub fn encode(&self) -> String {
         // The envelope is built here from owned strings, so serialization
         // cannot fail; the fallback keeps the signature infallible.
-        serde_json::to_string(self).unwrap_or_default()
+        format!("{LIST_THROUGH_TOKEN_PREFIX}{}", serde_json::to_string(self).unwrap_or_default())
     }
 }
 
@@ -153,21 +155,18 @@ pub enum ListThroughTokenError {
 
 /// Classifies an already base64-decoded continuation token.
 ///
-/// Only a JSON object carrying the envelope marker is read as a merged token;
+/// Only a framed JSON object is read as a merged token;
 /// anything else is a local marker, so a bucket that turns `list_through` off
 /// keeps paginating with the tokens it handed out. A token that *is* an
 /// envelope but was tampered with (unknown version, unknown field, truncated
 /// JSON) is an error, never a silent fallback.
 pub fn decode_continuation_token(decoded: &str) -> Result<ListThroughCursor, ListThroughTokenError> {
-    if !decoded.starts_with('{') {
-        return Ok(ListThroughCursor::Local(decoded.to_string()));
-    }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(decoded) else {
-        // Not JSON at all: an object key may legitimately start with '{'.
+    let Some(payload) = decoded.strip_prefix(LIST_THROUGH_TOKEN_PREFIX) else {
         return Ok(ListThroughCursor::Local(decoded.to_string()));
     };
+    let value = serde_json::from_str::<serde_json::Value>(payload).map_err(|_| ListThroughTokenError::Malformed)?;
     if value.get("t").and_then(serde_json::Value::as_str) != Some(LIST_THROUGH_TOKEN_TAG) {
-        return Ok(ListThroughCursor::Local(decoded.to_string()));
+        return Err(ListThroughTokenError::Malformed);
     }
     match value.get("v").and_then(serde_json::Value::as_u64) {
         Some(version) if version == u64::from(LIST_THROUGH_TOKEN_VERSION) => {}
@@ -718,14 +717,21 @@ mod tests {
         assert_eq!(decode_continuation_token(&extra), Err(ListThroughTokenError::Malformed));
 
         let truncated = &encoded[..encoded.len() - 3];
-        assert_eq!(decode_continuation_token(truncated), Ok(ListThroughCursor::Local(truncated.to_string())));
+        assert_eq!(decode_continuation_token(truncated), Err(ListThroughTokenError::Malformed));
 
-        let no_version = "{\"t\":\"odm-list\"}";
+        let no_version = "\0odm-list:{\"t\":\"odm-list\"}";
         assert_eq!(decode_continuation_token(no_version), Err(ListThroughTokenError::Malformed));
     }
 
     #[test]
     fn a_plain_local_marker_stays_local() {
+        for marker in [
+            r#"{"t":"odm-list","v":1}"#,
+            r#"{"t":"odm-list","v":2,"local_done":true}"#,
+            r#"{"t":"odm-list"}"#,
+        ] {
+            assert_eq!(decode_continuation_token(marker), Ok(ListThroughCursor::Local(marker.to_string())));
+        }
         assert_eq!(
             decode_continuation_token("photos/2024/01.jpg"),
             Ok(ListThroughCursor::Local("photos/2024/01.jpg".to_string()))

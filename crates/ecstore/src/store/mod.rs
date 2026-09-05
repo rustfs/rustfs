@@ -848,7 +848,7 @@ impl ECStore {
     }
 
     pub fn scanner_namespace_mutation_generation(&self) -> u64 {
-        list_objects::scanner_namespace_mutation_generation()
+        list_objects::scanner_namespace_mutation_generation().saturating_add(self.ctx.namespace_commit_generation())
     }
 
     pub async fn scanner_data_movement_active(&self) -> bool {
@@ -857,7 +857,7 @@ impl ECStore {
     }
 
     /// Return the storage-owned movement state and generation as one
-    /// authenticated activity snapshot.  The read lock is acquired before
+    /// authenticated activity snapshot. The read lock is acquired before
     /// the state locks (cancelers, pool metadata, then rebalance metadata),
     /// matching the transition writer order and preventing a terminal state
     /// from being reported with the preceding generation.
@@ -886,11 +886,12 @@ impl ECStore {
     /// Returns whether scanner metadata may still be hidden by a local
     /// data-movement state. Terminal failed/canceled decommission entries
     /// remain suspended until an operator clears or retries them, so they are
-    /// a publication barrier even after the worker has stopped.
+    /// a publication barrier even after the worker has stopped. Active PUT
+    /// rename fanouts also defer publication, including post-ACK tails.
     pub async fn scanner_data_usage_publication_blocked(&self) -> bool {
         let operation_gate = self.ctx.data_movement_operation_gate();
         let _operation_guard = operation_gate.read_owned().await;
-        self.scanner_data_usage_publication_snapshot_blocked().await
+        self.scanner_data_usage_publication_snapshot_blocked().await || self.ctx.namespace_commits_pending()
     }
 
     pub async fn scanner_data_movement_pause_status(&self) -> ScannerDataMovementPauseStatus {
@@ -1070,7 +1071,7 @@ impl ECStore {
         {
             return Err(Error::other("scanner publication lease generation is stale"));
         }
-        if self.scanner_data_movement_snapshot_locked().await.1 {
+        if self.scanner_data_movement_snapshot_locked().await.1 || self.ctx.namespace_commits_pending() {
             return Err(Error::other("scanner publication lease is blocked by data movement"));
         }
 
@@ -1109,7 +1110,7 @@ impl ECStore {
         {
             return Err(Error::other("scanner publication lease generation is stale"));
         }
-        if self.scanner_data_movement_snapshot_locked().await.1 {
+        if self.scanner_data_movement_snapshot_locked().await.1 || self.ctx.namespace_commits_pending() {
             return Err(Error::other("scanner publication lease is blocked by data movement"));
         }
         if !self.ctx.scanner_publication_lease_is_active(token).await {
@@ -1129,7 +1130,7 @@ impl ECStore {
         if self.ctx.data_movement_generation_exhausted() || self.ctx.data_movement_operation_epoch_exhausted() {
             return Err(Error::other("scanner publication lease generation is exhausted"));
         }
-        if self.scanner_data_movement_snapshot_locked().await.1 {
+        if self.scanner_data_movement_snapshot_locked().await.1 || self.ctx.namespace_commits_pending() {
             return Err(Error::other("scanner publication lease is blocked by data movement"));
         }
         let Some(lease_generation) = self.ctx.scanner_publication_lease_generation(token).await else {

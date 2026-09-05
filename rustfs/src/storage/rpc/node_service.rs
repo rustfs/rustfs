@@ -2056,9 +2056,9 @@ impl Node for NodeService {
             )
             .map_err(|err| Status::failed_precondition(err.to_string()))?;
         }
-        let namespace_generation = store.scanner_namespace_mutation_generation();
         let topology_digest = rustfs_scanner::scanner_topology_digest(store.as_ref());
         let (data_movement_active, publication_blocked, movement_generation) = store.scanner_data_movement_activity().await;
+        let namespace_generation = store.scanner_namespace_mutation_generation();
         let mut response = match request_protocol {
             SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION | SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION => {
                 previous_scanner_activity_response(namespace_generation, topology_digest, data_movement_active)
@@ -6118,6 +6118,91 @@ mod tests {
             .await
             .expect_err("authenticated activity queries still require initialized storage");
         assert_eq!(unavailable.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn scanner_activity_samples_namespace_generation_after_waiting_for_movement_state() {
+        use crate::storage::storage_api::{ObjectOptions, PutObjReader, contract::object::ObjectIO as _};
+
+        let _ = rustfs_credentials::set_global_rpc_secret("scanner-activity-generation-test-secret".to_string());
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("TESTROOTACCESSKEY".to_string()),
+            Some("TESTROOTSECRET123".to_string()),
+        );
+        let temp_dir = tempfile::tempdir().expect("scanner activity RPC test directory");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp_dir.path())
+            .build()
+            .await;
+        ObjectStore::new(Arc::clone(&env.ecstore))
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+            .await
+            .expect("build isolated IAM");
+        let context = Arc::new(crate::runtime_sources::AppContext::with_default_interfaces(
+            Arc::clone(&env.ecstore),
+            iam,
+            Arc::new(KmsServiceManager::new()),
+        ));
+        let service = make_server_for_context(Some(context));
+        let bucket = "scanner-activity-generation";
+        env.make_bucket(bucket, false).await;
+        let generation_before = env.ecstore.scanner_namespace_mutation_generation();
+        let mut request = Request::new(ScannerActivityRequest {
+            challenge: vec![7; 16].into(),
+            protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            acknowledge_instance_id: String::new(),
+            acknowledge_dirty_usage_generation: 0,
+        });
+        let canonical = rustfs_protos::canonical_scanner_activity_request_body(request.get_ref())
+            .expect("scanner activity request should encode");
+        set_tonic_canonical_body_digest(&mut request, &canonical).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut request);
+
+        let pool_meta = env.ecstore.pool_meta.write().await;
+        drop(
+            env.ecstore
+                .decommission_cancelers
+                .try_write()
+                .expect("movement snapshot should not hold the cancelers before the RPC"),
+        );
+        let mut activity = Box::pin(tokio::task::unconstrained(service.scanner_activity(request)));
+        assert!(futures::poll!(activity.as_mut()).is_pending());
+        assert!(
+            env.ecstore.decommission_cancelers.try_write().is_err(),
+            "the RPC must hold the cancelers read guard while waiting for pool metadata"
+        );
+
+        // Select the existing set directly: ECStore pool selection reads the lock held by this test.
+        let mut reader = PutObjReader::from_vec(b"namespace changed during activity probe".to_vec());
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            env.ecstore.pools[0].disk_set[0].put_object(
+                bucket,
+                "object",
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("the namespace mutation must not wait for the RPC's pool lock")
+        .expect("the namespace mutation must complete while the RPC waits");
+        let generation_after = env.ecstore.scanner_namespace_mutation_generation();
+        assert!(generation_after > generation_before);
+        drop(pool_meta);
+
+        let response = tokio::time::timeout(Duration::from_secs(30), activity)
+            .await
+            .expect("scanner activity RPC should resume after the pool lock is released")
+            .expect("authenticated scanner activity RPC should succeed")
+            .into_inner();
+        assert_eq!(response.namespace_generation, generation_after);
+        assert_eq!(response.publication_blocked, Some(false));
     }
 
     #[tokio::test]

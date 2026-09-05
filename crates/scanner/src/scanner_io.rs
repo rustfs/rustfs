@@ -331,9 +331,12 @@ async fn scanner_cycle_activity_status<S>(
 where
     S: ScannerStorage,
 {
+    // Read the pending-commit barrier before sampling its completion generation.
+    // A tail that drains during this await must invalidate the earlier baseline.
+    let publication_blocked = store.scanner_data_usage_publication_blocked().await;
     match crate::scanner::probe_scanner_activity(store, distributed).await {
         Ok(after) => {
-            let status = if after == *before {
+            let status = if !publication_blocked && after == *before {
                 ScannerCycleActivityStatus::Unchanged
             } else {
                 ScannerCycleActivityStatus::Changed
@@ -635,6 +638,7 @@ fn scanner_activity_preflight(
 pub(crate) struct ScannerCycleResult {
     pub(crate) status: ScannerCycleStatus,
     publication_epoch: Option<u64>,
+    activity_digest: Option<[u8; 32]>,
     observational_snapshot_published: bool,
     dirty_usage_clear: Option<DirtyUsageBuckets>,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
@@ -649,6 +653,7 @@ impl ScannerCycleResult {
         Self {
             status,
             publication_epoch: None,
+            activity_digest: None,
             observational_snapshot_published: false,
             dirty_usage_clear,
             remote_dirty_usage_acknowledgements: Vec::new(),
@@ -666,6 +671,15 @@ impl ScannerCycleResult {
 
     pub(crate) fn publication_epoch(&self) -> Option<u64> {
         self.publication_epoch
+    }
+
+    fn with_activity_digest(mut self, activity_digest: [u8; 32]) -> Self {
+        self.activity_digest = Some(activity_digest);
+        self
+    }
+
+    pub(crate) fn activity_digest(&self) -> Option<[u8; 32]> {
+        self.activity_digest
     }
 
     pub(crate) fn with_observational_snapshot_published(mut self, published: bool) -> Self {

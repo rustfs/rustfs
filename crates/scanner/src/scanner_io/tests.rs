@@ -17,6 +17,7 @@ use super::io_disk::tier_stats_template;
 use super::*;
 use crate::scanner_budget::ScannerCycleBudgetConfig;
 use crate::scanner_folder::ScannerItem;
+use crate::storage_api::ecstore_hold_namespace_commit;
 use crate::storage_api::owner::{
     EcstorePoolDecommissionInfo, EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats,
 };
@@ -342,6 +343,16 @@ async fn multi_pool_scanner_cycle_publishes_combined_usage() {
             .put_object(&bucket, object, &mut reader, &ScannerObjectOptions::default())
             .await
             .expect("object should be written to its selected pool");
+
+        // Quorum ACK can precede tail publication on the disk chosen to scan.
+        let lock = store.pools[pool_index].disk_set[0]
+            .new_ns_lock(&bucket, object)
+            .await
+            .expect("fixture namespace lock should be created");
+        let _settled = lock
+            .get_write_lock(Duration::from_secs(30))
+            .await
+            .expect("fixture rename tail should finish before the usage scan");
     }
 
     let ctx = CancellationToken::new();
@@ -361,7 +372,7 @@ async fn multi_pool_scanner_cycle_publishes_combined_usage() {
         .buckets_usage
         .get(&bucket)
         .expect("combined bucket usage should be present");
-    assert_eq!(bucket_usage.objects_count, 2);
+    assert_eq!(bucket_usage.objects_count, 2, "{usage:?}");
     assert_eq!(bucket_usage.size, 11);
     assert_eq!(usage.objects_total_count, 2);
     assert_eq!(usage.objects_total_size, 11);
@@ -369,6 +380,85 @@ async fn multi_pool_scanner_cycle_publishes_combined_usage() {
         receiver.recv().await.is_none(),
         "a scanner cycle must publish at most one terminal usage snapshot"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn pending_put_commit_keeps_scanner_walk_live_without_authoritative_usage() {
+    let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+    let bucket = format!("scanner-pending-put-{}", Uuid::new_v4().simple());
+    store
+        .make_bucket(&bucket, &MakeBucketOptions::default())
+        .await
+        .expect("bucket should be created across both pools");
+    for (pool_index, (object, body)) in [("pool-a", b"first".as_slice()), ("pool-b", b"second".as_slice())]
+        .into_iter()
+        .enumerate()
+    {
+        let mut reader = ScannerPutObjReader::from_vec(body.to_vec());
+        store.pools[pool_index].disk_set[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut reader,
+                &ScannerObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("fixture objects must finish their rename fanouts before scanning");
+    }
+
+    let mut pending = Some(ecstore_hold_namespace_commit(store.as_ref()));
+    for (cycle, converged) in [(1, false), (2, true)] {
+        if converged {
+            drop(pending.take());
+        }
+        assert_eq!(store.scanner_data_usage_publication_blocked().await, !converged);
+        assert!(!store.scanner_data_movement_pause_status().await.paused);
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default());
+        let (updates, mut receiver) = mpsc::channel(1);
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            ScannerIOCycle::nsscanner_with_status(
+                store.as_ref(),
+                ctx,
+                Arc::clone(&budget),
+                updates,
+                cycle,
+                1,
+                HealScanMode::Normal,
+            ),
+        )
+        .await
+        .expect("namespace scanning must finish while a PUT commit is pending")
+        .expect("namespace scanning must remain available during a pending PUT commit");
+        if !converged {
+            assert_eq!(budget.progress().0, 2, "the pending commit must not suppress actual object traversal");
+        }
+        assert_eq!(
+            result.status,
+            if converged {
+                ScannerCycleStatus::Complete
+            } else {
+                ScannerCycleStatus::Superseded
+            }
+        );
+        let usage = receiver
+            .recv()
+            .await
+            .expect("the completed walk should produce a usage candidate");
+        assert_eq!(usage.usage_snapshot_converged, Some(converged));
+        assert_eq!(usage.scanner_cycle, Some(cycle));
+        assert_eq!(usage.objects_total_count, 2);
+        assert_eq!(usage.objects_total_size, 11);
+        let bucket_usage = usage.buckets_usage.get(&bucket).expect("the walked bucket must be present");
+        assert_eq!(bucket_usage.objects_count, 2);
+        assert_eq!(bucket_usage.size, 11);
+        assert!(receiver.recv().await.is_none(), "each walk must emit exactly one terminal candidate");
+    }
 }
 
 #[tokio::test]
@@ -386,6 +476,16 @@ async fn multi_pool_scanner_cycle_zero_fills_bucket_absent_from_first_pool() {
         .put_object(&bucket, "pool-b", &mut reader, &ScannerObjectOptions::default())
         .await
         .expect("object should be written only to the second pool");
+    {
+        let lock = store.pools[1].disk_set[0]
+            .new_ns_lock(&bucket, "pool-b")
+            .await
+            .expect("fixture namespace lock should be created");
+        let _settled = lock
+            .get_write_lock(Duration::from_secs(30))
+            .await
+            .expect("fixture rename tail should finish before the usage scan");
+    }
     store.pools[0]
         .delete_bucket(&bucket, &DeleteBucketOptions::default())
         .await

@@ -891,11 +891,44 @@ pub(crate) fn mark_on_demand_migration_list_local_only(headers: &mut HeaderMap) 
 /// forwarded to the source: a 304/412 answered by the source would be
 /// indistinguishable from a source failure.
 pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceHead) -> S3Result<()> {
+    let if_match = headers
+        .get(http::header::IF_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    let if_none_match = headers
+        .get(http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    let needs_etag = if_match.is_some_and(|value| value != "*") || if_none_match.is_some_and(|value| value != "*");
+    let needs_mtime = (!headers.contains_key(http::header::IF_MATCH) && headers.contains_key(http::header::IF_UNMODIFIED_SINCE))
+        || (!headers.contains_key(http::header::IF_NONE_MATCH) && headers.contains_key(http::header::IF_MODIFIED_SINCE));
+    if (needs_etag && head.etag.is_none()) || (needs_mtime && head.last_modified.is_none()) {
+        return Err(odm_source_unavailable_error("missing_source_validator"));
+    }
     let info = ObjectInfo {
         etag: head.etag.clone(),
         mod_time: head.last_modified.map(OffsetDateTime::from),
         ..Default::default()
     };
+    // A successful source read establishes wildcard existence, but the
+    // remaining conditions must still run in their ordinary precedence.
+    if head.etag.is_none() && (if_match == Some("*") || if_none_match == Some("*")) {
+        let mut remaining = headers.clone();
+        if if_match == Some("*") {
+            remaining.remove(http::header::IF_MATCH);
+            remaining.remove(http::header::IF_UNMODIFIED_SINCE);
+        }
+        if if_none_match == Some("*") {
+            remaining.remove(http::header::IF_NONE_MATCH);
+            remaining.remove(http::header::IF_MODIFIED_SINCE);
+        }
+        check_preconditions(&remaining, &info)?;
+        return if if_none_match == Some("*") {
+            Err(S3Error::new(S3ErrorCode::NotModified))
+        } else {
+            Ok(())
+        };
+    }
     check_preconditions(headers, &info)
 }
 
@@ -1952,8 +1985,42 @@ mod on_demand_migration_tests {
         .expect_err("modified since an earlier date is 412");
         assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
 
-        // A source without validators cannot fail a precondition.
         let bare = SourceHead::default();
-        assert!(odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "\"other\""), &bare).is_ok());
+        let err =
+            odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "\"other\""), &bare).expect_err("missing ETag");
+        assert_eq!(err.status_code(), Some(http::StatusCode::FAILED_DEPENDENCY));
+        assert!(odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "*"), &bare).is_ok());
+        let err =
+            odm_check_source_preconditions(&headers_with(http::header::IF_NONE_MATCH, "*"), &bare).expect_err("source exists");
+        assert_eq!(err.code(), &S3ErrorCode::NotModified);
+        let dated = SourceHead {
+            last_modified: head.last_modified,
+            ..Default::default()
+        };
+        assert!(odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "*"), &dated).is_ok());
+        let mut combined = headers_with(http::header::IF_NONE_MATCH, "*");
+        combined.insert(http::header::IF_MATCH, HeaderValue::from_static("\"other\""));
+        assert_eq!(
+            odm_check_source_preconditions(&combined, &dated)
+                .expect_err("specific ETag unavailable")
+                .status_code(),
+            Some(http::StatusCode::FAILED_DEPENDENCY)
+        );
+        combined.remove(http::header::IF_MATCH);
+        combined.insert(
+            http::header::IF_UNMODIFIED_SINCE,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(
+            odm_check_source_preconditions(&combined, &dated)
+                .expect_err("unmodified-since fails before none-match")
+                .code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+        for header in [http::header::IF_MODIFIED_SINCE, http::header::IF_UNMODIFIED_SINCE] {
+            let err = odm_check_source_preconditions(&headers_with(header, "Wed, 21 Oct 2015 07:28:00 GMT"), &bare)
+                .expect_err("missing timestamp");
+            assert_eq!(err.status_code(), Some(http::StatusCode::FAILED_DEPENDENCY));
+        }
     }
 }

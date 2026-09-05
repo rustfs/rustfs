@@ -949,7 +949,11 @@ pub(super) enum PutObjectOrigin<'a> {
     /// request and no credential: managed-SSE authorization treats the write
     /// as internal, and the creation event, when requested, names
     /// `principal_id` instead of an access key.
-    Internal { principal_id: &'static str, emit_events: bool },
+    Internal {
+        principal_id: &'static str,
+        emit_events: bool,
+        preserve_delete_marker: bool,
+    },
 }
 
 impl PutObjectOrigin<'_> {
@@ -1602,6 +1606,12 @@ impl DefaultObjectUsecase {
         if let Some(etag) = preserve_etag {
             opts.preserve_etag = Some(etag);
         }
+        if let PutObjectOrigin::Internal {
+            preserve_delete_marker, ..
+        } = &origin
+        {
+            opts.preserve_delete_marker = *preserve_delete_marker;
+        }
         if let Some(quota_check) = quota_check.as_ref() {
             apply_quota_admission(&mut opts, quota_check)?;
         }
@@ -1768,6 +1778,7 @@ impl DefaultObjectUsecase {
             PutObjectOrigin::Internal {
                 principal_id,
                 emit_events,
+                ..
             } => {
                 let principal_id = *principal_id;
                 let request_context = request_context::RequestContext::fallback();

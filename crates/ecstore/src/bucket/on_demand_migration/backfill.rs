@@ -25,8 +25,8 @@
 //!   [`BACKFILL_SAVE_INTERVAL`], and at every page end, with an `If-Match`
 //!   compare-and-set so a concurrent cancel or takeover is never overwritten.
 //! - The `continuation_token` only advances once every pull queued from the
-//!   page before it has reported back, so a crash re-lists at most one page
-//!   (already-present keys are then skipped, never re-pulled).
+//!   page before it has succeeded. After a failure it stays at that page,
+//!   so crash recovery cannot skip failed pulls (existing keys are skipped).
 //! - The owner holds a lease of [`BACKFILL_LEASE`] renewed by every save. The
 //!   recovery loop ([`run_backfill_recovery_loop`]) scans the buckets this
 //!   node has an ODM state for every [`BACKFILL_RECOVERY_INTERVAL`] and takes
@@ -367,9 +367,8 @@ pub struct LocalBackfillObject {
     pub source_etag: Option<String>,
 }
 
-/// Receiver of one queued pull's report; `None` when the pull was coalesced
-/// into one already running.
-pub type PullReport = Option<oneshot::Receiver<QueuedPullOutcome>>;
+/// Shared report of a new or coalesced pull; absent only when not admitted.
+pub type PullReport = Option<super::pull::QueuedPullReport>;
 
 /// Everything the job needs from its bucket, so the loop can run against a
 /// mock in unit tests. Production: [`BucketBackfillContext`].
@@ -1190,9 +1189,10 @@ impl Job {
     }
 
     async fn main_loop(&mut self) -> Result<(), Stop> {
+        let mut cursor = self.checkpoint.continuation_token.clone();
         loop {
             self.check_cancel()?;
-            let page = self.list_page().await?;
+            let page = self.list_page(cursor.as_deref()).await?;
             for object in &page.objects {
                 self.check_cancel()?;
                 self.checkpoint.listed += 1;
@@ -1204,10 +1204,13 @@ impl Job {
                 self.drain_ready();
                 self.tick(false).await?;
             }
-            // Only advance the cursor once every pull of this page reported
-            // back, so a takeover re-lists at most this page.
+            // A persisted cursor certifies successful work, not just listing
+            // progress. Keep it at the first failed page for crash recovery.
             self.drain_all().await?;
-            self.checkpoint.continuation_token = page.next_continuation_token.clone();
+            cursor = page.next_continuation_token;
+            if self.checkpoint.failed == 0 {
+                self.checkpoint.continuation_token = cursor.clone();
+            }
             self.tick(true).await?;
             if !page.is_truncated {
                 return Ok(());
@@ -1222,7 +1225,7 @@ impl Job {
         }
     }
 
-    async fn list_page(&mut self) -> Result<SourcePage, Stop> {
+    async fn list_page(&mut self, cursor: Option<&str>) -> Result<SourcePage, Stop> {
         let mut attempt = 0;
         loop {
             while !self.context.source_available() {
@@ -1230,7 +1233,7 @@ impl Job {
                 self.tick(false).await?;
             }
             let prefix = self.checkpoint.prefix.clone();
-            let token = self.checkpoint.continuation_token.clone();
+            let token = cursor.map(str::to_string);
             match self
                 .context
                 .list_page(prefix.as_deref(), token.as_deref(), BACKFILL_LIST_PAGE_SIZE)
@@ -1304,9 +1307,10 @@ impl Job {
         }
         loop {
             match self.context.enqueue(key) {
-                (EnqueueOutcome::Enqueued, report) => {
+                (EnqueueOutcome::Enqueued | EnqueueOutcome::Coalesced, report) => {
                     self.checkpoint.enqueued += 1;
-                    if let Some(rx) = report {
+                    let rx = report.ok_or(Stop::Unavailable)?;
+                    {
                         let key = key.to_string();
                         self.outstanding.push(Box::pin(async move { (key, rx.await) }));
                     }
@@ -1319,11 +1323,6 @@ impl Job {
                         key = %key,
                         "On-demand migration backfill queued a pull"
                     );
-                    return Ok(());
-                }
-                (EnqueueOutcome::Coalesced, _) => {
-                    // Someone else pulls it; its result is not ours to count.
-                    self.checkpoint.enqueued += 1;
                     return Ok(());
                 }
                 (EnqueueOutcome::QueueFull, _) => {
@@ -1639,6 +1638,7 @@ mod tests {
         queue_capacity: usize,
         pending: Mutex<Vec<(String, oneshot::Sender<QueuedPullOutcome>)>>,
         fail_keys: HashSet<String>,
+        coalesced: bool,
         auto_complete: AtomicBool,
         cancel: CancellationToken,
         config_updated_at: Mutex<Option<OffsetDateTime>>,
@@ -1666,6 +1666,7 @@ mod tests {
                 queue_capacity: usize::MAX,
                 pending: Mutex::new(Vec::new()),
                 fail_keys: HashSet::new(),
+                coalesced: false,
                 auto_complete: AtomicBool::new(true),
                 cancel: CancellationToken::new(),
                 config_updated_at: Mutex::new(Some(ts(1_700_000_000))),
@@ -1745,7 +1746,12 @@ mod tests {
             } else {
                 self.pending.lock().push((key.to_string(), tx));
             }
-            (EnqueueOutcome::Enqueued, Some(rx))
+            let outcome = if self.coalesced {
+                EnqueueOutcome::Coalesced
+            } else {
+                EnqueueOutcome::Enqueued
+            };
+            (outcome, Some(futures::FutureExt::shared(rx)))
         }
 
         fn cancel_token(&self) -> CancellationToken {
@@ -1911,7 +1917,7 @@ mod tests {
     #[tokio::test]
     async fn failed_pulls_are_counted_hashed_and_finish_with_failures() {
         let bucket = "backfill-failed";
-        let mut context = MockContext::new(5, 1000);
+        let mut context = MockContext::new(5, 2);
         Arc::get_mut(&mut context)
             .expect("unshared")
             .fail_keys
@@ -1926,10 +1932,50 @@ mod tests {
             .checkpoint;
         assert_eq!(cp.state, BackfillState::CompletedWithFailures);
         assert_eq!((cp.pulled, cp.failed), (4, 1));
+        assert_eq!(cp.continuation_token.as_deref(), Some("2"), "retain the first failed page for recovery");
         assert_eq!(cp.failed_keys, vec![key_hash("k/00002")]);
         let last = cp.last_error.expect("last error");
         assert_eq!(last.class, "local_write");
         assert_eq!(last.key_hash.as_deref(), Some(key_hash("k/00002").as_str()));
+    }
+
+    #[tokio::test]
+    async fn coalesced_pulls_block_the_checkpoint_and_report_failures() {
+        let bucket = "backfill-coalesced";
+        let mut context = MockContext::new(1, 1);
+        {
+            let ctx = Arc::get_mut(&mut context).expect("unshared");
+            ctx.coalesced = true;
+            ctx.auto_complete = AtomicBool::new(false);
+            ctx.fail_keys.insert("k/00000".to_string());
+        }
+        let (_dirs, store, runner) = runner_with("node-a", bucket, Arc::clone(&context)).await;
+        runner.start(bucket, BackfillRequest::default()).await.expect("start");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while context.pending.lock().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("job enqueued");
+        assert!(runner.is_running_locally(bucket), "coalescing is not completion");
+        let cp = read_checkpoint(&store, bucket)
+            .await
+            .expect("read")
+            .expect("checkpoint")
+            .checkpoint;
+        assert!(cp.state.is_active());
+        assert!(cp.continuation_token.is_none());
+        context.complete_pending();
+        runner.wait_until_idle(bucket).await;
+        let cp = read_checkpoint(&store, bucket)
+            .await
+            .expect("read")
+            .expect("checkpoint")
+            .checkpoint;
+        assert_eq!(cp.state, BackfillState::CompletedWithFailures);
+        assert_eq!((cp.enqueued, cp.pulled, cp.failed), (1, 0, 1));
+        assert_eq!(cp.failed_keys, vec![key_hash("k/00000")]);
     }
 
     #[tokio::test]

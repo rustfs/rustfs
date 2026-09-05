@@ -1616,7 +1616,7 @@ where
     // Refresh the storage-owned movement snapshot before reading background
     // heal state. A missing heal object yields an in-memory default; do not
     // let that default influence a cycle while publication is blocked.
-    if storeapi.scanner_data_usage_publication_blocked().await {
+    if storeapi.scanner_data_movement_pause_status().await.paused {
         mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
     }
@@ -1812,6 +1812,19 @@ where
     let publication_defer_reason = publication_defer_reason
         .or(remote_lease_defer_reason)
         .or(remote_lease_fence_defer_reason);
+    // A PUT tail can finish between the walk and lease acquisition without
+    // changing the movement epoch accepted by those leases. Re-prove the
+    // namespace baseline only after every peer has granted publication.
+    let post_lease_activity_defer_reason = if publication_defer_reason.is_none()
+        && remote_publication_leases.is_some()
+        && let Ok(result) = &scan_result
+        && result.status == ScannerCycleStatus::Complete
+    {
+        scanner_post_lease_activity_defer_reason(result.activity_digest(), probe_scanner_activity(storeapi.as_ref(), true).await)
+    } else {
+        None
+    };
+    let publication_defer_reason = publication_defer_reason.or(post_lease_activity_defer_reason);
     // Include reasons discovered while acquiring or validating remote leases.
     let publication_deferred = publication_defer_reason.is_some();
     let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
@@ -3233,6 +3246,21 @@ where
         // Incomplete cycles may publish a non-authoritative observational
         // snapshot when at least one set has a usable current/LKG view.
         ScannerCycleStatus::Incomplete => None,
+    }
+}
+
+fn scanner_post_lease_activity_defer_reason(
+    expected_digest: Option<[u8; 32]>,
+    activity: Result<ScannerActivitySnapshot, String>,
+) -> Option<ScannerCycleDeferReason> {
+    match activity {
+        Ok(snapshot)
+            if scanner_activity_allows_usage_publication(&snapshot)
+                && expected_digest == Some(scanner_activity_snapshot_digest(&snapshot)) =>
+        {
+            None
+        }
+        Ok(_) | Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
     }
 }
 

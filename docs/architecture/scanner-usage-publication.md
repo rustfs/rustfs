@@ -23,6 +23,30 @@ therefore has three identities:
 If any identity changes before commit, the result is a candidate for retry or
 observation, not an authoritative baseline.
 
+Ordinary PUT rename fanouts also track instance-scoped in-flight work. A quorum
+ACK does not release it: the actual disk tasks retain ownership until their
+rename work ends, including when the request caller is cancelled. Scan admission
+remains movement-only so sustained PUTs do not stop namespace walks and
+scanner-driven lifecycle discovery. The post-walk local publication check and
+remote publication leases reject pending fanouts. Begin/end namespace generations
+invalidate scans and cached plans across the fanout; after acquiring remote
+leases, the coordinator rechecks the full activity digest before publishing an
+authoritative aggregate. This catches a tail that finishes between the scan's
+last probe and lease acquisition.
+
+This adds no namespace or movement lock. An already-verified older snapshot may
+still precede a newly started write. Sustained or stalled PUT tails can delay
+authoritative usage publication, which resumes through the existing retry
+schedule rather than a new immediate-wakeup protocol. Intermediate per-set and
+prefix cache readers retain their existing approximate-cache semantics. A
+prolonged pending tail with no generation changes can also delay cycle advancement
+and fresh rescans of already-current caches; this is not a guarantee of lifecycle
+progress under indefinitely stalled storage I/O.
+
+This PUT-tail protection requires every writer node to be upgraded. It does not
+prove that a failed tail replica has healed, and it does not extend the same
+in-flight tracking to multipart or other namespace mutation paths.
+
 ## Fences
 
 The protocol uses separate fences because they exclude different stale inputs.
