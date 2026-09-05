@@ -1137,6 +1137,36 @@ fn scoped_scan_selects_only_current_dirty_buckets_after_baseline_validation() {
     assert_ne!(scope.baseline_scan_plan_digest, Some(baseline_scan_plan_digest));
 }
 
+#[test]
+fn scoped_scan_baseline_work_proof_requires_uniform_known_set_identity() {
+    let source = DataUsageCacheSource::new(1, 2);
+    let second_source = DataUsageCacheSource::new(1, 3);
+    let sources = HashSet::from([source, second_source]);
+    let structural = DataUsageScanPlanDigest([9; 32]);
+    let full = scanner_bucket_work_digest(structural, HealScanMode::Normal, true);
+    let deep = scanner_bucket_work_digest(structural, HealScanMode::Deep, true);
+    let encoded = complete_usage_baseline(source, full, 7, 11);
+    let baseline: DataUsageInfo = serde_json::from_slice(&encoded).expect("baseline should decode");
+    for (second_plan, expected) in [(full, Some(full)), (deep, None), (DataUsageScanPlanDigest([8; 32]), None)] {
+        let mut candidate = baseline.clone();
+        let mut second = candidate.usage_snapshot_set_states[0].clone();
+        second.set_index = 3;
+        second.scan_plan_digest = Some(second_plan.0);
+        candidate.usage_snapshot_set_states.push(second);
+        let data = Bytes::from(serde_json::to_vec(&candidate).expect("candidate should encode"));
+        assert_eq!(
+            complete_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
+                data: Some(&data),
+                expected_sources: &sources,
+                leader_epoch: 11,
+                want_cycle: 8,
+                scan_plan_digest: structural,
+            }),
+            expected
+        );
+    }
+}
+
 fn peer_dirty_usage_snapshot(
     instance_id: &str,
     generation: u64,

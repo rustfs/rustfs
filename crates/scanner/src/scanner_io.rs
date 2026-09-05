@@ -183,6 +183,18 @@ fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<
         return None;
     }
 
+    // Completed maintenance also covers ordinary usage. Keep its exact stored
+    // proof for cache reuse, and reject mixtures of different set work proofs.
+    let baseline_plan_digest = DataUsageScanPlanDigest(baseline.usage_snapshot_set_states.first()?.scan_plan_digest?);
+    if ![
+        proof.scan_plan_digest,
+        scanner_bucket_work_digest(proof.scan_plan_digest, HealScanMode::Normal, true),
+        scanner_bucket_work_digest(proof.scan_plan_digest, HealScanMode::Deep, true),
+    ]
+    .contains(&baseline_plan_digest)
+    {
+        return None;
+    }
     let mut states = HashSet::with_capacity(baseline.usage_snapshot_set_states.len());
     for state in &baseline.usage_snapshot_set_states {
         let source = DataUsageCacheSource::new(usize::try_from(state.pool_index).ok()?, usize::try_from(state.set_index).ok()?);
@@ -192,13 +204,13 @@ fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<
             || state.tombstone
             || state.scanner_epoch != Some(proof.leader_epoch)
             || state.scanner_cycle.is_none_or(|cycle| cycle > proof.want_cycle)
-            || state.scan_plan_digest != Some(proof.scan_plan_digest.0)
+            || state.scan_plan_digest != Some(baseline_plan_digest.0)
         {
             return None;
         }
     }
 
-    (states == *proof.expected_sources).then_some(proof.scan_plan_digest)
+    (states == *proof.expected_sources).then_some(baseline_plan_digest)
 }
 
 fn scoped_scan_scope_from_dirty_buckets(

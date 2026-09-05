@@ -275,10 +275,11 @@ where
     }
     bucket_plan_complete &= buckets_by_source.keys().copied().collect::<HashSet<_>>() == *expected_sources;
     bucket_plan_complete &= scanner_bucket_inventory_is_complete(&all_buckets, &buckets_by_source);
-    let scan_plan_digest =
+    let structural_scan_plan_digest =
         scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_structural_digest(&activity_before));
     let bucket_coverage_digest =
         scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_snapshot_digest(&activity_before));
+    let scan_plan_digest = scanner_bucket_work_digest(structural_scan_plan_digest, scan_mode, requires_full_scan);
     let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets(&all_buckets, dirty_generation_before_bucket_list));
     let scan_scope = resolve_scanner_bucket_scan_scope(
         store,
@@ -290,7 +291,7 @@ where
                 expected_sources: &expected_sources,
                 leader_epoch,
                 want_cycle,
-                scan_plan_digest,
+                scan_plan_digest: structural_scan_plan_digest,
             },
             activity_before: &activity_before,
             dirty_usage_snapshot: &dirty_usage_snapshot,
@@ -431,7 +432,7 @@ where
             buckets: set_buckets,
             all_buckets: Arc::clone(&all_buckets),
             scope: scan_scope.clone(),
-            digest: scan_plan_digest,
+            digest: structural_scan_plan_digest,
             bucket_coverage_digest,
             requires_full_scan,
             leader_epoch,

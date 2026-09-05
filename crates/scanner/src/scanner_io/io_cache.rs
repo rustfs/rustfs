@@ -126,6 +126,7 @@ impl ScannerIOCache for SetDisks {
             cache_cycle_floor,
         } = scan_plan;
         let bucket_work_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
+        let scan_plan_digest = scanner_bucket_work_digest(scan_plan_digest, scan_mode, requires_full_scan);
         let pool_label = self.pool_index.to_string();
         let set_label = self.set_index.to_string();
 
