@@ -818,7 +818,7 @@ pub(crate) fn classify_peer_transport_error(is_connect: bool, is_timeout: bool, 
     let detail = detail.to_ascii_lowercase();
     if is_connect && detail.contains("dns") {
         "dns resolution"
-    } else if detail.contains("certificate") || detail.contains("tls") {
+    } else if is_connect && (detail.contains("certificate") || detail.contains("tls")) {
         "tls handshake"
     } else if is_connect {
         "connect"
