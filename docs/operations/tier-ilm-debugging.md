@@ -16,6 +16,7 @@
 | Persisted free-version scan and re-enqueue after local-first expiry | `crates/ecstore/src/bucket/lifecycle/tier_free_version_recovery.rs` |
 | Fenced free-version remote delete, local-marker cleanup, and rescan | `crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops.rs` (`cleanup_free_version_exact`) |
 | Durable manual transition job/task/result records | `crates/ecstore/src/bucket/lifecycle/manual_transition_job.rs` |
+| Dormant tier validation probe intent format and read-only core inspection | `crates/ecstore/src/services/tier/tier_probe_intent.rs` |
 | Manual run/status/cancel and transition-transaction reconcile admin routes | `rustfs/src/admin/handlers/ilm_transition.rs` |
 | `ObjectInfo` / `TransitionedObject` types | `crates/ecstore/src/object_api/types.rs` |
 | `FileMeta` / `FileInfo` / version metadata | `crates/filemeta/src/` |
@@ -118,6 +119,12 @@ Recommended operator flow (external `rc` CLI):
 rc admin ilm transition run local/mybucket --prefix logs/ --tier cold --dry-run --max-objects 1000 --max-duration-seconds 30
 rc admin ilm transition run local/mybucket --prefix logs/ --tier cold --max-objects 1000 --max-duration-seconds 30
 ```
+
+## Validation probe crash recovery status
+
+Tier Add, Edit, and Verify currently validate a destination with a unique `rustfs-tier-probe-<uuid>` object and perform bounded compensation while the process remains alive. The `rustfs-tier-probe-intent-v1` decoder, canonical durable namespace, conditional storage primitives, state machine, and crate-level inspection type are present only as a dormant foundation. No validation path writes this record, no startup or periodic recovery scans it, and no admin HTTP route exposes it. V1 requires the owner to remain exactly equal to the immutable creator; takeover would require a new schema with explicit proof. Both durable writing and destructive recovery remain disabled until the fleet capability, operation-generation revalidation, provider timeout, retention, and operator contracts are approved.
+
+Do not search the internal metadata bucket for these records as evidence that validation is crash recoverable: a current server does not create them. If a process is killed after the remote probe PUT but before cleanup, inspect the destination provider manually and retain ambiguous candidates. Never delete an empty or guessed version, and do not hand-create a probe intent to authorize cleanup.
 
 Inspect the aggregate counters before widening scope. Full object-key lists are intentionally not returned. If `RUSTFS_RPC_SECRET` or other credentials were pasted into an issue, chat, log, or ticket while debugging tiering, rotate them on every node, restart the cluster with the new value, and redact the exposed copy before sharing more diagnostics.
 
