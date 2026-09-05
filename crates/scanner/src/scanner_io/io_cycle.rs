@@ -72,6 +72,7 @@ where
         scan_mode,
         scan_scope: ScannerBucketScanScope::default(),
         persisted_usage_baseline: None,
+        observed_usage_candidate: None,
     };
     nsscanner_with_storage_status_scoped(store, request).await
 }
@@ -85,6 +86,7 @@ pub(crate) struct ScannerCycleRequest {
     pub(crate) scan_mode: HealScanMode,
     pub(crate) scan_scope: ScannerBucketScanScope,
     pub(crate) persisted_usage_baseline: Option<Bytes>,
+    pub(crate) observed_usage_candidate: Option<Bytes>,
 }
 
 struct ScannerBucketScopeResolution<'a> {
@@ -172,6 +174,7 @@ where
         scan_mode,
         scan_scope,
         persisted_usage_baseline,
+        observed_usage_candidate,
     } = request;
     let child_token = ctx.child_token();
     let _tier_cycle_guard = begin_tier_registry_cycle(want_cycle, leader_epoch);
@@ -274,7 +277,8 @@ where
         ScannerBucketScopeResolution {
             requested_scope: scan_scope,
             baseline_proof: ScannerCacheBaselineProof {
-                data: persisted_usage_baseline.as_ref(),
+                authoritative_data: persisted_usage_baseline.as_ref(),
+                observed_candidate_data: observed_usage_candidate.as_ref(),
                 expected_sources: &expected_sources,
                 leader_epoch,
                 want_cycle,
