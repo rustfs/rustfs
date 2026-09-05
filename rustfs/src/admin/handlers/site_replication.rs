@@ -6142,20 +6142,24 @@ fn ensure_add_bucket_set_matches_preflight(expected: &HashSet<String>, present: 
     let mut missing = expected.difference(present).cloned().collect::<Vec<_>>();
     if !missing.is_empty() {
         missing.sort_unstable();
-        return Err(s3_error!(
-            InvalidRequest,
-            "bucket `{}` disappeared while site replication was being added; peers may already be joined — re-run replicate add",
-            missing[0]
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!(
+                "bucket `{}` disappeared while site replication was being added; peers may already be joined — re-run replicate add",
+                missing[0]
+            ),
         ));
     }
 
     let mut unexpected = present.difference(expected).cloned().collect::<Vec<_>>();
     if !unexpected.is_empty() {
         unexpected.sort_unstable();
-        return Err(s3_error!(
-            InvalidRequest,
-            "bucket `{}` appeared while site replication was being added; peers may already be joined — re-run replicate add",
-            unexpected[0]
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!(
+                "bucket `{}` appeared while site replication was being added; peers may already be joined — re-run replicate add",
+                unexpected[0]
+            ),
         ));
     }
 
