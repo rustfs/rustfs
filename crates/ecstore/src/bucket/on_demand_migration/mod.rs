@@ -19,25 +19,36 @@
 //! client, and the per-node runtime (`sys`) that turns configs into live
 //! clients guarded by a breaker, a negative cache, singleflight and a pull
 //! concurrency limit (rustfs/backlog#2147).
+//!
+//! A source is reached through one `SourceBackend`: the S3 dialect for every
+//! S3-compatible provider, and a native backend for the providers that have no
+//! S3 API (`azure`, `gcs_native`).
 
+pub mod azure;
+#[cfg(test)]
+mod backend_contract;
 pub mod backfill;
 pub mod breaker;
 pub mod config;
+pub mod gcs;
 pub mod list_through;
+mod native_http;
 pub mod negative_cache;
 pub mod pull;
 pub mod source_client;
 pub mod stats;
 pub mod sys;
+#[cfg(test)]
+mod test_http_fixture;
 
 pub use breaker::{
     BREAKER_FAILURE_THRESHOLD, BREAKER_FAILURE_WINDOW, BREAKER_HALF_OPEN_MAX_PROBES, BREAKER_OPEN_DURATION, Breaker,
     BreakerState, BreakerTransition, BreakerVerdict,
 };
 pub use config::{
-    ConfigPublishHook, FilterConfig, HeadPolicy, ON_DEMAND_MIGRATION_CONFIG_HOOK, ON_DEMAND_MIGRATION_CONFIG_VERSION,
-    OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig, Provider, RangeGetPolicy, SourceConfig,
-    SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
+    AzureSourceConfig, ConfigPublishHook, FilterConfig, GcsSourceConfig, HeadPolicy, ON_DEMAND_MIGRATION_CONFIG_HOOK,
+    ON_DEMAND_MIGRATION_CONFIG_VERSION, OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig, Provider,
+    RangeGetPolicy, SourceConfig, SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
 };
 pub use list_through::{
     FetchRequest, LIST_THROUGH_TOKEN_VERSION, ListEntryKey, ListPageError, ListThroughCursor, ListThroughMerger,
@@ -57,5 +68,6 @@ pub use stats::{
 };
 pub use sys::{
     ApplyOutcome, BucketOdmState, GLOBAL_ON_DEMAND_MIGRATION_SYS, OdmBucketSnapshot, OdmLookup, OdmStateError,
-    OnDemandMigrationSys, PullError, PullFollower, PullLeader, PullOutcome, PullResult, PullSlot, source_client_spec,
+    OnDemandMigrationSys, PullError, PullFollower, PullLeader, PullOutcome, PullResult, PullSlot, source_backend_spec,
+    source_client_spec,
 };
