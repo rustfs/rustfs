@@ -23,8 +23,19 @@ runs:
       with:
         tool: |
           ripgrep@15.2.0
-          actionlint@1.7.12
           shellcheck@0.11.0
+
+    - name: Install actionlint
+      shell: bash
+      run: |
+        actionlint_dir="$(mktemp -d "${RUNNER_TEMP}/actionlint.XXXXXX")"
+        curl --fail --location --silent --show-error \
+          --output "$actionlint_dir/actionlint.tar.gz" \
+          https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+        echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $actionlint_dir/actionlint.tar.gz" | sha256sum --check --status
+        tar -xzf "$actionlint_dir/actionlint.tar.gz" -C "$actionlint_dir" actionlint
+        rm "$actionlint_dir/actionlint.tar.gz"
+        echo "$actionlint_dir" >> "$GITHUB_PATH"
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
