@@ -48,7 +48,7 @@ Required headings and strings in these files are asserted by `scripts/check_arch
 | [config-model-boundary-adr.md](config-model-boundary-adr.md) | touching the server-config model (`Config`, `KV`, `KVS`) or its persistence, or asking which crate owns which part of server configuration |
 | [admin-route-action-snapshot.md](admin-route-action-snapshot.md) | adding, moving, or re-authorizing an admin route and needing to know where the route → handler → `AdminAction` contract is enforced |
 | [kms-bulk-rekey-contract.md](kms-bulk-rekey-contract.md) | changing the bulk envelope re-wrap sweep, its admin endpoints, the re-wrap primitive, or which objects a rekey may touch |
-| [remote-credential-sealing-adr.md](remote-credential-sealing-adr.md) | adding, reading, or persisting a stored remote credential (replication target, remote tier, on-demand migration source), or needing the sealed-envelope format and its mixed-version rules |
+| [remote-credential-sealing-adr.md](remote-credential-sealing-adr.md) | adding, reading, or persisting a stored remote credential (replication target, remote tier, on-demand migration source), or needing the sealed-envelope format, the mixed-version rules, or the reason this is worth doing in one deployment and not in another |
 | [tier-stats-contract.md](tier-stats-contract.md) | changing what `GET /rustfs/admin/v3/tier-stats` returns, adding a tier accounting source, or wiring a metric to a remote tier request |
 
 ## Support and compatibility matrices (release-facing, keep current)
