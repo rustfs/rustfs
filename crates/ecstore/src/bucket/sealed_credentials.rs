@@ -203,7 +203,7 @@ mod tests {
     use parking_lot::Mutex;
     use std::collections::BTreeMap;
 
-    fn encode_context(context: &HashMap<String, String>) -> String {
+    fn encode_context(context: &BTreeMap<String, String>) -> String {
         let ordered = context.iter().collect::<BTreeMap<_, _>>();
         serde_json::to_string(&ordered).expect("context serializes")
     }
