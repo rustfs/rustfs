@@ -907,9 +907,9 @@ impl OnDemandMigrationSys {
     fn remove_with_generation(&self, bucket: &str, generation: u64) -> ApplyOutcome {
         let removed = {
             let mut buckets = self.buckets.write();
-            let Some(slot) = buckets.get_mut(bucket) else {
-                return ApplyOutcome::NotDesired;
-            };
+            // A first install may still be building its client. Retain the
+            // removal generation even before that install creates a slot.
+            let slot = buckets.entry(bucket.to_string()).or_default();
             if slot.generation > generation {
                 return ApplyOutcome::Superseded;
             }
@@ -1298,11 +1298,10 @@ mod tests {
         let older = sys.next_generation();
         let newer = sys.next_generation();
         assert_eq!(sys.remove_with_generation("b", newer), ApplyOutcome::NotDesired);
-        // The removal above did not create a slot; simulate an install that
-        // started before it and finishes after.
-        sys.apply_with_generation("b", Some(&cfg), older).await;
-        assert!(sys.state("b").is_some(), "no slot yet, so the older install lands");
+        assert_eq!(sys.apply_with_generation("b", Some(&cfg), older).await, ApplyOutcome::Superseded);
+        assert!(sys.state("b").is_none(), "removal must supersede an in-flight first install");
 
+        assert_eq!(sys.apply("b", Some(&cfg)).await, ApplyOutcome::Installed);
         let installed = sys.state("b").unwrap();
         let older = sys.next_generation();
         let newer = sys.next_generation();
