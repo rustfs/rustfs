@@ -6088,10 +6088,14 @@ async fn apply_iam_service_account_item(
     };
     let envelope = change.oidc_service_account_envelope;
     if let Some(create) = change.create {
-        let local_updated_at = iam_sys
-            .get_user(&create.access_key)
-            .await
-            .map(|local| local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH));
+        // Like the user path: with the account already deleted here, the
+        // recorded deletion mark is the timestamp a stale create/update
+        // (a snapshot or a delayed delivery) has to beat (backlog#2291).
+        let local_updated_at = match iam_sys.get_user(&create.access_key).await {
+            Some(local) => Some(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH)),
+            None if create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT => None,
+            None => local_iam_deletion_mark(&[format!("svc-acc:{}", create.access_key)]).await,
+        };
         let replicated_policy = if create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
             if local_updated_at.is_some_and(|local_updated_at| is_stale_update(local_updated_at, incoming_updated_at)) {
                 return Ok(());
