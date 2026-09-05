@@ -99,7 +99,7 @@ async fn round(request: &Request) -> serde_json::Value {
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
     *OBSERVATION.lock().expect("install observation") = Some(Observation {
-        root: disk_root,
+        root: disk.path().to_path_buf(),
         limit: request.raw_entry_budget,
         entries: 0,
         name_bytes: 0,
@@ -176,6 +176,6 @@ async fn enumeration_restart_worker() {
         assert_eq!(report["objects_retained"], 4);
         assert_eq!(report["versions_retained"], 4);
         assert_eq!(report["bytes_retained"], 4);
-        assert!(report["raw_entries"].as_u64().expect("observed entries") >= 8);
+        assert!(report["raw_entries"].as_u64().expect("observed entries") >= 8, "{report}");
     }
 }
