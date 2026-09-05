@@ -99,7 +99,7 @@ async fn round(request: &Request) -> serde_json::Value {
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
     *OBSERVATION.lock().expect("install observation") = Some(Observation {
-        root: disk.path().to_path_buf(),
+        root: disk.path(),
         limit: request.raw_entry_budget,
         entries: 0,
         name_bytes: 0,
