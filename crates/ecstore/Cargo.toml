@@ -215,6 +215,7 @@ serde_urlencoded.workspace = true
 google-cloud-storage = { workspace = true }
 google-cloud-auth = { workspace = true }
 faster-hex = { workspace = true }
+quick-xml = { workspace = true }
 ratelimit = { workspace = true }
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["rustls-aws-lc"] }
 

@@ -47,7 +47,10 @@ use super::config::{
 use super::list_through::{SOURCE_LIST_RATE_PER_SEC, SourceListRateLimiter};
 use super::negative_cache::NegativeCache;
 use super::pull::{OdmWriteBack, PullQueue};
-use super::source_client::{SourceClient, SourceClientSpec, SourceError, SourceProvider, SourceTimeouts};
+use super::source_client::{
+    AzureAuth, AzureSourceSpec, GcsSourceSpec, SourceBackendSpec, SourceClient, SourceClientSpec, SourceError, SourceProvider,
+    SourceTimeouts,
+};
 use super::stats::{GaugeGuard, OdmStats, OdmStatsSnapshot, PullFailureReason};
 use crate::bucket::remote_s3_client::{
     PathStyle as ClientPathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3RetryPolicy,
@@ -619,6 +622,7 @@ pub fn source_client_spec(config: &OnDemandMigrationConfig) -> SourceClientSpec 
         // load on a source that is already failing.
         retry: RemoteS3RetryPolicy::Disabled,
         bandwidth_limit: policy.bandwidth_limit_bytes_per_sec.and_then(NonZeroU64::new),
+        backend: source_backend_spec(source),
     }
 }
 
@@ -630,6 +634,31 @@ fn source_provider(provider: Provider) -> SourceProvider {
         Provider::Rustfs => SourceProvider::Rustfs,
         Provider::R2 => SourceProvider::R2,
         Provider::Gcs => SourceProvider::Gcs,
+        Provider::Azure => SourceProvider::Azure,
+        Provider::GcsNative => SourceProvider::GcsNative,
+    }
+}
+
+/// Which backend the client builds. A native provider whose block is missing
+/// falls back to the S3 spec, where the builder reports the missing
+/// credentials: the config layer already refuses to store that shape, so this
+/// only covers a config written by an older or hand-edited build.
+pub(crate) fn source_backend_spec(source: &SourceConfig) -> SourceBackendSpec {
+    match (source.provider, source.azure.as_ref(), source.gcs.as_ref()) {
+        (Provider::Azure, Some(azure), _) => SourceBackendSpec::Azure(AzureSourceSpec {
+            account: azure.account.clone(),
+            auth: match (&azure.account_key, &azure.sas_token) {
+                (Some(key), _) => AzureAuth::SharedKey(key.clone()),
+                (None, Some(sas)) => AzureAuth::Sas(sas.clone()),
+                // Refused by `SourceConfig::validate`; an empty shared key
+                // fails closed at the builder rather than signing with none.
+                (None, None) => AzureAuth::SharedKey(String::new()),
+            },
+        }),
+        (Provider::GcsNative, _, Some(gcs)) => SourceBackendSpec::Gcs(GcsSourceSpec {
+            service_account_json: gcs.service_account_json.clone(),
+        }),
+        _ => SourceBackendSpec::S3,
     }
 }
 
@@ -929,6 +958,8 @@ mod tests {
                     session_token: None,
                 }),
                 tls: TlsConfig::default(),
+                azure: None,
+                gcs: None,
             },
             filter: FilterConfig {
                 prefix: prefix.map(str::to_string),

@@ -19,11 +19,17 @@
 //! client, and the per-node runtime (`sys`) that turns configs into live
 //! clients guarded by a breaker, a negative cache, singleflight and a pull
 //! concurrency limit (rustfs/backlog#2147).
+//!
+//! A source is reached through one `SourceBackend`: the S3 dialect for every
+//! S3-compatible provider, and a native backend for the providers that have no
+//! S3 API (`azure`).
 
+pub mod azure;
 pub mod backfill;
 pub mod breaker;
 pub mod config;
 pub mod list_through;
+mod native_http;
 pub mod negative_cache;
 pub mod pull;
 pub mod source_client;

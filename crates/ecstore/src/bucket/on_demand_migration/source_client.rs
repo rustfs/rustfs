@@ -25,6 +25,7 @@
 //! Client-supplied `If-*`, `Authorization`, `Host` and SSE-C headers are never
 //! forwarded: v1 rejects SSE-C source objects outright.
 
+use super::azure::AzureSourceBackend;
 use crate::bucket::remote_s3_client::{
     PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, RemoteS3RetryPolicy, build_remote_s3_config,
 };
@@ -64,6 +65,10 @@ pub enum SourceProvider {
     /// Generic S3-compatible service.
     #[default]
     S3,
+    /// Native Azure Blob service; not an S3 dialect.
+    Azure,
+    /// Native GCS JSON API with a service-account key; not an S3 dialect.
+    GcsNative,
 }
 
 impl SourceProvider {
@@ -75,6 +80,8 @@ impl SourceProvider {
             "minio" => Some(Self::Minio),
             "rustfs" => Some(Self::Rustfs),
             "s3" => Some(Self::S3),
+            "azure" => Some(Self::Azure),
+            "gcs_native" => Some(Self::GcsNative),
             _ => None,
         }
     }
@@ -87,6 +94,8 @@ impl SourceProvider {
             Self::Minio => "minio",
             Self::Rustfs => "rustfs",
             Self::S3 => "s3",
+            Self::Azure => "azure",
+            Self::GcsNative => "gcs_native",
         }
     }
 
@@ -158,6 +167,69 @@ pub struct SourceClientSpec {
     /// Bytes per second the pull pipeline may consume from this source;
     /// `None` means unlimited. Enforced by the consumer, not by this client.
     pub bandwidth_limit: Option<NonZeroU64>,
+    /// Which [`SourceBackend`] to build. The S3 variant reads `region`,
+    /// `path_style` and `credentials`; the native variants ignore all three
+    /// and carry their own credentials.
+    pub backend: SourceBackendSpec,
+}
+
+/// Provider-specific half of [`SourceClientSpec`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SourceBackendSpec {
+    #[default]
+    S3,
+    Azure(AzureSourceSpec),
+    Gcs(GcsSourceSpec),
+}
+
+/// Native Azure Blob parameters. The container is [`SourceClientSpec::bucket`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct AzureSourceSpec {
+    pub account: String,
+    pub auth: AzureAuth,
+}
+
+impl fmt::Debug for AzureSourceSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AzureSourceSpec")
+            .field("account", &self.account)
+            .field("auth", &self.auth)
+            .finish()
+    }
+}
+
+/// How Azure requests are authorized.
+#[derive(Clone, PartialEq, Eq)]
+pub enum AzureAuth {
+    /// Base64 storage-account key, signed per request with Shared Key.
+    SharedKey(String),
+    /// SAS query string without the leading `?`, appended to every URL.
+    Sas(String),
+}
+
+impl fmt::Debug for AzureAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Both variants are secrets; only the scheme may be rendered.
+        f.write_str(match self {
+            Self::SharedKey(_) => "SharedKey(REDACTED)",
+            Self::Sas(_) => "Sas(REDACTED)",
+        })
+    }
+}
+
+/// Native GCS parameters. The bucket is [`SourceClientSpec::bucket`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct GcsSourceSpec {
+    /// Service-account key JSON.
+    pub service_account_json: String,
+}
+
+impl fmt::Debug for GcsSourceSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GcsSourceSpec")
+            .field("service_account_json", &"REDACTED")
+            .finish()
+    }
 }
 
 impl SourceClientSpec {
@@ -268,7 +340,7 @@ const ACCESS_DENIED_CODES: &[&str] = &[
     "InvalidToken",
 ];
 
-fn classify_status(status: u16, code: Option<&str>, message: String) -> SourceError {
+pub(super) fn classify_status(status: u16, code: Option<&str>, message: String) -> SourceError {
     if let Some(code) = code {
         if THROTTLE_CODES.contains(&code) {
             return SourceError::Throttled;
@@ -341,6 +413,11 @@ pub struct SourceHead {
     pub storage_class: Option<String>,
     pub sse: Option<SourceSse>,
     pub is_multipart_etag: bool,
+    /// The provider's ETag is not derived from the object bytes (Azure
+    /// stamps an opaque concurrency token). Such an ETag is recorded for
+    /// provenance but must never be read as a content digest, so the
+    /// write-back path refuses to use it as the expected MD5.
+    pub etag_is_opaque: bool,
 }
 
 /// Per-operation fields shared by HEAD and GET outputs.
@@ -362,7 +439,7 @@ struct HeadParts {
     sse_customer_algorithm: Option<String>,
 }
 
-fn normalize_etag(etag: Option<String>) -> Option<String> {
+pub(super) fn normalize_etag(etag: Option<String>) -> Option<String> {
     etag.map(|etag| etag.trim().trim_matches('"').to_string())
         .filter(|etag| !etag.is_empty())
 }
@@ -411,6 +488,7 @@ fn source_head(parts: HeadParts) -> Result<SourceHead, SourceError> {
         storage_class: parts.storage_class,
         sse,
         is_multipart_etag,
+        etag_is_opaque: false,
     })
 }
 
@@ -621,9 +699,40 @@ impl fmt::Debug for SourceClient {
 
 impl SourceClient {
     pub async fn new(spec: &SourceClientSpec) -> Result<Self, RemoteS3ClientError> {
-        let endpoint = spec.endpoint_spec()?;
-        let config = build_remote_s3_config(&endpoint).await?;
-        Ok(Self::from_config_builder(config, endpoint.endpoint_url(), spec))
+        match &spec.backend {
+            SourceBackendSpec::S3 => {
+                let endpoint = spec.endpoint_spec()?;
+                let config = build_remote_s3_config(&endpoint).await?;
+                Ok(Self::from_config_builder(config, endpoint.endpoint_url(), spec))
+            }
+            SourceBackendSpec::Azure(azure) => {
+                let backend = AzureSourceBackend::new(
+                    &spec.endpoint,
+                    &spec.bucket,
+                    azure,
+                    spec.timeouts,
+                    spec.skip_tls_verify,
+                    spec.ca_cert_pem.as_deref(),
+                )?;
+                Ok(Self::from_backend(Box::new(backend), spec))
+            }
+            SourceBackendSpec::Gcs(_) => {
+                Err(RemoteS3ClientError::Credentials("the native gcs source backend is not implemented yet"))
+            }
+        }
+    }
+
+    /// Wraps a ready backend in the prefix-mapping client. The endpoint is
+    /// kept only for `Debug` and admin status.
+    fn from_backend(backend: Box<dyn SourceBackend>, spec: &SourceClientSpec) -> Self {
+        Self {
+            backend,
+            endpoint: spec.endpoint.clone(),
+            bucket: spec.bucket.clone(),
+            source_prefix: spec.source_prefix.clone().filter(|prefix| !prefix.is_empty()),
+            timeouts: spec.timeouts,
+            bandwidth_limit: spec.bandwidth_limit,
+        }
     }
 
     /// `config` must come from [`SourceClientSpec::endpoint_spec`], which is
@@ -983,6 +1092,7 @@ mod tests {
             retry: RemoteS3RetryPolicy::Disabled,
             timeouts: SourceTimeouts::default(),
             bandwidth_limit: NonZeroU64::new(1_000_000),
+            backend: SourceBackendSpec::S3,
         }
     }
 
@@ -1487,7 +1597,9 @@ mod tests {
         assert_eq!(resolve_path_style(PathStyle::VirtualHost, Minio, "10.0.0.1"), PathStyle::VirtualHost);
         assert_eq!(resolve_path_style(PathStyle::Path, Aws, "s3.amazonaws.com"), PathStyle::Path);
         assert_eq!(SourceProvider::from_label(" AWS "), Some(Aws));
-        assert_eq!(SourceProvider::from_label("azure"), None);
+        assert_eq!(SourceProvider::from_label(" Azure "), Some(Azure));
+        assert_eq!(SourceProvider::from_label("gcs_native"), Some(GcsNative));
+        assert_eq!(SourceProvider::from_label("swift"), None);
     }
 
     fn prefix_client(prefix: Option<String>) -> SourceClient {
