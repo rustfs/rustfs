@@ -764,8 +764,53 @@ def check_profile_listing(root: Path, profile: str, listing: Path) -> list[str]:
     return []
 
 
+def core_requirements(root: Path) -> dict:
+    data = json.loads((root / ".config/ecstore-required-tests.json").read_text())
+    if not data["tests"] or not data["fixtures"]:
+        raise ValueError("core test and fixture requirements must not be empty")
+    identities = [(test["suite"], test["name"]) for test in data["tests"]]
+    if len(set(identities)) != len(identities):
+        raise ValueError("duplicate core test requirement")
+    return data
+
+
+def check_core_fixtures(root: Path) -> list[str]:
+    try:
+        fixtures = core_requirements(root)["fixtures"]
+        errors = []
+        for fixture in fixtures:
+            path = (root / fixture["path"]).resolve()
+            if not path.is_relative_to(root.resolve()):
+                raise ValueError("core fixture path escapes repository")
+            if not path.is_file():
+                errors.append(f"{fixture['path']}: required core fixture missing")
+            elif hashlib.sha256(path.read_bytes()).hexdigest() != fixture["sha256"]:
+                errors.append(f"{fixture['path']}: core fixture sha256 mismatch")
+        return errors
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        return [f"cannot validate core fixtures: {error}"]
+
+
+def check_core_listing(root: Path, listing: Path) -> list[str]:
+    """Check the existing CI run's selection, not a second filtered test run."""
+    try:
+        required = core_requirements(root)["tests"]
+        suites = json.loads(listing.read_text())["rust-suites"]
+        if not isinstance(suites, dict):
+            raise ValueError("rust-suites must be an object")
+        errors = check_core_fixtures(root)
+        for test in required:
+            testcase = suites.get(test["suite"], {}).get("testcases", {}).get(test["name"], {})
+            if testcase.get("ignored") is not False or testcase.get("filter-match", {}).get("status") != "matches":
+                errors.append(f"{test['invariant']}: required test not selected: {test['suite']}::{test['name']}")
+        return errors
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        return [f"cannot read core nextest listing: {error}"]
+
+
 def validate(root: Path) -> list[str]:
     errors: list[str] = []
+    errors.extend(check_core_fixtures(root))
     errors.extend(check_e2e_modules(root))
     errors.extend(check_vault_test_groups(root))
     errors.extend(check_ilm_build_budget(root))
@@ -779,6 +824,32 @@ def validate(root: Path) -> list[str]:
 
 
 class SelfTests(unittest.TestCase):
+    def test_core_gate_rejects_missing_ignored_filtered_and_corrupt_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".config").mkdir()
+            fixture = root / "fixture.hex"
+            fixture.write_text("4142")
+            requirements = {
+                "tests": [{"invariant": "commit", "suite": "store", "name": "commit_test"}],
+                "fixtures": [{"path": "fixture.hex", "sha256": hashlib.sha256(fixture.read_bytes()).hexdigest()}],
+            }
+            (root / ".config/ecstore-required-tests.json").write_text(json.dumps(requirements))
+            listing = root / "listing.json"
+            good = {"ignored": False, "filter-match": {"status": "matches"}}
+            for case, testcase in (("selected", good), ("missing", {}), ("ignored", dict(good, ignored=True)),
+                                   ("filtered", dict(good, **{"filter-match": {"status": "mismatch"}}))):
+                with self.subTest(case=case):
+                    listing.write_text(json.dumps({"rust-suites": {"store": {"testcases": {"commit_test": testcase}}}}))
+                    self.assertEqual(bool(check_core_listing(root, listing)), case != "selected")
+            listing.write_text(json.dumps({"rust-suites": {"store": {"testcases": {"commit_test": good}}}}))
+            fixture.write_text("4143")
+            self.assertIn("sha256 mismatch", check_core_listing(root, listing)[0])
+            fixture.unlink()
+            self.assertIn("fixture missing", check_core_listing(root, listing)[0])
+            listing.write_text("not json")
+            self.assertIn("cannot read", check_core_listing(root, listing)[0])
+
     def test_ilm_lane_keeps_the_measured_cargo_build_budget(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -981,6 +1052,7 @@ class SelfTests(unittest.TestCase):
                 mock.patch(__name__ + ".check_e2e_modules", return_value=[]),
                 mock.patch(__name__ + ".check_vault_test_groups", return_value=[]),
                 mock.patch(__name__ + ".check_fuzz_targets", return_value=[]),
+                mock.patch(__name__ + ".check_core_fixtures", return_value=[]),
                 mock.patch(__name__ + ".check_runner_selection", return_value=[]),
                 mock.patch(__name__ + ".check_workflow_readiness", return_value=[]),
                 mock.patch(__name__ + ".check_profile_definitions", return_value=[]),
@@ -1393,6 +1465,11 @@ def main() -> int:
     if sys.argv[1:] == ["--self-test"]:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTests)
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
+    if len(sys.argv) == 3 and sys.argv[1] == "--check-core":
+        errors = check_core_listing(ROOT, Path(sys.argv[2]))
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 1 if errors else 0
     if len(sys.argv) == 4 and sys.argv[1] == "--check-profile":
         errors = check_profile_listing(ROOT, sys.argv[2], Path(sys.argv[3]))
         if errors:
@@ -1410,7 +1487,7 @@ def main() -> int:
         return 0
     if sys.argv[1:]:
         print(
-            "usage: check_test_wiring.py [--self-test | --check-profile PROFILE LISTING | "
+            "usage: check_test_wiring.py [--self-test | --check-core LISTING | --check-profile PROFILE LISTING | "
             "--update-profile PROFILE LISTING PLATFORM]",
             file=sys.stderr,
         )

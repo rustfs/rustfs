@@ -2979,6 +2979,33 @@ mod tests {
     #[cfg(feature = "test-util")]
     const DECOMMISSION_TEST_FAULT_STAGE_TIERED: &str = "decommission_tiered_object";
 
+    fn decommission_retry_fault_hook(
+        bucket: &str,
+        object: &str,
+        faults: Arc<AtomicUsize>,
+    ) -> crate::core::pools::DecommissionTestFaultDecision {
+        let target_bucket = bucket.to_string();
+        let target_object = object.to_string();
+        Arc::new(move |stage, bucket, object, _attempt, succeeded| {
+            if !succeeded
+                || stage != DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT
+                || bucket != target_bucket
+                || object != target_object
+            {
+                return false;
+            }
+
+            // Entry retries reset the local attempt; real copy errors can skip
+            // successful attempts. Only injected faults spend this global budget.
+            faults
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |faults| {
+                    (faults < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS.saturating_sub(1))
+                        .then_some(faults.saturating_add(1))
+                })
+                .is_ok()
+        })
+    }
+
     async fn seed_decommission_source(
         store: &Arc<crate::store::ECStore>,
         bucket: &str,
@@ -5121,6 +5148,33 @@ mod tests {
     }
 
     #[test]
+    fn decommission_retry_fault_budget_counts_successes_across_attempt_changes() {
+        for attempts in [[1, 2, 3], [1, 1, 2], [1, 3, 3]] {
+            let faults = Arc::new(AtomicUsize::new(0));
+            let hook = decommission_retry_fault_hook("bucket", "object", Arc::clone(&faults));
+
+            for (stage, bucket, object, succeeded) in [
+                ("other-stage", "bucket", "object", true),
+                (DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT, "other-bucket", "object", true),
+                (DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT, "bucket", "other-object", true),
+                (DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT, "bucket", "object", false),
+            ] {
+                assert!(!hook(stage, bucket, object, 1, succeeded));
+            }
+            assert_eq!(faults.load(Ordering::SeqCst), 0, "unrelated or failed copies must not consume faults");
+
+            for (index, attempt) in attempts.into_iter().enumerate() {
+                assert_eq!(
+                    hook(DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT, "bucket", "object", attempt, true),
+                    index < 2,
+                    "attempts={attempts:?}, index={index}"
+                );
+            }
+            assert_eq!(faults.load(Ordering::SeqCst), 2, "attempts={attempts:?}");
+        }
+    }
+
+    #[test]
     #[serial_test::serial(storage_class_env)]
     fn decommission_entry_retries_source_changed_without_canceling_other_bucket() {
         let handle = std::thread::Builder::new()
@@ -5214,31 +5268,8 @@ mod tests {
                     ));
 
                     let ordinary_faults = Arc::new(AtomicUsize::new(0));
-                    let ordinary_faults_for_hook = Arc::clone(&ordinary_faults);
-                    let fault_bucket = other_bucket.clone();
-                    let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
-                        move |stage, bucket, object, attempt, succeeded| {
-                            let candidate = succeeded
-                                && stage == DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT
-                                && bucket == fault_bucket.as_str()
-                                && object == other_object;
-                            if !candidate {
-                                return false;
-                            }
-
-                            // Keep the fault budget global across any
-                            // entry-level re-list; its inner attempt counter
-                            // restarts after SourceChanged.
-                            ordinary_faults_for_hook
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |faults| {
-                                    let next_fault = faults.saturating_add(1);
-                                    (faults < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS.saturating_sub(1)
-                                        && attempt == next_fault)
-                                        .then_some(next_fault)
-                                })
-                                .is_ok()
-                        },
-                    ));
+                    let fault_hook = decommission_retry_fault_hook(&other_bucket, other_object, Arc::clone(&ordinary_faults));
+                    let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(fault_hook);
 
                     let rx = CancellationToken::new();
                     let source_changed_exhaustions = Arc::new(AtomicUsize::new(0));
@@ -8045,10 +8076,15 @@ mod tests {
         );
         assert!(com::read_config(store.pools[0].clone(), &second_page_path).await.is_ok());
 
-        com::save_config(store.pools[target_pool_idx].clone(), &second_page_path, receipt_bytes.clone())
+        let full_tail = ObjectOptions {
+            max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        com::save_config_with_opts(store.pools[target_pool_idx].clone(), &second_page_path, receipt_bytes.clone(), &full_tail)
             .await
             .expect("second page receipt should restore");
-        com::save_config(store.pools[target_pool_idx].clone(), &second_page_path, b"{corrupt".to_vec())
+        com::save_config_with_opts(store.pools[target_pool_idx].clone(), &second_page_path, b"{corrupt".to_vec(), &full_tail)
             .await
             .expect("second page receipt should corrupt deterministically");
         let corrupt = store
@@ -11575,6 +11611,7 @@ mod tests {
         pool_index: usize,
         bucket: &str,
         object: &str,
+        minio_unversioned: bool,
     ) {
         for disk_index in 0..4 {
             let metadata_path =
@@ -11608,6 +11645,11 @@ mod tests {
                 ] {
                     rustfs_utils::http::metadata_compat::remove_bytes(&mut object_meta.meta_sys, suffix);
                 }
+                if minio_unversioned {
+                    object_meta
+                        .meta_sys
+                        .insert("x-minio-internal-transitioned-versionID".to_string(), Vec::new());
+                }
                 *shallow = rustfs_filemeta::FileMetaShallowVersion::try_from(version)
                     .expect("legacy transitioned version should re-encode");
             }
@@ -11616,6 +11658,152 @@ mod tests {
                 .await
                 .expect("legacy transitioned xl.meta should persist");
         }
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn read_store_body(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        range: Option<HTTPRangeSpec>,
+        opts: &ObjectOptions,
+    ) -> Vec<u8> {
+        let mut reader = store
+            .get_object_reader(bucket, object, range, HeaderMap::new(), opts)
+            .await
+            .expect("object reader should open");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("object body should drain");
+        body
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn legacy_unknown_unversioned_transition_supports_head_get_and_range_without_backfill() {
+        let temp_dir = tempfile::tempdir().expect("create legacy unknown unversioned store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "legacy-unknown-unversioned-read", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "LEGACY-UNKNOWN-UNVERSIONED-READ";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        backend.set_put_remote_version(Some(String::new())).await;
+        let bucket = "legacy-unknown-unversioned-read-bucket";
+        let object = "object.bin";
+        let payload = b"legacy unversioned remote tier object remains readable".repeat(1024);
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("legacy source bucket should be created");
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let source = store
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("legacy source should be written");
+        store
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: source.etag.clone().expect("legacy source should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("legacy source should transition");
+        rewrite_transitioned_xlmeta_as_legacy_unknown(temp_dir.path(), 0, bucket, object, true).await;
+        backend.clear_op_log().await;
+
+        let opts = ObjectOptions {
+            metadata_cache_safe: false,
+            ..Default::default()
+        };
+        let head = store
+            .get_object_info(bucket, object, &opts)
+            .await
+            .expect("legacy transitioned HEAD should use local metadata");
+        assert_eq!(head.transition_version_state, rustfs_filemeta::TransitionVersionState::Unknown);
+        assert!(head.transitioned_object.version_id.is_empty());
+        assert_eq!(
+            head.user_defined
+                .get("x-minio-internal-transitioned-versionID")
+                .map(String::as_str),
+            Some(""),
+            "the MinIO empty version-key provenance must survive xl.meta decoding"
+        );
+        assert!(
+            !rustfs_utils::http::metadata_compat::contains_key_str(
+                &head.user_defined,
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_STATE,
+            ),
+            "the compatibility read must not synthesize version-state metadata"
+        );
+
+        let full_body = read_store_body(&store, bucket, object, None, &opts).await;
+        assert_eq!(full_body, payload);
+
+        let range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 7,
+            end: 38,
+        };
+        let ranged_body = read_store_body(&store, bucket, object, Some(range), &opts).await;
+        assert_eq!(ranged_body, &payload[7..=38]);
+
+        let after_read = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("legacy metadata should remain readable after GET")
+            .expect("legacy object metadata should remain on disk")
+            .versions
+            .into_iter()
+            .find(|version| version.transition_status == rustfs_filemeta::TRANSITION_COMPLETE)
+            .expect("legacy transitioned source should remain visible after GET");
+        assert_eq!(after_read.transition_version_state, rustfs_filemeta::TransitionVersionState::Unknown);
+        assert!(after_read.transition_version.is_none());
+        assert!(after_read.transition_version_id.is_none());
+        assert_eq!(
+            after_read
+                .metadata
+                .get("x-minio-internal-transitioned-versionID")
+                .map(String::as_str),
+            Some(""),
+            "the MinIO empty version-key provenance must remain after GET and Range GET"
+        );
+        assert!(
+            !rustfs_utils::http::metadata_compat::contains_key_str(
+                &after_read.metadata,
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_STATE,
+            ),
+            "the compatibility read must remain side-effect free"
+        );
+
+        assert_eq!(
+            backend.op_log().await,
+            vec![
+                MockWarmOp::Probe {
+                    object: after_read.transitioned_objname.clone(),
+                },
+                MockWarmOp::Get {
+                    object: after_read.transitioned_objname.clone(),
+                },
+                MockWarmOp::Probe {
+                    object: after_read.transitioned_objname.clone(),
+                },
+                MockWarmOp::Get {
+                    object: after_read.transitioned_objname,
+                },
+            ],
+            "legacy reads should probe before each unversioned GET and never mutate local metadata"
+        );
+        assert_eq!(backend.remove_count().await, 0);
     }
 
     #[cfg(feature = "test-util")]
@@ -11658,7 +11846,7 @@ mod tests {
                 )
                 .await
                 .expect("legacy source should transition");
-            rewrite_transitioned_xlmeta_as_legacy_unknown(temp_dir.path(), 0, bucket, object).await;
+            rewrite_transitioned_xlmeta_as_legacy_unknown(temp_dir.path(), 0, bucket, object, false).await;
             let legacy = store.pools[0]
                 .get_disks_by_key(object)
                 .load_file_info_versions_exact(bucket, object)
@@ -12799,7 +12987,7 @@ mod tests {
                 .expect("merge-loser source should transition");
             copy_test_xlmeta_between_pools(temp_dir.path(), 0, 1, bucket, object).await;
         }
-        rewrite_transitioned_xlmeta_as_legacy_unknown(temp_dir.path(), 1, bucket, "legacy/item.bin").await;
+        rewrite_transitioned_xlmeta_as_legacy_unknown(temp_dir.path(), 1, bucket, "legacy/item.bin", false).await;
         backend.set_remove_failure(true);
         store.pools[1]
             .delete_object(bucket, "hidden/item.bin", ObjectOptions::default())
@@ -16866,6 +17054,10 @@ mod tests {
                             .find(|version| version.version_id == history.version_id)
                             .expect("transitioned history should exist");
                         transitioned.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
+                        rustfs_utils::http::metadata_compat::remove_str(
+                            &mut transitioned.metadata,
+                            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_STATE,
+                        );
                         metadata
                             .add_version(transitioned)
                             .expect("unknown state should replace the transitioned version");

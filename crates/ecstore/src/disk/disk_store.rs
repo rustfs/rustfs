@@ -317,6 +317,22 @@ impl DiskStoreRenameDataExt for LocalDiskWrapper {
         dst_path: &str,
         external_guard: Option<Arc<dyn Send + Sync>>,
     ) -> Result<RenameDataResp> {
+        self.rename_data_observed(src_volume, src_path, fi, dst_volume, dst_path, external_guard)
+            .await
+            .result
+    }
+}
+
+impl LocalDiskWrapper {
+    pub(in crate::disk) async fn rename_data_observed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> super::RenameDataObservation {
         let operation = self.clone();
         let src_volume = src_volume.to_owned();
         let src_path = src_path.to_owned();
@@ -333,22 +349,35 @@ impl DiskStoreRenameDataExt for LocalDiskWrapper {
         } else {
             get_max_timeout_duration()
         };
-        run_owned_mutation(external_guard, move || async move {
-            operation
+        let observed = run_owned_mutation(external_guard, move || async move {
+            let mut preflight_rejection = None;
+            let result = operation
                 .track_disk_health_mutation(
                     "rename_data",
                     DiskMetricMutation::Write,
                     || async {
-                        operation
-                            .disk
-                            .rename_data_borrowed(&src_volume, &src_path, &fi, &dst_volume, &dst_path)
-                            .await
+                        // Preserve the former DiskAPI future's single boxing boundary.
+                        let observed =
+                            Box::pin(
+                                operation
+                                    .disk
+                                    .rename_data_observed(&src_volume, &src_path, &fi, &dst_volume, &dst_path),
+                            )
+                            .await;
+                        preflight_rejection = observed.preflight_rejection;
+                        observed.result
                     },
                     timeout_duration,
                 )
-                .await
+                .await;
+            // Health tracking must observe the real disk error, not an Ok tuple.
+            Ok(super::RenameDataObservation {
+                result,
+                preflight_rejection,
+            })
         })
-        .await
+        .await;
+        observed.unwrap_or_else(|error| super::RenameDataObservation::unknown(Err(error)))
     }
 }
 
@@ -2586,6 +2615,46 @@ mod tests {
             .expect("legacy health wrapper call should succeed");
 
         assert_eq!(wrapper.metrics_snapshot().api_calls.get("unknown"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn rename_preflight_evidence_preserves_health_errors_and_owned_reply() {
+        for source_exists in [false, true] {
+            for guarded in [false, true] {
+                let dir = tempfile::tempdir().expect("temp dir should be created");
+                let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8"))
+                    .expect("endpoint should parse");
+                let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+                if source_exists {
+                    disk.make_volume("source").await.expect("source volume should exist");
+                }
+                let wrapper = LocalDiskWrapper::new(disk, false);
+                let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let external_guard = guarded.then(|| Arc::new(DropProbe(Arc::clone(&drops))) as Arc<dyn Send + Sync>);
+                let mut file_info = FileInfo::new("object", 1, 0);
+                file_info.mod_time = Some(::time::OffsetDateTime::now_utc());
+                file_info.erasure.index = 1;
+                let observed = wrapper
+                    .rename_data_observed("source", "object", &file_info, "missing-destination", "object", external_guard)
+                    .await;
+                assert!(observed.rejected_before_publication(), "normal access rejection must carry proof");
+                assert!(matches!(observed.result, Err(DiskError::VolumeNotFound)));
+                let snapshot = wrapper.metrics_snapshot();
+                assert_eq!(snapshot.api_calls.get("rename_data"), Some(&1));
+                assert_eq!(snapshot.total_writes, 0, "health tracking must not observe the rejection as Ok");
+                assert_eq!(drops.load(Ordering::SeqCst), usize::from(guarded));
+
+                wrapper.health.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+                let observed = wrapper
+                    .rename_data_observed("source", "object", &file_info, "missing-destination", "object", None)
+                    .await;
+                assert!(!observed.rejected_before_publication(), "wrapper errors carry no local preflight proof");
+                assert!(matches!(observed.result, Err(DiskError::FaultyDisk)));
+                let snapshot = wrapper.metrics_snapshot();
+                assert_eq!(snapshot.total_errors_availability, 1);
+                assert_eq!(snapshot.total_writes, 0);
+            }
+        }
     }
 
     #[tokio::test]

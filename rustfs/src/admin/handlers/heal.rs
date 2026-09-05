@@ -39,7 +39,7 @@ use rustfs_utils::path::path_join;
 use s3s::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -261,6 +261,7 @@ struct BackgroundHealStatus<'a> {
     heal_active_tasks: u64,
     heal_operations: rustfs_heal::HealOperationsSnapshot,
     cluster_status_complete: bool,
+    coverage: &'a BackgroundHealCoverage,
     #[serde(skip_serializing_if = "Option::is_none")]
     progress: Option<BackgroundHealProgress>,
 }
@@ -300,6 +301,23 @@ fn background_heal_runtime_state(
 
 type BackgroundHealProgress = rustfs_heal::HealProgress;
 
+#[derive(Debug, Serialize)]
+struct BackgroundHealCoverage {
+    expected: usize,
+    responded: usize,
+    unknown: usize,
+    reasons: BTreeSet<BackgroundHealCoverageReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BackgroundHealCoverageReason {
+    NotificationSystemUnavailable,
+    PeerTopologyIncomplete,
+    PeerStatusUnsupported,
+    PeerStatusUnavailable,
+}
+
 #[derive(Debug)]
 struct ClusterHealStatusSnapshot {
     info: BackgroundHealInfo,
@@ -307,6 +325,7 @@ struct ClusterHealStatusSnapshot {
     operations: rustfs_heal::HealOperationsSnapshot,
     progress: Option<BackgroundHealProgress>,
     complete: bool,
+    coverage: BackgroundHealCoverage,
 }
 
 fn add_priority_counts(total: &mut rustfs_heal::HealPriorityCounts, next: rustfs_heal::HealPriorityCounts) {
@@ -338,6 +357,7 @@ fn add_operations(total: &mut rustfs_heal::HealOperationsSnapshot, next: rustfs_
 }
 
 fn aggregate_cluster_heal_status(snapshots: Vec<NodeHealStatusSnapshot>) -> ClusterHealStatusSnapshot {
+    let responded = snapshots.len();
     let mut info = BackgroundHealInfo::default();
     let mut operations = rustfs_heal::HealOperationsSnapshot::default();
     let mut progress = Vec::new();
@@ -379,6 +399,12 @@ fn aggregate_cluster_heal_status(snapshots: Vec<NodeHealStatusSnapshot>) -> Clus
         operations,
         progress,
         complete: true,
+        coverage: BackgroundHealCoverage {
+            expected: responded,
+            responded,
+            unknown: 0,
+            reasons: BTreeSet::new(),
+        },
     }
 }
 
@@ -413,12 +439,14 @@ fn merge_peer_heal_statuses(
     mut snapshots: Vec<NodeHealStatusSnapshot>,
     peer_statuses: Vec<Result<Option<NodeHealStatusSnapshot>, String>>,
     expected_nodes: usize,
-    topology_complete: bool,
+    coverage_reason: Option<BackgroundHealCoverageReason>,
 ) -> S3Result<ClusterHealStatusSnapshot> {
+    let mut reasons: BTreeSet<_> = coverage_reason.into_iter().collect();
     for peer_status in peer_statuses {
         match peer_status {
             Ok(Some(snapshot)) => snapshots.push(snapshot),
             Ok(None) => {
+                reasons.insert(BackgroundHealCoverageReason::PeerStatusUnsupported);
                 warn!(
                     event = EVENT_ADMIN_REQUEST_FAILED,
                     component = LOG_COMPONENT_ADMIN_API,
@@ -430,6 +458,7 @@ fn merge_peer_heal_statuses(
                 );
             }
             Err(err) => {
+                reasons.insert(BackgroundHealCoverageReason::PeerStatusUnavailable);
                 warn!(
                     event = EVENT_ADMIN_REQUEST_FAILED,
                     component = LOG_COMPONENT_ADMIN_API,
@@ -452,9 +481,12 @@ fn merge_peer_heal_statuses(
     // so during a reconfiguration the count can equal `expected_nodes` while
     // the topology is known-incomplete. Counting alone would report a
     // definitive answer precisely when the membership itself is in doubt.
-    let complete = topology_complete && snapshots.len() == expected_nodes;
+    let complete = reasons.is_empty() && snapshots.len() == expected_nodes;
     let mut status = aggregate_cluster_heal_status(snapshots);
     status.complete = complete;
+    status.coverage.expected = expected_nodes;
+    status.coverage.unknown = expected_nodes.saturating_sub(status.coverage.responded);
+    status.coverage.reasons = reasons;
     // A partial answer must never be mistakable for a definitive verdict: an
     // unreachable peer might be mid-heal, so reporting the reachable nodes'
     // "idle" (or disabled/uninitialized) as the cluster state would falsely
@@ -497,7 +529,12 @@ async fn read_cluster_heal_status(
         return Ok(aggregate_cluster_heal_status(snapshots));
     }
     let Some(notification_system) = notification_system else {
-        return Err(cluster_heal_status_unavailable("notification_system_unavailable"));
+        return merge_peer_heal_statuses(
+            snapshots,
+            Vec::new(),
+            expected_nodes,
+            Some(BackgroundHealCoverageReason::NotificationSystemUnavailable),
+        );
     };
     // An incomplete peer topology (a down member's client slot, a rolling
     // upgrade) previously failed the whole endpoint here, before any peer was
@@ -540,7 +577,12 @@ async fn read_cluster_heal_status(
     }))
     .await;
 
-    merge_peer_heal_statuses(snapshots, peer_statuses, expected_nodes, topology_complete)
+    merge_peer_heal_statuses(
+        snapshots,
+        peer_statuses,
+        expected_nodes,
+        (!topology_complete).then_some(BackgroundHealCoverageReason::PeerTopologyIncomplete),
+    )
 }
 
 async fn query_peer_replacement_recovery_status<E>(
@@ -1164,6 +1206,7 @@ fn encode_background_heal_status(
     heal_operations: rustfs_heal::HealOperationsSnapshot,
     progress: Option<BackgroundHealProgress>,
     cluster_status_complete: bool,
+    coverage: &BackgroundHealCoverage,
 ) -> S3Result<Vec<u8>> {
     let status = BackgroundHealStatus {
         info,
@@ -1172,6 +1215,7 @@ fn encode_background_heal_status(
         heal_active_tasks: heal_operations.active_tasks,
         heal_operations,
         cluster_status_complete,
+        coverage,
         progress,
     };
     serde_json::to_vec(&status).map_err(|e| {
@@ -1461,6 +1505,7 @@ impl Operation for BackgroundHealStatusHandler {
             cluster_status.operations,
             cluster_status.progress,
             cluster_status.complete,
+            &cluster_status.coverage,
         )?;
         info!(
             event = EVENT_ADMIN_RESPONSE_EMITTED,
@@ -1515,13 +1560,14 @@ impl Operation for ReplacementRecoveryStatusHandler {
 mod tests {
     use super::extract_heal_init_params;
     use super::{
-        BackgroundHealProgress, HealInitParams, HealResp, HealRuntimeState, aggregate_cluster_heal_status,
-        aggregate_replacement_recovery_cluster_status, background_heal_runtime_state, build_heal_channel_request,
-        build_replacement_recovery_status_response, encode_background_heal_status, encode_heal_control_path,
-        encode_heal_start_success, encode_heal_task_status, execute_after_heal_control_capability, heal_channel_response_items,
-        heal_channel_response_progress, heal_channel_response_summary, heal_control_response_id, json_response,
-        map_heal_response, merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status,
-        query_peer_replacement_recovery_status, reject_heal_admission, validate_heal_request_mode, validate_heal_target,
+        BackgroundHealCoverage, BackgroundHealCoverageReason, BackgroundHealProgress, HealInitParams, HealResp, HealRuntimeState,
+        aggregate_cluster_heal_status, aggregate_replacement_recovery_cluster_status, background_heal_runtime_state,
+        build_heal_channel_request, build_replacement_recovery_status_response, encode_background_heal_status,
+        encode_heal_control_path, encode_heal_start_success, encode_heal_task_status, execute_after_heal_control_capability,
+        heal_channel_response_items, heal_channel_response_progress, heal_channel_response_summary, heal_control_response_id,
+        json_response, map_heal_response, merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status,
+        query_peer_replacement_recovery_status, read_cluster_heal_status, reject_heal_admission, validate_heal_request_mode,
+        validate_heal_target,
     };
     use crate::storage::rpc::node_service::heal::{
         NodeHealProgress, NodeHealStatusSnapshot, NodeReplacementRecoveryStatusSnapshot, encode_node_replacement_recovery_status,
@@ -2175,7 +2221,13 @@ mod tests {
             ..Default::default()
         };
 
-        let encoded = encode_background_heal_status(&info, HealRuntimeState::Active, operations, None, true)
+        let coverage = BackgroundHealCoverage {
+            expected: 1,
+            responded: 1,
+            unknown: 0,
+            reasons: Default::default(),
+        };
+        let encoded = encode_background_heal_status(&info, HealRuntimeState::Active, operations, None, true, &coverage)
             .expect("background heal info should serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
 
@@ -2225,6 +2277,12 @@ mod tests {
             rustfs_heal::HealOperationsSnapshot::default(),
             Some(progress),
             true,
+            &BackgroundHealCoverage {
+                expected: 1,
+                responded: 1,
+                unknown: 0,
+                reasons: Default::default(),
+            },
         )
         .expect("background heal info should serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
@@ -2398,6 +2456,84 @@ mod tests {
         assert!(peer_topology_complete(1, 0, 0, 1, 0));
     }
 
+    #[tokio::test]
+    async fn test_background_heal_status_without_notification_preserves_local_snapshot() {
+        let initialized = rustfs_heal::heal_runtime_initialized();
+        let info = BackgroundHealInfo {
+            bitrot_start_cycle: 37,
+            current_scan_mode: HealScanMode::Deep,
+            ..Default::default()
+        };
+        for expected in [1, 3] {
+            let status = tokio::time::timeout(Duration::from_secs(1), read_cluster_heal_status(info.clone(), None, expected))
+                .await
+                .expect("local status must not wait for remote peers")
+                .expect("missing notification must retain the local snapshot");
+            assert_eq!(status.info.bitrot_start_cycle, 37);
+            assert_eq!(status.info.current_scan_mode, HealScanMode::Deep);
+            assert_eq!(status.complete, expected == 1);
+            assert_eq!(status.coverage.expected, expected);
+            assert_eq!(status.coverage.responded, 1);
+            assert_eq!(status.coverage.unknown, expected - 1);
+            if expected == 1 {
+                assert!(status.coverage.reasons.is_empty());
+            } else {
+                assert!(matches!(status.state, HealRuntimeState::Degraded | HealRuntimeState::Active));
+                assert_eq!(
+                    status.coverage.reasons,
+                    [BackgroundHealCoverageReason::NotificationSystemUnavailable].into()
+                );
+            }
+            let encoded = encode_background_heal_status(
+                &status.info,
+                status.state,
+                status.operations,
+                status.progress,
+                status.complete,
+                &status.coverage,
+            )
+            .expect("fallback status must encode");
+            let decoded: rustfs_madmin::client::BackgroundHealStatus =
+                serde_json::from_slice(&encoded).expect("the actual madmin client must decode the server response");
+            assert_eq!(decoded.cluster_status_complete, expected == 1);
+            let coverage = decoded.coverage.expect("new server supplies coverage");
+            assert_eq!(coverage.expected, Some(expected));
+            assert_eq!(coverage.responded, Some(1));
+            assert_eq!(coverage.unknown, Some(expected - 1));
+            if expected > 1 {
+                assert_eq!(coverage.reasons, ["notification_system_unavailable"]);
+            }
+        }
+        assert_eq!(
+            rustfs_heal::heal_runtime_initialized(),
+            initialized,
+            "reading status must not initialize heal"
+        );
+    }
+
+    #[test]
+    fn test_background_heal_status_coverage_reasons_are_bounded() {
+        let local = NodeHealStatusSnapshot::for_test(true, true, BackgroundHealInfo::default(), Default::default(), None);
+        let peers = (0..100)
+            .map(|index| {
+                if index % 2 == 0 {
+                    Ok(None)
+                } else {
+                    Err("peer unavailable".to_owned())
+                }
+            })
+            .collect();
+        let status = merge_peer_heal_statuses(vec![local], peers, 101, None).expect("local status remains available");
+        assert_eq!(status.coverage.responded, 1);
+        assert_eq!(status.coverage.unknown, 100);
+        assert_eq!(status.coverage.reasons.len(), 2);
+        let encoded = serde_json::to_vec(&status.coverage).expect("coverage encodes");
+        assert!(encoded.len() < 256, "coverage must not grow with peer failures");
+        let decoded: rustfs_madmin::client::BackgroundHealCoverage =
+            serde_json::from_slice(&encoded).expect("client coverage decodes");
+        assert_eq!(decoded.reasons, ["peer_status_unsupported", "peer_status_unavailable"]);
+    }
+
     #[test]
     fn test_peer_status_merge_degrades_explicitly_and_never_claims_idle() {
         let local = || {
@@ -2413,15 +2549,20 @@ mod tests {
         // but the safety property of the previous fail-closed behaviour is
         // preserved: the partial answer is labelled Degraded, never Idle, so
         // unknown peer work cannot be mistaken for "nothing is running".
-        let partial = merge_peer_heal_statuses(vec![local()], vec![Err("peer timeout".to_string())], 2, true)
+        let partial = merge_peer_heal_statuses(vec![local()], vec![Err("peer timeout".to_string())], 2, None)
             .expect("an unreachable peer degrades the answer instead of destroying it");
         assert!(!partial.complete);
         assert_eq!(partial.state, HealRuntimeState::Degraded);
+        assert_eq!(partial.coverage.expected, 2);
+        assert_eq!(partial.coverage.responded, 1);
+        assert_eq!(partial.coverage.unknown, 1);
+        assert_eq!(partial.coverage.reasons, [BackgroundHealCoverageReason::PeerStatusUnavailable].into());
 
-        let older_peer = merge_peer_heal_statuses(vec![local()], vec![Ok(None)], 2, true)
+        let older_peer = merge_peer_heal_statuses(vec![local()], vec![Ok(None)], 2, None)
             .expect("an older peer degrades the answer instead of destroying it");
         assert!(!older_peer.complete);
         assert_eq!(older_peer.state, HealRuntimeState::Degraded);
+        assert_eq!(older_peer.coverage.reasons, [BackgroundHealCoverageReason::PeerStatusUnsupported].into());
 
         let known_active = NodeHealStatusSnapshot::for_test(
             true,
@@ -2433,12 +2574,12 @@ mod tests {
             },
             None,
         );
-        let partial_active = merge_peer_heal_statuses(vec![known_active], vec![Ok(None)], 2, true)
+        let partial_active = merge_peer_heal_statuses(vec![known_active], vec![Ok(None)], 2, None)
             .expect("known active work may be reported as an explicit partial status");
         assert!(!partial_active.complete);
         assert_eq!(partial_active.state, HealRuntimeState::Active);
 
-        merge_peer_heal_statuses(Vec::new(), vec![Err("peer timeout".to_string())], 2, true)
+        merge_peer_heal_statuses(Vec::new(), vec![Err("peer timeout".to_string())], 2, None)
             .expect_err("no snapshot at all still fails closed");
     }
 
@@ -2459,12 +2600,22 @@ mod tests {
                 None,
             )
         };
-        let full_count_incomplete_topology = merge_peer_heal_statuses(vec![snapshot()], vec![Ok(Some(snapshot()))], 2, false)
-            .expect("incomplete topology degrades the answer instead of destroying it");
+        let full_count_incomplete_topology = merge_peer_heal_statuses(
+            vec![snapshot()],
+            vec![Ok(Some(snapshot()))],
+            2,
+            Some(BackgroundHealCoverageReason::PeerTopologyIncomplete),
+        )
+        .expect("incomplete topology degrades the answer instead of destroying it");
         assert!(!full_count_incomplete_topology.complete);
         assert_eq!(full_count_incomplete_topology.state, HealRuntimeState::Degraded);
+        assert_eq!(full_count_incomplete_topology.coverage.unknown, 0);
+        assert_eq!(
+            full_count_incomplete_topology.coverage.reasons,
+            [BackgroundHealCoverageReason::PeerTopologyIncomplete].into()
+        );
 
-        let full_count_complete_topology = merge_peer_heal_statuses(vec![snapshot()], vec![Ok(Some(snapshot()))], 2, true)
+        let full_count_complete_topology = merge_peer_heal_statuses(vec![snapshot()], vec![Ok(Some(snapshot()))], 2, None)
             .expect("complete topology and full count is a definitive answer");
         assert!(full_count_complete_topology.complete);
         assert_eq!(full_count_complete_topology.state, HealRuntimeState::Idle);
@@ -2478,6 +2629,12 @@ mod tests {
             rustfs_heal::HealOperationsSnapshot::default(),
             None,
             false,
+            &BackgroundHealCoverage {
+                expected: 2,
+                responded: 1,
+                unknown: 1,
+                reasons: [BackgroundHealCoverageReason::PeerStatusUnavailable].into(),
+            },
         )
         .expect("degraded status must serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("valid json");
