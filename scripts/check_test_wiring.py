@@ -533,7 +533,7 @@ def yaml_scalar_continues(lines: list[str], index: int, indent: int) -> bool:
 
 def check_quick_checks(root: Path) -> list[str]:
     errors: list[str] = []
-    bypass_key = r'''(?:if|continue-on-error|"if"|"continue-on-error"|'if'|'continue-on-error')\s*:'''
+    bypass_key = r'''(?:if|continue-on-error|needs|"if"|"continue-on-error"|"needs"|'if'|'continue-on-error'|'needs')\s*:'''
     for name in ("ci.yml", "ci-docs-only.yml"):
         relative = f".github/workflows/{name}"
         path = root / relative
@@ -546,7 +546,7 @@ def check_quick_checks(root: Path) -> list[str]:
         if [job[index].strip() for index in conditions] != expected or any(
             yaml_scalar_continues(job, index, 4) for index in conditions
         ):
-            errors.append(f"{relative}: Quick Checks job must not bypass failures or change its event condition")
+            errors.append(f"{relative}: Quick Checks job must not add dependencies, bypass failures, or change its event condition")
         checkout = workflow_step_block(job, "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0")
         action = workflow_step_block(job, "./.github/actions/quick-checks")
         if checkout is None or action is None:
@@ -944,6 +944,10 @@ class SelfTests(unittest.TestCase):
                         "    if: github.event_name != 'pull_request' || github.event.action != 'closed'\n", ""
                     ) if "if" in key else source
                     mutations[f"quoted job {key}"] = job_source.replace("    steps:", f"    {key}\n    steps:")
+                for dependency in ("needs: prerequisite", "needs: [prerequisite]", "needs:\n      - prerequisite", "'needs' : [prerequisite]", '"needs": [prerequisite]'):
+                    for condition in ("false", "true"):
+                        prerequisite = f"\n  prerequisite:\n    if: {condition}\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 1\n"
+                        mutations[f"job dependency {dependency} if {condition}"] = source.replace("    steps:", f"    {dependency}\n    steps:") + prerequisite
                 if relative.endswith("/ci.yml"):
                     for separator in ("", "\n", "      # continued condition\n"):
                         mutations[f"continued job condition {separator!r}"] = source.replace(
