@@ -416,6 +416,106 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
 }
 
 #[tokio::test]
+#[serial]
+async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure() {
+    for (scan_mode, requires_full_scan) in [(HealScanMode::Deep, false), (HealScanMode::Normal, true)] {
+        let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+        clear_dirty_usage_buckets_for_tests();
+        for bucket in ["hot-bucket", "cold-bucket"] {
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            let mut reader = ScannerPutObjReader::from_vec(b"initial".to_vec());
+            store.pools[0].disk_set[0]
+                .put_object(bucket, "initial", &mut reader, &ScannerObjectOptions::default())
+                .await
+                .expect("initial object should persist");
+        }
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+        let (updates, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let failed = tokio::time::timeout(
+            Duration::from_secs(30),
+            nsscanner_with_storage_status_scoped(
+                store.as_ref(),
+                ScannerCycleRequest {
+                    ctx,
+                    budget,
+                    updates,
+                    want_cycle: 7,
+                    leader_epoch: 11,
+                    scan_mode: HealScanMode::Normal,
+                    scan_scope: ScannerBucketScanScope::default(),
+                    persisted_usage_baseline: None,
+                    requires_full_scan: false,
+                    resolved_scope_observer: None,
+                },
+            ),
+        )
+        .await
+        .expect("normal scan should finish")
+        .expect_err("root delivery must fail after bucket cache persistence");
+        assert!(failed.to_string().contains("receiver closed"), "{failed}");
+        let cache_name = path_join_buf(&["cold-bucket", DATA_USAGE_CACHE_NAME]);
+        let mut cached = DataUsageCache::default();
+        cached
+            .load(store.pools[0].disk_set[0].clone(), &cache_name)
+            .await
+            .expect("normal bucket cache should have committed");
+        assert!(cached.info.snapshot_complete);
+        assert_eq!(cached.info.next_cycle, 7);
+        assert_eq!(
+            cached
+                .checked_flatten("cold-bucket")
+                .expect("cached root should be valid")
+                .objects,
+            1
+        );
+
+        let mut reader = ScannerPutObjReader::from_vec(b"maintenance".to_vec());
+        store.pools[0].disk_set[0]
+            .put_object("cold-bucket", "new", &mut reader, &ScannerObjectOptions::default())
+            .await
+            .expect("new cold object should persist");
+        record_dirty_usage_bucket("hot-bucket");
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+        let (updates, mut receiver) = mpsc::channel(1);
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            nsscanner_with_storage_status_scoped(
+                store.as_ref(),
+                ScannerCycleRequest {
+                    ctx,
+                    budget,
+                    updates,
+                    want_cycle: 7,
+                    leader_epoch: 11,
+                    scan_mode,
+                    scan_scope: ScannerBucketScanScope::default(),
+                    persisted_usage_baseline: None,
+                    requires_full_scan,
+                    resolved_scope_observer: None,
+                },
+            ),
+        )
+        .await
+        .expect("maintenance scan should finish")
+        .expect("maintenance scan should succeed");
+        assert_eq!(result.status, ScannerCycleStatus::Complete);
+        let snapshot = receiver.recv().await.expect("maintenance snapshot should be published");
+        assert_eq!(snapshot.scanner_cycle, Some(7));
+        assert_eq!(
+            snapshot.buckets_usage["cold-bucket"].objects_count, 2,
+            "{scan_mode:?}/full={requires_full_scan} must not replay the same-cycle Normal root"
+        );
+        clear_dirty_usage_buckets_for_tests();
+    }
+}
+
+#[tokio::test]
 async fn data_usage_publish_fails_when_receiver_is_closed() {
     let (updates, receiver) = mpsc::channel(1);
     drop(receiver);

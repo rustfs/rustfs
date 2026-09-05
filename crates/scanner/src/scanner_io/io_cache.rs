@@ -116,6 +116,7 @@ impl ScannerIOCache for SetDisks {
             scope,
             digest: scan_plan_digest,
             bucket_coverage_digest,
+            requires_full_scan,
             leader_epoch,
             tier_registry_generation,
             publication_epoch,
@@ -124,6 +125,7 @@ impl ScannerIOCache for SetDisks {
             pending_maintenance_work,
             cache_cycle_floor,
         } = scan_plan;
+        let bucket_work_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
         let pool_label = self.pool_index.to_string();
         let set_label = self.set_index.to_string();
 
@@ -635,7 +637,7 @@ impl ScannerIOCache for SetDisks {
 
                     let cache_name = path_join_buf(&[&bucket.name, DATA_USAGE_CACHE_NAME]);
                     let bucket_scan_plan_digest =
-                        scanner_bucket_cache_digest(bucket_coverage_digest, dirty_usage_buckets_clone.get(&bucket.name).copied());
+                        scanner_bucket_cache_digest(bucket_work_digest, dirty_usage_buckets_clone.get(&bucket.name).copied());
 
                     if let Some(server_epoch) = remote_server_epoch {
                         let request_sequence = remote_session_sequence;

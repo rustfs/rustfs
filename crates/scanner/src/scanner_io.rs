@@ -273,6 +273,7 @@ pub struct ScannerBucketScanPlan {
     digest: DataUsageScanPlanDigest,
     /// Includes mutation generations even when the set planner uses a structural digest.
     bucket_coverage_digest: DataUsageScanPlanDigest,
+    requires_full_scan: bool,
     leader_epoch: u64,
     tier_registry_generation: u64,
     /// Epoch captured once for the whole scanner cycle.  `None` is retained
@@ -336,6 +337,29 @@ fn scanner_bucket_inventory_is_complete(
         }
     }
     covered.len() == inventory.len()
+}
+
+// Bind known work requirements before both local and remote cache admission.
+// Matching requirements remain reusable for the same intent; this is not a
+// new deadline or a durable generation for newly due maintenance.
+fn scanner_bucket_work_digest(
+    scan_plan_digest: DataUsageScanPlanDigest,
+    scan_mode: HealScanMode,
+    requires_full_scan: bool,
+) -> DataUsageScanPlanDigest {
+    if scan_mode == HealScanMode::Normal && !requires_full_scan {
+        return scan_plan_digest;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"scanner-bucket-work-v1");
+    hasher.update(scan_plan_digest.0);
+    hasher.update([match scan_mode {
+        HealScanMode::Unknown => 0,
+        HealScanMode::Normal => 1,
+        HealScanMode::Deep => 2,
+    }]);
+    hasher.update([u8::from(requires_full_scan || scan_mode == HealScanMode::Deep)]);
+    DataUsageScanPlanDigest(hasher.finalize().into())
 }
 
 fn scanner_bucket_cache_digest(

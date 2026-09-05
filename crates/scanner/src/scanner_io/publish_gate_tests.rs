@@ -1331,6 +1331,56 @@ fn dirty_bucket_cache_digest_changes_with_generation() {
 }
 
 #[test]
+fn scoped_scan_bucket_work_proof_fences_same_cycle_cache() {
+    let source = DataUsageCacheSource::new(0, 0);
+    let structural_plan = DataUsageScanPlanDigest([9; 32]);
+    let normal_plan = scanner_bucket_work_digest(structural_plan, HealScanMode::Normal, false);
+    assert_eq!(normal_plan, structural_plan, "ordinary work keeps the existing digest contract");
+    for (scan_mode, full) in [(HealScanMode::Deep, false), (HealScanMode::Normal, true)] {
+        let requested_plan = scanner_bucket_work_digest(structural_plan, scan_mode, full);
+        assert_ne!(requested_plan, normal_plan);
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "cold".to_string(),
+                next_cycle: 7,
+                leader_epoch: 11,
+                last_update: Some(SystemTime::UNIX_EPOCH),
+                source: Some(source),
+                snapshot_complete: true,
+                scan_plan_digest: Some(normal_plan),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace("cold", "", DataUsageEntry::default());
+        assert!(cache_snapshot_is_current(&cache, "cold", source, 7, 11, normal_plan));
+        assert!(matches!(
+            current_cache_root_or_prepare(&mut cache, "cold", source, 7, 11, requested_plan, true),
+            DataUsageCacheScanState::Prepared {
+                outcome: DataUsageCachePrepareOutcome::Reset,
+                ..
+            }
+        ));
+        assert!(cache.cache.is_empty(), "different work requirements must enter a fresh walk");
+        cache.replace("cold", "", DataUsageEntry::default());
+        cache.info.snapshot_complete = true;
+        cache.info.last_update = Some(SystemTime::UNIX_EPOCH);
+        assert!(
+            matches!(
+                current_cache_root_or_prepare(&mut cache, "cold", source, 7, 11, requested_plan, true),
+                DataUsageCacheScanState::Current(_)
+            ),
+            "completed matching work may satisfy the same intent retry"
+        );
+    }
+    assert_eq!(
+        scanner_bucket_work_digest(structural_plan, HealScanMode::Deep, false),
+        scanner_bucket_work_digest(structural_plan, HealScanMode::Deep, true)
+    );
+}
+
+#[test]
 fn scanner_cache_lock_resource_is_scoped_to_cache_source() {
     let cache_name = "photos/.usage-cache.bin";
     let first_source = DataUsageCacheSource::new(0, 1);

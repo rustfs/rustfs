@@ -433,6 +433,7 @@ where
             scope: scan_scope.clone(),
             digest: scan_plan_digest,
             bucket_coverage_digest,
+            requires_full_scan,
             leader_epoch,
             tier_registry_generation,
             publication_epoch,
