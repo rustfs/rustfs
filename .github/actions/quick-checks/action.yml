@@ -94,6 +94,10 @@ runs:
       shell: bash
       run: ./scripts/check_embedded_secrets.sh
 
+    - name: Run script contract tests
+      shell: bash
+      run: make script-tests
+
     - name: Check test wiring
       shell: bash
       run: |
