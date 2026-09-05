@@ -14140,6 +14140,196 @@ mod test {
         );
     }
 
+    #[tokio::test]
+    async fn observed_rename_timeout_has_no_preflight_proof_and_retains_namespace_lease() {
+        use crate::disk::disk_store::LocalDiskWrapper;
+        use futures::FutureExt;
+        use std::sync::mpsc;
+
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60"))], async {
+            let dir = tempfile::tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+            let bucket = "observed-timeout-bucket";
+            let object = "prefix/object";
+            let tmp_object = "observed-timeout-stage";
+            let data_dir = Uuid::new_v4();
+            ensure_test_volume(&disk, bucket).await;
+            ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+            let staged_part = disk
+                .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{data_dir}/part.1"))
+                .expect("staged part path should resolve");
+            fs::create_dir_all(staged_part.parent().expect("staged part should have a parent"))
+                .await
+                .expect("staged data directory should be created");
+            fs::write(&staged_part, b"new-payload")
+                .await
+                .expect("staged part should be written");
+            let staged_metadata = disk
+                .get_object_path_for_io(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{STORAGE_FORMAT_FILE}"))
+                .expect("staged metadata path should resolve");
+            let destination = disk.io_get_object_path(bucket, object).expect("destination should resolve");
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            set_owned_file_write_before_open(&staged_metadata, move || {
+                entered_tx.send(()).expect("signal staged writer entry");
+                // Dropping the sender also unblocks the syscall if the test fails.
+                let _ = release_rx.recv();
+            });
+            let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+            let operation = wrapper.clone();
+            let fi = test_file_info(object, Uuid::new_v4(), Some(data_dir), None);
+            let rename = tokio::spawn(async move {
+                operation
+                    .rename_data_observed(RUSTFS_META_TMP_BUCKET, tmp_object, &fi, bucket, object, None)
+                    .await
+            });
+            tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
+                .await
+                .expect("staged writer waiter should run")
+                .expect("rename must enter the real staged metadata write");
+
+            // Advance only after the blocking syscall owns its lease and the wrapper's timer exists.
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(61)).await;
+            tokio::time::resume();
+            let observed = tokio::time::timeout(Duration::from_secs(5), rename)
+                .await
+                .expect("wrapper timeout must not wait for the blocked syscall")
+                .expect("the wrapper waiter must not panic");
+            assert!(!observed.rejected_before_publication(), "a timeout must carry no local preflight proof");
+            assert!(matches!(observed.result, Err(DiskError::Timeout)));
+            let snapshot = wrapper.metrics_snapshot();
+            assert_eq!(snapshot.api_calls.get("rename_data"), Some(&1));
+            assert_eq!(snapshot.total_errors_timeout, 1);
+            assert_eq!(snapshot.total_writes, 0);
+            assert_eq!(snapshot.total_waiting, 0);
+            let volume_lock = os::disk_volume_mutation_lock(&disk.root, bucket);
+            assert!(
+                Arc::clone(&volume_lock).try_write_owned().is_err(),
+                "the blocked syscall must retain its volume guard"
+            );
+            assert!(
+                os::acquire_rename_data_mutation_lease(&disk.root, bucket, &destination)
+                    .now_or_never()
+                    .is_none(),
+                "a same-object mutation must still wait for the blocked syscall"
+            );
+            assert_eq!(fs::read(&staged_part).await.expect("staged data must remain"), b"new-payload");
+            assert!(!destination.join(STORAGE_FORMAT_FILE).exists());
+
+            release_tx.send(()).expect("release timed-out staged writer");
+            let lease = tokio::time::timeout(
+                Duration::from_secs(5),
+                os::acquire_rename_data_mutation_lease(&disk.root, bucket, &destination),
+            )
+            .await
+            .expect("the namespace lease must be released when the syscall drains");
+            drop(lease);
+            let _exclusive = tokio::time::timeout(Duration::from_secs(5), volume_lock.write_owned())
+                .await
+                .expect("the volume guard must be released when the syscall drains");
+            assert!(
+                !destination.join(STORAGE_FORMAT_FILE).exists(),
+                "timed-out waiter must not publish metadata later"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observed_rename_owned_task_panic_has_no_preflight_proof_and_releases_guard() {
+        use crate::disk::disk_store::LocalDiskWrapper;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let bucket = "observed-panic-bucket";
+        let object = "prefix/object";
+        let tmp_object = "observed-panic-stage";
+        let data_dir = Uuid::new_v4();
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        let staged_part = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{data_dir}/part.1"))
+            .expect("staged part path should resolve");
+        fs::create_dir_all(staged_part.parent().expect("staged part should have a parent"))
+            .await
+            .expect("staged data directory should be created");
+        fs::write(&staged_part, b"new-payload")
+            .await
+            .expect("staged part should be written");
+        let destination = disk.io_get_object_path(bucket, object).expect("destination should resolve");
+        let published_part = destination.join(data_dir.to_string()).join("part.1");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        set_rename_data_after_first_publication(&disk.root, bucket, object, move || {
+            entered_tx.send(()).expect("signal data publication");
+            let _ = release_rx.recv();
+            // This hook runs in the owned async mutation, outside spawn_blocking.
+            panic!("injected observed rename owner panic after publication");
+        });
+        let external_guard = Arc::new(());
+        let guard_probe = Arc::downgrade(&external_guard);
+        let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+        let operation = wrapper.clone();
+        let fi = test_file_info(object, Uuid::new_v4(), Some(data_dir), None);
+        let rename = tokio::spawn(async move {
+            operation
+                .rename_data_observed(RUSTFS_META_TMP_BUCKET, tmp_object, &fi, bucket, object, Some(external_guard))
+                .await
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("publication waiter should run")
+            .expect("rename must publish data before the injected owner panic");
+        assert!(guard_probe.upgrade().is_some(), "the owned task must retain the publication guard");
+        assert_eq!(fs::read(&published_part).await.expect("new data must be published"), b"new-payload");
+        assert!(!staged_part.exists(), "the real data rename must have consumed staging");
+        assert!(!destination.join(STORAGE_FORMAT_FILE).exists());
+        let volume_lock = os::disk_volume_mutation_lock(&disk.root, bucket);
+        assert!(
+            Arc::clone(&volume_lock).try_write_owned().is_err(),
+            "the mutation must retain its volume guard"
+        );
+
+        release_tx.send(()).expect("release mutation owner into the injected panic");
+        let observed = tokio::time::timeout(Duration::from_secs(5), rename)
+            .await
+            .expect("owned task panic must reach the wrapper")
+            .expect("the wrapper must convert the inner task panic into an error");
+        assert!(
+            !observed.rejected_before_publication(),
+            "a join failure must carry no local preflight proof"
+        );
+        assert!(matches!(observed.result, Err(DiskError::Io(error)) if error.to_string() == "owned mutation task failed"));
+        assert!(
+            guard_probe.upgrade().is_none(),
+            "the guard must be released after the mutation owner unwinds"
+        );
+        let snapshot = wrapper.metrics_snapshot();
+        assert_eq!(snapshot.api_calls.get("rename_data"), Some(&1));
+        assert_eq!(snapshot.total_writes, 0);
+        assert_eq!(snapshot.total_waiting, 0);
+        let lease = tokio::time::timeout(
+            Duration::from_secs(5),
+            os::acquire_rename_data_mutation_lease(&disk.root, bucket, &destination),
+        )
+        .await
+        .expect("panic must release the namespace lease");
+        drop(lease);
+        let _exclusive = tokio::time::timeout(Duration::from_secs(5), volume_lock.write_owned())
+            .await
+            .expect("panic must release the volume guard");
+        assert_eq!(
+            fs::read(&published_part).await.expect("published recovery data must remain"),
+            b"new-payload"
+        );
+        assert!(!destination.join(STORAGE_FORMAT_FILE).exists());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn windows_and_unix_cancelled_staged_metadata_write_serializes_same_object_retry() {
         use std::sync::{Arc, mpsc};
