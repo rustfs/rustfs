@@ -283,19 +283,19 @@ pub struct FetchRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ListPageError {
     #[error("truncated listing has no continuation token")]
-    MissingToken,
+    Missing,
     #[error("truncated listing has an empty continuation token")]
-    EmptyToken,
+    Empty,
     #[error("truncated listing repeats a continuation token")]
-    RepeatedToken,
+    Repeated,
 }
 
 pub(crate) fn validate_list_page(is_truncated: bool, token: Option<&str>, next_token: Option<&str>) -> Result<(), ListPageError> {
     if is_truncated {
         match next_token {
-            None => return Err(ListPageError::MissingToken),
-            Some("") => return Err(ListPageError::EmptyToken),
-            Some(next) if Some(next) == token => return Err(ListPageError::RepeatedToken),
+            None => return Err(ListPageError::Missing),
+            Some("") => return Err(ListPageError::Empty),
+            Some(next) if Some(next) == token => return Err(ListPageError::Repeated),
             Some(_) => {}
         }
     }
@@ -424,7 +424,7 @@ impl ListThroughMerger {
         validate_list_page(is_truncated, token.as_deref(), next_token.as_deref())?;
         // Also reject a cycle through an earlier page in this bounded fetch.
         if is_truncated && state.pages.iter().any(|page| page.token == next_token) {
-            return Err(ListPageError::RepeatedToken);
+            return Err(ListPageError::Repeated);
         }
         state.more = is_truncated;
         state.pages.push(FetchedPage {
@@ -667,11 +667,11 @@ mod tests {
             let Some(suffix) = key.strip_prefix(prefix) else {
                 continue;
             };
-            if let Some(delimiter) = delimiter.filter(|delimiter| !delimiter.is_empty()) {
-                if let Some((directory, _)) = suffix.split_once(delimiter) {
-                    namespace.insert(format!("{prefix}{directory}{delimiter}"), true);
-                    continue;
-                }
+            if let Some(delimiter) = delimiter.filter(|delimiter| !delimiter.is_empty())
+                && let Some((directory, _)) = suffix.split_once(delimiter)
+            {
+                namespace.insert(format!("{prefix}{directory}{delimiter}"), true);
+                continue;
             }
             namespace.insert(key.clone(), false);
         }
@@ -765,9 +765,9 @@ mod tests {
         for side in [MergeSide::Local, MergeSide::Source] {
             for entries in [vec![], vec![ListEntryKey::object("a")]] {
                 for (next, expected) in [
-                    (None, Err(ListPageError::MissingToken)),
-                    (Some(""), Err(ListPageError::EmptyToken)),
-                    (Some("stuck"), Err(ListPageError::RepeatedToken)),
+                    (None, Err(ListPageError::Missing)),
+                    (Some(""), Err(ListPageError::Empty)),
+                    (Some("stuck"), Err(ListPageError::Repeated)),
                     (Some("advances"), Ok(())),
                 ] {
                     let resume = ListThroughToken::new(
@@ -815,7 +815,7 @@ mod tests {
         );
         assert_eq!(
             merger.push_page(MergeSide::Source, vec![], true, Some("stuck".into())),
-            Err(ListPageError::RepeatedToken)
+            Err(ListPageError::Repeated)
         );
     }
 
@@ -868,7 +868,7 @@ mod tests {
             .expect("first page advances");
         assert_eq!(
             merger.push_page(MergeSide::Source, vec![], true, Some("first".into())),
-            Err(ListPageError::RepeatedToken)
+            Err(ListPageError::Repeated)
         );
     }
 
@@ -884,7 +884,7 @@ mod tests {
         assert_eq!(merger.next_fetch().expect("source refill is required").token.as_deref(), Some("stuck"));
         assert_eq!(
             merger.push_page(MergeSide::Source, vec![], true, Some("stuck".into())),
-            Err(ListPageError::RepeatedToken)
+            Err(ListPageError::Repeated)
         );
         merger.disable_source();
         let outcome = merger.finish();
