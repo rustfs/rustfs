@@ -17505,27 +17505,69 @@ mod put_object_tmp_cleanup_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
     async fn put_object_failure_cleans_tmp_workspace_inline() {
-        let (temp_dirs, _disk_stores, set_disks) = hermetic_set_disks(4).await;
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            for write_completion in [WriteCompletion::Quorum, WriteCompletion::TailDrained] {
+                let (temp_dirs, _disk_stores, set_disks) = hermetic_set_disks(4).await;
+                let bucket = "tmp-clean-missing-bucket";
+                let object = "orphan-object";
+                let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeNamespace);
+                let writer = Arc::clone(&set_disks);
+                let put = tokio::spawn(async move {
+                    let mut reader = PutObjReader::from_vec(vec![9u8; TEST_OBJECT_SIZE]);
+                    writer
+                        .put_object(
+                            bucket,
+                            object,
+                            &mut reader,
+                            &ObjectOptions {
+                                write_completion,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                    .await
+                    .expect("missing-bucket PUT must stage before rename");
+                let staged = non_trash_tmp_entries(&temp_dirs).await;
+                assert_eq!(staged.len(), 4, "every disk must have a staged workspace before rejection");
+                for workspace in staged {
+                    let mut entries = tokio::fs::read_dir(&workspace)
+                        .await
+                        .expect("staged workspace should be readable");
+                    let mut shards = 0;
+                    while let Some(entry) = entries.next_entry().await.expect("staged data directory should be readable") {
+                        if entry.file_type().await.expect("staged entry type").is_dir() {
+                            let part = tokio::fs::metadata(entry.path().join("part.1"))
+                                .await
+                                .expect("staging must contain an actual erasure shard");
+                            assert!(part.len() > 0, "the shard must be written before the missing-bucket failure");
+                            shards += 1;
+                        }
+                    }
+                    assert_eq!(shards, 1);
+                }
+                assert!(temp_dirs.iter().all(|dir| !dir.path().join(bucket).exists()));
+                barrier.release();
+                let err = tokio::time::timeout(Duration::from_secs(30), put)
+                    .await
+                    .expect("missing-bucket PUT must finish")
+                    .expect("PUT task should join")
+                    .expect_err("put_object into a missing bucket volume must fail");
+                assert!(matches!(err, StorageError::VolumeNotFound), "original disk error expected: {err}");
 
-        // The bucket volume is never created, so the shards are written into
-        // the tmp workspace and the commit fails at rename_data with a quorum
-        // error — exercising the failure-path cleanup.
-        let mut reader = PutObjReader::from_vec(vec![9u8; TEST_OBJECT_SIZE]);
-        let err = set_disks
-            .put_object("tmp-clean-missing-bucket", "orphan-object", &mut reader, &ObjectOptions::default())
-            .await
-            .expect_err("put_object into a missing bucket volume must fail");
-
-        // No polling: the failure path must clean the tmp workspace inline,
-        // before put_object returns (backlog#864 / backlog#898 hardening).
-        let leftovers = non_trash_tmp_entries(&temp_dirs).await;
-        assert!(
-            leftovers.is_empty(),
-            "failed PUT must not leave tmp shards behind, leftovers: {leftovers:?}, err: {err}"
-        );
-
-        drop(temp_dirs);
+                // No polling: known pre-publication rejection must clean staging
+                // inline, before PUT returns (backlog#864 / backlog#898).
+                let leftovers = non_trash_tmp_entries(&temp_dirs).await;
+                assert!(
+                    leftovers.is_empty(),
+                    "failed PUT must not leave tmp shards behind, leftovers: {leftovers:?}, err: {err}"
+                );
+            }
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -18373,87 +18415,92 @@ mod put_object_tmp_cleanup_tests {
 
         temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
             for write_completion in [WriteCompletion::Quorum, WriteCompletion::TailDrained] {
-                let (dirs, disks, set) = hermetic_set_disks(4).await;
-                let bucket = "put-incomplete-undo";
-                let object = "incomplete-undo-object";
-                make_completion_test_bucket(&disks, bucket).await;
-                let mut old_reader = PutObjReader::from_vec(vec![b'0'; TEST_OBJECT_SIZE]);
-                set.put_object(
-                    bucket,
-                    object,
-                    &mut old_reader,
-                    &ObjectOptions {
-                        write_completion: WriteCompletion::TailDrained,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("old generation should be completely committed");
-                wait_for_tmp_workspace_to_drain(&dirs, "old PUT must leave no unrelated staging").await;
-                let old = disks[0]
-                    .read_version("", bucket, object, "", &ReadOptions::default())
+                for fault in [
+                    rollback_fault_injection::Fault::Io,
+                    rollback_fault_injection::Fault::VolumeNotFoundAfterRename,
+                ] {
+                    let (dirs, disks, set) = hermetic_set_disks(4).await;
+                    let bucket = "put-incomplete-undo";
+                    let object = "incomplete-undo-object";
+                    make_completion_test_bucket(&disks, bucket).await;
+                    let mut old_reader = PutObjReader::from_vec(vec![b'0'; TEST_OBJECT_SIZE]);
+                    set.put_object(
+                        bucket,
+                        object,
+                        &mut old_reader,
+                        &ObjectOptions {
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
                     .await
-                    .expect("old metadata must be readable");
-                let old_data_dir = old.data_dir.expect("non-inline old version needs a data directory");
-                let tasks = rename_fanout_barrier::observe_tasks(object);
-                let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
-                let _rename_fault = rename_fault_injection::fail_rename_on(object, &[2, 3]);
-                let _undo_fault = rollback_fault_injection::arm(object, 0, rollback_fault_injection::Fault::Io);
-                let writer = Arc::clone(&set);
-                let put = tokio::spawn(async move {
-                    let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
-                    writer
-                        .put_object(
-                            bucket,
-                            object,
-                            &mut reader,
-                            &ObjectOptions {
-                                write_completion,
-                                ..Default::default()
-                            },
-                        )
+                    .expect("old generation should be completely committed");
+                    wait_for_tmp_workspace_to_drain(&dirs, "old PUT must leave no unrelated staging").await;
+                    let old = disks[0]
+                        .read_version("", bucket, object, "", &ReadOptions::default())
                         .await
-                });
-                tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
-                    .await
-                    .expect("overwrite must enter the actual rename fan-out before failure injection");
-                barrier.release();
-                let err = tokio::time::timeout(Duration::from_secs(30), put)
-                    .await
-                    .expect("incomplete undo must return without hanging")
-                    .expect("PUT task should join")
-                    .expect_err("two renamed disks cannot satisfy write quorum three");
-                assert!(
-                    matches!(err, Error::ErasureWriteQuorum | Error::InsufficientWriteQuorum(_, _)),
-                    "original quorum error expected: {err}"
-                );
-                assert_eq!(tasks.running(), 0, "every rename and undo task must be reaped before return");
-                let leftovers = non_trash_tmp_entries(&dirs).await;
-                assert!(!leftovers.is_empty(), "incomplete undo must retain the new staging source for recovery");
-                let backups = dirs
-                    .iter()
-                    .filter(|dir| {
-                        dir.path()
-                            .join(bucket)
-                            .join(object)
-                            .join(old_data_dir.to_string())
-                            .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP)
-                            .exists()
-                    })
-                    .count();
-                assert_eq!(backups, 1, "exactly the failed undo disk must retain its old-version backup");
-                // The remaining three disks still serve the old generation;
-                // the failed minority must never become an acknowledged write.
-                let mut read = set
-                    .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
-                    .await
-                    .expect("old generation must remain readable after incomplete rollback");
-                let mut body = Vec::new();
-                read.stream
-                    .read_to_end(&mut body)
-                    .await
-                    .expect("old generation should stream");
-                assert_eq!(body, vec![b'0'; TEST_OBJECT_SIZE]);
+                        .expect("old metadata must be readable");
+                    let old_data_dir = old.data_dir.expect("non-inline old version needs a data directory");
+                    let tasks = rename_fanout_barrier::observe_tasks(object);
+                    let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+                    let _rename_fault = rename_fault_injection::fail_rename_on(object, &[2, 3]);
+                    let _undo_fault = rollback_fault_injection::arm(object, 0, fault);
+                    let writer = Arc::clone(&set);
+                    let put = tokio::spawn(async move {
+                        let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+                        writer
+                            .put_object(
+                                bucket,
+                                object,
+                                &mut reader,
+                                &ObjectOptions {
+                                    write_completion,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                    });
+                    tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                        .await
+                        .expect("overwrite must enter the actual rename fan-out before failure injection");
+                    barrier.release();
+                    let err = tokio::time::timeout(Duration::from_secs(30), put)
+                        .await
+                        .expect("incomplete undo must return without hanging")
+                        .expect("PUT task should join")
+                        .expect_err("two renamed disks cannot satisfy write quorum three");
+                    assert!(
+                        matches!(err, Error::ErasureWriteQuorum | Error::InsufficientWriteQuorum(_, _)),
+                        "original quorum error expected: {err}"
+                    );
+                    assert_eq!(tasks.running(), 0, "every rename and undo task must be reaped before return");
+                    let leftovers = non_trash_tmp_entries(&dirs).await;
+                    assert!(!leftovers.is_empty(), "incomplete undo must retain the new staging source for recovery");
+                    let backups = dirs
+                        .iter()
+                        .filter(|dir| {
+                            dir.path()
+                                .join(bucket)
+                                .join(object)
+                                .join(old_data_dir.to_string())
+                                .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP)
+                                .exists()
+                        })
+                        .count();
+                    assert_eq!(backups, 1, "exactly the failed undo disk must retain its old-version backup");
+                    // The remaining three disks still serve the old generation;
+                    // the failed minority must never become an acknowledged write.
+                    let mut read = set
+                        .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                        .await
+                        .expect("old generation must remain readable after incomplete rollback");
+                    let mut body = Vec::new();
+                    read.stream
+                        .read_to_end(&mut body)
+                        .await
+                        .expect("old generation should stream");
+                    assert_eq!(body, vec![b'0'; TEST_OBJECT_SIZE]);
+                }
             }
         })
         .await;

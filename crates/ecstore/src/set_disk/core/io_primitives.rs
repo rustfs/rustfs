@@ -3493,9 +3493,17 @@ pub(in crate::set_disk) struct RenameTailOutcome {
 
 const EVENT_SET_DISK_RENAME_ROLLBACK: &str = "set_disk_rename_rollback";
 
+#[derive(Clone, Copy)]
+enum RenameDispatchState {
+    NotDispatched,
+    RejectedBeforePublication,
+    MayHavePublished,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RenameRollbackOutcome {
     NotAttempted(DiskError),
+    RejectedBeforePublication(DiskError),
     Indeterminate(DiskError),
     Succeeded,
     Failed(DiskError),
@@ -3507,6 +3515,7 @@ impl RenameRollbackOutcome {
     fn stage(&self) -> &'static str {
         match self {
             Self::NotAttempted(_) => "rename_not_dispatched",
+            Self::RejectedBeforePublication(_) => "rename_rejected_before_publication",
             Self::Indeterminate(_) => "rename_indeterminate",
             Self::Succeeded => "undo_succeeded",
             Self::Failed(_) => "undo_failed",
@@ -3592,14 +3601,14 @@ async fn rollback_failed_rename(
     disks: &[Option<DiskStore>],
     file_infos: Vec<FileInfo>,
     errs: &[Option<DiskError>],
-    dispatched: &[bool],
+    dispatch_states: &[RenameDispatchState],
     rollback_dirs: &[Option<Uuid>],
     dst: (&str, &str),
     receipt: Option<RenameRollbackReceipt>,
 ) {
     let owned_disks = disks.to_vec();
     let owned_errs = errs.to_vec();
-    let owned_dispatched = dispatched.to_vec();
+    let owned_dispatch_states = dispatch_states.to_vec();
     let owned_dirs = rollback_dirs.to_vec();
     let owned_dst = (dst.0.to_string(), dst.1.to_string());
     let coordinator_failure_receipt = receipt.clone();
@@ -3608,7 +3617,7 @@ async fn rollback_failed_rename(
     let rollback = tokio::spawn(async move {
         let disks = owned_disks.as_slice();
         let errs = owned_errs.as_slice();
-        let dispatched = owned_dispatched.as_slice();
+        let dispatch_states = owned_dispatch_states.as_slice();
         let rollback_dirs = owned_dirs.as_slice();
         let dst = (owned_dst.0.as_str(), owned_dst.1.as_str());
         let mut file_infos = file_infos;
@@ -3619,8 +3628,13 @@ async fn rollback_failed_rename(
         for (disk_index, disk) in disks.iter().enumerate() {
             let rollback_dir = rollback_dirs[disk_index];
             let outcome = match &errs[disk_index] {
-                Some(err) if dispatched[disk_index] => RenameRollbackOutcome::Indeterminate(err.clone()),
-                Some(err) => RenameRollbackOutcome::NotAttempted(err.clone()),
+                Some(err) => match dispatch_states[disk_index] {
+                    RenameDispatchState::NotDispatched => RenameRollbackOutcome::NotAttempted(err.clone()),
+                    RenameDispatchState::RejectedBeforePublication => {
+                        RenameRollbackOutcome::RejectedBeforePublication(err.clone())
+                    }
+                    RenameDispatchState::MayHavePublished => RenameRollbackOutcome::Indeterminate(err.clone()),
+                },
                 None => RenameRollbackOutcome::Failed(DiskError::DiskNotFound),
             };
             outcomes.push(RenameRollbackDiskOutcome {
@@ -4197,7 +4211,7 @@ impl SetDisks {
                     let file_info = file_info.clone();
                     let successful_rename_completion_rank = successful_rename_completion_rank.clone();
                     tasks.spawn(async move {
-                        let mut dispatched = false;
+                        let mut dispatch_state = RenameDispatchState::NotDispatched;
                         let result = std::panic::AssertUnwindSafe(async {
                             #[allow(clippy::let_unit_value)]
                             let _fanout_task_guard = Self::rename_fanout_task_guard(&dst_object);
@@ -4223,9 +4237,9 @@ impl SetDisks {
                             }
 
                             let disk_wait_started = rustfs_io_metrics::put_stage_timer();
-                            dispatched = true;
-                            let result = disk
-                                .rename_data_borrowed_with_fence(
+                            dispatch_state = RenameDispatchState::MayHavePublished;
+                            let observed = disk
+                                .rename_data_borrowed_with_fence_observed(
                                     &src_bucket,
                                     &src_object,
                                     &file_info,
@@ -4234,6 +4248,8 @@ impl SetDisks {
                                     scanner_publication_lease_token,
                                 )
                                 .await;
+                            let rejected_before_publication = observed.rejected_before_publication();
+                            let result = observed.result;
                             #[cfg(test)]
                             if result.is_ok() {
                                 rollback_fault_injection::after_rename(&dst_object, i)?;
@@ -4259,11 +4275,14 @@ impl SetDisks {
                                 };
                                 rustfs_io_metrics::record_put_rename_disk_wait_completion(position, duration_ms);
                             }
+                            if rejected_before_publication {
+                                dispatch_state = RenameDispatchState::RejectedBeforePublication;
+                            }
                             result
                         })
                         .catch_unwind()
                         .await;
-                        (i, dispatched, result)
+                        (i, dispatch_state, result)
                     });
                 }
 
@@ -4274,7 +4293,7 @@ impl SetDisks {
                 let mut results_seen = 0usize;
                 let mut errs = vec![Some(DiskError::DiskNotFound); disk_count];
                 // Missing task results cannot prove that a disk mutation never ran.
-                let mut dispatched = vec![true; disk_count];
+                let mut dispatch_states = vec![RenameDispatchState::MayHavePublished; disk_count];
                 let mut disk_versions = vec![None; disk_count];
                 let mut data_dirs = vec![None; disk_count];
                 let mut cleanup_data_dirs = vec![None; disk_count];
@@ -4285,8 +4304,8 @@ impl SetDisks {
                 while let Some(joined) = tasks.join_next().await {
                     results_seen += 1;
                     match joined {
-                        Ok((idx, was_dispatched, Ok(Ok(res)))) => {
-                            dispatched[idx] = was_dispatched;
+                        Ok((idx, dispatch_state, Ok(Ok(res)))) => {
+                            dispatch_states[idx] = dispatch_state;
                             data_dirs[idx] = res.rollback_data_dir.or(res.old_data_dir);
                             cleanup_data_dirs[idx] = res.cleanup_data_dir;
                             disk_versions[idx] = res.sign;
@@ -4294,12 +4313,12 @@ impl SetDisks {
                             errs[idx] = None;
                             success_count += 1;
                         }
-                        Ok((idx, was_dispatched, Ok(Err(err)))) => {
-                            dispatched[idx] = was_dispatched;
+                        Ok((idx, dispatch_state, Ok(Err(err)))) => {
+                            dispatch_states[idx] = dispatch_state;
                             errs[idx] = Some(err);
                         }
-                        Ok((idx, was_dispatched, Err(_))) => {
-                            dispatched[idx] = was_dispatched;
+                        Ok((idx, dispatch_state, Err(_))) => {
+                            dispatch_states[idx] = dispatch_state;
                             errs[idx] = Some(DiskError::Unexpected);
                             fanout_panic += 1;
                         }
@@ -4350,7 +4369,7 @@ impl SetDisks {
                         &coordinator_disks,
                         file_infos,
                         &errs,
-                        &dispatched,
+                        &dispatch_states,
                         &data_dirs,
                         (&fanout_dst_bucket, &fanout_dst_object),
                         rollback_receipt,
@@ -4566,7 +4585,7 @@ impl SetDisks {
                     let publication_scope = scanner_publication_commit_scope.clone();
 
                     async move {
-                        let mut dispatched = false;
+                        let mut dispatch_state = RenameDispatchState::NotDispatched;
                         let result = std::panic::AssertUnwindSafe(async {
                             // Test-only introspection guard: counts this operation as
                             // in-flight for the whole body. Compiles to `()` in production.
@@ -4608,9 +4627,9 @@ impl SetDisks {
                             }
 
                             let disk_wait_started = rustfs_io_metrics::put_stage_timer();
-                            dispatched = true;
-                            let result = disk
-                                .rename_data_borrowed_with_fence(
+                            dispatch_state = RenameDispatchState::MayHavePublished;
+                            let observed = disk
+                                .rename_data_borrowed_with_fence_observed(
                                     &src_bucket,
                                     &src_object,
                                     file_info,
@@ -4619,6 +4638,8 @@ impl SetDisks {
                                     scanner_publication_lease_token,
                                 )
                                 .await;
+                            let rejected_before_publication = observed.rejected_before_publication();
+                            let result = observed.result;
                             #[cfg(test)]
                             if result.is_ok() {
                                 rollback_fault_injection::after_rename(&dst_object, i)?;
@@ -4644,11 +4665,14 @@ impl SetDisks {
                                 };
                                 rustfs_io_metrics::record_put_rename_disk_wait_completion(position, duration_ms);
                             }
+                            if rejected_before_publication {
+                                dispatch_state = RenameDispatchState::RejectedBeforePublication;
+                            }
                             result
                         })
                         .catch_unwind()
                         .await;
-                        (dispatched, result)
+                        (dispatch_state, result)
                     }
                 });
             let results = join_all(futures).await;
@@ -4695,9 +4719,9 @@ impl SetDisks {
             );
         }
 
-        let mut dispatched = Vec::with_capacity(results.len());
-        for (idx, (was_dispatched, result)) in results.iter().enumerate() {
-            dispatched.push(*was_dispatched);
+        let mut dispatch_states = Vec::with_capacity(results.len());
+        for (idx, (dispatch_state, result)) in results.iter().enumerate() {
+            dispatch_states.push(*dispatch_state);
             match result {
                 Ok(Ok(res)) => {
                     data_dirs[idx] = res.rollback_data_dir.or(res.old_data_dir);
@@ -4763,7 +4787,7 @@ impl SetDisks {
                 disks,
                 file_infos,
                 &errs,
-                &dispatched,
+                &dispatch_states,
                 &data_dirs,
                 (&dst_bucket, &dst_object),
                 rollback_receipt,
@@ -6727,6 +6751,7 @@ pub(in crate::set_disk) mod rollback_fault_injection {
         Io,
         Panic,
         IoAfterRename,
+        VolumeNotFoundAfterRename,
         PanicAfterRename,
         CoordinatorPanic,
     }
@@ -6775,6 +6800,7 @@ pub(in crate::set_disk) mod rollback_fault_injection {
             .copied();
         match fault {
             Some((target, Fault::IoAfterRename)) if target == disk_index => Err(DiskError::FaultyDisk),
+            Some((target, Fault::VolumeNotFoundAfterRename)) if target == disk_index => Err(DiskError::VolumeNotFound),
             Some((target, Fault::PanicAfterRename)) if target == disk_index => panic!("injected panic after rename mutation"),
             _ => Ok(()),
         }
@@ -10599,6 +10625,7 @@ mod tests {
         temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
             for fault in [
                 rollback_fault_injection::Fault::IoAfterRename,
+                rollback_fault_injection::Fault::VolumeNotFoundAfterRename,
                 rollback_fault_injection::Fault::PanicAfterRename,
             ] {
                 let bucket = "rename-tail-unknown";
@@ -10666,6 +10693,7 @@ mod tests {
             for fault in [
                 rollback_fault_injection::Fault::Io,
                 rollback_fault_injection::Fault::IoAfterRename,
+                rollback_fault_injection::Fault::VolumeNotFoundAfterRename,
                 rollback_fault_injection::Fault::PanicAfterRename,
                 rollback_fault_injection::Fault::CoordinatorPanic,
             ] {
