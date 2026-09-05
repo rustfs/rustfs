@@ -1741,7 +1741,13 @@ impl FolderScanner {
                 source: FolderScanSource::Existing,
             }));
             let has_queued_folders = !queued_folders.is_empty();
-            let resume_order = order_queued_folders_for_resume(&mut queued_folders, scan_resume_after);
+            let forward_sweep = self.old_cache.info.scan_progress.is_some();
+            let forward_resume_after = forward_sweep.then(|| scan_resume_after.map(str::to_owned)).flatten();
+            let resume_order = if forward_sweep {
+                order_queued_folders_for_resume(&mut queued_folders, None)
+            } else {
+                order_queued_folders_for_resume(&mut queued_folders, scan_resume_after)
+            };
             if checkpoint_tracks_child_order && has_queued_folders {
                 match resume_order {
                     FolderResumeOrder::Used => global_metrics().record_scanner_checkpoint_used(),
@@ -1758,6 +1764,18 @@ impl FolderScanner {
 
                 let mut folder_item = queued_folder.folder;
                 let h = hash_path(&folder_item.name);
+                if forward_sweep
+                    && !into.compacted
+                    && forward_resume_after.as_deref().is_some_and(|resume| {
+                        folder_item.name.as_str() <= resume
+                            && !matches!(folder_resume_match(&folder_item.name, resume), Some(FolderResumeMatch::Descendant))
+                    })
+                    && self.old_cache.find(&folder_item.name).is_some()
+                {
+                    self.new_cache.copy_with_children(&self.old_cache, &h, &folder_item.parent);
+                    into.add_child(&h);
+                    continue;
+                }
 
                 match queued_folder.source {
                     FolderScanSource::New => {
@@ -1789,7 +1807,7 @@ impl FolderScanner {
                         }
                     }
                     FolderScanSource::Existing => {
-                        if !into.compacted && self.old_cache.is_compacted(&h) {
+                        if !forward_sweep && !into.compacted && self.old_cache.is_compacted(&h) {
                             let next_cycle = self.old_cache.info.next_cycle as u32;
                             if !h.mod_(next_cycle, data_usage_update_dir_cycles()) {
                                 // Transfer and add as child...
@@ -2250,7 +2268,10 @@ impl FolderScanner {
             self.new_cache.replace_hashed(&this_hash, &folder.parent, into);
         }
 
+        // Keep independently accounted children while the sweep cursor may
+        // reference them; the hard cardinality compaction below still applies.
         if !into.compacted
+            && self.old_cache.info.scan_progress.is_none()
             && self.new_cache.info.name != folder.name
             && let Some(mut flat) = self.new_cache.size_recursive(&this_hash.key())
         {
@@ -2425,7 +2446,22 @@ pub async fn scan_data_folder(
             let unresolved_objects = root.failed_objects > 0
                 || !new_cache.info.failed_objects.is_empty()
                 || !new_cache.info.size_reconciliation.is_empty();
-            new_cache.info.snapshot_complete = !unresolved_objects;
+            let mixed_coverage = new_cache
+                .info
+                .scan_progress
+                .is_some_and(|progress| progress.started_plan != progress.requested_plan);
+            new_cache.info.snapshot_complete = !unresolved_objects && !mixed_coverage;
+            if let Some(progress) = &mut new_cache.info.scan_progress {
+                if new_cache.info.snapshot_complete {
+                    new_cache.info.scan_plan_digest = Some(progress.requested_plan);
+                    new_cache.info.scan_progress = None;
+                } else {
+                    // Retain observations, then verify from the beginning under
+                    // the latest plan. A clean tail cannot certify an old prefix.
+                    progress.started_plan = progress.requested_plan;
+                    new_cache.info.scan_plan_digest = None;
+                }
+            }
             let had_scan_checkpoint = cache.info.scan_checkpoint.is_some() || new_cache.info.scan_checkpoint.is_some();
             new_cache.info.scan_resume_after = None;
             new_cache.info.scan_checkpoint = None;
@@ -2434,7 +2470,7 @@ pub async fn scan_data_folder(
             }
 
             close_disk_guard.close().await;
-            if unresolved_objects {
+            if unresolved_objects || mixed_coverage {
                 Err(ScannerError::PartialCache(Box::new(new_cache.clone())))
             } else {
                 Ok(new_cache.clone())

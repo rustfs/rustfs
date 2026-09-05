@@ -400,6 +400,52 @@ impl DataUsageScanCheckpoint {
     }
 }
 
+/// Durable scope of a bucket checkpoint, independent of namespace mutation counters.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DataUsageScanIdentity {
+    pub version: u16,
+    pub bucket_incarnation: uuid::Uuid,
+    pub set_layout: DataUsageScanPlanDigest,
+    pub publication_epoch: u64,
+    pub tier_registry_generation: u64,
+}
+
+impl Serialize for DataUsageScanIdentity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(5))?;
+        map.serialize_entry("version", &self.version)?;
+        map.serialize_entry("bucket_incarnation", &self.bucket_incarnation)?;
+        map.serialize_entry("set_layout", &self.set_layout)?;
+        map.serialize_entry("publication_epoch", &self.publication_epoch)?;
+        map.serialize_entry("tier_registry_generation", &self.tier_registry_generation)?;
+        map.end()
+    }
+}
+
+impl DataUsageScanIdentity {
+    pub(crate) fn is_valid(&self) -> bool {
+        self.version == 1 && !self.bucket_incarnation.is_nil()
+    }
+}
+
+/// A forward coverage sweep may span budgets, but not authorize mixed mutation generations.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DataUsageScanProgress {
+    pub started_plan: DataUsageScanPlanDigest,
+    pub requested_plan: DataUsageScanPlanDigest,
+}
+
+impl Serialize for DataUsageScanProgress {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("started_plan", &self.started_plan)?;
+        map.serialize_entry("requested_plan", &self.requested_plan)?;
+        map.end()
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DataUsageEntryInfo {
     pub name: String,
@@ -470,6 +516,10 @@ pub struct DataUsageCacheInfo {
     #[serde(default)]
     pub scan_checkpoint: Option<DataUsageScanCheckpoint>,
     #[serde(default)]
+    pub scan_identity: Option<DataUsageScanIdentity>,
+    #[serde(default)]
+    pub scan_progress: Option<DataUsageScanProgress>,
+    #[serde(default)]
     pub pending_heals: Vec<PendingScannerHeal>,
     #[serde(default)]
     pub object_lock: Option<Arc<ObjectLockConfiguration>>,
@@ -513,6 +563,8 @@ impl Serialize for DataUsageCacheInfo {
         // Keep this metadata map-encoded so older readers can ignore fields
         // appended by newer scanner versions during rolling upgrades.
         let field_count = 16
+            + usize::from(self.scan_identity.is_some())
+            + usize::from(self.scan_progress.is_some())
             + usize::from(self.tier_registry_generation.is_some())
             + usize::from(!self.size_reconciliation.is_empty())
             + usize::from(self.lkg_snapshot_complete)
@@ -531,6 +583,12 @@ impl Serialize for DataUsageCacheInfo {
         state.serialize_entry("failed_objects", &self.failed_objects)?;
         state.serialize_entry("scan_resume_after", &self.scan_resume_after)?;
         state.serialize_entry("scan_checkpoint", &self.scan_checkpoint)?;
+        if let Some(identity) = self.scan_identity {
+            state.serialize_entry("scan_identity", &identity)?;
+        }
+        if let Some(progress) = self.scan_progress {
+            state.serialize_entry("scan_progress", &progress)?;
+        }
         state.serialize_entry("pending_heals", &self.pending_heals)?;
         state.serialize_entry("object_lock", &self.object_lock)?;
         state.serialize_entry("source", &self.source)?;
@@ -688,6 +746,89 @@ impl DataUsageCache {
         self.info.scan_plan_digest = Some(scan_plan_digest);
         self.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT;
         self.info.snapshot_complete = false;
+        if reusable {
+            DataUsageCachePrepareOutcome::Reused
+        } else {
+            DataUsageCachePrepareOutcome::Reset
+        }
+    }
+
+    pub(crate) fn prepare_bucket_checkpoint(
+        &mut self,
+        name: &str,
+        next_cycle: u64,
+        leader_epoch: u64,
+        source: DataUsageCacheSource,
+        scan_plan_digest: DataUsageScanPlanDigest,
+        identity: DataUsageScanIdentity,
+    ) -> DataUsageCachePrepareOutcome {
+        if self.info.next_cycle > next_cycle {
+            return DataUsageCachePrepareOutcome::RejectedNewerCycle;
+        }
+        if self.info.leader_epoch > leader_epoch {
+            return DataUsageCachePrepareOutcome::RejectedNewerLeader;
+        }
+        let reusable = identity.is_valid()
+            && name != DATA_USAGE_ROOT
+            && self.info.name == name
+            && self.info.source == Some(source)
+            && self.info.leader_epoch == leader_epoch
+            && self.info.cache_key_format == DATA_USAGE_CACHE_KEY_FORMAT
+            && self.info.scan_identity == Some(identity)
+            && self.info.tier_registry_generation == Some(identity.tier_registry_generation)
+            && (self.cache.is_empty() || self.checked_flatten_complete_scope(name).is_some());
+        if !reusable {
+            let keep_debts = self.info.name == name
+                && self
+                    .info
+                    .scan_identity
+                    .is_none_or(|previous| previous.bucket_incarnation == identity.bucket_incarnation);
+            let (pending_heals, size_reconciliation) = if keep_debts {
+                (
+                    std::mem::take(&mut self.info.pending_heals),
+                    std::mem::take(&mut self.info.size_reconciliation),
+                )
+            } else {
+                (Vec::new(), HashMap::new())
+            };
+            *self = Self::default();
+            self.info.pending_heals = pending_heals;
+            self.info.size_reconciliation = size_reconciliation;
+        }
+        let cursor_is_valid = match (&self.info.scan_checkpoint, &self.info.scan_resume_after) {
+            (None, None) => true,
+            (Some(checkpoint), Some(resume)) => {
+                checkpoint.version == DATA_USAGE_SCAN_CHECKPOINT_VERSION
+                    && checkpoint.resume_after == *resume
+                    && resume.strip_prefix(name).is_some_and(|suffix| suffix.starts_with('/'))
+                    && self.find(resume).is_some()
+            }
+            _ => false,
+        };
+        if !cursor_is_valid {
+            self.info.scan_progress = None;
+        }
+        self.info.name = name.to_owned();
+        self.info.next_cycle = next_cycle;
+        self.info.leader_epoch = leader_epoch;
+        self.info.source = Some(source);
+        self.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT;
+        self.info.tier_registry_generation = Some(identity.tier_registry_generation);
+        self.info.scan_identity = Some(identity);
+        self.info.snapshot_complete = false;
+        if let Some(progress) = &mut self.info.scan_progress {
+            progress.requested_plan = scan_plan_digest;
+        } else {
+            self.info.scan_progress = Some(DataUsageScanProgress {
+                started_plan: scan_plan_digest,
+                requested_plan: scan_plan_digest,
+            });
+            self.info.scan_resume_after = None;
+            self.info.scan_checkpoint = None;
+        }
+        // Old readers do not understand coverage sweeps. An absent plan makes
+        // their existing prepare path rebuild instead of promoting mixed data.
+        self.info.scan_plan_digest = None;
         if reusable {
             DataUsageCachePrepareOutcome::Reused
         } else {

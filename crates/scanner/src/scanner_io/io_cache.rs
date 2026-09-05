@@ -115,6 +115,7 @@ impl ScannerIOCache for SetDisks {
             all_buckets,
             scope,
             digest: scan_plan_digest,
+            bucket_coverage_digest,
             leader_epoch,
             tier_registry_generation,
             publication_epoch,
@@ -634,7 +635,7 @@ impl ScannerIOCache for SetDisks {
 
                     let cache_name = path_join_buf(&[&bucket.name, DATA_USAGE_CACHE_NAME]);
                     let bucket_scan_plan_digest =
-                        scanner_bucket_cache_digest(scan_plan_digest, dirty_usage_buckets_clone.get(&bucket.name).copied());
+                        scanner_bucket_cache_digest(bucket_coverage_digest, dirty_usage_buckets_clone.get(&bucket.name).copied());
 
                     if let Some(server_epoch) = remote_server_epoch {
                         let request_sequence = remote_session_sequence;
@@ -880,6 +881,16 @@ impl ScannerIOCache for SetDisks {
                             continue;
                         }
                     };
+                    // Lack of an authoritative legacy identity disables the new
+                    // checkpoint protocol; the existing full rebuild remains available.
+                    let checkpoint_identity = scanner_bucket_checkpoint_identity(
+                        &store_clone_clone,
+                        &bucket.name,
+                        expected_publication_epoch_clone,
+                        tier_registry_generation,
+                    )
+                    .await
+                    .ok();
                     let scan_state = current_cache_root_or_prepare_with_generation(
                         &mut cache,
                         &bucket.name,
@@ -890,6 +901,7 @@ impl ScannerIOCache for SetDisks {
                         DataUsageCacheReuseOptions {
                             require_source: require_cache_source,
                             tier_registry_generation: Some(tier_registry_generation),
+                            checkpoint_identity,
                         },
                     );
                     let outcome = match scan_state {
@@ -1039,6 +1051,20 @@ impl ScannerIOCache for SetDisks {
                             }
                         }
                     };
+                    if let Some(expected) = checkpoint_identity
+                        && scanner_bucket_checkpoint_identity(
+                            &store_clone_clone,
+                            &bucket.name,
+                            expected_publication_epoch_clone,
+                            tier_registry_generation,
+                        )
+                        .await
+                        .ok()
+                            != Some(expected)
+                    {
+                        record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                        continue;
+                    }
                     let scan_outcome = match scan_result {
                         Ok(scan_outcome) => scan_outcome,
                         Err(e) => {

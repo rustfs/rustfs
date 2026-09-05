@@ -271,6 +271,8 @@ pub struct ScannerBucketScanPlan {
     all_buckets: Arc<Vec<BucketInfo>>,
     scope: ScannerBucketScanScope,
     digest: DataUsageScanPlanDigest,
+    /// Includes mutation generations even when the set planner uses a structural digest.
+    bucket_coverage_digest: DataUsageScanPlanDigest,
     leader_epoch: u64,
     tier_registry_generation: u64,
     /// Epoch captured once for the whole scanner cycle.  `None` is retained
@@ -728,6 +730,37 @@ pub(crate) async fn scanner_set_disk_inventory(set: &SetDisks) -> Vec<Arc<Disk>>
     disks.extend(membership.returning);
     disks.extend(membership.offline);
     disks
+}
+
+pub(crate) async fn scanner_bucket_checkpoint_identity(
+    set: &SetDisks,
+    bucket: &str,
+    publication_epoch: u64,
+    tier_registry_generation: u64,
+) -> Result<crate::DataUsageScanIdentity> {
+    let bucket_incarnation = set.bucket_incarnation_id_from_disk(bucket).await?;
+    let disks = set
+        .format
+        .erasure
+        .sets
+        .get(set.set_index)
+        .filter(|disks| !disks.is_empty())
+        .ok_or_else(|| Error::other("scanner checkpoint set layout is absent"))?;
+    if set.format.id.is_nil() || disks.iter().any(uuid::Uuid::is_nil) {
+        return Err(Error::other("scanner checkpoint set layout has a nil identity"));
+    }
+    let mut digest = Sha256::new();
+    digest.update(set.format.id.as_bytes());
+    for disk in disks {
+        digest.update(disk.as_bytes());
+    }
+    Ok(crate::DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation,
+        set_layout: crate::DataUsageScanPlanDigest(digest.finalize().into()),
+        publication_epoch,
+        tier_registry_generation,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

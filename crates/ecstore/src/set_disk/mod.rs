@@ -4498,6 +4498,12 @@ impl SetDisks {
         &self.ctx
     }
 
+    /// Read the persisted bucket identity through this set's metadata owner.
+    /// Missing or non-authoritative legacy identities remain errors.
+    pub async fn bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Uuid> {
+        metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await
+    }
+
     /// Admit one short scanner cache publication under this set's instance
     /// movement fence. The caller must hold the returned guard through its
     /// final conditional cache write; no scan-round work belongs under it.
