@@ -393,6 +393,30 @@ async fn peer_clients_do_not_follow_redirects() {
     assert!(tls_server.await.expect("custom redirect TLS server task"));
 }
 
+#[tokio::test]
+async fn peer_http_error_body_cannot_spoof_an_unreachable_peer() {
+    let (endpoint, ca_pem, server) = spawn_test_tls_server_with_response(
+        b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 27\r\nconnection: close\r\n\r\ndownstream failed (connect)",
+    )
+    .await;
+    let connection = validate_peer_connection_inner(&endpoint, false, &ca_pem, true).expect("custom CA peer connection");
+    let client =
+        build_custom_site_replication_peer_client(&empty_outbound_tls_state(), &connection).expect("custom CA peer client");
+    let err = PeerAdminRequest::post(&connection, SITE_REPLICATION_PEER_DEVNULL_PATH, "access-key")
+        .with_client(&client)
+        .send("secret-key", &serde_json::json!({}))
+        .await
+        .expect_err("HTTP 500 must fail");
+    let detail = err.to_string();
+
+    assert!(detail.contains("downstream failed (connect)"));
+    assert!(
+        !retry_error_indicates_peer_unreachable(&detail),
+        "an untrusted response body must not enable the fast reachability probe"
+    );
+    assert!(server.await.expect("HTTP error TLS server task"));
+}
+
 fn peer(name: &str, endpoint: &str) -> PeerInfo {
     PeerInfo {
         name: name.to_string(),
@@ -876,10 +900,10 @@ fn test_bucket_retry_settlement_preserves_a_newer_same_path_failure() {
     let observed = drain_event("remote", path, 1, Some(observed_at));
     let mut queue = vec![observed.clone()];
 
-    queue[0].updated_at = Some(observed_at + time::Duration::seconds(1));
+    queue[0].id = "evt-remote-new-revision".to_string();
     queue[0].retry_count += 1;
     assert_eq!(settle_observed_site_replication_retry_event(&mut queue, &peer, &observed), 0);
-    assert_eq!(queue.len(), 1, "a newer failure must survive stale settlement");
+    assert_eq!(queue.len(), 1, "a newer same-timestamp failure must survive stale settlement");
 
     let current = queue[0].clone();
     assert_eq!(settle_observed_site_replication_retry_event(&mut queue, &peer, &current), 1);
@@ -897,10 +921,18 @@ fn test_reachable_probe_promotion_is_fenced_by_the_observed_event() {
         retry_queue: vec![event],
         ..Default::default()
     };
+    state
+        .peers
+        .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
 
     assert_eq!(mark_reachable_deferred_retry_events(&mut state, &[recovered.clone()]), 1);
     assert_eq!(state.retry_queue[0].updated_at, None);
     assert!(!state.retry_queue[0].peer_unreachable);
+    assert_eq!(
+        actionable_site_replication_retry_events(&state, now).len(),
+        1,
+        "a successful probe must make the event replayable in the same drain tick"
+    );
 
     state.retry_queue[0].updated_at = Some(now + time::Duration::seconds(1));
     state.retry_queue[0].peer_unreachable = true;
@@ -1020,10 +1052,13 @@ fn test_retry_error_marks_peer_unreachable_only_for_connection_failures() {
         &mut queue,
         &peer,
         bucket_make,
-        "peer request to https://remote.example.com failed with 500 Internal Server Error",
+        "peer request to https://remote.example.com failed with 500 Internal Server Error: downstream failed (connect)",
         None,
     );
-    assert!(!queue[0].peer_unreachable, "application failures must keep the normal replay backoff");
+    assert!(
+        !queue[0].peer_unreachable,
+        "application failures and their untrusted bodies must keep the normal replay backoff"
+    );
 }
 
 #[test]
@@ -1035,11 +1070,25 @@ fn test_retry_event_peer_unreachable_is_legacy_serde_default() {
         "path":"/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning",
         "retry_count":1,
         "failed":false,
-        "last_error":"legacy"
+        "last_error":"peer request to https://remote.example.com failed (connect): connection refused"
     }"#;
 
-    let event: SiteReplicationRetryEvent = serde_json::from_str(json).expect("legacy retry event decodes");
+    let mut event: SiteReplicationRetryEvent = serde_json::from_str(json).expect("legacy retry event decodes");
     assert!(!event.peer_unreachable);
+
+    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    event.updated_at = Some(now - time::Duration::seconds(30));
+    let mut state = SiteReplicationState::default();
+    state
+        .peers
+        .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
+    state.retry_queue.push(event);
+
+    assert_eq!(
+        deferred_site_replication_retry_events(&state, now).len(),
+        1,
+        "rolling-upgrade records must retain fast recovery from their trusted outer error shape"
+    );
 }
 
 /// The actionable subset respects classification, peer membership and
@@ -2041,10 +2090,14 @@ fn test_retry_event_upsert_marks_repeated_failures() {
     let mut queue = Vec::new();
 
     upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "first", None);
+    let first_revision = queue[0].id.clone();
     upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "second", None);
+    let second_revision = queue[0].id.clone();
     upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "third", None);
 
     assert_eq!(queue.len(), 1);
+    assert_ne!(first_revision, second_revision);
+    assert_ne!(second_revision, queue[0].id, "each failure must advance the settlement revision");
     assert_eq!(queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
     assert_eq!(queue[0].retry_count, SITE_REPLICATION_RETRY_FAILED_AFTER);
     assert!(queue[0].failed);

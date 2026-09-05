@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use futures::{StreamExt, stream};
 
 pub(crate) const SITE_REPLICATION_RETRY_QUEUE_LIMIT: usize = 256;
 
@@ -228,6 +229,10 @@ pub(crate) fn upsert_site_replication_retry_event(
     let detail = summarize_peer_error_detail(error);
     let peer_unreachable = retry_error_indicates_peer_unreachable(error);
     if let Some(event) = queue.iter_mut().find(|event| retry_event_matches(event, peer, path)) {
+        // The id is the event revision used by probe promotion and replay
+        // settlement. Refresh it on every failure so an older in-flight
+        // success can never acknowledge the newer observation.
+        event.id = Uuid::new_v4().to_string();
         event.retry_count = event.retry_count.saturating_add(1);
         event.failed = event.retry_count >= SITE_REPLICATION_RETRY_FAILED_AFTER;
         event.last_error = detail;
@@ -260,7 +265,13 @@ pub(crate) fn upsert_site_replication_retry_event(
 
 pub(crate) fn retry_error_indicates_peer_unreachable(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
-    error.contains("failed (connect)") || error.contains("failed (dns resolution)") || error.contains("failed (tls handshake)")
+    let Some((_, request)) = error.split_once("peer request to ") else {
+        return false;
+    };
+    let Some((_, failure)) = request.split_once(" failed ") else {
+        return false;
+    };
+    failure.starts_with("(connect):") || failure.starts_with("(dns resolution):") || failure.starts_with("(tls handshake):")
 }
 
 pub(crate) fn retry_stats_for_state(state: &SiteReplicationState) -> Option<SRRetryStats> {
@@ -686,6 +697,10 @@ pub(crate) const SITE_REPLICATION_RETRY_DRAIN_MAX_BACKOFF_SECS: i64 = 86_400;
 /// chain. Larger snapshots and topology edits remain queued for operator
 /// repair instead of monopolizing lifecycle admission.
 pub(crate) const SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER: usize = 2;
+
+/// Bound sockets for every retry pass. The lightweight pass also admits at
+/// most this many peer request chains per round, bounding its lock hold time.
+pub(crate) const SITE_REPLICATION_RETRY_DRAIN_PEER_CONCURRENCY: usize = 4;
 
 /// A replay shape the retry machinery can derive from persisted state. The
 /// lightweight 30-second scheduler admits only bounded bucket-op chains;
@@ -1174,6 +1189,11 @@ pub(crate) fn deferred_site_replication_retry_events(
         .filter(|event| {
             event.updated_at.is_none_or(|updated_at| {
                 event.peer_unreachable
+                    // Older binaries do not persist `peer_unreachable`. Parse
+                    // only the locally-produced outer transport-error shape so
+                    // rolling upgrades retain fast recovery without trusting
+                    // an HTTP error body containing the same words.
+                    || retry_error_indicates_peer_unreachable(&event.last_error)
                     || now.unix_timestamp().saturating_sub(updated_at.unix_timestamp())
                         >= SITE_REPLICATION_RETRY_DRAIN_BASE_BACKOFF_SECS
             })
@@ -1257,17 +1277,21 @@ pub(crate) async fn promote_reachable_deferred_retry_events(
         })
     });
     let mut recovered = Vec::new();
-    for (deployment_id, peer_endpoint, events, reachable) in futures::future::join_all(probes).await {
+    let probe_results = stream::iter(probes)
+        .buffer_unordered(SITE_REPLICATION_RETRY_DRAIN_PEER_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for (deployment_id, peer_endpoint, events, reachable) in probe_results {
         if reachable {
             info!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                result = "retry_backoff_probe_promoted",
                 peer = %peer_endpoint,
                 deployment_id = %deployment_id,
                 promoted = events.len(),
-                result = "retry_backoff_probe_promoted",
-                "peer reachable again; promoting backed-off retry events for the next tick"
+                "peer reachable again; promoting backed-off retry events for replay"
             );
             recovered.extend(events);
         }
@@ -1370,6 +1394,12 @@ async fn drain_site_replication_retry_queue_lightweight_inner() -> S3Result<()> 
         return Ok(());
     };
     log_site_replication_retry_liabilities(&runtime.state);
+    if runtime.state.pending_endpoint_refresh.is_some()
+        || runtime.state.pending_remove.is_some()
+        || runtime.state.pending_rotation.is_some()
+    {
+        return Ok(());
+    }
     let now = OffsetDateTime::now_utc();
     let mut actionable = actionable_site_replication_retry_events(&runtime.state, now);
     let mut deferred = deferred_site_replication_retry_events(&runtime.state, now);
@@ -1385,12 +1415,11 @@ async fn drain_site_replication_retry_queue_lightweight_inner() -> S3Result<()> 
     let Some(store) = current_object_store_handle() else {
         return Ok(());
     };
-    if runtime.state.pending_endpoint_refresh.is_some()
-        || runtime.state.pending_remove.is_some()
-        || runtime.state.pending_rotation.is_some()
-    {
-        return Ok(());
-    }
+
+    // Probes are read-only and can consume the full request timeout. Keep
+    // them outside repair coordination; promotion is fenced by event id and
+    // timestamp, and the locked reload below decides what may actually send.
+    promote_reachable_deferred_retry_events(&runtime, &actionable, deferred).await?;
 
     with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
         let Some(runtime) = runtime_site_replication_targets().await? else {
@@ -1404,26 +1433,13 @@ async fn drain_site_replication_retry_queue_lightweight_inner() -> S3Result<()> 
         }
         let now = OffsetDateTime::now_utc();
         let mut actionable = actionable_site_replication_retry_events(&runtime.state, now);
-        let mut deferred = deferred_site_replication_retry_events(&runtime.state, now);
         actionable.retain(|event| {
             classify_site_replication_retry_event(event).is_some_and(|action| is_lightweight_retry_drain_action(&action))
         });
-        deferred.retain(|event| {
-            classify_site_replication_retry_event(event).is_some_and(|action| is_lightweight_retry_drain_action(&action))
-        });
-
-        let runtime = Arc::new(runtime);
-        match (actionable.is_empty(), deferred.is_empty()) {
-            (true, true) => Ok(()),
-            (true, false) => promote_reachable_deferred_retry_events(&runtime, &actionable, deferred).await,
-            (false, true) => drain_site_replication_retry_queue_lightweight_locked(runtime, actionable).await,
-            (false, false) => {
-                let probe = promote_reachable_deferred_retry_events(&runtime, &actionable, deferred);
-                let replay = drain_site_replication_retry_queue_lightweight_locked(Arc::clone(&runtime), actionable.clone());
-                tokio::try_join!(probe, replay)?;
-                Ok(())
-            }
+        if actionable.is_empty() {
+            return Ok(());
         }
+        drain_site_replication_retry_queue_lightweight_locked(Arc::new(runtime), actionable).await
     })
     .await
     .map_err(ApiError::from)?
@@ -1454,6 +1470,12 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
         // guard) may have started since. Re-check on the fresh state.
         return Ok(());
     }
+
+    // Persist successful recovery probes without monopolizing repair
+    // coordination. The locked reload below observes those promotions and
+    // replays them in this same round.
+    promote_reachable_deferred_retry_events(&runtime, &actionable, deferred).await?;
+
     // Serialize against operator repair execution. Peer membership is
     // re-checked under the bucket-op read lock immediately before each
     // network request, so the caller need not hold the lifecycle guard while
@@ -1461,9 +1483,9 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
     // dry-run -> execute window (dry-run takes no lock): a drain settling a
     // replayable bucket-op entry in that window changes the preflight token
     // and execute fails safe with "preflight is stale" — the operator
-    // re-runs the dry-run. The lock also elects one server to probe
-    // and replay the queue; after acquiring it, reload state so a settled
-    // event or deleted bucket cannot be replayed from this admission snapshot.
+    // re-runs the dry-run. The lock elects one server to replay the queue;
+    // after acquiring it, reload state so a settled event or deleted bucket
+    // cannot be replayed from this admission snapshot.
     with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
         // Runtime and queue snapshots captured before this distributed lock
         // are only admission hints. Another node may have settled the event,
@@ -1479,8 +1501,6 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
         }
         let now = OffsetDateTime::now_utc();
         let actionable = actionable_site_replication_retry_events(&runtime.state, now);
-        let deferred = deferred_site_replication_retry_events(&runtime.state, now);
-        promote_reachable_deferred_retry_events(&runtime, &actionable, deferred).await?;
         if actionable.is_empty() {
             return Ok(());
         }
@@ -1502,53 +1522,60 @@ async fn drain_site_replication_retry_queue_lightweight_locked(
             .push(event);
     }
 
-    let peer_replays = events_by_peer.into_iter().filter_map(|(deployment_id, peer_events)| {
-        let peer = runtime.state.peers.get(&deployment_id)?.clone();
-        if deployment_id == runtime.local_peer.deployment_id
-            || same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
-        {
-            return None;
-        }
-        let runtime = Arc::clone(&runtime);
-        Some(async move {
-            let Some((event, action, bucket)) = peer_events.into_iter().find_map(|event| {
-                let action = classify_site_replication_retry_event(&event)?;
-                let bucket = match &action {
-                    RetryDrainAction::BucketOpReplay { bucket, .. } => bucket.clone(),
-                    _ => return None,
+    let peer_replays = events_by_peer
+        .into_iter()
+        .filter_map(|(deployment_id, peer_events)| {
+            let peer = runtime.state.peers.get(&deployment_id)?.clone();
+            if deployment_id == runtime.local_peer.deployment_id
+                || same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
+            {
+                return None;
+            }
+            let runtime = Arc::clone(&runtime);
+            Some(async move {
+                let Some((event, action, bucket)) = peer_events.into_iter().find_map(|event| {
+                    let action = classify_site_replication_retry_event(&event)?;
+                    let bucket = match &action {
+                        RetryDrainAction::BucketOpReplay { bucket, .. } => bucket.clone(),
+                        _ => return None,
+                    };
+                    Some((event, action, bucket))
+                }) else {
+                    return (0, 0);
                 };
-                Some((event, action, bucket))
-            }) else {
-                return (0, 0);
-            };
-            let plan = match site_replication_bucket_retry_plan(&bucket).await {
-                Ok(plan) => plan,
-                Err(err) => {
-                    enqueue_site_replication_retry_event(&peer, &event.path, &err).await;
-                    return (0, 1);
+                let plan = match site_replication_bucket_retry_plan(&bucket).await {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        enqueue_site_replication_retry_event(&peer, &event.path, &err).await;
+                        return (0, 1);
+                    }
+                };
+                if retry_drain_request_count(&action, Some(&plan)) > SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER {
+                    return (0, 0);
                 }
-            };
-            if retry_drain_request_count(&action, Some(&plan)) > SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER {
-                return (0, 0);
-            }
-            let transport = match PeerTransport::for_runtime_peer(&peer).await {
-                Ok(transport) => transport,
-                Err(err) => {
-                    enqueue_site_replication_retry_event(&peer, &event.path, &err).await;
-                    return (0, 1);
+                let transport = match PeerTransport::for_runtime_peer(&peer).await {
+                    Ok(transport) => transport,
+                    Err(err) => {
+                        enqueue_site_replication_retry_event(&peer, &event.path, &err).await;
+                        return (0, 1);
+                    }
+                };
+                match drain_one_site_replication_retry_event(&runtime, &peer, &transport, &event, action, Some(&plan)).await {
+                    Ok(true) => (1, 0),
+                    Ok(false) => (0, 0),
+                    Err(_) => (0, 1),
                 }
-            };
-            match drain_one_site_replication_retry_event(&runtime, &peer, &transport, &event, action, Some(&plan)).await {
-                Ok(true) => (1, 0),
-                Ok(false) => (0, 0),
-                Err(_) => (0, 1),
-            }
+            })
         })
-    });
+        .take(SITE_REPLICATION_RETRY_DRAIN_PEER_CONCURRENCY);
 
     let mut settled = 0usize;
     let mut failures = 0usize;
-    for (peer_settled, peer_failures) in futures::future::join_all(peer_replays).await {
+    let replay_results = stream::iter(peer_replays)
+        .buffer_unordered(SITE_REPLICATION_RETRY_DRAIN_PEER_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for (peer_settled, peer_failures) in replay_results {
         settled += peer_settled;
         failures += peer_failures;
     }
@@ -1631,7 +1658,11 @@ pub(crate) async fn drain_site_replication_retry_queue_locked(
 
     let mut settled = 0usize;
     let mut failures = 0usize;
-    for (peer_settled, peer_failures) in futures::future::join_all(peer_replays).await {
+    let replay_results = stream::iter(peer_replays)
+        .buffer_unordered(SITE_REPLICATION_RETRY_DRAIN_PEER_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for (peer_settled, peer_failures) in replay_results {
         settled += peer_settled;
         failures += peer_failures;
     }
@@ -1838,9 +1869,10 @@ pub(crate) async fn dequeue_observed_site_replication_retry_event(peer: &PeerInf
         Ok(settled) => settled,
         Err(err) => {
             warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                result = "retry_event_dequeue_failed",
                 peer = %peer.endpoint,
                 deployment_id = %peer.deployment_id,
                 path = %observed.path,

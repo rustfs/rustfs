@@ -455,7 +455,7 @@ pub(crate) async fn broadcast_site_replication_make_bucket(
     broadcast_site_replication_json_using_runtime(runtime, &configure_path, &serde_json::json!({})).await
 }
 
-async fn broadcast_site_replication_destructive_bucket_op(runtime: &SiteReplicationRuntime, path: &str) -> S3Result<()> {
+async fn broadcast_site_replication_delete_bucket(runtime: &SiteReplicationRuntime, path: &str) -> S3Result<()> {
     let sends = runtime.state.peers.values().filter_map(|peer| {
         if peer.deployment_id == runtime.local_peer.deployment_id
             || same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
@@ -463,31 +463,18 @@ async fn broadcast_site_replication_destructive_bucket_op(runtime: &SiteReplicat
             return None;
         }
         Some(async move {
-            let result = async {
-                let transport = PeerTransport::for_runtime_peer(peer).await?;
-                PeerAdminRequest::put(&transport.connection, path, &runtime.state.service_account_access_key)
-                    .with_client(&transport.client)
-                    .send(&runtime.service_account_secret_key, &serde_json::json!({}))
-                    .await
-            }
-            .await;
-            match result {
-                Ok(_) => {
-                    dequeue_site_replication_retry_event(peer, path).await;
-                    None
-                }
-                Err(err) => {
-                    enqueue_site_replication_retry_event(peer, path, &err).await;
-                    Some(err)
-                }
-            }
+            let transport = PeerTransport::for_runtime_peer(peer).await?;
+            PeerAdminRequest::put(&transport.connection, path, &runtime.state.service_account_access_key)
+                .with_client(&transport.client)
+                .send(&runtime.service_account_secret_key, &serde_json::json!({}))
+                .await
+                .map(|_| ())
         })
     });
     futures::future::join_all(sends)
         .await
         .into_iter()
-        .flatten()
-        .next()
+        .find_map(Result::err)
         .map_or(Ok(()), Err)
 }
 
@@ -505,8 +492,9 @@ pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: boo
             .finish()
     );
     let runtime = {
-        // Serialize the peer snapshot with topology commits, then release the
-        // global lock before waiting for repair coordination or peer I/O.
+        // Capture one topology snapshot before waiting for repair
+        // coordination. The per-bucket mutation lock held by the caller keeps
+        // a newer local create from overtaking this delete while it waits.
         let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
         let Some(runtime) = runtime_site_replication_targets().await? else {
             return Ok(());
@@ -515,32 +503,11 @@ pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: boo
     };
     let store =
         current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
-    let retry_peers = runtime
-        .state
-        .peers
-        .values()
-        .filter(|peer| {
-            peer.deployment_id != runtime.local_peer.deployment_id
-                && !same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let retry_path = path.clone();
-    let result =
-        with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
-            broadcast_site_replication_destructive_bucket_op(&runtime, &path).await
-        })
-        .await;
-    match result {
-        Ok(result) => result,
-        Err(err) => {
-            let err: S3Error = ApiError::from(err).into();
-            for peer in &retry_peers {
-                enqueue_site_replication_retry_event(peer, &retry_path, &err).await;
-            }
-            Err(err)
-        }
-    }
+    with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
+        broadcast_site_replication_delete_bucket(&runtime, &path).await
+    })
+    .await
+    .map_err(ApiError::from)?
 }
 
 pub async fn site_replication_bucket_meta_hook(mut item: SRBucketMeta) -> S3Result<()> {
