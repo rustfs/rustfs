@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${1:-}" == "--abba" ]]; then
+  shift
+  SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  exec "$SCRIPT_DIR/python_bin.sh" "$SCRIPT_DIR/scanner_abba.py" "$@"
+fi
+
 ALIAS=""
 ENDPOINT=""
 ACCESS_KEY="${RUSTFS_ACCESS_KEY:-}"
@@ -23,6 +29,7 @@ TELEMETRY_PIDS=()
 usage() {
   cat <<'USAGE'
 Usage:
+  scripts/run_scanner_validation_harness.sh --abba --help
   scripts/run_scanner_validation_harness.sh --alias <admin-alias> \
     --endpoint <url> [options]
 
