@@ -94,13 +94,13 @@ runs:
       shell: bash
       run: ./scripts/check_embedded_secrets.sh
 
+    - name: Run script contract tests
+      shell: bash
+      run: make script-tests
+
     - name: Check test wiring
       shell: bash
-      run: |
-        python3 ./scripts/check_test_wiring.py --self-test
-        python3 ./scripts/check_scheduled_validation_freshness.py --self-test
-        python3 ./scripts/test_security_workflow.py
-        python3 ./scripts/check_test_wiring.py
+      run: python3 ./scripts/check_test_wiring.py
 
     - name: Check no planning docs committed
       shell: bash
