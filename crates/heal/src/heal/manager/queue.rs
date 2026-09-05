@@ -82,6 +82,8 @@ pub(super) enum QueuePushOutcome {
 pub(super) struct CompletedHealStatus {
     pub(super) heal_type: HealType,
     pub(super) status: HealTaskStatus,
+    pub(super) progress: Option<HealProgress>,
+    pub(super) retained_bytes: std::sync::OnceLock<usize>,
     pub(super) result_items_truncated: bool,
     pub(super) completed_at: SystemTime,
     /// Sequence-stamped retained window, archived with the completion so
@@ -90,6 +92,133 @@ pub(super) struct CompletedHealStatus {
     pub(super) seqed_items: Vec<(u64, HealResultItem)>,
     pub(super) next_seq: u64,
     pub(super) min_seq: u64,
+}
+
+impl CompletedHealStatus {
+    // Account for owned capacities, including nested drive arrays. Aliases
+    // conservatively charge the shared allocation again, keeping both token
+    // count and retained payload bounded without a second ownership index.
+    pub(super) fn retained_bytes(&self) -> usize {
+        *self.retained_bytes.get_or_init(|| self.measure_retained_bytes())
+    }
+
+    fn measure_retained_bytes(&self) -> usize {
+        let mut bytes = size_of::<Self>();
+        let mut add = |amount: usize| bytes = bytes.saturating_add(amount);
+        match &self.heal_type {
+            HealType::Cluster => {}
+            HealType::Bucket { bucket } => add(bucket.capacity()),
+            HealType::Object {
+                bucket,
+                object,
+                version_id,
+            }
+            | HealType::ECDecode {
+                bucket,
+                object,
+                version_id,
+            } => {
+                add(bucket.capacity());
+                add(object.capacity());
+                add(version_id.as_ref().map_or(0, String::capacity));
+            }
+            HealType::Prefix { bucket, prefix } => {
+                add(bucket.capacity());
+                add(prefix.capacity());
+            }
+            HealType::Metadata { bucket, object } => {
+                add(bucket.capacity());
+                add(object.capacity());
+            }
+            HealType::ErasureSet { buckets, set_disk_id } => {
+                add(buckets.capacity().saturating_mul(size_of::<String>()));
+                for bucket in buckets {
+                    add(bucket.capacity());
+                }
+                add(set_disk_id.capacity());
+            }
+        }
+        if let HealTaskStatus::Failed { error } | HealTaskStatus::Retrying { error, .. } = &self.status {
+            add(error.capacity());
+        }
+        add(self
+            .progress
+            .as_ref()
+            .and_then(|progress| progress.current_object.as_ref())
+            .map_or(0, String::capacity));
+        add(self.seqed_items.capacity().saturating_mul(size_of::<(u64, HealResultItem)>()));
+        for (_, item) in &self.seqed_items {
+            add(Self::result_item_heap_bytes(item));
+        }
+        bytes
+    }
+
+    fn result_item_heap_bytes(item: &HealResultItem) -> usize {
+        let mut bytes = 0usize;
+        let mut add = |amount: usize| bytes = bytes.saturating_add(amount);
+        for value in [
+            &item.heal_item_type,
+            &item.bucket,
+            &item.object,
+            &item.version_id,
+            &item.detail,
+        ] {
+            add(value.capacity());
+        }
+        for infos in [&item.before, &item.after] {
+            add(infos
+                .drives
+                .capacity()
+                .saturating_mul(size_of::<rustfs_madmin::heal_commands::HealDriveInfo>()));
+            for drive in &infos.drives {
+                add(drive.uuid.capacity());
+                add(drive.endpoint.capacity());
+                add(drive.state.capacity());
+            }
+        }
+        bytes
+    }
+
+    pub(super) fn bound_result_window(&mut self) {
+        let mut bytes = 0usize;
+        let retained = self
+            .seqed_items
+            .iter()
+            .rev()
+            .take_while(|(_, item)| {
+                bytes = bytes
+                    .saturating_add(size_of::<(u64, HealResultItem)>())
+                    .saturating_add(Self::result_item_heap_bytes(item));
+                bytes <= MAX_COMPLETED_HEAL_RESULT_BYTES
+            })
+            .count();
+        let truncated = retained < self.seqed_items.len();
+        if truncated {
+            self.seqed_items.drain(..self.seqed_items.len() - retained);
+            self.seqed_items.shrink_to_fit();
+            self.min_seq = self.seqed_items.first().map_or(self.next_seq, |(seq, _)| *seq);
+            self.result_items_truncated = true;
+            self.retained_bytes.take();
+        }
+    }
+
+    pub(super) async fn snapshot(task: &HealTask, status: HealTaskStatus) -> Self {
+        let seqed_items = task.get_seqed_result_items().await;
+        let (next_seq, min_seq) = task.result_seq_cursors();
+        let mut snapshot = Self {
+            heal_type: task.heal_type.clone(),
+            status,
+            progress: Some(task.get_progress().await),
+            retained_bytes: std::sync::OnceLock::new(),
+            result_items_truncated: task.result_items_truncated(),
+            completed_at: SystemTime::now(),
+            seqed_items,
+            next_seq,
+            min_seq,
+        };
+        snapshot.bound_result_window();
+        snapshot
+    }
 }
 
 #[derive(Debug, Clone)]
