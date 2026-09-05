@@ -1034,7 +1034,7 @@ mod tests {
         assert_eq!(sample().source.effective_region(), "us-west-1");
     }
 
-    const SERVICE_ACCOUNT_JSON: &str = r#"{"type":"service_account","project_id":"p","client_email":"a@b.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n"}"#;
+    const SERVICE_ACCOUNT_JSON: &str = r#"{"type":"service_account","project_id":"p","client_email":"a@b.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"}"#;
 
     fn azure_cfg() -> OnDemandMigrationConfig {
         let mut cfg = sample();
@@ -1214,7 +1214,7 @@ mod tests {
             format!("{gcs:?}"),
             String::from_utf8(gcs.redacted().to_json().expect("json")).expect("utf8"),
         ] {
-            assert!(!rendered.contains("BEGIN PRIVATE KEY"), "{rendered}");
+            assert!(!rendered.contains("PRIVATE KEY-----"), "{rendered}");
             assert!(!rendered.contains("gserviceaccount"), "{rendered}");
         }
     }
