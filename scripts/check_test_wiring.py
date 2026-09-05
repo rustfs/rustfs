@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -481,18 +483,20 @@ def yaml_block(lines: list[str], key: str, indent: int) -> list[str] | None:
     return lines[start:end]
 
 
-def workflow_step_block(job_lines: list[str], action: str) -> tuple[int, list[str]] | None:
+def workflow_step_block(
+    job_lines: list[str], value: str, key: str = "uses", indent: int = 6
+) -> tuple[int, list[str]] | None:
     uses_index = next(
         (
             index
             for index, line in enumerate(job_lines)
             if (
-                line.split("#", 1)[0].strip() == f"- uses: {action}"
-                and len(line) - len(line.lstrip()) == 6
+                line.split("#", 1)[0].strip() == f"- {key}: {value}"
+                and len(line) - len(line.lstrip()) == indent
             )
             or (
-                line.split("#", 1)[0].strip() == f"uses: {action}"
-                and len(line) - len(line.lstrip()) == 8
+                line.split("#", 1)[0].strip() == f"{key}: {value}"
+                and len(line) - len(line.lstrip()) == indent + 2
             )
         ),
         None,
@@ -518,6 +522,67 @@ def workflow_step_block(job_lines: list[str], action: str) -> tuple[int, list[st
         len(job_lines),
     )
     return start, job_lines[start:end]
+
+
+def yaml_scalar_continues(lines: list[str], index: int, indent: int) -> bool:
+    following = next(
+        (line for line in lines[index + 1:] if line.strip() and not line.lstrip().startswith("#")), None
+    )
+    return following is not None and len(following) - len(following.lstrip()) > indent
+
+
+def check_quick_checks(root: Path) -> list[str]:
+    errors: list[str] = []
+    bypass_key = r'''(?:if|continue-on-error|"if"|"continue-on-error"|'if'|'continue-on-error')\s*:'''
+    for name in ("ci.yml", "ci-docs-only.yml"):
+        relative = f".github/workflows/{name}"
+        path = root / relative
+        job = yaml_block(path.read_text().splitlines(), "quick-checks", 2) if path.is_file() else None
+        if job is None:
+            errors.append(f"{relative}: missing Quick Checks job")
+            continue
+        conditions = [index for index, line in enumerate(job) if re.match(rf"^    {bypass_key}", line)]
+        expected = ["if: github.event_name != 'pull_request' || github.event.action != 'closed'"] if name == "ci.yml" else []
+        if [job[index].strip() for index in conditions] != expected or any(
+            yaml_scalar_continues(job, index, 4) for index in conditions
+        ):
+            errors.append(f"{relative}: Quick Checks job must not bypass failures or change its event condition")
+        checkout = workflow_step_block(job, "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0")
+        action = workflow_step_block(job, "./.github/actions/quick-checks")
+        if checkout is None or action is None:
+            errors.append(f"{relative}: Quick Checks requires checkout and the shared quick-checks action")
+            continue
+        if checkout[0] >= action[0]:
+            errors.append(f"{relative}: checkout must run before shared Quick Checks")
+        if "          persist-credentials: false" not in checkout[1]:
+            errors.append(f"{relative}: Quick Checks checkout must disable persisted credentials")
+        for step in (checkout, action):
+            if any(re.match(rf"^\s+(?:- )?{bypass_key}", line) for line in step[1]):
+                errors.append(f"{relative}: Quick Checks checkout and shared action must run without bypasses")
+
+    relative = ".github/actions/quick-checks/action.yml"
+    path = root / relative
+    runs = yaml_block(path.read_text().splitlines(), "runs", 0) if path.is_file() else None
+    if runs is None or "  using: composite" not in runs:
+        errors.append(f"{relative}: missing composite action")
+        return errors
+    steps = yaml_block(runs, "steps", 2) or []
+    for command in ("shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh"):
+        step = workflow_step_block(steps, command, key="run", indent=4)
+        if step is None:
+            errors.append(f"{relative}: missing direct execution of {command}")
+            continue
+        if "      shell: bash" not in step[1] or any(
+            re.match(rf"^\s+(?:- )?{bypass_key}", line) for line in step[1]
+        ):
+            errors.append(f"{relative}: {command} must use bash without a condition or continue-on-error")
+        run_index = next(
+            index for index, line in enumerate(step[1])
+            if line.split("#", 1)[0].rstrip() in (f"      run: {command}", f"    - run: {command}")
+        )
+        if yaml_scalar_continues(step[1], run_index, 6):
+            errors.append(f"{relative}: {command} must remain a single-line run scalar")
+    return errors
 
 
 def alert_step_errors(
@@ -820,10 +885,135 @@ def validate(root: Path) -> list[str]:
     errors.extend(check_workflow_readiness(root))
     errors.extend(check_profile_definitions(root))
     errors.extend(check_scheduled_alerts(root))
+    errors.extend(check_quick_checks(root))
     return errors
 
 
 class SelfTests(unittest.TestCase):
+    def test_quick_checks_rejects_caller_and_execution_bypasses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            caller = (
+                "jobs:\n  quick-checks:\n    steps:\n"
+                "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
+                "        with:\n          persist-credentials: false\n"
+                "      - uses: ./.github/actions/quick-checks\n"
+            )
+            action = (
+                "runs:\n  using: composite\n  steps:\n"
+                "    - uses: taiki-e/install-action@pinned\n"
+                "      with:\n        tool: actionlint@1.7.12\n"
+                "    - name: Lint workflows\n      shell: bash\n      run: shellcheck --version && actionlint\n"
+                "    - name: Error format ratchet\n      shell: bash\n"
+                "      run: ./scripts/check_error_other_format_ratchet.sh\n"
+            )
+            sources = {
+                ".github/workflows/ci.yml": caller.replace(
+                    "    steps:", "    if: github.event_name != 'pull_request' || github.event.action != 'closed'\n    steps:"
+                ),
+                ".github/workflows/ci-docs-only.yml": caller,
+                ".github/actions/quick-checks/action.yml": action,
+            }
+            for relative, source in sources.items():
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source)
+            self.assertEqual(check_quick_checks(root), [])
+            for relative in (".github/workflows/ci.yml", ".github/workflows/ci-docs-only.yml"):
+                source = sources[relative]
+                mutations = {
+                    "different action": source.replace("./.github/actions/quick-checks", "./.github/actions/other"),
+                    "conditional call": source + "        if: false\n",
+                    "ignored call failure": source + "        continue-on-error: true\n",
+                    "conditional checkout": source.replace("        with:", "        if: false\n        with:"),
+                    "ignored job failure": source.replace("    steps:", "    continue-on-error: true\n    steps:"),
+                    "changed job condition": (
+                        source.replace("github.event_name != 'pull_request' || github.event.action != 'closed'", "false")
+                        if relative.endswith("/ci.yml") else source.replace("    steps:", "    if: false\n    steps:")
+                    ),
+                    "persisted credentials": source.replace("persist-credentials: false", "persist-credentials: true"),
+                    "late checkout": source.replace("      - uses: ./.github/actions/quick-checks\n", "").replace(
+                        "    steps:\n", "    steps:\n      - uses: ./.github/actions/quick-checks\n"
+                    ),
+                    "missing job": source.replace("  quick-checks:", "  other-checks:"),
+                }
+                for key in ("'if' : false", '"if": false', "'continue-on-error': true", '"continue-on-error" : true'):
+                    mutations[f"quoted call {key}"] = source + f"        {key}\n"
+                    mutations[f"quoted checkout {key}"] = source.replace("        with:", f"        {key}\n        with:")
+                    job_source = source.replace(
+                        "    if: github.event_name != 'pull_request' || github.event.action != 'closed'\n", ""
+                    ) if "if" in key else source
+                    mutations[f"quoted job {key}"] = job_source.replace("    steps:", f"    {key}\n    steps:")
+                if relative.endswith("/ci.yml"):
+                    for separator in ("", "\n", "      # continued condition\n"):
+                        mutations[f"continued job condition {separator!r}"] = source.replace(
+                            "    steps:", f"{separator}      && false\n    steps:"
+                        )
+                for case, mutated in mutations.items():
+                    with self.subTest(path=relative, case=case):
+                        (root / relative).write_text(mutated)
+                        self.assertTrue(check_quick_checks(root))
+                (root / relative).write_text(source)
+            relative = ".github/actions/quick-checks/action.yml"
+            mutations = {
+                "not composite": action.replace("using: composite", "using: node24"),
+                "only installed actionlint": action.replace("run: shellcheck --version && actionlint", "run: echo actionlint"),
+                "missing shellcheck preflight": action.replace("shellcheck --version && ", ""),
+                "missing ratchet": action.replace("run: ./scripts/check_error_other_format_ratchet.sh", "run: echo skipped"),
+                "swallowed lint failure": action.replace("&& actionlint", "&& actionlint || true"),
+                "swallowed ratchet failure": action.replace("ratchet.sh", "ratchet.sh || true"),
+                "conditional lint": action.replace("run: shellcheck", "if: false\n      run: shellcheck"),
+                "ignored ratchet failure": action.replace("run: ./scripts/", "continue-on-error: true\n      run: ./scripts/"),
+                "non-failing shell": action.replace("shell: bash", "shell: bash {0}"),
+                "run text in step name": action.replace(
+                    "name: Lint workflows", "name: |\n        run: shellcheck --version && actionlint"
+                ).replace("\n      run: shellcheck --version && actionlint\n", "\n      run: shellcheck --version && actionlint\n        || true\n"),
+            }
+            for command in ("shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh"):
+                for key in ("'if' : false", '"if": false', "'continue-on-error': true", '"continue-on-error" : true'):
+                    mutations[f"quoted {command} {key}"] = action.replace(f"run: {command}", f"{key}\n      run: {command}")
+                for separator in ("", "\n", "        # continued command\n"):
+                    mutations[f"continued {command} {separator!r}"] = action.replace(
+                        f"run: {command}\n", f"run: {command}\n{separator}        || true\n"
+                    )
+            for case, mutated in mutations.items():
+                with self.subTest(case=case):
+                    (root / relative).write_text(mutated)
+                    self.assertTrue(check_quick_checks(root))
+            (root / relative).unlink()
+            self.assertTrue(check_quick_checks(root))
+
+    def test_quick_checks_commands_propagate_failure(self) -> None:
+        runs = yaml_block((ROOT / ".github/actions/quick-checks/action.yml").read_text().splitlines(), "runs", 0)
+        steps = yaml_block(runs or [], "steps", 2) or []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            commands = ("shellcheck", "actionlint", "./scripts/check_error_other_format_ratchet.sh")
+            for failing in commands:
+                with self.subTest(command=failing):
+                    run = "shellcheck --version && actionlint" if failing != commands[-1] else failing
+                    step = workflow_step_block(steps, run, key="run", indent=4)
+                    self.assertIsNotNone(step)
+                    run_index = next(index for index, line in enumerate(step[1]) if line.startswith("      run:"))
+                    self.assertFalse(yaml_scalar_continues(step[1], run_index, 6))
+                    body = step[1][run_index].removeprefix("      run: ")
+                    for command in commands:
+                        shim = root / command
+                        shim.write_text(f"#!/bin/sh\nexit {17 if command == failing else 0}\n")
+                        shim.chmod(0o755)
+                    result = subprocess.run(
+                        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", body],
+                        cwd=root, env=dict(os.environ, PATH=f"{root}{os.pathsep}{os.environ['PATH']}"),
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 17, result.stderr)
+
+    def test_validate_includes_quick_checks(self) -> None:
+        error = "Quick Checks wiring regression"
+        with mock.patch(__name__ + ".check_quick_checks", return_value=[error]):
+            self.assertIn(error, validate(ROOT))
+
     def test_core_gate_rejects_missing_ignored_filtered_and_corrupt_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1058,6 +1248,7 @@ class SelfTests(unittest.TestCase):
                 mock.patch(__name__ + ".check_profile_definitions", return_value=[]),
                 mock.patch(__name__ + ".check_ilm_build_budget", return_value=[]),
                 mock.patch(__name__ + ".check_scheduled_alerts", return_value=[]),
+                mock.patch(__name__ + ".check_quick_checks", return_value=[]),
             ):
                 self.assertEqual(len(validate(root)), 1)
 
@@ -1498,7 +1689,7 @@ def main() -> int:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    print("OK: e2e modules, runner selection, fuzz matrices, profiles, and scheduled alerts are wired")
+    print("OK: e2e modules, runner selection, fuzz matrices, profiles, scheduled alerts, and Quick Checks are wired")
     return 0
 
 
