@@ -46,10 +46,10 @@ use super::stats::{PullFailureReason, PullPath};
 use super::sys::{BucketOdmState, OnDemandMigrationSys, PullError, PullOutcome, PullSlot};
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt, future::Shared};
 use parking_lot::Mutex;
 use rand::RngExt;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::pin::Pin;
@@ -132,6 +132,8 @@ pub enum QueuedPullOutcome {
     AlreadyPresent,
     Failed(PullError),
 }
+
+pub type QueuedPullReport = Shared<oneshot::Receiver<QueuedPullOutcome>>;
 
 /// Result of [`PullQueue::enqueue`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -251,6 +253,7 @@ pub struct WriteBackRequest {
     pub preserve_etag: bool,
     /// `policy.emit_events`.
     pub emit_events: bool,
+    pub respect_delete_marker: bool,
     /// Source tags to copy (`policy.copy_tags`), `None` to skip.
     pub tags: Option<HashMap<String, String>>,
 }
@@ -266,6 +269,7 @@ impl WriteBackRequest {
             pulled_at: OffsetDateTime::now_utc(),
             preserve_etag: config.policy.preserve_etag,
             emit_events: config.policy.emit_events,
+            respect_delete_marker: config.policy.respect_local_delete_marker,
             tags,
         }
     }
@@ -830,7 +834,7 @@ pub struct PullQueue {
     bucket: String,
     tx: mpsc::Sender<PullJob>,
     /// Keys queued or running; the job removes its key when it ends.
-    pending: Mutex<HashSet<String>>,
+    pending: Mutex<HashMap<String, QueuedPullReport>>,
     capacity: usize,
     cancel: CancellationToken,
     stats: Arc<super::stats::OdmStats>,
@@ -869,7 +873,7 @@ impl PullQueue {
         let queue = Arc::new(Self {
             bucket: state.bucket().to_string(),
             tx,
-            pending: Mutex::new(HashSet::new()),
+            pending: Mutex::new(HashMap::new()),
             capacity,
             cancel: state.cancel_token(),
             stats: Arc::clone(state.stats()),
@@ -903,29 +907,24 @@ impl PullQueue {
         self.enqueue_with_report(key, reason).0
     }
 
-    /// [`Self::enqueue`] that also hands back the job's report channel when
-    /// a new job was queued (`Coalesced` pulls report to their first
-    /// requester only).
-    pub fn enqueue_with_report(
-        &self,
-        key: &str,
-        reason: PullReason,
-    ) -> (EnqueueOutcome, Option<oneshot::Receiver<QueuedPullOutcome>>) {
+    /// [`Self::enqueue`] with a shared report, including for coalesced pulls.
+    pub fn enqueue_with_report(&self, key: &str, reason: PullReason) -> (EnqueueOutcome, Option<QueuedPullReport>) {
         if self.cancel.is_cancelled() {
             return (EnqueueOutcome::Unavailable, None);
         }
         let mut pending = self.pending.lock();
-        if pending.contains(key) {
-            return (EnqueueOutcome::Coalesced, None);
+        if let Some(report) = pending.get(key) {
+            return (EnqueueOutcome::Coalesced, Some(report.clone()));
         }
         let (report_tx, report_rx) = oneshot::channel();
+        let report_rx = report_rx.shared();
         match self.tx.try_send(PullJob {
             key: key.to_string(),
             reason,
             report: Some(report_tx),
         }) {
             Ok(()) => {
-                pending.insert(key.to_string());
+                pending.insert(key.to_string(), report_rx.clone());
                 (EnqueueOutcome::Enqueued, Some(report_rx))
             }
             Err(TrySendError::Full(_)) => {
@@ -1072,7 +1071,7 @@ impl BucketOdmState {
         self: &Arc<Self>,
         key: &str,
         reason: PullReason,
-    ) -> (EnqueueOutcome, Option<oneshot::Receiver<QueuedPullOutcome>>) {
+    ) -> (EnqueueOutcome, Option<QueuedPullReport>) {
         match self.pull_queue() {
             Some(queue) => queue.enqueue_with_report(key, reason),
             None => (EnqueueOutcome::Unavailable, None),
@@ -1119,6 +1118,8 @@ mod tests {
                     session_token: None,
                 }),
                 tls: TlsConfig::default(),
+                azure: None,
+                gcs: None,
             },
             filter: FilterConfig::default(),
             policy: PolicyConfig::default(),
@@ -1399,12 +1400,20 @@ mod tests {
         assert_eq!(queue.capacity(), 1024);
 
         let mut outcomes = HashMap::new();
+        let mut shared_report = None;
         for _ in 0..100 {
-            *outcomes.entry(queue.enqueue("a", PullReason::RangeGet)).or_insert(0) += 1;
+            let (outcome, report) = queue.enqueue_with_report("a", PullReason::RangeGet);
+            *outcomes.entry(outcome).or_insert(0) += 1;
+            shared_report = report;
         }
         assert_eq!(outcomes.get(&EnqueueOutcome::Enqueued), Some(&1));
         assert_eq!(outcomes.get(&EnqueueOutcome::Coalesced), Some(&99));
         assert_eq!(queue.pending_keys(), 1);
+
+        assert_eq!(
+            shared_report.expect("coalesced report").await,
+            Ok(QueuedPullOutcome::Stored { size: 1000 })
+        );
 
         wait_until("first pull to finish", || queue.pending_keys() == 0).await;
         assert_eq!(source.head_calls.load(Ordering::SeqCst), 1);
@@ -1439,6 +1448,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coalesced_enqueues_share_failure_reports() {
+        let sys = OnDemandMigrationSys::new();
+        let state = enabled_state(&sys, &config()).await;
+        let source = MockSource::with_object("missing", 1000, BodyKind::Bytes(body_bytes(1000)));
+        let queue = PullQueue::start(Arc::clone(&state), source, Arc::new(MockWriteBack::default()));
+        let (first, first_report) = queue.enqueue_with_report("absent", PullReason::RangeGet);
+        let (second, second_report) = queue.enqueue_with_report("absent", PullReason::Backfill);
+        assert_eq!(first, EnqueueOutcome::Enqueued);
+        assert_eq!(second, EnqueueOutcome::Coalesced);
+        let (first, second) = tokio::join!(first_report.expect("leader report"), second_report.expect("coalesced report"));
+        assert_eq!(first, second);
+        assert!(matches!(first, Ok(QueuedPullOutcome::Failed(_))));
+        sys.remove(BUCKET);
+        queue.wait_until_stopped().await;
+    }
+
+    #[tokio::test]
     async fn queue_full_is_reported_and_cancel_drains_without_leaking_tasks() {
         let sys = OnDemandMigrationSys::new();
         let mut cfg = config();
@@ -1467,7 +1493,8 @@ mod tests {
         wait_until("dispatcher to wait for a slot", || state.stats().queue_depth() == 1).await;
         assert_eq!(queue.enqueue("c", PullReason::LargeObject), EnqueueOutcome::Enqueued);
         assert_eq!(queue.enqueue("d", PullReason::LargeObject), EnqueueOutcome::QueueFull);
-        assert_eq!(queue.enqueue("c", PullReason::LargeObject), EnqueueOutcome::Coalesced);
+        let (coalesced, canceled_report) = queue.enqueue_with_report("c", PullReason::LargeObject);
+        assert_eq!(coalesced, EnqueueOutcome::Coalesced);
         assert_eq!(queue.pending_keys(), 3);
         assert_eq!(failures(&state).get("queue_full"), Some(&1));
         assert!(!queue.is_stopped());
@@ -1477,6 +1504,12 @@ mod tests {
             .await
             .expect("dispatcher and in-flight job must exit after cancel");
         assert!(queue.is_stopped());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), canceled_report.expect("coalesced cancellation report"))
+                .await
+                .expect("cancellation closes the report")
+                .is_err()
+        );
         assert_eq!(queue.pending_keys(), 0);
         assert_eq!(state.inflight_keys(), 0);
         assert_eq!(state.stats().inflight_pulls(), 0);
