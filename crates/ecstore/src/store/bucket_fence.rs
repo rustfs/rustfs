@@ -150,7 +150,7 @@ impl BucketFenceRegistry {
 /// A held bucket lifecycle read lock plus its registration in the fence
 /// registry. Dropping the guard deregisters it; the memo is cleared when the
 /// last guard for the bucket drops (or a lost lock is observed).
-pub(crate) struct BucketIncarnationFenceGuard {
+pub struct BucketIncarnationFenceGuard {
     inner: Option<NamespaceLockGuard>,
     registry: Arc<BucketFenceRegistry>,
     bucket: String,
@@ -158,6 +158,14 @@ pub(crate) struct BucketIncarnationFenceGuard {
 }
 
 impl BucketIncarnationFenceGuard {
+    /// Propagate lifecycle lock loss into the storage commit checks.
+    /// The caller still owns this guard until the complete write tail drains.
+    pub fn attach_to_object_options(&self, opts: &mut crate::object_api::ObjectOptions) {
+        if let Some(guard) = self.namespace_lock_guard() {
+            opts.add_bucket_lifecycle_lock_guard(guard);
+        }
+    }
+
     pub(crate) fn is_lock_lost(&self) -> bool {
         self.inner.as_ref().is_some_and(NamespaceLockGuard::is_lock_lost)
     }
@@ -344,6 +352,36 @@ mod tests {
 
         second_pieces.abandon("b", second.token);
         first_pieces.abandon("b", first.token);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_options_inherit_bucket_fence_lock_loss() {
+        let lock = NamespaceLock::new("bucket-fence-options".to_string(), Arc::new(LocalClient::new()));
+        let inner = lock
+            .acquire_guard(&lock_request("options"))
+            .await
+            .expect("acquire")
+            .expect("quorum");
+        let pieces = FencePieces {
+            registry: Arc::default(),
+            inner,
+        };
+        let registration = pieces.enter("b");
+        let fence = pieces.into_guard("b", registration.token);
+        let mut opts = crate::object_api::ObjectOptions::default();
+        fence.attach_to_object_options(&mut opts);
+        let inherited = opts
+            .bucket_lifecycle_lock_fence
+            .as_ref()
+            .expect("checkpoint inherits lifecycle guard");
+        assert!(!inherited.is_lock_lost());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fence.namespace_lock_guard().expect("held guard").lock_lost_notified(),
+        )
+        .await
+        .expect("distributed guard expires");
+        assert!(inherited.is_lock_lost(), "the actual pre-rename options must observe lifecycle lock loss");
     }
 
     #[test]

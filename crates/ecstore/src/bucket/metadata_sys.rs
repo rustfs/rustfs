@@ -19,7 +19,6 @@ use super::quota::BucketQuota;
 use super::target::BucketTargets;
 use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata::{load_bucket_metadata_parse, load_bucket_metadata_parse_with_presence};
-use crate::bucket::on_demand_migration::{ON_DEMAND_MIGRATION_CONFIG_HOOK, OnDemandMigrationConfig};
 use crate::bucket::utils::is_meta_bucketname;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result, is_err_bucket_not_found, is_err_strict_volume_not_found};
@@ -48,6 +47,11 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 use uuid::Uuid;
+
+/// Opaque bucket configuration notifications for application-owned services.
+/// `None` withdraws a configuration; consumers validate nonempty bytes.
+pub type BucketConfigPublishHook = Box<dyn Fn(&str, &str, Option<(&[u8], OffsetDateTime, Uuid)>) + Send + Sync>;
+pub static BUCKET_CONFIG_PUBLISH_HOOK: std::sync::OnceLock<BucketConfigPublishHook> = std::sync::OnceLock::new();
 
 const BUCKET_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
@@ -395,39 +399,21 @@ fn clear_bucket_durability(bucket: &str) {
     crate::disk::local::bucket_durability::set(bucket, None);
 }
 
-/// Publish the bucket's on-demand migration config (or its absence) to the
-/// runtime registered in `ON_DEMAND_MIGRATION_CONFIG_HOOK`.
-///
-/// Called from the same five cache-install paths as
-/// [`sync_bucket_durability`]. A stored payload this build cannot parse is
-/// published as `None`: the runtime must stop pulling for that bucket rather
-/// than keep an older config or guess.
+/// Publish application-owned bytes on every cache install path.
 fn sync_on_demand_migration(bucket: &str, bm: &BucketMetadata) {
-    let Some(hook) = ON_DEMAND_MIGRATION_CONFIG_HOOK.get() else {
-        return;
-    };
-    match bm.on_demand_migration_config() {
-        Ok(config) => hook(bucket, config.as_ref()),
-        Err(err) => {
-            warn!(
-                event = "bucket_metadata_parse_failed",
-                component = "ecstore",
-                subsystem = "bucket_metadata",
-                bucket = %bucket,
-                config = "on_demand_migration",
-                error = %err,
-                "Failed to parse bucket metadata config"
-            );
-            hook(bucket, None);
-        }
+    if let Some(hook) = BUCKET_CONFIG_PUBLISH_HOOK.get() {
+        hook(
+            bucket,
+            super::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG,
+            bm.on_demand_migration_config()
+                .map(|(bytes, stamp)| (bytes, stamp, bm.bucket_incarnation_id)),
+        );
     }
 }
 
-/// Withdraw a bucket's on-demand migration config when its metadata leaves
-/// the cache.
 fn clear_on_demand_migration(bucket: &str) {
-    if let Some(hook) = ON_DEMAND_MIGRATION_CONFIG_HOOK.get() {
-        hook(bucket, None);
+    if let Some(hook) = BUCKET_CONFIG_PUBLISH_HOOK.get() {
+        hook(bucket, super::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG, None);
     }
 }
 
@@ -1145,13 +1131,19 @@ pub async fn get_durability_config(
 }
 
 /// The bucket's on-demand migration config with its update time, or
-/// `Ok(None)` when the bucket has none. A stored payload that does not parse
-/// is a typed error (`OnDemandMigrationConfigError` inside `Error::Io`).
-pub async fn get_on_demand_migration_config(bucket: &str) -> Result<Option<(OnDemandMigrationConfig, OffsetDateTime)>> {
+/// `Ok(None)` when the bucket has none. Bytes are opaque to the metadata owner.
+pub async fn get_on_demand_migration_config(bucket: &str) -> Result<Option<(Vec<u8>, OffsetDateTime)>> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_on_demand_migration_config(bucket).await
+}
+
+/// Resolve opaque configuration from the store's own metadata system.
+pub async fn get_on_demand_migration_config_in(api: &ECStore, bucket: &str) -> Result<Option<(Vec<u8>, OffsetDateTime)>> {
+    let sys = bucket_metadata_sys_of(&api.ctx)?;
+    let lock = sys.read().await;
+    lock.get_on_demand_migration_config(bucket).await
 }
 
 pub async fn get_quota_config(bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
@@ -2681,29 +2673,27 @@ impl BucketMetadataSys {
     }
 
     /// See [`get_on_demand_migration_config`].
-    pub async fn get_on_demand_migration_config(
-        &self,
-        bucket: &str,
-    ) -> Result<Option<(OnDemandMigrationConfig, OffsetDateTime)>> {
+    pub async fn get_on_demand_migration_config(&self, bucket: &str) -> Result<Option<(Vec<u8>, OffsetDateTime)>> {
         let (bm, _) = self.get_config(bucket).await?;
 
-        let config = bm.on_demand_migration_config().map_err(Error::other)?;
-        Ok(config.map(|config| (config, bm.on_demand_migration_config_updated_at)))
+        Ok(bm
+            .on_demand_migration_config()
+            .map(|(bytes, updated_at)| (bytes.to_vec(), updated_at)))
     }
 }
 
 /// Test-only fixture shared with sibling modules (e.g. the quota checker
 /// tests): a 4-disk `ECStore` on an isolated instance context, so tests
 /// exercising the metadata system never touch ambient process state.
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_support {
     use super::*;
     use crate::disk::endpoint::Endpoint;
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::runtime::instance::InstanceContext;
     use crate::store::init_local_disks_with_instance_ctx;
 
-    pub(crate) async fn isolated_store_over_temp_disks() -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
+    pub async fn isolated_store_over_temp_disks() -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
         let mut dirs = Vec::with_capacity(4);
         let mut endpoints = Vec::with_capacity(4);
         for disk_idx in 0..4 {
@@ -4593,19 +4583,26 @@ mod tests {
 
     const ODM_JSON: &[u8] = br#"{"source":{"provider":"minio","endpoint":"https://legacy.example.com:9000","region":"auto","bucket":"legacy-bucket","credentials":{"access_key":"AK","secret_key":"SK"}}}"#;
 
+    type RecordedOdmConfig = Option<(Vec<u8>, OffsetDateTime, Uuid)>;
+    type RecordedOdmHookCall = (String, RecordedOdmConfig);
+
     /// Every `(bucket, config)` the recording hook has seen. Tests filter by
     /// their own bucket name; the hook is process-wide and set once.
-    static ODM_HOOK_CALLS: std::sync::Mutex<Vec<(String, Option<OnDemandMigrationConfig>)>> = std::sync::Mutex::new(Vec::new());
+    static ODM_HOOK_CALLS: std::sync::Mutex<Vec<RecordedOdmHookCall>> = std::sync::Mutex::new(Vec::new());
 
     fn install_recording_odm_hook() {
-        ON_DEMAND_MIGRATION_CONFIG_HOOK.get_or_init(|| {
-            Box::new(|bucket, config| {
-                ODM_HOOK_CALLS.lock().unwrap().push((bucket.to_string(), config.cloned()));
+        BUCKET_CONFIG_PUBLISH_HOOK.get_or_init(|| {
+            Box::new(|bucket, config_file, config| {
+                assert_eq!(config_file, super::super::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG);
+                ODM_HOOK_CALLS.lock().unwrap().push((
+                    bucket.to_string(),
+                    config.map(|(bytes, stamp, incarnation)| (bytes.to_vec(), stamp, incarnation)),
+                ));
             })
         });
     }
 
-    fn odm_hook_calls(bucket: &str) -> Vec<Option<OnDemandMigrationConfig>> {
+    fn odm_hook_calls(bucket: &str) -> Vec<RecordedOdmConfig> {
         ODM_HOOK_CALLS
             .lock()
             .unwrap()
@@ -4613,54 +4610,6 @@ mod tests {
             .filter(|(name, _)| name == bucket)
             .map(|(_, config)| config.clone())
             .collect()
-    }
-
-    /// rustfs/backlog#2148: the accessor reports absence as `Ok(None)` and a
-    /// stored payload it cannot parse as a typed error, never as a default
-    /// and never as `ConfigNotFound`.
-    #[tokio::test]
-    async fn get_on_demand_migration_config_distinguishes_absent_from_corrupt() {
-        use crate::bucket::on_demand_migration::OnDemandMigrationConfigError;
-
-        let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
-        let sys = BucketMetadataSys::new(ecstore);
-        let bucket = "odm-accessor";
-
-        sys.set(bucket.to_string(), Arc::new(BucketMetadata::new(bucket))).await;
-        assert_eq!(sys.get_on_demand_migration_config(bucket).await.unwrap(), None);
-
-        let mut corrupt = BucketMetadata::new(bucket);
-        corrupt.on_demand_migration_config_json = br#"{"source":{"provider":"s3"},"bogus":1}"#.to_vec();
-        sys.set(bucket.to_string(), Arc::new(corrupt)).await;
-        let err = sys
-            .get_on_demand_migration_config(bucket)
-            .await
-            .expect_err("corrupt config must not read as a default");
-        assert_ne!(err, Error::ConfigNotFound, "corruption must not be reported as absence");
-        let typed = match &err {
-            Error::Io(io) => io
-                .get_ref()
-                .and_then(|source| source.downcast_ref::<OnDemandMigrationConfigError>()),
-            _ => None,
-        };
-        assert!(
-            matches!(typed, Some(OnDemandMigrationConfigError::Malformed(_))),
-            "typed parse error must survive the Result boundary, got: {err:?}"
-        );
-
-        let mut valid = BucketMetadata::new(bucket);
-        valid
-            .update_config(crate::bucket::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG, ODM_JSON.to_vec())
-            .unwrap();
-        let stamped = valid.on_demand_migration_config_updated_at;
-        sys.set(bucket.to_string(), Arc::new(valid)).await;
-        let (config, updated_at) = sys
-            .get_on_demand_migration_config(bucket)
-            .await
-            .unwrap()
-            .expect("stored config is returned");
-        assert_eq!(config, OnDemandMigrationConfig::from_json(ODM_JSON).unwrap());
-        assert_eq!(updated_at, stamped);
     }
 
     /// rustfs/backlog#2148: the publish hook fires on every path that
@@ -4676,15 +4625,22 @@ mod tests {
         for dir in &dirs {
             std::fs::create_dir_all(dir.path().join(bucket)).expect("physical bucket should exist");
         }
-        let expected = OnDemandMigrationConfig::from_json(ODM_JSON).unwrap();
+
+        let incarnation = Uuid::new_v4();
         let expect_publish = |before: usize, label: &str| {
             let calls = odm_hook_calls(bucket);
             assert_eq!(calls.len(), before + 1, "{label} must publish exactly once");
-            assert_eq!(calls.last().unwrap().as_ref(), Some(&expected), "{label} must publish the stored config");
+            assert_eq!(
+                calls.last().unwrap().as_ref().map(|(bytes, _, _)| bytes.as_slice()),
+                Some(ODM_JSON),
+                "{label} must publish the stored bytes"
+            );
+            assert_eq!(calls.last().unwrap().as_ref().map(|(_, _, id)| *id), Some(incarnation));
         };
 
         // set (via persist_new_and_set, which installs through `set`).
         let mut bm = BucketMetadata::new(bucket);
+        bm.bucket_incarnation_id = incarnation;
         bm.update_config(crate::bucket::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG, ODM_JSON.to_vec())
             .unwrap();
         let writer = BucketMetadataSys::new(ecstore.clone());
@@ -4726,14 +4682,18 @@ mod tests {
         assert_eq!(calls.len(), before + 1, "remove must withdraw exactly once");
         assert_eq!(calls.last().unwrap(), &None);
 
-        // A corrupt payload is withdrawn, never published as a config.
+        // Opaque bytes reach the application even if they are not valid JSON.
         let mut corrupt = BucketMetadata::new(bucket);
         corrupt.on_demand_migration_config_json = b"not-json".to_vec();
         let before = odm_hook_calls(bucket).len();
         lazy.set(bucket.to_string(), Arc::new(corrupt)).await;
         let calls = odm_hook_calls(bucket);
         assert_eq!(calls.len(), before + 1);
-        assert_eq!(calls.last().unwrap(), &None, "unreadable config must publish absence");
+        assert_eq!(
+            calls.last().unwrap().as_ref().map(|(bytes, _, _)| bytes.as_slice()),
+            Some(b"not-json".as_slice()),
+            "the application validates opaque config bytes"
+        );
     }
 
     #[tokio::test]

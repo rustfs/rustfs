@@ -146,70 +146,25 @@ pub mod bucket {
         };
     }
 
-    pub mod on_demand_migration {
-        pub use crate::bucket::on_demand_migration::{
-            ApplyOutcome, BREAKER_FAILURE_THRESHOLD, BREAKER_FAILURE_WINDOW, BREAKER_HALF_OPEN_MAX_PROBES, BREAKER_OPEN_DURATION,
-            Breaker, BreakerState, BreakerTransition, BreakerVerdict, BucketOdmState, GLOBAL_ON_DEMAND_MIGRATION_SYS, GaugeGuard,
-            LastSourceError, LatencyBucketSnapshot, NEGATIVE_CACHE_MAX_ENTRIES, NegativeCache, OdmBucketSnapshot, OdmLookup,
-            OdmOp, OdmOutcome, OdmStateError, OdmStats, OdmStatsSnapshot, OnDemandMigrationSys, PullError, PullFailureReason,
-            PullFollower, PullLeader, PullOutcome, PullPath, PullResult, PullSlot, SOURCE_LATENCY_BUCKET_BOUNDS_MS,
-            SourceLatencySnapshot, source_backend_spec, source_client_spec,
-        };
-        pub use crate::bucket::on_demand_migration::{
-            AzureSourceConfig, ConfigPublishHook, FilterConfig, GcsSourceConfig, HeadPolicy, ON_DEMAND_MIGRATION_CONFIG_HOOK,
-            ON_DEMAND_MIGRATION_CONFIG_VERSION, OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig,
-            Provider, RangeGetPolicy, SourceConfig, SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig,
-            ValidationContext,
-        };
-        pub use crate::bucket::on_demand_migration::{
-            EnqueueOutcome, LocalObject, MAX_MULTIPART_PARTS, OdmWriteBack, PULL_MAX_RETRIES, PULL_RETRY_BASE_DELAYS,
-            PullCompletion, PullQueue, PullReason, PullSource, QueuedPullOutcome, SourceBody, SourceIdleGuard, WriteBackBody,
-            WriteBackError, WriteBackOutcome, WriteBackPart, WriteBackRequest, commit_inline, commit_inline_with,
-            idle_guarded_body,
-        };
-        pub use crate::bucket::on_demand_migration::{
-            FetchRequest, LIST_THROUGH_TOKEN_VERSION, ListEntryKey, ListPageError, ListThroughCursor, ListThroughMerger,
-            ListThroughToken, ListThroughTokenError, MAX_LIST_FETCHES_PER_SIDE, MAX_LIST_NO_PROGRESS_PAGES, MergeOutcome,
-            MergePick, MergeSide, SOURCE_LIST_MAX_RATE_WAIT, SOURCE_LIST_RATE_PER_SEC, SourceListPlan, SourceListRateLimiter,
-            decode_continuation_token, source_list_plan,
-        };
-        pub mod backfill {
-            pub use crate::bucket::on_demand_migration::backfill::{
-                BACKFILL_CHECKPOINT_FILE, BACKFILL_CHECKPOINT_FORMAT_VERSION, BACKFILL_FAILED_KEYS_CAPACITY, BACKFILL_LEASE,
-                BACKFILL_LEASE_LOCK_PREFIX, BACKFILL_LIST_PAGE_SIZE, BACKFILL_RECOVERY_INTERVAL, BACKFILL_SAVE_EVERY_KEYS,
-                BACKFILL_SAVE_INTERVAL, BackfillCheckpoint, BackfillContext, BackfillContextFactory, BackfillError,
-                BackfillLastError, BackfillOwner, BackfillRecoveryStats, BackfillRequest, BackfillRunner, BackfillState,
-                BucketBackfillContext, LocalBackfillObject, PriorityPullPermits, PullPermit, PullPriority, SkipExisting,
-                StoredCheckpoint, SysBackfillContexts, global_backfill_runner, install_global_backfill_runner, key_hash,
-                read_checkpoint, run_backfill_recovery_loop, spawn_backfill_recovery_loop,
-            };
-        }
-        pub mod source_client {
-            pub use crate::bucket::on_demand_migration::source_client::{
-                AzureAuth, AzureSourceSpec, GcsSourceSpec, SourceBackendSpec, SourceClient, SourceClientSpec, SourceError,
-                SourceGet, SourceHead, SourceListRequest, SourceObject, SourcePage, SourceProbe, SourceProvider, SourceSse,
-                SourceTimeouts, USER_AGENT_SUFFIX, is_multipart_etag, range_header_value, resolve_path_style,
-            };
-        }
-    }
-
     pub mod metadata_sys {
-        #[cfg(feature = "test-util")]
-        pub use crate::bucket::metadata_sys::ConfigWriteLockProbe;
         pub use crate::bucket::metadata_sys::{
-            BucketMetadataMutationGuard, BucketMetadataSys, ObjectLockConfigState, acquire_bucket_metadata_transaction_lock,
+            BUCKET_CONFIG_PUBLISH_HOOK, BucketConfigPublishHook, BucketMetadataMutationGuard, BucketMetadataSys,
+            ObjectLockConfigState, acquire_bucket_metadata_transaction_lock,
             acquire_bucket_metadata_transaction_lock_for_incarnation, acquire_scanner_bucket_incarnation_fence,
             capture_bucket_metadata_incarnation, delete, delete_if_incarnation, delete_if_incarnation_at,
             delete_under_transaction_lock, get, get_accelerate_config, get_bucket_policy, get_bucket_policy_raw,
             get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
             get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
-            get_object_lock_config, get_object_lock_config_state, get_on_demand_migration_config, get_public_access_block_config,
-            get_quota_config, get_replication_config, get_request_payment_config, get_sse_config, get_tagging_config,
-            get_versioning_config, get_website_config, init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata,
-            remove_bucket_metadata, set_bucket_metadata, update, update_bucket_targets_under_transaction_lock,
-            update_config_with, update_if_incarnation, update_if_incarnation_at, update_quota_if_incarnation,
-            update_quota_if_incarnation_at, update_under_transaction_lock, update_under_transaction_lock_at,
+            get_object_lock_config, get_object_lock_config_state, get_on_demand_migration_config,
+            get_on_demand_migration_config_in, get_public_access_block_config, get_quota_config, get_replication_config,
+            get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config, get_website_config,
+            init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata, set_bucket_metadata,
+            update, update_bucket_targets_under_transaction_lock, update_config_with, update_if_incarnation,
+            update_if_incarnation_at, update_quota_if_incarnation, update_quota_if_incarnation_at, update_under_transaction_lock,
+            update_under_transaction_lock_at,
         };
+        #[cfg(feature = "test-util")]
+        pub use crate::bucket::metadata_sys::{ConfigWriteLockProbe, test_support};
     }
 
     pub mod migration {
@@ -252,7 +207,7 @@ pub mod bucket {
     pub mod remote_s3_client {
         pub use crate::bucket::remote_s3_client::{
             PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, RemoteS3RetryPolicy, build_remote_s3_client,
-            validate_remote_endpoint,
+            build_remote_s3_config, validate_remote_endpoint, validate_target_ca_pem,
         };
     }
 
@@ -498,9 +453,9 @@ pub mod object {
         ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions, PutObjReader, QuotaAdmission,
         RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
         SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, ScannerPublicationCommitScope, ScannerPublicationCommitStartError,
-        ScannerPublicationCommitState, StreamConsumer, get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook,
-        register_get_object_body_cache_hook, register_object_mutation_hook, unregister_get_object_body_cache_hook,
-        unregister_object_mutation_hook,
+        ScannerPublicationCommitState, StreamConsumer, WriteCompletion, get_object_body_cache_plaintext_len,
+        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
+        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
     pub use crate::store::{
         PrepareSelectObjectSnapshotError, PreparedGetObjectReader, SelectObjectSnapshot, SelectObjectSnapshotReadError,
