@@ -40,9 +40,10 @@ pub use config::{
     SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
 };
 pub use list_through::{
-    FetchRequest, LIST_THROUGH_TOKEN_VERSION, ListEntryKey, ListThroughCursor, ListThroughMerger, ListThroughToken,
-    ListThroughTokenError, MAX_LIST_FETCHES_PER_SIDE, MergeOutcome, MergePick, MergeSide, SOURCE_LIST_MAX_RATE_WAIT,
-    SOURCE_LIST_RATE_PER_SEC, SourceListPlan, SourceListRateLimiter, decode_continuation_token, source_list_plan,
+    FetchRequest, LIST_THROUGH_TOKEN_VERSION, ListEntryKey, ListPageError, ListThroughCursor, ListThroughMerger,
+    ListThroughToken, ListThroughTokenError, MAX_LIST_FETCHES_PER_SIDE, MAX_LIST_NO_PROGRESS_PAGES, MergeOutcome, MergePick,
+    MergeSide, SOURCE_LIST_MAX_RATE_WAIT, SOURCE_LIST_RATE_PER_SEC, SourceListPlan, SourceListRateLimiter,
+    decode_continuation_token, source_list_plan,
 };
 pub use negative_cache::{NEGATIVE_CACHE_MAX_ENTRIES, NegativeCache};
 pub use pull::{
