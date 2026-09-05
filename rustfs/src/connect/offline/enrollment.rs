@@ -380,6 +380,12 @@ impl OfflineEnrollment {
             return Err(EnrollmentError::MalformedDocument);
         }
         let issued_at = parse_timestamp(&routing.issued_at)?;
+
+        // The frozen decision order classifies the top-level signature before
+        // parsing any trust-link routing fields. Otherwise a malformed first
+        // link could mask a malformed artifact signature with DOCUMENT_MALFORMED.
+        let signature = decode_signature(&envelope.signature)?;
+
         let first = routing.trust_chain.first().ok_or(EnrollmentError::MalformedDocument)?;
         let first_bytes = decode_document_bytes(&first.bytes)?;
         let first_routing: TrustLinkRouting =
@@ -387,10 +393,6 @@ impl OfflineEnrollment {
         if !is_key_id(&first_routing.issuer_key_id) {
             return Err(EnrollmentError::MalformedDocument);
         }
-
-        // Only after the document can route verification do we classify the
-        // top-level signature spelling and algorithm.
-        let signature = decode_signature(&envelope.signature)?;
 
         // Steps 3 to 5.
         let connect_key = verify_trust_chain(
