@@ -25,11 +25,6 @@
 use super::storage_api::bucket_usecase::ECStore;
 use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
 use super::storage_api::bucket_usecase::StorageObjectOptions;
-use super::storage_api::bucket_usecase::bucket::on_demand_migration::{
-    BucketOdmState, ListEntryKey, ListPageError, ListThroughCursor, ListThroughMerger, ListThroughToken, ListThroughTokenError,
-    MergeSide, OnDemandMigrationSys, SOURCE_LIST_MAX_RATE_WAIT, SourceClient, SourceError, SourceErrorPolicy, SourceListPlan,
-    SourceListRequest, SourceObject, SourcePage, decode_continuation_token, source_list_plan,
-};
 use super::storage_api::bucket_usecase::bucket::versioning_sys::BucketVersioningSys;
 use super::storage_api::bucket_usecase::contract::list::{ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as _};
 use super::storage_api::bucket_usecase::contract::object::ObjectOperations as _;
@@ -37,6 +32,11 @@ use super::storage_api::bucket_usecase::s3::{S3Error, S3ErrorCode, S3Result};
 use super::storage_api::bucket_usecase::s3_api::bucket::ListObjectsV2Params;
 use crate::app::object::shared::{odm_source_unavailable_error, odm_state_error_class};
 use crate::error::ApiError;
+use crate::on_demand_migration::{
+    BucketOdmState, ListEntryKey, ListPageError, ListThroughCursor, ListThroughMerger, ListThroughToken, ListThroughTokenError,
+    MergeSide, OnDemandMigrationSys, SOURCE_LIST_MAX_RATE_WAIT, SourceClient, SourceError, SourceErrorPolicy, SourceListPlan,
+    SourceListRequest, SourceObject, SourcePage, decode_continuation_token, source_list_plan,
+};
 use futures::StreamExt;
 use http::HeaderMap;
 use rustfs_utils::http::{SUFFIX_SOURCE_PROXY_REQUEST, get_header};
@@ -443,14 +443,16 @@ mod tests {
     use super::*;
     use crate::app::bucket_usecase::DefaultBucketUsecase;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ecstore};
-    use crate::app::storage_api::bucket_usecase::bucket::on_demand_migration::{
-        FilterConfig, MAX_LIST_NO_PROGRESS_PAGES, OnDemandMigrationConfig, PathStyle, PolicyConfig, Provider, SourceConfig,
-        SourceCredentials, TlsConfig,
+    use crate::app::storage_api::bucket_usecase::s3::{
+        ListObjectsInput, ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response, XmlSerialize, XmlSerializer,
     };
-    use crate::app::storage_api::bucket_usecase::s3::{ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response};
     use crate::app::storage_api::test::StoragePutObjReader;
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::app::storage_api::test::contract::object::ObjectIO as _;
+    use crate::on_demand_migration::{
+        FilterConfig, MAX_LIST_NO_PROGRESS_PAGES, OnDemandMigrationConfig, PathStyle, PolicyConfig, Provider, SourceConfig,
+        SourceCredentials, TlsConfig,
+    };
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -793,6 +795,97 @@ mod tests {
             .expect("source connections must finish")
             .expect("source server must not panic");
         (result, requests)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_v1_stays_local_with_xml_safe_key_markers() {
+        run_large_stack_test("list-through-v1-local-markers", || async {
+            temp_env::async_with_vars(
+                [
+                    ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                    ("HTTP_PROXY", None),
+                    ("HTTPS_PROXY", None),
+                    ("ALL_PROXY", None),
+                    ("http_proxy", None),
+                    ("https_proxy", None),
+                    ("all_proxy", None),
+                    ("NO_PROXY", Some("*")),
+                    ("no_proxy", Some("*")),
+                ],
+                async {
+                    let (endpoint, server, stop) =
+                        list_source(std::iter::repeat(source_xml(None, false, Some("a-source")))).await;
+                    let (_state_guard, source_input) =
+                        source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                    let store = shared_gating_ecstore().await;
+                    store
+                        .put_object(
+                            &source_input.bucket,
+                            "a&local",
+                            &mut StoragePutObjReader::from_vec(vec![1]),
+                            &StorageObjectOptions::default(),
+                        )
+                        .await
+                        .expect("seed a second local object");
+
+                    for delimiter in [None, Some("/".to_string())] {
+                        let mut input = ListObjectsInput {
+                            bucket: source_input.bucket.clone(),
+                            max_keys: Some(1),
+                            delimiter,
+                            ..Default::default()
+                        };
+                        for (index, expected_key) in ["a&local", "z-local"].into_iter().enumerate() {
+                            let request_marker = input.marker.clone().unwrap_or_default();
+                            let response = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                DefaultBucketUsecase::from_global().execute_list_objects(S3Request {
+                                    input: input.clone(),
+                                    method: http::Method::GET,
+                                    uri: http::Uri::from_static("/"),
+                                    headers: HeaderMap::new(),
+                                    extensions: http::Extensions::new(),
+                                    credentials: None,
+                                    region: None,
+                                    service: None,
+                                    trailing_headers: None,
+                                }),
+                            )
+                            .await
+                            .expect("v1 pagination must finish")
+                            .expect("list-through must not change v1 listing");
+                            assert!(!response.headers.contains_key("x-rustfs-on-demand-migration-list"));
+                            let output = response.output;
+                            let contents = output.contents.as_ref().expect("local page contents");
+                            assert_eq!(contents.len(), 1);
+                            assert_eq!(contents[0].key.as_deref(), Some(expected_key));
+                            assert_eq!(output.marker.as_deref(), Some(request_marker.as_str()));
+                            assert_eq!(output.is_truncated, Some(index == 0));
+                            assert_eq!(output.next_marker.as_deref(), (index == 0).then_some(expected_key));
+
+                            let mut xml = Vec::new();
+                            XmlSerialize::serialize(&output, &mut XmlSerializer::new(&mut xml))
+                                .expect("serialize the real v1 response");
+                            assert!(!xml.contains(&0), "XML 1.0 forbids NUL in NextMarker");
+                            let mut reader = quick_xml::Reader::from_reader(xml.as_slice());
+                            loop {
+                                if reader.read_event().expect("v1 response must be well-formed XML")
+                                    == quick_xml::events::Event::Eof
+                                {
+                                    break;
+                                }
+                            }
+                            input.marker = output.next_marker;
+                        }
+                    }
+                    stop.cancel();
+                    let requests = server.await.expect("source server must not panic");
+                    assert!(requests.is_empty(), "ListObjects v1 must issue no remote LIST requests: {requests:?}");
+                },
+            )
+            .await;
+        });
     }
 
     #[test]

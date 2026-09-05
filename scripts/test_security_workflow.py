@@ -355,6 +355,8 @@ fi
                 self.assertFalse(any(line.strip().startswith("continue-on-error:") for line in self.steps[handoff]))
                 self.assertIn("        if: always()", self.steps["Cleanup environment (after)"])
                 self.assertLess(list(self.steps).index("Cleanup environment (after)"), list(self.steps).index(handoff))
+                initialized = self.run_step("Initialize functional evidence")
+                self.assertEqual(initialized.returncode, 0, initialized.stderr)
                 suite = self.directory / "auto-testing/rustfs-replication-test.sh"
                 suite.write_text('#!/bin/sh\nprintf "suite failed\\n" >> "$EXECUTED"\nexit 17\n')
                 failed = self.run_step("Run replication suite")
