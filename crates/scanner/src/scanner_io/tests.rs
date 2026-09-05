@@ -970,8 +970,7 @@ fn scoped_scan_uses_only_locally_verified_prefix_hints() {
         true,
         &[bucket_info("photos"), bucket_info("videos")],
         ScannerCacheBaselineProof {
-            authoritative_data: Some(&baseline),
-            observed_candidate_data: None,
+            data: Some(&baseline),
             expected_sources: &expected_sources,
             leader_epoch: 11,
             want_cycle: 8,
@@ -988,8 +987,7 @@ fn scoped_scan_uses_only_locally_verified_prefix_hints() {
         true,
         &[bucket_info("photos"), bucket_info("videos")],
         ScannerCacheBaselineProof {
-            authoritative_data: Some(&baseline),
-            observed_candidate_data: None,
+            data: Some(&baseline),
             expected_sources: &expected_sources,
             leader_epoch: 11,
             want_cycle: 8,
