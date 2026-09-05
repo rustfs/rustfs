@@ -150,7 +150,7 @@ impl BucketFenceRegistry {
 /// A held bucket lifecycle read lock plus its registration in the fence
 /// registry. Dropping the guard deregisters it; the memo is cleared when the
 /// last guard for the bucket drops (or a lost lock is observed).
-pub(crate) struct BucketIncarnationFenceGuard {
+pub struct BucketIncarnationFenceGuard {
     inner: Option<NamespaceLockGuard>,
     registry: Arc<BucketFenceRegistry>,
     bucket: String,
@@ -158,6 +158,19 @@ pub(crate) struct BucketIncarnationFenceGuard {
 }
 
 impl BucketIncarnationFenceGuard {
+    /// Run an operation while the validated bucket incarnation stays locked.
+    /// Lock loss cancels the operation before it can continue on a replacement
+    /// bucket. The guard must remain held through every durable write tail.
+    pub async fn run<T>(&self, future: impl std::future::Future<Output = T>) -> crate::error::Result<T> {
+        super::bucket::await_bucket_namespace_operation(
+            self.namespace_lock_guard(),
+            &self.bucket,
+            "bucket incarnation fenced operation",
+            async { Ok(future.await) },
+        )
+        .await
+    }
+
     pub(crate) fn is_lock_lost(&self) -> bool {
         self.inner.as_ref().is_some_and(NamespaceLockGuard::is_lock_lost)
     }
@@ -344,6 +357,52 @@ mod tests {
 
         second_pieces.abandon("b", second.token);
         first_pieces.abandon("b", first.token);
+    }
+
+    #[tokio::test]
+    async fn fence_run_cancels_pending_work_and_rejects_work_after_lock_loss() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let lock = NamespaceLock::new("bucket-fence-operation".to_string(), Arc::new(LocalClient::new()));
+        let inner = lock
+            .acquire_guard(&lock_request("operation"))
+            .await
+            .expect("acquire")
+            .expect("quorum");
+        let pieces = FencePieces {
+            registry: Arc::default(),
+            inner,
+        };
+        let registration = pieces.enter("b");
+        let fence = pieces.into_guard("b", registration.token);
+        let polled = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            fence.run(async {
+                let _drop = Dropped(Arc::clone(&dropped));
+                polled.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }),
+        )
+        .await
+        .expect("lock loss must wake an in-flight operation");
+        assert!(result.is_err());
+        assert!(polled.load(Ordering::SeqCst), "the operation started under valid coverage");
+        assert!(dropped.load(Ordering::SeqCst), "lock loss drops the pending mutation future");
+        assert!(
+            fence
+                .run(async { panic!("lost coverage must not poll another mutation") })
+                .await
+                .is_err()
+        );
     }
 
     #[test]

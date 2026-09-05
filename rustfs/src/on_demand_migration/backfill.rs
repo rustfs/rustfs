@@ -370,6 +370,8 @@ pub type PullReport = Option<super::pull::QueuedPullReport>;
 /// mock in unit tests. Production: [`BucketBackfillContext`].
 #[async_trait]
 pub trait BackfillContext: Send + Sync {
+    /// The bucket incarnation captured by this context.
+    fn incarnation_id(&self) -> Uuid;
     /// One source page in the local key namespace.
     async fn list_page(&self, prefix: Option<&str>, token: Option<&str>, max_keys: i32) -> Result<SourcePage, SourceError>;
     /// Whether the breaker admits source traffic right now.
@@ -411,6 +413,10 @@ impl BucketBackfillContext {
 
 #[async_trait]
 impl BackfillContext for BucketBackfillContext {
+    fn incarnation_id(&self) -> Uuid {
+        self.state.incarnation_id()
+    }
+
     async fn list_page(&self, prefix: Option<&str>, token: Option<&str>, max_keys: i32) -> Result<SourcePage, SourceError> {
         let client = self.state.client().map_err(|err| SourceError::Unsupported(err.to_string()))?;
         let started = Instant::now();
@@ -661,6 +667,21 @@ pub async fn read_checkpoint(api: &Arc<ECStore>, bucket: &str) -> Result<Option<
 async fn write_checkpoint(
     api: &Arc<ECStore>,
     bucket: &str,
+    incarnation_id: Uuid,
+    checkpoint: &BackfillCheckpoint,
+    expected_etag: Option<&str>,
+) -> Result<String, BackfillError> {
+    let fence = api.acquire_bucket_incarnation_fence(bucket, incarnation_id).await?;
+    fence
+        .run(write_checkpoint_while_fenced(api, bucket, checkpoint, expected_etag))
+        .await?
+}
+
+/// The caller holds the destination bucket's lifecycle fence through the CAS
+/// write and its read-back, including the drained erasure write tail.
+async fn write_checkpoint_while_fenced(
+    api: &Arc<ECStore>,
+    bucket: &str,
     checkpoint: &BackfillCheckpoint,
     expected_etag: Option<&str>,
 ) -> Result<String, BackfillError> {
@@ -851,7 +872,14 @@ impl BackfillRunner {
             });
         }
         let checkpoint = BackfillCheckpoint::new(&request, config_updated_at, &self.node, now);
-        let etag = write_checkpoint(&self.api, bucket, &checkpoint, stored.as_ref().map(|s| s.etag.as_str())).await?;
+        let etag = write_checkpoint(
+            &self.api,
+            bucket,
+            context.incarnation_id(),
+            &checkpoint,
+            stored.as_ref().map(|s| s.etag.as_str()),
+        )
+        .await?;
         info!(
             event = EVENT_ODM_BACKFILL_STATE,
             component = LOG_COMPONENT_ECSTORE,
@@ -886,30 +914,36 @@ impl BackfillRunner {
             }
             return Ok(handle.snapshot.lock().clone());
         }
+        let incarnation_id = self.api.bucket_incarnation_id_from_disk(bucket).await?;
         let _lock = self.lease_lock(bucket, get_lock_acquire_timeout()).await?;
-        let Some(stored) = read_checkpoint(&self.api, bucket).await? else {
-            return Err(BackfillError::NotFound(bucket.to_string()));
-        };
-        if !stored.checkpoint.state.is_active() {
-            return Ok(stored.checkpoint);
-        }
-        let mut checkpoint = stored.checkpoint;
-        let now = OffsetDateTime::now_utc();
-        checkpoint.state = BackfillState::Cancelled;
-        checkpoint.updated_at = now;
-        write_checkpoint(&self.api, bucket, &checkpoint, Some(&stored.etag)).await?;
-        info!(
-            event = EVENT_ODM_BACKFILL_STATE,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_ON_DEMAND_MIGRATION,
-            state = checkpoint.state.as_str(),
-            result = "cancelled",
-            bucket = %bucket,
-            job_id = %checkpoint.job_id,
-            owner = %checkpoint.owner.as_ref().map(|o| o.node.as_str()).unwrap_or_default(),
-            "On-demand migration backfill job cancelled remotely"
-        );
-        Ok(checkpoint)
+        let fence = self.api.acquire_bucket_incarnation_fence(bucket, incarnation_id).await?;
+        fence
+            .run(async {
+                let Some(stored) = read_checkpoint(&self.api, bucket).await? else {
+                    return Err(BackfillError::NotFound(bucket.to_string()));
+                };
+                if !stored.checkpoint.state.is_active() {
+                    return Ok(stored.checkpoint);
+                }
+                let mut checkpoint = stored.checkpoint;
+                let now = OffsetDateTime::now_utc();
+                checkpoint.state = BackfillState::Cancelled;
+                checkpoint.updated_at = now;
+                write_checkpoint_while_fenced(&self.api, bucket, &checkpoint, Some(&stored.etag)).await?;
+                info!(
+                    event = EVENT_ODM_BACKFILL_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_ON_DEMAND_MIGRATION,
+                    state = checkpoint.state.as_str(),
+                    result = "cancelled",
+                    bucket = %bucket,
+                    job_id = %checkpoint.job_id,
+                    owner = %checkpoint.owner.as_ref().map(|o| o.node.as_str()).unwrap_or_default(),
+                    "On-demand migration backfill job cancelled remotely"
+                );
+                Ok(checkpoint)
+            })
+            .await?
     }
 
     /// Latest checkpoint: the in-memory progress of a local job, else the
@@ -1002,7 +1036,7 @@ impl BackfillRunner {
             checkpoint.state = BackfillState::Cancelled;
             checkpoint.updated_at = now;
             checkpoint.record_failure("config_changed", None, now);
-            write_checkpoint(&self.api, bucket, &checkpoint, Some(&stored.etag)).await?;
+            write_checkpoint(&self.api, bucket, context.incarnation_id(), &checkpoint, Some(&stored.etag)).await?;
             info!(
                 event = EVENT_ODM_BACKFILL_STATE,
                 component = LOG_COMPONENT_ECSTORE,
@@ -1021,7 +1055,7 @@ impl BackfillRunner {
             node: self.node.clone(),
             lease_until: now + BACKFILL_LEASE,
         });
-        let etag = write_checkpoint(&self.api, bucket, &checkpoint, Some(&stored.etag)).await?;
+        let etag = write_checkpoint(&self.api, bucket, context.incarnation_id(), &checkpoint, Some(&stored.etag)).await?;
         warn!(
             event = EVENT_ODM_BACKFILL_LEASE_TAKEOVER,
             component = LOG_COMPONENT_ECSTORE,
@@ -1460,7 +1494,8 @@ impl Job {
                 lease_until: now + BACKFILL_LEASE,
             });
         }
-        let etag = write_checkpoint(&self.api, &self.bucket, &self.checkpoint, Some(&self.etag)).await?;
+        let etag =
+            write_checkpoint(&self.api, &self.bucket, self.context.incarnation_id(), &self.checkpoint, Some(&self.etag)).await?;
         self.etag = etag;
         self.keys_since_save = 0;
         self.last_save = Instant::now();
@@ -1500,7 +1535,7 @@ pub async fn run_backfill_recovery_loop(runner: Arc<BackfillRunner>, cancel: Can
 
 #[cfg(test)]
 mod tests {
-    use super::super::storage_api::test_support::isolated_store_over_temp_disks;
+    use super::super::storage_api::test_support::{BucketOperations as _, isolated_store_over_temp_disks};
     use super::*;
     use crate::on_demand_migration::source_client::SourceObject;
     use crate::on_demand_migration::sys::PullError;
@@ -1626,6 +1661,7 @@ mod tests {
 
     /// Scripted source + local store + queue with a controllable report path.
     struct MockContext {
+        incarnation_id: Mutex<Option<Uuid>>,
         objects: Vec<SourceObject>,
         page_size: usize,
         local: Mutex<HashMap<String, LocalBackfillObject>>,
@@ -1654,6 +1690,7 @@ mod tests {
                 })
                 .collect();
             Arc::new(Self {
+                incarnation_id: Mutex::new(None),
                 objects,
                 page_size,
                 local: Mutex::new(HashMap::new()),
@@ -1688,6 +1725,10 @@ mod tests {
 
     #[async_trait]
     impl BackfillContext for MockContext {
+        fn incarnation_id(&self) -> Uuid {
+            self.incarnation_id.lock().expect("test bucket initialized")
+        }
+
         async fn list_page(&self, prefix: Option<&str>, token: Option<&str>, max_keys: i32) -> Result<SourcePage, SourceError> {
             if let Some(err) = self.list_error.lock().take() {
                 return Err(err);
@@ -1780,12 +1821,17 @@ mod tests {
         context: Arc<MockContext>,
     ) -> (Vec<tempfile::TempDir>, Arc<ECStore>, Arc<BackfillRunner>) {
         let (dirs, store) = isolated_store_over_temp_disks().await;
-        // The isolated store has no bucket metadata system; the checkpoint
-        // only needs the bucket's directory under the metadata volume.
-        for dir in &dirs {
-            std::fs::create_dir_all(dir.path().join(RUSTFS_META_BUCKET).join(BUCKET_META_PREFIX).join(bucket))
-                .expect("test bucket metadata directory");
-        }
+        super::super::storage_api::test_support::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        store
+            .make_bucket(bucket, &Default::default())
+            .await
+            .expect("create test bucket");
+        *context.incarnation_id.lock() = Some(
+            store
+                .bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect("test bucket identity"),
+        );
         let runner = runner_on(node, bucket, context, Arc::clone(&store));
         (dirs, store, runner)
     }
@@ -1793,6 +1839,59 @@ mod tests {
     fn runner_on(node: &str, bucket: &str, context: Arc<MockContext>, store: Arc<ECStore>) -> Arc<BackfillRunner> {
         let contexts = MockContexts(Mutex::new(HashMap::from([(bucket.to_string(), context)])));
         BackfillRunner::new(store, node, Arc::new(contexts))
+    }
+
+    #[tokio::test]
+    async fn stale_checkpoint_writer_cannot_resurrect_or_overwrite_a_recreated_bucket() {
+        let bucket = "backfill-incarnation";
+        let context = MockContext::new(0, 1);
+        let (_dirs, store, _runner) = runner_with("node-a", bucket, Arc::clone(&context)).await;
+        let old_incarnation = context.incarnation_id();
+        let old = BackfillCheckpoint::new(&BackfillRequest::default(), ts(1_700_000_000), "node-a", ts(1_700_000_001));
+        let old_etag = write_checkpoint(&store, bucket, old_incarnation, &old, None)
+            .await
+            .expect("old checkpoint");
+
+        store
+            .delete_bucket(bucket, &Default::default())
+            .await
+            .expect("delete original bucket");
+        store.make_bucket(bucket, &Default::default()).await.expect("recreate bucket");
+        let current_incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("new identity");
+        assert_ne!(old_incarnation, current_incarnation);
+        assert!(
+            read_checkpoint(&store, bucket)
+                .await
+                .expect("read after recreation")
+                .is_none()
+        );
+        for expected_etag in [None, Some(old_etag.as_str())] {
+            let error = write_checkpoint(&store, bucket, old_incarnation, &old, expected_etag)
+                .await
+                .expect_err("stale writer rejected");
+            assert!(matches!(error, BackfillError::Storage(StorageError::BucketNotFound(_))));
+        }
+        assert!(
+            read_checkpoint(&store, bucket)
+                .await
+                .expect("stale writer left no checkpoint")
+                .is_none()
+        );
+
+        let current = BackfillCheckpoint::new(&BackfillRequest::default(), ts(1_700_000_000), "node-b", ts(1_700_000_002));
+        let current_etag = write_checkpoint(&store, bucket, current_incarnation, &current, None)
+            .await
+            .expect("current checkpoint");
+        let error = write_checkpoint(&store, bucket, old_incarnation, &old, Some(&current_etag))
+            .await
+            .expect_err("old identity cannot overwrite a matching ETag");
+        assert!(matches!(error, BackfillError::Storage(StorageError::BucketNotFound(_))));
+        let stored = read_checkpoint(&store, bucket)
+            .await
+            .expect("read current checkpoint")
+            .expect("current checkpoint remains");
+        assert_eq!(stored.etag, current_etag);
+        assert_eq!(stored.checkpoint, current);
     }
 
     #[tokio::test]
@@ -2134,7 +2233,7 @@ mod tests {
             node: "node-a".to_string(),
             lease_until: now - Duration::from_secs(120),
         });
-        let etag = write_checkpoint(&store, bucket, &crashed, None)
+        let etag = write_checkpoint(&store, bucket, context.incarnation_id(), &crashed, None)
             .await
             .expect("seed checkpoint");
 
@@ -2145,7 +2244,7 @@ mod tests {
             lease_until: now + Duration::from_secs(60),
         });
         live.updated_at = now;
-        let etag = write_checkpoint(&store, bucket, &live, Some(&etag))
+        let etag = write_checkpoint(&store, bucket, context.incarnation_id(), &live, Some(&etag))
             .await
             .expect("live lease");
         assert_eq!(runner.recover_once().await.taken_over, 0, "unexpired lease must not be taken over");
@@ -2162,7 +2261,7 @@ mod tests {
             lease_until: now - Duration::from_secs(1),
         });
         expired.updated_at = now + Duration::from_millis(1);
-        write_checkpoint(&store, bucket, &expired, Some(&etag))
+        write_checkpoint(&store, bucket, context.incarnation_id(), &expired, Some(&etag))
             .await
             .expect("expire lease");
         let stats = runner.recover_once().await;
@@ -2201,7 +2300,7 @@ mod tests {
         crashed.continuation_token = Some("2".to_string());
         crashed.failed = 1;
         crashed.record_failure("local_write", Some("k/00002"), crashed_at);
-        write_checkpoint(&store, bucket, &crashed, None)
+        write_checkpoint(&store, bucket, context.incarnation_id(), &crashed, None)
             .await
             .expect("seed failed page with an expired lease");
 
@@ -2257,7 +2356,9 @@ mod tests {
 
         // Same node name, unexpired lease: only a restart can produce this.
         let own = BackfillCheckpoint::new(&BackfillRequest::default(), ts(1_700_000_000), "node-a", now);
-        let etag = write_checkpoint(&store, bucket, &own, None).await.expect("seed");
+        let etag = write_checkpoint(&store, bucket, context.incarnation_id(), &own, None)
+            .await
+            .expect("seed");
         assert_eq!(runner.recover_once().await.taken_over, 1, "own-node running job is reclaimed at once");
         runner.wait_until_idle(bucket).await;
         let cp = read_checkpoint(&store, bucket)
@@ -2275,7 +2376,7 @@ mod tests {
             node: "node-z".to_string(),
             lease_until: now - Duration::from_secs(1),
         });
-        write_checkpoint(&store, bucket, &stale, Some(&stored.etag))
+        write_checkpoint(&store, bucket, context.incarnation_id(), &stale, Some(&stored.etag))
             .await
             .expect("seed stale");
         let stats = runner.recover_once().await;
