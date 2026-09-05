@@ -50,7 +50,7 @@ use uuid::Uuid;
 
 /// Opaque bucket configuration notifications for application-owned services.
 /// `None` withdraws a configuration; consumers validate nonempty bytes.
-pub type BucketConfigPublishHook = Box<dyn Fn(&str, &str, Option<(&[u8], OffsetDateTime)>) + Send + Sync>;
+pub type BucketConfigPublishHook = Box<dyn Fn(&str, &str, Option<(&[u8], OffsetDateTime, Uuid)>) + Send + Sync>;
 pub static BUCKET_CONFIG_PUBLISH_HOOK: std::sync::OnceLock<BucketConfigPublishHook> = std::sync::OnceLock::new();
 
 const BUCKET_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -405,7 +405,8 @@ fn sync_on_demand_migration(bucket: &str, bm: &BucketMetadata) {
         hook(
             bucket,
             super::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG,
-            bm.on_demand_migration_config(),
+            bm.on_demand_migration_config()
+                .map(|(bytes, stamp)| (bytes, stamp, bm.bucket_incarnation_id)),
         );
     }
 }
@@ -4374,23 +4375,26 @@ mod tests {
 
     const ODM_JSON: &[u8] = br#"{"source":{"provider":"minio","endpoint":"https://legacy.example.com:9000","region":"auto","bucket":"legacy-bucket","credentials":{"access_key":"AK","secret_key":"SK"}}}"#;
 
+    type RecordedOdmConfig = Option<(Vec<u8>, OffsetDateTime, Uuid)>;
+    type RecordedOdmHookCall = (String, RecordedOdmConfig);
+
     /// Every `(bucket, config)` the recording hook has seen. Tests filter by
     /// their own bucket name; the hook is process-wide and set once.
-    static ODM_HOOK_CALLS: std::sync::Mutex<Vec<(String, Option<(Vec<u8>, OffsetDateTime)>)>> = std::sync::Mutex::new(Vec::new());
+    static ODM_HOOK_CALLS: std::sync::Mutex<Vec<RecordedOdmHookCall>> = std::sync::Mutex::new(Vec::new());
 
     fn install_recording_odm_hook() {
         BUCKET_CONFIG_PUBLISH_HOOK.get_or_init(|| {
             Box::new(|bucket, config_file, config| {
                 assert_eq!(config_file, super::super::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG);
-                ODM_HOOK_CALLS
-                    .lock()
-                    .unwrap()
-                    .push((bucket.to_string(), config.map(|(bytes, stamp)| (bytes.to_vec(), stamp))));
+                ODM_HOOK_CALLS.lock().unwrap().push((
+                    bucket.to_string(),
+                    config.map(|(bytes, stamp, incarnation)| (bytes.to_vec(), stamp, incarnation)),
+                ));
             })
         });
     }
 
-    fn odm_hook_calls(bucket: &str) -> Vec<Option<(Vec<u8>, OffsetDateTime)>> {
+    fn odm_hook_calls(bucket: &str) -> Vec<RecordedOdmConfig> {
         ODM_HOOK_CALLS
             .lock()
             .unwrap()
@@ -4414,18 +4418,21 @@ mod tests {
             std::fs::create_dir_all(dir.path().join(bucket)).expect("physical bucket should exist");
         }
 
+        let incarnation = Uuid::new_v4();
         let expect_publish = |before: usize, label: &str| {
             let calls = odm_hook_calls(bucket);
             assert_eq!(calls.len(), before + 1, "{label} must publish exactly once");
             assert_eq!(
-                calls.last().unwrap().as_ref().map(|(bytes, _)| bytes.as_slice()),
+                calls.last().unwrap().as_ref().map(|(bytes, _, _)| bytes.as_slice()),
                 Some(ODM_JSON),
                 "{label} must publish the stored bytes"
             );
+            assert_eq!(calls.last().unwrap().as_ref().map(|(_, _, id)| *id), Some(incarnation));
         };
 
         // set (via persist_new_and_set, which installs through `set`).
         let mut bm = BucketMetadata::new(bucket);
+        bm.bucket_incarnation_id = incarnation;
         bm.update_config(crate::bucket::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG, ODM_JSON.to_vec())
             .unwrap();
         let writer = BucketMetadataSys::new(ecstore.clone());
@@ -4475,7 +4482,7 @@ mod tests {
         let calls = odm_hook_calls(bucket);
         assert_eq!(calls.len(), before + 1);
         assert_eq!(
-            calls.last().unwrap().as_ref().map(|(bytes, _)| bytes.as_slice()),
+            calls.last().unwrap().as_ref().map(|(bytes, _, _)| bytes.as_slice()),
             Some(b"not-json".as_slice()),
             "the application validates opaque config bytes"
         );
