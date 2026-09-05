@@ -150,6 +150,18 @@ static XXHASH_SEED: u64 = 0;
 static TIER_FREE_VERSION_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 static MANUAL_TRANSITION_JOB_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 
+#[cfg(test)]
+#[derive(Default)]
+struct FreeVersionPostRemoteDeleteTestBarrier {
+    arrived: Notify,
+    release: Notify,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static FREE_VERSION_POST_REMOTE_DELETE_TEST_BARRIER: Arc<FreeVersionPostRemoteDeleteTestBarrier>;
+}
+
 pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
 #[allow(
     dead_code,
@@ -909,6 +921,11 @@ async fn cleanup_free_version_exact(api: Arc<ECStore>, oi: &ObjectInfo, cancel: 
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "tier free-version remote delete timed out")
             })??;
         }
+    }
+    #[cfg(test)]
+    if let Ok(barrier) = FREE_VERSION_POST_REMOTE_DELETE_TEST_BARRIER.try_with(Arc::clone) {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
     }
     if !free_version_cleanup_fences_current(&topology_generation, &api, &bucket_guard, &object_guards, &lease, cancel, deadline) {
         // Remote DELETE is idempotent, but a changed fence makes the local
@@ -5831,7 +5848,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     use crate::services::tier::test_util::register_mock_tier;
     #[cfg(feature = "test-util")]
-    use crate::services::tier::tier::TierConfigMgr;
+    use crate::services::tier::tier::{TIER_DRIVER_TEST_FACTORY, TierConfigMgr, TierDriverTestFactory};
     #[cfg(feature = "test-util")]
     use crate::services::tier::warm_backend::{TransitionCandidateProbe, WarmBackend as _};
     use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause};
@@ -7828,6 +7845,119 @@ mod tests {
                     .expect("free-version path existence check should succeed")
             );
         }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn tier_remove_waits_for_inflight_free_version_local_commit() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("tier-remove-free-version-{}", Uuid::new_v4());
+        let object = "free-version";
+        create_test_bucket(&ecstore, &bucket).await;
+        let (backend, identity_hex) = register_recovery_mock_tier(&ecstore).await;
+        let tier_manager = ecstore.tier_config_mgr();
+        {
+            let manager = tier_manager.read().await;
+            manager
+                .save_tiering_config(Arc::clone(&ecstore))
+                .await
+                .expect("mock tier configuration should persist before removal");
+        }
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, Some(identity_hex)).await;
+        let page = list_tier_free_versions(Arc::clone(&ecstore), 1, None, None, CancellationToken::new())
+            .await
+            .expect("seeded free version should be listed");
+        let oi = page
+            .items
+            .into_iter()
+            .next()
+            .expect("seeded free version should be recoverable");
+
+        backend
+            .set_put_remote_version(Some(oi.transitioned_object.version_id.clone()))
+            .await;
+        let seed_lease = TierConfigMgr::acquire_operation_lease(&tier_manager, "WARM")
+            .await
+            .expect("mock tier lease should be available");
+        seed_lease
+            .put(&oi.transitioned_object.name, ReaderImpl::Body(Bytes::from_static(b"body")), 4)
+            .await
+            .expect("remote free-version tuple should be seeded");
+        drop(seed_lease);
+
+        let barrier = Arc::new(super::FreeVersionPostRemoteDeleteTestBarrier::default());
+        let cleanup_barrier = Arc::clone(&barrier);
+        let cleanup_store = Arc::clone(&ecstore);
+        let cleanup_oi = oi.clone();
+        let cleanup = tokio::spawn(async move {
+            super::FREE_VERSION_POST_REMOTE_DELETE_TEST_BARRIER
+                .scope(cleanup_barrier, async move {
+                    super::cleanup_free_version_exact(cleanup_store, &cleanup_oi, &CancellationToken::new()).await
+                })
+                .await
+        });
+        tokio::time::timeout(StdDuration::from_secs(30), barrier.arrived.notified())
+            .await
+            .expect("free-version cleanup should pause after the remote delete");
+        assert!(!backend.contains(&oi.transitioned_object.name).await);
+
+        let remove_manager = Arc::clone(&tier_manager);
+        let remove_store = Arc::clone(&ecstore);
+        let remove_backend = backend.clone();
+        let remove_driver_factory: TierDriverTestFactory = Arc::new(move |_| Ok(Box::new(remove_backend.clone())));
+        let mut remove = tokio::spawn(async move {
+            TIER_DRIVER_TEST_FACTORY
+                .scope(
+                    remove_driver_factory,
+                    TierConfigMgr::remove_and_save(&remove_manager, remove_store, "WARM", true),
+                )
+                .await
+        });
+        let prepared = tokio::time::timeout(StdDuration::from_secs(30), async {
+            loop {
+                match TierConfigMgr::acquire_operation_lease(&tier_manager, "WARM").await {
+                    Ok(lease) => drop(lease),
+                    Err(err) if TierConfigMgr::operation_lease_blocked_by_mutation(&err) => break,
+                    Err(err) => panic!("tier remove should only block new operations while cleanup is paused: {err}"),
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::select! {
+            prepared = prepared => {
+                prepared.expect("tier remove should install its prepared admission fence");
+            }
+            result = &mut remove => {
+                panic!("tier remove finished before installing its prepared admission fence: {result:?}");
+            }
+        }
+        assert!(!remove.is_finished(), "tier remove must wait for the leased local cleanup commit");
+
+        barrier.release.notify_one();
+        tokio::time::timeout(StdDuration::from_secs(30), cleanup)
+            .await
+            .expect("free-version cleanup should finish after release")
+            .expect("free-version cleanup task should join")
+            .expect("free-version cleanup should keep its generation current");
+        tokio::time::timeout(StdDuration::from_secs(30), remove)
+            .await
+            .expect("tier remove should finish after local cleanup")
+            .expect("tier remove task should join")
+            .expect("tier remove should pass its fresh authoritative proof");
+
+        assert!(!tier_manager.read().await.is_tier_valid("WARM"));
+        for disk_path in &disk_paths {
+            assert!(
+                !fs::try_exists(disk_path.join(&bucket).join(object))
+                    .await
+                    .expect("post-removal free-version path check should succeed")
+            );
+        }
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty free-version test bucket should be removed");
     }
 
     #[cfg(feature = "test-util")]
