@@ -15,7 +15,7 @@
 use super::heal_info::{classify_background_heal_read_error, decode_background_heal_info};
 use super::*;
 use crate::EcstoreResult;
-use crate::storage_api::ecstore_hold_namespace_commit;
+use crate::storage_api::owner::ecstore_hold_namespace_commit;
 use crate::storage_api::scan::{BucketOperations as _, ObjectIO as _};
 use crate::{
     DATA_USAGE_BLOOM_RECOVERY_PATH, DATA_USAGE_CACHE_KEY_FORMAT, DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT,
@@ -1221,13 +1221,34 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
         "the pending candidate must not replace the authoritative baseline"
     );
 
+    let committed_body = b"committed-after-walk";
+    let mut reader = PutObjReader::from_vec(committed_body.to_vec());
+    store.pools[0].disk_set[0]
+        .put_object(
+            &bucket,
+            "object",
+            &mut reader,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the pending tail must change the physical object before it drains");
+    assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
     drop(pending);
+    let retry_budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default());
     let outcome = tokio::time::timeout(
         Duration::from_secs(30),
-        run_data_scanner_cycle(&ctx, &store, &mut cycle_info, &mut revision, 1),
+        run_data_scanner_cycle_with_budget(&ctx, &store, &mut cycle_info, &mut revision, 1, Arc::clone(&retry_budget)),
     )
     .await
     .expect("the same cycle must converge after the pending PUT drains");
+    assert_eq!(
+        retry_budget.progress().0,
+        1,
+        "the same-cycle retry must not reuse the pre-tail bucket cache"
+    );
     assert!(matches!(
         outcome,
         ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
@@ -1241,13 +1262,16 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
     assert_eq!(usage.usage_snapshot_converged, Some(true));
     assert_eq!(usage.scanner_cycle, Some(1));
     assert_eq!(usage.objects_total_count, 1);
-    assert_eq!(usage.objects_total_size, 5);
+    assert_eq!(
+        usage.objects_total_size,
+        u64::try_from(committed_body.len()).expect("fixture body length")
+    );
     let bucket_usage = usage
         .buckets_usage
         .get(&bucket)
         .expect("the scanned bucket should be published");
     assert_eq!(bucket_usage.objects_count, 1);
-    assert_eq!(bucket_usage.size, 5);
+    assert_eq!(bucket_usage.size, u64::try_from(committed_body.len()).expect("fixture body length"));
     global_metrics().set_cycle(None).await;
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
 }

@@ -271,6 +271,8 @@ pub struct ScannerBucketScanPlan {
     all_buckets: Arc<Vec<BucketInfo>>,
     scope: ScannerBucketScanScope,
     digest: DataUsageScanPlanDigest,
+    // Bucket work must invalidate on namespace completion even when its scoped baseline remains reusable.
+    bucket_cache_digest: DataUsageScanPlanDigest,
     leader_epoch: u64,
     tier_registry_generation: u64,
     /// Epoch captured once for the whole scanner cycle.  `None` is retained

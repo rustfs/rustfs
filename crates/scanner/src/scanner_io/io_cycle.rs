@@ -263,6 +263,10 @@ where
     let activity_digest = crate::scanner::scanner_activity_snapshot_digest(&activity_before);
     let scan_plan_digest =
         scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_structural_digest(&activity_before));
+    let mut bucket_cache_hasher = Sha256::new();
+    bucket_cache_hasher.update(scan_plan_digest.0);
+    bucket_cache_hasher.update(activity_digest);
+    let bucket_cache_digest = DataUsageScanPlanDigest(bucket_cache_hasher.finalize().into());
     let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets(&all_buckets, dirty_generation_before_bucket_list));
     let scan_scope = resolve_scanner_bucket_scan_scope(
         store,
@@ -412,6 +416,7 @@ where
             all_buckets: Arc::clone(&all_buckets),
             scope: scan_scope.clone(),
             digest: scan_plan_digest,
+            bucket_cache_digest,
             leader_epoch,
             tier_registry_generation,
             publication_epoch,

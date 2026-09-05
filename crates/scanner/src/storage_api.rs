@@ -114,8 +114,6 @@ pub(crate) use rustfs_ecstore::api::runtime::{
 };
 pub(crate) use rustfs_ecstore::api::set_disk::SetDisks as EcstoreSetDisks;
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::api::set_disk::test_util::hold_namespace_commit as ecstore_hold_namespace_commit;
-#[cfg(test)]
 pub(crate) use rustfs_ecstore::api::storage::SCANNER_PUBLICATION_LEASE_TTL_MS as ECSTORE_SCANNER_PUBLICATION_LEASE_TTL_MS;
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::storage::init_local_disks_with_instance_ctx as ecstore_init_local_disks_with_instance_ctx;
@@ -129,6 +127,9 @@ pub(crate) use rustfs_lifecycle::{
 use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod owner {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::set_disk::test_util::hold_namespace_commit as ecstore_hold_namespace_commit;
+
     pub(crate) use super::storage_contracts::{
         HTTPPreconditions, HTTPRangeSpec, NS_SCANNER_PROTOCOL_VERSION, ObjectIO, ObjectOperations, ObjectToDelete,
     };

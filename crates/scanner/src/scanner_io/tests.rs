@@ -17,11 +17,12 @@ use super::io_disk::tier_stats_template;
 use super::*;
 use crate::scanner_budget::ScannerCycleBudgetConfig;
 use crate::scanner_folder::ScannerItem;
+use crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot;
 use crate::storage_api::owner::{
     EcstorePoolDecommissionInfo, EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats,
+    ecstore_hold_namespace_commit,
 };
 use crate::storage_api::scan::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, ObjectIO as _};
-use crate::storage_api::{EcstoreScannerPeerDirtyUsageSnapshot, ecstore_hold_namespace_commit};
 use crate::{
     DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints, ScannerObjectOptions,
     ScannerPutObjReader, UNKNOWN_TIER, init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests,
@@ -411,12 +412,21 @@ async fn pending_put_commit_keeps_scanner_walk_live_without_authoritative_usage(
     }
 
     let mut pending = Some(ecstore_hold_namespace_commit(store.as_ref()));
+    let mut previous_activity_digest = None;
+    let mut structural_plan_digest = None;
     for (cycle, converged) in [(1, false), (2, true)] {
         if converged {
             drop(pending.take());
         }
         assert_eq!(store.scanner_data_usage_publication_blocked().await, !converged);
         assert!(!store.scanner_data_movement_pause_status().await.paused);
+        let activity = crate::scanner::probe_scanner_activity(store.as_ref(), false)
+            .await
+            .expect("the fixture activity should be observable");
+        let activity_digest = crate::scanner::scanner_activity_snapshot_digest(&activity);
+        if let Some(previous) = previous_activity_digest.replace(activity_digest) {
+            assert_ne!(previous, activity_digest, "draining a namespace commit must change the publication proof");
+        }
         let ctx = CancellationToken::new();
         let budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default());
         let (updates, mut receiver) = mpsc::channel(1);
@@ -435,6 +445,7 @@ async fn pending_put_commit_keeps_scanner_walk_live_without_authoritative_usage(
         .await
         .expect("namespace scanning must finish while a PUT commit is pending")
         .expect("namespace scanning must remain available during a pending PUT commit");
+        assert_eq!(result.activity_digest(), Some(activity_digest));
         if !converged {
             assert_eq!(budget.progress().0, 2, "the pending commit must not suppress actual object traversal");
         }
@@ -454,6 +465,13 @@ async fn pending_put_commit_keeps_scanner_walk_live_without_authoritative_usage(
         assert_eq!(usage.scanner_cycle, Some(cycle));
         assert_eq!(usage.objects_total_count, 2);
         assert_eq!(usage.objects_total_size, 11);
+        assert_eq!(usage.usage_snapshot_set_states.len(), 2);
+        for state in &usage.usage_snapshot_set_states {
+            let digest = state
+                .scan_plan_digest
+                .expect("each set must retain its structural cache identity");
+            assert_eq!(*structural_plan_digest.get_or_insert(digest), digest);
+        }
         let bucket_usage = usage.buckets_usage.get(&bucket).expect("the walked bucket must be present");
         assert_eq!(bucket_usage.objects_count, 2);
         assert_eq!(bucket_usage.size, 11);
