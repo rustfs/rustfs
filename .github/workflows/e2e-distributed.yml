@@ -20,6 +20,13 @@
 # `[profile.e2e-distributed]` in `.config/nextest.toml`. Storage-sensitive PRs,
 # nightly runs, and manual dispatches all execute the same fail-closed suite.
 # Upgrade cases download the same pinned previous release as e2e-upgrade.yml.
+#
+# Isolated pool filesystems: expand/decommission/rebalance cases require
+# independent `statfs` capacity. `sm-standard-4` is an ARC pod
+# (`scripts/ci/check_runner_ephemerality.sh`) and usually has no
+# `/dev/loop-control`, so `mount -o loop` fails with ENOENT ("mount failed:
+# No such file or directory"). The prepare step therefore mounts four 1 GiB
+# tmpfs instances and exports them as `RUSTFS_E2E_POOL_ROOTS`.
 
 name: e2e-distributed
 
@@ -101,21 +108,21 @@ jobs:
           mkdir -p "${mount_base}"
           roots=()
           for pool in 0 1 2 3; do
-            image="${mount_base}/pool-${pool}.img"
             mountpoint="${mount_base}/pool-${pool}"
-            truncate -s 1G "${image}"
-            mkfs.ext4 -q -F "${image}"
             mkdir -p "${mountpoint}"
-            sudo mount -o loop,nosuid,nodev "${image}" "${mountpoint}"
+            # sm-standard-4 is an ARC pod without usable loop devices, so
+            # `mount -o loop` fails with ENOENT. Sized tmpfs still reports a
+            # distinct st_dev and independent 1G statfs capacity.
+            sudo mount -t tmpfs -o size=1G,nosuid,nodev,mode=1777 tmpfs "${mountpoint}"
             sudo chmod 1777 "${mountpoint}"
             roots+=("${mountpoint}")
           done
           printf -v joined_roots '%s:' "${roots[@]}"
           echo "RUSTFS_E2E_POOL_ROOTS=${joined_roots%:}" >> "${GITHUB_ENV}"
-          findmnt --noheadings --output TARGET,SOURCE,FSTYPE --target "${roots[0]}"
-          findmnt --noheadings --output TARGET,SOURCE,FSTYPE --target "${roots[1]}"
-          findmnt --noheadings --output TARGET,SOURCE,FSTYPE --target "${roots[2]}"
-          findmnt --noheadings --output TARGET,SOURCE,FSTYPE --target "${roots[3]}"
+          findmnt --noheadings --output TARGET,SOURCE,FSTYPE,SIZE --target "${roots[0]}"
+          findmnt --noheadings --output TARGET,SOURCE,FSTYPE,SIZE --target "${roots[1]}"
+          findmnt --noheadings --output TARGET,SOURCE,FSTYPE,SIZE --target "${roots[2]}"
+          findmnt --noheadings --output TARGET,SOURCE,FSTYPE,SIZE --target "${roots[3]}"
 
       - name: Download pinned previous release
         env:
