@@ -322,12 +322,14 @@ fn validate_lifecycle_filter(filter: &LifecycleRuleFilter) -> Result<(), std::io
     Ok(())
 }
 
-/// S3 requires a tag to carry a key; both key and value are length-bounded.
-/// The DTO makes both optional, so a keyless tag has to be rejected here
+/// S3 requires a tag to carry a key and value; both are length-bounded.
+/// The DTO makes both optional, so incomplete tags have to be rejected here
 /// rather than silently matching nothing.
 fn validate_lifecycle_tag(tag: &s3s::dto::Tag) -> Result<(), std::io::Error> {
     let key = tag.key.as_deref().unwrap_or_default();
-    let value = tag.value.as_deref().unwrap_or_default();
+    let Some(value) = tag.value.as_deref() else {
+        return Err(std::io::Error::other(ERR_LIFECYCLE_FILTER_INVALID_TAG));
+    };
     if key.is_empty() || key.chars().count() > MAX_TAG_KEY_LEN || value.chars().count() > MAX_TAG_VALUE_LEN {
         return Err(std::io::Error::other(ERR_LIFECYCLE_FILTER_INVALID_TAG));
     }
@@ -708,6 +710,23 @@ impl Lifecycle for BucketLifecycleConfiguration {
 
         if let Some(ref lc_rules) = self.filter_rules(obj).await {
             for rule in lc_rules.iter() {
+                // A retention count that PUT validation would have rejected can
+                // only come from older persistence or an import. Take no action
+                // for the rule instead of allowing another action on the same
+                // corrupt rule to delete or transition an object (backlog#2201).
+                if rule_has_corrupt_retention_count(rule) {
+                    debug!(
+                        event = EVENT_LIFECYCLE_NONCURRENT_EXPIRY_SKIPPED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        object = %obj.name,
+                        rule_id = %rule.id.clone().unwrap_or_default(),
+                        reason = "corrupt_newer_noncurrent_versions",
+                        "Skipped lifecycle evaluation for a rule with an invalid retention count"
+                    );
+                    continue;
+                }
+
                 if obj.is_latest && obj.expired_object_deletemarker() {
                     if let Some(expiration) = rule.expiration.as_ref()
                         && expiration.expired_object_delete_marker.is_some_and(|v| v)
@@ -759,24 +778,6 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             storage_class: "".into(),
                         });
                     }
-                    continue;
-                }
-
-                // A retention count that PUT validation would have rejected can
-                // only come from older persistence or an import. Take no action
-                // for the rule instead of reading the negative value as "retain
-                // (almost) everything", which is how such a rule silently
-                // stopped deleting versions (backlog#2201).
-                if !obj.is_latest && rule_has_corrupt_retention_count(rule) {
-                    debug!(
-                        event = EVENT_LIFECYCLE_NONCURRENT_EXPIRY_SKIPPED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                        object = %obj.name,
-                        rule_id = %rule.id.clone().unwrap_or_default(),
-                        reason = "corrupt_newer_noncurrent_versions",
-                        "Skipped noncurrent expiration for a rule with an invalid retention count"
-                    );
                     continue;
                 }
 
@@ -4562,6 +4563,64 @@ mod tests {
         assert_eq!(event.action, IlmAction::NoneAction);
     }
 
+    #[tokio::test]
+    async fn eval_inner_does_not_expire_latest_object_for_a_corrupt_retention_rule() {
+        let mut rule = rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: Some(1),
+            newer_noncurrent_versions: Some(-1),
+        });
+        rule.expiration = Some(LifecycleExpiration {
+            days: Some(1),
+            ..Default::default()
+        });
+        let lc = config_with_rules(vec![rule]);
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(datetime!(2025-01-01 00:00:00 UTC)),
+            is_latest: true,
+            ..Default::default()
+        };
+
+        let event = lc.eval_inner(&opts, datetime!(2025-06-01 00:00:00 UTC), 0).await;
+
+        assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    async fn eval_inner_does_not_delete_latest_marker_for_a_corrupt_retention_rule() {
+        let mut expired_marker_rule = rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: Some(1),
+            newer_noncurrent_versions: Some(-1),
+        });
+        expired_marker_rule.expiration = Some(LifecycleExpiration {
+            expired_object_delete_marker: Some(true),
+            ..Default::default()
+        });
+
+        let mut aged_marker_rule = rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: Some(1),
+            newer_noncurrent_versions: Some(-1),
+        });
+        aged_marker_rule.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(1) });
+
+        for rule in [expired_marker_rule, aged_marker_rule] {
+            let lc = config_with_rules(vec![rule]);
+            let opts = ObjectOpts {
+                name: "obj".to_string(),
+                mod_time: Some(datetime!(2025-01-01 00:00:00 UTC)),
+                version_id: Some(Uuid::new_v4()),
+                is_latest: true,
+                delete_marker: true,
+                num_versions: 1,
+                ..Default::default()
+            };
+
+            let event = lc.eval_inner(&opts, datetime!(2025-06-01 00:00:00 UTC), 0).await;
+
+            assert_eq!(event.action, IlmAction::NoneAction);
+        }
+    }
+
     #[test]
     fn corrupt_retention_count_is_detected_on_either_action() {
         let mut transition_rule = rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
@@ -4732,6 +4791,25 @@ mod tests {
                     ..Default::default()
                 },
                 expected: Some((ERR_LIFECYCLE_FILTER_INVALID_TAG, std::io::ErrorKind::Other)),
+            },
+            Case {
+                name: "missing tag value",
+                filter: LifecycleRuleFilter {
+                    tag: Some(s3s::dto::Tag {
+                        key: Some("env".to_string()),
+                        value: None,
+                    }),
+                    ..Default::default()
+                },
+                expected: Some((ERR_LIFECYCLE_FILTER_INVALID_TAG, std::io::ErrorKind::Other)),
+            },
+            Case {
+                name: "empty tag value",
+                filter: LifecycleRuleFilter {
+                    tag: Some(tag("env", "")),
+                    ..Default::default()
+                },
+                expected: None,
             },
             Case {
                 name: "tag key at the limit",
