@@ -12,7 +12,7 @@ To inspect readable configurations while identifying failures, use the same auth
 
 ## Recover unreadable replication targets
 
-MinIO target configuration may be an array or KMS-encrypted data that RustFS cannot decode. Diagnosis preserves the failure instead of interpreting it as an empty target set.
+RustFS currently accepts the documented `{"targets": [...]}` object format. It cannot decrypt MinIO KMS-encrypted target metadata. Unreadable target payloads remain failures instead of being interpreted as an empty target set; diagnostic export and replacement import do not add MinIO KMS decryption support.
 
 1. Inspect the diagnostic manifest to identify affected buckets. Preserve a separate backup of the original source configuration and any credentials needed for recovery.
 2. Prepare a ZIP containing `<bucket>/bucket-targets.json` with a valid RustFS replacement, whose top-level shape is `{"targets": [...]}`. Supply the intended target settings and credentials; exported credentials are redacted. Use `{"targets": []}` only when intentionally clearing all targets, and reconcile any replication rules that reference removed targets.
