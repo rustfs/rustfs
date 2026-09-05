@@ -34,8 +34,7 @@ on:
           - site
         default: all
   repository_dispatch:
-    # Chain handoff: dispatched when the security suite finishes. This is the
-    # last link of the functional chain.
+    # Chain handoff: dispatched when the security suite finishes.
     types: [rustfs-chain-replication]
 
 permissions:
@@ -330,13 +329,50 @@ jobs:
             '
           done
 
-      - name: Chain complete
-        # Replication is the last link of the functional chain: nothing to
-        # dispatch after it. This step just records that the chain finished.
+      - name: "Continue functional chain (next: Performance)"
         if: ${{ always() && github.event_name == 'repository_dispatch' }}
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
         run: |
-          echo "Functional chain complete: replication (final suite) finished."
-          echo "from_suite=security trigger=${{ github.event_name }} outcome=${{ steps.test.outcome }}"
+          set -uo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; cannot dispatch the next suite" >&2
+            exit 1
+          fi
+          DISPATCHED=0
+          for attempt in 1 2 3; do
+            if gh api --method POST repos/rustfs/rustfs/dispatches \
+              -f event_type='rustfs-chain-performance' \
+              -F 'client_payload[from_suite]=replication'; then
+              echo "dispatched next suite Performance (attempt ${attempt})"
+              DISPATCHED=1
+              break
+            fi
+            echo "dispatch attempt ${attempt} failed; retrying in ${attempt}0s" >&2
+            sleep "${attempt}0"
+          done
+          if [ "${DISPATCHED:-0}" -ne 1 ]; then
+            echo "ERROR: functional chain stalled: could not dispatch Performance after 3 attempts" >&2
+            TITLE="[functional][chain] stalled after replication (run ${GITHUB_RUN_ID})"
+            BODY_FILE="$(mktemp)"
+            trap 'rm -f "${BODY_FILE}"' EXIT
+            {
+              echo "The functional chain could not hand off from **replication** to **Performance** after 3 attempts."
+              echo ""
+              echo "- Failed suite job: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+              echo "- Expected next event: 'rustfs-chain-performance'"
+              echo "- Likely cause: PF_TESTING_GH_TOKEN lacks contents:write on rustfs/rustfs, or the GitHub API was unavailable."
+              echo "- Recovery: re-dispatch manually with"
+              FENCE="$(printf "\x60\x60\x60")"; echo "  ${FENCE}"
+              echo "  gh api --method POST repos/rustfs/rustfs/dispatches -f event_type='rustfs-chain-performance'"
+              FENCE="$(printf "\x60\x60\x60")"; echo "  ${FENCE}"
+            } > "${BODY_FILE}"
+            gh issue create -R rustfs/backlog --title "${TITLE}" \
+              --body-file "${BODY_FILE}" --label functional-test \
+              || gh issue create -R rustfs/backlog --title "${TITLE}" --body-file "${BODY_FILE}" \
+              || echo "could not file the stall alert issue either; check the token" >&2
+            exit 1
+          fi
 
       - name: Notify on failure
         if: failure()
