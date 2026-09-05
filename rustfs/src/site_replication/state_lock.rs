@@ -28,8 +28,10 @@
 //! process-local lock must never be reintroduced in front of it as if it
 //! added protection. All IO inside the closure must use the `*_no_lock`
 //! config helpers — the locked variants would self-deadlock on the same
-//! object lock. Do not perform peer network calls or take other config locks
-//! inside the closure.
+//! object lock. Write-lock closures must not perform peer network calls or
+//! take other config locks. A read-lock closure may carry bounded peer
+//! delivery only when the receiver cannot write this state. Peer-edit
+//! delivery must run after the read lock is released.
 //!
 //! Lock order: lifecycle -> bucket operation -> repair admission
 //! -> state object lock -> per-bucket metadata.
@@ -58,8 +60,10 @@ where
 }
 
 /// Hold the distributed state-object read lock while `operation` validates a
-/// topology snapshot and performs one bounded side effect. Topology writers
-/// use the matching write lock through [`with_site_replication_state_lock`].
+/// topology snapshot. The closure may carry a bounded peer delivery only when
+/// its receiver cannot write site replication state; peer-edit delivery must
+/// run after this lock is released. Topology writers use the matching write
+/// lock through [`with_site_replication_state_lock`].
 pub(crate) async fn with_site_replication_state_read_lock<T, F, Fut>(operation: F) -> S3Result<T>
 where
     T: Send + 'static,
