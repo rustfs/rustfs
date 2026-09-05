@@ -430,7 +430,7 @@ pub(crate) mod on_demand_migration {
 
     #[cfg(test)]
     pub(crate) mod test_support {
-        pub(crate) use crate::storage::storage_api::contract::bucket::BucketOperations;
+        pub(crate) use crate::storage::storage_api::contract::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, BucketOperations};
         pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::{
             BUCKET_ON_DEMAND_MIGRATION_CONFIG, BucketMetadata,
         };

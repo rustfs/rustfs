@@ -1552,7 +1552,8 @@ pub async fn run_backfill_recovery_loop(runner: Arc<BackfillRunner>, cancel: Can
 #[cfg(test)]
 mod tests {
     use super::super::storage_api::test_support::{
-        BucketOperations as _, PutObjectCommitBarrier, PutObjectCommitPause, isolated_store_over_temp_disks,
+        BUCKET_LIFECYCLE_LOCK_OBJECT, BucketOperations as _, PutObjectCommitBarrier, PutObjectCommitPause,
+        isolated_store_over_temp_disks,
     };
     use super::*;
     use crate::on_demand_migration::source_client::SourceObject;
@@ -1879,6 +1880,24 @@ mod tests {
             barrier.wait_until_paused().await;
             waiter.abort();
             assert!(waiter.await.expect_err("caller aborted").is_cancelled());
+
+            let lifecycle_lock = store
+                .new_ns_lock(&bucket, BUCKET_LIFECYCLE_LOCK_OBJECT)
+                .await
+                .expect("lifecycle lock");
+            {
+                let mut probe = Box::pin(lifecycle_lock.get_write_lock(Duration::from_secs(1)));
+                assert!(
+                    futures::poll!(probe.as_mut()).is_pending(),
+                    "lifecycle writer must first try to acquire the lock"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), probe.as_mut())
+                        .await
+                        .is_err(),
+                    "the checkpoint owner must retain the user bucket lifecycle read lock after caller cancellation"
+                );
+            }
 
             let delete_api = Arc::clone(&store);
             let delete_bucket = bucket.clone();
