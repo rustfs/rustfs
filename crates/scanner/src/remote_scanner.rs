@@ -52,6 +52,9 @@ static REMOTE_SCANNER_CYCLE_REFRESH: LazyLock<AsyncMutex<()>> = LazyLock::new(||
 
 mod stream;
 
+#[cfg(test)]
+pub(crate) use stream::checkpoint_fixture_partial_return;
+
 pub use stream::{RemoteScannerAdmission, RemoteScannerRequest, serve_remote_scanner_request};
 pub(crate) use stream::{RemoteScannerOutcome, RemoteScannerScanSpec, scan_remote_bucket};
 use stream::{RemoteScannerReplayCache, RemoteScannerRequestWire, RemoteScannerValidatedCycle};
