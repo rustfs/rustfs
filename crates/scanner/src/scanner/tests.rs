@@ -8631,7 +8631,8 @@ fn scoped_scan_remote_dirty_coverage_invalidates_local_bucket_current() {
             new_plan,
             crate::scanner_io::DataUsageCacheReuseOptions {
                 require_source: true,
-                tier_registry_generation: None
+                tier_registry_generation: None,
+                checkpoint_identity: None,
             },
         ),
         crate::scanner_io::DataUsageCacheScanState::Prepared {

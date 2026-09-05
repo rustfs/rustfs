@@ -299,6 +299,20 @@ fn checkpoint_fixture_roundtrip_retains_verified_scope_but_old_reader_rebuilds()
 }
 
 #[test]
+fn checkpoint_fixture_optional_coverage_metadata_roundtrips_together() {
+    let (mut cache, _) = bound_checkpoint();
+    cache.info.scan_coverage_digest = Some(DataUsageScanPlanDigest([77; 32]));
+    let encoded = cache.marshal_msg().expect("encode every optional coverage field");
+    let decoded = DataUsageCache::unmarshal(&encoded).expect("decode combined W03/W04 metadata map");
+    assert_eq!(decoded.info.scan_identity, cache.info.scan_identity);
+    assert_eq!(decoded.info.scan_progress, cache.info.scan_progress);
+    assert_eq!(decoded.info.scan_coverage_receipt, cache.info.scan_coverage_receipt);
+    assert_eq!(decoded.info.scan_coverage_digest, cache.info.scan_coverage_digest);
+    assert_eq!(decoded.validated_scan_frontier(), Some("bucket/static"));
+    assert!(!decoded.info.snapshot_complete);
+}
+
+#[test]
 fn checkpoint_fixture_unchanged_complete_plan_keeps_existing_rescan_policy() {
     let (mut cache, identity) = bound_checkpoint();
     cache.info.scan_progress = None;
