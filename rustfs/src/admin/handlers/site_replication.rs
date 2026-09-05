@@ -9570,8 +9570,8 @@ mod tests {
         assert_eq!(SITE_REPLICATION_PEER_REQUEST_TIMEOUT, Duration::from_secs(10));
         assert_eq!(SITE_REPLICATION_PEER_CONNECT_TIMEOUT, Duration::from_secs(3));
         assert!(
-            SITE_REPLICATION_RETRY_PROBE_BATCH_TIMEOUT < SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT,
-            "the entire retry probe batch must finish before lifecycle waiters time out"
+            SITE_REPLICATION_RETRY_DRAIN_BATCH_TIMEOUT < SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT,
+            "the entire retry drain batch must finish before lifecycle waiters time out"
         );
         assert!(
             SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT >= SITE_REPLICATION_PEER_REQUEST_TIMEOUT,

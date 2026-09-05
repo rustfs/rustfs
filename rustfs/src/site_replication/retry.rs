@@ -16,9 +16,7 @@ use super::*;
 
 pub(crate) const SITE_REPLICATION_RETRY_QUEUE_LIMIT: usize = 256;
 
-pub(crate) const SITE_REPLICATION_RETRY_PROBE_CONCURRENCY: usize = 4;
-
-pub(crate) const SITE_REPLICATION_RETRY_PROBE_BATCH_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const SITE_REPLICATION_RETRY_DRAIN_BATCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Attempts before an entry reports as `failed` in retryStats. Visibility
 /// only: a `failed` entry stays drain-eligible, and the reachability probe
@@ -276,6 +274,37 @@ pub(crate) fn retry_stats_for_state(state: &SiteReplicationState) -> Option<SRRe
 
 pub(crate) async fn enqueue_site_replication_retry_event(peer: &PeerInfo, path: &str, error: &S3Error) {
     enqueue_site_replication_retry_event_for_generation(peer, path, error, None).await
+}
+
+pub(crate) fn prequeue_site_replication_destructive_events_in_state(
+    state: &mut SiteReplicationState,
+    peers: &[PeerInfo],
+    path: &str,
+) {
+    for peer in peers {
+        if state.peers.contains_key(&peer.deployment_id) {
+            upsert_site_replication_retry_event(
+                &mut state.retry_queue,
+                peer,
+                path,
+                "destructive site replication bucket operation pending delivery",
+                None,
+            );
+        }
+    }
+}
+
+pub(crate) async fn prequeue_site_replication_destructive_events(peers: &[PeerInfo], path: &str) -> S3Result<()> {
+    if peers.is_empty() {
+        return Ok(());
+    }
+    let peers = peers.to_vec();
+    let path = path.to_string();
+    update_site_replication_state(move |state| {
+        prequeue_site_replication_destructive_events_in_state(state, &peers, &path);
+        Ok(())
+    })
+    .await
 }
 
 pub(crate) async fn enqueue_site_replication_retry_event_for_generation(
@@ -1109,8 +1138,6 @@ pub(crate) async fn promote_reachable_deferred_retry_events(
     actionable: &mut Vec<SiteReplicationRetryEvent>,
     deferred: Vec<SiteReplicationRetryEvent>,
 ) {
-    use futures::StreamExt as _;
-
     let due_peers: HashSet<String> = actionable.iter().map(|event| event.peer_deployment_id.clone()).collect();
     let mut deferred_by_peer: BTreeMap<String, Vec<SiteReplicationRetryEvent>> = BTreeMap::new();
     for event in deferred {
@@ -1136,10 +1163,7 @@ pub(crate) async fn promote_reachable_deferred_retry_events(
             (deployment_id, peer.endpoint.clone(), events, reachable)
         })
     });
-    let mut probes = futures::stream::iter(probes).buffer_unordered(SITE_REPLICATION_RETRY_PROBE_CONCURRENCY);
-    let deadline = tokio::time::Instant::now() + SITE_REPLICATION_RETRY_PROBE_BATCH_TIMEOUT;
-    while let Ok(Some((deployment_id, peer_endpoint, events, reachable))) = tokio::time::timeout_at(deadline, probes.next()).await
-    {
+    for (deployment_id, peer_endpoint, events, reachable) in futures::future::join_all(probes).await {
         if reachable {
             info!(
                 component = LOG_COMPONENT_ADMIN,
@@ -1269,11 +1293,17 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
         let now = OffsetDateTime::now_utc();
         let mut actionable = actionable_site_replication_retry_events(&runtime.state, now);
         let deferred = deferred_site_replication_retry_events(&runtime.state, now);
-        promote_reachable_deferred_retry_events(&runtime, &mut actionable, deferred).await;
-        if actionable.is_empty() {
-            return Ok(());
+        let drain = async {
+            promote_reachable_deferred_retry_events(&runtime, &mut actionable, deferred).await;
+            if actionable.is_empty() {
+                return Ok(());
+            }
+            drain_site_replication_retry_queue_locked(runtime, actionable).await
+        };
+        match tokio::time::timeout(SITE_REPLICATION_RETRY_DRAIN_BATCH_TIMEOUT, drain).await {
+            Ok(result) => result,
+            Err(_) => Ok(()),
         }
-        drain_site_replication_retry_queue_locked(runtime, actionable).await
     })
     .await
     .map_err(ApiError::from)?

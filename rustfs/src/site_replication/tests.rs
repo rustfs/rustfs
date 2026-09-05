@@ -794,6 +794,35 @@ fn test_bucket_make_retry_without_matching_configure_fails_closed() {
 }
 
 #[test]
+fn test_destructive_bucket_op_prequeues_every_remote_peer() {
+    let peer_b = PeerInfo {
+        deployment_id: "peer-b".to_string(),
+        ..peer("peer-b", "https://peer-b.example.com")
+    };
+    let peer_c = PeerInfo {
+        deployment_id: "peer-c".to_string(),
+        ..peer("peer-c", "https://peer-c.example.com")
+    };
+    let mut state = SiteReplicationState::default();
+    state.peers.insert(peer_b.deployment_id.clone(), peer_b.clone());
+    state.peers.insert(peer_c.deployment_id.clone(), peer_c.clone());
+    let path = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket";
+
+    prequeue_site_replication_destructive_events_in_state(&mut state, &[peer_b, peer_c], path);
+
+    assert_eq!(state.retry_queue.len(), 2);
+    assert!(state.retry_queue.iter().all(|event| event.path == path));
+    assert_eq!(
+        state
+            .retry_queue
+            .iter()
+            .map(|event| event.peer_deployment_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["peer-b", "peer-c"])
+    );
+}
+
+#[test]
 fn test_retry_snapshot_fingerprint_detects_concurrent_iam_change() {
     let old = SRIAMItem {
         r#type: "policy".to_string(),

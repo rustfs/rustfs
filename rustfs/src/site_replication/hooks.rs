@@ -393,6 +393,39 @@ pub(crate) async fn broadcast_site_replication_make_bucket(
     broadcast_site_replication_json_using_runtime(runtime, &configure_path, &serde_json::json!({})).await
 }
 
+async fn broadcast_site_replication_destructive_bucket_op(runtime: &SiteReplicationRuntime, path: &str) -> S3Result<()> {
+    let peers = runtime
+        .state
+        .peers
+        .values()
+        .filter(|peer| {
+            peer.deployment_id != runtime.local_peer.deployment_id
+                && !same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    prequeue_site_replication_destructive_events(&peers, path).await?;
+    let mut first_error = None;
+    for peer in &peers {
+        let result = async {
+            let transport = PeerTransport::for_runtime_peer(peer).await?;
+            PeerAdminRequest::put(&transport.connection, path, &runtime.state.service_account_access_key)
+                .with_client(&transport.client)
+                .send(&runtime.service_account_secret_key, &serde_json::json!({}))
+                .await
+        }
+        .await;
+        match result {
+            Ok(_) => dequeue_site_replication_retry_event(peer, path).await,
+            Err(err) => {
+                enqueue_site_replication_retry_event(peer, path, &err).await;
+                first_error.get_or_insert(err);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: bool) -> S3Result<()> {
     let operation = if force_delete {
         "force-delete-bucket"
@@ -424,7 +457,7 @@ pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: boo
     let retry_path = path.clone();
     let result =
         with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
-            broadcast_site_replication_json_with_runtime(&runtime, &path, &serde_json::json!({})).await
+            broadcast_site_replication_destructive_bucket_op(&runtime, &path).await
         })
         .await;
     match result {
