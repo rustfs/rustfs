@@ -103,7 +103,9 @@ pub(crate) use rustfs_ecstore::api::rebalance::{
     RebalStatus as EcstoreRebalStatus, RebalanceInfo as EcstoreRebalanceInfo, RebalanceMeta as EcstoreRebalanceMeta,
     RebalanceStats as EcstoreRebalanceStats,
 };
-pub(crate) use rustfs_ecstore::api::rpc::ScannerBucketListing as EcstoreScannerBucketListing;
+pub(crate) use rustfs_ecstore::api::rpc::{
+    ScannerBucketListing as EcstoreScannerBucketListing, ScannerPeerDirtyUsageSnapshot as EcstoreScannerPeerDirtyUsageSnapshot,
+};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::runtime::InstanceContext as EcstoreInstanceContext;
 pub(crate) use rustfs_ecstore::api::runtime::{

@@ -1170,6 +1170,7 @@ pub async fn save_manual_transition_job_record_if_current(
         data.clone(),
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_match: Some(current_etag.to_string()),
                 ..Default::default()
@@ -1242,6 +1243,7 @@ pub(crate) async fn save_manual_transition_worker_result_if_absent(
         data,
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_none_match: Some("*".to_string()),
                 ..Default::default()
@@ -1270,6 +1272,7 @@ pub(crate) async fn save_manual_transition_task_if_absent(
         data,
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_none_match: Some("*".to_string()),
                 ..Default::default()
@@ -1621,6 +1624,7 @@ pub async fn save_manual_transition_scope_admission_if_absent(
         data.clone(),
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_none_match: Some("*".to_string()),
                 ..Default::default()
@@ -1672,6 +1676,7 @@ pub async fn save_manual_transition_scope_admission_if_current(
         data.clone(),
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_match: Some(current_etag.to_string()),
                 ..Default::default()

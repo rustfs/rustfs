@@ -530,6 +530,10 @@ mod tests {
                 "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 63\r\nConnection: close\r\n\r\n<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>",
                 "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 66\r\nConnection: close\r\n\r\n<Error><Code>NoSuchObject</Code><Message>missing</Message></Error>",
                 "HTTP/1.1 403 Forbidden\r\nContent-Type: application/xml\r\nContent-Length: 65\r\nConnection: close\r\n\r\n<Error><Code>AccessDenied</Code><Message>denied</Message></Error>",
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 63\r\nConnection: close\r\n\r\n<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>",
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Type: application/xml\r\nContent-Length: 72\r\nConnection: close\r\n\r\n<Error><Code>InvalidRange</Code><Message>empty version</Message></Error>",
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 67\r\nConnection: close\r\n\r\n<Error><Code>NoSuchVersion</Code><Message>missing</Message></Error>",
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: 63\r\nConnection: close\r\n\r\n<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>",
             ];
             let mut requests = Vec::new();
             for response in responses {
@@ -623,15 +627,52 @@ mod tests {
             .await
             .expect_err("an authorization failure must not be mistaken for a missing key");
         assert_eq!(to_error_response(&err).code, S3ErrorCode::AccessDenied);
+        assert_eq!(
+            backend
+                .probe_transition_candidate("delete-marker-hidden")
+                .await
+                .expect("a current delete marker should hide the data version"),
+            TransitionCandidateProbe::Missing
+        );
+        assert_eq!(
+            backend
+                .probe_transition_version("delete-marker-hidden", "historical-version")
+                .await
+                .expect("the stored historical version should be probed exactly"),
+            TransitionCandidateProbe::VersionedPresent("historical-version".to_string())
+        );
+        assert_eq!(
+            backend
+                .probe_transition_version("delete-marker-hidden", "missing-version")
+                .await
+                .expect("a missing exact version should be classified"),
+            TransitionCandidateProbe::Missing
+        );
+        assert_eq!(
+            backend
+                .probe_transition_version("missing-object", "historical-version")
+                .await
+                .expect("a missing key for an exact version probe should be classified"),
+            TransitionCandidateProbe::Missing
+        );
 
         let requests = fixture.await.expect("candidate fixture should join");
-        for request in requests {
+        for request in &requests[..6] {
             let request = request.to_ascii_lowercase();
             assert!(request.starts_with("get /bucket/"), "candidate discovery must use object GET");
             assert!(request.contains("\r\nrange: bytes=0-0\r\n"));
             assert!(!request.contains("?versioning"));
             assert!(!request.contains("?versions"));
         }
+        for request in &requests[6..] {
+            let request = request.to_ascii_lowercase();
+            assert!(request.starts_with("get /bucket/"), "exact discovery must use object GET");
+            assert!(request.contains("\r\nrange: bytes=0-0\r\n"));
+        }
+        assert!(!requests[5].to_ascii_lowercase().contains("versionid="));
+        assert!(requests[6].to_ascii_lowercase().contains("?versionid=historical-version"));
+        assert!(requests[7].to_ascii_lowercase().contains("?versionid=missing-version"));
+        assert!(requests[8].to_ascii_lowercase().contains("?versionid=historical-version"));
     }
 
     fn list_versions(versions: &[(&str, &str)], delete_markers: &[(&str, &str)], is_truncated: bool) -> ListVersionsResult {

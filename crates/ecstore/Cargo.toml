@@ -244,6 +244,7 @@ windows-sys = { workspace = true, features = [
 windows-sys = { workspace = true, features = ["Win32_System_Ioctl"] }
 
 [dev-dependencies]
+aws-smithy-async.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "fs"] }
 criterion = { workspace = true, features = ["html_reports"] }
 temp-env = { workspace = true, features = ["async_closure"] }

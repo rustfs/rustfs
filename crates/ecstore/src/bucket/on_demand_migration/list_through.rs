@@ -189,8 +189,8 @@ pub enum SourceListPlan {
     /// delimiter — the source's own roll-up boundary matches the request's.
     Page { prefix: String },
     /// `filter.prefix` reaches past a delimiter, so every key the source could
-    /// contribute rolls into this one common prefix. One bounded probe listing
-    /// decides whether it exists; there is nothing to paginate.
+    /// contribute rolls into this one common prefix. Bounded probes follow
+    /// empty progressing pages until a key proves existence or the source ends.
     Folded { probe_prefix: String, common_prefix: String },
 }
 
@@ -279,6 +279,29 @@ pub struct FetchRequest {
     pub token: Option<String>,
 }
 
+/// Invalid pagination metadata. Opaque cursor values are never included in errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ListPageError {
+    #[error("truncated listing has no continuation token")]
+    Missing,
+    #[error("truncated listing has an empty continuation token")]
+    Empty,
+    #[error("truncated listing repeats a continuation token")]
+    Repeated,
+}
+
+pub(crate) fn validate_list_page(is_truncated: bool, token: Option<&str>, next_token: Option<&str>) -> Result<(), ListPageError> {
+    if is_truncated {
+        match next_token {
+            None => return Err(ListPageError::Missing),
+            Some("") => return Err(ListPageError::Empty),
+            Some(next) if Some(next) == token => return Err(ListPageError::Repeated),
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct SideState {
     start: SideCursor,
@@ -364,6 +387,11 @@ impl ListThroughMerger {
     /// or `filter.prefix` excludes it.
     pub fn disable_source(&mut self) {
         self.source.disabled = true;
+        // A refill can fail after a valid first page. A local-only response
+        // must discard both that source payload and its ordering horizon.
+        self.source.entries.clear();
+        self.source.pages.clear();
+        self.source.more = false;
     }
 
     pub fn next_fetch(&self) -> Option<FetchRequest> {
@@ -378,7 +406,13 @@ impl ListThroughMerger {
     /// Records one fetched page. `entries` must be sorted by `name` and already
     /// filtered with [`Self::accepts`]; the caller keeps the matching payloads
     /// in the same order.
-    pub fn push_page(&mut self, side: MergeSide, entries: Vec<ListEntryKey>, is_truncated: bool, next_token: Option<String>) {
+    pub fn push_page(
+        &mut self,
+        side: MergeSide,
+        entries: Vec<ListEntryKey>,
+        is_truncated: bool,
+        next_token: Option<String>,
+    ) -> Result<(), ListPageError> {
         let state = match side {
             MergeSide::Local => &mut self.local,
             MergeSide::Source => &mut self.source,
@@ -387,15 +421,19 @@ impl ListThroughMerger {
             Some(last) => last.next_token.clone(),
             None => state.start.token.clone(),
         };
-        // A truncated page without a cursor cannot be continued; treating the
-        // side as finished is the only alternative to looping on it forever.
-        state.more = is_truncated && next_token.is_some();
+        validate_list_page(is_truncated, token.as_deref(), next_token.as_deref())?;
+        // Also reject a cycle through an earlier page in this bounded fetch.
+        if is_truncated && state.pages.iter().any(|page| page.token == next_token) {
+            return Err(ListPageError::Repeated);
+        }
+        state.more = is_truncated;
         state.pages.push(FetchedPage {
             token,
             count: entries.len(),
             next_token: is_truncated.then_some(next_token).flatten(),
         });
         state.entries.extend(entries);
+        Ok(())
     }
 
     pub fn finish(self) -> MergeOutcome {
@@ -599,9 +637,15 @@ mod tests {
                 let (entries, truncated, next) = reference_page(keys, prefix, delimiter, fetch.token.as_deref(), max_keys);
                 let kept: Vec<ListEntryKey> = entries.into_iter().filter(|entry| merger.accepts(&entry.name)).collect();
                 buffers[usize::from(fetch.side == MergeSide::Source)].extend(kept.iter().cloned());
-                merger.push_page(fetch.side, kept, truncated, next);
+                merger
+                    .push_page(fetch.side, kept, truncated, next)
+                    .expect("reference provider pages must advance");
             }
             let outcome = merger.finish();
+            assert_eq!(outcome.is_truncated, outcome.next_token.is_some());
+            if outcome.is_truncated {
+                assert_ne!(outcome.next_token, token, "every truncated merged page must make progress");
+            }
             page_sizes.push(outcome.picks.len());
             for pick in &outcome.picks {
                 let entry = buffers[usize::from(pick.side == MergeSide::Source)][pick.index].clone();
@@ -616,11 +660,25 @@ mod tests {
     }
 
     fn expected(local: &[String], source: &[String], prefix: &str, delimiter: Option<&str>) -> Vec<ListEntryKey> {
-        let mut all: Vec<String> = local.iter().chain(source.iter()).cloned().collect();
-        all.sort();
-        all.dedup();
-        let (entries, _, _) = reference_page(&all, prefix, delimiter, None, usize::MAX);
-        entries
+        // This oracle builds the complete namespace independently of the
+        // provider's page/marker helper and the production merger.
+        let mut namespace = std::collections::BTreeMap::new();
+        for key in local.iter().chain(source) {
+            let Some(suffix) = key.strip_prefix(prefix) else {
+                continue;
+            };
+            if let Some(delimiter) = delimiter.filter(|delimiter| !delimiter.is_empty())
+                && let Some((directory, _)) = suffix.split_once(delimiter)
+            {
+                namespace.insert(format!("{prefix}{directory}{delimiter}"), true);
+                continue;
+            }
+            namespace.insert(key.clone(), false);
+        }
+        namespace
+            .into_iter()
+            .map(|(name, is_prefix)| ListEntryKey { name, is_prefix })
+            .collect()
     }
 
     #[test]
@@ -662,7 +720,9 @@ mod tests {
                 token: None
             })
         );
-        merger.push_page(MergeSide::Local, vec![ListEntryKey::object("a")], false, None);
+        merger
+            .push_page(MergeSide::Local, vec![ListEntryKey::object("a")], false, None)
+            .expect("local EOF is valid");
         assert_eq!(merger.next_fetch(), None);
         let outcome = merger.finish();
         assert_eq!(outcome.picks.len(), 1);
@@ -683,12 +743,14 @@ mod tests {
         };
         let mut merger = ListThroughMerger::new(1, Some(&resume));
         merger.disable_source();
-        merger.push_page(
-            MergeSide::Local,
-            vec![ListEntryKey::object("b"), ListEntryKey::object("c")],
-            true,
-            Some("local-2".to_string()),
-        );
+        merger
+            .push_page(
+                MergeSide::Local,
+                vec![ListEntryKey::object("b"), ListEntryKey::object("c")],
+                true,
+                Some("local-2".to_string()),
+            )
+            .expect("local cursor advances");
         let outcome = merger.finish();
         assert!(outcome.is_truncated);
         let token = outcome.next_token.expect("truncated page carries a token");
@@ -696,6 +758,212 @@ mod tests {
         assert!(!token.source_done);
         assert_eq!(token.last_key.as_deref(), Some("b"));
         assert_eq!(token.local.as_deref(), Some("local-1"), "a partly read page is re-listed");
+    }
+
+    #[test]
+    fn truncated_pages_require_a_nonempty_advancing_cursor() {
+        for side in [MergeSide::Local, MergeSide::Source] {
+            for entries in [vec![], vec![ListEntryKey::object("a")]] {
+                for (next, expected) in [
+                    (None, Err(ListPageError::Missing)),
+                    (Some(""), Err(ListPageError::Empty)),
+                    (Some("stuck"), Err(ListPageError::Repeated)),
+                    (Some("advances"), Ok(())),
+                ] {
+                    let resume = ListThroughToken::new(
+                        SideCursor {
+                            token: Some("stuck".into()),
+                            done: false,
+                        },
+                        SideCursor {
+                            token: Some("stuck".into()),
+                            done: false,
+                        },
+                        None,
+                    );
+                    let mut merger = ListThroughMerger::new(2, Some(&resume));
+                    let result = merger.push_page(side, entries.clone(), true, next.map(str::to_string));
+                    assert_eq!(result, expected, "{side:?}, {entries:?}, {next:?}");
+                    let state = if side == MergeSide::Local {
+                        &merger.local
+                    } else {
+                        &merger.source
+                    };
+                    assert_eq!(state.pages.len(), usize::from(result.is_ok()), "invalid page must not be accepted");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_empty_cursor_is_rejected_before_an_identical_page_can_escape() {
+        let resume = ListThroughToken::new(
+            SideCursor { token: None, done: true },
+            SideCursor {
+                token: Some("stuck".into()),
+                done: false,
+            },
+            None,
+        );
+        let mut merger = ListThroughMerger::new(2, Some(&resume));
+        assert_eq!(
+            merger.next_fetch(),
+            Some(FetchRequest {
+                side: MergeSide::Source,
+                token: Some("stuck".into())
+            })
+        );
+        assert_eq!(
+            merger.push_page(MergeSide::Source, vec![], true, Some("stuck".into())),
+            Err(ListPageError::Repeated)
+        );
+    }
+
+    #[test]
+    fn empty_pages_may_advance_within_the_fetch_budget_until_eof() {
+        let mut merger = ListThroughMerger::new(2, None);
+        merger.push_page(MergeSide::Local, vec![], false, None).expect("local EOF");
+        for next in ["opaque-z", "opaque-a"] {
+            assert_eq!(merger.next_fetch().expect("bounded source fetch").side, MergeSide::Source);
+            merger
+                .push_page(MergeSide::Source, vec![], true, Some(next.into()))
+                .expect("opaque cursor advances regardless of sort order");
+        }
+        assert!(merger.next_fetch().is_none(), "two source fetches exhaust the request budget");
+        let outcome = merger.finish();
+        assert!(outcome.picks.is_empty());
+        assert!(outcome.is_truncated);
+        let token = outcome.next_token.expect("empty progressing page has a cursor");
+        assert_eq!(token.source.as_deref(), Some("opaque-a"));
+        let mut merger = ListThroughMerger::new(2, Some(&token));
+        assert_eq!(merger.next_fetch().expect("source resumes").token.as_deref(), Some("opaque-a"));
+        merger
+            .push_page(MergeSide::Source, vec![ListEntryKey::object("result")], false, None)
+            .expect("source EOF");
+        let outcome = merger.finish();
+        assert_eq!(
+            outcome.picks,
+            vec![MergePick {
+                side: MergeSide::Source,
+                index: 0
+            }]
+        );
+        assert!(!outcome.is_truncated);
+        assert!(outcome.next_token.is_none());
+    }
+
+    #[test]
+    fn a_cursor_cycle_inside_the_fetch_budget_is_rejected() {
+        let resume = ListThroughToken::new(
+            SideCursor { token: None, done: true },
+            SideCursor {
+                token: Some("first".into()),
+                done: false,
+            },
+            None,
+        );
+        let mut merger = ListThroughMerger::new(2, Some(&resume));
+        merger
+            .push_page(MergeSide::Source, vec![], true, Some("second".into()))
+            .expect("first page advances");
+        assert_eq!(
+            merger.push_page(MergeSide::Source, vec![], true, Some("first".into())),
+            Err(ListPageError::Repeated)
+        );
+    }
+
+    #[test]
+    fn source_refill_failure_discards_buffered_source_entries_and_horizon() {
+        let mut merger = ListThroughMerger::new(2, None);
+        merger
+            .push_page(MergeSide::Local, vec![ListEntryKey::object("z")], false, None)
+            .expect("local EOF");
+        merger
+            .push_page(MergeSide::Source, vec![ListEntryKey::object("a")], true, Some("stuck".into()))
+            .expect("first source page advances");
+        assert_eq!(merger.next_fetch().expect("source refill is required").token.as_deref(), Some("stuck"));
+        assert_eq!(
+            merger.push_page(MergeSide::Source, vec![], true, Some("stuck".into())),
+            Err(ListPageError::Repeated)
+        );
+        merger.disable_source();
+        let outcome = merger.finish();
+        assert_eq!(
+            outcome.picks,
+            vec![MergePick {
+                side: MergeSide::Local,
+                index: 0
+            }]
+        );
+        assert!(!outcome.is_truncated);
+        assert!(outcome.next_token.is_none());
+    }
+
+    #[test]
+    fn list_through_static_namespace_boundary_matrix() {
+        let corpus = [
+            "a",
+            "a/",
+            "a/b",
+            "a/b/child",
+            "a0",
+            "b",
+            "b/leaf",
+            "quote\"&<",
+            "space key",
+            "z",
+            "é",
+            "中/文",
+        ];
+        for count in [0, 1, 3, 4, corpus.len()] {
+            let keys: Vec<String> = corpus[..count].iter().map(|key| (*key).to_string()).collect();
+            for placement in 0..3 {
+                let (local, source): (Vec<_>, Vec<_>) =
+                    keys.iter()
+                        .enumerate()
+                        .fold((vec![], vec![]), |(mut local, mut source), (index, key)| {
+                            if placement != 1 || index % 2 == 0 {
+                                local.push(key.clone());
+                            }
+                            if placement != 0 || index % 2 == 0 {
+                                source.push(key.clone());
+                            }
+                            (local, source)
+                        });
+                for prefix in ["", "a", "a/", "中/"] {
+                    for delimiter in [None, Some("/")] {
+                        for max_keys in [1, 3, 4] {
+                            let oracle = expected(&local, &source, prefix, delimiter);
+                            let (emitted, sizes) = walk(&local, &source, prefix, delimiter, max_keys);
+                            assert_eq!(
+                                emitted.iter().map(|(entry, _)| entry.clone()).collect::<Vec<_>>(),
+                                oracle,
+                                "count={count}, placement={placement}, prefix={prefix}, delimiter={delimiter:?}, max={max_keys}"
+                            );
+                            let expected_sizes: Vec<_> = if oracle.is_empty() {
+                                vec![0]
+                            } else {
+                                oracle.chunks(max_keys).map(<[ListEntryKey]>::len).collect()
+                            };
+                            assert_eq!(sizes, expected_sizes, "exact max and max+1 boundaries must agree");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn list_through_large_overlap_walk_keeps_all_5300_keys() {
+        let source: Vec<_> = (0..5000).map(|index| format!("k{index:05}")).collect();
+        let local: Vec<_> = (4800..5300).map(|index| format!("k{index:05}")).collect();
+        let (emitted, sizes) = walk(&local, &source, "", None, 333);
+        assert_eq!(emitted.len(), 5300);
+        for (index, (entry, side)) in emitted.iter().enumerate() {
+            assert_eq!(entry.name, format!("k{index:05}"));
+            assert_eq!(*side, if index >= 4800 { MergeSide::Local } else { MergeSide::Source });
+        }
+        assert_eq!(sizes, [vec![333; 15], vec![305]].concat());
     }
 
     #[test]
@@ -796,7 +1064,10 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+        #![proptest_config(ProptestConfig {
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0xec5706),
+            ..ProptestConfig::with_cases(256)
+        })]
 
         /// Full pagination of a merged listing equals the sorted, deduplicated
         /// union of both sides, with every shared key served by local, and no

@@ -40,6 +40,7 @@ use rustfs_s3_client::credentials::{Credentials, SignatureType, Static, Value};
 use rustfs_s3_client::transition_api::{BucketLookupType, Options, TransitionClient, TransitionClientTimeouts, TransitionCore};
 use rustfs_s3_client::{
     admin_handler_utils::AdminError,
+    api_error_response::to_error_response,
     api_put_object::{AdvancedPutOptions, PutObjectOptions},
     transition_api::{ReadCloser, ReaderImpl},
 };
@@ -48,10 +49,13 @@ use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
 };
-use s3s::dto::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode, ReplicationStatus};
 use s3s::header::{
     X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_REPLICATION_STATUS,
     X_AMZ_STORAGE_CLASS,
+};
+use s3s::{
+    S3ErrorCode,
+    dto::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode, ReplicationStatus},
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -140,6 +144,42 @@ pub trait WarmBackend {
     }
     async fn probe_transition_candidate(&self, _object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
         Ok(TransitionCandidateProbe::Unsupported)
+    }
+    async fn probe_transition_version(
+        &self,
+        object: &str,
+        remote_version_id: &str,
+    ) -> Result<TransitionCandidateProbe, std::io::Error> {
+        if remote_version_id.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "an exact tier probe requires a remote version ID",
+            ));
+        }
+        self.validate_remote_version_id(remote_version_id)?;
+        match self
+            .get(
+                object,
+                remote_version_id,
+                WarmBackendGetOpts {
+                    start_offset: 0,
+                    length: 1,
+                },
+            )
+            .await
+        {
+            Ok(_) => Ok(TransitionCandidateProbe::VersionedPresent(remote_version_id.to_string())),
+            Err(err) if matches!(to_error_response(&err).code, S3ErrorCode::InvalidRange) => {
+                Ok(TransitionCandidateProbe::VersionedPresent(remote_version_id.to_string()))
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    || matches!(to_error_response(&err).code, S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchVersion) =>
+            {
+                Ok(TransitionCandidateProbe::Missing)
+            }
+            Err(err) => Err(err),
+        }
     }
     async fn in_use(&self) -> Result<bool, std::io::Error>;
 }
@@ -457,6 +497,17 @@ impl WarmBackend for MeteredWarmBackend {
             return result;
         }
         Self::record(TierRequestOperation::Probe, result)
+    }
+
+    async fn probe_transition_version(
+        &self,
+        object: &str,
+        remote_version_id: &str,
+    ) -> Result<TransitionCandidateProbe, std::io::Error> {
+        Self::record(
+            TierRequestOperation::Probe,
+            self.inner.probe_transition_version(object, remote_version_id).await,
+        )
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {
