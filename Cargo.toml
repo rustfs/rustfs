@@ -371,7 +371,8 @@ dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.5.3" }
-hotpath = { version = "0.25.1", default-features = false }
+# Preserve Unicode focus filters until rustfs/backlog#2302 is resolved.
+hotpath = { version = "=0.25.0", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }
 
