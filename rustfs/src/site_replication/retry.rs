@@ -16,6 +16,10 @@ use super::*;
 
 pub(crate) const SITE_REPLICATION_RETRY_QUEUE_LIMIT: usize = 256;
 
+pub(crate) const SITE_REPLICATION_RETRY_PROBE_CONCURRENCY: usize = 4;
+
+pub(crate) const SITE_REPLICATION_RETRY_PROBE_BATCH_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Attempts before an entry reports as `failed` in retryStats. Visibility
 /// only: a `failed` entry stays drain-eligible, and the reachability probe
 /// short-circuits its backoff once the peer answers again — so an early
@@ -1105,6 +1109,8 @@ pub(crate) async fn promote_reachable_deferred_retry_events(
     actionable: &mut Vec<SiteReplicationRetryEvent>,
     deferred: Vec<SiteReplicationRetryEvent>,
 ) {
+    use futures::StreamExt as _;
+
     let due_peers: HashSet<String> = actionable.iter().map(|event| event.peer_deployment_id.clone()).collect();
     let mut deferred_by_peer: BTreeMap<String, Vec<SiteReplicationRetryEvent>> = BTreeMap::new();
     for event in deferred {
@@ -1118,21 +1124,28 @@ pub(crate) async fn promote_reachable_deferred_retry_events(
             .or_default()
             .push(event);
     }
-    for (deployment_id, events) in deferred_by_peer {
-        let Some(peer) = runtime.state.peers.get(&deployment_id) else {
-            continue;
-        };
+    let probes = deferred_by_peer.into_iter().filter_map(|(deployment_id, events)| {
+        let peer = runtime.state.peers.get(&deployment_id)?;
         if deployment_id == runtime.local_peer.deployment_id
             || same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
         {
-            continue;
+            return None;
         }
-        if probe_site_replication_peer_reachable(runtime, peer).await {
+        Some(async move {
+            let reachable = probe_site_replication_peer_reachable(runtime, peer).await;
+            (deployment_id, peer.endpoint.clone(), events, reachable)
+        })
+    });
+    let mut probes = futures::stream::iter(probes).buffer_unordered(SITE_REPLICATION_RETRY_PROBE_CONCURRENCY);
+    let deadline = tokio::time::Instant::now() + SITE_REPLICATION_RETRY_PROBE_BATCH_TIMEOUT;
+    while let Ok(Some((deployment_id, peer_endpoint, events, reachable))) = tokio::time::timeout_at(deadline, probes.next()).await
+    {
+        if reachable {
             info!(
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
                 event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                peer = %peer.endpoint,
+                peer = %peer_endpoint,
                 deployment_id = %deployment_id,
                 promoted = events.len(),
                 result = "retry_backoff_probe_promoted",
@@ -1214,7 +1227,7 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
     // escalated markers are exactly the entries the drain skips.
     log_site_replication_retry_liabilities(&runtime.state);
     let now = OffsetDateTime::now_utc();
-    let mut actionable = actionable_site_replication_retry_events(&runtime.state, now);
+    let actionable = actionable_site_replication_retry_events(&runtime.state, now);
     let deferred = deferred_site_replication_retry_events(&runtime.state, now);
     if actionable.is_empty() && deferred.is_empty() {
         return Ok(());
@@ -1231,21 +1244,35 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
         // guard) may have started since. Re-check on the fresh state.
         return Ok(());
     }
-    // Probe before taking the repair lock: probes are read-only peer traffic
-    // and a dead peer's connect timeout must not hold the lock.
-    promote_reachable_deferred_retry_events(&runtime, &mut actionable, deferred).await;
-    if actionable.is_empty() {
-        return Ok(());
-    }
     // Serialize against operator repair execution. This does NOT close the
     // dry-run -> execute window (dry-run takes no lock): a drain settling a
     // replayable bucket-op entry in that window changes the preflight token
     // and execute fails safe with "preflight is stale" — the operator
     // re-runs the dry-run. Lock order matches repair: lifecycle guard (held
     // by the reconcile tick) -> repair execution lock -> state object lock
-    // inside the send bookkeeping. An operator repair holding the lock makes
-    // this tick skip after the lock-acquire timeout.
+    // inside the send bookkeeping. The lock also elects one server to probe
+    // and replay the queue; after acquiring it, reload state so a settled
+    // event or deleted bucket cannot be replayed from this admission snapshot.
     with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
+        // Runtime and queue snapshots captured before this distributed lock
+        // are only admission hints. Another node may have settled the event,
+        // or a local bucket may have been deleted, while this node waited.
+        let Some(runtime) = runtime_site_replication_targets().await? else {
+            return Ok(());
+        };
+        if runtime.state.pending_endpoint_refresh.is_some()
+            || runtime.state.pending_remove.is_some()
+            || runtime.state.pending_rotation.is_some()
+        {
+            return Ok(());
+        }
+        let now = OffsetDateTime::now_utc();
+        let mut actionable = actionable_site_replication_retry_events(&runtime.state, now);
+        let deferred = deferred_site_replication_retry_events(&runtime.state, now);
+        promote_reachable_deferred_retry_events(&runtime, &mut actionable, deferred).await;
+        if actionable.is_empty() {
+            return Ok(());
+        }
         drain_site_replication_retry_queue_locked(runtime, actionable).await
     })
     .await

@@ -406,7 +406,37 @@ pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: boo
             .append_pair("operation", operation)
             .finish()
     );
-    broadcast_site_replication_json(&path, &serde_json::json!({})).await
+    let Some(runtime) = runtime_site_replication_targets().await? else {
+        return Ok(());
+    };
+    let store =
+        current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
+    let retry_peers = runtime
+        .state
+        .peers
+        .values()
+        .filter(|peer| {
+            peer.deployment_id != runtime.local_peer.deployment_id
+                && !same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let retry_path = path.clone();
+    let result =
+        with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
+            broadcast_site_replication_json_with_runtime(&runtime, &path, &serde_json::json!({})).await
+        })
+        .await;
+    match result {
+        Ok(result) => result,
+        Err(err) => {
+            let err: S3Error = ApiError::from(err).into();
+            for peer in &retry_peers {
+                enqueue_site_replication_retry_event(peer, &retry_path, &err).await;
+            }
+            Err(err)
+        }
+    }
 }
 
 pub async fn site_replication_bucket_meta_hook(mut item: SRBucketMeta) -> S3Result<()> {
