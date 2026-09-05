@@ -1629,6 +1629,34 @@ mod test {
         assert!(bm.bucket_target_config.is_none());
     }
 
+    /// rustfs/backlog#2309: the MinIO-origin `.metadata.bin` this repository
+    /// already carries as a compatibility fixture stores
+    /// `BucketTargetsConfigJSON` as a bare JSON array, which `BucketTargets`
+    /// (a `{"targets":[…]}` struct with no array fallback) cannot decode. The
+    /// bytes below are the exact payload the fixture in
+    /// `metadata_test.rs::TEST_BUCKET_METADATA_HEX` decodes to, so if RustFS
+    /// ever grows the array-shaped compatibility parse, this test is where the
+    /// upgrade break is pinned and where the decision has to be recorded.
+    #[test]
+    fn minio_array_shaped_bucket_targets_are_unreadable() {
+        let minio_array = br#"[{"endpoint":"http://target.example.com","targetBucket":"tb","region":"us-east-1"}]"#.to_vec();
+        let mut bm = BucketMetadata::new("minio-array-targets");
+        bm.bucket_targets_config_json = minio_array.clone();
+
+        bm.parse_all_configs()
+            .expect("a MinIO-shaped targets blob must not fail the whole metadata load");
+
+        assert!(
+            bm.bucket_targets_unreadable(),
+            "an array-shaped MinIO targets blob is unreadable, not an empty target set"
+        );
+        assert!(bm.bucket_target_config.is_none());
+        assert_eq!(
+            bm.bucket_targets_config_json, minio_array,
+            "the raw MinIO bytes must survive so the configuration stays recoverable"
+        );
+    }
+
     /// The invariant every branch of `parse_all_configs` shares: a stored but
     /// undecodable payload keeps its raw bytes and leaves the typed field
     /// `None`, so no branch fabricates a value. What a reader may then do with
