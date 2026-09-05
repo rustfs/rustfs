@@ -3609,3 +3609,73 @@ async fn test_broadcast_json_reaches_healthy_peers_after_a_peer_without_transpor
     );
     server.abort();
 }
+
+fn service_account_item_with_claims(order: &[&str]) -> SRIAMItem {
+    let mut claims = HashMap::new();
+    for key in order {
+        claims.insert((*key).to_string(), serde_json::json!(format!("value-of-{key}")));
+    }
+    SRIAMItem {
+        r#type: "service-account".to_string(),
+        svc_acc_change: Some(SRSvcAccChange {
+            create: Some(rustfs_madmin::SRSvcAccCreate {
+                parent: "alice".to_string(),
+                access_key: "alice-svc".to_string(),
+                secret_key: "alice-svc-secret".to_string(),
+                groups: Vec::new(),
+                claims,
+                session_policy: SRSessionPolicy::default(),
+                status: "on".to_string(),
+                name: String::new(),
+                description: String::new(),
+                expiration: None,
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        }),
+        updated_at: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp")),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The repair preflight token and the retry-snapshot fingerprint hash the
+/// serialized items. Service-account claims live in a `HashMap`, whose
+/// iteration order differs between instances, so the hash must not depend on
+/// it (the real-VM repair returned 412 "preflight is stale" between dry-run
+/// and execute once snapshots carried service accounts).
+#[test]
+fn test_repair_task_id_and_retry_fingerprint_ignore_claim_map_order() {
+    let forward = service_account_item_with_claims(&["accessKey", "exp", "parent", "sa-policy", "sub", "tenant"]);
+    let backward = service_account_item_with_claims(&["tenant", "sub", "sa-policy", "parent", "exp", "accessKey"]);
+
+    let canonical = canonical_json_vec(&forward).expect("canonical json");
+    let text = String::from_utf8(canonical).expect("utf8");
+    let positions: Vec<usize> = [
+        "\"accessKey\"",
+        "\"exp\"",
+        "\"parent\"",
+        "\"sa-policy\"",
+        "\"sub\"",
+        "\"tenant\"",
+    ]
+    .iter()
+    .map(|key| text.find(key).expect("claim key present"))
+    .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "claim keys must serialize sorted: {text}"
+    );
+
+    assert_eq!(
+        SiteReplicationRepairTask::Iam(&forward).id().expect("id"),
+        SiteReplicationRepairTask::Iam(&backward).id().expect("id"),
+        "identical items must yield the same repair task id regardless of claim map order"
+    );
+    assert_eq!(
+        RetrySnapshot::Iam(vec![forward]).fingerprint().expect("fingerprint"),
+        RetrySnapshot::Iam(vec![backward]).fingerprint().expect("fingerprint"),
+        "identical snapshots must fingerprint equal regardless of claim map order"
+    );
+}

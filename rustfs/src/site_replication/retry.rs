@@ -867,8 +867,8 @@ impl RetrySnapshot {
 
     pub(crate) fn fingerprint(&self) -> S3Result<Vec<Vec<u8>>> {
         let mut payloads = match self {
-            Self::Iam(items) => items.iter().map(serde_json::to_vec).collect::<Result<Vec<_>, _>>(),
-            Self::BucketMetadata(items) => items.iter().map(serde_json::to_vec).collect::<Result<Vec<_>, _>>(),
+            Self::Iam(items) => items.iter().map(canonical_json_vec).collect::<Result<Vec<_>, _>>(),
+            Self::BucketMetadata(items) => items.iter().map(canonical_json_vec).collect::<Result<Vec<_>, _>>(),
         }
         .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize retry snapshot failed: {err}")))?;
         payloads.sort_unstable();

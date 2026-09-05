@@ -234,9 +234,9 @@ impl SiteReplicationRepairTask<'_> {
 
     pub(crate) fn id(&self) -> S3Result<String> {
         let payload = match self {
-            Self::Iam(item) => serde_json::to_vec(item),
+            Self::Iam(item) => canonical_json_vec(item),
             Self::BucketMake(_) | Self::Replication(_) => serde_json::to_vec(&serde_json::json!({})),
-            Self::BucketMetadata(item) => serde_json::to_vec(item),
+            Self::BucketMetadata(item) => canonical_json_vec(item),
         }
         .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize repair task failed: {err}")))?;
         let mut digest = Sha256::new();

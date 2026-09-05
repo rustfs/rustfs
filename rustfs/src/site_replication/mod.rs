@@ -110,6 +110,26 @@ use tracing::{info, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
+/// Serialize `value` with every JSON object's keys sorted, for hashing and
+/// equality checks. `HashMap` fields (service-account claims) iterate in a
+/// per-instance random order and `serde_json` is built with `preserve_order`,
+/// so two identical plans would otherwise hash differently: the repair
+/// preflight token went stale between dry-run and execute, and a retry
+/// snapshot resend never looked "stable" (backlog#2289 follow-up).
+pub(crate) fn canonical_json_vec<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
+    fn sort_keys(value: Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let sorted: BTreeMap<String, Value> = map.into_iter().map(|(key, value)| (key, sort_keys(value))).collect();
+                Value::Object(sorted.into_iter().collect())
+            }
+            Value::Array(items) => Value::Array(items.into_iter().map(sort_keys).collect()),
+            other => other,
+        }
+    }
+    serde_json::to_vec(&sort_keys(serde_json::to_value(value)?))
+}
+
 pub(crate) const LOG_COMPONENT_ADMIN: &str = "admin";
 
 pub(crate) const LOG_SUBSYSTEM_SITE_REPLICATION: &str = "site_replication";
