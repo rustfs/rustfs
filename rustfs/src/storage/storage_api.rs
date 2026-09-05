@@ -379,7 +379,7 @@ pub(crate) mod tonic_service_consumer {
     #[cfg(test)]
     pub(crate) use super::super::tonic_service::{heal_topology_fingerprint, make_heal_control_server_for_source};
     pub(crate) use super::super::tonic_service::{
-        make_heal_control_server_with_cache, make_server, make_tier_mutation_control_server,
+        make_heal_control_server_with_cache, make_scanner_control_server, make_server, make_tier_mutation_control_server,
     };
 }
 
@@ -1702,6 +1702,14 @@ pub(crate) async fn acquire_bucket_metadata_transaction_lock(
     bucket: &str,
 ) -> Result<ecstore_bucket::metadata_sys::BucketMetadataMutationGuard> {
     ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await
+}
+
+pub(crate) async fn acquire_scanner_bucket_incarnation_fence(
+    bucket: &str,
+    incarnation: uuid::Uuid,
+    owner_id: uuid::Uuid,
+) -> Result<ecstore_bucket::metadata_sys::BucketMetadataMutationGuard> {
+    ecstore_bucket::metadata_sys::acquire_scanner_bucket_incarnation_fence(bucket, incarnation, owner_id).await
 }
 
 pub(crate) async fn update_bucket_targets_under_transaction_lock(

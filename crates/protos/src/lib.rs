@@ -541,6 +541,8 @@ pub fn canonical_scanner_activity_v7_response_body(
     Ok(body)
 }
 
+pub mod scoped_dirty_usage;
+
 pub fn canonical_scanner_dirty_usage_snapshot_request_body(
     request: &proto_gen::node_service::ScannerDirtyUsageSnapshotRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {

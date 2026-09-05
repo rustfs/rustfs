@@ -121,6 +121,11 @@ fn map_bucket_target_error(err: BucketTargetError) -> S3Error {
         | BucketTargetError::BucketRemoteRemoveDisallowed { .. } => {
             S3Error::with_message(S3ErrorCode::InvalidRequest, err.to_string())
         }
+        // A stored target configuration this node cannot decode is a
+        // server-side data fault, not a bad request (rustfs/backlog#2282).
+        BucketTargetError::BucketRemoteTargetsUnreadable { .. } => {
+            S3Error::with_message(S3ErrorCode::InternalError, err.to_string())
+        }
         BucketTargetError::Io(io_err) => S3Error::with_message(S3ErrorCode::InternalError, io_err.to_string()),
     }
 }
@@ -753,7 +758,12 @@ impl Operation for ListRemoteTargetHandler {
                 .map_err(ApiError::from)?;
 
             let sys = BucketTargetSys::get();
-            let targets = sys.list_targets(bucket, "").await;
+            // An unreadable targets configuration must not be reported as an
+            // empty target list (rustfs/backlog#2282).
+            let targets = sys.list_targets(bucket, "").await.map_err(|e| {
+                error!("list remote targets failed: {}", e);
+                map_bucket_target_error(e)
+            })?;
 
             let targets: Vec<_> = targets
                 .iter()

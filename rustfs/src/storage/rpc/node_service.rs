@@ -493,6 +493,13 @@ impl std::fmt::Debug for NodeService {
     }
 }
 
+pub(crate) fn make_scanner_control_server() -> scanner_control_service_server::ScannerControlServiceServer<NodeService> {
+    let limit = rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES as usize;
+    scanner_control_service_server::ScannerControlServiceServer::new(make_server())
+        .max_decoding_message_size(limit)
+        .max_encoding_message_size(limit)
+}
+
 pub fn make_server() -> NodeService {
     let context = runtime_sources::current_app_context();
     make_server_for_context(context)
@@ -1084,6 +1091,74 @@ impl NodeService {
     fn get_lock_client(&self) -> Result<Arc<dyn LockClient>, Status> {
         runtime_sources::current_lock_client()
             .ok_or_else(|| Status::internal("Lock client not initialized. Please ensure storage is initialized first."))
+    }
+}
+
+#[tonic::async_trait]
+impl scanner_control_service_server::ScannerControlService for NodeService {
+    async fn scanner_scoped_dirty_usage_ack(
+        &self,
+        request: Request<ScannerScopedDirtyUsageAckRequest>,
+    ) -> Result<Response<ScannerScopedDirtyUsageAckResponse>, Status> {
+        use rustfs_protos::scoped_dirty_usage::*;
+        static ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+        let canonical =
+            canonical_scoped_dirty_usage_request(request.get_ref()).map_err(|err| Status::invalid_argument(err.to_string()))?;
+        verify_tonic_canonical_body_digest(&request, &canonical)
+            .map_err(|_| Status::permission_denied("scoped dirty usage authentication failed"))?;
+        let _admission = ADMISSION
+            .try_acquire()
+            .map_err(|_| Status::resource_exhausted("scoped dirty usage receiver is busy"))?;
+        let request = request.into_inner();
+        let store = self
+            .resolve_object_store()
+            .ok_or_else(|| Status::unavailable("storage layer is not initialized"))?;
+        if store.id.is_nil()
+            || request.owner_id != store.id.to_string()
+            || request.instance_id != rustfs_scanner::scanner_activity_epoch()
+        {
+            return Err(Status::failed_precondition("scoped dirty usage peer or process changed"));
+        }
+        let cleared = timeout(Duration::from_secs(30), async {
+            // Strict bucket order is validated before admission. Acquire every
+            // lifecycle/metadata fence before clearing any dirty record.
+            let mut guards = Vec::with_capacity(request.entries.len());
+            for entry in &request.entries {
+                let incarnation = Uuid::from_slice(entry.bucket_incarnation.as_ref())
+                    .map_err(|_| Status::invalid_argument("invalid bucket incarnation"))?;
+                let guard =
+                    crate::storage::storage_api::acquire_scanner_bucket_incarnation_fence(&entry.bucket, incarnation, store.id)
+                        .await
+                        .map_err(|_| Status::failed_precondition("trusted bucket incarnation is unavailable"))?;
+                guards.push(guard);
+            }
+            let entries = guards
+                .iter()
+                .zip(&request.entries)
+                .map(|(guard, entry)| (guard, entry.generation))
+                .collect::<Vec<_>>();
+            rustfs_scanner::acknowledge_scoped_dirty_usage(&request.instance_id, &entries, request.probe_only)
+                .map_err(|err| Status::failed_precondition(err.to_string()))
+        })
+        .await
+        .map_err(|_| Status::deadline_exceeded("scoped dirty usage incarnation validation timed out"))??;
+        let mut response = ScannerScopedDirtyUsageAckResponse {
+            protocol_version: SCOPED_DIRTY_USAGE_PROTOCOL_VERSION,
+            owner_id: request.owner_id,
+            instance_id: request.instance_id,
+            supported: true,
+            max_entries: SCOPED_DIRTY_USAGE_MAX_ENTRIES,
+            max_request_bytes: SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES,
+            cleared,
+            response_proof: Bytes::new(),
+        };
+        let body = canonical_scoped_dirty_usage_response(&canonical, &response)
+            .map_err(|_| Status::internal("scoped dirty usage response is too large"))?;
+        response.response_proof = sign_tonic_rpc_response_proof(&body)
+            .map_err(|_| Status::unavailable("scoped dirty usage response authentication is unavailable"))?
+            .into();
+        Ok(Response::new(response))
     }
 }
 
@@ -2056,9 +2131,9 @@ impl Node for NodeService {
             )
             .map_err(|err| Status::failed_precondition(err.to_string()))?;
         }
-        let namespace_generation = store.scanner_namespace_mutation_generation();
         let topology_digest = rustfs_scanner::scanner_topology_digest(store.as_ref());
         let (data_movement_active, publication_blocked, movement_generation) = store.scanner_data_movement_activity().await;
+        let namespace_generation = store.scanner_namespace_mutation_generation();
         let mut response = match request_protocol {
             SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION | SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION => {
                 previous_scanner_activity_response(namespace_generation, topology_digest, data_movement_active)
@@ -2623,6 +2698,7 @@ mod tests {
     use rustfs_kms::KmsServiceManager;
     use rustfs_protos::CanonicalMutationBody as _;
     use rustfs_protos::models::PingBodyBuilder;
+    use rustfs_protos::proto_gen::node_service::scanner_control_service_server::ScannerControlService as _;
     use rustfs_protos::proto_gen::node_service::{
         BackgroundHealStatusRequest, BatchGenerallyLockRequest, CancelDecommissionRequest, CheckPartsRequest,
         ClearDecommissionRequest, ControlPlaneErrorCode, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest,
@@ -5990,6 +6066,74 @@ mod tests {
         );
     }
 
+    fn scoped_dirty_usage_request() -> rustfs_protos::proto_gen::node_service::ScannerScopedDirtyUsageAckRequest {
+        rustfs_protos::proto_gen::node_service::ScannerScopedDirtyUsageAckRequest {
+            challenge: vec![7; 16].into(),
+            protocol_version: 1,
+            owner_id: "11111111-1111-1111-1111-111111111111".into(),
+            instance_id: "a".repeat(32),
+            scope: 1,
+            probe_only: false,
+            entries: vec![rustfs_protos::proto_gen::node_service::ScannerScopedDirtyUsageEntry {
+                bucket: "photos".into(),
+                bucket_incarnation: vec![1; 16].into(),
+                generation: 8,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_dirty_usage_authenticates_before_storage_and_rejects_tampering() {
+        use rustfs_protos::scoped_dirty_usage::canonical_scoped_dirty_usage_request;
+        let service = create_test_node_service();
+        let unsigned = service
+            .scanner_scoped_dirty_usage_ack(Request::new(scoped_dirty_usage_request()))
+            .await
+            .expect_err("unsigned ACK must not access storage");
+        assert_eq!(unsigned.code(), tonic::Code::PermissionDenied);
+        for field in 0..9 {
+            let mut signed = Request::new(scoped_dirty_usage_request());
+            let canonical = canonical_scoped_dirty_usage_request(signed.get_ref()).expect("canonical request");
+            set_tonic_canonical_body_digest(&mut signed, &canonical).expect("digest");
+            mark_v2_authenticated(&mut signed);
+            match field {
+                0 => signed.get_mut().challenge = vec![3; 16].into(),
+                1 => signed.get_mut().owner_id = "22222222-2222-2222-2222-222222222222".into(),
+                2 => signed.get_mut().instance_id = "b".repeat(32),
+                3 => signed.get_mut().probe_only = true,
+                4 => signed.get_mut().entries[0].bucket = "videos".into(),
+                5 => signed.get_mut().entries[0].bucket_incarnation = vec![2; 16].into(),
+                6 => signed.get_mut().entries[0].generation += 1,
+                7 => signed.get_mut().scope += 1,
+                _ => signed.get_mut().protocol_version += 1,
+            }
+            let error = service
+                .scanner_scoped_dirty_usage_ack(signed)
+                .await
+                .expect_err("tampered ACK must fail");
+            assert_eq!(
+                error.code(),
+                if field < 7 {
+                    tonic::Code::PermissionDenied
+                } else {
+                    tonic::Code::InvalidArgument
+                }
+            );
+        }
+        let mut signed = Request::new(scoped_dirty_usage_request());
+        let canonical = canonical_scoped_dirty_usage_request(signed.get_ref()).expect("canonical request");
+        set_tonic_canonical_body_digest(&mut signed, &canonical).expect("digest");
+        mark_v2_authenticated(&mut signed);
+        assert_eq!(
+            service
+                .scanner_scoped_dirty_usage_ack(signed)
+                .await
+                .expect_err("missing owner cannot advertise capability")
+                .code(),
+            tonic::Code::Unavailable
+        );
+    }
+
     #[tokio::test]
     async fn test_scanner_activity_requires_body_bound_auth_before_storage_lookup() {
         let service = create_test_node_service();
@@ -6118,6 +6262,91 @@ mod tests {
             .await
             .expect_err("authenticated activity queries still require initialized storage");
         assert_eq!(unavailable.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn scanner_activity_samples_namespace_generation_after_waiting_for_movement_state() {
+        use crate::storage::storage_api::{ObjectOptions, PutObjReader, contract::object::ObjectIO as _};
+
+        let _ = rustfs_credentials::set_global_rpc_secret("scanner-activity-generation-test-secret".to_string());
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("TESTROOTACCESSKEY".to_string()),
+            Some("TESTROOTSECRET123".to_string()),
+        );
+        let temp_dir = tempfile::tempdir().expect("scanner activity RPC test directory");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp_dir.path())
+            .build()
+            .await;
+        ObjectStore::new(Arc::clone(&env.ecstore))
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+            .await
+            .expect("build isolated IAM");
+        let context = Arc::new(crate::runtime_sources::AppContext::with_default_interfaces(
+            Arc::clone(&env.ecstore),
+            iam,
+            Arc::new(KmsServiceManager::new()),
+        ));
+        let service = make_server_for_context(Some(context));
+        let bucket = "scanner-activity-generation";
+        env.make_bucket(bucket, false).await;
+        let generation_before = env.ecstore.scanner_namespace_mutation_generation();
+        let mut request = Request::new(ScannerActivityRequest {
+            challenge: vec![7; 16].into(),
+            protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            acknowledge_instance_id: String::new(),
+            acknowledge_dirty_usage_generation: 0,
+        });
+        let canonical = rustfs_protos::canonical_scanner_activity_request_body(request.get_ref())
+            .expect("scanner activity request should encode");
+        set_tonic_canonical_body_digest(&mut request, &canonical).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut request);
+
+        let pool_meta = env.ecstore.pool_meta.write().await;
+        drop(
+            env.ecstore
+                .decommission_cancelers
+                .try_write()
+                .expect("movement snapshot should not hold the cancelers before the RPC"),
+        );
+        let mut activity = Box::pin(tokio::task::unconstrained(service.scanner_activity(request)));
+        assert!(futures::poll!(activity.as_mut()).is_pending());
+        assert!(
+            env.ecstore.decommission_cancelers.try_write().is_err(),
+            "the RPC must hold the cancelers read guard while waiting for pool metadata"
+        );
+
+        // Select the existing set directly: ECStore pool selection reads the lock held by this test.
+        let mut reader = PutObjReader::from_vec(b"namespace changed during activity probe".to_vec());
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            env.ecstore.pools[0].disk_set[0].put_object(
+                bucket,
+                "object",
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("the namespace mutation must not wait for the RPC's pool lock")
+        .expect("the namespace mutation must complete while the RPC waits");
+        let generation_after = env.ecstore.scanner_namespace_mutation_generation();
+        assert!(generation_after > generation_before);
+        drop(pool_meta);
+
+        let response = tokio::time::timeout(Duration::from_secs(30), activity)
+            .await
+            .expect("scanner activity RPC should resume after the pool lock is released")
+            .expect("authenticated scanner activity RPC should succeed")
+            .into_inner();
+        assert_eq!(response.namespace_generation, generation_after);
+        assert_eq!(response.publication_blocked, Some(false));
     }
 
     #[tokio::test]
@@ -6483,6 +6712,62 @@ mod tests {
                 .await
                 .expect("heal control test client should connect"),
         )
+    }
+
+    #[tokio::test]
+    async fn scoped_dirty_usage_transport_rejects_oversized_unknown_and_duplicate_fields() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind scoped ACK transport test");
+        let addr = listener.local_addr().expect("test listener address");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(super::make_scanner_control_server())
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("scoped ACK transport server");
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .http2_prior_knowledge()
+            .build()
+            .expect("HTTP/2 client");
+        let limit = rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES as usize;
+        for tag in [0x78, 0x0a] {
+            // Unknown varint field 15, or repeated empty singular challenge:
+            // both decode to a tiny default struct despite the large wire body.
+            for oversized in [false, true] {
+                let mut payload = [tag, 0].repeat(if oversized { (limit - 4) / 2 } else { limit / 2 });
+                if oversized {
+                    // Unknown fixed32 field 15 makes a valid cap+1 protobuf.
+                    payload.extend_from_slice(&[0x7d, 0, 0, 0, 0]);
+                }
+                assert_eq!(payload.len(), limit + usize::from(oversized));
+                let mut frame = vec![0];
+                frame.extend_from_slice(&u32::try_from(payload.len()).expect("bounded test payload").to_be_bytes());
+                frame.extend_from_slice(&payload);
+                let response = client
+                    .post(format!("http://{addr}/node_service.ScannerControlService/ScannerScopedDirtyUsageAck"))
+                    .header("content-type", "application/grpc")
+                    .header("te", "trailers")
+                    .body(frame)
+                    .send()
+                    .await
+                    .expect("send raw protobuf frame");
+                let status = response.headers().get("grpc-status").expect("gRPC failure status");
+                assert_eq!(
+                    status.to_str().expect("status text"),
+                    if oversized { "11" } else { "3" },
+                    "cap+1 must fail in the codec, while cap bytes reach request validation"
+                );
+            }
+        }
+        drop(client);
+        shutdown.send(()).expect("stop test server");
+        server.await.expect("join test server");
     }
 
     #[tokio::test]

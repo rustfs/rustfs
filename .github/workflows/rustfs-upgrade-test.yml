@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       from_version:
-        description: 'OLD RustFS release tag (must ship a .deb asset, e.g. 1.0.0-rc.3)'
+        description: 'OLD RustFS release tag, e.g. 1.0.0-rc.3 (its release must ship a .deb asset). Leave empty for the default.'
         required: false
         default: '1.0.0-rc.3'
       from_url:
@@ -26,7 +26,7 @@ on:
         required: false
         type: string
       to_version:
-        description: 'NEW RustFS release tag (leave empty for latest nightly)'
+        description: 'NEW RustFS release tag, e.g. 1.0.0-rc.5 (any version with a .deb asset). Leave empty for latest nightly.'
         required: false
       to_url:
         description: 'NEW .deb URL. Overrides to_version / nightly default.'
@@ -79,7 +79,6 @@ env:
 jobs:
   upgrade-test:
     runs-on: smoke-testing
-    continue-on-error: true
     timeout-minutes: 420
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
@@ -142,9 +141,9 @@ jobs:
 
       - name: Run upgrade compatibility suite
         id: test
-        continue-on-error: true
         env:
           LOG_FILE: /tmp/rustfs-upgrade.log
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
         run: |
           set -euo pipefail
           chmod +x auto-testing/rustfs-upgrade-test.sh
@@ -174,6 +173,29 @@ jobs:
             ARGS+=(--to-version "${TO_VERSION}")
           else
             ARGS+=(--to-url "${RUSTFS_NIGHTLY_PACKAGE_URL}")
+          fi
+          # Fail fast with a clear message when a requested release tag has
+          # no .deb asset (e.g. 1.0.0-rc.4 ships only zips), instead of
+          # letting the suite die mid-run on a 404.
+          check_release_asset() {
+            local version="$1" tag asset url
+            [ -n "${version}" ] && [ "${version}" != "null" ] || return 0
+            tag="${version#v}"
+            asset="rustfs_${tag//-/.}_amd64.deb"
+            url="https://github.com/rustfs/rustfs/releases/download/${tag}/${asset}"
+            if ! gh api "repos/rustfs/rustfs/releases/tags/${tag}" --jq '.assets[].name' 2>/dev/null | grep -qxF "${asset}"; then
+              echo "ERROR: release ${tag} has no downloadable asset ${asset}:" >&2
+              echo "       ${url}" >&2
+              echo "Pick a tag whose release ships a .deb (check its release assets)." >&2
+              exit 1
+            fi
+            echo "resolved ${tag} -> ${url}"
+          }
+          if [ -z "${FROM_URL}" ]; then
+            check_release_asset "${FROM_VERSION}"
+          fi
+          if [ -z "${TO_URL}" ]; then
+            check_release_asset "${TO_VERSION}"
           fi
           ./auto-testing/rustfs-upgrade-test.sh "${ARGS[@]}"
 

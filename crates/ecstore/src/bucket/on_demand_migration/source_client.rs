@@ -25,6 +25,9 @@
 //! Client-supplied `If-*`, `Authorization`, `Host` and SSE-C headers are never
 //! forwarded: v1 rejects SSE-C source objects outright.
 
+use super::azure::AzureSourceBackend;
+use super::gcs::GcsNativeSourceBackend;
+use super::list_through::{ListPageError, validate_list_page};
 use crate::bucket::remote_s3_client::{
     PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, RemoteS3RetryPolicy, build_remote_s3_config,
 };
@@ -64,6 +67,10 @@ pub enum SourceProvider {
     /// Generic S3-compatible service.
     #[default]
     S3,
+    /// Native Azure Blob service; not an S3 dialect.
+    Azure,
+    /// Native GCS JSON API with a service-account key; not an S3 dialect.
+    GcsNative,
 }
 
 impl SourceProvider {
@@ -75,6 +82,8 @@ impl SourceProvider {
             "minio" => Some(Self::Minio),
             "rustfs" => Some(Self::Rustfs),
             "s3" => Some(Self::S3),
+            "azure" => Some(Self::Azure),
+            "gcs_native" => Some(Self::GcsNative),
             _ => None,
         }
     }
@@ -87,6 +96,8 @@ impl SourceProvider {
             Self::Minio => "minio",
             Self::Rustfs => "rustfs",
             Self::S3 => "s3",
+            Self::Azure => "azure",
+            Self::GcsNative => "gcs_native",
         }
     }
 
@@ -152,12 +163,75 @@ pub struct SourceClientSpec {
     /// Wire requests one logical source call may cost. The pull pipeline and
     /// the backfill job own the retry budget (`pull.rs` `PULL_MAX_RETRIES`,
     /// `backfill.rs` `LIST_MAX_RETRIES`) and the breaker counts logical calls,
-    /// so ODM declares [`RemoteS3RetryPolicy::Disabled`] and keeps one counted
-    /// failure equal to one request against a struggling source.
+    /// so ODM declares [`RemoteS3RetryPolicy::Disabled`]. An ambiguous HEAD
+    /// 404 additionally probes the bucket before declaring a key absent.
     pub retry: RemoteS3RetryPolicy,
     /// Bytes per second the pull pipeline may consume from this source;
     /// `None` means unlimited. Enforced by the consumer, not by this client.
     pub bandwidth_limit: Option<NonZeroU64>,
+    /// Which [`SourceBackend`] to build. The S3 variant reads `region`,
+    /// `path_style` and `credentials`; the native variants ignore all three
+    /// and carry their own credentials.
+    pub backend: SourceBackendSpec,
+}
+
+/// Provider-specific half of [`SourceClientSpec`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SourceBackendSpec {
+    #[default]
+    S3,
+    Azure(AzureSourceSpec),
+    Gcs(GcsSourceSpec),
+}
+
+/// Native Azure Blob parameters. The container is [`SourceClientSpec::bucket`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct AzureSourceSpec {
+    pub account: String,
+    pub auth: AzureAuth,
+}
+
+impl fmt::Debug for AzureSourceSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AzureSourceSpec")
+            .field("account", &self.account)
+            .field("auth", &self.auth)
+            .finish()
+    }
+}
+
+/// How Azure requests are authorized.
+#[derive(Clone, PartialEq, Eq)]
+pub enum AzureAuth {
+    /// Base64 storage-account key, signed per request with Shared Key.
+    SharedKey(String),
+    /// SAS query string without the leading `?`, appended to every URL.
+    Sas(String),
+}
+
+impl fmt::Debug for AzureAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Both variants are secrets; only the scheme may be rendered.
+        f.write_str(match self {
+            Self::SharedKey(_) => "SharedKey(REDACTED)",
+            Self::Sas(_) => "Sas(REDACTED)",
+        })
+    }
+}
+
+/// Native GCS parameters. The bucket is [`SourceClientSpec::bucket`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct GcsSourceSpec {
+    /// Service-account key JSON.
+    pub service_account_json: String,
+}
+
+impl fmt::Debug for GcsSourceSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GcsSourceSpec")
+            .field("service_account_json", &"REDACTED")
+            .finish()
+    }
 }
 
 impl SourceClientSpec {
@@ -223,6 +297,8 @@ pub enum SourceError {
     ServerError(u16),
     #[error("unsupported source object: {0}")]
     Unsupported(String),
+    #[error("invalid source listing: {0}")]
+    InvalidPagination(#[from] ListPageError),
     #[error("source request failed: {0}")]
     Other(String),
 }
@@ -245,6 +321,7 @@ impl SourceError {
             SourceError::Connect(_) => "connect",
             SourceError::ServerError(_) => "server_error",
             SourceError::Unsupported(_) => "unsupported",
+            SourceError::InvalidPagination(_) => "invalid_pagination",
             SourceError::Other(_) => "other",
         }
     }
@@ -258,7 +335,7 @@ const THROTTLE_CODES: &[&str] = &[
     "TooManyRequests",
     "RequestThrottled",
 ];
-const NOT_FOUND_CODES: &[&str] = &["NoSuchKey", "NotFound", "NoSuchBucket", "NoSuchVersion"];
+const NOT_FOUND_CODES: &[&str] = &["NoSuchKey"];
 const ACCESS_DENIED_CODES: &[&str] = &[
     "AccessDenied",
     "InvalidAccessKeyId",
@@ -268,7 +345,7 @@ const ACCESS_DENIED_CODES: &[&str] = &[
     "InvalidToken",
 ];
 
-fn classify_status(status: u16, code: Option<&str>, message: String) -> SourceError {
+pub(super) fn classify_status(status: u16, code: Option<&str>, message: String) -> SourceError {
     if let Some(code) = code {
         if THROTTLE_CODES.contains(&code) {
             return SourceError::Throttled;
@@ -281,7 +358,6 @@ fn classify_status(status: u16, code: Option<&str>, message: String) -> SourceEr
         }
     }
     match status {
-        404 => SourceError::NotFound,
         401 | 403 => SourceError::AccessDenied,
         429 | 503 => SourceError::Throttled,
         500..=599 => SourceError::ServerError(status),
@@ -341,6 +417,11 @@ pub struct SourceHead {
     pub storage_class: Option<String>,
     pub sse: Option<SourceSse>,
     pub is_multipart_etag: bool,
+    /// The provider's ETag is not derived from the object bytes (Azure
+    /// stamps an opaque concurrency token). Such an ETag is recorded for
+    /// provenance but must never be read as a content digest, so the
+    /// write-back path refuses to use it as the expected MD5.
+    pub etag_is_opaque: bool,
 }
 
 /// Per-operation fields shared by HEAD and GET outputs.
@@ -362,7 +443,7 @@ struct HeadParts {
     sse_customer_algorithm: Option<String>,
 }
 
-fn normalize_etag(etag: Option<String>) -> Option<String> {
+pub(super) fn normalize_etag(etag: Option<String>) -> Option<String> {
     etag.map(|etag| etag.trim().trim_matches('"').to_string())
         .filter(|etag| !etag.is_empty())
 }
@@ -411,6 +492,7 @@ fn source_head(parts: HeadParts) -> Result<SourceHead, SourceError> {
         storage_class: parts.storage_class,
         sse,
         is_multipart_etag,
+        etag_is_opaque: false,
     })
 }
 
@@ -621,14 +703,52 @@ impl fmt::Debug for SourceClient {
 
 impl SourceClient {
     pub async fn new(spec: &SourceClientSpec) -> Result<Self, RemoteS3ClientError> {
-        let endpoint = spec.endpoint_spec()?;
-        let config = build_remote_s3_config(&endpoint).await?;
-        Ok(Self::from_config_builder(config, endpoint.endpoint_url(), spec))
+        match &spec.backend {
+            SourceBackendSpec::S3 => {
+                let endpoint = spec.endpoint_spec()?;
+                let config = build_remote_s3_config(&endpoint).await?;
+                Ok(Self::from_config_builder(config, endpoint.endpoint_url(), spec))
+            }
+            SourceBackendSpec::Azure(azure) => {
+                let backend = AzureSourceBackend::new(
+                    &spec.endpoint,
+                    &spec.bucket,
+                    azure,
+                    spec.timeouts,
+                    spec.skip_tls_verify,
+                    spec.ca_cert_pem.as_deref(),
+                )?;
+                Ok(Self::from_backend(Box::new(backend), spec))
+            }
+            SourceBackendSpec::Gcs(gcs) => {
+                let backend = GcsNativeSourceBackend::new(
+                    &spec.endpoint,
+                    &spec.bucket,
+                    gcs,
+                    spec.timeouts,
+                    spec.skip_tls_verify,
+                    spec.ca_cert_pem.as_deref(),
+                )?;
+                Ok(Self::from_backend(Box::new(backend), spec))
+            }
+        }
+    }
+
+    /// Wraps a ready backend in the prefix-mapping client. The endpoint is
+    /// kept only for `Debug` and admin status.
+    fn from_backend(backend: Box<dyn SourceBackend>, spec: &SourceClientSpec) -> Self {
+        Self {
+            backend,
+            endpoint: spec.endpoint.clone(),
+            bucket: spec.bucket.clone(),
+            source_prefix: spec.source_prefix.clone().filter(|prefix| !prefix.is_empty()),
+            timeouts: spec.timeouts,
+            bandwidth_limit: spec.bandwidth_limit,
+        }
     }
 
     /// `config` must come from [`SourceClientSpec::endpoint_spec`], which is
-    /// where the retry policy that keeps one logical call equal to one wire
-    /// request is declared.
+    /// where the policy disabling SDK-level retries is declared.
     fn from_config_builder(config: aws_sdk_s3::config::Builder, endpoint: String, spec: &SourceClientSpec) -> Self {
         let client = S3Client::from_conf(config.interceptor(SourceProxyMarkerInterceptor::new()).build());
         Self {
@@ -714,6 +834,7 @@ impl SourceClient {
                 ..*request
             })
             .await?;
+        validate_list_page(page.is_truncated, request.continuation_token, page.next_continuation_token.as_deref())?;
         page.objects = page
             .objects
             .into_iter()
@@ -749,15 +870,16 @@ impl SourceClient {
 #[async_trait::async_trait]
 impl SourceBackend for S3SourceBackend {
     async fn head(&self, key: &str) -> Result<SourceHead, SourceError> {
-        let output = self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(classify_sdk_error)?;
-        source_head_from_head_output(output)
+        match self.client.head_object().bucket(&self.bucket).key(key).send().await {
+            Ok(output) => source_head_from_head_output(output),
+            Err(err) if err.raw_response().is_some_and(|response| response.status().as_u16() == 404) => {
+                // HEAD has no error body: a missing bucket must not poison
+                // the per-key negative cache as though only the key was absent.
+                self.probe().await?;
+                Err(SourceError::NotFound)
+            }
+            Err(err) => Err(classify_sdk_error(err)),
+        }
     }
 
     /// Streams the object; `range` is passed through as an HTTP `Range`
@@ -800,17 +922,12 @@ impl SourceBackend for S3SourceBackend {
 
         let is_truncated = output.is_truncated.unwrap_or(false);
         let next_continuation_token = output.next_continuation_token;
-        if is_truncated && next_continuation_token.is_none() {
-            return Err(SourceError::Other(
-                "source reported a truncated listing without a continuation token".to_string(),
-            ));
-        }
         let objects = output
             .contents
             .unwrap_or_default()
             .into_iter()
-            .filter_map(s3_source_object)
-            .collect();
+            .map(s3_source_object)
+            .collect::<Result<Vec<_>, _>>()?;
         let common_prefixes = output
             .common_prefixes
             .unwrap_or_default()
@@ -849,14 +966,20 @@ impl SourceBackend for S3SourceBackend {
     }
 }
 
-fn s3_source_object(object: SdkObject) -> Option<SourceObject> {
-    let key = object.key?;
+fn s3_source_object(object: SdkObject) -> Result<SourceObject, SourceError> {
+    let key = object
+        .key
+        .ok_or_else(|| SourceError::Other("source listing object has no key".to_string()))?;
+    let size = object
+        .size
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or_else(|| SourceError::Other("source listing object has no valid size".to_string()))?;
     let etag = normalize_etag(object.e_tag);
     let is_multipart_etag = etag.as_deref().is_some_and(is_multipart_etag);
-    Some(SourceObject {
+    Ok(SourceObject {
         key,
         etag,
-        size: object.size.and_then(|size| u64::try_from(size).ok()).unwrap_or(0),
+        size,
         last_modified: system_time(object.last_modified),
         storage_class: object.storage_class.map(|class| class.as_str().to_string()),
         is_multipart_etag,
@@ -866,6 +989,7 @@ fn s3_source_object(object: SdkObject) -> Option<SourceObject> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::on_demand_migration::backend_contract::{BackendCapabilities, OBJECT_MD5, assert_backend_contract};
     use aws_smithy_runtime_api::client::http::{HttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn};
     use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
     use aws_smithy_runtime_api::client::result::ConnectorError;
@@ -983,6 +1107,7 @@ mod tests {
             retry: RemoteS3RetryPolicy::Disabled,
             timeouts: SourceTimeouts::default(),
             bandwidth_limit: NonZeroU64::new(1_000_000),
+            backend: SourceBackendSpec::S3,
         }
     }
 
@@ -1274,7 +1399,9 @@ mod tests {
 <CommonPrefixes><Prefix>data/photos/</Prefix></CommonPrefixes>
 <CommonPrefixes><Prefix>outside/</Prefix></CommonPrefixes>
 </ListBucketResult>"#;
-        let (client, requests) = scripted_client(&spec(Some("data/")), vec![ok(Vec::new(), body), ok(Vec::new(), body)]).await;
+        let next_body = body.replace("data/opaque", "data/next");
+        let (client, requests) =
+            scripted_client(&spec(Some("data/")), vec![ok(Vec::new(), body), ok(Vec::new(), &next_body)]).await;
         let first = client
             .list_page(&SourceListRequest {
                 prefix: Some("photos/"),
@@ -1336,7 +1463,104 @@ mod tests {
             .list_objects_v2(None, None, 10)
             .await
             .expect_err("truncated page without token is corrupt");
-        assert!(matches!(err, SourceError::Other(_)), "{err:?}");
+        assert!(matches!(err, SourceError::InvalidPagination(ListPageError::Missing)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn list_page_validates_s3_cursor_progress_before_mapping_entries() {
+        for contents in ["", "<Contents><Key>data/a</Key><Size>1</Size></Contents>"] {
+            for (truncated, next, expected) in [
+                (true, None, Some(ListPageError::Missing)),
+                (true, Some(""), Some(ListPageError::Empty)),
+                (true, Some("stuck"), Some(ListPageError::Repeated)),
+                (true, Some("opaque-next"), None),
+                (false, None, None),
+                (false, Some("stuck"), None),
+            ] {
+                let next_xml = next
+                    .map(|next| format!("<NextContinuationToken>{next}</NextContinuationToken>"))
+                    .unwrap_or_default();
+                let body = format!(
+                    "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>{truncated}</IsTruncated>{next_xml}{contents}</ListBucketResult>"
+                );
+                let (client, requests) = scripted_client(&spec(Some("data/")), vec![ok(Vec::new(), &body)]).await;
+                let result = client
+                    .list_page(&SourceListRequest {
+                        continuation_token: Some("stuck"),
+                        max_keys: 2,
+                        ..Default::default()
+                    })
+                    .await;
+                match expected {
+                    Some(expected) => {
+                        let error = result.expect_err("malformed pagination must fail at the provider boundary");
+                        assert!(
+                            matches!(&error, SourceError::InvalidPagination(actual) if *actual == expected),
+                            "{error:?}"
+                        );
+                        assert_eq!(error.class_label(), "invalid_pagination");
+                        assert!(!error.is_retryable());
+                        assert!(!error.to_string().contains("stuck"), "errors must not echo opaque tokens");
+                    }
+                    None => {
+                        let page = result.expect("progressing empty/nonempty pages and EOF are valid");
+                        assert_eq!(page.is_truncated, truncated);
+                        assert_eq!(page.next_continuation_token.as_deref(), next);
+                        assert_eq!(page.objects.len(), usize::from(!contents.is_empty()));
+                        if let Some(object) = page.objects.first() {
+                            assert_eq!(object.key, "a");
+                        }
+                    }
+                }
+                let requests = recorded(&requests);
+                assert_eq!(requests.len(), 1, "invalid pagination must not be retried");
+                assert!(requests[0].uri.contains("continuation-token=stuck"));
+            }
+        }
+    }
+
+    struct ListOnlyBackend(SourcePage);
+
+    #[async_trait::async_trait]
+    impl SourceBackend for ListOnlyBackend {
+        async fn list(&self, request: &SourceListRequest<'_>) -> Result<SourcePage, SourceError> {
+            assert_eq!(request.continuation_token, Some("stuck"), "opaque cursors reach every provider unchanged");
+            Ok(self.0.clone())
+        }
+
+        async fn head(&self, _key: &str) -> Result<SourceHead, SourceError> {
+            panic!("unexpected HEAD in list test")
+        }
+        async fn get(&self, _key: &str, _range: Option<&HTTPRangeSpec>) -> Result<SourceGet, SourceError> {
+            panic!("unexpected GET in list test")
+        }
+        async fn tagging(&self, _key: &str) -> Result<HashMap<String, String>, SourceError> {
+            panic!("unexpected tagging in list test")
+        }
+        async fn probe(&self) -> Result<(), SourceError> {
+            panic!("unexpected probe in list test")
+        }
+    }
+
+    #[tokio::test]
+    async fn list_page_validates_non_s3_provider_cursors_at_the_common_boundary() {
+        for (next, expected) in [
+            (None, ListPageError::Missing),
+            (Some(""), ListPageError::Empty),
+            (Some("stuck"), ListPageError::Repeated),
+        ] {
+            let mut client = prefix_client(Some("data/".into()));
+            client.backend = Box::new(ListOnlyBackend(SourcePage {
+                is_truncated: true,
+                next_continuation_token: next.map(str::to_string),
+                ..Default::default()
+            }));
+            let error = client
+                .list_objects_v2(None, Some("stuck"), 2)
+                .await
+                .expect_err("all providers must advance pagination");
+            assert!(matches!(error, SourceError::InvalidPagination(actual) if actual == expected));
+        }
     }
 
     const TAGGING_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1390,7 +1614,10 @@ mod tests {
     #[tokio::test]
     async fn source_error_classification_covers_every_class() {
         let cases: Vec<(Scripted, &str, bool)> = vec![
-            (status(404, ""), "not_found", false),
+            (status(404, ""), "other", false),
+            (status(404, "<Error><Code>NoSuchKey</Code></Error>"), "not_found", false),
+            (status(404, "<Error><Code>NoSuchBucket</Code></Error>"), "other", false),
+            (status(404, "<Error><Code>NoSuchVersion</Code></Error>"), "other", false),
             (status(403, ACCESS_DENIED_BODY), "access_denied", false),
             (status(401, ""), "access_denied", false),
             (status(429, ""), "throttled", true),
@@ -1413,12 +1640,33 @@ mod tests {
             }
         }
 
-        // HEAD carries no error body, so the classification must work from the
-        // status alone as well.
-        let (client, _) = scripted_client(&spec(None), vec![status(404, "")]).await;
+        let (client, requests) = scripted_client(&spec(None), vec![status(404, ""), status(200, "")]).await;
         assert!(matches!(client.head_object("missing").await, Err(SourceError::NotFound)));
+        assert_eq!(recorded(&requests).len(), 2, "ambiguous HEAD 404 must check the bucket");
+        let (client, _) = scripted_client(&spec(None), vec![status(404, ""), status(404, "")]).await;
+        assert!(matches!(client.head_object("missing").await, Err(SourceError::Other(_))));
+        let (client, _) = scripted_client(&spec(None), vec![status(404, ""), status(403, "")]).await;
+        assert!(matches!(client.head_object("missing").await, Err(SourceError::AccessDenied)));
         let (client, _) = scripted_client(&spec(None), vec![status(403, "")]).await;
         assert!(matches!(client.head_object("secret").await, Err(SourceError::AccessDenied)));
+    }
+
+    #[test]
+    fn source_listing_rejects_missing_and_negative_sizes() {
+        for size in [None, Some(-1)] {
+            let object = SdkObject::builder().key("key").set_size(size).build();
+            assert!(matches!(s3_source_object(object), Err(SourceError::Other(_))));
+        }
+        assert!(matches!(
+            s3_source_object(SdkObject::builder().size(0).build()),
+            Err(SourceError::Other(_))
+        ));
+        assert_eq!(
+            s3_source_object(SdkObject::builder().key("empty").size(0).build())
+                .expect("empty object")
+                .size,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1487,7 +1735,101 @@ mod tests {
         assert_eq!(resolve_path_style(PathStyle::VirtualHost, Minio, "10.0.0.1"), PathStyle::VirtualHost);
         assert_eq!(resolve_path_style(PathStyle::Path, Aws, "s3.amazonaws.com"), PathStyle::Path);
         assert_eq!(SourceProvider::from_label(" AWS "), Some(Aws));
-        assert_eq!(SourceProvider::from_label("azure"), None);
+        assert_eq!(SourceProvider::from_label(" Azure "), Some(Azure));
+        assert_eq!(SourceProvider::from_label("gcs_native"), Some(GcsNative));
+        assert_eq!(SourceProvider::from_label("swift"), None);
+    }
+
+    const CONTRACT_LIST_PAGE_ONE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>source-bucket</Name>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>cursor-1</NextContinuationToken>
+  <Contents>
+    <Key>dir/a.txt</Key>
+    <LastModified>2015-10-21T07:28:00.000Z</LastModified>
+    <ETag>&quot;5d41402abc4b2a76b9719d911017c592&quot;</ETag>
+    <Size>5</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+  <CommonPrefixes><Prefix>dir/sub/</Prefix></CommonPrefixes>
+</ListBucketResult>"#;
+
+    const CONTRACT_LIST_PAGE_TWO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>source-bucket</Name>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>dir/b.txt</Key>
+    <LastModified>2015-10-21T07:28:00.000Z</LastModified>
+    <ETag>&quot;7d41402abc4b2a76b9719d911017c592&quot;</ETag>
+    <Size>7</Size>
+  </Contents>
+</ListBucketResult>"#;
+
+    const CONTRACT_TAGGING: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet>
+  <Tag><Key>env</Key><Value>prod</Value></Tag>
+</TagSet></Tagging>"#;
+
+    fn contract_object_headers(content_length: u64) -> Vec<(&'static str, String)> {
+        vec![
+            ("etag", format!("\"{OBJECT_MD5}\"")),
+            ("content-length", content_length.to_string()),
+            ("content-type", "text/plain".to_string()),
+            ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+            ("x-amz-meta-owner", "alice".to_string()),
+            ("x-amz-storage-class", "STANDARD".to_string()),
+        ]
+    }
+
+    /// The S3 backend behind the scripted connector, without the prefix-mapping
+    /// client on top: the contract is a property of the backend itself.
+    async fn scripted_s3_backend(responses: Vec<Scripted>) -> S3SourceBackend {
+        let spec = spec(None);
+        let connector = SharedHttpConnector::new(ScriptedConnector {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+        });
+        let http_client = http_client_fn(move |_settings, _components| connector.clone());
+        let endpoint = spec.endpoint_spec().expect("test spec endpoint should parse");
+        let config = build_remote_s3_config(&endpoint)
+            .await
+            .expect("test spec should build")
+            .http_client(http_client)
+            .interceptor(SourceProxyMarkerInterceptor::new());
+        S3SourceBackend {
+            client: S3Client::from_conf(config.build()),
+            bucket: spec.bucket.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_backend_satisfies_the_shared_backend_contract() {
+        let mut ranged = contract_object_headers(3);
+        ranged.push(("content-range", "bytes 1-3/5".to_string()));
+        let backend = scripted_s3_backend(vec![
+            ok(contract_object_headers(5), ""),
+            ok(contract_object_headers(5), "hello"),
+            ok(ranged, "ell"),
+            ok(Vec::new(), CONTRACT_LIST_PAGE_ONE),
+            ok(Vec::new(), CONTRACT_LIST_PAGE_TWO),
+            ok(Vec::new(), CONTRACT_TAGGING),
+            ok(Vec::new(), ""),
+            status(404, ""),
+            status(403, ACCESS_DENIED_BODY),
+        ])
+        .await;
+
+        assert_backend_contract(
+            &backend,
+            BackendCapabilities {
+                etag_is_opaque: false,
+                supports_start_after: true,
+                supports_tagging: true,
+            },
+        )
+        .await;
     }
 
     fn prefix_client(prefix: Option<String>) -> SourceClient {

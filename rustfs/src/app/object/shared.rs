@@ -269,6 +269,129 @@ pub(super) fn resolve_bucket_default_sse(
     (effective_sse, effective_kms_key_id)
 }
 
+/// The bucket's default encryption configuration for a write path.
+///
+/// `Ok(None)` carries one meaning only — this bucket has no default encryption
+/// — and the write proceeds in plaintext exactly as before. Every other
+/// outcome refuses the write rather than collapsing onto that same value: an
+/// encryption blob that exists but cannot be read fails closed in
+/// `get_sse_config` since rustfs/rustfs#7172, and swallowing that error here
+/// stores plaintext into a bucket whose operator mandated encryption, with
+/// nothing returned to the client and nothing in the object to tell it apart
+/// afterwards (rustfs/backlog#2287).
+///
+/// The states the lookup can report, and what each one does:
+///
+/// * configured and readable — apply the bucket default;
+/// * no encryption blob at all, including a bucket that does not exist and a
+///   bucket whose metadata document is absent — `ConfigNotFound`, so a cold
+///   cache and a missing bucket are never turned into a refusal, and the write
+///   still fails later with its own `NoSuchBucket`;
+/// * blob present but unparseable — deterministic, so retrying cannot help;
+///   surfaces as `InternalError` until an operator repairs or removes it;
+/// * the metadata read itself failed (namespace lock, quorum, disk, an
+///   uninitialized metadata system) — transient, and the typed error maps to
+///   the retryable `ServiceUnavailable`.
+///
+/// The last two are distinguished by the typed error the accessor returns, not
+/// re-derived here: [`ApiError`] already separates them. This mirrors
+/// `prepare_sse_configuration` in `storage::sse`, the resolver the multipart
+/// writer uses, which has always failed closed on the same lookup.
+pub(super) async fn load_bucket_default_sse_config(
+    bucket: &str,
+) -> S3Result<Option<(ServerSideEncryptionConfiguration, OffsetDateTime)>> {
+    classify_bucket_default_sse_lookup(bucket, metadata_sys::get_sse_config(bucket).await)
+}
+
+fn classify_bucket_default_sse_lookup(
+    bucket: &str,
+    lookup: Result<(ServerSideEncryptionConfiguration, OffsetDateTime), StorageError>,
+) -> S3Result<Option<(ServerSideEncryptionConfiguration, OffsetDateTime)>> {
+    match lookup {
+        Ok(config) => Ok(Some(config)),
+        Err(StorageError::ConfigNotFound) => Ok(None),
+        Err(err) => {
+            let api_error = ApiError::from(err);
+            error!(
+                event = "bucket_sse_config_lookup_failed",
+                component = LOG_COMPONENT_APP,
+                subsystem = LOG_SUBSYSTEM_OBJECT,
+                result = "write_refused",
+                bucket = %bucket,
+                code = %api_error.code.as_str(),
+                error = %api_error,
+                "Bucket default encryption is unreadable; refusing the write instead of storing plaintext"
+            );
+            Err(api_error.into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod bucket_default_sse_lookup_tests {
+    use super::*;
+    use s3s::dto::{ServerSideEncryptionByDefault, ServerSideEncryptionRule};
+    use time::OffsetDateTime;
+
+    fn sse_config() -> ServerSideEncryptionConfiguration {
+        ServerSideEncryptionConfiguration {
+            rules: vec![ServerSideEncryptionRule {
+                apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                    sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                    kms_master_key_id: None,
+                }),
+                blocked_encryption_types: None,
+                bucket_key_enabled: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn an_absent_configuration_still_writes_plaintext() {
+        let resolved = classify_bucket_default_sse_lookup("bucket", Err(StorageError::ConfigNotFound))
+            .expect("a bucket without default encryption must keep writing plaintext");
+
+        assert!(resolved.is_none());
+        assert_eq!(resolve_bucket_default_sse(None, None, None, false), (None, None));
+    }
+
+    #[test]
+    fn a_readable_configuration_is_returned() {
+        let resolved = classify_bucket_default_sse_lookup("bucket", Ok((sse_config(), OffsetDateTime::UNIX_EPOCH)))
+            .expect("a readable configuration must not refuse the write")
+            .expect("a readable configuration must be applied");
+
+        assert_eq!(resolved.0.rules.len(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_configuration_refuses_the_write() {
+        let err = classify_bucket_default_sse_lookup(
+            "bucket",
+            Err(StorageError::other("persisted bucket encryption configuration is invalid")),
+        )
+        .expect_err("a corrupt encryption blob must never degrade to plaintext");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn an_unavailable_metadata_read_refuses_the_write_as_retryable() {
+        let err = classify_bucket_default_sse_lookup("bucket", Err(StorageError::ErasureReadQuorum))
+            .expect_err("an unreadable metadata subsystem must never degrade to plaintext");
+
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+    }
+
+    #[test]
+    fn a_missing_bucket_keeps_its_own_error() {
+        let err = classify_bucket_default_sse_lookup("bucket", Err(StorageError::BucketNotFound("bucket".to_string())))
+            .expect_err("a bucket-not-found lookup must not be reported as an encryption failure");
+
+        assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
+    }
+}
+
 #[cfg(test)]
 mod deadlock_request_guard_tests {
     use super::DeadlockRequestGuard;
@@ -891,11 +1014,44 @@ pub(crate) fn mark_on_demand_migration_list_local_only(headers: &mut HeaderMap) 
 /// forwarded to the source: a 304/412 answered by the source would be
 /// indistinguishable from a source failure.
 pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceHead) -> S3Result<()> {
+    let if_match = headers
+        .get(http::header::IF_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    let if_none_match = headers
+        .get(http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    let needs_etag = if_match.is_some_and(|value| value != "*") || if_none_match.is_some_and(|value| value != "*");
+    let needs_mtime = (!headers.contains_key(http::header::IF_MATCH) && headers.contains_key(http::header::IF_UNMODIFIED_SINCE))
+        || (!headers.contains_key(http::header::IF_NONE_MATCH) && headers.contains_key(http::header::IF_MODIFIED_SINCE));
+    if (needs_etag && head.etag.is_none()) || (needs_mtime && head.last_modified.is_none()) {
+        return Err(odm_source_unavailable_error("missing_source_validator"));
+    }
     let info = ObjectInfo {
         etag: head.etag.clone(),
         mod_time: head.last_modified.map(OffsetDateTime::from),
         ..Default::default()
     };
+    // A successful source read establishes wildcard existence, but the
+    // remaining conditions must still run in their ordinary precedence.
+    if head.etag.is_none() && (if_match == Some("*") || if_none_match == Some("*")) {
+        let mut remaining = headers.clone();
+        if if_match == Some("*") {
+            remaining.remove(http::header::IF_MATCH);
+            remaining.remove(http::header::IF_UNMODIFIED_SINCE);
+        }
+        if if_none_match == Some("*") {
+            remaining.remove(http::header::IF_NONE_MATCH);
+            remaining.remove(http::header::IF_MODIFIED_SINCE);
+        }
+        check_preconditions(&remaining, &info)?;
+        return if if_none_match == Some("*") {
+            Err(S3Error::new(S3ErrorCode::NotModified))
+        } else {
+            Ok(())
+        };
+    }
     check_preconditions(headers, &info)
 }
 
@@ -1952,8 +2108,42 @@ mod on_demand_migration_tests {
         .expect_err("modified since an earlier date is 412");
         assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
 
-        // A source without validators cannot fail a precondition.
         let bare = SourceHead::default();
-        assert!(odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "\"other\""), &bare).is_ok());
+        let err =
+            odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "\"other\""), &bare).expect_err("missing ETag");
+        assert_eq!(err.status_code(), Some(http::StatusCode::FAILED_DEPENDENCY));
+        assert!(odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "*"), &bare).is_ok());
+        let err =
+            odm_check_source_preconditions(&headers_with(http::header::IF_NONE_MATCH, "*"), &bare).expect_err("source exists");
+        assert_eq!(err.code(), &S3ErrorCode::NotModified);
+        let dated = SourceHead {
+            last_modified: head.last_modified,
+            ..Default::default()
+        };
+        assert!(odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "*"), &dated).is_ok());
+        let mut combined = headers_with(http::header::IF_NONE_MATCH, "*");
+        combined.insert(http::header::IF_MATCH, HeaderValue::from_static("\"other\""));
+        assert_eq!(
+            odm_check_source_preconditions(&combined, &dated)
+                .expect_err("specific ETag unavailable")
+                .status_code(),
+            Some(http::StatusCode::FAILED_DEPENDENCY)
+        );
+        combined.remove(http::header::IF_MATCH);
+        combined.insert(
+            http::header::IF_UNMODIFIED_SINCE,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(
+            odm_check_source_preconditions(&combined, &dated)
+                .expect_err("unmodified-since fails before none-match")
+                .code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+        for header in [http::header::IF_MODIFIED_SINCE, http::header::IF_UNMODIFIED_SINCE] {
+            let err = odm_check_source_preconditions(&headers_with(header, "Wed, 21 Oct 2015 07:28:00 GMT"), &bare)
+                .expect_err("missing timestamp");
+            assert_eq!(err.status_code(), Some(http::StatusCode::FAILED_DEPENDENCY));
+        }
     }
 }
