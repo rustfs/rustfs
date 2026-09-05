@@ -867,7 +867,6 @@ fn test_retry_drain_bounds_each_peer_round_to_one_small_request_chain() {
             r#type: "tags".to_string(),
             ..Default::default()
         }],
-        ..Default::default()
     };
     let make = RetryDrainAction::BucketOpReplay {
         operation: SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING.to_string(),
@@ -973,7 +972,7 @@ fn test_lightweight_bucket_retry_plan_orders_real_metadata_and_counts_it() {
     operator_replication.rules.push(operator_rule("operator-backup"));
     let mut bucket_with_operator_rule = bucket;
     bucket_with_operator_rule.replication_config =
-        Some(BASE64_STANDARD.encode_to_string(&serialize(&operator_replication).expect("operator replication config")));
+        Some(BASE64_STANDARD.encode_to_string(serialize(&operator_replication).expect("operator replication config")));
     let plan = site_replication_bucket_retry_plan_from_info(&bucket_with_operator_rule, false).expect("targeted retry plan");
     assert!(
         plan.bucket_items.iter().any(|item| item.r#type == "replication-config"),
@@ -1050,7 +1049,7 @@ fn test_reachable_probe_promotion_is_fenced_by_the_observed_event() {
         .peers
         .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
 
-    assert_eq!(mark_reachable_deferred_retry_events(&mut state, &[recovered.clone()]), 1);
+    assert_eq!(mark_reachable_deferred_retry_events(&mut state, std::slice::from_ref(&recovered)), 1);
     assert_eq!(state.retry_queue[0].updated_at, None);
     assert!(!state.retry_queue[0].peer_unreachable);
     assert_eq!(

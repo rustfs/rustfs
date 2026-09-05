@@ -309,7 +309,7 @@ fn classify_bucket_default_sse_lookup(
 ) -> S3Result<Option<(ServerSideEncryptionConfiguration, OffsetDateTime)>> {
     match lookup {
         Ok(config) => Ok(Some(config)),
-        Err(err) if err == StorageError::ConfigNotFound => Ok(None),
+        Err(StorageError::ConfigNotFound) => Ok(None),
         Err(err) => {
             let api_error = ApiError::from(err);
             error!(
