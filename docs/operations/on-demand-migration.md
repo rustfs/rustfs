@@ -1,11 +1,25 @@
 # On-Demand Migration
 
 **Use this when:** you are moving an existing S3-compatible bucket into RustFS without a stop-the-world copy, or you are debugging a bucket that serves reads from an external source (424 `SourceUnavailable`, an open circuit breaker, missing pulled objects, a source 403).
-**Source of truth:** `crates/ecstore/src/bucket/on_demand_migration/` (`config.rs` for the wire model and its bounds, `sys.rs` for the per-node runtime, `source_client.rs` for the outbound client, `pull.rs` for the write-back pipeline, `breaker.rs` and `negative_cache.rs` for the protections), `rustfs/src/app/object/get.rs` and `head.rs` for the read paths, `rustfs/src/app/object/on_demand_migration_put.rs` for the local write, `rustfs/src/admin/handlers/on_demand_migration.rs` for the admin API, and `crates/obs/src/metrics/schema/on_demand_migration.rs` for the metric contract.
+**Source of truth:** `rustfs/src/on_demand_migration/` (`config.rs` for the wire model and its bounds, `sys.rs` for the per-node runtime, `source_client.rs` for the outbound client, `pull.rs` for the write-back pipeline, `breaker.rs` and `negative_cache.rs` for the protections), `rustfs/src/app/object/get.rs` and `head.rs` for the read paths, `rustfs/src/app/object/on_demand_migration_put.rs` for the local write, `rustfs/src/admin/handlers/on_demand_migration.rs` for the admin API, and `crates/obs/src/metrics/schema/on_demand_migration.rs` for the metric contract.
 
 On-Demand Migration (ODM) attaches an external S3-compatible **source bucket** to a local RustFS bucket. When a client GETs a key that does not exist locally, RustFS fetches it from the source, streams it to the client, and stores it locally in the same pass; every later read is served locally. It is a pull-style, lazy migration path — the RustFS equivalent of Cloudflare R2 Sippy, Tigris shadow buckets, and Alibaba Cloud OSS / Tencent COS mirror-back-to-origin.
 
 The module is on by default (rustfs/backlog#2163); set `RUSTFS_ON_DEMAND_MIGRATION_ENABLED=false` on every node to turn it off (`rustfs/src/module_switches.rs`). With the switch off, the runtime never intervenes on a read and the admin `PUT` route refuses with `OnDemandMigrationDisabled`. Reads of the configuration and of the status endpoint keep working while the switch is off, so a disabled deployment can still be inspected. The switch only decides whether the module may act at all: a bucket with no `on-demand-migration.json` is never resolved by the runtime and makes no source call, so turning the module on changes nothing for buckets you have not configured.
+
+## Upgrade and rollback compatibility
+
+ODM configuration is stored in two additional keys in the existing bucket metadata map. The metadata format version remains `1` for MinIO compatibility. RustFS `1.0.0-rc.5` only re-encodes its 44 known keys: a bucket configuration write through an rc.5 node discards the ODM configuration and timestamp, even if another node originally wrote them. Restarting a newer binary cannot recover the discarded values. This also means ODM is not supported during a rolling upgrade that still allows rc.5 nodes to write bucket metadata.
+
+Upgrade every node before enabling ODM. Before any rollback to rc.5, stop new migration work, retain a secure copy of the original full configuration and credentials, and disable ODM on every bucket and node. The redacted configuration GET and metadata export are not credential backups. Objects still present only at the source cannot be read through RustFS while ODM is disabled or rc.5 is running; finish migration first, redirect those reads to the source, or plan a maintenance window. After all nodes return to a compatible release, reapply and validate the saved configuration; already stored local objects remain local. Turning the global module switch off alone does not make an old metadata writer preserve these keys.
+
+The ignored `upgrade_compatibility_test::rc5_rollback_requires_restoring_odm_configuration` test pins release commit `40a2470feb567201165a5b809b7598bb4b1f68f5`, restarts against the same data directory, writes bucket tags through rc.5, and verifies configuration recovery after returning to the current binary. Set `RUSTFS_UPGRADE_SOURCE_BINARY` to that release's executable and run `cargo test -p e2e_test rc5_rollback_requires_restoring_odm_configuration -- --ignored --test-threads=1`. The test records a known old-writer limitation; it does not certify mixed-version ODM operation.
+
+## Optional Google dependencies
+
+The default and `full` server builds include the `gcs` Cargo feature to preserve native GCS migration and existing GCS tier support. For a server without Google SDK dependencies, build with `cargo build -p rustfs --no-default-features --features ftps,webdav`. Add `gcs` to that feature list to restore native GCS support. The ECStore library has no default Google dependency; library users that need GCS tiers must enable its `gcs` feature.
+
+Both builds can read, redact and preserve GCS configuration. A build without `gcs` rejects native ODM client construction with `OnDemandMigrationBackendNotCompiled` (HTTP 501); persisted native sources report an unavailable client. GCS tier initialization returns `XRustFSAdminTierTypeUnsupported` (HTTP 501). Do not deploy that build to a cluster with GCS tiers containing transitioned objects: the configuration remains intact, but reading their remote data requires a GCS-capable binary. The `gcs` provider using HMAC credentials and the S3 interoperability API remains available in every build; only `gcs_native` and native GCS tier clients need the feature.
 
 ## List continuation token rollout
 
@@ -97,7 +111,7 @@ Read-through only migrates what clients touch. The background backfill job walks
 
 ## Configuration reference
 
-The persisted blob is `on-demand-migration.json` in the bucket's metadata. Unknown fields are rejected rather than dropped, so a config written by a newer build fails loudly on an older one. Every default and bound below comes from `crates/ecstore/src/bucket/on_demand_migration/config.rs`.
+The persisted blob is `on-demand-migration.json` in the bucket's metadata. Unknown fields are rejected rather than dropped, so a config written by a newer build fails loudly on an older one. Every default and bound below comes from `rustfs/src/on_demand_migration/config.rs`.
 
 | Field | Type | Default | Bounds / rules |
 |---|---|---|---|
@@ -154,7 +168,7 @@ Validation also rejects two shapes outright: a source whose endpoint and bucket 
 | `azure` | Optional; derived as `https://<account>.blob.core.windows.net` | Native Blob REST, not S3 | Unused; write `auto` | Needs `source.azure`; the container is `source.bucket`. Reads need `Read` on the blob and `List` on the container, plus `Tags` when `policy.copy_tags` is on | None yet: no interop job covers Azure |
 | `gcs_native` | Optional; derived as `https://storage.googleapis.com` | Native GCS API, not S3 | Unused; write `auto` | Needs `source.gcs`. Reads use the XML API for objects and `objects.list` for listings, both with an OAuth token minted from the service-account key; the key needs `storage.objects.get` and `storage.objects.list` | None yet: no interop job covers native GCS |
 
-Every backend answers the same trait contract, pinned by `backend_contract.rs` in `crates/ecstore/src/bucket/on_demand_migration/`, and the three differences that contract allows are the ones documented here.
+Every backend answers the same trait contract, pinned by `backend_contract.rs` in `rustfs/src/on_demand_migration/`, and the three differences that contract allows are the ones documented here.
 
 `azure` differs in two of them. Its ETag is a concurrency token rather than a digest of the bytes, so it is stored as `odm-source-etag` provenance and never used as the expected MD5 of a pulled object — the write-back integrity check falls back to the local digest. And its listing paginates only with an opaque marker: there is no "start after this key" form, so a caller that asks for one gets `Unsupported` instead of a listing that silently starts over.
 
