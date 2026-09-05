@@ -16,15 +16,18 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::chaos::{VersionShardCensus, census_object_version_on_disk, signed_admin_post};
+    use crate::chaos::{VersionShardCensus, census_object_version_on_disk, sha256_hex, signed_admin_post};
     use crate::common::{
         FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request, init_logging,
+        rustfs_binary_path,
     };
     use crate::storage_api::RUSTFS_META_BUCKET;
     use aws_sdk_s3::primitives::ByteStream;
     use http::Method;
+    use sha2::{Digest, Sha256};
     use std::collections::HashSet;
     use std::error::Error;
+    use std::io::{Read, Write};
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -33,6 +36,64 @@ mod tests {
     use tracing::info;
 
     const POOL_METADATA_OBJECT: &str = "pool.bin";
+
+    #[derive(serde::Deserialize)]
+    struct EvidenceBuild {
+        sha256: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RestartEvidenceRun {
+        run_id: String,
+        source_revision: String,
+        test_sources_sha256: String,
+        binary: EvidenceBuild,
+        test_binary: EvidenceBuild,
+    }
+
+    fn file_sha256(path: &Path) -> Result<String, Box<dyn Error + Send + Sync>> {
+        let mut file = std::fs::File::open(path)?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        Ok(digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    fn restart_evidence_run(binary: &Path) -> Result<Option<(PathBuf, RestartEvidenceRun)>, Box<dyn Error + Send + Sync>> {
+        let Some(directory) = std::env::var_os("RUSTFS_SCANNER_HEAL_RUN_DIR") else {
+            return Ok(None);
+        };
+        let directory = PathBuf::from(directory);
+        let receipt = directory.join("run.json");
+        if receipt.metadata()?.len() > 1024 * 1024 {
+            return Err("oversized scanner/heal execution receipt".into());
+        }
+        let run: RestartEvidenceRun = serde_json::from_slice(&std::fs::read(receipt)?)?;
+        if run.run_id.len() != 32 || run.source_revision.len() != 40 {
+            return Err("invalid scanner/heal execution identity".into());
+        }
+        let mut sources = Sha256::new();
+        sources.update(include_bytes!("heal_erasure_disk_rebuild_test.rs"));
+        sources.update(include_bytes!("chaos.rs"));
+        let source_digest: String = sources.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(source_digest, run.test_sources_sha256, "compiled test sources must match the receipt");
+        assert_eq!(file_sha256(binary)?, run.binary.sha256, "server binary must match the run receipt");
+        assert_eq!(
+            file_sha256(&std::env::current_exe()?)?,
+            run.test_binary.sha256,
+            "test executable must match the run receipt"
+        );
+        if directory.join("background-target-restart.json").exists() {
+            return Err("scanner/heal oracle already exists; create a new execution receipt".into());
+        }
+        Ok(Some((directory, run)))
+    }
 
     struct TcpPortBlackhole {
         port: u16,
@@ -195,8 +256,9 @@ mod tests {
         clients: &[aws_sdk_s3::Client],
         bucket: &str,
         expected_keys: &HashSet<String>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<Vec<Vec<String>>, Box<dyn Error + Send + Sync>> {
         const PAGE_SIZE: i32 = 10;
+        let mut node_listings = Vec::with_capacity(clients.len());
         for (node_index, client) in clients.iter().enumerate() {
             let mut listed_keys = Vec::new();
             let mut continuation_token = None;
@@ -243,8 +305,10 @@ mod tests {
                 &listed_key_set, expected_keys,
                 "node {node_index} did not expose the complete recovered namespace"
             );
+            listed_keys.sort();
+            node_listings.push(listed_keys);
         }
-        Ok(())
+        Ok(node_listings)
     }
 
     fn heal_task_status_diagnostic(body: &str) -> String {
@@ -808,6 +872,13 @@ mod tests {
     }
 
     async fn run_cluster_root_heal_interruption(scenario: InterruptionScenario) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let server_binary = rustfs_binary_path();
+        let evidence_run = if scenario == InterruptionScenario::BackgroundTargetRestart {
+            restart_evidence_run(&server_binary)?
+        } else {
+            None
+        };
+        let mut evidence_objects = Vec::new();
         let (background_enabled, interruption_node, interruption_kind) = match scenario {
             InterruptionScenario::IsolatedTargetRestart => (false, 1, "target_restart"),
             InterruptionScenario::BackgroundTargetRestart => (true, 1, "background_target_restart"),
@@ -855,7 +926,7 @@ mod tests {
         for node_index in 0..cluster.nodes.len() {
             cluster.set_node_capture_log_path(node_index, format!("{log_dir}/node{node_index}.log"))?;
         }
-        cluster.start().await?;
+        cluster.start_with_binary(&server_binary).await?;
         let clients = cluster.create_all_clients()?;
 
         let bucket = "heal-restart-during-rebuild";
@@ -996,7 +1067,7 @@ mod tests {
             }
         }
 
-        cluster.start_node(1).await?;
+        cluster.start_node_from_binary(1, &server_binary).await?;
 
         let status_url = format!("{}/rustfs/admin/v3/background-heal/status", cluster.nodes[0].url);
         let recovery_deadline = Instant::now() + Duration::from_secs(60);
@@ -1274,7 +1345,7 @@ mod tests {
                     }
                 }
             }
-            cluster.start_node(interruption_node).await?;
+            cluster.start_node_from_binary(interruption_node, &server_binary).await?;
             if interruption_node == 0 {
                 let target = cluster.nodes[1]
                     .process
@@ -1373,7 +1444,7 @@ mod tests {
             .map(|manifest| manifest.key.clone())
             .collect::<HashSet<_>>();
         assert!(expected_keys.insert(outage_key.to_string()));
-        assert_all_nodes_list_exact_keys(&clients, bucket, &expected_keys).await?;
+        let node_listings = assert_all_nodes_list_exact_keys(&clients, bucket, &expected_keys).await?;
 
         let target_client = cluster.create_s3_client(1)?;
         for expected in &expected_manifests {
@@ -1381,11 +1452,31 @@ mod tests {
             let actual = response.body.collect().await?.into_bytes();
             let expected_body = deterministic_object_body(object_size_bytes, expected.payload_seed);
             assert_eq!(actual.as_ref(), expected_body.as_slice(), "object body changed for {}", expected.key);
+            if evidence_run.is_some() {
+                evidence_objects.push(serde_json::json!({
+                    "key": expected.key, "version_id": expected.shard_census.version_id,
+                    "expected_bytes": expected_body.len(), "actual_bytes": actual.len(),
+                    "expected_sha256": sha256_hex(&expected_body),
+                    "actual_sha256": sha256_hex(&actual),
+                    "expected_physical": expected.shard_census,
+                    "physical": census_object_version_on_disk(&replaced_disk, bucket, &expected.key, None)?,
+                }));
+            }
         }
         let response = target_client.get_object().bucket(bucket).key(outage_key).send().await?;
         let actual = response.body.collect().await?.into_bytes();
         let expected_outage_body = deterministic_object_body(object_size_bytes, outage_payload_seed);
         assert_eq!(actual.as_ref(), expected_outage_body.as_slice(), "object body changed for {outage_key}");
+        if evidence_run.is_some() {
+            evidence_objects.push(serde_json::json!({
+                "key": outage_key, "version_id": null,
+                "expected_bytes": expected_outage_body.len(), "actual_bytes": actual.len(),
+                "expected_sha256": sha256_hex(&expected_outage_body),
+                "actual_sha256": sha256_hex(&actual),
+                "expected_physical": null,
+                "physical": census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?,
+            }));
+        }
 
         let terminal_deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -1430,6 +1521,31 @@ mod tests {
         }
         if task_status["summary"].as_str() != Some("finished") {
             return Err(format!("heal data rebuilt but task did not finish successfully: {task_status}").into());
+        }
+
+        if let Some((directory, run)) = evidence_run {
+            let restarted_pid = cluster.nodes[1].process.as_ref().ok_or("restarted target is absent")?.id();
+            assert_ne!(target_pid, restarted_pid, "target must be a new process");
+            assert_eq!(file_sha256(&server_binary)?, run.binary.sha256, "server build changed during restart");
+            let evidence = serde_json::json!({
+                "schema": 1, "case": "background-target-restart", "evidence": "process-restart",
+                "run_id": run.run_id, "source_revision": run.source_revision,
+                "test_sources_sha256": run.test_sources_sha256,
+                "binary_sha256": run.binary.sha256, "test_binary_sha256": run.test_binary.sha256,
+                "topology": {"nodes": cluster.nodes.len(), "drives_per_node": cluster.nodes[0].data_dirs.len()},
+                "pid_before": target_pid, "pid_after": restarted_pid,
+                "objects": evidence_objects, "node_listings": node_listings,
+            });
+            let data = serde_json::to_vec(&evidence)?;
+            if data.len() > 1024 * 1024 {
+                return Err("scanner/heal oracle exceeds the 1 MiB artifact budget".into());
+            }
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(directory.join("background-target-restart.json"))?;
+            output.write_all(&data)?;
+            output.sync_all()?;
         }
 
         Ok(())

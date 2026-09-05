@@ -55,7 +55,7 @@ type ChaosResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 /// A successful S3 GET only proves that a quorum can serve an object. Replacement
 /// tests need this lower-level record to prove that the rebuilt target holds the
 /// `xl.meta` selected for a specific version and every `part.N` it declares.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct VersionShardCensus {
     pub version_id: Option<String>,
     pub has_xl_meta: bool,
@@ -66,7 +66,7 @@ pub(crate) struct VersionShardCensus {
     pub inline_data_fingerprint: Option<PartShardFingerprint>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct PartShardFingerprint {
     pub size: u64,
     pub sha256: String,
@@ -94,7 +94,7 @@ impl VersionShardCensus {
     }
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
