@@ -30,13 +30,16 @@ mod backend_contract;
 pub mod backfill;
 pub mod breaker;
 pub mod config;
+#[cfg(feature = "gcs")]
 pub mod gcs;
 pub mod list_through;
+mod metrics;
 mod native_http;
 pub mod negative_cache;
 pub mod pull;
 pub mod source_client;
 pub mod stats;
+mod storage_api;
 pub mod sys;
 #[cfg(test)]
 mod test_http_fixture;
@@ -46,9 +49,9 @@ pub use breaker::{
     BreakerState, BreakerTransition, BreakerVerdict,
 };
 pub use config::{
-    AzureSourceConfig, ConfigPublishHook, FilterConfig, GcsSourceConfig, HeadPolicy, ON_DEMAND_MIGRATION_CONFIG_HOOK,
-    ON_DEMAND_MIGRATION_CONFIG_VERSION, OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig, Provider,
-    RangeGetPolicy, SourceConfig, SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
+    AzureSourceConfig, FilterConfig, GcsSourceConfig, HeadPolicy, ON_DEMAND_MIGRATION_CONFIG_VERSION, OnDemandMigrationConfig,
+    OnDemandMigrationConfigError, PathStyle, PolicyConfig, Provider, RangeGetPolicy, SourceConfig, SourceCredentials,
+    SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
 };
 pub use list_through::{
     FetchRequest, LIST_THROUGH_TOKEN_VERSION, ListEntryKey, ListPageError, ListThroughCursor, ListThroughMerger,
@@ -62,6 +65,9 @@ pub use pull::{
     PullQueue, PullReason, PullSource, QueuedPullOutcome, SourceBody, SourceIdleGuard, WriteBackBody, WriteBackError,
     WriteBackOutcome, WriteBackPart, WriteBackRequest, commit_inline, commit_inline_with, idle_guarded_body,
 };
+pub use source_client::{
+    SourceClient, SourceError, SourceGet, SourceHead, SourceListRequest, SourceObject, SourcePage, SourceSse, is_multipart_etag,
+};
 pub use stats::{
     GaugeGuard, LastSourceError, LatencyBucketSnapshot, OdmOp, OdmOutcome, OdmStats, OdmStatsSnapshot, PullFailureReason,
     PullPath, SOURCE_LATENCY_BUCKET_BOUNDS_MS, SourceLatencySnapshot,
@@ -71,3 +77,7 @@ pub use sys::{
     OnDemandMigrationSys, PullError, PullFollower, PullLeader, PullOutcome, PullResult, PullSlot, source_backend_spec,
     source_client_spec,
 };
+
+pub(crate) fn register_metrics() {
+    metrics::register();
+}

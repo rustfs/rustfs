@@ -14,10 +14,11 @@
 
 use crate::app::object::OnDemandMigrationWriteBack;
 use crate::module_switches::{on_demand_migration_enabled_from_env, set_on_demand_migration_module_enabled};
+use crate::on_demand_migration::OnDemandMigrationSys;
 use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage_api::startup::bucket_metadata::{
-    ECStore, Error as StorageError, OnDemandMigrationSys, Result as StorageResult, get_global_replication_pool,
-    init_bucket_metadata_sys, reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata, try_migrate_iam_config,
+    ECStore, Error as StorageError, Result as StorageResult, get_global_replication_pool, init_bucket_metadata_sys,
+    reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata, try_migrate_iam_config,
 };
 use std::{
     io::{Error as IoError, Result as IoResult},
@@ -98,6 +99,7 @@ pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: Cance
 /// `OnDemandMigrationSys` with a usable write-back (rustfs/backlog#2152).
 /// Idempotent across embedded and server startups.
 fn init_on_demand_migration_runtime() {
+    crate::on_demand_migration::register_metrics();
     let enabled = on_demand_migration_enabled_from_env();
     set_on_demand_migration_module_enabled(enabled);
     let sys = OnDemandMigrationSys::get();

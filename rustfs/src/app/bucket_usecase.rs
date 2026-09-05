@@ -20,7 +20,7 @@ use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
 use super::storage_api::bucket_usecase::access::ReqInfo;
 use super::storage_api::bucket_usecase::access::{
     authorize_request, bucket_config_mutation_incarnation, log_list_buckets_iam_implicit_deny,
-    prepare_list_buckets_iam_authorization, req_info_ref,
+    prepare_list_buckets_iam_authorization, prepare_odm_read_generation, req_info_ref,
 };
 #[cfg(test)]
 use super::storage_api::bucket_usecase::bucket::target::BucketTarget;
@@ -2724,7 +2724,14 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "trace", skip(self, req))]
     pub async fn execute_list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
-        // warn!("list_objects_v2 req {:?}", &req.input);
+        self.execute_list_objects_v2_inner(req, true).await
+    }
+
+    async fn execute_list_objects_v2_inner(
+        &self,
+        mut req: S3Request<ListObjectsV2Input>,
+        allow_list_through: bool,
+    ) -> S3Result<S3Response<ListObjectsV2Output>> {
         let ListObjectsV2Input {
             bucket,
             continuation_token,
@@ -2735,7 +2742,7 @@ impl DefaultBucketUsecase {
             prefix,
             start_after,
             ..
-        } = req.input;
+        } = req.input.clone();
 
         let params = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
 
@@ -2750,8 +2757,18 @@ impl DefaultBucketUsecase {
         // The on-demand migration envelope is decoded whether or not this
         // bucket still merges: a token handed out under `list_through` must keep
         // paginating after the policy is turned off (rustfs/backlog#2164).
-        let merged_token = list_through::decode_list_cursor(params.decoded_continuation_token.as_deref())?;
-        let (object_infos, degraded) = match list_through::list_through_state(&bucket, &req.headers) {
+        if allow_list_through {
+            prepare_odm_read_generation(&store, &mut req, &bucket).await;
+        }
+        let (merged_token, source_state) = if allow_list_through {
+            (
+                list_through::decode_list_cursor(params.decoded_continuation_token.as_deref())?,
+                list_through::list_through_state(&store, &bucket, &req, &params).await?,
+            )
+        } else {
+            (None, None)
+        };
+        let (object_infos, degraded) = match source_state {
             Some(state) => {
                 let outcome = list_through::merged_list_objects_v2(
                     &store,
@@ -2938,7 +2955,9 @@ impl DefaultBucketUsecase {
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         let request_marker = req.input.marker.clone();
-        let v2_resp = self.execute_list_objects_v2(req.map_input(Into::into)).await?;
+        // V1 markers are object keys, so they cannot carry the opaque merged
+        // pagination state used by V2 list-through.
+        let v2_resp = self.execute_list_objects_v2_inner(req.map_input(Into::into), false).await?;
 
         Ok(v2_resp.map_output(|v2| build_list_objects_output(v2, request_marker)))
     }

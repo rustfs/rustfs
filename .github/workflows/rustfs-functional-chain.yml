@@ -14,8 +14,8 @@
 
 # Functional chain driver: runs the ten functional suites in a fixed order
 # (upgrade -> s3 -> kms -> tier -> storage -> heal -> pool -> security ->
-# replication, with performance on its own runner in parallel) and guarantees
-# the chain keeps moving even when individual suites fail.
+# replication -> performance). Each suite attempts the next handoff even
+# when its tests fail.
 #
 # Each suite workflow can still be dispatched standalone (workflow_dispatch);
 # only chain-triggered runs forward to the next suite via repository_dispatch,
@@ -58,17 +58,4 @@ jobs:
           fi
           gh api --method POST repos/rustfs/rustfs/dispatches \
             -f event_type='rustfs-chain-upgrade' \
-            -F 'client_payload[from_suite]=nightly-build'
-
-      - name: Dispatch performance suite (parallel, own runner)
-        env:
-          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "PF_TESTING_GH_TOKEN is not configured; cannot dispatch performance" >&2
-            exit 1
-          fi
-          gh api --method POST repos/rustfs/rustfs/dispatches \
-            -f event_type='rustfs-chain-performance' \
             -F 'client_payload[from_suite]=nightly-build'
