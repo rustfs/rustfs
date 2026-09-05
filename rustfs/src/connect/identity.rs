@@ -220,8 +220,10 @@ impl DeviceIdentity {
     /// Build the PKCS#10 certificate request Connect consumes.
     ///
     /// Connect reads the request for its SubjectPublicKeyInfo and its
-    /// self-signature and for nothing else: it assigns the device uid itself,
-    /// so the subject and SAN carried here name nothing Connect will honour.
+    /// self-signature. The generated profile deliberately has no subject
+    /// alternative name, so the stock CA authorization path cannot
+    /// reinterpret an untyped name as a different ASN.1 GeneralName. Connect
+    /// assigns the issued subject and device URI itself.
     pub fn certificate_request_der(&self) -> Result<Vec<u8>, IdentityError> {
         let pkcs8 = self.to_pkcs8_der()?;
         let key_pair =

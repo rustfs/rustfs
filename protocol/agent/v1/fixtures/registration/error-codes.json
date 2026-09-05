@@ -61,6 +61,14 @@
             "note": "Separate from CERTIFICATE_REQUEST_MALFORMED because the request is structurally fine and the refusal is a policy one: ADR 0008 fixes the device key and this surface may not widen it."
         },
         {
+            "reason": "CERTIFICATE_REQUEST_PROFILE_UNSUPPORTED",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "meaning": "The CSR subject or a typed subject alternative name cannot round-trip through the pinned stock step-ca JWK authorization strings without changing its ASN.1 type.",
+            "definedBy": "protocol/agent/v1/registration-proof.md",
+            "note": "Stable and non-retryable. No SAN is valid and is the RustFS-generated profile. IP, absolute URI, email containing @, and remaining DNS strings are valid only in their matching GeneralName choice. These names authorize the CSR key only; the issued CN and sole URI SAN still come only from Connect's assigned device uid."
+        },
+        {
             "reason": "REGISTRATION_TOKEN_UNUSABLE",
             "httpStatus": 401,
             "status": "UNAUTHENTICATED",
