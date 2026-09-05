@@ -49,5 +49,14 @@ rustfs-rio.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+astral-tokio-tar = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tar-codec = { workspace = true }
+tar-framing = { workspace = true }
+
 [lints]
 workspace = true

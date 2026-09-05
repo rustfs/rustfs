@@ -1018,6 +1018,48 @@ fn finish_remote_scanner_stream(
 const TEST_NEXT_CYCLE: u64 = 11;
 
 #[cfg(test)]
+pub(crate) async fn checkpoint_fixture_partial_return(progress: (u64, u64), entries_visited: u64) {
+    let request_id = Uuid::new_v4();
+    let writer_auth = FrameAuthenticator::for_test(request_id);
+    let reader_auth = FrameAuthenticator::for_test(request_id);
+    let mut bytes = Vec::new();
+    write_frame(
+        &mut bytes,
+        &writer_auth,
+        &mut 0,
+        &RemoteScannerFrame::terminal(
+            RemoteScannerProgress {
+                objects_scanned: progress.0,
+                directories_started: progress.1,
+                entries_visited,
+            },
+            RemoteScannerFrameResult::Partial,
+        ),
+    )
+    .await
+    .expect("checkpoint partial frame must encode");
+    let frame = read_frame(&mut std::io::Cursor::new(bytes.as_slice()), &reader_auth, &mut 0)
+        .await
+        .expect("checkpoint progress frame must authenticate");
+    assert_eq!(frame.progress.entries_visited, entries_visited);
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
+    let result = consume_remote_scanner_stream(
+        std::io::Cursor::new(bytes),
+        parent,
+        budget.clone(),
+        "bucket",
+        DataUsageCacheSource::new(0, 0),
+        DataUsageScanPlanDigest([17; 32]),
+        reader_auth,
+    )
+    .await
+    .expect("checkpoint partial frame must decode");
+    assert!(matches!(result, RemoteScannerOutcome::Partial));
+    assert_eq!(budget.progress(), progress);
+}
+
+#[cfg(test)]
 async fn consume_remote_scanner_stream<R>(
     reader: R,
     ctx: CancellationToken,
