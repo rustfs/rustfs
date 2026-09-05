@@ -76,11 +76,12 @@ async fn walk_and_save(observe: bool) -> (Vec<String>, serde_json::Value) {
             let mut metadata = FileMeta::new();
             let mut info = FileInfo::new(&object, 4, 2);
             info.volume = "bucket".to_string();
+            info.name = object.clone();
             info.size = 1;
-            info.mod_time = Some(time::OffsetDateTime::UNIX_EPOCH);
+            info.mod_time = Some(time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture timestamp"));
             info.metadata.insert("etag".to_string(), "before".to_string());
             metadata.add_version(info).expect("construct segment fixture metadata");
-            write_test_object_metadata_bytes(&root, "bucket", &object, metadata.marshal_msg().expect("encode metadata")).await;
+            write_test_object_metadata_bytes(&root, "bucket", &object, &metadata.marshal_msg().expect("encode metadata")).await;
         }
     }
     let changed_key = "hot/one";
@@ -89,11 +90,12 @@ async fn walk_and_save(observe: bool) -> (Vec<String>, serde_json::Value) {
     let mut metadata = FileMeta::new();
     let mut info = FileInfo::new(changed_key, 4, 2);
     info.volume = "bucket".to_string();
+    info.name = changed_key.to_string();
     info.size = 1;
-    info.mod_time = Some(time::OffsetDateTime::UNIX_EPOCH);
+    info.mod_time = Some(time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture timestamp"));
     info.metadata.insert("etag".to_string(), "after!".to_string());
     metadata.add_version(info).expect("construct same-size hot mutation");
-    write_test_object_metadata_bytes(&root, "bucket", changed_key, metadata.marshal_msg().expect("encode hot mutation")).await;
+    write_test_object_metadata_bytes(&root, "bucket", changed_key, &metadata.marshal_msg().expect("encode hot mutation")).await;
     let after = tokio::fs::read(&changed_path)
         .await
         .expect("read back committed fixture mutation");
@@ -183,6 +185,8 @@ async fn walk_and_save(observe: bool) -> (Vec<String>, serde_json::Value) {
             "segment fixture: proposed={proposed:?}, actual_segments={walked_segments:?}, actual_walk_callbacks={}, production_producer_coverage=unverified",
             paths.len()
         );
+    } else {
+        assert!(proposed_walked.lock().expect("read disabled observations").is_empty());
     }
     // Compare semantic values because map encoding order is not content identity.
     (paths, cache_value(&loaded))
