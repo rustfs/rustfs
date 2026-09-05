@@ -418,7 +418,11 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
 #[tokio::test]
 #[serial]
 async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure() {
-    for (scan_mode, requires_full_scan) in [(HealScanMode::Deep, false), (HealScanMode::Normal, true)] {
+    for (scan_mode, requires_full_scan) in [
+        (HealScanMode::Normal, false),
+        (HealScanMode::Deep, false),
+        (HealScanMode::Normal, true),
+    ] {
         let (_temp_dir, store) = setup_two_pool_scanner_store().await;
         clear_dirty_usage_buckets_for_tests();
         for bucket in ["hot-bucket", "cold-bucket"] {
@@ -480,6 +484,9 @@ async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure(
             .await
             .expect("new cold object should persist");
         record_dirty_usage_bucket("hot-bucket");
+        if scan_mode == HealScanMode::Normal && !requires_full_scan {
+            record_dirty_usage_bucket("cold-bucket");
+        }
         let ctx = CancellationToken::new();
         let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
         let (updates, mut receiver) = mpsc::channel(1);
