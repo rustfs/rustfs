@@ -17,10 +17,11 @@ use crate::module_switches::{
     bitrot_selftest_enabled_from_env, bitrot_selftest_strict_from_env, heal_enabled_from_env,
     is_on_demand_migration_module_enabled, scanner_enabled_from_env,
 };
-use crate::storage_api::startup::background::{
-    BackfillRunner, ECStore, OnDemandMigrationSys, SysBackfillContexts, install_global_backfill_runner,
-    set_workload_admission_snapshot_provider, spawn_backfill_recovery_loop,
+use crate::on_demand_migration::OnDemandMigrationSys;
+use crate::on_demand_migration::backfill::{
+    BackfillRunner, SysBackfillContexts, install_global_backfill_runner, spawn_backfill_recovery_loop,
 };
+use crate::storage_api::startup::background::{ECStore, set_workload_admission_snapshot_provider};
 use crate::workload_admission::RustFsWorkloadAdmissionSnapshotProvider;
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_heal::{

@@ -15,7 +15,7 @@
 //! HeadObject path.
 
 use super::*;
-use crate::app::storage_api::object_usecase::bucket::on_demand_migration::{
+use crate::on_demand_migration::{
     BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OnDemandMigrationSys, SourceClient, SourceError, SourceHead,
 };
 
@@ -638,7 +638,7 @@ impl DefaultObjectUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::storage_api::object_usecase::bucket::on_demand_migration::{
+    use crate::on_demand_migration::{
         BREAKER_FAILURE_THRESHOLD, BreakerState, FilterConfig, OdmStateError, OnDemandMigrationConfig, PathStyle, PolicyConfig,
         Provider, SourceConfig, SourceCredentials, SourceErrorPolicy, TlsConfig,
     };
@@ -739,11 +739,9 @@ mod tests {
             user_metadata: HashMap::from([("owner".to_string(), "alice".to_string())]),
             version_id: Some("v1".to_string()),
             storage_class: Some("STANDARD_IA".to_string()),
-            sse: Some(
-                crate::storage::storage_api::ecstore_bucket::on_demand_migration::source_client::SourceSse::Kms {
-                    key_id: Some("key-1".to_string()),
-                },
-            ),
+            sse: Some(crate::on_demand_migration::source_client::SourceSse::Kms {
+                key_id: Some("key-1".to_string()),
+            }),
             is_multipart_etag: true,
             etag_is_opaque: false,
         }

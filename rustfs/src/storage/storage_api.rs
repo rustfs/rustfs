@@ -407,8 +407,8 @@ pub(crate) mod ecstore_bucket {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::bucket::lifecycle::tier_delete_journal::test_util::install_all_v6_fleet_capability_proof;
     pub(crate) use rustfs_ecstore::api::bucket::{
-        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, migration, object_lock, on_demand_migration,
-        policy_sys, remote_s3_client, replication, tagging, target, utils,
+        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, migration, object_lock, policy_sys,
+        remote_s3_client, replication, tagging, target, utils,
     };
     pub(crate) use rustfs_ecstore::api::bucket::{quota, versioning, versioning_sys};
 }
@@ -466,10 +466,10 @@ pub(crate) mod ecstore_data_usage {
 #[allow(unused_imports)]
 pub(crate) mod ecstore_disk {
     pub(crate) use rustfs_ecstore::api::disk::{
-        BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskStore,
-        FileInfoVersions, FileReader, FileWriter, OldCurrentSize, PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq,
-        ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-        get_object_disk_read_timeout, validate_batch_read_version_item_count,
+        BUCKET_META_PREFIX, BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo,
+        DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, OldCurrentSize, PartTransactionAction,
+        RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken,
+        UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout, validate_batch_read_version_item_count,
     };
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
@@ -560,7 +560,7 @@ pub(crate) mod ecstore_object {
     pub(crate) use rustfs_ecstore::api::object::{
         EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup,
         ObjectEncryptionResolver, ObjectMutationHook, PrepareSelectObjectSnapshotError, ReadEncryptionMaterial,
-        ReadEncryptionMode, ReadEncryptionRequest, SelectObjectSnapshot, get_object_body_cache_plaintext_len,
+        ReadEncryptionMode, ReadEncryptionRequest, SelectObjectSnapshot, WriteCompletion, get_object_body_cache_plaintext_len,
         lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
         unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
