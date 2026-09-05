@@ -854,6 +854,7 @@ async fn run_checkpoint_fixture(change_digest: bool) {
                 cache,
                 None,
                 HealScanMode::Normal,
+                None,
             )
             .await
             .expect("budgeted local disk scan returns partial cache");
@@ -932,6 +933,7 @@ async fn run_checkpoint_fixture(change_digest: bool) {
             loaded.clone(),
             None,
             HealScanMode::Normal,
+            None,
         )
         .await;
     assert!(result.is_err(), "pre-scan cancellation must not produce a complete root");

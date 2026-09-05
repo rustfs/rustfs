@@ -164,7 +164,10 @@ mod scoped_dirty_usage_tests {
                 DirtyUsageBucketScope::TopLevelEntries(HashSet::from(["first".to_string()])),
             ),
         ]);
-        assert_eq!(apply_scoped_dirty_usage_ack("p", "p", 8, &mut dirty, &mut scopes, &[("cold", 8)], true), Ok(0));
+        assert_eq!(
+            apply_scoped_dirty_usage_ack("p", "p", 8, &mut dirty, &mut scopes, &[("cold", 8)], true),
+            Ok(0)
+        );
         assert_eq!(dirty.len(), 2);
         assert!(scopes.contains_key("cold"));
         assert_eq!(
@@ -203,15 +206,7 @@ mod scoped_dirty_usage_tests {
         assert_eq!(scopes, original_scopes);
         for generation in [0, 9, u64::MAX] {
             assert_eq!(
-                apply_scoped_dirty_usage_ack(
-                    "p",
-                    "p",
-                    8,
-                    &mut dirty,
-                    &mut scopes,
-                    &[("cold", 8), ("hot", generation)],
-                    false,
-                ),
+                apply_scoped_dirty_usage_ack("p", "p", 8, &mut dirty, &mut scopes, &[("cold", 8), ("hot", generation)], false,),
                 Err(ScannerDirtyUsageAckError::InvalidGeneration)
             );
             assert_eq!(dirty, original);
