@@ -171,8 +171,11 @@ mod canonical_outcome {
             .find(|item| item.identity.object == "object-a")
             .expect("failed object");
         assert_eq!(failed.disposition, HealObjectDisposition::Failed(HealFailureClass::RetryExhausted));
-        let calls = storage.heal_object_calls.lock().expect("calls");
-        assert_eq!(calls.iter().filter(|object| object.as_str() == "object-b").count(), 1);
+        let object_b_calls = {
+            let calls = storage.heal_object_calls.lock().expect("calls");
+            calls.iter().filter(|object| object.as_str() == "object-b").count()
+        };
+        assert_eq!(object_b_calls, 1);
         let progress = task.get_progress().await;
         assert_eq!((progress.objects_scanned, progress.objects_healed, progress.objects_failed), (2, 1, 1));
     }
@@ -357,8 +360,11 @@ mod canonical_outcome {
         request.options.set_index = Some(3);
         let task = HealTask::from_request(request, storage.clone());
         task.execute().await.expect("decode fixture");
-        let options = storage.object_heal_opts.lock().expect("storage options");
-        assert_eq!((options[0].pool, options[0].set), (Some(2), Some(3)));
+        let pool_and_set = {
+            let options = storage.object_heal_opts.lock().expect("storage options");
+            (options[0].pool, options[0].set)
+        };
+        assert_eq!(pool_and_set, (Some(2), Some(3)));
         let outcome = task.get_outcome().await;
         let identity = &outcome.objects[0].identity;
         assert_eq!((identity.pool_index, identity.set_index), (Some(2), Some(3)));
