@@ -684,6 +684,7 @@ async fn write_checkpoint(
     };
     let opts = ObjectOptions {
         max_parity: true,
+        write_completion: crate::object_api::WriteCompletion::TailDrained,
         http_preconditions: Some(preconditions),
         ..Default::default()
     };
