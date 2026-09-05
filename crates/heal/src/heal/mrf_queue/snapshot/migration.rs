@@ -1360,4 +1360,61 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn migration_third_generation_source_change_retry_keeps_reused_slot_recoverable() {
+        let root = TempDir::new().expect("test directory");
+        let disk = disk(&root, "disk").await;
+        let disks = [Some(disk.clone())];
+        let owner = Uuid::new_v4();
+        let records = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|name| record(name, MrfKind::PartialWrite, None))
+            .collect::<Vec<_>>();
+
+        for bytes in &records[..2] {
+            source(&disk, bytes).await;
+            let candidate = capture_legacy_migration(&disks, LIMITS)
+                .await
+                .expect("capture committed generation");
+            stage_legacy_migration(&disks, &candidate, owner, LIMITS)
+                .await
+                .expect("stage committed generation");
+        }
+
+        source(&disk, &records[2]).await;
+        let third = capture_legacy_migration(&disks, LIMITS)
+            .await
+            .expect("capture third generation");
+        SOURCE_CHANGES
+            .lock()
+            .expect("source fault map")
+            .insert(owner, (disk.clone(), records[3].clone()));
+        assert!(matches!(
+            stage_legacy_migration(&disks, &third, owner, LIMITS).await,
+            Err(MigrationError::SourceChanged)
+        ));
+        assert!(matches!(recover_pending_migration(&disks, LIMITS).await, Err(MigrationError::Conflict)));
+
+        source(&disk, &records[2]).await;
+        let retry = capture_legacy_migration(&disks, LIMITS)
+            .await
+            .expect("recapture restored third generation");
+        assert_eq!(
+            stage_legacy_migration(&disks, &retry, owner, LIMITS)
+                .await
+                .expect("retry restored third generation"),
+            3
+        );
+        let recovered = recover_pending_migration(&disks, LIMITS)
+            .await
+            .expect("recover after restored third retry")
+            .expect("third generation");
+        let replayed = recovered.replay_records(LIMITS).expect("all staged responsibilities");
+        assert_eq!(replayed.len(), 3);
+        for record in &records[..3] {
+            assert!(replayed.contains(record));
+        }
+        assert!(!replayed.contains(&records[3]));
+    }
 }
