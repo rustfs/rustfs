@@ -6479,6 +6479,120 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stale_idle_group_cleanup_preserves_successor_registration() {
+        let temp_dir = tempdir().expect("fixture directory");
+        let registry = DstDirFsyncGroupCommit::default();
+        let (mut first_rx, first_worker) = registry.enqueue_for_test(temp_dir.path()).expect("enqueue first worker");
+        let old_group = first_worker.expect("first waiter starts a worker");
+        // W1 has completed its batch and marked G idle, but has not cleaned G up.
+        let first_waiter = old_group.inner.lock().pending.pop_front().expect("first batch waiter");
+        registry.complete_batch(1);
+        old_group.inner.lock().worker_running = false;
+
+        let (mut second_rx, second_worker) = registry.enqueue_for_test(temp_dir.path()).expect("enqueue second worker");
+        let reused_group = second_worker.expect("idle G starts another worker");
+        assert!(Arc::ptr_eq(&old_group, &reused_group));
+        let second_waiter = reused_group.inner.lock().pending.pop_front().expect("second batch waiter");
+        registry.complete_batch(1);
+        reused_group.inner.lock().worker_running = false;
+        registry.remove_idle_group(&reused_group);
+        assert_eq!(registry.counts_for_test(), (0, 0), "normal idle cleanup must remove G");
+        assert!(second_waiter.result_tx.send(Ok(())).is_ok());
+        assert!(second_rx.try_recv().expect("second worker reports completion").is_ok());
+
+        let (mut successor_rx, successor_worker) = registry.enqueue_for_test(temp_dir.path()).expect("enqueue successor");
+        let successor = successor_worker.expect("successor starts a new group");
+        assert!(!Arc::ptr_eq(&old_group, &successor));
+        assert_eq!(registry.counts_for_test(), (1, 1));
+        // W1 resumes with its old Arc after W2 removed G and W3 installed G2.
+        registry.remove_idle_group(&old_group);
+        assert!(first_waiter.result_tx.send(Ok(())).is_ok());
+        assert!(first_rx.try_recv().expect("first worker reports completion").is_ok());
+        assert!(
+            registry
+                .inner
+                .lock()
+                .groups
+                .get(&successor.key)
+                .is_some_and(|registered| Arc::ptr_eq(registered, &successor)),
+            "stale cleanup must retain the exact successor Arc"
+        );
+        assert_eq!(registry.counts_for_test(), (1, 1));
+        assert!(successor.inner.lock().worker_running);
+        assert_eq!(successor.inner.lock().pending.len(), 1);
+        assert!(matches!(successor_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+
+        let (_joined_rx, new_worker) = registry.enqueue_for_test(temp_dir.path()).expect("join successor");
+        assert!(new_worker.is_none(), "a later waiter must join G2 instead of creating G3");
+        assert_eq!(successor.inner.lock().pending.len(), 2);
+        assert_eq!(registry.counts_for_test(), (1, 2));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit)]
+    async fn stale_idle_cleanup_then_unpolled_worker_drop_releases_waiter_budget() {
+        wait_for_dst_dir_fsync_group_commit_idle().await;
+        let temp_dir = tempdir().expect("fixture directory");
+        let (old_rx, old_worker) = DST_DIR_FSYNC_GROUP_COMMIT
+            .enqueue_for_test(temp_dir.path())
+            .expect("enqueue old group");
+        let old_group = old_worker.expect("old group starts a worker");
+        tokio::time::timeout(Duration::from_secs(5), run_dst_dir_fsync_group_worker(old_group.clone()))
+            .await
+            .expect("old worker must finish its actual fsync");
+        assert!(old_rx.await.expect("old worker reports completion").is_ok());
+        assert!(fsync_dir_recorder::was_fsynced(temp_dir.path()));
+        assert_eq!(fsync_dir_recorder::grouped_batch_sizes(temp_dir.path()), vec![1]);
+        assert_eq!(DST_DIR_FSYNC_GROUP_COMMIT.counts_for_test(), (0, 0));
+
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let owner = ctx.begin_namespace_commit();
+        let probe = Arc::downgrade(&owner);
+        let generation = ctx.namespace_commit_generation();
+        let (rx, successor_worker) = DST_DIR_FSYNC_GROUP_COMMIT
+            .enqueue_opened(
+                OpenedDstDirFsyncGroup::open(temp_dir.path()).expect("open successor directory"),
+                Some(owner),
+            )
+            .expect("enqueue successor owner");
+        let successor = successor_worker.expect("successor starts a new group");
+        assert!(!Arc::ptr_eq(&old_group, &successor));
+        let worker = run_dst_dir_fsync_group_worker(successor.clone());
+        // The stale Arc represents W1 resuming after another worker removed G.
+        DST_DIR_FSYNC_GROUP_COMMIT.remove_idle_group(&old_group);
+        assert!(ctx.namespace_commits_pending());
+        assert!(probe.upgrade().is_some());
+        drop(worker);
+        let channel_closed = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("dropping the unpolled worker must release its channel")
+            .is_err();
+        let counts_after_drop = DST_DIR_FSYNC_GROUP_COMMIT.counts_for_test();
+        let owner_released = probe.upgrade().is_none();
+        let namespace_pending = ctx.namespace_commits_pending();
+        let generation_after_drop = ctx.namespace_commit_generation();
+        let successor_pending = successor.inner.lock().pending.len();
+        let worker_running = successor.inner.lock().worker_running;
+        // Preserve the observed result before cleanup, so a RED run cannot leak
+        // its phantom count into unrelated tests in the same process.
+        clear_dst_dir_fsync_group_commit_for_test();
+        assert!(channel_closed);
+        assert!(owner_released);
+        assert!(!namespace_pending);
+        assert!(generation_after_drop > generation);
+        assert_eq!(successor_pending, 0);
+        assert!(!worker_running);
+        assert_eq!(
+            fsync_dir_recorder::grouped_batch_sizes(temp_dir.path()),
+            vec![1],
+            "dropping the successor before its first poll must not dispatch another fsync"
+        );
+        assert_eq!(counts_after_drop, (0, 0), "stale cleanup must not strand a phantom waiter");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(dst_dir_fsync_group_commit)]
     async fn dst_dir_fsync_group_commit_cancellation_releases_waiter_state() {
