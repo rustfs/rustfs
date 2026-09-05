@@ -209,6 +209,14 @@ fn scanner_bucket_cache_digest(
     DataUsageScanPlanDigest(hasher.finalize().into())
 }
 
+#[cfg(test)]
+pub(crate) fn checkpoint_fixture_bucket_digest(
+    scan_plan_digest: DataUsageScanPlanDigest,
+    dirty_generation: Option<u64>,
+) -> DataUsageScanPlanDigest {
+    scanner_bucket_cache_digest(scan_plan_digest, dirty_generation)
+}
+
 fn finalize_nsscanner_result(results: &[DataUsageCache], first_err: Option<Error>) -> Result<()> {
     if results.iter().any(|result| result.info.last_update.is_some()) {
         return Ok(());

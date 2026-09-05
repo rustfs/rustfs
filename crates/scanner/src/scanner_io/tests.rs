@@ -1049,6 +1049,27 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
 }
 
 #[test]
+fn checkpoint_fixture_superseded_is_distinct_from_partial_and_cancel() {
+    for (budget, cancelled, bucket, expected) in [
+        (false, false, ScannerBucketScanStatus::Complete, ScannerCycleStatus::Superseded),
+        (true, false, ScannerBucketScanStatus::Partial, ScannerCycleStatus::Incomplete),
+        (false, true, ScannerBucketScanStatus::Partial, ScannerCycleStatus::Incomplete),
+    ] {
+        assert_eq!(
+            classify_nsscanner_cycle(
+                true,
+                budget,
+                cancelled,
+                bucket,
+                DirtyUsageSnapshotStatus::Changed,
+                ScannerCycleActivityStatus::Unchanged
+            ),
+            expected,
+        );
+    }
+}
+
+#[test]
 fn unverified_activity_defers_partial_and_floor_cycles() {
     let expected = ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
 
