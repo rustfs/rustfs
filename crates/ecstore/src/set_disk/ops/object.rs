@@ -303,7 +303,7 @@ use crate::object_api::{
 };
 use crate::services::notification_sys::RemoteVersionStateFleetProofToken;
 use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease, tier_destination_id_from_metadata};
-use crate::set_disk::core::io_primitives::{RenameTailCleanup, finish_rename_tail_heal};
+use crate::set_disk::core::io_primitives::{RenameRollbackReceipt, RenameTailCleanup, finish_rename_tail_heal};
 #[cfg(test)]
 use crate::storage_api_contracts::namespace::NamespaceLocking;
 #[cfg(test)]
@@ -3548,6 +3548,7 @@ impl SetDisks {
                 (None, None, None)
             };
         let mut tmp_cleanup_owned = false;
+        let rollback_receipt = RenameRollbackReceipt::default();
         let operation = async {
             let erasure = Arc::new(erasure_from_file_info(&fi, false)?);
 
@@ -4256,6 +4257,7 @@ impl SetDisks {
             let commit_bucket = bucket.to_owned();
             let commit_object = object.to_owned();
             let commit_tmp_dir = tmp_dir.clone();
+            let commit_rollback_receipt = rollback_receipt.clone();
             let commit_object_lock_guard = object_lock_guard.take();
             let commit_decommission_object_lock_guard = decommission_object_lock_guard.take();
             let commit_publication_guard = publication_commit_guard.take();
@@ -4456,7 +4458,8 @@ impl SetDisks {
                         write_quorum,
                         commit_scanner_publication_lease_tokens.as_ref(),
                     )
-                    .with_publication_scope(commit_scanner_publication_scope.clone()),
+                    .with_publication_scope(commit_scanner_publication_scope.clone())
+                    .with_rollback_receipt(commit_rollback_receipt.clone()),
                 )
                 .await;
                 if let Some(scope) = commit_scanner_publication_scope.as_ref() {
@@ -4589,6 +4592,11 @@ impl SetDisks {
                 let rename_commit = match rename_result {
                     Ok(commit) => commit,
                     Err(err) => {
+                        if commit_rollback_receipt.is_incomplete() {
+                            // Incomplete undo retains the staging source and
+                            // rollback backup for recovery; cleanup is unsafe.
+                            return Err(err.into());
+                        }
                         if let Err(cleanup_err) = commit_set.delete_all(RUSTFS_META_TMP_BUCKET, &commit_tmp_dir).await {
                             warn!(tmp_dir = %commit_tmp_dir, error = ?cleanup_err, "failed to cleanup put_object temporary data");
                         } else if issue3031_diag_enabled() {
@@ -4888,7 +4896,7 @@ impl SetDisks {
                     );
                 }
             });
-        } else {
+        } else if !rollback_receipt.is_incomplete() {
             // Failure path (quorum loss / rollback): keep the cleanup inline so
             // a failed PUT never returns while its tmp shards are still on disk
             // (state-residue hardening tracked by backlog#864 / backlog#898).
@@ -18356,6 +18364,99 @@ mod put_object_tmp_cleanup_tests {
             set.get_object_info(bucket, object, &ObjectOptions::default()).await.is_err(),
             "failed fresh write must not become visible"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn put_incomplete_rollback_preserves_staging_and_old_version_backup() {
+        use crate::set_disk::core::io_primitives::rollback_fault_injection;
+
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            for write_completion in [WriteCompletion::Quorum, WriteCompletion::TailDrained] {
+                let (dirs, disks, set) = hermetic_set_disks(4).await;
+                let bucket = "put-incomplete-undo";
+                let object = "incomplete-undo-object";
+                make_completion_test_bucket(&disks, bucket).await;
+                let mut old_reader = PutObjReader::from_vec(vec![b'0'; TEST_OBJECT_SIZE]);
+                set.put_object(
+                    bucket,
+                    object,
+                    &mut old_reader,
+                    &ObjectOptions {
+                        write_completion: WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("old generation should be completely committed");
+                wait_for_tmp_workspace_to_drain(&dirs, "old PUT must leave no unrelated staging").await;
+                let old = disks[0]
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .expect("old metadata must be readable");
+                let old_data_dir = old.data_dir.expect("non-inline old version needs a data directory");
+                let tasks = rename_fanout_barrier::observe_tasks(object);
+                let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+                let _rename_fault = rename_fault_injection::fail_rename_on(object, &[2, 3]);
+                let _undo_fault = rollback_fault_injection::arm(object, 0, rollback_fault_injection::Fault::Io);
+                let writer = Arc::clone(&set);
+                let put = tokio::spawn(async move {
+                    let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+                    writer
+                        .put_object(
+                            bucket,
+                            object,
+                            &mut reader,
+                            &ObjectOptions {
+                                write_completion,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                    .await
+                    .expect("overwrite must enter the actual rename fan-out before failure injection");
+                barrier.release();
+                let err = tokio::time::timeout(Duration::from_secs(30), put)
+                    .await
+                    .expect("incomplete undo must return without hanging")
+                    .expect("PUT task should join")
+                    .expect_err("two renamed disks cannot satisfy write quorum three");
+                assert!(
+                    matches!(err, Error::ErasureWriteQuorum | Error::InsufficientWriteQuorum(_, _)),
+                    "original quorum error expected: {err}"
+                );
+                assert_eq!(tasks.running(), 0, "every rename and undo task must be reaped before return");
+                let leftovers = non_trash_tmp_entries(&dirs).await;
+                assert!(!leftovers.is_empty(), "incomplete undo must retain the new staging source for recovery");
+                let backups = dirs
+                    .iter()
+                    .filter(|dir| {
+                        dir.path()
+                            .join(bucket)
+                            .join(object)
+                            .join(old_data_dir.to_string())
+                            .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP)
+                            .exists()
+                    })
+                    .count();
+                assert_eq!(backups, 1, "exactly the failed undo disk must retain its old-version backup");
+                // The remaining three disks still serve the old generation;
+                // the failed minority must never become an acknowledged write.
+                let mut read = set
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("old generation must remain readable after incomplete rollback");
+                let mut body = Vec::new();
+                read.stream
+                    .read_to_end(&mut body)
+                    .await
+                    .expect("old generation should stream");
+                assert_eq!(body, vec![b'0'; TEST_OBJECT_SIZE]);
+            }
+        })
+        .await;
     }
 
     #[tokio::test]
