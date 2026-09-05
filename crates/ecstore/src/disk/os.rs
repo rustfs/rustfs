@@ -735,7 +735,13 @@ impl DstDirFsyncGroupCommit {
     fn remove_idle_group(&self, group: &Arc<DstDirFsyncGroup>) {
         let mut registry = self.inner.lock();
         let group_state = group.inner.lock();
-        if !group_state.worker_running && group_state.pending.is_empty() {
+        if !group_state.worker_running
+            && group_state.pending.is_empty()
+            && registry
+                .groups
+                .get(&group.key)
+                .is_some_and(|registered| Arc::ptr_eq(registered, group))
+        {
             registry.groups.remove(&group.key);
         }
     }
