@@ -90,6 +90,8 @@ const BACKFILL_OP_CANCEL: &str = "cancel";
 pub(crate) const ERR_CODE_MODULE_DISABLED: &str = "OnDemandMigrationDisabled";
 /// Error code returned when the source bucket did not answer the probe.
 pub(crate) const ERR_CODE_SOURCE_UNREACHABLE: &str = "OnDemandMigrationSourceUnreachable";
+/// Error code returned when the configured provider was excluded at build time.
+pub(crate) const ERR_CODE_BACKEND_NOT_COMPILED: &str = "OnDemandMigrationBackendNotCompiled";
 /// Error code returned by `GET` when the bucket has no configuration.
 pub(crate) const ERR_CODE_NO_SUCH_CONFIGURATION: &str = "NoSuchConfiguration";
 /// Error code (409) returned by `start` while a backfill job holds the lease.
@@ -630,12 +632,17 @@ pub(crate) fn source_client_spec(config: &OnDemandMigrationConfig) -> SourceClie
     }
 }
 
-/// Builder failures are input errors: the endpoint policy, the CA PEM or the
-/// credentials the operator supplied. Anonymous sources are not wired yet
+/// Distinguishes excluded backends from invalid endpoint, CA or credentials.
+/// Anonymous S3 sources are not wired yet
 /// (ODM-05 adds the credential-less path), so `MissingCredentials` is a 400
 /// naming the field instead of an opaque internal error.
 fn client_build_error(err: RemoteS3ClientError) -> S3Error {
     match err {
+        RemoteS3ClientError::BackendNotCompiled(provider) => custom_error(
+            ERR_CODE_BACKEND_NOT_COMPILED,
+            StatusCode::NOT_IMPLEMENTED,
+            format!("the {provider} backend is not included in this build; rebuild with the gcs feature"),
+        ),
         RemoteS3ClientError::MissingCredentials => admin_s3_error(
             S3ErrorCode::InvalidArgument,
             "source.credentials is required: anonymous sources are not supported yet",
@@ -1286,6 +1293,14 @@ mod tests {
         let err = client_build_error(RemoteS3ClientError::MissingCredentials);
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
         assert!(err.message().unwrap_or_default().contains("source.credentials"));
+    }
+
+    #[test]
+    fn backend_not_compiled_is_distinct_from_invalid_credentials() {
+        let err = client_build_error(RemoteS3ClientError::BackendNotCompiled("gcs_native"));
+        assert_eq!(err.code(), &S3ErrorCode::Custom(ERR_CODE_BACKEND_NOT_COMPILED.into()));
+        assert_eq!(err.status_code(), Some(StatusCode::NOT_IMPLEMENTED));
+        assert!(err.message().unwrap_or_default().contains("gcs feature"));
     }
 
     #[test]

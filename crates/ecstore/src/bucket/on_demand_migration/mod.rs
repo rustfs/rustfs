@@ -30,6 +30,7 @@ mod backend_contract;
 pub mod backfill;
 pub mod breaker;
 pub mod config;
+#[cfg(feature = "gcs")]
 pub mod gcs;
 pub mod list_through;
 mod native_http;
