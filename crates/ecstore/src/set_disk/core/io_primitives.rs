@@ -10009,6 +10009,7 @@ mod tests {
                 file_info.mod_time = Some(OffsetDateTime::now_utc());
                 file_info.erasure.index = idx + 1;
                 file_info.data = Some(Bytes::from_static(b"inline-body"));
+                file_info.set_inline_data();
                 file_info.metadata.insert("etag".to_string(), etag.to_string());
                 file_info
             })
@@ -10808,6 +10809,7 @@ mod tests {
                                 let mut old = metadata_test_fileinfo(&object);
                                 old.mod_time = Some(OffsetDateTime::now_utc());
                                 old.data = Some(Bytes::from_static(b"old-inline-body"));
+                                old.set_inline_data();
                                 old.metadata.insert("etag".to_string(), "old-etag".to_string());
                                 for disk in disks.iter().flatten() {
                                     disk.write_metadata(bucket, bucket, &object, old.clone())
@@ -10921,7 +10923,8 @@ mod tests {
                                             b"inline-body".as_slice()
                                         } else {
                                             b"old-inline-body".as_slice()
-                                        })
+                                        }),
+                                        "object={object}, disk={idx}, keeps_new={keeps_new}"
                                     );
                                 } else {
                                     assert!(
@@ -11143,6 +11146,7 @@ mod tests {
             let mut old = metadata_test_fileinfo(object);
             old.mod_time = Some(OffsetDateTime::now_utc());
             old.data = Some(Bytes::from_static(b"old-inline-body"));
+            old.set_inline_data();
             old.metadata.insert("etag".to_string(), "old-etag".to_string());
             for disk in disks.iter().flatten() {
                 disk.write_metadata(bucket, bucket, object, old.clone())
