@@ -28,18 +28,19 @@ pub(crate) fn EndpointServerPools(
 /// the direct s3s surface (s3s footprint ratchet, `scripts/check_s3s_footprint.sh`).
 pub(crate) mod s3 {
     #[cfg(test)]
+    pub(crate) use s3s::S3Response;
+    #[cfg(test)]
     pub(crate) use s3s::dto::ListObjectsInput;
     #[cfg(test)]
     pub(crate) use s3s::dto::{
-        BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ListObjectsV2Input,
-        ListObjectsV2Output, ReplicationConfiguration, ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus,
-        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, VersioningConfiguration,
+        BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, GetObjectInput,
+        HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output, ReplicationConfiguration, ReplicationRule,
+        ReplicationRuleFilter, ReplicationRuleStatus, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+        ServerSideEncryptionRule, Tag, VersioningConfiguration,
     };
     #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
-    pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
-    #[cfg(test)]
-    pub(crate) use s3s::{S3Request, S3Response};
+    pub(crate) use s3s::{S3Error, S3ErrorCode, S3Request, S3Result};
 }
 
 pub(crate) mod admin {
@@ -266,8 +267,9 @@ pub(crate) mod access {
     pub(crate) use crate::storage::storage_api::access_consumer::{
         PostObjectRequestMarker, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_request,
         bucket_config_mutation_incarnation, has_bypass_governance_header, load_bucket_generation_from_store,
-        log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization, recursive_force_delete_is_authorized,
-        replication_request_authorized, req_info_mut, req_info_ref,
+        log_list_buckets_iam_implicit_deny, odm_read_generation, prepare_list_buckets_iam_authorization,
+        prepare_odm_read_generation, recursive_force_delete_is_authorized, replication_request_authorized, req_info_mut,
+        req_info_ref,
     };
 }
 
