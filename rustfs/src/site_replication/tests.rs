@@ -1161,6 +1161,11 @@ fn test_retry_error_marks_peer_unreachable_only_for_connection_failures() {
 fn test_connect_timeout_is_classified_as_a_connection_failure() {
     assert_eq!(classify_peer_transport_error(true, true, "tcp connect timed out"), "connect");
     assert_eq!(classify_peer_transport_error(false, true, "request timed out"), "timeout");
+    assert_eq!(
+        classify_peer_transport_error(false, true, "request timed out for https://tls-gateway.example"),
+        "timeout"
+    );
+    assert_eq!(classify_peer_transport_error(true, false, "tls handshake failed"), "tls handshake");
 }
 
 #[test]
