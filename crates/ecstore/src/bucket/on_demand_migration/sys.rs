@@ -1079,6 +1079,23 @@ mod tests {
         assert_eq!(sys.apply("b", Some(&cfg)).await, ApplyOutcome::Rebuilt);
     }
 
+    #[tokio::test]
+    async fn native_azure_uses_provider_credentials_without_s3_credentials() {
+        let sys = enabled_sys();
+        let mut cfg = config(None);
+        cfg.source.provider = Provider::Azure;
+        cfg.source.endpoint = None;
+        cfg.source.credentials = None;
+        cfg.source.azure = Some(super::super::config::AzureSourceConfig {
+            account: "legacyaccount".to_string(),
+            account_key: Some("c2VjcmV0LWtleQ==".to_string()),
+            sas_token: None,
+        });
+        assert_eq!(sys.apply("b", Some(&cfg)).await, ApplyOutcome::Installed);
+        let state = ready_state(sys.resolve("b", "k"));
+        assert!(state.client().is_ok(), "native credentials must not be classified as anonymous S3");
+    }
+
     #[cfg(not(feature = "gcs"))]
     #[tokio::test]
     async fn gcs_backend_not_compiled_is_unavailable_not_anonymous() {
