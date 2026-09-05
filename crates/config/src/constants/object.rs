@@ -137,6 +137,28 @@ pub const DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED: bool = false;
 const _: () = assert!(!DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE);
 const _: () = assert!(!DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED);
 
+/// Environment variable for remote tier TCP connect timeout in seconds.
+pub const ENV_TIER_REMOTE_CONNECT_TIMEOUT_SECS: &str = "RUSTFS_TIER_REMOTE_CONNECT_TIMEOUT_SECS";
+/// Default remote tier TCP connect timeout in seconds.
+pub const DEFAULT_TIER_REMOTE_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Environment variable for the remote tier request timeout in seconds.
+///
+/// This bounds upload/download request progress through response headers. The
+/// default is intentionally large so multi-TiB transition uploads keep their
+/// previous production budget while black-hole remotes no longer wait forever.
+pub const ENV_TIER_REMOTE_REQUEST_TIMEOUT_SECS: &str = "RUSTFS_TIER_REMOTE_REQUEST_TIMEOUT_SECS";
+/// Default remote tier request timeout in seconds.
+pub const DEFAULT_TIER_REMOTE_REQUEST_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+/// Environment variable for remote tier response-body idle timeout in seconds.
+///
+/// The timer is re-armed on every non-empty response-body chunk, so slow but
+/// progressing remotes can continue while silent response bodies are cancelled.
+pub const ENV_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS: &str = "RUSTFS_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS";
+/// Default remote tier response-body idle timeout in seconds.
+pub const DEFAULT_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS: u64 = 60;
+
 /// Request the object-transaction fencing contract used by storage-owned
 /// cleanup receipts and lock-window optimizations.
 ///
@@ -809,6 +831,16 @@ mod remote_version_state_tests {
         assert_eq!(
             super::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
             "RUSTFS_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED"
+        );
+    }
+
+    #[test]
+    fn remote_tier_timeout_env_names_are_stable() {
+        assert_eq!(super::ENV_TIER_REMOTE_CONNECT_TIMEOUT_SECS, "RUSTFS_TIER_REMOTE_CONNECT_TIMEOUT_SECS");
+        assert_eq!(super::ENV_TIER_REMOTE_REQUEST_TIMEOUT_SECS, "RUSTFS_TIER_REMOTE_REQUEST_TIMEOUT_SECS");
+        assert_eq!(
+            super::ENV_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS,
+            "RUSTFS_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS"
         );
     }
 

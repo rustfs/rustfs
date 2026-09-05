@@ -76,9 +76,6 @@ jobs:
   pool-expansion-test:
     name: Pool expansion / decommission test
     runs-on: smoke-testing
-    # Requirement: a failing suite must not fail the workflow; failures
-    # are filed to rustfs/backlog and the chain continues.
-    continue-on-error: true
     timeout-minutes: 360
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     env:

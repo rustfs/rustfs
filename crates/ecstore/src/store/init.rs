@@ -787,6 +787,12 @@ impl ECStore {
     pub fn single_pool(&self) -> bool {
         self.pools.len() == 1
     }
+
+    /// The set-local create-only check is atomic only when every object
+    /// mutation uses that same, enabled namespace lock domain.
+    pub fn supports_atomic_create_only_write_back(&self) -> bool {
+        !self.ctx.lock_manager().is_disabled() && self.pools.len() == 1 && self.pools[0].disk_set.len() == 1
+    }
 }
 
 #[cfg(test)]
@@ -2127,7 +2133,7 @@ mod tests {
             .iter()
             .map(|&drives_per_set| (1, drives_per_set))
             .collect::<Vec<_>>();
-        build_isolated_test_store_with_layout(temp_dir, cmd_line, &pool_layouts, shutdown).await
+        build_isolated_test_store_with_layout(temp_dir, cmd_line, &pool_layouts, shutdown, None).await
     }
 
     async fn build_isolated_test_store_with_layout(
@@ -2135,6 +2141,7 @@ mod tests {
         cmd_line: &str,
         pool_layouts: &[(usize, usize)],
         shutdown: CancellationToken,
+        instance_ctx: Option<Arc<crate::runtime::instance::InstanceContext>>,
     ) -> (
         Arc<crate::runtime::instance::InstanceContext>,
         Arc<crate::store::ECStore>,
@@ -2167,7 +2174,7 @@ mod tests {
         let endpoint_pools = EndpointServerPools(pools);
         crate::services::notification_sys::install_cross_pool_fence_fleet_proof_for_test();
 
-        let instance_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let instance_ctx = instance_ctx.unwrap_or_else(|| Arc::new(crate::runtime::instance::InstanceContext::new()));
         crate::store::init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
             .await
             .expect("register local disks into the fresh context");
@@ -2532,6 +2539,348 @@ mod tests {
             .await
             .expect("target body should stream");
         assert_eq!(target_body, payload);
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
+    async fn early_ack_put_tails_block_scanner_publication_until_all_renames_finish() {
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+
+        let temp_dir = tempfile::tempdir().expect("create scanner PUT tail store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "scanner-put-tails", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = format!("scanner-put-tails-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create scanner PUT tail bucket");
+        let set = &store.pools[0].disk_set[0];
+        let objects = [("scanner-tail-a", vec![0xA1; 273]), ("scanner-tail-b", vec![0xB2; 379])];
+
+        temp_env::async_with_vars([(crate::set_disk::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let (active, blocked, movement_generation) = store.scanner_data_movement_activity().await;
+            assert!(!active && !blocked);
+            assert!(ctx.scanner_publication_state_allowed(), "the set admission cache should start allowed");
+            let (old_lease, _) = store
+                .acquire_scanner_publication_lease(movement_generation, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+                .await
+                .expect("publication lease should be admitted before either PUT starts");
+
+            let barriers: Vec<_> = objects
+                .iter()
+                .map(|(object, _)| {
+                    crate::set_disk::rename_fanout_barrier::arm(object, 0, crate::set_disk::rename_fanout_barrier::PHASE_RENAME)
+                })
+                .collect();
+            let trackers: Vec<_> = objects
+                .iter()
+                .map(|(object, _)| crate::set_disk::rename_fanout_barrier::observe_tasks(object))
+                .collect();
+            let puts: Vec<_> = objects
+                .iter()
+                .map(|(object, body)| {
+                    let put_store = Arc::clone(&store);
+                    let put_bucket = bucket.clone();
+                    let object = *object;
+                    let body = body.clone();
+                    tokio::spawn(async move {
+                        let mut reader = PutObjReader::from_vec(body);
+                        put_store
+                            .put_object(&put_bucket, object, &mut reader, &ObjectOptions::default())
+                            .await
+                    })
+                })
+                .collect();
+            let committed = tokio::time::timeout(Duration::from_secs(30), async {
+                for barrier in &barriers {
+                    barrier.wait_until_paused().await;
+                }
+                let mut committed = Vec::with_capacity(puts.len());
+                for put in puts {
+                    committed.push(
+                        put.await
+                            .expect("early-ACK PUT task should join while its tail is paused")
+                            .expect("root PUT should return after quorum without waiting for its tail"),
+                    );
+                }
+                committed
+            })
+            .await
+            .expect("both root PUTs must quorum-ACK while their tail disks remain paused");
+
+            assert!(trackers.iter().all(|tracker| tracker.running() >= 1));
+            assert!(ctx.namespace_commits_pending());
+            assert!(
+                ctx.scanner_publication_state_allowed(),
+                "pending PUT tails must not disable scanner namespace walks"
+            );
+            let (active, blocked, observed_movement_generation) = store.scanner_data_movement_activity().await;
+            assert!(!active, "ordinary PUT tails are not decommission or rebalance work");
+            assert!(!blocked, "ordinary PUT tails must not block the movement-only scan baseline");
+            assert_eq!(observed_movement_generation, movement_generation);
+            assert!(store.scanner_data_usage_publication_blocked().await);
+            assert!(store.scanner_data_usage_publication_admission_guard().await.is_some());
+            assert!(set.scanner_data_usage_publication_admission_guard().await.is_some());
+            for error in [
+                store
+                    .acquire_scanner_publication_lease(
+                        movement_generation,
+                        crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL,
+                    )
+                    .await
+                    .expect_err("a new remote publication lease must reject pending PUT tails"),
+                store
+                    .validate_scanner_publication_lease(old_lease, movement_generation)
+                    .await
+                    .expect_err("an existing remote lease must not bypass pending PUT tails"),
+                store
+                    .acquire_scanner_publication_lease_guard(old_lease)
+                    .await
+                    .expect_err("target-side publication admission must reject pending PUT tails"),
+            ] {
+                assert!(
+                    error.to_string().contains("blocked"),
+                    "publication must fail because of active tails: {error}"
+                );
+            }
+            store.release_scanner_publication_lease(old_lease).await;
+
+            for (index, barrier) in barriers.iter().enumerate() {
+                let commit_generation = ctx.namespace_commit_generation();
+                let namespace_generation = store.scanner_namespace_mutation_generation();
+                barrier.release();
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while trackers[index].running() != 0 || ctx.namespace_commit_generation() <= commit_generation {
+                        tokio::task::yield_now().await;
+                    }
+                    if index + 1 == barriers.len() {
+                        while ctx.namespace_commits_pending() {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                })
+                .await
+                .expect("released tail must drain and publish its terminal namespace generation");
+                assert!(store.scanner_namespace_mutation_generation() > namespace_generation);
+                let pending = index + 1 < barriers.len();
+                assert_eq!(ctx.namespace_commits_pending(), pending);
+                assert_eq!(store.scanner_data_usage_publication_blocked().await, pending);
+                assert!(!store.scanner_data_movement_activity().await.1);
+                assert!(store.scanner_data_usage_publication_admission_guard().await.is_some());
+                assert!(set.scanner_data_usage_publication_admission_guard().await.is_some());
+            }
+
+            let (lease, generation) = store
+                .acquire_scanner_publication_lease(movement_generation, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+                .await
+                .expect("remote publication lease should resume after both tails drain");
+            store
+                .validate_scanner_publication_lease(lease, generation)
+                .await
+                .expect("a resumed remote publication lease should validate");
+            drop(
+                store
+                    .acquire_scanner_publication_lease_guard(lease)
+                    .await
+                    .expect("target-side publication admission should resume after both tails drain"),
+            );
+            assert!(store.release_scanner_publication_lease(lease).await);
+
+            let disks = set.disk_inventory().await;
+            assert_eq!(disks.len(), 4);
+            for ((object, body), committed) in objects.iter().zip(&committed) {
+                let logical_size = i64::try_from(body.len()).expect("fixture payload size should fit i64");
+                let etag = committed.etag.as_ref().expect("root PUT should return a committed ETag");
+                for (disk_index, disk) in disks.iter().enumerate() {
+                    let file_info = disk
+                        .as_ref()
+                        .expect("every fixture disk should remain online")
+                        .read_version(
+                            "",
+                            &bucket,
+                            object,
+                            "",
+                            &crate::disk::ReadOptions {
+                                read_data: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap_or_else(|err| panic!("disk {disk_index} should publish {object} after its tail finishes: {err}"));
+                    assert_eq!(file_info.size, logical_size);
+                    assert_eq!(file_info.metadata.get(http::header::ETAG.as_str()), Some(etag));
+                    assert!(
+                        file_info.inline_data(),
+                        "small fixture payloads should have an inline shard on every disk"
+                    );
+                    let inline_data = file_info.data.as_ref().expect("every disk should retain its inline shard");
+                    let erasure = crate::erasure::coding::Erasure::try_new_with_options(
+                        file_info.erasure.data_blocks,
+                        file_info.erasure.parity_blocks,
+                        file_info.erasure.block_size,
+                        file_info.uses_legacy_checksum,
+                    )
+                    .expect("persisted erasure geometry should be valid");
+                    let shard_size =
+                        usize::try_from(erasure.shard_file_size(logical_size)).expect("fixture shard size should fit usize");
+                    crate::erasure::coding::bitrot_verify(
+                        Cursor::new(inline_data.clone()),
+                        inline_data.len(),
+                        shard_size,
+                        rustfs_utils::HashAlgorithm::HighwayHash256S,
+                        erasure.shard_size(),
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("disk {disk_index} should retain a complete valid shard for {object}: {err}"));
+                }
+                let mut reader = store
+                    .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("fully drained PUT should be readable");
+                let mut actual = Vec::new();
+                reader.stream.read_to_end(&mut actual).await.expect("PUT body should drain");
+                assert_eq!(&actual, body);
+            }
+
+            let generation_before_internal_put = ctx.namespace_commit_generation();
+            let internal_object = "scanner-tail-regression/internal-metadata";
+            let internal_body = b"scanner metadata must not invalidate its own publication";
+            let mut internal_reader = PutObjReader::from_vec(internal_body.to_vec());
+            store
+                .put_object(RUSTFS_META_BUCKET, internal_object, &mut internal_reader, &ObjectOptions::default())
+                .await
+                .expect("internal metadata PUT should commit without scanner self-invalidation");
+            let internal_lock = set
+                .new_ns_lock(RUSTFS_META_BUCKET, internal_object)
+                .await
+                .expect("internal metadata tail lock should be available");
+            drop(
+                internal_lock
+                    .get_write_lock(Duration::from_secs(30))
+                    .await
+                    .expect("internal metadata tail should drain"),
+            );
+            assert_eq!(ctx.namespace_commit_generation(), generation_before_internal_put);
+            assert!(!ctx.namespace_commits_pending());
+            assert!(store.scanner_data_usage_publication_admission_guard().await.is_some());
+            assert!(set.scanner_data_usage_publication_admission_guard().await.is_some());
+            let mut internal_reader = store
+                .get_object_reader(RUSTFS_META_BUCKET, internal_object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("internal metadata should remain readable");
+            let mut actual = Vec::new();
+            internal_reader
+                .stream
+                .read_to_end(&mut actual)
+                .await
+                .expect("internal metadata body should drain");
+            assert_eq!(actual, internal_body);
+        })
+        .await;
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
+    async fn cancelled_early_ack_put_keeps_scanner_publication_blocked_until_tail_finishes() {
+        let temp_dir = tempfile::tempdir().expect("create cancelled scanner PUT tail store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "scanner-cancelled-put-tail", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = format!("scanner-cancelled-put-tail-{}", Uuid::new_v4());
+        let object = "scanner-cancelled-tail";
+        let body = vec![0xC3; 273];
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create cancelled scanner PUT tail bucket");
+
+        temp_env::async_with_vars([(crate::set_disk::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let tracker = crate::set_disk::rename_fanout_barrier::observe_tasks(object);
+            let tail =
+                crate::set_disk::rename_fanout_barrier::arm(object, 0, crate::set_disk::rename_fanout_barrier::PHASE_RENAME);
+            let quorum = crate::set_disk::PutObjectCommitBarrier::install(
+                &bucket,
+                object,
+                crate::set_disk::PutObjectCommitPause::AfterRenameQuorum,
+            );
+            let handoff = crate::set_disk::PutObjectCommitBarrier::install(
+                &bucket,
+                object,
+                crate::set_disk::PutObjectCommitPause::AfterRenameHandoff,
+            );
+            let put_store = Arc::clone(&store);
+            let put_bucket = bucket.clone();
+            let put_body = body.clone();
+            let put = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(put_body);
+                put_store
+                    .put_object(&put_bucket, object, &mut reader, &ObjectOptions::default())
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), tail.wait_until_paused())
+                .await
+                .expect("cancelled PUT should pause one disk before rename");
+            quorum.wait_until_paused().await;
+            put.abort();
+            assert!(
+                put.await
+                    .expect_err("caller should be cancelled after rename quorum")
+                    .is_cancelled()
+            );
+            quorum.release();
+            handoff.wait_until_paused().await;
+            assert!(tracker.running() >= 1);
+            assert!(ctx.namespace_commits_pending());
+            assert!(!store.scanner_data_movement_activity().await.1);
+            assert!(store.scanner_data_usage_publication_blocked().await);
+            assert!(store.scanner_data_usage_publication_admission_guard().await.is_some());
+            assert!(
+                store.pools[0].disk_set[0]
+                    .scanner_data_usage_publication_admission_guard()
+                    .await
+                    .is_some()
+            );
+            let generation = store.scanner_namespace_mutation_generation();
+
+            handoff.release();
+            tail.release();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while tracker.running() != 0 || ctx.namespace_commits_pending() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled request's detached fanout must release scanner admission after finishing");
+            assert!(store.scanner_namespace_mutation_generation() > generation);
+            assert!(!store.scanner_data_usage_publication_blocked().await);
+            assert!(store.scanner_data_usage_publication_admission_guard().await.is_some());
+            for (disk_index, disk) in store.pools[0].disk_set[0].disk_inventory().await.iter().enumerate() {
+                let file_info = disk
+                    .as_ref()
+                    .expect("cancelled PUT fixture disk should remain online")
+                    .read_version("", &bucket, object, "", &crate::disk::ReadOptions::default())
+                    .await
+                    .unwrap_or_else(|err| panic!("cancelled PUT must still publish on disk {disk_index}: {err}"));
+                assert_eq!(file_info.size, i64::try_from(body.len()).expect("fixture body size should fit i64"));
+            }
+            let mut reader = store
+                .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("a cancelled caller must not discard its quorum-committed object");
+            let mut actual = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut actual)
+                .await
+                .expect("cancelled PUT body should drain");
+            assert_eq!(actual, body);
+        })
+        .await;
         shutdown.cancel();
     }
 
@@ -2986,8 +3335,9 @@ mod tests {
     ) -> crate::core::pools::DecommissionTestFaultDecision {
         let target_bucket = bucket.to_string();
         let target_object = object.to_string();
-        Arc::new(move |stage, bucket, object, _attempt, succeeded| {
+        Arc::new(move |stage, bucket, object, attempt, succeeded| {
             if !succeeded
+                || attempt >= crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS
                 || stage != DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT
                 || bucket != target_bucket
                 || object != target_object
@@ -2997,6 +3347,7 @@ mod tests {
 
             // Entry retries reset the local attempt; real copy errors can skip
             // successful attempts. Only injected faults spend this global budget.
+            // A real failure may consume an attempt, so preserve the final chance.
             faults
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |faults| {
                     (faults < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS.saturating_sub(1))
@@ -5018,6 +5369,7 @@ mod tests {
             "decommission-delete-fence",
             &[(2, 4), (1, 4)],
             CancellationToken::new(),
+            None,
         ))
         .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
@@ -5149,7 +5501,15 @@ mod tests {
 
     #[test]
     fn decommission_retry_fault_budget_counts_successes_across_attempt_changes() {
-        for attempts in [[1, 2, 3], [1, 1, 2], [1, 3, 3]] {
+        let cases: &[&[(usize, bool, bool)]] = &[
+            &[(1, true, true), (2, true, true), (3, true, false)],
+            &[(1, true, true), (1, true, true), (2, true, false)],
+            &[(1, true, true), (3, true, false), (3, true, false)],
+            &[(1, true, true), (2, false, false), (1, true, true), (2, true, false)],
+            &[(1, true, true), (2, false, false), (3, true, false)],
+            &[(3, true, false), (4, true, false)],
+        ];
+        for case in cases {
             let faults = Arc::new(AtomicUsize::new(0));
             let hook = decommission_retry_fault_hook("bucket", "object", Arc::clone(&faults));
 
@@ -5163,14 +5523,16 @@ mod tests {
             }
             assert_eq!(faults.load(Ordering::SeqCst), 0, "unrelated or failed copies must not consume faults");
 
-            for (index, attempt) in attempts.into_iter().enumerate() {
+            let mut expected_faults = 0;
+            for &(attempt, succeeded, expected) in *case {
                 assert_eq!(
-                    hook(DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT, "bucket", "object", attempt, true),
-                    index < 2,
-                    "attempts={attempts:?}, index={index}"
+                    hook(DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT, "bucket", "object", attempt, succeeded),
+                    expected,
+                    "fault plan {case:?} at attempt {attempt}"
                 );
+                expected_faults += usize::from(expected);
+                assert_eq!(faults.load(Ordering::SeqCst), expected_faults);
             }
-            assert_eq!(faults.load(Ordering::SeqCst), 2, "attempts={attempts:?}");
         }
     }
 
@@ -5306,6 +5668,15 @@ mod tests {
                     changed_result.expect("SourceChanged entry retry must converge");
                     other_result.expect("other bucket entry must continue through ordinary copy retries");
 
+                    assert_eq!(
+                        store.pool_meta.read().await.pools[0]
+                            .decommission
+                            .as_ref()
+                            .expect("decommission progress should remain available")
+                            .items_decommission_failed,
+                        0,
+                        "entry completion must not hide an exhausted copy failure"
+                    );
                     assert!(!rx.is_cancelled(), "entry-level SourceChanged must not cancel the shared worker token");
                     assert_eq!(mutation_calls.load(Ordering::SeqCst), 2, "entry must be re-listed after SourceChanged");
                     assert_eq!(ordinary_faults.load(Ordering::SeqCst), 2, "ordinary copy must consume the retry budget");
@@ -5934,6 +6305,7 @@ mod tests {
             "reverse-decommission-fixed-target",
             &[(1, 4), (1, 4)],
             CancellationToken::new(),
+            None,
         ))
         .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
@@ -6355,6 +6727,7 @@ mod tests {
             "multi-set-decommission-source-cleanup",
             &[(2, 4)],
             CancellationToken::new(),
+            None,
         ))
         .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
@@ -8870,18 +9243,17 @@ mod tests {
         const MANIFEST_COUNT: usize = 10;
 
         let temp_dir = tempfile::tempdir().expect("create fast manifest pass recovery store dir");
-        let (ctx, store, _shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-delete-fast-manifest-pass", &[4])).await;
+        let mut instance_ctx = crate::runtime::instance::InstanceContext::new();
+        instance_ctx.suppress_tier_delete_journal_recovery_for_test();
+        let (ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "tier-delete-fast-manifest-pass",
+            &[(1, 4)],
+            CancellationToken::new(),
+            Some(Arc::new(instance_ctx)),
+        ))
+        .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
-        let bucket = "tier-delete-fast-manifest-pass-bucket";
-        store
-            .make_bucket(bucket, &MakeBucketOptions::default())
-            .await
-            .expect("fast manifest pass bucket should be created");
-        let incarnation = store
-            .bucket_incarnation_id(bucket)
-            .await
-            .expect("fast manifest pass bucket incarnation should resolve");
         let tier_name = "FAST-MANIFEST-PASS";
         let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
         let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
@@ -8889,9 +9261,19 @@ mod tests {
             .expect("fast manifest pass tier lease should resolve")
             .backend_identity();
         for index in 0..MANIFEST_COUNT {
+            // Pagination must not depend on same-bucket lock wait deadlines.
+            let bucket = format!("tier-delete-fast-manifest-pass-{index}");
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("fast manifest pass bucket should be created");
+            let incarnation = store
+                .bucket_incarnation_id(&bucket)
+                .await
+                .expect("fast manifest pass bucket incarnation should resolve");
             install_aborting_dispatch_fixture(
                 store.clone(),
-                bucket,
+                &bucket,
                 incarnation,
                 &format!("manifest-page-{index:06}/"),
                 tier_name,
@@ -8922,12 +9304,78 @@ mod tests {
             "one production pass must cross the default eight-manifest page limit"
         );
         assert_eq!(stats.manifests.scanned, MANIFEST_COUNT);
-        assert_eq!(stats.manifests.deleted, MANIFEST_COUNT);
-        assert_eq!(stats.manifests.failed, 0);
+        assert_eq!(stats.manifests.deleted, MANIFEST_COUNT, "full recovery result: {stats:?}");
+        assert_eq!(stats.manifests.failed, 0, "full recovery result: {stats:?}");
         assert_eq!(manifest_marker, None);
         assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 0);
         assert_eq!(tier_delete_journal_count(store).await, 0);
         assert_eq!(backend.remove_count().await, 0, "rollback recovery must not call the remote tier");
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_delete_manual_pass_retains_manifest_owned_by_startup_recovery() {
+        let temp_dir = tempfile::tempdir().expect("create automatic recovery ownership store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-delete-auto-owner", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "tier-delete-auto-owner-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("automatic recovery bucket should be created");
+        let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+        let tier_name = "AUTO-OWNER";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("automatic recovery tier lease")
+            .backend_identity();
+
+        // The automatic worker must not observe a partially installed fixture.
+        let lifecycle_guard = store
+            .acquire_bucket_lifecycle_write_lock(bucket)
+            .await
+            .expect("fixture lifecycle lock");
+        let (manifest_name, entries) =
+            install_aborting_dispatch_fixture(store.clone(), bucket, incarnation, "auto-owner/", tier_name, identity, 1).await;
+        let journal_name = tier_delete_journal_object_name(&entries[0]);
+        let hook = TierDeleteDispatchRollbackTestHook::install_slow_delete(&journal_name, &journal_name);
+        drop(lifecycle_guard);
+        ctx.wake_tier_delete_journal_recovery();
+        tokio::time::timeout(Duration::from_secs(30), hook.wait_until_delete_paused())
+            .await
+            .expect("startup recovery should own the manifest before a manual pass");
+        assert!(tier_delete_dispatch_manifest_recovery_inflight_for_test(&store, &manifest_name));
+
+        let stats = recover_tier_delete_dispatch_manifests(store.clone(), 8, None)
+            .await
+            .expect("manual recovery scan");
+        assert_eq!(stats.scanned, 1, "{stats:?}");
+        assert_eq!(stats.retained, 1, "{stats:?}");
+        assert_eq!(stats.deleted, 0, "{stats:?}");
+        assert_eq!(stats.failed, 0, "{stats:?}");
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 1);
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 1);
+
+        hook.release_delete();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let manifest_gone = matches!(com::read_config(store.clone(), &manifest_name).await, Err(Error::ConfigNotFound));
+                if manifest_gone && !tier_delete_dispatch_manifest_recovery_inflight_for_test(&store, &manifest_name) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("automatic recovery should converge without a manual retry");
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 0);
+        assert_eq!(tier_delete_journal_count(store).await, 0);
+        assert_eq!(backend.remove_count().await, 0, "rollback must not delete from the remote tier");
+        shutdown.cancel();
     }
 
     #[cfg(feature = "test-util")]
@@ -10302,8 +10750,17 @@ mod tests {
         const JOURNAL_COUNT: usize = 40;
 
         let temp_dir = tempfile::tempdir().expect("create rollback retry store dir");
-        let (ctx, store, _shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-rollback-retry", &[4])).await;
+        // Manual retries must own progress between fault removal and the next attempt.
+        let mut instance_ctx = crate::runtime::instance::InstanceContext::new();
+        instance_ctx.suppress_tier_delete_journal_recovery_for_test();
+        let (ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "dispatch-rollback-retry",
+            &[(1, 4)],
+            CancellationToken::new(),
+            Some(Arc::new(instance_ctx)),
+        ))
+        .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         let bucket = "dispatch-rollback-retry-bucket";
         store
@@ -10377,6 +10834,7 @@ mod tests {
 
         assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 0);
         assert_eq!(backend.remove_count().await, 0, "rollback retries must never call the remote tier");
+        shutdown.cancel();
     }
 
     #[cfg(feature = "test-util")]
@@ -13204,6 +13662,7 @@ mod tests {
             "partial-set-prefix-delete",
             &[(2, 4)],
             CancellationToken::new(),
+            None,
         ))
         .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
@@ -16576,6 +17035,7 @@ mod tests {
             "prepared-directory-recovery",
             &[(2, 4)],
             shutdown,
+            None,
         ))
         .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
@@ -17226,6 +17686,38 @@ mod tests {
             .expect("test thread should spawn")
             .join()
             .expect("test thread should complete");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn odm_write_back_requires_one_set_and_enabled_namespace_locking() {
+        for (layout, locking, supported) in [
+            (&[(1, 4)][..], true, true),
+            (&[(1, 4), (1, 4)][..], true, false),
+            (&[(2, 4)][..], true, false),
+            (&[(1, 4)][..], false, false),
+        ] {
+            temp_env::async_with_vars([("RUSTFS_LOCK_ENABLED", Some(if locking { "true" } else { "false" }))], async {
+                let dir = tempfile::tempdir().expect("isolated topology");
+                let shutdown = CancellationToken::new();
+                let (_ctx, store, _) = without_storage_class_env(build_isolated_test_store_with_layout(
+                    dir.path(),
+                    "odm-topology",
+                    layout,
+                    shutdown.clone(),
+                    None,
+                ))
+                .await;
+                assert_eq!(
+                    store.supports_atomic_create_only_write_back(),
+                    supported,
+                    "layout={layout:?}, locking={locking}"
+                );
+                shutdown.cancel();
+            })
+            .await;
+        }
     }
 
     #[cfg(feature = "test-util")]
