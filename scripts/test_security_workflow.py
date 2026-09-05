@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the security workflow's evidence and result steps without remote VMs."""
+"""Exercise functional workflow failures and security evidence without remote VMs."""
 
 from __future__ import annotations
 
@@ -18,16 +18,32 @@ WORKFLOW = ROOT / ".github/workflows/rustfs-security-test.yml"
 CASE_ROW = "| IAM-101 | user CRUD lifecycle | PASS |"
 
 
+def named_steps(job: list[str]) -> dict[str, list[str]]:
+    starts = [i for i, line in enumerate(job) if line.startswith("      - name: ")]
+    return {
+        job[start].split(": ", 1)[1].strip('"'): job[start:end]
+        for start, end in zip(starts, starts[1:] + [len(job)])
+    }
+
+
+def shell_body(lines: list[str]) -> str:
+    start = lines.index("        run: |") + 1
+    shell_lines = []
+    for line in lines[start:]:
+        if line.strip() and not line.startswith("          "):
+            break
+        shell_lines.append(line[10:])
+    if not shell_lines:
+        raise ValueError("missing literal shell body")
+    return "\n".join(shell_lines)
+
+
 class SecurityWorkflowTests(unittest.TestCase):
     def setUp(self) -> None:
         self.source = WORKFLOW.read_text()
         self.job = yaml_block(self.source.splitlines(), "security-test", 2)
         self.assertIsNotNone(self.job)
-        starts = [i for i, line in enumerate(self.job) if line.startswith("      - name: ")]
-        self.steps = {
-            self.job[start].split(": ", 1)[1].strip('"'): self.job[start:end]
-            for start, end in zip(starts, starts[1:] + [len(self.job)])
-        }
+        self.steps = named_steps(self.job)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
@@ -83,15 +99,8 @@ class SecurityWorkflowTests(unittest.TestCase):
 
     def run_step(self, name: str) -> subprocess.CompletedProcess[str]:
         lines = self.steps[name]
-        start = lines.index("        run: |") + 1
-        shell_lines = []
-        for line in lines[start:]:
-            if line.strip() and not line.startswith("          "):
-                break
-            shell_lines.append(line[10:])
-        self.assertTrue(shell_lines, f"missing literal shell body: {name}")
         result = subprocess.run(
-            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", self.render("\n".join(shell_lines))],
+            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", self.render(shell_body(lines))],
             cwd=self.directory, env={**self.env, **self.step_env(lines)}, capture_output=True, text=True,
         )
         for line in lines:
@@ -191,6 +200,90 @@ class SecurityWorkflowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("OLD RUN REPORT", body.read_text())
         self.assertIn("https://github.com/rustfs/rustfs/actions/runs/314159", body.read_text())
+
+
+class FunctionalWorkflowTests(unittest.TestCase):
+    JOBS = {
+        "kms": "kms-test", "storage": "storage-test", "s3-compat": "s3-compat-test",
+        "upgrade": "upgrade-test", "replication": "replication-test", "heal": "heal-test",
+        "tier": "tier-test", "pool-expand": "pool-expansion-test", "performance": "performance-test",
+    }
+    DIRECT_TESTS = {
+        "kms": "Run KMS suite", "storage": "Run storage engine suite",
+        "s3-compat": "Run S3 compatibility suite", "upgrade": "Run upgrade compatibility suite",
+        "replication": "Run replication suite",
+    }
+
+    def test_failure_and_always_step_wiring(self) -> None:
+        for suite, job_id in self.JOBS.items():
+            with self.subTest(suite=suite):
+                source = (ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text()
+                job = yaml_block(source.splitlines(), job_id, 2)
+                self.assertIsNotNone(job)
+                self.assertNotRegex("\n".join(job), r'''(?m)^    ["']?continue-on-error["']?\s*:''')
+                steps = named_steps(job)
+                if suite in self.DIRECT_TESTS:
+                    test = steps[self.DIRECT_TESTS[suite]]
+                    self.assertNotRegex("\n".join(test), r'''(?m)^        ["']?continue-on-error["']?\s*:''')
+                    self.assertIn("        if: always()", steps["Generate report"])
+                cleanup = steps["Reset test environment (after)" if suite == "performance" else "Cleanup environment (after)"]
+                condition = next(line.strip() for line in cleanup if line.startswith("        if:"))
+                self.assertIn(condition, (
+                    "if: always()",
+                    "if: ${{ always() && inputs.cleanup_after != 'false' }}",
+                    "if: ${{ always() && (inputs.cleanup_after != 'false' || github.event_name != 'workflow_dispatch') }}",
+                ))
+                if suite != "performance":
+                    handoff = steps["Chain complete"] if suite == "replication" else next(
+                        value for name, value in steps.items() if name.startswith("Continue functional chain")
+                    )
+                    self.assertIn("        if: ${{ always() && github.event_name == 'repository_dispatch' }}", handoff)
+
+    def test_failed_suite_preserves_exit_and_cleanup_and_dispatch_execute(self) -> None:
+        for suite, test_name in self.DIRECT_TESTS.items():
+            with self.subTest(suite=suite), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "auto-testing").mkdir()
+                script = root / f"auto-testing/rustfs-{suite}-test.sh"
+                script.write_text('#!/bin/sh\nprintf "partial suite diagnostics\\n"\nexit 17\n')
+                script.chmod(0o755)
+                fake_bin = root / "bin"
+                fake_bin.mkdir()
+                for command, marker in (("ssh", "cleanup"), ("gh", "dispatch")):
+                    fake = fake_bin / command
+                    fake.write_text(f'#!/bin/sh\nprintf "{marker}\\n" >> "$EXECUTED"\n')
+                    fake.chmod(0o755)
+                env = {
+                    **os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                    "EXECUTED": str(root / "executed"), "RUSTFS_NODES": "fixture-node",
+                    "RUSTFS_SSH_USER": "fixture-user", "RUSTFS_NIGHTLY_PACKAGE_URL": "https://example.invalid/package.deb",
+                    "GH_TOKEN": "local-fixture", "GITHUB_EVENT_NAME": "repository_dispatch", "GITHUB_RUN_ID": "314159",
+                }
+                source = (ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text()
+                steps = named_steps(yaml_block(source.splitlines(), self.JOBS[suite], 2))
+                context = {"github.event_name": "repository_dispatch", "steps.test.outcome": "failure"}
+                for expression in re.findall(r"\$\{\{\s*(.*?)\s*\}\}", source):
+                    if expression.startswith("inputs.") and re.fullmatch(r"inputs\.\w+", expression):
+                        context[expression] = ""
+                def execute(name):
+                    lines = steps[name]
+                    rendered = re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda match: context[match[1]], shell_body(lines))
+                    return subprocess.run(
+                        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", rendered],
+                        cwd=root, env={**env, "LOG_FILE": str(root / "suite.log")}, capture_output=True, text=True,
+                    )
+                failed = execute(test_name)
+                self.assertEqual(failed.returncode, 17, failed.stderr)
+                self.assertIn("partial suite diagnostics", failed.stdout)
+                cleanup = execute("Cleanup environment (after)")
+                self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+                handoff_name = "Chain complete" if suite == "replication" else next(
+                    name for name in steps if name.startswith("Continue functional chain")
+                )
+                handoff = execute(handoff_name)
+                self.assertEqual(handoff.returncode, 0, handoff.stderr)
+                markers = (root / "executed").read_text().splitlines()
+                self.assertEqual(markers, ["cleanup"] if suite == "replication" else ["cleanup", "dispatch"])
 
 
 if __name__ == "__main__":

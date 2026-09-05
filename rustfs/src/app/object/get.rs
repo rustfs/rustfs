@@ -4615,6 +4615,7 @@ fn odm_inline_client_body(primary: TeePrimary) -> StreamingBlob {
 async fn odm_get_passthrough<S: OdmGetSource>(
     state: &Arc<BucketOdmState>,
     source: &S,
+    headers: &HeaderMap,
     key: &str,
     range: Option<&HTTPRangeSpec>,
     backfill: Option<PullReason>,
@@ -4623,6 +4624,9 @@ async fn odm_get_passthrough<S: OdmGetSource>(
         Ok(get) => get,
         Err(err) => return OdmGetReply::Error(odm_get_source_failure(state, &err)),
     };
+    if let Err(err) = odm_check_source_preconditions(headers, &get.head) {
+        return OdmGetReply::Error(err);
+    }
     let content_length = match odm_content_length(get.head.size) {
         Ok(length) => length,
         Err(err) => {
@@ -4648,6 +4652,7 @@ async fn odm_get_passthrough<S: OdmGetSource>(
 async fn odm_get_inline<S: OdmGetSource>(
     state: &Arc<BucketOdmState>,
     source: &S,
+    headers: &HeaderMap,
     key: &str,
     leader: PullLeader,
     request_context: Option<request_context::RequestContext>,
@@ -4676,6 +4681,12 @@ async fn odm_get_inline<S: OdmGetSource>(
         body,
         content_range,
     } = get;
+    // HEAD and GET can observe different source versions. Validate the
+    // representation whose body will actually be returned and persisted.
+    if let Err(err) = odm_check_source_preconditions(headers, &head) {
+        leader.complete(Err(PullError::canceled("source GET did not satisfy request preconditions")));
+        return OdmGetReply::Error(err);
+    }
     // The object outgrew the inline budget between HEAD and GET: followers
     // stream through on their own and the background pull stores it.
     if head.size > policy.inline_max_bytes {
@@ -4758,19 +4769,19 @@ pub(super) async fn odm_get_from_source<S: OdmGetSource>(
     let policy = &state.config().policy;
     if let Some(range) = range {
         let backfill = (policy.range_get == RangeGetPolicy::ServeAndBackfill).then_some(PullReason::RangeGet);
-        return odm_get_passthrough(state, source, key, Some(range), backfill).await;
+        return odm_get_passthrough(state, source, headers, key, Some(range), backfill).await;
     }
     if head.size > policy.inline_max_bytes {
-        return odm_get_passthrough(state, source, key, None, Some(PullReason::LargeObject)).await;
+        return odm_get_passthrough(state, source, headers, key, None, Some(PullReason::LargeObject)).await;
     }
     let slot = match state.acquire_pull_slot(key).await {
         Ok(slot) => slot,
         // The bucket state was torn down under this request: serve it
         // without queueing anything on the old state.
-        Err(_) => return odm_get_passthrough(state, source, key, None, None).await,
+        Err(_) => return odm_get_passthrough(state, source, headers, key, None, None).await,
     };
     match slot {
-        PullSlot::Leader(leader) => odm_get_inline(state, source, key, leader, request_context).await,
+        PullSlot::Leader(leader) => odm_get_inline(state, source, headers, key, leader, request_context).await,
         PullSlot::Follower(follower) => {
             let first_byte = Duration::from_millis(policy.source_timeout.first_byte_ms);
             match tokio::time::timeout(first_byte, follower.wait()).await {
@@ -4778,7 +4789,7 @@ pub(super) async fn odm_get_from_source<S: OdmGetSource>(
                     stats.record_request(OdmOp::Get, OdmOutcome::SourceHit);
                     OdmGetReply::RetryLocal
                 }
-                Ok(Err(_)) | Err(_) => odm_get_passthrough(state, source, key, None, None).await,
+                Ok(Err(_)) | Err(_) => odm_get_passthrough(state, source, headers, key, None, None).await,
             }
         }
     }
@@ -4821,6 +4832,8 @@ mod on_demand_migration_tests {
                     session_token: None,
                 }),
                 tls: TlsConfig::default(),
+                azure: None,
+                gcs: None,
             },
             filter: FilterConfig {
                 prefix: None,
@@ -5294,6 +5307,73 @@ mod on_demand_migration_tests {
         assert_eq!(get_count(&state, OdmOutcome::SourceHit), 2);
         assert_eq!(state.inflight_keys(), 0);
         assert!(rt.write_back.puts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn odm_get_rechecks_conditions_against_the_get_representation() {
+        for inline_max_bytes in [0, 1024] {
+            for range in [
+                None,
+                Some(HTTPRangeSpec {
+                    is_suffix_length: false,
+                    start: 0,
+                    end: 2,
+                }),
+            ] {
+                let rt = runtime(
+                    "changed-source",
+                    PolicyConfig {
+                        inline_max_bytes,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                let state = rt.state("changed-source");
+                let before = source_head(b"before");
+                let after = source_head(b"after!");
+                let source = ScriptedSource::new(vec![Ok(before.clone())], vec![Ok((after, b"after!".to_vec(), None))]);
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    http::header::IF_MATCH,
+                    HeaderValue::from_str(&format!("\"{}\"", before.etag.expect("etag"))).expect("header"),
+                );
+                let error = failed(odm_get_from_source(&state, &source, &headers, KEY, range.as_ref(), None).await);
+                assert_eq!(error.code(), &S3ErrorCode::PreconditionFailed);
+                assert_eq!(source.get_calls(), 1);
+                assert_eq!(state.inflight_keys(), 0);
+                assert!(rt.write_back.puts().is_empty(), "a failed condition must not start write-back");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn odm_get_missing_validators_cannot_bypass_a_condition() {
+        for inline_max_bytes in [0, 1024] {
+            let rt = runtime(
+                "missing-validator",
+                PolicyConfig {
+                    inline_max_bytes,
+                    ..Default::default()
+                },
+            )
+            .await;
+            let state = rt.state("missing-validator");
+            let before = source_head(b"before");
+            let after = SourceHead {
+                size: 6,
+                ..Default::default()
+            };
+            let source = ScriptedSource::new(vec![Ok(before.clone())], vec![Ok((after, b"after!".to_vec(), None))]);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::IF_MATCH,
+                HeaderValue::from_str(&format!("\"{}\"", before.etag.expect("etag"))).expect("header"),
+            );
+            let error = failed(odm_get_from_source(&state, &source, &headers, KEY, None, None).await);
+            assert_eq!(error.status_code(), Some(StatusCode::FAILED_DEPENDENCY));
+            assert_eq!(error.message(), Some("missing_source_validator"));
+            assert!(rt.write_back.puts().is_empty());
+        }
     }
 
     #[tokio::test]

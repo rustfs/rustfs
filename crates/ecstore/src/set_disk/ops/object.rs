@@ -4459,7 +4459,10 @@ impl SetDisks {
                         commit_scanner_publication_lease_tokens.as_ref(),
                     )
                     .with_publication_scope(commit_scanner_publication_scope.clone())
-                    .with_rollback_receipt(commit_rollback_receipt.clone()),
+                    .with_rollback_receipt(commit_rollback_receipt.clone())
+                    .with_namespace_commit_guard(
+                        (!is_meta_bucketname(&commit_bucket)).then(|| commit_set.ctx.begin_namespace_commit()),
+                    ),
                 )
                 .await;
                 if let Some(scope) = commit_scanner_publication_scope.as_ref() {
