@@ -1281,6 +1281,8 @@ impl FolderScanner {
                     }
                     Err(e) => return Err(ScannerError::Io(e)),
                 };
+                #[cfg(test)]
+                tests::enumeration_restart::observe_raw_entry(&dir_path, &entry.file_name(), &self.budget);
                 pending_entry_progress = pending_entry_progress.saturating_add(1);
                 if pending_entry_progress >= SCANNER_ENTRY_PROGRESS_BATCH
                     || last_entry_progress.elapsed() >= SCANNER_ENTRY_PROGRESS_INTERVAL
