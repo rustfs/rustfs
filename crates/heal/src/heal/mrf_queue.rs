@@ -45,6 +45,10 @@ use uuid::Uuid;
 
 use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealType};
 
+/// Read-only inspection of committed MRF checkpoints. The legacy consumer
+/// remains unchanged until ownership-aware replay is deployed.
+pub mod snapshot;
+
 /// Journal location inside the metadata bucket, following the resume-state
 /// layout.
 pub(crate) const MRF_JOURNAL_PATH: &str = "buckets/.heal/mrf/journal.bin";
