@@ -27,8 +27,8 @@ use super::storage_api::bucket_usecase::bucket::target::BucketTarget;
 use super::storage_api::bucket_usecase::bucket::{
     ObjectLockConfigExt as _, VersioningConfigExt as _,
     lifecycle::bucket_lifecycle_ops::{
-        enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, run_stale_multipart_upload_cleanup_once,
-        validate_lifecycle_config, validate_transition_tier,
+        LIFECYCLE_MALFORMED_XML_ERROR_KIND, enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects,
+        run_stale_multipart_upload_cleanup_once, validate_lifecycle_config, validate_transition_tier,
     },
     metadata::{
         BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
@@ -1188,6 +1188,21 @@ fn validate_lifecycle_rule_status(rules: &[LifecycleRule]) -> std::result::Resul
     Ok(())
 }
 
+/// Map a lifecycle validation failure onto the S3 error the client should see.
+///
+/// The validator reports a schema-shape violation (a `Filter` with more than
+/// one predicate, a one-member `And`) with
+/// [`LIFECYCLE_MALFORMED_XML_ERROR_KIND`]; AWS answers those with
+/// `MalformedXML`. Everything else is a value the schema allows but S3 refuses,
+/// which stays `InvalidArgument` — the code this path has always returned
+/// (backlog#2201).
+fn lifecycle_validation_error(err: &std::io::Error) -> S3Error {
+    if err.kind() == LIFECYCLE_MALFORMED_XML_ERROR_KIND {
+        return S3Error::with_message(S3ErrorCode::MalformedXML, format!("Malformed XML: {err}"));
+    }
+    s3_error!(InvalidArgument, "{err}")
+}
+
 fn lifecycle_has_transition_rules(config: &BucketLifecycleConfiguration) -> bool {
     config.rules.iter().any(|rule| {
         rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
@@ -2296,7 +2311,7 @@ impl DefaultBucketUsecase {
         };
 
         if let Err(err) = validate_lifecycle_config(&input_cfg, &rcfg).await {
-            return Err(s3_error!(InvalidArgument, "{err}"));
+            return Err(lifecycle_validation_error(&err));
         }
 
         if let Err(err) = validate_transition_tier(&input_cfg).await {
@@ -4028,6 +4043,70 @@ mod tests {
         assert_eq!(rules[0].id.as_deref(), Some("rule-0"));
         assert_eq!(rules[1].id.as_deref(), Some("rule-1"));
         assert_eq!(rules[2].id.as_deref(), Some("rule-2"));
+    }
+
+    #[tokio::test]
+    async fn put_bucket_lifecycle_validation_errors_keep_their_s3_code() {
+        // The PUT path answers a schema-shape violation with MalformedXML and a
+        // rejected value with InvalidArgument. Both categories are produced by
+        // the real validator here, so the mapping cannot drift from it
+        // (backlog#2201).
+        let malformed = validate_lifecycle_config(
+            &BucketLifecycleConfiguration {
+                expiry_updated_at: None,
+                rules: vec![LifecycleRule {
+                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                    expiration: Some(LifecycleExpiration {
+                        days: Some(1),
+                        ..Default::default()
+                    }),
+                    abort_incomplete_multipart_upload: None,
+                    del_marker_expiration: None,
+                    filter: Some(s3s::dto::LifecycleRuleFilter {
+                        prefix: Some("logs/".to_string()),
+                        tag: Some(s3s::dto::Tag {
+                            key: Some("env".to_string()),
+                            value: Some("prod".to_string()),
+                        }),
+                        ..Default::default()
+                    }),
+                    id: Some("two-predicates".to_string()),
+                    noncurrent_version_expiration: None,
+                    noncurrent_version_transitions: None,
+                    prefix: None,
+                    transitions: None,
+                }],
+            },
+            &ObjectLockConfiguration::default(),
+        )
+        .await
+        .expect_err("a Filter with two predicates is a schema violation");
+        assert_eq!(*lifecycle_validation_error(&malformed).code(), S3ErrorCode::MalformedXML);
+
+        let invalid_value = validate_lifecycle_config(
+            &BucketLifecycleConfiguration {
+                expiry_updated_at: None,
+                rules: vec![LifecycleRule {
+                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                    expiration: None,
+                    abort_incomplete_multipart_upload: None,
+                    del_marker_expiration: None,
+                    filter: None,
+                    id: Some("negative-count".to_string()),
+                    noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                        noncurrent_days: Some(30),
+                        newer_noncurrent_versions: Some(-1),
+                    }),
+                    noncurrent_version_transitions: None,
+                    prefix: None,
+                    transitions: None,
+                }],
+            },
+            &ObjectLockConfiguration::default(),
+        )
+        .await
+        .expect_err("a negative retention count is rejected");
+        assert_eq!(*lifecycle_validation_error(&invalid_value).code(), S3ErrorCode::InvalidArgument);
     }
 
     #[test]
