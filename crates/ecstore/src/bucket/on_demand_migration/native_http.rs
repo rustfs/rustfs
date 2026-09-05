@@ -130,6 +130,23 @@ impl NativeHttp {
         request: reqwest::Request,
         error_code_header: &str,
     ) -> Result<reqwest::Response, SourceError> {
+        self.send_classified(request, error_code_header, false).await
+    }
+
+    pub(super) async fn send_object(
+        &self,
+        request: reqwest::Request,
+        error_code_header: &str,
+    ) -> Result<reqwest::Response, SourceError> {
+        self.send_classified(request, error_code_header, true).await
+    }
+
+    async fn send_classified(
+        &self,
+        request: reqwest::Request,
+        error_code_header: &str,
+        not_found_on_404_without_code: bool,
+    ) -> Result<reqwest::Response, SourceError> {
         let response = self.client.execute(request).await.map_err(classify_transport_error)?;
         let status = response.status();
         if status.is_success() {
@@ -140,14 +157,14 @@ impl NativeHttp {
             .get(error_code_header)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        Err(classify_status(
-            status.as_u16(),
-            None,
-            match &code {
-                Some(code) => format!("source returned HTTP {status} ({code})"),
-                None => format!("source returned HTTP {status}"),
-            },
-        ))
+        let message = match &code {
+            Some(code) => format!("source returned HTTP {status} ({code})"),
+            None => format!("source returned HTTP {status}"),
+        };
+        match classify_status(status.as_u16(), code.as_deref(), message) {
+            SourceError::Other(_) if not_found_on_404_without_code && status.as_u16() == 404 => Err(SourceError::NotFound),
+            err => Err(err),
+        }
     }
 }
 

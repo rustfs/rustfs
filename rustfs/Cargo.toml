@@ -57,7 +57,8 @@ name = "swift_object_integration_test"
 required-features = ["swift"]
 
 [features]
-default = ["ftps", "webdav"]
+default = ["ftps", "webdav", "gcs"]
+gcs = ["rustfs-ecstore/gcs"]
 metrics-gpu = ["rustfs-obs/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
@@ -66,7 +67,7 @@ sftp = ["rustfs-protocols/sftp"]
 license = []
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
-full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope"]
+full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope", "gcs"]
 e2e-test-hooks = []
 # Shortens Connect credentials only in debug E2E builds.
 connect-e2e-short-credentials = []
