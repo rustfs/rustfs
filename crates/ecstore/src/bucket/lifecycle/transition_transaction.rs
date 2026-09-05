@@ -612,6 +612,7 @@ pub(crate) async fn save_transition_transaction_record(
         data.clone(),
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_none_match: Some("*".to_string()),
                 ..Default::default()
@@ -658,6 +659,7 @@ pub(crate) async fn save_transition_transaction_record_if_current(
         data.clone(),
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_match: Some(etag),
                 ..Default::default()

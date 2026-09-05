@@ -264,7 +264,7 @@ impl HealManager {
                         error: error.clone(),
                         retry_attempt: request.retry_attempts,
                     });
-                    let retry_request_for_queue = retry_request;
+                    let mut retry_request_for_queue = retry_request;
                     let retry_cancel_token = retry_request_for_queue.as_ref().map(|_| CancellationToken::new());
                     if retry_request_for_queue.is_none() {
                         replacement_recovery_anchors_clone
@@ -272,7 +272,35 @@ impl HealManager {
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .remove(&task_id);
                     }
+                    let mut completed_status = match retry_request_for_status {
+                        Some(status) => status,
+                        None => task.get_status().await,
+                    };
+                    let mut completed_status_entry = CompletedHealStatus::snapshot(&task, completed_status.clone()).await;
+                    let completed_progress = task.get_progress().await;
+                    #[cfg(test)]
+                    tests::pause_completed_retention_before_publish(&task_id, &completed_status).await;
                     let mut active_heals_guard = active_heals_clone.lock().await;
+                    let owns_completion = active_heals_guard.contains_key(&task_id);
+                    let cancelled_completion = if owns_completion {
+                        false
+                    } else {
+                        // Cancellation can win while a finished worker waits
+                        // for active ownership. It must not resurrect a retry
+                        // or replace an acknowledged cancellation with success.
+                        retry_request_for_queue = None;
+                        completed_heals_clone
+                            .lock()
+                            .await
+                            .get(&task_id)
+                            .is_some_and(|completed| completed.status == HealTaskStatus::Cancelled)
+                    };
+                    if cancelled_completion {
+                        completed_status = HealTaskStatus::Cancelled;
+                        completed_status_entry.status = HealTaskStatus::Cancelled;
+                    }
+                    let terminal_completion = !matches!(completed_status, HealTaskStatus::Retrying { .. });
+                    let successful_completion = matches!(completed_status, HealTaskStatus::Completed);
                     // Keep retry ownership continuous: status snapshots acquire
                     // these locks in the same active -> retrying order.
                     let mut retrying_heals_guard = if let (Some((request, _, error)), Some(cancel_token)) =
@@ -295,6 +323,16 @@ impl HealManager {
                     } else {
                         None
                     };
+                    if owns_completion || cancelled_completion {
+                        publish_completed_heal(
+                            &completed_heals_clone,
+                            &task_aliases_clone,
+                            &task_id,
+                            completed_status_entry,
+                            terminal_completion,
+                        )
+                        .await;
+                    }
                     let completed_task = active_heals_guard.remove(&task_id);
                     if let Some(completed_task) = completed_task.as_ref() {
                         publish_active_heal_count(&active_heals_guard);
@@ -304,33 +342,10 @@ impl HealManager {
                     drop(retrying_heals_guard.take());
                     drop(active_heals_guard);
 
-                    if let Some(completed_task) = completed_task {
-                        let completed_status = if let Some(status) = retry_request_for_status {
-                            status
-                        } else {
-                            completed_task.get_status().await
-                        };
-                        let terminal_completion = !matches!(completed_status, HealTaskStatus::Retrying { .. });
-                        let successful_completion = matches!(completed_status, HealTaskStatus::Completed);
-                        let completed_progress = completed_task.get_progress().await;
-                        // Single snapshot of the retained window: the task is
-                        // finished and already off the active map, so there is
-                        // no concurrent writer to race with.
-                        let seqed_items = completed_task.get_seqed_result_items().await;
-                        let (next_seq, min_seq) = completed_task.result_seq_cursors();
-                        let completed_status_entry = CompletedHealStatus {
-                            heal_type: completed_task.heal_type.clone(),
-                            status: completed_status.clone(),
-                            result_items_truncated: completed_task.result_items_truncated(),
-                            completed_at: SystemTime::now(),
-                            seqed_items,
-                            next_seq,
-                            min_seq,
-                        };
-                        let mut completed_heals_guard = completed_heals_clone.lock().await;
-                        prune_completed_heal_statuses(&mut completed_heals_guard);
-                        completed_heals_guard.insert(task_id.clone(), Arc::new(completed_status_entry));
-                        drop(completed_heals_guard);
+                    #[cfg(test)]
+                    tests::pause_completed_retention_handoff(&task_id).await;
+
+                    if completed_task.is_some() {
                         // update statistics
                         let mut stats = statistics_clone.write().await;
                         match completed_status {
@@ -352,10 +367,6 @@ impl HealManager {
                             } else {
                                 release_mrf_repair_notice_targets(notice_targets);
                             }
-                            task_aliases_clone
-                                .lock()
-                                .await
-                                .retain(|alias_id, alias| alias_id != &task_id && alias.task_id != task_id);
                         }
                     }
 
@@ -718,17 +729,42 @@ pub(super) fn heal_request_set_key_for_task(task: &HealTask) -> Option<String> {
 }
 
 pub(super) fn prune_completed_heal_statuses(completed_heals: &mut HashMap<String, Arc<CompletedHealStatus>>) {
-    let Ok(now) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) else {
-        return;
-    };
+    prune_completed_heal_statuses_at(completed_heals, SystemTime::now());
+}
 
+pub(super) fn prune_completed_heal_statuses_at(completed_heals: &mut HashMap<String, Arc<CompletedHealStatus>>, now: SystemTime) {
     completed_heals.retain(|_, completed| {
-        completed
-            .completed_at
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|completed_at| now.saturating_sub(completed_at) <= KEEP_HEAL_TASK_STATUS_DURATION)
+        now.duration_since(completed.completed_at)
+            .map(|age| age <= KEEP_HEAL_TASK_STATUS_DURATION)
             .unwrap_or(false)
     });
+    let entry_bytes = |key: &String, value: &Arc<CompletedHealStatus>| {
+        key.capacity()
+            .saturating_add(size_of::<(String, Arc<CompletedHealStatus>)>())
+            .saturating_add(value.retained_bytes())
+    };
+    let mut bytes = completed_heals
+        .iter()
+        .fold(0usize, |total, (key, value)| total.saturating_add(entry_bytes(key, value)));
+    while completed_heals.len() > MAX_COMPLETED_HEAL_TOKENS || bytes > MAX_COMPLETED_HEAL_BYTES {
+        let Some(oldest) = completed_heals
+            .iter()
+            .min_by(|(left_id, left), (right_id, right)| {
+                left.completed_at.cmp(&right.completed_at).then_with(|| left_id.cmp(right_id))
+            })
+            .map(|(_, value)| Arc::clone(value))
+        else {
+            break;
+        };
+        completed_heals.retain(|key, value| {
+            if Arc::ptr_eq(value, &oldest) {
+                bytes = bytes.saturating_sub(entry_bytes(key, value));
+                false
+            } else {
+                true
+            }
+        });
+    }
 }
 
 pub(super) fn can_schedule_request(
