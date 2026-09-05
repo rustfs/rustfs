@@ -16,6 +16,11 @@ use super::*;
 
 pub(crate) const SITE_REPLICATION_RETRY_QUEUE_LIMIT: usize = 256;
 
+/// Keep the reconcile tick's lifecycle guard below the 30-second operator
+/// wait bound. Successfully settled events are persisted as the batch runs,
+/// so a later tick continues with the remaining work.
+pub(crate) const SITE_REPLICATION_RETRY_DRAIN_BATCH_TIMEOUT: Duration = Duration::from_secs(25);
+
 /// Attempts before an entry reports as `failed` in retryStats. Visibility
 /// only: a `failed` entry stays drain-eligible, and the reachability probe
 /// short-circuits its backoff once the peer answers again — so an early
@@ -42,7 +47,7 @@ pub(crate) struct SiteReplicationRetryEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) edit_generation: Option<u64>,
     /// The latest delivery failure happened before an authenticated peer
-    /// response was received (connect, timeout, DNS, or TLS). Such failures
+    /// response was received (connect, DNS, or TLS). Such failures
     /// may bypass the expensive replay backoff only after a cheap devnull
     /// reachability probe proves the peer is back.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -246,10 +251,7 @@ pub(crate) fn upsert_site_replication_retry_event(
 
 pub(crate) fn retry_error_indicates_peer_unreachable(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
-    error.contains("failed (connect)")
-        || error.contains("failed (timeout)")
-        || error.contains("failed (dns resolution)")
-        || error.contains("failed (tls handshake)")
+    error.contains("failed (connect)") || error.contains("failed (dns resolution)") || error.contains("failed (tls handshake)")
 }
 
 pub(crate) fn retry_stats_for_state(state: &SiteReplicationState) -> Option<SRRetryStats> {
@@ -272,6 +274,46 @@ pub(crate) fn retry_stats_for_state(state: &SiteReplicationState) -> Option<SRRe
 
 pub(crate) async fn enqueue_site_replication_retry_event(peer: &PeerInfo, path: &str, error: &S3Error) {
     enqueue_site_replication_retry_event_for_generation(peer, path, error, None).await
+}
+
+pub(crate) fn prequeue_site_replication_destructive_events_in_state(
+    state: &mut SiteReplicationState,
+    peers: &[PeerInfo],
+    path: &str,
+) -> S3Result<Vec<PeerInfo>> {
+    let missing = peers
+        .iter()
+        .filter(|peer| {
+            state.peers.contains_key(&peer.deployment_id)
+                && !state.retry_queue.iter().any(|event| retry_event_matches(event, peer, path))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if state.retry_queue.len().saturating_add(missing.len()) > SITE_REPLICATION_RETRY_QUEUE_LIMIT {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InternalError,
+            "site replication retry queue is full; destructive operation was not reserved".to_string(),
+        ));
+    }
+    for peer in &missing {
+        upsert_site_replication_retry_event(
+            &mut state.retry_queue,
+            peer,
+            path,
+            "destructive site replication bucket operation pending delivery",
+            None,
+        );
+    }
+    Ok(missing)
+}
+
+pub(crate) async fn prequeue_site_replication_destructive_events(peers: &[PeerInfo], path: &str) -> S3Result<Vec<PeerInfo>> {
+    if peers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let peers = peers.to_vec();
+    let path = path.to_string();
+    update_site_replication_state(move |state| prequeue_site_replication_destructive_events_in_state(state, &peers, &path)).await
 }
 
 pub(crate) async fn enqueue_site_replication_retry_event_for_generation(
@@ -918,6 +960,12 @@ pub(crate) fn bucket_op_retry_replay_tasks<'a>(
                     format!("site replication retry plan has no configure operation for bucket {bucket:?}"),
                 ));
             }
+            tasks.extend(
+                plan.bucket_items
+                    .iter()
+                    .filter(|item| item.bucket == bucket)
+                    .map(SiteReplicationRepairTask::BucketMetadata),
+            );
             tasks.extend(configure_tasks);
             Ok(tasks)
         }
@@ -1051,10 +1099,10 @@ pub(crate) fn actionable_site_replication_retry_events(
 /// backoff exists to spare a *dead* peer the expensive replay (plan build,
 /// snapshot resend) — it must not delay convergence to a peer that has
 /// already RECOVERED, or a failure window ends in up to a day of silent
-/// divergence (backlog#2071). Transport failures may be probed before the
-/// normal replay backoff elapses; application failures still wait at least
-/// one base interval so a reachable peer that keeps rejecting a replay is not
-/// hammered faster than before.
+/// divergence (backlog#2071). Peer connection failures may be probed before
+/// the normal replay backoff elapses; request timeouts and application
+/// failures still wait at least one base interval so a reachable peer that
+/// keeps rejecting a replay is not hammered faster than before.
 pub(crate) fn deferred_site_replication_retry_events(
     state: &SiteReplicationState,
     now: OffsetDateTime,
@@ -1293,11 +1341,17 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
         let now = OffsetDateTime::now_utc();
         let actionable = actionable_site_replication_retry_events(&runtime.state, now);
         let deferred = deferred_site_replication_retry_events(&runtime.state, now);
-        promote_reachable_deferred_retry_events(&runtime, &actionable, deferred).await?;
-        if actionable.is_empty() {
-            return Ok(());
+        let drain = async {
+            promote_reachable_deferred_retry_events(&runtime, &actionable, deferred).await?;
+            if actionable.is_empty() {
+                return Ok(());
+            }
+            drain_site_replication_retry_queue_locked(runtime, actionable).await
+        };
+        match tokio::time::timeout(SITE_REPLICATION_RETRY_DRAIN_BATCH_TIMEOUT, drain).await {
+            Ok(result) => result,
+            Err(_) => Ok(()),
         }
-        drain_site_replication_retry_queue_locked(runtime, actionable).await
     })
     .await
     .map_err(ApiError::from)?

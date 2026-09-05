@@ -9573,6 +9573,10 @@ mod tests {
             SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT >= SITE_REPLICATION_PEER_REQUEST_TIMEOUT,
             "a waiter must not give up before the holder's single wedged peer probe can finish"
         );
+        assert!(
+            crate::site_replication::SITE_REPLICATION_RETRY_DRAIN_BATCH_TIMEOUT < SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT,
+            "the retry drainer must release the lifecycle guard before operator waiters time out"
+        );
     }
 
     #[tokio::test(start_paused = true)]

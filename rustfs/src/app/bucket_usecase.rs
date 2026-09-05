@@ -75,7 +75,8 @@ use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::shared_types::RemoteAddr;
 use crate::site_replication::{
-    site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
+    cancel_site_replication_delete_bucket_hook, finish_site_replication_delete_bucket_hook,
+    prepare_site_replication_delete_bucket_hook, site_replication_bucket_meta_hook, site_replication_make_bucket_hook,
 };
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::StatusCode;
@@ -1397,7 +1398,8 @@ impl DefaultBucketUsecase {
             authorize_request(&mut req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
         }
 
-        store
+        let replication_delete_intent = prepare_site_replication_delete_bucket_hook(&input.bucket, force).await?;
+        let delete_result = store
             .delete_bucket(
                 &input.bucket,
                 &DeleteBucketOptions {
@@ -1406,7 +1408,13 @@ impl DefaultBucketUsecase {
                 },
             )
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from);
+        if let Err(err) = delete_result {
+            if let Some(intent) = replication_delete_intent.as_ref() {
+                cancel_site_replication_delete_bucket_hook(intent).await;
+            }
+            return Err(err.into());
+        }
 
         // Drop every cached object body for the now-deleted bucket so dead
         // bytes do not sit resident until TTL. Covers both the normal and the
@@ -1421,7 +1429,9 @@ impl DefaultBucketUsecase {
         // Re-evaluate lifecycle and replication after bucket removal.
         rustfs_scanner::record_scanner_maintenance_change(&input.bucket);
 
-        if let Err(err) = site_replication_delete_bucket_hook(&input.bucket, force).await {
+        if let Some(intent) = replication_delete_intent
+            && let Err(err) = finish_site_replication_delete_bucket_hook(intent).await
+        {
             warn!(bucket = %input.bucket, error = ?err, "site replication delete bucket hook failed");
         }
 

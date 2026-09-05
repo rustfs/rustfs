@@ -764,6 +764,18 @@ fn test_bucket_make_retry_replays_matching_configure_before_settlement() {
             "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=videos&operation=configure-replication".to_string(),
             configure_photos.clone(),
         ],
+        bucket_items: vec![
+            SRBucketMeta {
+                bucket: "videos".to_string(),
+                r#type: "tags".to_string(),
+                ..Default::default()
+            },
+            SRBucketMeta {
+                bucket: "photos".to_string(),
+                r#type: "policy".to_string(),
+                ..Default::default()
+            },
+        ],
         ..Default::default()
     };
 
@@ -771,10 +783,15 @@ fn test_bucket_make_retry_replays_matching_configure_before_settlement() {
         .expect("make retry plan should include its configure follow-up");
     assert_eq!(
         tasks.iter().map(SiteReplicationRepairTask::path).collect::<Vec<_>>(),
-        vec![make_photos.as_str(), configure_photos.as_str()]
+        vec![
+            make_photos.as_str(),
+            "/rustfs/admin/v3/site-replication/peer/bucket-meta",
+            configure_photos.as_str()
+        ]
     );
     assert!(matches!(tasks[0], SiteReplicationRepairTask::BucketMake(_)));
-    assert!(matches!(tasks[1], SiteReplicationRepairTask::Replication(_)));
+    assert!(matches!(&tasks[1], SiteReplicationRepairTask::BucketMetadata(item) if item.bucket == "photos"));
+    assert!(matches!(tasks[2], SiteReplicationRepairTask::Replication(_)));
 }
 
 #[test]
@@ -814,6 +831,35 @@ fn test_reachable_probe_promotion_is_fenced_by_the_observed_event() {
     assert_eq!(mark_reachable_deferred_retry_events(&mut state, &[recovered]), 0);
     assert_eq!(state.retry_queue[0].updated_at, Some(now + time::Duration::seconds(1)));
     assert!(state.retry_queue[0].peer_unreachable);
+}
+
+#[test]
+fn test_destructive_bucket_op_prequeue_does_not_evict_existing_liability() {
+    let peer_b = PeerInfo {
+        deployment_id: "peer-b".to_string(),
+        ..peer("peer-b", "https://peer-b.example.com")
+    };
+    let mut state = SiteReplicationState::default();
+    state.peers.insert(peer_b.deployment_id.clone(), peer_b.clone());
+    for index in 0..SITE_REPLICATION_RETRY_QUEUE_LIMIT {
+        let existing_peer = peer(&format!("existing-{index}"), &format!("https://existing-{index}.example.com"));
+        upsert_site_replication_retry_event(
+            &mut state.retry_queue,
+            &existing_peer,
+            &format!("/existing/{index}"),
+            "failed (connect)",
+            None,
+        );
+    }
+    let existing_ids = state.retry_queue.iter().map(|event| event.id.clone()).collect::<Vec<_>>();
+    let path = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket";
+
+    let err = prequeue_site_replication_destructive_events_in_state(&mut state, &[peer_b], path)
+        .expect_err("a destructive operation must not evict existing retry liability");
+
+    assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    assert_eq!(state.retry_queue.len(), SITE_REPLICATION_RETRY_QUEUE_LIMIT);
+    assert_eq!(state.retry_queue.iter().map(|event| event.id.clone()).collect::<Vec<_>>(), existing_ids);
 }
 
 #[test]
@@ -897,7 +943,7 @@ fn test_site_replication_retry_backoff_schedule() {
 }
 
 #[test]
-fn test_retry_error_marks_peer_unreachable_only_for_transport_failures() {
+fn test_retry_error_marks_peer_unreachable_only_for_connection_failures() {
     let mut queue = Vec::new();
     let peer = peer("remote", "https://remote.example.com");
     let bucket_make = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning";
@@ -910,6 +956,18 @@ fn test_retry_error_marks_peer_unreachable_only_for_transport_failures() {
         None,
     );
     assert!(queue[0].peer_unreachable);
+
+    upsert_site_replication_retry_event(
+        &mut queue,
+        &peer,
+        bucket_make,
+        "peer request to https://remote.example.com failed (timeout): request exceeded 10 seconds",
+        None,
+    );
+    assert!(
+        !queue[0].peer_unreachable,
+        "a whole-request timeout does not prove the peer is unreachable"
+    );
 
     upsert_site_replication_retry_event(
         &mut queue,
