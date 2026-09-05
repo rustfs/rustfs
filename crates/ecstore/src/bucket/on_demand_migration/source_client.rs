@@ -1338,16 +1338,16 @@ mod tests {
             .list_objects_v2(None, None, 10)
             .await
             .expect_err("truncated page without token is corrupt");
-        assert!(matches!(err, SourceError::InvalidPagination(ListPageError::MissingToken)), "{err:?}");
+        assert!(matches!(err, SourceError::InvalidPagination(ListPageError::Missing)), "{err:?}");
     }
 
     #[tokio::test]
     async fn list_page_validates_s3_cursor_progress_before_mapping_entries() {
         for contents in ["", "<Contents><Key>data/a</Key><Size>1</Size></Contents>"] {
             for (truncated, next, expected) in [
-                (true, None, Some(ListPageError::MissingToken)),
-                (true, Some(""), Some(ListPageError::EmptyToken)),
-                (true, Some("stuck"), Some(ListPageError::RepeatedToken)),
+                (true, None, Some(ListPageError::Missing)),
+                (true, Some(""), Some(ListPageError::Empty)),
+                (true, Some("stuck"), Some(ListPageError::Repeated)),
                 (true, Some("opaque-next"), None),
                 (false, None, None),
                 (false, Some("stuck"), None),
@@ -1420,9 +1420,9 @@ mod tests {
     #[tokio::test]
     async fn list_page_validates_non_s3_provider_cursors_at_the_common_boundary() {
         for (next, expected) in [
-            (None, ListPageError::MissingToken),
-            (Some(""), ListPageError::EmptyToken),
-            (Some("stuck"), ListPageError::RepeatedToken),
+            (None, ListPageError::Missing),
+            (Some(""), ListPageError::Empty),
+            (Some("stuck"), ListPageError::Repeated),
         ] {
             let mut client = prefix_client(Some("data/".into()));
             client.backend = Box::new(ListOnlyBackend(SourcePage {
