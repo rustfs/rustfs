@@ -9,35 +9,29 @@ const MAX_WALK_SAMPLES: usize = 32;
 const MAX_WALK_BYTES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Untrusted {
-    MissingProducer,
-    Restart,
-    Gap,
-    CompactedCoverage,
+enum ProposalError {
     EntryLimit,
     ByteLimit,
     InvalidKey,
 }
 
-// The keys and coverage reason are explicit test inputs, not an inferred
-// production mutation stream. Equal usage totals never establish coverage.
-fn fixture_proposal(keys: &[&str], coverage: Result<(), Untrusted>) -> Result<BTreeSet<String>, Untrusted> {
-    coverage?;
+// Keys come from successful fixture writes, not a production mutation stream.
+fn fixture_proposal(keys: &[&str]) -> Result<BTreeSet<String>, ProposalError> {
     let mut segments = BTreeSet::new();
     let mut bytes = 0;
     for key in keys {
         if key.is_empty() || key.contains(['\\', '\0']) || key.split('/').any(|part| matches!(part, "" | "." | "..")) {
-            return Err(Untrusted::InvalidKey);
+            return Err(ProposalError::InvalidKey);
         }
         let segment = key.split('/').next().expect("validated nonempty key");
         if segments.contains(segment) {
             continue;
         }
         if segments.len() == MAX_SEGMENTS {
-            return Err(Untrusted::EntryLimit);
+            return Err(ProposalError::EntryLimit);
         }
         if segment.len() > MAX_SEGMENT_BYTES - bytes {
-            return Err(Untrusted::ByteLimit);
+            return Err(ProposalError::ByteLimit);
         }
         bytes += segment.len();
         segments.insert(segment.to_string());
@@ -46,28 +40,17 @@ fn fixture_proposal(keys: &[&str], coverage: Result<(), Untrusted>) -> Result<BT
 }
 
 #[test]
-fn segment_observation_fixture_coverage_and_bounds_are_explicit() {
-    assert_eq!(fixture_proposal(&["hot/one", "hot/two"], Ok(())), Ok(BTreeSet::from(["hot".to_string()])));
-    for reason in [
-        Untrusted::MissingProducer,
-        Untrusted::Restart,
-        Untrusted::Gap,
-        Untrusted::CompactedCoverage,
-    ] {
-        assert_eq!(fixture_proposal(&["hot/one"], Err(reason)), Err(reason));
-    }
-    assert_eq!(
-        fixture_proposal(&["a", "b", "c", "d"], Ok(())).expect("entry boundary").len(),
-        MAX_SEGMENTS
-    );
-    assert_eq!(fixture_proposal(&["a", "b", "c", "d", "e"], Ok(())), Err(Untrusted::EntryLimit));
+fn segment_observation_fixture_proposal_bounds() {
+    assert_eq!(fixture_proposal(&["hot/one", "hot/two"]), Ok(BTreeSet::from(["hot".to_string()])));
+    assert_eq!(fixture_proposal(&["a", "b", "c", "d"]).expect("entry boundary").len(), MAX_SEGMENTS);
+    assert_eq!(fixture_proposal(&["a", "b", "c", "d", "e"]), Err(ProposalError::EntryLimit));
     let exact = "x".repeat(MAX_SEGMENT_BYTES);
-    assert!(fixture_proposal(&[&exact], Ok(())).is_ok());
-    assert_eq!(fixture_proposal(&[&exact, "y"], Ok(())), Err(Untrusted::ByteLimit));
+    assert!(fixture_proposal(&[&exact]).is_ok());
+    assert_eq!(fixture_proposal(&[&exact, "y"]), Err(ProposalError::ByteLimit));
     let oversized = "x".repeat(MAX_SEGMENT_BYTES + 1);
-    assert_eq!(fixture_proposal(&[&oversized], Ok(())), Err(Untrusted::ByteLimit));
+    assert_eq!(fixture_proposal(&[&oversized]), Err(ProposalError::ByteLimit));
     for key in ["", "/hot", "hot/../cold", "hot//one", "hot\\one", "hot/\0"] {
-        assert_eq!(fixture_proposal(&[key], Ok(())), Err(Untrusted::InvalidKey));
+        assert_eq!(fixture_proposal(&[key]), Err(ProposalError::InvalidKey));
     }
 }
 
@@ -95,22 +78,52 @@ async fn walk_and_save(observe: bool) -> (Vec<String>, serde_json::Value) {
             info.volume = "bucket".to_string();
             info.size = 1;
             info.mod_time = Some(time::OffsetDateTime::UNIX_EPOCH);
+            info.metadata.insert("etag".to_string(), "before".to_string());
             metadata.add_version(info).expect("construct segment fixture metadata");
             write_test_object_metadata_bytes(&root, "bucket", &object, metadata.marshal_msg().expect("encode metadata")).await;
         }
     }
+    let changed_key = "hot/one";
+    let changed_path = root.join("bucket").join(changed_key).join("xl.meta");
+    let before = tokio::fs::read(&changed_path).await.expect("read initial hot metadata");
+    let mut metadata = FileMeta::new();
+    let mut info = FileInfo::new(changed_key, 4, 2);
+    info.volume = "bucket".to_string();
+    info.size = 1;
+    info.mod_time = Some(time::OffsetDateTime::UNIX_EPOCH);
+    info.metadata.insert("etag".to_string(), "after!".to_string());
+    metadata.add_version(info).expect("construct same-size hot mutation");
+    write_test_object_metadata_bytes(&root, "bucket", changed_key, metadata.marshal_msg().expect("encode hot mutation")).await;
+    let after = tokio::fs::read(&changed_path)
+        .await
+        .expect("read back committed fixture mutation");
+    assert_eq!(before.len(), after.len(), "fixture rewrite must keep metadata byte length unchanged");
+    assert_ne!(before, after, "a changed key requires an observable successful fixture write");
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
     scanner.update_cache.info.name = "bucket".to_string();
     let paths = Arc::new(Mutex::new(Vec::<String>::new()));
+    let proposed_walked = Arc::new(Mutex::new(BTreeSet::<String>::new()));
     scanner.update_current_path = Arc::new({
         let paths = paths.clone();
+        let proposed_walked = proposed_walked.clone();
         move |path: &str| {
             let mut paths = paths.lock().expect("lock bounded actual-walk samples");
             assert!(paths.len() < MAX_WALK_SAMPLES, "fixture walk exceeded its entry budget");
             let bytes: usize = paths.iter().map(String::len).sum();
             assert!(path.len() <= MAX_WALK_BYTES - bytes, "fixture walk exceeded its byte budget");
             paths.push(path.to_string());
+            if observe {
+                let proposed = fixture_proposal(&[changed_key]).expect("bounded successful fixture mutation");
+                if let Some(segment) = path.strip_prefix("bucket/").and_then(|path| path.split('/').next())
+                    && proposed.contains(segment)
+                {
+                    proposed_walked
+                        .lock()
+                        .expect("lock bounded observed segments")
+                        .insert(segment.to_string());
+                }
+            }
             Box::pin(async {})
         }
     });
@@ -152,7 +165,7 @@ async fn walk_and_save(observe: bool) -> (Vec<String>, serde_json::Value) {
         "codec round-trip must retain the entire cache, not just aggregate size"
     );
     if observe {
-        let proposed = fixture_proposal(&["hot/one", "hot/two"], Ok(())).expect("explicit fixture coverage");
+        let proposed = proposed_walked.lock().expect("read callback observations").clone();
         assert_eq!(proposed, BTreeSet::from(["hot".to_string()]));
         let walked_segments: BTreeSet<_> = paths
             .iter()
