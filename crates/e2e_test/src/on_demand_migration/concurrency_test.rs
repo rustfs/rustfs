@@ -20,9 +20,10 @@
 //! journal (`count_requests`) carries the assertion in every one of them.
 
 use super::common::{BoxError, OdmTestEnv, RawResponse, SeedObject, start_configured_env};
-use crate::fake_s3_target::Operation;
+use crate::fake_s3_target::{FaultAction, Operation};
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt};
 use std::time::Duration;
 
 type TestResult = Result<(), BoxError>;
@@ -145,14 +146,38 @@ async fn test_odm_range_burst_overflows_the_pull_queue_without_failing_clients()
     .await?;
 
     let body = payload(128 * 1024);
+    let blocker = "queue/blocker.bin";
+    env.seed_source(SOURCE_BUCKET, &[SeedObject::new(blocker, body.clone())]);
+    // The one-chunk range completes immediately; its full background pull
+    // occupies the only slot while the remaining requests fill the queue.
+    env.source.inject_for_key(
+        Operation::GetObject,
+        blocker,
+        FaultAction::SlowSendBody {
+            chunk_bytes: 1024,
+            delay: Duration::from_millis(100),
+        },
+        2,
+    );
+    let response = env
+        .raw_object_request(http::Method::GET, bucket, blocker, &[("range", "bytes=0-1023")])
+        .await?;
+    assert_eq!(response.status, 206);
+    assert_eq!(response.body, body.slice(0..1024));
+    env.wait_for_status_counter(bucket, "/inflight_pulls", 1, SETTLE).await?;
+
     let keys: Vec<String> = (0..REQUESTS).map(|index| format!("queue/object-{index:03}.bin")).collect();
     let seeds: Vec<SeedObject> = keys.iter().map(|key| SeedObject::new(key.clone(), body.clone())).collect();
     env.seed_source(SOURCE_BUCKET, &seeds);
 
-    let responses: Vec<RawResponse> = futures::future::try_join_all(
+    // Bound source connections below the fixture's limit while still
+    // submitting all 100 requests to the eight-slot background queue.
+    let responses: Vec<RawResponse> = futures::stream::iter(
         keys.iter()
             .map(|key| env.raw_object_request(http::Method::GET, bucket, key, &[("range", "bytes=0-1023")])),
     )
+    .buffered(16)
+    .try_collect()
     .await?;
     for (key, response) in keys.iter().zip(&responses) {
         assert_eq!(response.status, 206, "{key}: {}", String::from_utf8_lossy(&response.body));
@@ -168,6 +193,15 @@ async fn test_odm_range_burst_overflows_the_pull_queue_without_failing_clients()
         .wait_for_status_counter(bucket, "/counters/pull_failures_total/queue_full", 1, SETTLE)
         .await?;
     assert!(queue_full > 0, "a 100-deep burst must overflow an 8-slot queue");
+    let queue_full = usize::try_from(queue_full)?;
+    assert!(queue_full <= REQUESTS);
+    env.wait_for_status_counter(
+        bucket,
+        "/counters/pulled_objects_total/background",
+        u64::try_from(REQUESTS + 1 - queue_full)?,
+        SETTLE,
+    )
+    .await?;
 
     let ranged_reads: usize = keys.iter().map(|key| source_get_count(&env, key)).sum();
     assert!(
@@ -175,9 +209,6 @@ async fn test_odm_range_burst_overflows_the_pull_queue_without_failing_clients()
         "every reader is served from the source: {ranged_reads} GETs for {REQUESTS} readers"
     );
     let dropped = keys.iter().filter(|key| source_get_count(&env, key) == 1).count();
-    assert!(
-        dropped > 0,
-        "the overflowed keys are the ones with no backfill GET, but every key got one"
-    );
+    assert_eq!(dropped, queue_full, "only overflowed keys remain without a background GET");
     Ok(())
 }
