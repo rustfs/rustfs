@@ -28,21 +28,30 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(600);
+pub(crate) const RETRY_DRAIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A reconciler reports its own failures; the outcome carries no value because neither
 /// caller can act on one — a site that cannot repair its replication wiring still serves S3.
 type ReconcileHook = fn() -> Pin<Box<dyn Future<Output = ()> + Send>>;
 
 static RECONCILER: OnceLock<ReconcileHook> = OnceLock::new();
+static RETRY_DRAINER: OnceLock<ReconcileHook> = OnceLock::new();
 
 /// Install the admin layer's reconciler. Idempotent: a second call is ignored, which keeps
 /// repeated router construction (tests, the embedded server) from panicking.
 pub(crate) fn register_site_replication_reconciler(reconcile: ReconcileHook) {
     let _ = RECONCILER.set(reconcile);
+}
+
+/// Install the admin layer's lightweight retry drain. Idempotent for the same
+/// reason as [`register_site_replication_reconciler`].
+pub(crate) fn register_site_replication_retry_drainer(drain: ReconcileHook) {
+    let _ = RETRY_DRAINER.set(drain);
 }
 
 /// Repair drifted site-replication wiring, immediately and then on a timer.
@@ -62,20 +71,53 @@ pub(crate) fn spawn_site_replication_reconcile_task(ctx: CancellationToken) {
         return;
     }
 
+    spawn_reconcile_loop(ctx.clone(), RECONCILE_INTERVAL, &RECONCILER, true);
+
+    if RETRY_DRAINER.get().is_none() {
+        warn!("site replication retry drainer is not registered; periodic retry drain disabled");
+        return;
+    }
+    spawn_reconcile_loop(ctx, RETRY_DRAIN_INTERVAL, &RETRY_DRAINER, false);
+}
+
+fn spawn_reconcile_loop(
+    ctx: CancellationToken,
+    interval: Duration,
+    hook: &'static OnceLock<ReconcileHook>,
+    run_immediately: bool,
+) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
+        let first_tick = if run_immediately {
+            Instant::now()
+        } else {
+            Instant::now() + interval
+        };
+        let mut ticker = tokio::time::interval_at(first_tick, interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
                 _ = ctx.cancelled() => break,
-                // The first tick fires immediately, which is the startup repair pass.
+                // The heavy reconciler owns the startup repair pass. The lightweight
+                // retry drain starts on its normal cadence so it cannot steal that
+                // first lifecycle lock and defer bucket/IAM repair for a full interval.
                 _ = ticker.tick() => {
-                    if let Some(reconcile) = RECONCILER.get() {
+                    if let Some(reconcile) = hook.get() {
                         reconcile().await;
                     }
                 }
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_drain_runs_faster_than_heavy_reconcile() {
+        assert!(RETRY_DRAIN_INTERVAL < RECONCILE_INTERVAL);
+        assert!(RETRY_DRAIN_INTERVAL <= Duration::from_secs(60));
+    }
 }
