@@ -274,8 +274,7 @@ async fn read_recovery_snapshot(disks: &[EcstoreDiskStore], limit: usize) -> Res
     if let Some(snapshot) = read_committed(disks, limit).await? {
         return Ok(Some(RecoverySnapshot::Committed(snapshot)));
     }
-    // RUSTFS_COMPAT_TODO(backlog-2263): keep legacy import until every supported
-    // rollback reader understands committed snapshots. Never mix both mirrors.
+    // RUSTFS_COMPAT_TODO(backlog-2263): inspect retained legacy MRF journals. Remove after all supported upgrade and rollback readers understand committed snapshots and retained journals have migrated.
     if let Some(payload) = read_legacy(disks, MRF_SCOPED_JOURNAL_PATH, limit).await? {
         return Ok(Some(RecoverySnapshot::Legacy(payload)));
     }
