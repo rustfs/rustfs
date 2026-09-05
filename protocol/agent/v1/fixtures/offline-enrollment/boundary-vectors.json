@@ -1,0 +1,181 @@
+{
+    "protocolVersion": "v1",
+    "fixtureSet": "offline-enrollment",
+    "fixture": "boundary-vectors",
+    "description": "Frozen challenge boundary and decision vectors for failures that cannot be added as newly signed golden documents because no fixture private key exists. Mutations start from the accepted pinned-root challenge and are applied without re-signing; every targeted rule runs before the signature invalidated by that mutation.",
+    "sourceVector": "challenge signed by a chained signing key under the pinned root",
+    "preparseMutations": [
+        {
+            "name": "challenge envelope is not JSON",
+            "scope": "serializedEnvelope",
+            "value": "{",
+            "expectedReason": "DOCUMENT_MALFORMED"
+        },
+        {
+            "name": "challenge bytes are non-canonical padded base64",
+            "scope": "envelopeBytes",
+            "value": "QR==",
+            "expectedReason": "DOCUMENT_MALFORMED"
+        },
+        {
+            "name": "challenge bytes decode to a JSON scalar",
+            "scope": "envelopeBytes",
+            "value": "bnVsbA==",
+            "expectedReason": "DOCUMENT_MALFORMED"
+        },
+        {
+            "name": "challenge is missing trustChain",
+            "scope": "challenge",
+            "operation": "remove",
+            "field": "trustChain",
+            "expectedReason": "DOCUMENT_MALFORMED"
+        },
+        {
+            "name": "challenge trustChain is a JSON object",
+            "scope": "challengeChain",
+            "operation": "objectWithFirst",
+            "expectedReason": "DOCUMENT_MALFORMED"
+        },
+        {
+            "name": "challenge issuedAt is not a real calendar instant",
+            "scope": "challenge",
+            "operation": "replace",
+            "field": "issuedAt",
+            "value": "2026-02-31T00:00:00Z",
+            "expectedReason": "DOCUMENT_MALFORMED"
+        },
+        {
+            "name": "first trust link issuerKeyId is malformed",
+            "scope": "trustLink",
+            "index": 0,
+            "operation": "replace",
+            "field": "issuerKeyId",
+            "value": "not-a-key-id",
+            "expectedReason": "DOCUMENT_MALFORMED"
+        }
+    ],
+    "verificationMutations": [
+        {
+            "name": "challenge signature algorithm is not ES256",
+            "scope": "envelopeSignature",
+            "operation": "replace",
+            "field": "algorithm",
+            "value": "ES384",
+            "expectedReason": "SIGNATURE_MALFORMED"
+        },
+        {
+            "name": "challenge signature keyId is malformed",
+            "scope": "envelopeSignature",
+            "operation": "replace",
+            "field": "keyId",
+            "value": "not-a-key-id",
+            "expectedReason": "SIGNATURE_MALFORMED"
+        },
+        {
+            "name": "challenge signature keyId names another well-formed key",
+            "scope": "envelopeSignature",
+            "operation": "replace",
+            "field": "keyId",
+            "value": "f6fbe050defded18b50477ace38c9515fb61b8157e57b2f0e7e8ca69c862b6ca",
+            "expectedReason": "SIGNATURE_INVALID"
+        },
+        {
+            "name": "pinned-root challenge carries only one trust link",
+            "scope": "challengeChain",
+            "operation": "keepFirst",
+            "expectedReason": "TRUST_CHAIN_INVALID"
+        },
+        {
+            "name": "intermediate link formatVersion is unsupported",
+            "scope": "trustLink",
+            "index": 0,
+            "operation": "replace",
+            "field": "formatVersion",
+            "value": "rustfs.connect.offline.trustLink/2",
+            "expectedReason": "TRUST_CHAIN_INVALID"
+        },
+        {
+            "name": "intermediate link protocolVersion is unsupported",
+            "scope": "trustLink",
+            "index": 0,
+            "operation": "replace",
+            "field": "protocolVersion",
+            "value": "v2",
+            "expectedReason": "TRUST_CHAIN_INVALID"
+        },
+        {
+            "name": "intermediate link signature algorithm is not ES256",
+            "scope": "trustLinkSignature",
+            "index": 0,
+            "operation": "replace",
+            "field": "algorithm",
+            "value": "ES384",
+            "expectedReason": "TRUST_CHAIN_INVALID"
+        },
+        {
+            "name": "intermediate link omits serial",
+            "scope": "trustLink",
+            "index": 0,
+            "operation": "remove",
+            "field": "serial",
+            "expectedReason": "TRUST_CHAIN_INVALID"
+        },
+        {
+            "name": "first trust link carries signing role",
+            "scope": "trustLink",
+            "index": 0,
+            "operation": "replace",
+            "field": "role",
+            "value": "signing",
+            "expectedReason": "TRUST_CHAIN_INVALID"
+        }
+    ],
+    "linkValidityPolicyVectors": [
+        {
+            "name": "intermediate link at its maximum validity",
+            "role": "intermediate",
+            "notBefore": "2026-01-01T00:00:00Z",
+            "notAfter": "2027-01-01T00:00:00Z",
+            "expectedReason": null
+        },
+        {
+            "name": "intermediate link one second beyond its maximum validity",
+            "role": "intermediate",
+            "notBefore": "2026-01-01T00:00:00Z",
+            "notAfter": "2027-01-01T00:00:01Z",
+            "expectedReason": "TRUST_CHAIN_INVALID"
+        },
+        {
+            "name": "signing link at its maximum validity",
+            "role": "signing",
+            "notBefore": "2026-08-01T00:00:00Z",
+            "notAfter": "2026-09-01T00:00:00Z",
+            "expectedReason": null
+        },
+        {
+            "name": "signing link one second beyond its maximum validity",
+            "role": "signing",
+            "notBefore": "2026-08-01T00:00:00Z",
+            "notAfter": "2026-09-01T00:00:01Z",
+            "expectedReason": "TRUST_CHAIN_INVALID"
+        }
+    ],
+    "postSignaturePolicyVectors": [
+        {
+            "name": "overlong challenge expires at the frozen seven-day boundary",
+            "issuedAt": "2026-08-01T00:00:00Z",
+            "declaredExpiresAt": "2026-08-09T00:00:00Z",
+            "evaluationTime": "2026-08-08T00:05:01Z",
+            "expectedEffectiveExpiresAt": "2026-08-08T00:00:00Z",
+            "expectedReason": "CHALLENGE_EXPIRED"
+        },
+        {
+            "name": "overlong challenge remains valid at the frozen boundary plus tolerance",
+            "issuedAt": "2026-08-01T00:00:00Z",
+            "declaredExpiresAt": "2026-08-09T00:00:00Z",
+            "evaluationTime": "2026-08-08T00:05:00Z",
+            "expectedEffectiveExpiresAt": "2026-08-08T00:00:00Z",
+            "expectedReason": null
+        }
+    ]
+}

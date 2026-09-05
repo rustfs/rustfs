@@ -28,6 +28,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::RwLock;
 
 use base64_simd::STANDARD as BASE64_STANDARD;
 use base64_simd::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
@@ -44,6 +45,11 @@ const SPKI_PREFIX_HEX: &str = "3059301306072a8648ce3d020106082a8648ce3d030107034
 
 /// `clockSkew.toleranceSeconds` in `trust-model.json`.
 const SKEW_TOLERANCE_SECONDS: i64 = 300;
+
+/// Fixture reads use real descriptors, while the offline invariant below
+/// snapshots the process descriptor table. A write guard around that snapshot
+/// keeps parallel test fixture I/O from masquerading as network activity.
+static FIXTURE_ACCESS: RwLock<()> = RwLock::new(());
 
 // ---------------------------------------------------------------------------
 // Fixture access
@@ -73,6 +79,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// redefining what conformance means, which is the failure mode a
 /// fixture-driven suite is otherwise blind to.
 fn read_fixture(name: &str) -> Vec<u8> {
+    let _fixture_guard = FIXTURE_ACCESS.read().expect("fixture access lock");
     let dir = fixture_dir();
     let manifest = fs::read_to_string(dir.join("MANIFEST.sha256")).expect("read MANIFEST.sha256");
 
@@ -108,6 +115,10 @@ fn trust_model() -> Value {
     fixture_json("trust-model.json")
 }
 
+fn boundary_vectors() -> Value {
+    fixture_json("boundary-vectors.json")
+}
+
 fn vector_list(fixture: &Value) -> Vec<Value> {
     fixture["vectors"].as_array().expect("fixture carries a vector list").clone()
 }
@@ -140,6 +151,75 @@ fn signed_octets(document: &Value) -> Vec<u8> {
 /// below; the implementation under test is required to verify before it parses.
 fn signed_document(document: &Value) -> Value {
     serde_json::from_slice(&signed_octets(document)).expect("signed document parses")
+}
+
+fn encoded_document(document: &Value) -> String {
+    BASE64_STANDARD.encode_to_string(serde_json::to_vec(document).expect("document serialises"))
+}
+
+fn apply_object_mutation(target: &mut Value, mutation: &Value) {
+    let object = target.as_object_mut().expect("mutation target is an object");
+    let name = field(mutation, "field");
+
+    match mutation["operation"].as_str().expect("mutation carries an operation") {
+        "remove" => {
+            object.remove(name);
+        }
+        "replace" => {
+            object.insert(name.to_string(), mutation["value"].clone());
+        }
+        operation => panic!("unsupported object mutation {operation}"),
+    }
+}
+
+fn boundary_artifact(source: &Value, mutation: &Value) -> Vec<u8> {
+    if field(mutation, "scope") == "serializedEnvelope" {
+        return field(mutation, "value").as_bytes().to_vec();
+    }
+
+    let mut result = source["document"].clone();
+    let scope = field(mutation, "scope");
+    if scope == "envelopeBytes" {
+        result["bytes"] = mutation["value"].clone();
+        return envelope(&result);
+    }
+    if scope == "envelopeSignature" {
+        apply_object_mutation(&mut result["signature"], mutation);
+        return envelope(&result);
+    }
+
+    let mut challenge = signed_document(&result);
+    match scope {
+        "challenge" => apply_object_mutation(&mut challenge, mutation),
+        "challengeChain" => {
+            let chain = challenge["trustChain"].as_array().expect("challenge carries a chain");
+            challenge["trustChain"] = match mutation["operation"].as_str().expect("chain mutation carries an operation") {
+                "keepFirst" => Value::Array(vec![chain[0].clone()]),
+                "objectWithFirst" => {
+                    let mut object = serde_json::Map::new();
+                    object.insert("first".to_string(), chain[0].clone());
+                    Value::Object(object)
+                }
+                operation => panic!("unsupported chain mutation {operation}"),
+            };
+        }
+        "trustLink" | "trustLinkSignature" => {
+            let index = mutation["index"].as_u64().expect("trust-link mutation carries an index") as usize;
+            let chain = challenge["trustChain"].as_array_mut().expect("challenge carries a chain");
+            let link_envelope = &mut chain[index];
+            if scope == "trustLinkSignature" {
+                apply_object_mutation(&mut link_envelope["signature"], mutation);
+            } else {
+                let mut link = signed_document(link_envelope);
+                apply_object_mutation(&mut link, mutation);
+                link_envelope["bytes"] = Value::String(encoded_document(&link));
+            }
+        }
+        other => panic!("unsupported boundary scope {other}"),
+    }
+
+    result["bytes"] = Value::String(encoded_document(&challenge));
+    envelope(&result)
 }
 
 fn unix(rfc3339: &str) -> i64 {
@@ -275,6 +355,41 @@ fn every_challenge_accept_vector_verifies_and_exposes_the_signed_fields() {
         verified_count, 3,
         "accept-vectors.json publishes three challenge vectors; a fourth is a protocol change"
     );
+}
+
+#[test]
+fn malformed_top_level_signature_members_keep_the_frozen_reason() {
+    let vector = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let now = unix(field(&vector, "evaluationTime"));
+
+    for (member, malformed) in [
+        ("algorithm", serde_json::json!(1)),
+        ("keyId", serde_json::Value::Null),
+        ("value", serde_json::json!([])),
+    ] {
+        let mut document = vector["document"].clone();
+        document["signature"][member] = malformed;
+
+        let error = OfflineEnrollment::verify_challenge(&envelope(&document), now)
+            .expect_err(&format!("a malformed top-level signature {member} must be refused"));
+        assert_eq!(
+            error.reason(),
+            "SIGNATURE_MALFORMED",
+            "a malformed top-level signature {member} keeps the frozen classifier"
+        );
+    }
+}
+
+#[test]
+fn duplicate_top_level_signature_members_are_refused() {
+    let vector = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let document = String::from_utf8(envelope(&vector["document"])).expect("envelope is UTF-8 JSON");
+    let duplicate = document.replacen("\"algorithm\":\"ES256\"", "\"algorithm\":\"ES384\",\"algorithm\":\"ES256\"", 1);
+    assert_ne!(duplicate, document, "the accepted vector carries the expected algorithm");
+
+    let error = OfflineEnrollment::verify_challenge(duplicate.as_bytes(), unix(field(&vector, "evaluationTime")))
+        .expect_err("a duplicate top-level signature member must be refused");
+    assert_eq!(error.reason(), "DOCUMENT_MALFORMED");
 }
 
 #[cfg(feature = "offline-enrollment-e2e-root")]
@@ -470,6 +585,124 @@ fn every_challenge_reject_vector_fails_with_its_frozen_reason() {
         rejected, 8,
         "reject-vectors.json publishes eight challenge vectors; losing one silently narrows the suite"
     );
+}
+
+#[test]
+fn every_challenge_boundary_mutation_fails_with_its_frozen_reason() {
+    let boundaries = boundary_vectors();
+    let source = accept_vector_named(field(&boundaries, "sourceVector"));
+    let now = unix(field(&source, "evaluationTime"));
+    let mut covered = 0usize;
+
+    for group in ["preparseMutations", "verificationMutations"] {
+        for mutation in boundaries[group].as_array().expect("boundary group is a list") {
+            let name = field(mutation, "name");
+            let expected = field(mutation, "expectedReason");
+            let error = match OfflineEnrollment::verify_challenge(&boundary_artifact(&source, mutation), now) {
+                Err(error) => error,
+                Ok(_) => panic!("boundary mutation '{name}' must fail"),
+            };
+            assert_eq!(error.reason(), expected, "boundary mutation '{name}'");
+            covered += 1;
+        }
+    }
+
+    assert_eq!(covered, 16, "boundary-vectors.json publishes sixteen executable challenge mutations");
+}
+
+#[test]
+fn malformed_top_level_signature_precedes_malformed_first_link_routing() {
+    let source = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let now = unix(field(&source, "evaluationTime"));
+    let mut challenge_envelope = source["document"].clone();
+    challenge_envelope["signature"]["algorithm"] = Value::String("ES384".to_string());
+
+    let mut challenge = signed_document(&challenge_envelope);
+    let first_envelope = &mut challenge["trustChain"].as_array_mut().expect("challenge carries a chain")[0];
+    let mut first_link = signed_document(first_envelope);
+    first_link["issuerKeyId"] = Value::String("not-a-key-id".to_string());
+    first_envelope["bytes"] = Value::String(encoded_document(&first_link));
+    challenge_envelope["bytes"] = Value::String(encoded_document(&challenge));
+
+    let error = OfflineEnrollment::verify_challenge(&envelope(&challenge_envelope), now)
+        .expect_err("a malformed top-level signature and first-link issuer must not verify");
+    assert_eq!(error.reason(), "SIGNATURE_MALFORMED");
+}
+
+#[test]
+fn malformed_top_level_signature_precedes_malformed_second_link_envelope() {
+    let source = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let now = unix(field(&source, "evaluationTime"));
+    let mut challenge_envelope = source["document"].clone();
+    challenge_envelope["signature"]["algorithm"] = Value::String("ES384".to_string());
+
+    let mut challenge = signed_document(&challenge_envelope);
+    challenge["trustChain"].as_array_mut().expect("challenge carries a chain")[1]
+        .as_object_mut()
+        .expect("trust link envelope is an object")
+        .remove("signature");
+    challenge_envelope["bytes"] = Value::String(encoded_document(&challenge));
+
+    let error = OfflineEnrollment::verify_challenge(&envelope(&challenge_envelope), now)
+        .expect_err("a malformed top-level signature and second-link envelope must not verify");
+    assert_eq!(error.reason(), "SIGNATURE_MALFORMED");
+}
+
+#[test]
+fn unpinned_root_precedes_a_malformed_chain_shape() {
+    let source = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let now = unix(field(&source, "evaluationTime"));
+    let mut challenge_envelope = source["document"].clone();
+    let mut challenge = signed_document(&challenge_envelope);
+    let first_envelope = &mut challenge["trustChain"].as_array_mut().expect("challenge carries a chain")[0];
+    let mut first_link = signed_document(first_envelope);
+    first_link.as_object_mut().expect("trust link is an object").remove("serial");
+    first_link["issuerKeyId"] = Value::String("5ff37910aa4d69949e2c488f98d6072f10a3c3e73d776698963872582644f731".to_string());
+    first_envelope["bytes"] = Value::String(encoded_document(&first_link));
+    challenge_envelope["bytes"] = Value::String(encoded_document(&challenge));
+
+    let error =
+        OfflineEnrollment::verify_challenge(&envelope(&challenge_envelope), now).expect_err("an unpinned root must never verify");
+    assert_eq!(
+        error.reason(),
+        "ENROLLMENT_ROOT_UNKNOWN",
+        "the pinned-root decision must precede the rest of the attacker-controlled chain shape"
+    );
+}
+
+#[test]
+fn response_production_honours_the_frozen_effective_challenge_expiry() {
+    let key = DeviceIdentity::generate();
+    let boundaries = boundary_vectors();
+    let mut covered = 0usize;
+
+    for vector in boundaries["postSignaturePolicyVectors"]
+        .as_array()
+        .expect("post-signature policy vectors are a list")
+    {
+        let name = field(vector, "name");
+        let challenge = VerifiedChallenge {
+            challenge_id: "018f7e6d-9d6a-7d93-8f64-8b20b3384712".to_string(),
+            organization_name: "organizations/01HZXQ9J2XW6R7V8T9Y0Z1A2B3".to_string(),
+            cluster_name: "organizations/01HZXQ9J2XW6R7V8T9Y0Z1A2B3/clusters/01HZXQ9J2XW6R7V8T9Y0Z1A2B4".to_string(),
+            nonce: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            issued_at: field(vector, "issuedAt").to_string(),
+            expires_at: field(vector, "declaredExpiresAt").to_string(),
+            connect_key_id: "08e7295c8f9d043e22b2b80fdb1480b0bec060dacbce7de9dd2e3d583f93d7e8".to_string(),
+            challenge_proof: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        };
+        let outcome = OfflineEnrollment::build_response(&challenge, &key, &[0x5a; 32], unix(field(vector, "evaluationTime")));
+
+        match vector["expectedReason"].as_str() {
+            Some(expected) => assert_eq!(outcome.unwrap_err().reason(), expected, "post-signature policy vector '{name}'"),
+            None => {
+                outcome.unwrap_or_else(|error| panic!("post-signature policy vector '{name}' must pass: {}", error.reason()));
+            }
+        }
+        covered += 1;
+    }
+
+    assert_eq!(covered, 2, "boundary-vectors.json publishes two effective-expiry vectors");
 }
 
 /// The response reject vectors are artifacts Connect refuses. This side never
@@ -949,6 +1182,7 @@ fn enrollment_opens_no_descriptor_and_is_a_pure_byte_transform() {
     let document = envelope(&vector["document"]);
     let now = unix(field(&vector, "evaluationTime"));
     let key = DeviceIdentity::generate();
+    let _fixture_guard = FIXTURE_ACCESS.write().expect("fixture access lock");
 
     // Warm anything the test harness itself lazily opens before the baseline.
     let _ = open_descriptors();

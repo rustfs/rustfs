@@ -22,7 +22,8 @@
         "keyIdOver": "DER SubjectPublicKeyInfo",
         "keyIdEncoding": "lowercase-hex",
         "keyIdPattern": "^[0-9a-f]{64}$",
-        "documentTransferEncoding": "base64-padded"
+        "documentTransferEncoding": "base64-padded",
+        "documentTransferValidation": "strict standard base64 whose length is a multiple of four and whose decode then encode result is byte-identical to the received value"
     },
     "domainSeparation": {
         "rule": "signatureInput = domainSeparationTag || 0x00 || the exact raw octets of the signed document as transmitted",
@@ -39,6 +40,7 @@
         }
     },
     "verifierMustReject": [
+        "An envelope or decoded document that is not valid JSON, bytes that are not strict padded base64, or a field required before signature verification that is absent or malformed.",
         "A signature that is not exactly 64 octets of fixed-width r||s.",
         "A DER or any other ASN.1 encoded signature, even when it decodes to the same r and s.",
         "A signature encoded with the standard base64 alphabet or with = padding.",
@@ -89,25 +91,61 @@
     ],
     "verificationOrder": {
         "principle": "Parse as late as the verification key allows, and treat anything read before the signature verified as untrusted routing information rather than as a fact.",
+        "enrollmentFailureReasons": {
+            "challengeDocumentMalformed": {
+                "appliesTo": "enrollmentChallenge",
+                "reason": "DOCUMENT_MALFORMED",
+                "covers": [
+                    "an envelope that is not a JSON object or lacks document.bytes or document.signature",
+                    "document.bytes that is not strict standard padded base64",
+                    "decoded document bytes that are not a JSON object",
+                    "a missing or ill-typed challenge field required before signature verification",
+                    "issuedAt that is not a real RFC 3339 UTC instant at second precision"
+                ],
+                "noPartialProcessing": true
+            },
+            "artifactSignatureAlgorithm": {
+                "appliesTo": [
+                    "enrollmentChallenge",
+                    "enrollmentResponse"
+                ],
+                "supported": "ES256",
+                "reason": "SIGNATURE_MALFORMED"
+            },
+            "artifactSignatureKeyId": {
+                "malformedReason": "SIGNATURE_MALFORMED",
+                "challengeMismatchReason": "SIGNATURE_INVALID",
+                "responseMismatchReason": "DEVICE_PROOF_INVALID"
+            },
+            "trustLink": {
+                "invalidFormatVersionReason": "TRUST_CHAIN_INVALID",
+                "invalidProtocolVersionReason": "TRUST_CHAIN_INVALID",
+                "missingRequiredFieldReason": "TRUST_CHAIN_INVALID",
+                "invalidRoleReason": "TRUST_CHAIN_INVALID",
+                "invalidSignatureAlgorithmReason": "TRUST_CHAIN_INVALID",
+                "excessiveValidityReason": "TRUST_CHAIN_INVALID"
+            }
+        },
         "enrollmentChallenge": {
-            "note": "A challenge carries its own chain, so the CLI must read structure before it can verify anything. The pre-parse yields only trustChain, connectKeyId, and issuedAt, and none of them is believed: the chain has to close on a pinned root, and the challenge signature has to verify, before any other field is used.",
+            "note": "A challenge carries its own chain, so the CLI must read structure before it can verify anything. The pre-parse yields only trustChain, connectKeyId, and issuedAt, and none of them is believed. When a first link is present and readable, its issuer is checked against the pinned roots before chain length or role checks. This precedence deliberately makes an unpinned-root artifact ENROLLMENT_ROOT_UNKNOWN even when the rest of its chain is malformed.",
             "steps": [
-                "check the signature encoding",
-                "pre-parse the untrusted document for trustChain, connectKeyId, and issuedAt",
+                "decode the envelope and document bytes, then pre-parse the untrusted document for trustChain, connectKeyId, and issuedAt; reject an unreadable value as DOCUMENT_MALFORMED",
+                "check signature.algorithm and the signature encoding; reject a non-ES256 algorithm or malformed encoding as SIGNATURE_MALFORMED",
+                "pre-parse the first trust link for an issuerKeyId matching the frozen keyId pattern; reject an unreadable or malformed value as DOCUMENT_MALFORMED",
                 "reject unless trustChain[0].issuerKeyId is a pinned root",
-                "verify every trust link against its issuer and its validity at issuedAt",
+                "require exactly two links and the positional roles [intermediate, signing], then verify every required field, version, algorithm, signature, issuer binding, role validity limit, and validity at issuedAt; reject any failure as TRUST_CHAIN_INVALID",
                 "reject unless connectKeyId is the subject of the last link",
                 "verify the challenge signature over the received octets",
-                "only now read protocolVersion, then formatVersion",
-                "check the freshness window"
+                "only now read protocolVersion, then formatVersion, then validate the remaining required document fields",
+                "check the freshness window against effectiveExpiresAt = min(expiresAt, issuedAt + maxChallengeLifetimeSeconds)"
             ]
         },
         "enrollmentResponse": {
             "note": "A response presents the device key it is enrolling, so Connect necessarily reads that key from the document. Proof of possession is what makes it safe: the presented key must be the key that signed the presenting document.",
             "steps": [
-                "check the signature encoding",
-                "reject unless deviceKeyId is the fingerprint of devicePublicKey and the signature verifies under devicePublicKey",
-                "only now read protocolVersion, then formatVersion",
+                "check signature.algorithm and the signature encoding; reject a non-ES256 algorithm or malformed encoding as SIGNATURE_MALFORMED",
+                "pre-parse deviceKeyId and devicePublicKey, then reject an unreadable value or unless deviceKeyId is the fingerprint of devicePublicKey and the signature verifies under devicePublicKey as DEVICE_PROOF_INVALID",
+                "only now read protocolVersion, then formatVersion, then validate the remaining required document fields",
                 "compare organization, then cluster, against the stored challenge",
                 "compare challengeId, challengeNonce, and challengeProof against the stored challenge",
                 "check the freshness window against producedAt, then against the receive time",
@@ -146,6 +184,11 @@
         "chainLinkCount": 2,
         "maxChainLinkCount": 2,
         "chainOrder": "index 0 is issued by a pinned root, index 1 is issued by the subject of index 0",
+        "chainRoles": [
+            "intermediate",
+            "signing"
+        ],
+        "rootCheckPrecedesChainShape": true,
         "note": "Because no root is ever learned at runtime, an operator cannot be socially engineered into accepting an attacker root, and a stolen intermediate cannot mint its own root. The cost is that a root rollover requires redistributing the RustFS build, which is stated in rollover.root."
     },
     "keyHierarchy": [
@@ -242,12 +285,14 @@
     "clockSkew": {
         "toleranceSeconds": 300,
         "deviceClockAuthority": "advisory",
-        "challengeWindow": "accepted while verifierNow is within [issuedAt - 300, expiresAt + 300]",
+        "challengeWindow": "accepted while verifierNow is within [issuedAt - 300, effectiveExpiresAt + 300], where effectiveExpiresAt = min(expiresAt, issuedAt + maxChallengeLifetimeSeconds)",
         "chainLinkWindow": "each link must satisfy notBefore <= challenge.issuedAt <= notAfter, evaluated with no tolerance because the issuer controls both values",
         "maxChallengeLifetimeSeconds": 604800,
+        "excessiveChallengeLifetimePolicy": "clamp-effective-expiry",
+        "excessiveChallengeLifetimeReason": "CHALLENGE_EXPIRED",
         "maxManifestAgeSeconds": 2592000,
         "maxManifestFutureSkewSeconds": 300,
-        "responseWindow": "producedAt must fall within [challenge.issuedAt - 300, challenge.expiresAt + 300]",
+        "responseWindow": "producedAt must fall within [challenge.issuedAt - 300, effectiveExpiresAt + 300]",
         "note": "ADR 0003 already treats client clocks as advisory for heartbeat freshness. An air-gapped device is worse: it may have no synchronised clock at all. Every window is therefore evaluated against the Connect clock for artifacts Connect receives, and against the issuer-supplied issuedAt for the chain a device validates locally."
     },
     "replay": {
