@@ -712,6 +712,8 @@ mod tests {
                     session_token: None,
                 }),
                 tls: TlsConfig::default(),
+                azure: None,
+                gcs: None,
             },
             filter: FilterConfig {
                 prefix: filter_prefix.map(str::to_string),
