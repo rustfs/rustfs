@@ -15,11 +15,11 @@
 //! GetObject / GetObjectAttributes read path: cold fill, resume, stream tuning.
 
 use super::*;
-use crate::app::storage_api::object_usecase::bucket::on_demand_migration::{
+use crate::on_demand_migration::WriteBackBody;
+use crate::on_demand_migration::{
     BucketOdmState, OdmLookup, OdmOp, OdmOutcome, OnDemandMigrationSys, PullError, PullLeader, PullOutcome, PullReason, PullSlot,
     RangeGetPolicy, SourceBody, SourceClient, SourceError, SourceGet, SourceHead, commit_inline, idle_guarded_body,
 };
-use crate::app::storage_api::object_usecase::on_demand_migration::WriteBackBody;
 use rustfs_rio::{TeeOptions, TeePrimary, tee_reader_with_options};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -4798,11 +4798,11 @@ pub(super) async fn odm_get_from_source<S: OdmGetSource>(
 #[cfg(test)]
 mod on_demand_migration_tests {
     use super::*;
-    use crate::app::storage_api::object_usecase::bucket::on_demand_migration::{
+    use crate::on_demand_migration::{
         BREAKER_FAILURE_THRESHOLD, BreakerState, FilterConfig, OdmStateError, OnDemandMigrationConfig, PathStyle, PolicyConfig,
         Provider, SourceConfig, SourceCredentials, SourceErrorPolicy, TlsConfig,
     };
-    use crate::app::storage_api::object_usecase::on_demand_migration::{
+    use crate::on_demand_migration::{
         LocalObject, OdmWriteBack, WriteBackError, WriteBackOutcome, WriteBackPart, WriteBackRequest,
     };
     use async_trait::async_trait;

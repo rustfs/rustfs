@@ -14,15 +14,33 @@
 
 //! Bucket-level On-Demand Migration configuration: wire model (JSON stored
 //! under `on-demand-migration.json`), pure validation, credential redaction,
-//! and the publish hook the runtime registers into (rustfs/backlog#2148).
+//! and persisted-config decoding (rustfs/backlog#2148).
 //!
 //! The persisted blob is not encrypted; it shares the trust boundary of
 //! `bucket-targets.json` and `tier-config.bin`.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::sync::OnceLock;
 use url::Url;
+
+/// Decode bytes only at the service boundary, preserving typed corruption errors.
+pub(super) fn decode_stored_config(
+    stored: Option<(Vec<u8>, time::OffsetDateTime)>,
+) -> Result<Option<(OnDemandMigrationConfig, time::OffsetDateTime)>, super::storage_api::StorageError> {
+    stored
+        .map(|(bytes, updated_at)| {
+            OnDemandMigrationConfig::from_json(&bytes)
+                .map(|config| (config, updated_at))
+                .map_err(super::storage_api::StorageError::other)
+        })
+        .transpose()
+}
+
+pub(crate) async fn get_config(
+    bucket: &str,
+) -> Result<Option<(OnDemandMigrationConfig, time::OffsetDateTime)>, super::storage_api::StorageError> {
+    decode_stored_config(super::storage_api::get_on_demand_migration_config(bucket).await?)
+}
 
 /// The only wire version this build reads and writes.
 pub const ON_DEMAND_MIGRATION_CONFIG_VERSION: u32 = 1;
@@ -786,16 +804,6 @@ impl EndpointKey {
     }
 }
 
-/// Signature of the runtime publish hook: called with the bucket name and
-/// its parsed config (`None` when absent, cleared, or unreadable) every time
-/// the bucket's metadata is installed into or removed from the cache.
-pub type ConfigPublishHook = Box<dyn Fn(&str, Option<&OnDemandMigrationConfig>) + Send + Sync>;
-
-/// Registration point for the runtime (`OnDemandMigrationSys`). Until it is
-/// set, metadata publishes are no-ops for ODM, so this crate carries no
-/// runtime dependency and the config layer stays inert.
-pub static ON_DEMAND_MIGRATION_CONFIG_HOOK: OnceLock<ConfigPublishHook> = OnceLock::new();
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1500,5 +1508,56 @@ mod tests {
         let rendered = format!("{err} / {err:?}");
         assert!(!rendered.contains("topsecret"), "{rendered}");
         assert!(!rendered.contains("SK"), "{rendered}");
+    }
+    /// rustfs/backlog#2148: the accessor reports absence as `Ok(None)` and a
+    /// stored payload it cannot parse as a typed error, never as a default
+    /// and never as `ConfigNotFound`.
+    #[tokio::test]
+    async fn get_on_demand_migration_config_distinguishes_absent_from_corrupt() {
+        use super::super::storage_api::StorageError as Error;
+        use super::super::storage_api::test_support::{
+            BUCKET_ON_DEMAND_MIGRATION_CONFIG, BucketMetadata, BucketMetadataSys, isolated_store_over_temp_disks,
+        };
+        use std::sync::Arc;
+        const ODM_JSON: &[u8] = br#"{"source":{"provider":"minio","endpoint":"https://legacy.example.com:9000","region":"auto","bucket":"legacy-bucket","credentials":{"access_key":"AK","secret_key":"SK"}}}"#;
+
+        let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore);
+        let bucket = "odm-accessor";
+
+        sys.set(bucket.to_string(), Arc::new(BucketMetadata::new(bucket))).await;
+        assert_eq!(
+            decode_stored_config(sys.get_on_demand_migration_config(bucket).await.unwrap()).unwrap(),
+            None
+        );
+
+        let mut corrupt = BucketMetadata::new(bucket);
+        corrupt.on_demand_migration_config_json = br#"{"source":{"provider":"s3"},"bogus":1}"#.to_vec();
+        sys.set(bucket.to_string(), Arc::new(corrupt)).await;
+        let err = decode_stored_config(sys.get_on_demand_migration_config(bucket).await.unwrap())
+            .expect_err("corrupt config must not read as a default");
+        assert_ne!(err, Error::ConfigNotFound, "corruption must not be reported as absence");
+        let typed = match &err {
+            Error::Io(io) => io
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<OnDemandMigrationConfigError>()),
+            _ => None,
+        };
+        assert!(
+            matches!(typed, Some(OnDemandMigrationConfigError::Malformed(_))),
+            "typed parse error must survive the Result boundary, got: {err:?}"
+        );
+
+        let mut valid = BucketMetadata::new(bucket);
+        valid
+            .update_config(BUCKET_ON_DEMAND_MIGRATION_CONFIG, ODM_JSON.to_vec())
+            .unwrap();
+        let stamped = valid.on_demand_migration_config_updated_at;
+        sys.set(bucket.to_string(), Arc::new(valid)).await;
+        let (config, updated_at) = decode_stored_config(sys.get_on_demand_migration_config(bucket).await.unwrap())
+            .unwrap()
+            .expect("stored config is returned");
+        assert_eq!(config, OnDemandMigrationConfig::from_json(ODM_JSON).unwrap());
+        assert_eq!(updated_at, stamped);
     }
 }
