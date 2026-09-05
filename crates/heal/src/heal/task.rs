@@ -47,6 +47,26 @@ use uuid::Uuid;
 
 use super::{BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME, RUSTFS_META_BUCKET};
 
+#[cfg(test)]
+pub(crate) struct OutcomeFinishTestHook {
+    pub(crate) task_id: String,
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) static OUTCOME_FINISH_TEST_HOOK: std::sync::LazyLock<tokio::sync::Mutex<Option<Arc<OutcomeFinishTestHook>>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+#[cfg(test)]
+async fn pause_outcome_finish(task_id: &str) {
+    let hook = OUTCOME_FINISH_TEST_HOOK.lock().await.clone();
+    if let Some(hook) = hook.filter(|hook| hook.task_id == task_id) {
+        hook.reached.notify_one();
+        hook.release.notified().await;
+    }
+}
+
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_TASK: &str = "task";
 const LOG_SUBSYSTEM_OBJECT: &str = "object";
@@ -932,6 +952,8 @@ impl HealTask {
             HealType::ErasureSet { buckets, set_disk_id } => self.heal_erasure_set(buckets.clone(), set_disk_id.clone()).await,
         };
 
+        #[cfg(test)]
+        pause_outcome_finish(&self.id).await;
         {
             let mut outcome = self.outcome.write().await;
             if outcome.counters.processed == 0

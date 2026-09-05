@@ -36,6 +36,70 @@ mod canonical_outcome {
         )
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn cluster_retries_only_the_failed_listing_page() {
+        let storage = Arc::new(MockStorage {
+            recoverable_second_page_failures: Mutex::new(Some(1)),
+            ..Default::default()
+        });
+        let task = HealTask::from_request(
+            HealRequest::new(
+                HealType::Cluster,
+                HealOptions {
+                    recursive: true,
+                    timeout: None,
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            ),
+            storage.clone(),
+        );
+        task.execute().await.expect("second-page retry succeeds");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+        assert_eq!(outcome.counters.processed, 2);
+        assert_eq!(outcome.counters.attempt_failures, 1);
+        assert_eq!(task.get_progress().await.objects_scanned, 2);
+        assert_eq!(
+            storage.heal_object_calls.lock().expect("object calls").as_slice(),
+            ["object-a", "object-b"]
+        );
+        assert_eq!(
+            storage.listing_tokens.lock().expect("listing tokens").as_slice(),
+            [None, Some("second".to_string()), Some("second".to_string())]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_listing_page_cannot_restart_the_bucket() {
+        let storage = Arc::new(MockStorage {
+            recoverable_second_page_failures: Mutex::new(Some(4)),
+            ..Default::default()
+        });
+        let task = HealTask::from_request(
+            HealRequest::new(
+                HealType::Cluster,
+                HealOptions {
+                    recursive: true,
+                    timeout: None,
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            ),
+            storage.clone(),
+        );
+        task.execute().await.expect_err("listing page budget exhausted");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::Aborted(HealAbortReason::Untraversable));
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Partial);
+        assert_eq!(outcome.counters.processed, 1);
+        assert_eq!(outcome.counters.attempt_failures, 4);
+        assert_eq!(task.get_progress().await.objects_scanned, 1);
+        assert_eq!(storage.heal_object_calls.lock().expect("object calls").as_slice(), ["object-a"]);
+        assert_eq!(storage.bucket_heal_calls.lock().expect("bucket calls").as_slice(), ["bucket-a"]);
+    }
+
     #[tokio::test]
     async fn listing_failure_preserves_processed_objects_and_partial_coverage() {
         let storage = Arc::new(MockStorage {
@@ -872,6 +936,8 @@ struct MockStorage {
     listed: Mutex<bool>,
     list_each_bucket: bool,
     fail_second_listing_page: bool,
+    recoverable_second_page_failures: Mutex<Option<usize>>,
+    listing_tokens: Mutex<Vec<Option<String>>>,
     healed_objects: Mutex<Vec<String>>,
     heal_object_calls: Mutex<Vec<String>>,
     heal_object_version_ids: Mutex<Vec<Option<String>>>,
@@ -1285,6 +1351,28 @@ impl HealStorageAPI for MockStorage {
         _include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
         self.listed_prefixes.lock().unwrap().push(prefix.to_string());
+        self.listing_tokens
+            .lock()
+            .expect("listing tokens")
+            .push(continuation_token.map(ToOwned::to_owned));
+        if let Some(remaining) = self
+            .recoverable_second_page_failures
+            .lock()
+            .expect("listing failures")
+            .as_mut()
+        {
+            if continuation_token.is_none() {
+                return Ok((vec![heal_item("object-a")], Some("second".to_string()), true));
+            }
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(Error::Storage(EcstoreError::InsufficientReadQuorum(
+                    bucket.to_string(),
+                    "page".to_string(),
+                )));
+            }
+            return Ok((vec![heal_item("object-b")], None, false));
+        }
         if self.fail_second_listing_page {
             return if continuation_token.is_none() {
                 Ok((vec![heal_item("object-a")], Some("next-page".to_string()), true))

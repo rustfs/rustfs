@@ -141,7 +141,9 @@ pub struct HealTaskOutcome {
 
 impl HealTaskOutcome {
     pub(crate) fn start(&mut self) {
-        self.execution = HealExecutionOutcome::Running;
+        if self.execution != HealExecutionOutcome::Aborted(HealAbortReason::Cancelled) {
+            self.execution = HealExecutionOutcome::Running;
+        }
         self.coverage = HealTraversalCoverage::Partial;
     }
 
@@ -155,6 +157,9 @@ impl HealTaskOutcome {
     }
 
     pub(crate) fn finish(&mut self, abort: Option<HealAbortReason>) {
+        if self.execution == HealExecutionOutcome::Aborted(HealAbortReason::Cancelled) {
+            return;
+        }
         let abort = abort.or(self.untraversable.then_some(HealAbortReason::Untraversable));
         self.execution = match abort {
             Some(reason) => HealExecutionOutcome::Aborted(reason),

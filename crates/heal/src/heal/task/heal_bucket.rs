@@ -306,23 +306,47 @@ impl HealTask {
             let mut continuation_token: Option<String> = None;
             loop {
                 self.check_control_flags().await?;
-                let (objects, next_token, is_truncated) = if let Some(set_disk_id) = set_disk_id.as_deref() {
-                    self.await_with_control(self.storage.list_versions_for_heal_page_disk_walk(
-                        set_disk_id,
-                        bucket,
-                        prefix,
-                        continuation_token.as_deref(),
-                        false,
-                    ))
-                    .await?
-                } else {
-                    self.await_with_control(self.storage.list_objects_for_heal_page(
-                        bucket,
-                        prefix,
-                        continuation_token.as_deref(),
-                        false,
-                    ))
-                    .await?
+                let mut listing_attempt = 0;
+                let (objects, next_token, is_truncated) = loop {
+                    let page = if let Some(set_disk_id) = set_disk_id.as_deref() {
+                        self.await_with_control(self.storage.list_versions_for_heal_page_disk_walk(
+                            set_disk_id,
+                            bucket,
+                            prefix,
+                            continuation_token.as_deref(),
+                            false,
+                        ))
+                        .await
+                    } else {
+                        self.await_with_control(self.storage.list_objects_for_heal_page(
+                            bucket,
+                            prefix,
+                            continuation_token.as_deref(),
+                            false,
+                        ))
+                        .await
+                    };
+                    match page {
+                        Ok(page) => break page,
+                        Err(error @ (Error::TaskCancelled | Error::TaskTimeout)) => return Err(error),
+                        Err(error) => {
+                            self.outcome.write().await.attempt_failed();
+                            if error.is_recoverable_heal() && listing_attempt < MAX_BUCKET_OBJECT_HEAL_RETRIES {
+                                listing_attempt += 1;
+                                self.await_with_control(async {
+                                    tokio::time::sleep(self.bucket_object_retry_delay(listing_attempt)).await;
+                                    Ok(())
+                                })
+                                .await?;
+                                continue;
+                            }
+                            self.outcome.write().await.mark_untraversable();
+                            return Err(Error::HealListingFailed {
+                                bucket: bucket.to_string(),
+                                source: Box::new(error),
+                            });
+                        }
+                    }
                 };
 
                 let mut pending = objects;
