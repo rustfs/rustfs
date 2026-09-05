@@ -19,7 +19,6 @@
 #![allow(clippy::all)]
 
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
-use http_body_util::BodyExt;
 use hyper::body::Body;
 use hyper::body::Bytes;
 use rustfs_utils::HashAlgorithm;
@@ -351,14 +350,9 @@ impl TransitionClient {
                 )
                 .await?;
 
-            let mut body_vec = Vec::new();
-            let mut body = resp.into_body();
-            while let Some(frame) = body.frame().await {
-                let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-                if let Some(data) = frame.data_ref() {
-                    body_vec.extend_from_slice(data);
-                }
-            }
+            let body_vec = self
+                .collect_response_body(resp.into_body(), rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE)
+                .await?;
             process_remove_multi_objects_response(
                 ReaderImpl::Body(Bytes::from(body_vec)),
                 bucket_name,

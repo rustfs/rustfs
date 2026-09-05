@@ -3,9 +3,9 @@
 repos:
   - repo: local
     hooks:
-      - id: rustfs-dev-check
-        name: rustfs dev-check
-        entry: make dev-check
+      - id: rustfs-fmt-check
+        name: Rust formatting
+        entry: cargo fmt --all --check
         language: system
         types: [rust]
         pass_filenames: false

@@ -46,6 +46,7 @@ use crate::admin::storage_api::bucket::on_demand_migration::source_client::{
 };
 use crate::admin::storage_api::bucket::on_demand_migration::{
     OdmBucketSnapshot, OnDemandMigrationConfig, OnDemandMigrationConfigError, OnDemandMigrationSys, PathStyle, ValidationContext,
+    source_backend_spec,
 };
 use crate::admin::storage_api::bucket::remote_s3_client::{
     PathStyle as RemotePathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3RetryPolicy,
@@ -585,6 +586,8 @@ fn source_provider(config: &OnDemandMigrationConfig) -> SourceProvider {
         Provider::Rustfs => SourceProvider::Rustfs,
         Provider::R2 => SourceProvider::R2,
         Provider::Gcs => SourceProvider::Gcs,
+        Provider::Azure => SourceProvider::Azure,
+        Provider::GcsNative => SourceProvider::GcsNative,
     }
 }
 
@@ -621,6 +624,9 @@ pub(crate) fn source_client_spec(config: &OnDemandMigrationConfig) -> SourceClie
         // a flapping source behind a success and triple the probe's cost.
         retry: RemoteS3RetryPolicy::Disabled,
         bandwidth_limit: config.policy.bandwidth_limit_bytes_per_sec.and_then(NonZeroU64::new),
+        // One mapping serves the probe and the runtime, so an admin probe
+        // always exercises the backend the runtime will build.
+        backend: source_backend_spec(source),
     }
 }
 

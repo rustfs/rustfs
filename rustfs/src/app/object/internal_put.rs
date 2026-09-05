@@ -57,6 +57,9 @@ pub(crate) struct InternalPutContext {
     pub(crate) expected_md5_hex: Option<String>,
     /// ETag to store instead of the computed one.
     pub(crate) preserve_etag: Option<String>,
+    /// Reject an existing current object under the storage commit lock.
+    pub(crate) if_absent: bool,
+    pub(crate) preserve_delete_marker: bool,
     pub(crate) content_headers: HashMap<String, String>,
     pub(crate) user_metadata: HashMap<String, String>,
     pub(crate) tags: Option<String>,
@@ -240,6 +243,8 @@ impl DefaultObjectUsecase {
             size,
             expected_md5_hex,
             preserve_etag,
+            if_absent,
+            preserve_delete_marker,
             content_headers,
             user_metadata,
             tags,
@@ -252,7 +257,10 @@ impl DefaultObjectUsecase {
         };
         let size = i64::try_from(size).map_err(|_| ApiError::invalid_request("internal put size exceeds the supported range"))?;
 
-        let headers = internal_put_headers(&content_headers)?;
+        let mut headers = internal_put_headers(&content_headers)?;
+        if if_absent {
+            headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        }
         validate_internal_write_target(&key, &bucket, &headers).await?;
         remove_source_replication_bookkeeping(&mut internal_metadata);
 
@@ -287,6 +295,7 @@ impl DefaultObjectUsecase {
             origin: PutObjectOrigin::Internal {
                 principal_id,
                 emit_events,
+                preserve_delete_marker,
             },
         };
         let committed = self
@@ -527,10 +536,14 @@ impl DefaultObjectUsecase {
             .map_err(api_error_from_s3)?;
         let store = self.object_store().ok_or_else(not_initialized)?;
 
-        let headers = HeaderMap::new();
+        let mut headers = HeaderMap::new();
+        if ctx.if_absent {
+            headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        }
         let mut opts =
             get_complete_multipart_upload_opts_with_replication_authorization(&headers, false).map_err(ApiError::from)?;
         opts.preserve_etag = ctx.preserve_etag.clone();
+        opts.preserve_delete_marker = ctx.preserve_delete_marker;
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
         opts.versioned = versioned;
         opts.version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &key).await;
@@ -747,6 +760,8 @@ mod tests {
             size: Some(body.len() as u64),
             expected_md5_hex: Some(md5_hex(body)),
             preserve_etag: None,
+            if_absent: false,
+            preserve_delete_marker: false,
             content_headers: HashMap::from([
                 ("Content-Type".to_string(), "text/plain".to_string()),
                 ("Cache-Control".to_string(), "max-age=60".to_string()),

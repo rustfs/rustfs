@@ -62,9 +62,6 @@ env:
 jobs:
   replication-test:
     runs-on: smoke-testing
-    # A failed replication run must not break the chain or the workflow: the
-    # failure is reported to rustfs/backlog instead (see the issue step).
-    continue-on-error: true
     timeout-minutes: 360
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
@@ -116,7 +113,6 @@ jobs:
 
       - name: Run replication suite
         id: test
-        continue-on-error: true
         env:
           LOG_FILE: /tmp/rustfs-replication.log
         run: |
