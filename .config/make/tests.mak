@@ -40,6 +40,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_security_coverage.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_scheduled_validation_freshness.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_security_workflow.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_report_compat.py
 	bash -n ./scripts/validate_object_data_cache_cold_stampede.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_object_data_cache_follower_samples.py --self-test
