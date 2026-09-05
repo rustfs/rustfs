@@ -37,8 +37,8 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     # Temporary tokio-tar fork pinned to the reviewed parser limits,
-    # cancellation safety, and error-fusing change while
-    # astral-sh/tokio-tar#118 awaits an upstream release.
+    # cancellation safety, and error-fusing change while Snowball is
+    # prototyped against tar-codec and Swift retains its current reader.
     # owner: cxymds  review: 2026-10
     "https://github.com/cxymds/tokio-tar.git",
     # Official s3s repository. Temporarily pinned to the merged generic REST

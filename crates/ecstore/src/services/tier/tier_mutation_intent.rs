@@ -460,6 +460,7 @@ where
         data,
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_none_match: Some("*".to_string()),
                 ..Default::default()
@@ -556,6 +557,7 @@ where
         data,
         &ObjectOptions {
             max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
             http_preconditions: Some(HTTPPreconditions {
                 if_match: Some(current_etag.to_string()),
                 ..Default::default()

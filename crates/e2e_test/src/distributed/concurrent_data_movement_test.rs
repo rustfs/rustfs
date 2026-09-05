@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use super::harness::{
-    DECOMMISSION_POOL_ID, DistCluster, DistLayout, TestResult, assert_inventory, payload_for, put_inventory_retrying,
-    retrying_get_equals, retrying_put, start_decommission, unique_bucket, wait_for_decommission_active,
-    wait_for_decommission_complete,
+    DECOMMISSION_POOL_ID, DistCluster, DistLayout, TestResult, assert_inventory, decommission_running_with_progress,
+    decommission_status_json, payload_for, put_inventory_retrying, retrying_get_equals, retrying_put, start_decommission,
+    unique_bucket, wait_for_decommission_complete, wait_for_decommission_running_with_progress,
 };
 use crate::common::init_logging;
 use std::sync::Arc;
@@ -33,10 +33,9 @@ async fn concurrent_puts_during_decommission_do_not_lose_baseline_or_new_objects
     dist.expand_to_four_pools().await?;
 
     start_decommission(&dist.cluster, DECOMMISSION_POOL_ID).await?;
-    wait_for_decommission_active(&dist.cluster, DECOMMISSION_POOL_ID, Duration::from_secs(30)).await?;
 
     let clients = Arc::new(dist.clients()?);
-    let barrier = Arc::new(Barrier::new(16));
+    let barrier = Arc::new(Barrier::new(17));
     let mut handles = Vec::new();
     for idx in 0..16 {
         let clients = clients.clone();
@@ -52,9 +51,16 @@ async fn concurrent_puts_during_decommission_do_not_lose_baseline_or_new_objects
         }));
     }
 
+    wait_for_decommission_running_with_progress(&dist.cluster, DECOMMISSION_POOL_ID, Duration::from_secs(30)).await?;
+    barrier.wait().await;
+
     let mut live_objects = Vec::new();
     for handle in handles {
         live_objects.push(handle.await??);
+    }
+    let status = decommission_status_json(&dist.cluster).await?;
+    if !decommission_running_with_progress(&status, DECOMMISSION_POOL_ID)? {
+        return Err(format!("decommission did not remain active across concurrent PUTs: {status}").into());
     }
 
     wait_for_decommission_complete(&dist.cluster, DECOMMISSION_POOL_ID, Duration::from_secs(180)).await?;

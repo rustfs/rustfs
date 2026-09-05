@@ -870,6 +870,18 @@ impl TierFreeVersionReceiptSink {
     }
 }
 
+/// Internal PUT completion boundary; this does not change fsync or write quorum.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum WriteCompletion {
+    /// Return at write quorum when the commit owner can retain its guards.
+    #[default]
+    Quorum,
+    /// Drain the rename fan-out before returning. Minority failures still heal
+    /// after a successful quorum commit; this does not require every disk to succeed.
+    TailDrained,
+}
+
 #[derive(Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -896,6 +908,10 @@ pub struct ObjectOptions {
     /// Persisted bucket incarnation observed before authorization.
     pub expected_bucket_incarnation_id: Option<Uuid>,
     pub no_lock: bool,
+    /// Control-plane writers that immediately read or CAS the same namespace
+    /// key use TailDrained without changing namespace lock ownership.
+    #[doc(hidden)]
+    pub write_completion: WriteCompletion,
     /// True when an upper layer already holds the object read lock before
     /// forwarding a no_lock read to the set layer.
     pub metadata_cache_safe: bool,
@@ -940,6 +956,9 @@ pub struct ObjectOptions {
     pub preserve_etag: Option<String>,
     pub metadata_chg: bool,
     pub http_preconditions: Option<HTTPPreconditions>,
+    /// Internal create-only writes may also preserve an acknowledged deletion.
+    /// Evaluated with `http_preconditions` under the namespace commit lock.
+    pub preserve_delete_marker: bool,
 
     pub delete_replication: Option<ReplicationState>,
     pub delete_replication_config_snapshot: Option<Arc<DeleteReplicationConfigSnapshot>>,

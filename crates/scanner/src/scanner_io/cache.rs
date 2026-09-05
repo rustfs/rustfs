@@ -282,9 +282,26 @@ pub(super) fn completed_data_usage_info(
         .iter()
         .map(|(bucket, usage)| (bucket.clone(), usage.size))
         .collect();
+    let mut usage_snapshot_set_states = results
+        .iter()
+        .map(|result| {
+            let source = result.info.source?;
+            Some(DataUsageSnapshotSetState {
+                pool_index: u64::try_from(source.pool_index).ok()?,
+                set_index: u64::try_from(source.set_index).ok()?,
+                scanner_cycle: Some(result.info.next_cycle),
+                scanner_epoch: Some(result.info.leader_epoch),
+                scan_plan_digest: Some(result.info.scan_plan_digest?.0),
+                complete: true,
+                tombstone: false,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    usage_snapshot_set_states.sort_by_key(|state| (state.pool_index, state.set_index));
     let data_usage_info = DataUsageInfo {
         last_update: Some(merged_last_update),
         scanner_cycle: Some(results.first()?.info.next_cycle),
+        scanner_epoch: Some(results.first()?.info.leader_epoch),
         objects_total_count: u64::try_from(total.objects).ok()?,
         versions_total_count: u64::try_from(total.versions).ok()?,
         delete_markers_total_count: u64::try_from(total.delete_markers).ok()?,
@@ -295,6 +312,7 @@ pub(super) fn completed_data_usage_info(
         bucket_sizes,
         buckets_usage,
         usage_snapshot_complete: true,
+        usage_snapshot_set_states,
         ..Default::default()
     };
     Some((data_usage_info, merged_last_update))
@@ -586,10 +604,12 @@ pub(super) async fn persist_and_publish_cache_snapshot(
     store: Arc<SetDisks>,
     updates: &mpsc::Sender<DataUsageCache>,
     mut cache_snapshot: DataUsageCache,
+    initial_revisions: Option<&DataUsageCacheRevisions>,
     cache_cycle_floor: &AtomicU64,
     expected_publication_epoch: u64,
 ) -> Option<SystemTime> {
     let source = cache_snapshot.info.source?;
+    let execution_digest = cache_snapshot.info.scan_execution_digest?;
     let guard = match acquire_scanner_cache_locks(store.as_ref(), DATA_USAGE_CACHE_NAME, source).await {
         Ok(guard) => guard,
         Err(err) => {
@@ -654,20 +674,36 @@ pub(super) async fn persist_and_publish_cache_snapshot(
         );
         return None;
     }
-    if matches!(
-        current_cache_root_entry_with_generation(
-            &persisted,
-            DATA_USAGE_ROOT,
-            source,
-            cache_snapshot.info.next_cycle,
-            cache_snapshot.info.leader_epoch,
-            scan_plan_digest,
-            cache_snapshot.info.tier_registry_generation,
-        ),
-        Ok(Some(_))
-    ) {
+    if persisted.info.scan_execution_digest == Some(execution_digest)
+        && matches!(
+            current_cache_root_entry_with_generation(
+                &persisted,
+                DATA_USAGE_ROOT,
+                source,
+                cache_snapshot.info.next_cycle,
+                cache_snapshot.info.leader_epoch,
+                scan_plan_digest,
+                cache_snapshot.info.tier_registry_generation,
+            ),
+            Ok(Some(_))
+        )
+    {
         cache_snapshot = persisted;
     } else {
+        // A later execution may have completed while this scan was walking.
+        // Only replace the cache revision from which this scan started.
+        if initial_revisions != Some(&revisions) {
+            warn!(
+                target: "rustfs::scanner::io",
+                event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_IO,
+                state = "scan_baseline_revision_changed",
+                cache_name = DATA_USAGE_CACHE_NAME,
+                "Scanner skipped set snapshot without an unchanged baseline revision"
+            );
+            return None;
+        }
         if guard.is_lock_lost() {
             error!(
                 target: "rustfs::scanner::io",

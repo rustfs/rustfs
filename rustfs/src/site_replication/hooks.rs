@@ -22,6 +22,57 @@ pub(crate) const SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION: &str = "confi
 
 pub(crate) static SITE_REPLICATION_BUCKET_OP_LOCK: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
 
+const SITE_REPLICATION_BUCKET_MUTATION_LOCK_PREFIX: &str = "config/site-replication/bucket-mutation";
+pub(crate) const SITE_REPLICATION_BUCKET_MUTATION_ADMISSION_LOCK_PATH: &str =
+    "config/site-replication/bucket-mutation-admission.lock";
+
+pub(crate) fn site_replication_bucket_mutation_lock_path(bucket: &str) -> String {
+    format!("{SITE_REPLICATION_BUCKET_MUTATION_LOCK_PREFIX}/{bucket}.lock")
+}
+
+pub(crate) async fn with_site_replication_bucket_mutation_lock<F, Fut, T>(
+    store: Arc<ECStore>,
+    bucket: &str,
+    operation: F,
+) -> S3Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let mutation_store = store.clone();
+    let mutation_path = site_replication_bucket_mutation_lock_path(bucket);
+    with_config_object_read_lock(
+        store,
+        SITE_REPLICATION_BUCKET_MUTATION_ADMISSION_LOCK_PATH.to_string(),
+        move || async move {
+            with_config_object_write_lock(mutation_store, mutation_path, operation)
+                .await
+                .map_err(|err| S3Error::from(ApiError::from(err)))
+        },
+    )
+    .await
+    .map_err(|err| S3Error::from(ApiError::from(err)))?
+}
+
+/// Exclude every local bucket namespace mutation from an add's local preflight
+/// snapshot until its topology commit. Peer bootstrap callbacks do not enter
+/// this public-mutation admission path, so they can finish while the writer is
+/// held; post-commit fan-out and backfill must run after it is released.
+pub(crate) async fn with_site_replication_bucket_mutation_admission_lock<F, Fut, T>(
+    store: Arc<ECStore>,
+    operation: F,
+) -> S3Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = S3Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    with_config_object_write_lock(store, SITE_REPLICATION_BUCKET_MUTATION_ADMISSION_LOCK_PATH.to_string(), operation)
+        .await
+        .map_err(|err| S3Error::from(ApiError::from(err)))?
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct SiteReplicationBootstrapPlan {
     pub(crate) iam_items: Vec<SRIAMItem>,
@@ -329,6 +380,91 @@ pub(crate) fn site_replication_bootstrap_plan(info: &SRInfo) -> S3Result<SiteRep
     Ok(plan)
 }
 
+/// Build only the two bucket operations needed by the lightweight retry
+/// drain. The full bootstrap plan scans every bucket and IAM record; doing
+/// that on a 30-second recovery cadence would make lifecycle admission scale
+/// with the whole site instead of the one queued bucket.
+pub(crate) fn site_replication_bucket_retry_plan_for(
+    bucket: &SRBucketInfo,
+    replicate_ilm_expiry: bool,
+) -> S3Result<SiteReplicationBootstrapPlan> {
+    let mut plan = SiteReplicationBootstrapPlan {
+        bucket_make_ops: vec![bootstrap_bucket_make_op_path(bucket)],
+        bucket_configure_ops: vec![bootstrap_bucket_op_path(
+            &bucket.bucket,
+            SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION,
+        )],
+        ..Default::default()
+    };
+    append_bootstrap_bucket_items(&mut plan, bucket, replicate_ilm_expiry)?;
+    Ok(plan)
+}
+
+pub(crate) fn site_replication_bucket_retry_plan_from_info(
+    bucket: &SRBucketInfo,
+    replicate_ilm_expiry: bool,
+) -> S3Result<SiteReplicationBootstrapPlan> {
+    let mut plan = site_replication_bucket_retry_plan_for(bucket, replicate_ilm_expiry)?;
+    // Omit only metadata the make/configure operations can reproduce exactly.
+    // Non-default versioning fields and operator-authored replication rules
+    // remain in the plan; their extra request cost intentionally defers the
+    // event to the complete drain when the lightweight budget is too small.
+    plan.bucket_items.retain(|item| !retry_bucket_metadata_is_redundant(item));
+    Ok(plan)
+}
+
+fn retry_bucket_metadata_is_redundant(item: &SRBucketMeta) -> bool {
+    match item.r#type.as_str() {
+        "version-config" => item.versioning.as_deref().is_some_and(|raw| {
+            deserialize::<VersioningConfiguration>(&decode_bucket_meta_wire_value(raw)).is_ok_and(|config| {
+                config
+                    == VersioningConfiguration {
+                        status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                        ..Default::default()
+                    }
+            })
+        }),
+        "replication-config" => item.replication_config.as_deref().is_some_and(|raw| {
+            deserialize::<ReplicationConfiguration>(&decode_bucket_meta_wire_value(raw))
+                .is_ok_and(|config| config.role.trim().is_empty() && config.rules.iter().all(is_derived_site_replication_rule))
+        }),
+        // `Some("")` is the in-memory sentinel used when the bucket is lock
+        // enabled but has no object-lock configuration body. The make query
+        // carries lockEnabled=true; sending an empty metadata body is neither
+        // useful nor parseable.
+        "object-lock-config" => item.object_lock_config.as_deref() == Some(""),
+        _ => false,
+    }
+}
+
+pub(crate) async fn site_replication_bucket_retry_plan(
+    bucket: &str,
+    replicate_ilm_expiry: bool,
+) -> S3Result<SiteReplicationBootstrapPlan> {
+    let Some(store) = current_object_store_handle() else {
+        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+    };
+    let bucket_info = match store.get_bucket_info(bucket, &BucketOptions::default()).await {
+        Ok(bucket_info) => bucket_info,
+        Err(err) if is_err_bucket_not_found(&err) => return Ok(SiteReplicationBootstrapPlan::default()),
+        Err(err) => return Err(ApiError::from(err).into()),
+    };
+    let lock_enabled = bucket_info.object_locking;
+    let metadata = metadata_sys::get(bucket).await.map_err(ApiError::from)?;
+    let mut bucket_info = SRBucketInfo {
+        bucket: bucket.to_string(),
+        created_at: bucket_info.created,
+        location: current_region().map(|region| region.to_string()).unwrap_or_default(),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
+    };
+    populate_sr_bucket_info_from_metadata(&mut bucket_info, &metadata).await;
+    if lock_enabled && bucket_info.object_lock_config.is_none() {
+        bucket_info.object_lock_config = Some(String::new());
+    }
+    site_replication_bucket_retry_plan_from_info(&bucket_info, replicate_ilm_expiry)
+}
+
 pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {
     let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
     let runtime = {
@@ -393,20 +529,273 @@ pub(crate) async fn broadcast_site_replication_make_bucket(
     broadcast_site_replication_json_using_runtime(runtime, &configure_path, &serde_json::json!({})).await
 }
 
-pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: bool) -> S3Result<()> {
+const SITE_REPLICATION_DELETE_INTENT_PENDING: &str =
+    "bucket deletion reserved; local completion and peer delivery are not yet known";
+
+#[derive(Clone)]
+struct SiteReplicationDeleteBucketReservation {
+    peer: PeerInfo,
+    previous: Option<SiteReplicationRetryEvent>,
+    observed: SiteReplicationRetryEvent,
+}
+
+pub(crate) struct SiteReplicationDeleteBucketIntent {
+    path: String,
+    reservations: Vec<SiteReplicationDeleteBucketReservation>,
+    displaced: Vec<SiteReplicationRetryEvent>,
+}
+
+fn site_replication_delete_bucket_path(bucket: &str, force_delete: bool) -> String {
     let operation = if force_delete {
         "force-delete-bucket"
     } else {
         "delete-bucket"
     };
-    let path = format!(
+    format!(
         "/rustfs/admin/v3/site-replication/peer/bucket-ops?{}",
         form_urlencoded::Serializer::new(String::new())
             .append_pair("bucket", bucket)
             .append_pair("operation", operation)
             .finish()
-    );
-    broadcast_site_replication_json(&path, &serde_json::json!({})).await
+    )
+}
+
+/// Reserve every destructive peer delivery before the local namespace is
+/// changed. The state transaction either persists the complete set or writes
+/// nothing, so a full/unreadable queue fails the S3 delete closed.
+pub(crate) async fn prepare_site_replication_delete_bucket(
+    bucket: &str,
+    force_delete: bool,
+) -> S3Result<Option<SiteReplicationDeleteBucketIntent>> {
+    let path = site_replication_delete_bucket_path(bucket, force_delete);
+    let reservation_path = path.clone();
+    update_site_replication_state_when_changed(move |state| {
+        if !state.enabled() {
+            return Ok(StateCommit::Unchanged(None));
+        }
+        let local_peer = current_local_runtime_peer(state);
+        let peers = state
+            .peers
+            .values()
+            .filter(|peer| {
+                peer.deployment_id != local_peer.deployment_id && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if peers.is_empty() {
+            return Ok(StateCommit::Unchanged(None));
+        }
+
+        let mut reservations = Vec::with_capacity(peers.len());
+        let mut displaced = Vec::new();
+        for peer in peers {
+            let previous = state
+                .retry_queue
+                .iter()
+                .find(|event| retry_event_matches(event, &peer, &reservation_path))
+                .cloned();
+            displaced.extend(upsert_site_replication_retry_event(
+                &mut state.retry_queue,
+                &peer,
+                &reservation_path,
+                SITE_REPLICATION_DELETE_INTENT_PENDING,
+                None,
+            )?);
+            let observed = state
+                .retry_queue
+                .iter()
+                .find(|event| retry_event_matches(event, &peer, &reservation_path))
+                .cloned()
+                .ok_or_else(|| {
+                    S3Error::with_message(
+                        S3ErrorCode::InternalError,
+                        "site replication delete reservation disappeared before commit".to_string(),
+                    )
+                })?;
+            reservations.push(SiteReplicationDeleteBucketReservation {
+                peer,
+                previous,
+                observed,
+            });
+        }
+        Ok(StateCommit::Changed(Some(SiteReplicationDeleteBucketIntent {
+            path: reservation_path,
+            reservations,
+            displaced,
+        })))
+    })
+    .await
+}
+
+/// Roll back a reservation when the local storage delete definitively failed.
+/// A concurrently revised reservation is preserved; it belongs to a newer
+/// observation and this operation has no authority to settle it.
+pub(crate) async fn cancel_site_replication_delete_bucket(intent: SiteReplicationDeleteBucketIntent) {
+    let path = intent.path.clone();
+    let result = update_site_replication_state_when_changed(move |state| {
+        let mut changed = false;
+        for reservation in intent.reservations {
+            let Some(index) = state.retry_queue.iter().position(|event| {
+                retry_event_matches(event, &reservation.peer, &reservation.observed.path)
+                    && event.id == reservation.observed.id
+                    && event.updated_at == reservation.observed.updated_at
+            }) else {
+                continue;
+            };
+            if let Some(previous) = reservation.previous {
+                state.retry_queue[index] = previous;
+            } else {
+                state.retry_queue.remove(index);
+            }
+            changed = true;
+        }
+
+        let mut restored_all = true;
+        for displaced in intent.displaced {
+            let duplicate = state.retry_queue.iter().any(|event| {
+                event.id == displaced.id
+                    || (event.peer_deployment_id == displaced.peer_deployment_id && event.path == displaced.path)
+            });
+            if duplicate {
+                continue;
+            }
+            if state.retry_queue.len() >= SITE_REPLICATION_RETRY_QUEUE_LIMIT {
+                restored_all = false;
+                continue;
+            }
+            state.retry_queue.push(displaced);
+            changed = true;
+        }
+        Ok(if changed {
+            StateCommit::Changed(restored_all)
+        } else {
+            StateCommit::Unchanged(restored_all)
+        })
+    })
+    .await;
+
+    match result {
+        Ok(true) => {}
+        Ok(false) => warn!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            path,
+            result = "delete_intent_cancel_incomplete",
+            "admin site replication state"
+        ),
+        Err(err) => warn!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            path,
+            result = "delete_intent_cancel_failed",
+            error = ?err,
+            "admin site replication state"
+        ),
+    }
+}
+
+async fn broadcast_site_replication_delete_bucket(intent: &SiteReplicationDeleteBucketIntent) -> S3Result<()> {
+    let sends = intent.reservations.iter().cloned().map(|reservation| {
+        let request_path = intent.path.clone();
+        async move {
+            let fallback_peer = reservation.peer.clone();
+            let observed = reservation.observed.clone();
+            let delivery_path = request_path.clone();
+            let delivery = with_site_replication_state_read_lock(move |state| async move {
+                let Some(current_peer) = state.peers.get(&fallback_peer.deployment_id).cloned() else {
+                    return Ok(None);
+                };
+                let service_account_secret_key =
+                    match site_replicator_service_account_secret(&state.service_account_access_key).await {
+                        Ok(secret) => secret,
+                        Err(err) => {
+                            let Some(secret) = legacy_site_replicator_state_secret(&state) else {
+                                return Err(err);
+                            };
+                            warn!(
+                                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                                component = LOG_COMPONENT_ADMIN,
+                                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                                result = "legacy_state_service_account_secret_fallback",
+                                error = ?err,
+                                "admin site replication state"
+                            );
+                            secret
+                        }
+                    };
+                let result = async {
+                    let transport = PeerTransport::for_runtime_peer(&current_peer).await?;
+                    PeerAdminRequest::put(&transport.connection, &delivery_path, &state.service_account_access_key)
+                        .with_client(&transport.client)
+                        .send(&service_account_secret_key, &serde_json::json!({}))
+                        .await
+                }
+                .await;
+                Ok(Some((current_peer, result)))
+            })
+            .await;
+            match delivery {
+                Ok(Some((current_peer, Ok(_)))) => {
+                    dequeue_observed_site_replication_retry_event(&current_peer, &observed).await;
+                    None
+                }
+                Ok(Some((current_peer, Err(err)))) => {
+                    // Keep the failed deletion operator-visible, but never
+                    // replay it automatically: without a bucket-incarnation
+                    // fence, a delayed delete could erase a recreated bucket.
+                    enqueue_site_replication_retry_event(&current_peer, &request_path, &err).await;
+                    Some(err)
+                }
+                Ok(None) => {
+                    dequeue_observed_site_replication_retry_event(&reservation.peer, &observed).await;
+                    None
+                }
+                Err(err) => {
+                    enqueue_site_replication_retry_event(&reservation.peer, &request_path, &err).await;
+                    Some(err)
+                }
+            }
+        }
+    });
+    futures::future::join_all(sends)
+        .await
+        .into_iter()
+        .flatten()
+        .next()
+        .map_or(Ok(()), Err)
+}
+
+pub(crate) async fn commit_site_replication_delete_bucket(intent: &SiteReplicationDeleteBucketIntent) -> S3Result<()> {
+    let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
+    let store =
+        current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
+    let retry_peers = intent
+        .reservations
+        .iter()
+        .map(|reservation| reservation.peer.clone())
+        .collect::<Vec<_>>();
+    let retry_path = intent.path.clone();
+    let delivery_intent = SiteReplicationDeleteBucketIntent {
+        path: intent.path.clone(),
+        reservations: intent.reservations.clone(),
+        displaced: Vec::new(),
+    };
+    match with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
+        broadcast_site_replication_delete_bucket(&delivery_intent).await
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            let err: S3Error = ApiError::from(err).into();
+            for peer in &retry_peers {
+                enqueue_site_replication_retry_event(peer, &retry_path, &err).await;
+            }
+            Err(err)
+        }
+    }
 }
 
 pub async fn site_replication_bucket_meta_hook(mut item: SRBucketMeta) -> S3Result<()> {
@@ -515,6 +904,39 @@ pub(crate) fn maybe_time(value: OffsetDateTime) -> Option<OffsetDateTime> {
     (value != OffsetDateTime::UNIX_EPOCH).then_some(value)
 }
 
+async fn populate_sr_bucket_info_from_metadata(entry: &mut SRBucketInfo, metadata: &BucketMetadata) {
+    entry.policy = raw_config_to_string(&metadata.policy_config_json).and_then(|raw| serde_json::from_str(&raw).ok());
+    entry.versioning = raw_config_to_base64(&metadata.versioning_config_xml);
+    entry.tags = raw_config_to_base64(&metadata.tagging_config_xml);
+    entry.object_lock_config = raw_config_to_base64(&metadata.object_lock_config_xml);
+    entry.sse_config = raw_config_to_base64(&metadata.encryption_config_xml);
+    entry.replication_config = raw_config_to_base64(&metadata.replication_config_xml);
+    entry.quota_config = raw_config_to_base64(&metadata.quota_config_json);
+    // Expiry subset only: this entry feeds both the bootstrap/repair plan
+    // (peers must not receive transition rules) and cross-site consistency
+    // views (transition rules are site-local and would read as false
+    // mismatches). A deleted expiry state is a `None` value with the
+    // deletion's axis so repair can converge peers that missed the live
+    // delete.
+    let expiry_statement = lifecycle_expiry_statement(metadata);
+    entry.expiry_lc_config = expiry_statement.as_ref().and_then(|(subset, _)| subset.clone());
+    entry.cors_config = raw_config_to_base64(&metadata.cors_config_xml);
+    entry.policy_updated_at = maybe_time(metadata.policy_config_updated_at);
+    entry.tag_config_updated_at = maybe_time(metadata.tagging_config_updated_at);
+    entry.object_lock_config_updated_at = maybe_time(metadata.object_lock_config_updated_at);
+    entry.sse_config_updated_at = maybe_time(metadata.encryption_config_updated_at);
+    entry.versioning_config_updated_at = maybe_time(metadata.versioning_config_updated_at);
+    entry.replication_config_updated_at = maybe_time(metadata.replication_config_updated_at);
+    entry.quota_config_updated_at = maybe_time(metadata.quota_config_updated_at);
+    // The expiry axis, not the whole-config write time: local transition-only
+    // edits inflate the latter, and a repair item stamped with it could
+    // out-rank a newer real expiry edit on a third site.
+    entry.expiry_lc_config_updated_at = expiry_statement.map(|(_, axis)| axis);
+    entry.cors_config_updated_at = maybe_time(metadata.cors_config_updated_at);
+    entry.replication_targets_online =
+        Some(site_replication_targets_online(&entry.bucket, &metadata.replication_config_xml).await);
+}
+
 pub(crate) async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S3Result<SRInfo> {
     let Some(store) = current_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -546,37 +968,7 @@ pub(crate) async fn build_sr_info(state: &SiteReplicationState, local_peer: &Pee
         };
 
         if let Some(metadata) = metadata {
-            entry.policy = raw_config_to_string(&metadata.policy_config_json).and_then(|raw| serde_json::from_str(&raw).ok());
-            entry.versioning = raw_config_to_base64(&metadata.versioning_config_xml);
-            entry.tags = raw_config_to_base64(&metadata.tagging_config_xml);
-            entry.object_lock_config = raw_config_to_base64(&metadata.object_lock_config_xml);
-            entry.sse_config = raw_config_to_base64(&metadata.encryption_config_xml);
-            entry.replication_config = raw_config_to_base64(&metadata.replication_config_xml);
-            entry.quota_config = raw_config_to_base64(&metadata.quota_config_json);
-            // Expiry subset only: this entry feeds both the bootstrap/repair
-            // plan (peers must not receive transition rules) and cross-site
-            // consistency views (transition rules are site-local and would
-            // read as false mismatches). A deleted expiry state is a `None`
-            // value with the deletion's axis so repair can converge peers
-            // that missed the live delete.
-            let expiry_statement = lifecycle_expiry_statement(&metadata);
-            entry.expiry_lc_config = expiry_statement.as_ref().and_then(|(subset, _)| subset.clone());
-            entry.cors_config = raw_config_to_base64(&metadata.cors_config_xml);
-            entry.policy_updated_at = maybe_time(metadata.policy_config_updated_at);
-            entry.tag_config_updated_at = maybe_time(metadata.tagging_config_updated_at);
-            entry.object_lock_config_updated_at = maybe_time(metadata.object_lock_config_updated_at);
-            entry.sse_config_updated_at = maybe_time(metadata.encryption_config_updated_at);
-            entry.versioning_config_updated_at = maybe_time(metadata.versioning_config_updated_at);
-            entry.replication_config_updated_at = maybe_time(metadata.replication_config_updated_at);
-            entry.quota_config_updated_at = maybe_time(metadata.quota_config_updated_at);
-            // The expiry axis, not the whole-config write time: local
-            // transition-only edits inflate the latter, and a repair item
-            // stamped with it could out-rank a newer real expiry edit on a
-            // third site.
-            entry.expiry_lc_config_updated_at = expiry_statement.map(|(_, axis)| axis);
-            entry.cors_config_updated_at = maybe_time(metadata.cors_config_updated_at);
-            entry.replication_targets_online =
-                Some(site_replication_targets_online(&bucket.name, &metadata.replication_config_xml).await);
+            populate_sr_bucket_info_from_metadata(&mut entry, &metadata).await;
         }
 
         info.buckets.insert(bucket.name, entry);

@@ -37,9 +37,10 @@ use crate::services::tier::{
 use bytes::Bytes;
 use http::StatusCode;
 use rustfs_s3_client::credentials::{Credentials, SignatureType, Static, Value};
-use rustfs_s3_client::transition_api::{BucketLookupType, Options, TransitionClient, TransitionCore};
+use rustfs_s3_client::transition_api::{BucketLookupType, Options, TransitionClient, TransitionClientTimeouts, TransitionCore};
 use rustfs_s3_client::{
     admin_handler_utils::AdminError,
+    api_error_response::to_error_response,
     api_put_object::{AdvancedPutOptions, PutObjectOptions},
     transition_api::{ReadCloser, ReaderImpl},
 };
@@ -48,10 +49,13 @@ use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
 };
-use s3s::dto::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode, ReplicationStatus};
 use s3s::header::{
     X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_REPLICATION_STATUS,
     X_AMZ_STORAGE_CLASS,
+};
+use s3s::{
+    S3ErrorCode,
+    dto::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode, ReplicationStatus},
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -140,6 +144,42 @@ pub trait WarmBackend {
     }
     async fn probe_transition_candidate(&self, _object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
         Ok(TransitionCandidateProbe::Unsupported)
+    }
+    async fn probe_transition_version(
+        &self,
+        object: &str,
+        remote_version_id: &str,
+    ) -> Result<TransitionCandidateProbe, std::io::Error> {
+        if remote_version_id.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "an exact tier probe requires a remote version ID",
+            ));
+        }
+        self.validate_remote_version_id(remote_version_id)?;
+        match self
+            .get(
+                object,
+                remote_version_id,
+                WarmBackendGetOpts {
+                    start_offset: 0,
+                    length: 1,
+                },
+            )
+            .await
+        {
+            Ok(_) => Ok(TransitionCandidateProbe::VersionedPresent(remote_version_id.to_string())),
+            Err(err) if matches!(to_error_response(&err).code, S3ErrorCode::InvalidRange) => {
+                Ok(TransitionCandidateProbe::VersionedPresent(remote_version_id.to_string()))
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    || matches!(to_error_response(&err).code, S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchVersion) =>
+            {
+                Ok(TransitionCandidateProbe::Missing)
+            }
+            Err(err) => Err(err),
+        }
     }
     async fn in_use(&self) -> Result<bool, std::io::Error>;
 }
@@ -280,6 +320,27 @@ pub(crate) fn endpoint_authority(url: &url::Url) -> Result<String, std::io::Erro
     }
 }
 
+fn transition_timeout_from_env(env_key: &str, default_secs: u64) -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(env_key, default_secs))
+}
+
+pub(crate) fn transition_client_timeouts_from_env() -> TransitionClientTimeouts {
+    TransitionClientTimeouts::new(
+        transition_timeout_from_env(
+            rustfs_config::ENV_TIER_REMOTE_CONNECT_TIMEOUT_SECS,
+            rustfs_config::DEFAULT_TIER_REMOTE_CONNECT_TIMEOUT_SECS,
+        ),
+        transition_timeout_from_env(
+            rustfs_config::ENV_TIER_REMOTE_REQUEST_TIMEOUT_SECS,
+            rustfs_config::DEFAULT_TIER_REMOTE_REQUEST_TIMEOUT_SECS,
+        ),
+        transition_timeout_from_env(
+            rustfs_config::ENV_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS,
+            rustfs_config::DEFAULT_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS,
+        ),
+    )
+}
+
 /// Build the [`WarmBackendS3`] shared by the S3-compatible warm backend providers.
 ///
 /// Credential, bucket, and endpoint validation run in this order because the
@@ -310,6 +371,7 @@ pub(crate) async fn new_s3_compatible_warm_backend(
         signer_type: SignatureType::SignatureV4,
         ..Default::default()
     }));
+    let timeouts = transition_client_timeouts_from_env();
     let opts = Options {
         creds,
         secure: u.scheme() == "https",
@@ -322,7 +384,7 @@ pub(crate) async fn new_s3_compatible_warm_backend(
     // Run the SSRF guard after the host-presence check so a host-less endpoint
     // keeps this constructor's stable error text.
     (params.validate_endpoint)(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
-    let client = TransitionClient::new(&endpoint, opts, params.provider_tag).await?;
+    let client = TransitionClient::new_with_timeouts(&endpoint, opts, params.provider_tag, timeouts).await?;
 
     let client = Arc::new(client);
     let core = TransitionCore(Arc::clone(&client));
@@ -435,6 +497,17 @@ impl WarmBackend for MeteredWarmBackend {
             return result;
         }
         Self::record(TierRequestOperation::Probe, result)
+    }
+
+    async fn probe_transition_version(
+        &self,
+        object: &str,
+        remote_version_id: &str,
+    ) -> Result<TransitionCandidateProbe, std::io::Error> {
+        Self::record(
+            TierRequestOperation::Probe,
+            self.inner.probe_transition_version(object, remote_version_id).await,
+        )
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {

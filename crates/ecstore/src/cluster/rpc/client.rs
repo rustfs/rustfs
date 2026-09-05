@@ -30,6 +30,7 @@ use rustfs_protos::{
     ChannelClass, create_new_channel, get_channel_for_class,
     proto_gen::node_service::{
         heal_control_service_client::HealControlServiceClient, node_service_client::NodeServiceClient,
+        scanner_control_service_client::ScannerControlServiceClient,
         tier_mutation_control_service_client::TierMutationControlServiceClient,
     },
 };
@@ -58,6 +59,24 @@ pub async fn node_service_time_out_client(
     // Default to the latency-sensitive control channel; bulk `bytes` RPCs opt in via the
     // `_for_class` variant below (grpc-optimization P1).
     node_service_time_out_client_for_class(addr, interceptor, ChannelClass::Control).await
+}
+
+pub(crate) async fn scanner_control_time_out_client(
+    addr: &str,
+    interceptor: TonicInterceptor,
+) -> crate::error::Result<ScannerControlServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
+    let interceptor = interceptor.with_rpc_audience(addr)?;
+    let channel = match runtime_sources::cached_node_channel(addr).await {
+        Some(channel) => channel,
+        None => create_new_channel(addr)
+            .await
+            .map_err(|err| crate::error::Error::other(err.to_string()))?,
+    };
+    let channel = ReplayScopeChannel::new(channel, interceptor.replay_scope_audience());
+    let limit = rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES as usize;
+    Ok(ScannerControlServiceClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(limit)
+        .max_encoding_message_size(limit))
 }
 
 pub async fn heal_control_time_out_client(

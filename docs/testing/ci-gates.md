@@ -92,6 +92,12 @@ Scheduled lanes never block a PR. Their workflow-local gate fails the run, sched
 
 Manual `workflow_dispatch` runs are debugging evidence and do not open scheduled-failure issues. A manual performance run may explicitly allow a known regression; that override is not a passing baseline.
 
+## Packaged functional acceptance
+
+`rustfs-functional-chain.yml` dispatches the packaged-build suites in `rustfs-*-test.yml` on the shared lab runners. A failing suite step or job must fail its workflow. Report collection, cleanup, and dispatch of the next suite can still run with `always()`; continuing diagnostics does not make the failed suite successful.
+
+Workflow status preserves errors that the test scripts report. It does not establish complete execution or a common package identity across the chain: inspect the current run's case results, package identity, and test-script revision as well. A script that returns zero after a failed tool invocation needs its own result check.
+
 ## Release validation
 
 Post-merge and tag-driven; not a substitute for a PR gate.
@@ -110,3 +116,13 @@ Use an exact preview tag for an end-to-end release rehearsal. Manual dispatches 
 ## Change checklist
 
 Update this file in the same PR when a job or check name changes, a workflow gains or loses a `pull_request` or `schedule` trigger, required contexts or strict/merge-queue policy change, report-only vs gating semantics change, or `.github/scheduled-validations.json` membership changes. Do not copy timeouts, crons, or test counts here.
+
+## ECStore invariant selection
+
+The existing `ci.yml` test-and-lint job runs the ordinary ECStore and filemeta tests. After that run, `scripts/check_test_wiring.py --check-core` checks the same nextest profile and package selection against `.config/ecstore-required-tests.json`. Every named test must exist, match the filter, and be non-ignored; the job also requires a nonempty JUnit report. This checks membership without running the tests twice. `core-test-listing.json`, JUnit, and the run log are retained in the existing test-and-lint artifact.
+
+The manifest records a minimum set of invariants: write quorum, metadata rollback, stale-writer lock loss, plaintext Range content, multipart cancellation, hiding uncommitted LIST versions, real MinIO metadata, and corrupt part arrays. Renaming or moving a required test must update the manifest in the same change after checking the compiled listing. Extend this list as new deterministic regressions land; it is not a claim that all storage invariants are covered.
+
+The checked-in MinIO corpus is pinned by file SHA256 and its documented source release. The static wiring guard and the CI selection check both reject missing or changed fixtures. These are metadata fixtures, not a legacy shard-body corpus or proof of crash durability. Optional `legacy_bitrot_read_test` runs may still skip when their external corpus is absent; they do not satisfy a required compatibility lane. Real encrypted fixture reads remain in `minio-interop.yml`, and multi-node fault schedules remain in the existing nightly cluster lane. In-process reopen tests do not establish power-loss durability.
+
+Run `python3 scripts/check_test_wiring.py --self-test` to exercise the negative cases: removed/ignored/filtered tests, malformed listing, absent fixtures, and wrong fixture hashes. Do not update hashes merely to silence the guard; a fixture change needs source/provenance and compatibility review.

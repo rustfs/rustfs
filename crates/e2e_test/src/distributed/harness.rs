@@ -723,6 +723,21 @@ pub(crate) fn decommission_active(status: &serde_json::Value, pool_id: usize) ->
     Ok(queued || status_text.eq_ignore_ascii_case("running") || pool_status.eq_ignore_ascii_case("decommissioning"))
 }
 
+pub(crate) fn decommission_running_with_progress(status: &serde_json::Value, pool_id: usize) -> TestResult<bool> {
+    let pool = pool_entry(status, pool_id).ok_or_else(|| format!("pool {pool_id} missing from decommission status: {status}"))?;
+    if let Some(reason) = decommission_failure(pool) {
+        return Err(format!("{reason}: {pool}").into());
+    }
+    let info = pool
+        .get("decommissionInfo")
+        .ok_or_else(|| format!("pool {pool_id} has no decommissionInfo: {pool}"))?;
+    let status_text = pool.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
+    let pool_status = pool.get("poolStatus").and_then(serde_json::Value::as_str).unwrap_or("");
+    let running = status_text.eq_ignore_ascii_case("running") || pool_status.eq_ignore_ascii_case("decommissioning");
+    let progressed = nonzero_u64(info.get("objectsDecommissioned")) || nonzero_u64(info.get("bytesDecommissioned"));
+    Ok(running && progressed)
+}
+
 pub(crate) fn decommission_complete(status: &serde_json::Value, pool_id: usize) -> TestResult<bool> {
     let pool = pool_entry(status, pool_id).ok_or_else(|| format!("pool {pool_id} missing from decommission status: {status}"))?;
     if let Some(reason) = decommission_failure(pool) {
@@ -735,7 +750,7 @@ pub(crate) fn decommission_complete(status: &serde_json::Value, pool_id: usize) 
     let status_text = pool.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
     let pool_status = pool.get("poolStatus").and_then(serde_json::Value::as_str).unwrap_or("");
     let terminal = status_text.eq_ignore_ascii_case("complete") && pool_status.eq_ignore_ascii_case("decommissioned");
-    let moved_data = nonzero_u64(info.get("objectsDecommissioned")) || nonzero_u64(info.get("bytesDecommissioned"));
+    let moved_data = nonzero_u64(info.get("objectsDecommissioned")) && nonzero_u64(info.get("bytesDecommissioned"));
     Ok(complete && terminal && moved_data)
 }
 
@@ -745,6 +760,27 @@ pub(crate) async fn wait_for_decommission_active(
     timeout: Duration,
 ) -> TestResult {
     wait_for_decommission_state(cluster, pool_id, timeout, "active", decommission_active).await
+}
+
+pub(crate) async fn wait_for_decommission_running_with_progress(
+    cluster: &RustFSTestClusterEnvironment,
+    pool_id: usize,
+    timeout: Duration,
+) -> TestResult {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = decommission_status_json(cluster).await?;
+        if decommission_running_with_progress(&status, pool_id)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "decommission did not become active with non-zero progress within {timeout:?}; last status: {status}"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
 pub(crate) async fn wait_for_decommission_complete(
@@ -866,6 +902,20 @@ pub(crate) fn rebalance_active(status: &serde_json::Value, expected_id: &str) ->
     }))
 }
 
+pub(crate) fn rebalance_running_with_progress(status: &serde_json::Value, expected_id: &str) -> TestResult<bool> {
+    Ok(validate_rebalance_status(status, expected_id)?.iter().any(|pool| {
+        let started = pool
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("started"));
+        let progress = pool.get("progress");
+        started
+            && (nonzero_u64(progress.and_then(|value| value.get("objects")))
+                || nonzero_u64(progress.and_then(|value| value.get("versions")))
+                || nonzero_u64(progress.and_then(|value| value.get("bytes"))))
+    }))
+}
+
 pub(crate) fn rebalance_complete(status: &serde_json::Value, expected_id: &str) -> TestResult<bool> {
     let pools = validate_rebalance_status(status, expected_id)?;
     let completed: Vec<&serde_json::Value> = pools
@@ -905,6 +955,27 @@ pub(crate) async fn wait_for_rebalance_active(
             return Err(format!("rebalance did not become active within {timeout:?}; last status: {status}").into());
         }
         sleep(Duration::from_secs(1)).await;
+    }
+}
+
+pub(crate) async fn wait_for_rebalance_running_with_progress(
+    cluster: &RustFSTestClusterEnvironment,
+    expected_id: &str,
+    timeout: Duration,
+) -> TestResult {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = rebalance_status_json(cluster).await?;
+        if rebalance_running_with_progress(&status, expected_id)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "rebalance did not become active with non-zero progress within {timeout:?}; last status: {status}"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -1072,8 +1143,45 @@ fn decommission_complete_requires_terminal_status_and_clean_counters() {
             { "id": 1, "status": "none", "poolStatus": "active" }
         ]
     });
-    assert!(decommission_complete(&status, 0).unwrap());
+    assert!(decommission_complete(&status, 0).expect("complete fixture should be accepted"));
     assert!(decommission_complete(&status, 1).is_err());
+
+    for missing_counter in ["objectsDecommissioned", "bytesDecommissioned"] {
+        let mut one_sided = status.clone();
+        one_sided["pools"][0]["decommissionInfo"][missing_counter] = serde_json::json!(0);
+        assert!(
+            !decommission_complete(&one_sided, 0).expect("one-sided progress fixture should be readable"),
+            "completion must require both movement counters; zeroed {missing_counter}"
+        );
+    }
+}
+
+#[test]
+fn decommission_overlap_requires_running_state_and_progress() {
+    let mut status = serde_json::json!({
+        "pools": [{
+            "id": 0,
+            "status": "queued",
+            "poolStatus": "active",
+            "decommissionInfo": {
+                "queued": true,
+                "objectsDecommissioned": 1,
+                "bytesDecommissioned": 1024
+            }
+        }]
+    });
+    assert!(
+        !decommission_running_with_progress(&status, 0).expect("queued fixture should be readable"),
+        "queued work is not temporal overlap"
+    );
+    status["pools"][0]["status"] = serde_json::json!("running");
+    assert!(decommission_running_with_progress(&status, 0).expect("running fixture should be readable"));
+    status["pools"][0]["decommissionInfo"]["objectsDecommissioned"] = serde_json::json!(0);
+    status["pools"][0]["decommissionInfo"]["bytesDecommissioned"] = serde_json::json!(0);
+    assert!(
+        !decommission_running_with_progress(&status, 0).expect("zero-progress fixture should be readable"),
+        "running state alone does not prove movement started"
+    );
 }
 
 #[test]
@@ -1082,6 +1190,25 @@ fn rebalance_active_treats_started_as_in_progress() {
     let done = serde_json::json!({ "id": "run-1", "pools": [{ "id": 0, "status": "Completed", "stopping": false }] });
     assert!(rebalance_active(&started, "run-1").unwrap());
     assert!(!rebalance_active(&done, "run-1").unwrap());
+}
+
+#[test]
+fn rebalance_overlap_requires_started_state_and_progress() {
+    let mut status = serde_json::json!({
+        "id": "run-1",
+        "pools": [{ "id": 0, "status": "Started", "stopping": false, "progress": { "objects": 0, "bytes": 0 } }]
+    });
+    assert!(
+        !rebalance_running_with_progress(&status, "run-1").expect("zero-progress fixture should be readable"),
+        "started state alone does not prove movement"
+    );
+    status["pools"][0]["progress"]["objects"] = serde_json::json!(1);
+    assert!(rebalance_running_with_progress(&status, "run-1").expect("progress fixture should be readable"));
+    status["pools"][0]["status"] = serde_json::json!("Completed");
+    assert!(
+        !rebalance_running_with_progress(&status, "run-1").expect("completed fixture should be readable"),
+        "completed movement is not temporal overlap"
+    );
 }
 
 #[test]

@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use super::harness::{
-    DECOMMISSION_POOL_ID, DistCluster, DistLayout, TestResult, assert_inventory, put_inventory_retrying, retrying_get_equals,
-    retrying_put, start_decommission, start_rebalance, unique_bucket, wait_for_decommission_active,
-    wait_for_decommission_complete, wait_for_rebalance_active, wait_for_rebalance_complete,
+    DECOMMISSION_POOL_ID, DistCluster, DistLayout, TestResult, assert_inventory, decommission_running_with_progress,
+    decommission_status_json, put_inventory_retrying, rebalance_running_with_progress, rebalance_status_json,
+    retrying_get_equals, retrying_put, start_decommission, start_rebalance, unique_bucket, wait_for_decommission_complete,
+    wait_for_decommission_running_with_progress, wait_for_rebalance_complete, wait_for_rebalance_running_with_progress,
 };
 use crate::common::init_logging;
 use std::time::Duration;
@@ -31,7 +32,7 @@ async fn s3_put_get_list_succeed_during_decommission_and_rebalance() -> TestResu
     dist.expand_to_four_pools().await?;
 
     start_decommission(&dist.cluster, DECOMMISSION_POOL_ID).await?;
-    wait_for_decommission_active(&dist.cluster, DECOMMISSION_POOL_ID, Duration::from_secs(30)).await?;
+    wait_for_decommission_running_with_progress(&dist.cluster, DECOMMISSION_POOL_ID, Duration::from_secs(30)).await?;
     let live = dist.client(2)?;
     retrying_put(
         &live,
@@ -57,12 +58,16 @@ async fn s3_put_get_list_succeed_during_decommission_and_rebalance() -> TestResu
             .any(|object| object.key() == Some("during-decommission.bin")),
         "list during decommission missed the newly written key"
     );
+    let status = decommission_status_json(&dist.cluster).await?;
+    if !decommission_running_with_progress(&status, DECOMMISSION_POOL_ID)? {
+        return Err(format!("decommission did not remain active across the S3 operations: {status}").into());
+    }
 
     wait_for_decommission_complete(&dist.cluster, DECOMMISSION_POOL_ID, Duration::from_secs(180)).await?;
     assert_inventory(&live, &bucket, &inventory).await?;
 
     let rebalance_id = start_rebalance(&dist.cluster).await?;
-    wait_for_rebalance_active(&dist.cluster, &rebalance_id, Duration::from_secs(30)).await?;
+    wait_for_rebalance_running_with_progress(&dist.cluster, &rebalance_id, Duration::from_secs(30)).await?;
     retrying_put(
         &live,
         &bucket,
@@ -79,6 +84,10 @@ async fn s3_put_get_list_succeed_during_decommission_and_rebalance() -> TestResu
         Duration::from_secs(30),
     )
     .await?;
+    let status = rebalance_status_json(&dist.cluster).await?;
+    if !rebalance_running_with_progress(&status, &rebalance_id)? {
+        return Err(format!("rebalance did not remain active across the S3 operations: {status}").into());
+    }
     wait_for_rebalance_complete(&dist.cluster, &rebalance_id, Duration::from_secs(180)).await?;
     assert_inventory(&dist.client(1)?, &bucket, &inventory).await?;
     Ok(())
