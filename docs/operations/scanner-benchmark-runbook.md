@@ -34,6 +34,22 @@ The `scanner` and `heal` subsystems are served by `GetConfigKVHandler` (`rustfs/
 
 ## Test Matrix
 
+### Deterministic regression checks
+
+Run the scanner regressions before collecting host-pressure measurements:
+
+```bash
+cargo nextest run -p rustfs-scanner --lib
+```
+
+Most tests in `crates/scanner/tests/lifecycle_integration_test.rs` are ignored in the default lane because they require serial execution. Run the scanner portion of the `ILM Integration (serial)` selection in `.github/workflows/ci.yml` with `-j1 --run-ignored all` as well; preserve its documented exclusions for known noncurrent transition/expiry failures.
+
+The folder regressions exercise real directory enumeration and metadata decoding. `scanner_failed_child_retains_usage_and_scans_healthy_sibling` replaces an enumerated directory before descent, so its I/O failure is reproducible without depending on Unix permission enforcement. `scanner_nested_metadata_failure_without_retry_cache_is_partial_then_recovers` checks fresh and inherited failure state with retry caching disabled, reuse of a partial compacted subtree, and recovery on the next selected directory cycle. Neither a failed subtree nor an expired retry ledger proves zero usage.
+
+`scanner_compacted_directory_keeps_aggressive_heal_and_bitrot_sampling` covers disabled, sub-interval, and exact-interval heal divisors in normal and deep modes. `scanner_cancellation_interrupts_folder_throttle` uses a paused clock to require immediate cooperative cancellation. `scanner_blocked_expiry_preserves_usage_replication_and_integrity_work` covers lifecycle enabled/disabled with pending replication, failed replication, and Legal Hold; retained bytes and integrity/replication inspection must survive blocked expiry.
+
+These checks complement the sampling and cancellation design in [MinIO's scanner implementation](https://github.com/minio/minio/blob/master/cmd/data-scanner.go), especially `scanDataFolder`, `folderScanner.scanFolder`, and `dynamicSleeper.Sleep`. Scanner admission counters prove that work reaches the admission boundary; they do not prove remote replication delivery or a completed shard repair. The deployment matrix below remains necessary for those claims and for measured CPU, memory, IOPS, and foreground-latency comparisons.
+
 Collect at least two runs on the same RustFS commit and the same workload. Keep hardware, commit, object count, object size, bucket count, scanner-enabled state, and foreground workload constant between runs.
 
 | Run | Purpose | Example scanner settings |

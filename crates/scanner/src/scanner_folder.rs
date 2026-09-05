@@ -230,7 +230,7 @@ fn scanner_abandoned_child_list_options() -> ListPathRawOptions {
 }
 
 pub fn data_usage_update_dir_cycles() -> u32 {
-    rustfs_utils::get_env_u32(ENV_DATA_USAGE_UPDATE_DIR_CYCLES, DATA_USAGE_UPDATE_DIR_CYCLES)
+    rustfs_utils::get_env_u32(ENV_DATA_USAGE_UPDATE_DIR_CYCLES, DATA_USAGE_UPDATE_DIR_CYCLES).max(1)
 }
 
 pub fn heal_object_select_prob() -> u32 {
@@ -806,6 +806,7 @@ impl FolderScanner {
     fn prune_failed_objects_cache(&mut self) {
         let ttl = self.failed_object_ttl_secs;
         if ttl == 0 {
+            self.new_cache.info.failed_objects.clear();
             return;
         }
 
@@ -960,6 +961,27 @@ impl FolderScanner {
             self.update_cache.delete_recursive(child_hash);
             self.update_cache.copy_with_children(&self.new_cache, child_hash, parent);
             self.send_update().await;
+        }
+    }
+
+    async fn preserve_failed_child(
+        &mut self,
+        parent: &Option<DataUsageHash>,
+        child_hash: &DataUsageHash,
+        parent_entry: &mut DataUsageEntry,
+        child_entry: &DataUsageEntry,
+    ) {
+        // A failed walk proves neither deletion nor a complete replacement.
+        // Keep the previous subtree and mark this snapshot incomplete even
+        // when the failed-object retry cache is disabled or at capacity.
+        parent_entry.failed_objects = parent_entry.failed_objects.saturating_add(1);
+        if self.old_cache.cache.contains_key(&child_hash.key()) {
+            self.new_cache.delete_recursive(child_hash);
+            self.new_cache.copy_with_children(&self.old_cache, child_hash, parent);
+            parent_entry.add_child(child_hash);
+        } else {
+            self.preserve_partial_child_progress(parent, child_hash, parent_entry, child_entry)
+                .await;
         }
     }
 
@@ -1177,8 +1199,6 @@ impl FolderScanner {
                 return Err(ScannerError::Other("Operation cancelled".to_string()));
             }
 
-            self.prune_failed_objects_cache();
-
             let mut abandoned_children: DataUsageHashMap = HashSet::new();
             if !into.compacted {
                 abandoned_children = self.old_cache.find_children_copy(this_hash.clone());
@@ -1221,7 +1241,9 @@ impl FolderScanner {
             };
             let active_object_lock = self.old_cache.info.object_lock.clone();
 
-            self.sleeper.sleep_folder().await;
+            ctx.run_until_cancelled(self.sleeper.sleep_folder())
+                .await
+                .ok_or_else(|| ScannerError::Other("Operation cancelled".to_string()))?;
 
             let mut existing_folders: Vec<CachedFolder> = Vec::new();
             let mut new_folders: Vec<CachedFolder> = Vec::new();
@@ -1448,7 +1470,7 @@ impl FolderScanner {
 
                 let heal_enabled = this_hash.mod_alt(
                     self.old_cache.info.next_cycle as u32 / folder.object_heal_prob_div,
-                    self.heal_object_select / folder.object_heal_prob_div,
+                    (self.heal_object_select / folder.object_heal_prob_div).max(1),
                 ) && self.should_heal().await;
 
                 let mut item = ScannerItem {
@@ -1465,12 +1487,10 @@ impl FolderScanner {
                     file_type: entry_type,
                 };
 
-                // If this path is already known as failed, just skip it.
-                // We intentionally do NOT call `record_failed` or bump `failed_objects` here,
-                // because the failure was recorded when the original error occurred
-                // (e.g. in the get_size error branch below). This branch only accounts
-                // for subsequent skips of already-failed paths.
+                // Count unresolved objects in each snapshot without extending
+                // the retry TTL or emitting another failure event.
                 if self.should_skip_failed(&item.path) {
+                    into.failed_objects = into.failed_objects.saturating_add(1);
                     continue;
                 }
 
@@ -1485,7 +1505,7 @@ impl FolderScanner {
 
                         if failure_action != GetSizeFailureAction::Skip {
                             // Track failed objects to prevent infinite retry loops
-                            into.failed_objects += 1;
+                            into.failed_objects = into.failed_objects.saturating_add(1);
                             self.record_failed(&item.path);
 
                             if should_log_failed_object(into.failed_objects) {
@@ -1564,12 +1584,15 @@ impl FolderScanner {
                             }
                         }
 
-                        timer.sleep().await;
+                        ctx.run_until_cancelled(timer.sleep())
+                            .await
+                            .ok_or_else(|| ScannerError::Other("Operation cancelled".to_string()))?;
                         continue;
                     }
                 };
 
                 found_object_metadata = true;
+                self.new_cache.info.failed_objects.remove(&item.path);
 
                 item.transform_meta_dir();
 
@@ -1581,7 +1604,9 @@ impl FolderScanner {
                 object_count += 1;
                 self.budget.record_object_scanned();
 
-                timer.sleep().await;
+                ctx.run_until_cancelled(timer.sleep())
+                    .await
+                    .ok_or_else(|| ScannerError::Other("Operation cancelled".to_string()))?;
 
                 if ctx.is_cancelled() {
                     return Err(ScannerError::Other("Operation cancelled".to_string()));
@@ -1622,9 +1647,9 @@ impl FolderScanner {
             if self.is_erasure_mode && found_erasure_data_directory && !found_object_metadata {
                 found_object_metadata = true;
                 let metadata_path = path_join_buf(&[&dir_path, STORAGE_FORMAT_FILE]);
+                into.failed_objects = into.failed_objects.saturating_add(1);
 
                 if !self.should_skip_failed(&metadata_path) {
-                    into.failed_objects = into.failed_objects.saturating_add(1);
                     self.record_failed(&metadata_path);
 
                     let failed_cache_entries = self.new_cache.info.failed_objects.len();
@@ -1835,6 +1860,7 @@ impl FolderScanner {
                             error = %e,
                             "Scanner child folder scan failed"
                         );
+                        self.preserve_failed_child(&folder_item.parent, &h, into, &dst).await;
                         continue;
                     }
                     tokio::task::yield_now().await;
@@ -2230,6 +2256,7 @@ impl FolderScanner {
                                 error = %e,
                                 "Scanner heal child folder scan failed"
                             );
+                            self.preserve_failed_child(&folder_item.parent, &h, into, &dst).await;
                             continue;
                         }
                         tokio::task::yield_now().await;
@@ -2396,6 +2423,9 @@ pub async fn scan_data_folder(
     };
 
     let now = FolderScanner::now_secs();
+    // Prune once per bucket walk, not once per directory. Per-path TTL checks
+    // still allow retries during long scans, and insertions enforce the cap.
+    scanner.prune_failed_objects_cache();
     prune_size_reconciliation(&mut scanner.new_cache.info, now);
     prune_size_reconciliation(&mut scanner.update_cache.info, now);
 
@@ -2422,7 +2452,9 @@ pub async fn scan_data_folder(
             new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
             new_cache.info.last_update = Some(SystemTime::now());
             new_cache.info.next_cycle = cache.info.next_cycle;
-            let unresolved_objects = root.failed_objects > 0
+            let unresolved_objects = new_cache
+                .size_recursive(&cache.info.name)
+                .is_none_or(|root| root.failed_objects > 0)
                 || !new_cache.info.failed_objects.is_empty()
                 || !new_cache.info.size_reconciliation.is_empty();
             new_cache.info.snapshot_complete = !unresolved_objects;

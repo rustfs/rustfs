@@ -1366,6 +1366,104 @@ mod tests {
         assert_eq!(item.object_path(), "object");
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn scanner_blocked_expiry_preserves_usage_replication_and_integrity_work() {
+        use s3s::dto::{LifecycleExpiration, LifecycleRule};
+
+        let lifecycle = Arc::new(BucketLifecycleConfiguration {
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(1),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+            ..Default::default()
+        });
+        let attempts = |report: &rustfs_scanner_metrics::metrics::ScannerMetricsReport, source: ScannerWorkSource| {
+            report
+                .source_work
+                .iter()
+                .filter(|work| work.source == source.as_str())
+                .map(|work| work.queued + work.skipped + work.missed)
+                .sum::<u64>()
+        };
+        for with_lifecycle in [false, true] {
+            for scan_mode in [HealScanMode::Normal, HealScanMode::Deep] {
+                for guard in ["pending", "failed", "legal_hold"] {
+                    let mut metadata = HashMap::new();
+                    let replication_status = match guard {
+                        "pending" => ReplicationStatusType::Pending,
+                        "failed" => ReplicationStatusType::Failed,
+                        _ => {
+                            metadata.insert("x-amz-object-lock-legal-hold".to_string(), "ON".to_string());
+                            ReplicationStatusType::Completed
+                        }
+                    };
+                    let object = ObjectInfo {
+                        bucket: "bucket".to_string(),
+                        name: "object".to_string(),
+                        version_id: Some(uuid::Uuid::new_v4()),
+                        num_versions: 1,
+                        is_latest: true,
+                        mod_time: Some(OffsetDateTime::now_utc() - time::Duration::days(90)),
+                        size: 4096,
+                        actual_size: 4096,
+                        replication_status,
+                        user_defined: Arc::new(metadata),
+                        ..Default::default()
+                    };
+                    let events = Evaluator::new(lifecycle.clone())
+                        .eval(&[crate::ecstore_object_opts_from_object_info(&object)])
+                        .await
+                        .expect("evaluate expiry guard");
+                    assert_eq!(events[0].action, IlmAction::NoneAction, "expiry must be blocked by {guard}");
+
+                    let mut item = scanner_item_with_prefix("");
+                    item.object_name = "object".to_string();
+                    item.lifecycle = with_lifecycle.then(|| lifecycle.clone());
+                    item.replication = Some(Arc::new(ReplicationConfig::new(None, None)));
+                    item.heal_enabled = true;
+                    item.heal_bitrot = scan_mode == HealScanMode::Deep;
+                    let before = global_metrics().report().await;
+                    let mut summary = SizeSummary::default();
+                    item.apply_actions(vec![object], None, VersioningConfiguration::default(), &[], &mut summary)
+                        .await;
+                    let after = global_metrics().report().await;
+                    assert_eq!(summary.total_size, 4096, "blocked expiry must retain bytes for {guard}");
+                    assert_eq!(summary.versions, 1);
+                    assert_eq!(summary.delete_markers, 0);
+                    assert!(summary.size_reconciliation.is_empty());
+                    assert_eq!(
+                        attempts(&after, scanner_heal_source(scan_mode)) - attempts(&before, scanner_heal_source(scan_mode)),
+                        1,
+                        "integrity work must continue with lifecycle={with_lifecycle}, guard={guard}"
+                    );
+                    assert_eq!(
+                        attempts(&after, ScannerWorkSource::BucketReplication)
+                            - attempts(&before, ScannerWorkSource::BucketReplication),
+                        1,
+                        "replication inspection must continue with lifecycle={with_lifecycle}, guard={guard}"
+                    );
+                    assert_eq!(
+                        attempts(&after, ScannerWorkSource::Lifecycle) - attempts(&before, ScannerWorkSource::Lifecycle),
+                        0,
+                        "blocked expiry must not enqueue destructive lifecycle work"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn unknown_tier_never_triggers_transition() {
         let object = ObjectInfo {
