@@ -953,6 +953,7 @@ pub(super) enum PutObjectOrigin<'a> {
         principal_id: &'static str,
         emit_events: bool,
         preserve_delete_marker: bool,
+        expected_bucket_incarnation_id: Option<Uuid>,
     },
 }
 
@@ -967,7 +968,13 @@ impl PutObjectOrigin<'_> {
     fn apply_bucket_generation_guard(&self, bucket: &str, opts: &mut ObjectOptions) -> S3Result<()> {
         match self {
             Self::S3 { req, .. } => apply_bucket_generation_guard(req, bucket, opts),
-            Self::Internal { .. } => Ok(()),
+            Self::Internal {
+                expected_bucket_incarnation_id,
+                ..
+            } => {
+                opts.expected_bucket_incarnation_id = *expected_bucket_incarnation_id;
+                Ok(())
+            }
         }
     }
 

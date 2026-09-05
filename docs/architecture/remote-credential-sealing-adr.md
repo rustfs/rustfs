@@ -1,7 +1,7 @@
 # Remote Credential Sealing ADR
 
 **Use this when:** you add, read, or persist a stored remote credential — a replication target, a remote tier, or an on-demand migration source — or you need the sealed-envelope format, the mixed-version rules, or the reason this is worth doing in one deployment and not in another.
-**Source of truth:** the three stores that hold remote credentials — `BUCKET_TARGETS_FILE` and `BUCKET_ON_DEMAND_MIGRATION_CONFIG` in `crates/ecstore/src/bucket/metadata.rs`, `TIER_CONFIG_FILE` in `crates/ecstore/src/services/tier/tier.rs` — the shared envelope in `crates/ecstore/src/bucket/sealed_credentials.rs`, the consumers `crates/ecstore/src/bucket/bucket_target_sys.rs`, `crates/ecstore/src/services/tier/tier_config.rs` and `crates/ecstore/src/bucket/on_demand_migration/config.rs`, and the backend properties in [../operations/kms-backend-security.md](../operations/kms-backend-security.md).
+**Source of truth:** the three stores that hold remote credentials — `BUCKET_TARGETS_FILE` and `BUCKET_ON_DEMAND_MIGRATION_CONFIG` in `crates/ecstore/src/bucket/metadata.rs`, `TIER_CONFIG_FILE` in `crates/ecstore/src/services/tier/tier.rs` — the shared envelope in `crates/ecstore/src/bucket/sealed_credentials.rs`, the consumers `crates/ecstore/src/bucket/bucket_target_sys.rs`, `crates/ecstore/src/services/tier/tier_config.rs` and `rustfs/src/on_demand_migration/config.rs`, and the backend properties in [../operations/kms-backend-security.md](../operations/kms-backend-security.md).
 
 ## Recommendation
 
@@ -37,7 +37,7 @@ Two of the three are not files at all. `bucket-targets.json` and `on-demand-migr
 | Store | Reached as | Actually persisted at | Written by | Container |
 |---|---|---|---|---|
 | Replication and ILM targets | `BUCKET_TARGETS_FILE` | `BucketMetadata::bucket_targets_config_json`, msgpack field `BucketTargetsConfigJSON` | `BucketMetadata::update_config`, then `BucketMetadata::save_with_store`; `crates/ecstore/src/bucket/metadata_sys.rs` serializes the update under a transaction lock | `{BUCKET_META_PREFIX}/{bucket}/{BUCKET_METADATA_FILE}` in `RUSTFS_META_BUCKET` (`crates/ecstore/src/disk/mod.rs`) |
-| On-demand migration source | `BUCKET_ON_DEMAND_MIGRATION_CONFIG` | `BucketMetadata::on_demand_migration_config_json`, msgpack field `OnDemandMigrationConfigJSON` | same path; `update_config` additionally refuses a blob this build cannot parse | same blob as above |
+| On-demand migration source | `BUCKET_ON_DEMAND_MIGRATION_CONFIG` | `BucketMetadata::on_demand_migration_config_json`, msgpack field `OnDemandMigrationConfigJSON` | same path; the application validates structure and deployment constraints before persistence | same blob as above |
 | Remote tiers | `TIER_CONFIG_FILE` | its own object, a four-byte `TIER_CONFIG_FORMAT` / `TIER_CONFIG_VERSION` header followed by an `rmp_serde` payload of `ExternalTierConfigMgr` | `TierConfigMgr` through `encode_external_tiering_config_blob`, under `tier_config_lock_path` | `tier_config_path` under `CONFIG_PREFIX` in `RUSTFS_META_BUCKET` |
 
 The consequence of the first two sharing a blob is that any change to how that blob parses has a blast radius covering policy, lifecycle, versioning, object lock and everything else in `BucketMetadata` — not just credentials.
@@ -48,7 +48,7 @@ Three things hold the line today, and all three keep working whether or not seal
 
 - **The reserved bucket.** `RUSTFS_META_BUCKET` is `.rustfs.sys`; `is_reserved_or_invalid_bucket` keeps it off the S3 surface, and the admin inspect archive in `rustfs/src/admin/handlers/inspect_archive.rs` runs its request through a strict bucket-name check that a dot-prefixed reserved name does not pass.
 - **Admin authorization** on every route that can read or write one of the three configurations.
-- **Redaction on every read path.** `BucketTarget::redacted_credentials` and the `Debug` for `Credentials` in `crates/ecstore/src/bucket/target/bucket_target.rs`, used by the remote-target listing in `rustfs/src/admin/handlers/replication.rs` and by the bucket-metadata export in `rustfs/src/admin/handlers/bucket_meta.rs`; `TierConfig::redacted` in `crates/ecstore/src/services/tier/tier_config.rs`, which is also what that type's `Clone` and `Debug` do; and `SourceCredentials::redacted` in `crates/ecstore/src/bucket/on_demand_migration/config.rs`, used by `rustfs/src/admin/handlers/on_demand_migration.rs`.
+- **Redaction on every read path.** `BucketTarget::redacted_credentials` and the `Debug` for `Credentials` in `crates/ecstore/src/bucket/target/bucket_target.rs`, used by the remote-target listing in `rustfs/src/admin/handlers/replication.rs` and by the bucket-metadata export in `rustfs/src/admin/handlers/bucket_meta.rs`; `TierConfig::redacted` in `crates/ecstore/src/services/tier/tier_config.rs`, which is also what that type's `Clone` and `Debug` do; and `SourceCredentials::redacted` in `rustfs/src/on_demand_migration/config.rs`, used by `rustfs/src/admin/handlers/on_demand_migration.rs`.
 
 So no API returns a stored secret. The bytes are reachable by reading the drives, and that is the boundary sealing is proposed to move.
 
@@ -74,7 +74,7 @@ The envelope deliberately does **not** carry its own scope. A scope read out of 
 
 ## Why a hook instead of a dependency
 
-`crates/ecstore/Cargo.toml` has no `rustfs-kms` dependency, and adding one would invert the crate layering described in [crate-boundaries.md](crate-boundaries.md). The established shape is an `OnceLock` hook that ECStore defines and the binary installs at startup, as `EVENT_DISPATCH_HOOK` in `crates/ecstore/src/services/event_notification.rs` and `ON_DEMAND_MIGRATION_CONFIG_HOOK` in `crates/ecstore/src/bucket/on_demand_migration/config.rs` already do. `install_credential_sealer` follows it, and the binary supplies an implementation backed by `crates/kms/src/service_manager.rs`.
+`crates/ecstore/Cargo.toml` has no `rustfs-kms` dependency, and adding one would invert the crate layering described in [crate-boundaries.md](crate-boundaries.md). The established shape is an `OnceLock` hook that ECStore defines and the binary installs at startup, as `EVENT_DISPATCH_HOOK` in `crates/ecstore/src/services/event_notification.rs` and `BUCKET_CONFIG_PUBLISH_HOOK` in `crates/ecstore/src/bucket/metadata_sys.rs` already do. `install_credential_sealer` follows it, and the binary supplies an implementation backed by `crates/kms/src/service_manager.rs`.
 
 ## Compatibility, per store, because the three differ
 

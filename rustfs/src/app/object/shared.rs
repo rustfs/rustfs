@@ -15,9 +15,7 @@
 //! Cross-cutting helpers shared by the object use-case modules.
 
 use super::*;
-use crate::app::storage_api::object_usecase::bucket::on_demand_migration::{
-    OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead,
-};
+use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead};
 
 pub(super) const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 
