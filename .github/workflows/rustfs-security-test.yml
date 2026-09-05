@@ -77,10 +77,14 @@ jobs:
     timeout-minutes: 360
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
+      # Checkout the repository into its own subdirectory. Checking out at
+      # the workspace root would wipe the auto-testing clone above (that is
+      # exactly how run 33934141181 lost rustfs-security-test.sh).
       - name: Checkout repository (for the OIDC live gate script)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+          path: rustfs-repo
 
       - name: Initialize security evidence
         id: evidence
@@ -88,7 +92,7 @@ jobs:
           set -euo pipefail
           umask 077
           SECURITY_ARTIFACTS_DIR="${RUNNER_TEMP}/rustfs-security-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -- "${SECURITY_ARTIFACTS_DIR}"
+          mkdir -- "${SECURITY_ARTIFACTS_DIR}" "${SECURITY_ARTIFACTS_DIR}-scratch"
           printf 'SECURITY_ARTIFACTS_DIR=%s\n' "${SECURITY_ARTIFACTS_DIR}" >> "${GITHUB_ENV}"
 
       # auto-testing is private: clone it with the dedicated PF token (not
@@ -144,8 +148,8 @@ jobs:
         continue-on-error: true
         env:
           REPORT_FILE: ${{ env.SECURITY_ARTIFACTS_DIR }}/suite-report.md
-          TMPDIR: ${{ env.SECURITY_ARTIFACTS_DIR }}
-          RUSTFS_SECURITY_OIDC_LIVE_SCRIPT: ${{ github.workspace }}/scripts/test/oidc_keycloak_live.sh
+          TMPDIR: ${{ env.SECURITY_ARTIFACTS_DIR }}-scratch
+          RUSTFS_SECURITY_OIDC_LIVE_SCRIPT: ${{ github.workspace }}/rustfs-repo/scripts/test/oidc_keycloak_live.sh
         run: |
           set -euo pipefail
           chmod +x auto-testing/rustfs-security-test.sh
@@ -168,7 +172,7 @@ jobs:
           else
             ARGS+=(--package-url "${RUSTFS_NIGHTLY_PACKAGE_URL}")
           fi
-          GITHUB_STEP_SUMMARY=/dev/null ./auto-testing/rustfs-security-test.sh "${ARGS[@]}"
+          GITHUB_STEP_SUMMARY=/dev/null ./auto-testing/rustfs-security-test.sh "${ARGS[@]}" 2>&1 | tee "${SECURITY_ARTIFACTS_DIR}/suite.log"
 
       - name: Generate report
         id: report
@@ -219,17 +223,22 @@ jobs:
           fi
           DATE="$(date -u +%Y-%m-%d)"
           REPORT_PATH="functional-reports/${SUITE}/${DATE}.md"
-          CONTENT="$(python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}")"
+          # Base64-encode the report into a temp file and feed it to jq via
+          # --rawfile: large reports (e.g. pool) exceed the OS argv limit and
+          # make `jq --arg content "${CONTENT}"` fail with "Argument list too long".
+          B64_FILE="$(mktemp)"
+          python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}" > "${B64_FILE}"
           SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
           if [ -n "${SHA}" ]; then
-            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" --arg sha "${SHA}" \
-              '{message:$msg, content:$content, sha:$sha}' \
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --rawfile content "${B64_FILE}" --arg sha "${SHA}" \
+              '{message:$msg, content:($content|rtrimstr("\n")), sha:$sha}' \
               | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
           else
-            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" \
-              '{message:$msg, content:$content}' \
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --rawfile content "${B64_FILE}" \
+              '{message:$msg, content:($content|rtrimstr("\n"))}' \
               | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
           fi
+          rm -f "${B64_FILE}"
 
       - name: File failure issue in rustfs/backlog
         if: ${{ always() && (failure() || steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled') }}
@@ -296,7 +305,10 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rustfs-security-test-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.SECURITY_ARTIFACTS_DIR }}/
+          path: |
+            ${{ env.SECURITY_ARTIFACTS_DIR }}/report.md
+            ${{ env.SECURITY_ARTIFACTS_DIR }}/suite.log
+            ${{ env.SECURITY_ARTIFACTS_DIR }}/suite-report.md
           if-no-files-found: error
           retention-days: 3
 
