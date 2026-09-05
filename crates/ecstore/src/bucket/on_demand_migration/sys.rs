@@ -746,8 +746,9 @@ impl OnDemandMigrationSys {
     /// (client construction is async). Requires a Tokio runtime for the
     /// install path; without one the config is logged and skipped.
     pub fn publish(&'static self, bucket: &str, config: Option<&OnDemandMigrationConfig>) {
-        let generation = self.next_generation();
-        let Some(config) = self.desired(config) else {
+        let config = self.desired(config);
+        let generation = self.reserve_generation(bucket, config.is_some());
+        let Some(config) = config else {
             self.remove_with_generation(bucket, generation);
             return;
         };
@@ -777,7 +778,8 @@ impl OnDemandMigrationSys {
     /// Installs, rebuilds, or removes the bucket state for `config`.
     /// Idempotent: the same config on an installed bucket is a no-op.
     pub async fn apply(&self, bucket: &str, config: Option<&OnDemandMigrationConfig>) -> ApplyOutcome {
-        let generation = self.next_generation();
+        let config = self.desired(config);
+        let generation = self.reserve_generation(bucket, config.is_some());
         self.apply_with_generation(bucket, config, generation).await
     }
 
@@ -838,7 +840,7 @@ impl OnDemandMigrationSys {
 
     /// Removes a bucket's state (idempotent), cancelling its token.
     pub fn remove(&self, bucket: &str) -> ApplyOutcome {
-        let generation = self.next_generation();
+        let generation = self.reserve_generation(bucket, false);
         self.remove_with_generation(bucket, generation)
     }
 
@@ -879,8 +881,17 @@ impl OnDemandMigrationSys {
         snapshots
     }
 
-    fn next_generation(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::Relaxed) + 1
+    fn reserve_generation(&self, bucket: &str, installing: bool) -> u64 {
+        // Reserve a desired install before its async client build, under the
+        // same lock that orders removals. Unconfigured buckets need no slot.
+        let mut buckets = self.buckets.write();
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        if installing {
+            buckets.entry(bucket.to_string()).or_default().generation = generation;
+        } else if let Some(slot) = buckets.get_mut(bucket) {
+            slot.generation = generation;
+        }
+        generation
     }
 
     fn desired<'c>(&self, config: Option<&'c OnDemandMigrationConfig>) -> Option<&'c OnDemandMigrationConfig> {
@@ -1292,20 +1303,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn absent_config_updates_do_not_allocate_bucket_slots() {
+        let sys = enabled_sys();
+        for index in 0..1000 {
+            let bucket = format!("unconfigured-{index}");
+            assert_eq!(sys.apply(&bucket, None).await, ApplyOutcome::NotDesired);
+            assert_eq!(sys.remove(&bucket), ApplyOutcome::NotDesired);
+        }
+        assert!(sys.buckets.read().is_empty(), "unconfigured buckets must not accumulate tombstones");
+    }
+
+    #[tokio::test]
     async fn stale_install_cannot_overwrite_a_later_removal() {
         let sys = enabled_sys();
         let cfg = config(None);
-        let older = sys.next_generation();
-        let newer = sys.next_generation();
+        let older = sys.reserve_generation("b", true);
+        let newer = sys.reserve_generation("b", false);
         assert_eq!(sys.remove_with_generation("b", newer), ApplyOutcome::NotDesired);
-        // The removal above did not create a slot; simulate an install that
-        // started before it and finishes after.
-        sys.apply_with_generation("b", Some(&cfg), older).await;
-        assert!(sys.state("b").is_some(), "no slot yet, so the older install lands");
+        assert_eq!(sys.apply_with_generation("b", Some(&cfg), older).await, ApplyOutcome::Superseded);
+        assert!(sys.state("b").is_none(), "removal must supersede an in-flight first install");
 
+        assert_eq!(sys.apply("b", Some(&cfg)).await, ApplyOutcome::Installed);
         let installed = sys.state("b").unwrap();
-        let older = sys.next_generation();
-        let newer = sys.next_generation();
+        let older = sys.reserve_generation("b", true);
+        let newer = sys.reserve_generation("b", false);
         assert_eq!(sys.remove_with_generation("b", newer), ApplyOutcome::Removed);
         assert!(installed.is_cancelled());
         assert_eq!(sys.apply_with_generation("b", Some(&cfg), older).await, ApplyOutcome::Superseded);
