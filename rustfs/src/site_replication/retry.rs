@@ -683,12 +683,10 @@ pub(crate) const SITE_REPLICATION_RETRY_DRAIN_BASE_BACKOFF_SECS: i64 = 600;
 /// converges at the next tick instead of waiting out this ceiling.
 pub(crate) const SITE_REPLICATION_RETRY_DRAIN_MAX_BACKOFF_SECS: i64 = 86_400;
 
-/// Keep a background drain round below the lifecycle lock's 30-second wait
-/// bound. Peer requests may each consume the full 10-second request timeout,
-/// so a round may automatically replay only a small, indivisible request
-/// chain. Larger snapshots and topology edits remain queued for operator
-/// repair instead of monopolizing lifecycle admission.
-pub(crate) const SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER: usize = 2;
+/// Bound a background drain round to one complete bucket bootstrap chain:
+/// make, at most nine metadata records, then replication configuration.
+/// Larger snapshots and topology edits remain queued for operator repair.
+pub(crate) const SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER: usize = 11;
 
 /// A replay shape the retry machinery can derive from persisted state. The
 /// lightweight 30-second scheduler admits only bounded bucket-op chains;
@@ -1552,13 +1550,16 @@ async fn drain_site_replication_retry_queue_lightweight_locked(
             }) else {
                 return (0, 0);
             };
-            let plan = match site_replication_bucket_retry_plan(&bucket).await {
-                Ok(plan) => plan,
-                Err(err) => {
-                    enqueue_site_replication_retry_event(&peer, &event.path, &err).await;
-                    return (0, 1);
-                }
-            };
+            let plan =
+                match site_replication_bucket_retry_plan(&bucket, site_replication_state_replicates_ilm_expiry(&runtime.state))
+                    .await
+                {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        enqueue_site_replication_retry_event(&peer, &event.path, &err).await;
+                        return (0, 1);
+                    }
+                };
             if retry_drain_request_count(&action, Some(&plan)) > SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER {
                 return (0, 0);
             }

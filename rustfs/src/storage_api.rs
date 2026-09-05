@@ -221,7 +221,7 @@ pub(crate) mod server {
 /// targets, replication-config primitives, and the config-object lock
 /// helpers its state transaction runs on.
 pub(crate) mod site_replication {
-    pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions};
+    pub(crate) use super::storage_contracts::{BucketInfo, BucketOperations, BucketOptions};
     pub(crate) use crate::storage::storage_api::ecstore_bucket::bucket_target_sys::BucketTargetSys;
     pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::{
         BUCKET_REPLICATION_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BucketMetadata,

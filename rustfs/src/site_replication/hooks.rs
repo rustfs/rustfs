@@ -355,27 +355,25 @@ pub(crate) fn site_replication_bootstrap_plan(info: &SRInfo) -> S3Result<SiteRep
 /// that on a 30-second recovery cadence would make lifecycle admission scale
 /// with the whole site instead of the one queued bucket.
 pub(crate) fn site_replication_bucket_retry_plan_for(
-    bucket: &str,
-    created_at: Option<OffsetDateTime>,
-    lock_enabled: bool,
-) -> SiteReplicationBootstrapPlan {
-    let bucket = SRBucketInfo {
-        bucket: bucket.to_string(),
-        created_at,
-        object_lock_config: lock_enabled.then(String::new),
-        ..Default::default()
-    };
-    SiteReplicationBootstrapPlan {
-        bucket_make_ops: vec![bootstrap_bucket_make_op_path(&bucket)],
+    bucket: &SRBucketInfo,
+    replicate_ilm_expiry: bool,
+) -> S3Result<SiteReplicationBootstrapPlan> {
+    let mut plan = SiteReplicationBootstrapPlan {
+        bucket_make_ops: vec![bootstrap_bucket_make_op_path(bucket)],
         bucket_configure_ops: vec![bootstrap_bucket_op_path(
             &bucket.bucket,
             SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION,
         )],
         ..Default::default()
-    }
+    };
+    append_bootstrap_bucket_items(&mut plan, bucket, replicate_ilm_expiry)?;
+    Ok(plan)
 }
 
-pub(crate) async fn site_replication_bucket_retry_plan(bucket: &str) -> S3Result<SiteReplicationBootstrapPlan> {
+pub(crate) async fn site_replication_bucket_retry_plan(
+    bucket: &str,
+    replicate_ilm_expiry: bool,
+) -> S3Result<SiteReplicationBootstrapPlan> {
     let Some(store) = current_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
@@ -384,11 +382,11 @@ pub(crate) async fn site_replication_bucket_retry_plan(bucket: &str) -> S3Result
         Err(err) if is_err_bucket_not_found(&err) => return Ok(SiteReplicationBootstrapPlan::default()),
         Err(err) => return Err(ApiError::from(err).into()),
     };
-    Ok(site_replication_bucket_retry_plan_for(
-        bucket,
-        bucket_info.created,
-        bucket_info.object_locking,
-    ))
+    // A retry may settle only from an authoritative metadata snapshot. If the
+    // cache is unavailable, keep the event queued for a later drain.
+    let metadata = metadata_sys::get(&bucket_info.name).await.map_err(ApiError::from)?;
+    let bucket = build_sr_bucket_info(bucket_info, Some(metadata)).await;
+    site_replication_bucket_retry_plan_for(&bucket, replicate_ilm_expiry)
 }
 
 pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {
@@ -683,6 +681,46 @@ pub(crate) fn maybe_time(value: OffsetDateTime) -> Option<OffsetDateTime> {
     (value != OffsetDateTime::UNIX_EPOCH).then_some(value)
 }
 
+async fn build_sr_bucket_info(bucket: BucketInfo, metadata: Option<Arc<BucketMetadata>>) -> SRBucketInfo {
+    let mut entry = SRBucketInfo {
+        bucket: bucket.name,
+        created_at: bucket.created,
+        location: current_region().map(|region| region.to_string()).unwrap_or_default(),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
+    };
+
+    if let Some(metadata) = metadata {
+        entry.policy = raw_config_to_string(&metadata.policy_config_json).and_then(|raw| serde_json::from_str(&raw).ok());
+        entry.versioning = raw_config_to_base64(&metadata.versioning_config_xml);
+        entry.tags = raw_config_to_base64(&metadata.tagging_config_xml);
+        entry.object_lock_config = raw_config_to_base64(&metadata.object_lock_config_xml);
+        entry.sse_config = raw_config_to_base64(&metadata.encryption_config_xml);
+        entry.replication_config = raw_config_to_base64(&metadata.replication_config_xml);
+        entry.quota_config = raw_config_to_base64(&metadata.quota_config_json);
+        // Bootstrap and repair replicate only the expiry subset. Transition
+        // rules remain site-local.
+        let expiry_statement = lifecycle_expiry_statement(&metadata);
+        entry.expiry_lc_config = expiry_statement.as_ref().and_then(|(subset, _)| subset.clone());
+        entry.cors_config = raw_config_to_base64(&metadata.cors_config_xml);
+        entry.policy_updated_at = maybe_time(metadata.policy_config_updated_at);
+        entry.tag_config_updated_at = maybe_time(metadata.tagging_config_updated_at);
+        entry.object_lock_config_updated_at = maybe_time(metadata.object_lock_config_updated_at);
+        entry.sse_config_updated_at = maybe_time(metadata.encryption_config_updated_at);
+        entry.versioning_config_updated_at = maybe_time(metadata.versioning_config_updated_at);
+        entry.replication_config_updated_at = maybe_time(metadata.replication_config_updated_at);
+        entry.quota_config_updated_at = maybe_time(metadata.quota_config_updated_at);
+        // Use the expiry axis rather than the whole-config write time so a
+        // local transition edit cannot out-rank a newer remote expiry edit.
+        entry.expiry_lc_config_updated_at = expiry_statement.map(|(_, axis)| axis);
+        entry.cors_config_updated_at = maybe_time(metadata.cors_config_updated_at);
+        entry.replication_targets_online =
+            Some(site_replication_targets_online(&entry.bucket, &metadata.replication_config_xml).await);
+    }
+
+    entry
+}
+
 pub(crate) async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S3Result<SRInfo> {
     let Some(store) = current_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -704,50 +742,9 @@ pub(crate) async fn build_sr_info(state: &SiteReplicationState, local_peer: &Pee
 
     let buckets = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
     for bucket in buckets {
-        let metadata = metadata_sys::get(&bucket.name).await.ok();
-        let mut entry = SRBucketInfo {
-            bucket: bucket.name.clone(),
-            created_at: bucket.created,
-            location: current_region().map(|region| region.to_string()).unwrap_or_default(),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        };
-
-        if let Some(metadata) = metadata {
-            entry.policy = raw_config_to_string(&metadata.policy_config_json).and_then(|raw| serde_json::from_str(&raw).ok());
-            entry.versioning = raw_config_to_base64(&metadata.versioning_config_xml);
-            entry.tags = raw_config_to_base64(&metadata.tagging_config_xml);
-            entry.object_lock_config = raw_config_to_base64(&metadata.object_lock_config_xml);
-            entry.sse_config = raw_config_to_base64(&metadata.encryption_config_xml);
-            entry.replication_config = raw_config_to_base64(&metadata.replication_config_xml);
-            entry.quota_config = raw_config_to_base64(&metadata.quota_config_json);
-            // Expiry subset only: this entry feeds both the bootstrap/repair
-            // plan (peers must not receive transition rules) and cross-site
-            // consistency views (transition rules are site-local and would
-            // read as false mismatches). A deleted expiry state is a `None`
-            // value with the deletion's axis so repair can converge peers
-            // that missed the live delete.
-            let expiry_statement = lifecycle_expiry_statement(&metadata);
-            entry.expiry_lc_config = expiry_statement.as_ref().and_then(|(subset, _)| subset.clone());
-            entry.cors_config = raw_config_to_base64(&metadata.cors_config_xml);
-            entry.policy_updated_at = maybe_time(metadata.policy_config_updated_at);
-            entry.tag_config_updated_at = maybe_time(metadata.tagging_config_updated_at);
-            entry.object_lock_config_updated_at = maybe_time(metadata.object_lock_config_updated_at);
-            entry.sse_config_updated_at = maybe_time(metadata.encryption_config_updated_at);
-            entry.versioning_config_updated_at = maybe_time(metadata.versioning_config_updated_at);
-            entry.replication_config_updated_at = maybe_time(metadata.replication_config_updated_at);
-            entry.quota_config_updated_at = maybe_time(metadata.quota_config_updated_at);
-            // The expiry axis, not the whole-config write time: local
-            // transition-only edits inflate the latter, and a repair item
-            // stamped with it could out-rank a newer real expiry edit on a
-            // third site.
-            entry.expiry_lc_config_updated_at = expiry_statement.map(|(_, axis)| axis);
-            entry.cors_config_updated_at = maybe_time(metadata.cors_config_updated_at);
-            entry.replication_targets_online =
-                Some(site_replication_targets_online(&bucket.name, &metadata.replication_config_xml).await);
-        }
-
-        info.buckets.insert(bucket.name, entry);
+        let name = bucket.name.clone();
+        let metadata = metadata_sys::get(&name).await.ok();
+        info.buckets.insert(name, build_sr_bucket_info(bucket, metadata).await);
     }
 
     if let Some(iam_sys) = current_iam_handle() {
