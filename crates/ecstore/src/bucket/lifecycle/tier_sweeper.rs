@@ -15,8 +15,6 @@
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
 
 use super::runtime_boundary as runtime_sources;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::ExpiryOp;
@@ -72,9 +70,11 @@ static REMOTE_DELETE_BREAKER: LazyLock<Mutex<RemoteDeleteBreaker>> = LazyLock::n
 });
 
 #[cfg(test)]
-static REMOTE_TIER_DELETE_TEST_HOOK: std::sync::LazyLock<
-    std::sync::Mutex<Option<Box<dyn Fn(&str, &str, &str) -> std::io::Result<()> + Send + Sync>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+type RemoteTierDeleteTestHook = Box<dyn Fn(&str, &str, &str) -> std::io::Result<()> + Send + Sync>;
+
+#[cfg(test)]
+static REMOTE_TIER_DELETE_TEST_HOOK: std::sync::LazyLock<std::sync::Mutex<Option<RemoteTierDeleteTestHook>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 #[derive(Debug)]
 struct RemoteDeleteBreaker {
@@ -107,7 +107,7 @@ impl RemoteDeleteBreaker {
     fn prune(&mut self, now: Instant) {
         while let Some(ts) = self.failures.front().copied() {
             if now.duration_since(ts) > self.window {
-                self.failures.pop_front();
+                let _ = self.failures.pop_front();
             } else {
                 break;
             }
@@ -137,10 +137,10 @@ fn is_signer_header_error(err: &std::io::Error) -> bool {
         return false;
     }
 
-    if let Some(source) = err.get_ref() {
-        if error_chain_contains_signer_header_marker(source) {
-            return true;
-        }
+    if let Some(source) = err.get_ref()
+        && error_chain_contains_signer_header_marker(source)
+    {
+        return true;
     }
 
     let message = err.to_string().to_ascii_lowercase();
@@ -205,7 +205,7 @@ impl ObjSweeper {
 
     #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     pub fn with_version(&mut self, vid: Option<Uuid>) -> &Self {
-        self.version_id = vid.clone();
+        self.version_id = vid;
         self
     }
 
@@ -219,7 +219,7 @@ impl ObjSweeper {
     #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     pub fn get_opts(&self) -> lifecycle::ObjectOpts {
         let mut opts = ObjectOpts {
-            version_id: self.version_id.clone(),
+            version_id: self.version_id,
             versioned: self.versioned,
             version_suspended: self.suspended,
             ..Default::default()
@@ -388,8 +388,8 @@ impl Jentry {
 impl ExpiryOp for Jentry {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        hasher.update(format!("{}", self.tier_name).as_bytes());
-        hasher.update(format!("{}", self.obj_name).as_bytes());
+        hasher.update(self.tier_name.as_bytes());
+        hasher.update(self.obj_name.as_bytes());
         xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
@@ -436,7 +436,7 @@ async fn delete_object_from_remote_tier_raw_with_manager(
     tier_name: &str,
     tier_config_mgr: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
 ) -> Result<(), std::io::Error> {
-    let lease = TierConfigMgr::acquire_operation_lease(&tier_config_mgr, tier_name)
+    let lease = TierConfigMgr::acquire_operation_lease(tier_config_mgr, tier_name)
         .await
         .map_err(std::io::Error::other)?;
     delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, &lease, false, true).await

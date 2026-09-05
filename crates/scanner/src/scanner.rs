@@ -1703,14 +1703,18 @@ where
     let (sender, receiver) = mpsc::channel::<DataUsageInfo>(1);
 
     let done_cycle = Metrics::time(Metric::ScanCycle);
-    let scan_result = crate::scanner_io::nsscanner_with_storage_status(
+    let scan_result = crate::scanner_io::nsscanner_with_storage_status_scoped(
         storeapi.as_ref(),
-        cycle_budget.token(),
-        cycle_budget.clone(),
-        sender,
-        cycle_info.current,
-        leader_epoch,
-        scan_mode,
+        crate::scanner_io::ScannerCycleRequest {
+            ctx: cycle_budget.token(),
+            budget: cycle_budget.clone(),
+            updates: sender,
+            want_cycle: cycle_info.current,
+            leader_epoch,
+            scan_mode,
+            scan_scope: crate::scanner_io::ScannerBucketScanScope::default(),
+            persisted_usage_baseline: usage_persist_baseline.data.clone(),
+        },
     )
     .await;
     let publication_defer_reason = match &scan_result {
@@ -3424,10 +3428,13 @@ use cycle_state::*;
 use leadership::*;
 use usage_store::*;
 
+#[cfg(test)]
+pub(crate) use activity::scanner_activity_snapshot_digest;
 pub use activity::scanner_topology_digest;
 pub(crate) use activity::{
     ScannerActivitySnapshot, ScannerDirtyUsageAcknowledgement, probe_scanner_activity, scanner_activity_allows_usage_publication,
-    scanner_activity_publication_lease_targets, scanner_activity_snapshot_digest, scanner_dirty_usage_acknowledgements,
+    scanner_activity_dirty_usage_state_for_host, scanner_activity_publication_lease_targets, scanner_activity_structural_digest,
+    scanner_dirty_usage_acknowledgements,
 };
 pub(crate) use activity::{ScannerCycleOutcome, scanner_cycle_outcome_with_pending_maintenance};
 pub use backlog::{

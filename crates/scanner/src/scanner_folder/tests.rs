@@ -24,6 +24,8 @@ use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::Mutex;
 
+mod checkpoint_fixture;
+
 /// Reset the process-global alert cooldown map; test-only.
 fn reset_alert_cooldowns() {
     *SCANNER_ALERT_EMISSION_COOLDOWN

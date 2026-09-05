@@ -252,8 +252,16 @@ pub(crate) async fn merged_list_objects_v2(
             .filter(|entry| merger.accepts(&entry.key().name))
             .collect();
         let keys: Vec<ListEntryKey> = kept.iter().map(SideEntry::key).collect();
+        if let Err(error) = merger.push_page(fetch.side, keys, is_truncated, next_token) {
+            match fetch.side {
+                MergeSide::Source => {
+                    degrade_or_fail(&mut merger, &mut degraded, policy.source_error, "invalid_pagination")?;
+                    continue;
+                }
+                MergeSide::Local => return Err(S3Error::with_message(S3ErrorCode::InternalError, error.to_string())),
+            }
+        }
         buffers[usize::from(fetch.side == MergeSide::Source)].extend(kept.into_iter().map(Some));
-        merger.push_page(fetch.side, keys, is_truncated, next_token);
     }
 
     let outcome = merger.finish();
@@ -340,10 +348,12 @@ async fn fetch_source_page(
             continuation_token: token,
             max_keys: params.max_keys,
         },
-        // Everything under `filter.prefix` rolls into one common prefix, so a
-        // single bounded listing settles whether it exists.
+        // Everything under `filter.prefix` rolls into one common prefix. An
+        // empty truncated probe must still follow its cursor before declaring
+        // that prefix absent.
         SourceListPlan::Folded { probe_prefix, .. } => SourceListRequest {
             prefix: Some(probe_prefix.as_str()),
+            continuation_token: token,
             max_keys: 1,
             ..Default::default()
         },
@@ -368,8 +378,8 @@ async fn fetch_source_page(
                 } else {
                     Vec::new()
                 },
-                false,
-                None,
+                !exists && page.is_truncated,
+                if exists { None } else { page.next_continuation_token },
             ))
         }
         _ => {
@@ -417,6 +427,17 @@ async fn local_delete_markers(store: &Arc<ECStore>, bucket: &str, keys: &[String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::bucket_usecase::DefaultBucketUsecase;
+    use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ecstore};
+    use crate::app::storage_api::bucket_usecase::bucket::on_demand_migration::{
+        FilterConfig, OnDemandMigrationConfig, PathStyle, PolicyConfig, Provider, SourceConfig, SourceCredentials, TlsConfig,
+    };
+    use crate::app::storage_api::bucket_usecase::s3::{ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response};
+    use crate::app::storage_api::test::StoragePutObjReader;
+    use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::app::storage_api::test::contract::object::ObjectIO as _;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn token(local: Option<&str>, local_done: bool) -> ListThroughToken {
         ListThroughToken {
@@ -525,5 +546,333 @@ mod tests {
             .expect("not_found degrades instead of failing");
         assert!(degraded);
         assert_eq!(merger.next_fetch().map(|fetch| fetch.side), Some(MergeSide::Local));
+    }
+
+    /// Serves exactly the scripted S3 pages and joins every connection before
+    /// returning. A source retry or unexpected operation fails the test.
+    async fn scripted_list_source(pages: Vec<String>) -> (String, tokio_util::task::AbortOnDropHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listing source");
+        let address = listener.local_addr().expect("listing source address");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in pages {
+                let (mut stream, _) = listener.accept().await.expect("accept source listing");
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut chunk).await.expect("read signed listing request");
+                    assert!(count > 0, "source request must include complete headers");
+                    request.extend_from_slice(&chunk[..count]);
+                    assert!(request.len() <= 32 * 1024, "listing request headers must be bounded");
+                }
+                let first_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .expect("request line")
+                    .to_string();
+                // The SDK joins the bucket endpoint with the LIST operation's `/` path.
+                assert!(
+                    first_line.starts_with("GET /source-bucket/?"),
+                    "expected a path-style bucket-root LIST request, got {first_line:?}"
+                );
+                assert!(first_line.contains("list-type=2"), "expected a ListObjectsV2 query, got {first_line:?}");
+                requests.push(first_line);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.expect("write source page");
+                stream.shutdown().await.expect("finish source response");
+            }
+            requests
+        });
+        (format!("http://{address}"), tokio_util::task::AbortOnDropHandle::new(server))
+    }
+
+    fn source_xml(next: Option<&str>, truncated: bool, key: Option<&str>) -> String {
+        let next = next
+            .map(|token| format!("<NextContinuationToken>{token}</NextContinuationToken>"))
+            .unwrap_or_default();
+        let contents = key
+            .map(|key| format!("<Contents><Key>{key}</Key><Size>1</Size></Contents>"))
+            .unwrap_or_default();
+        format!(
+            "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>{truncated}</IsTruncated>{next}{contents}</ListBucketResult>"
+        )
+    }
+
+    struct ListThroughTestState {
+        bucket: String,
+        module_enabled: bool,
+    }
+
+    impl Drop for ListThroughTestState {
+        fn drop(&mut self) {
+            let sys = OnDemandMigrationSys::get();
+            sys.remove(&self.bucket);
+            sys.set_module_enabled(self.module_enabled);
+        }
+    }
+
+    async fn source_policy_request(
+        pages: Vec<String>,
+        policy: SourceErrorPolicy,
+        resume_source: Option<&str>,
+        filter_prefix: Option<&str>,
+    ) -> (S3Result<S3Response<ListObjectsV2Output>>, Vec<String>) {
+        let store = shared_gating_ecstore().await;
+        crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        let bucket = format!("odm-list-{}", uuid::Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create list-through bucket");
+        store
+            .put_object(
+                &bucket,
+                "z-local",
+                &mut StoragePutObjReader::from_vec(vec![1]),
+                &StorageObjectOptions::default(),
+            )
+            .await
+            .expect("seed real local listing");
+        let (endpoint, server) = scripted_list_source(pages).await;
+        let sys = OnDemandMigrationSys::get();
+        let _state_guard = ListThroughTestState {
+            bucket: bucket.clone(),
+            module_enabled: sys.is_module_enabled(),
+        };
+        sys.set_module_enabled(true);
+        let config = OnDemandMigrationConfig {
+            version: 1,
+            enabled: true,
+            source: SourceConfig {
+                provider: Provider::Minio,
+                endpoint: Some(endpoint),
+                region: "us-east-1".into(),
+                bucket: "source-bucket".into(),
+                path_style: PathStyle::Path,
+                credentials: Some(SourceCredentials {
+                    access_key: "test-access".into(),
+                    secret_key: "test-secret".into(),
+                    session_token: None,
+                }),
+                tls: TlsConfig::default(),
+            },
+            filter: FilterConfig {
+                prefix: filter_prefix.map(str::to_string),
+                ..Default::default()
+            },
+            policy: PolicyConfig {
+                list_through: true,
+                source_error: policy,
+                ..Default::default()
+            },
+        };
+        sys.apply(&bucket, Some(&config)).await;
+        assert!(
+            sys.state(&bucket).expect("ODM state installed").client().is_ok(),
+            "fake source client must build"
+        );
+        let continuation_token = resume_source.map(|source| {
+            let token = ListThroughToken {
+                t: "odm-list".into(),
+                v: 1,
+                local: None,
+                local_done: false,
+                source: Some(source.into()),
+                source_done: false,
+                last_key: None,
+            };
+            base64_simd::STANDARD.encode_to_string(token.encode().as_bytes())
+        });
+        let input = ListObjectsV2Input {
+            bucket,
+            max_keys: Some(2),
+            continuation_token,
+            delimiter: filter_prefix.map(|_| "/".to_string()),
+            encoding_type: None,
+            expected_bucket_owner: None,
+            fetch_owner: None,
+            optional_object_attributes: None,
+            prefix: None,
+            request_payer: None,
+            start_after: None,
+        };
+        let request = S3Request {
+            input,
+            method: http::Method::GET,
+            uri: http::Uri::from_static("/?list-type=2"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            DefaultBucketUsecase::from_global().execute_list_objects_v2(request),
+        )
+        .await
+        .expect("listing must complete within its bounded source budget");
+        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("source connections must finish")
+            .expect("source server must not panic");
+        (result, requests)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_invalid_source_pagination_obeys_policy_on_the_handler_path() {
+        run_large_stack_test("list-through-source-policy", || async {
+            temp_env::async_with_vars(
+                [
+                    ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                    ("HTTP_PROXY", None),
+                    ("HTTPS_PROXY", None),
+                    ("ALL_PROXY", None),
+                    ("http_proxy", None),
+                    ("https_proxy", None),
+                    ("all_proxy", None),
+                    ("NO_PROXY", Some("*")),
+                    ("no_proxy", Some("*")),
+                ],
+                async {
+                    for policy in [SourceErrorPolicy::Propagate, SourceErrorPolicy::NotFound] {
+                        for next in [None, Some(""), Some("stuck")] {
+                            for key in [None, Some("a-source")] {
+                                let (result, requests) =
+                                    source_policy_request(vec![source_xml(next, true, key)], policy, Some("stuck"), None).await;
+                                assert_eq!(requests.len(), 1, "a malformed source page must not be retried");
+                                assert!(requests[0].contains("continuation-token=stuck"));
+                                assert_source_policy_result(result, policy);
+                            }
+                        }
+                        let (result, requests) = source_policy_request(
+                            vec![
+                                source_xml(Some("stuck"), true, Some("a-source")),
+                                source_xml(Some("stuck"), true, None),
+                            ],
+                            policy,
+                            None,
+                            None,
+                        )
+                        .await;
+                        assert_eq!(requests.len(), 2, "the failure must occur during a real refill");
+                        assert!(!requests[0].contains("continuation-token="));
+                        assert!(requests[1].contains("continuation-token=stuck"));
+                        assert_source_policy_result(result, policy);
+                    }
+                },
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_empty_advancing_source_pages_reach_eof_on_the_handler_path() {
+        run_large_stack_test("list-through-empty-source-pages", || async {
+            temp_env::async_with_vars(
+                [
+                    ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                    ("HTTP_PROXY", None),
+                    ("HTTPS_PROXY", None),
+                    ("ALL_PROXY", None),
+                    ("http_proxy", None),
+                    ("https_proxy", None),
+                    ("all_proxy", None),
+                    ("NO_PROXY", Some("*")),
+                    ("no_proxy", Some("*")),
+                ],
+                async {
+                    for filter_prefix in [None, Some("photos/2024/")] {
+                        let source_key = if filter_prefix.is_some() {
+                            "photos/2024/a-source"
+                        } else {
+                            "a-source"
+                        };
+                        let (result, requests) = source_policy_request(
+                            vec![
+                                source_xml(Some("opaque-next"), true, None),
+                                source_xml(None, false, Some(source_key)),
+                            ],
+                            SourceErrorPolicy::Propagate,
+                            None,
+                            filter_prefix,
+                        )
+                        .await;
+                        assert_eq!(requests.len(), 2, "an empty truncated source page must reach its successor");
+                        assert!(requests[1].contains("continuation-token=opaque-next"));
+                        let response = result.expect("empty progressing source page is valid");
+                        assert!(!response.headers.contains_key("x-rustfs-on-demand-migration-list"));
+                        let output = response.output;
+                        let objects: Vec<_> = output
+                            .contents
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|object| object.key.expect("listed object key"))
+                            .collect();
+                        if filter_prefix.is_some() {
+                            assert_eq!(objects, vec!["z-local"]);
+                            assert_eq!(
+                                output
+                                    .common_prefixes
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(|prefix| prefix.prefix.expect("rolled-up prefix"))
+                                    .collect::<Vec<_>>(),
+                                vec!["photos/"]
+                            );
+                        } else {
+                            assert_eq!(objects, vec!["a-source", "z-local"]);
+                            assert!(output.common_prefixes.unwrap_or_default().is_empty());
+                        }
+                        assert_eq!(output.key_count, Some(2));
+                        assert_eq!(output.is_truncated, Some(false));
+                        assert!(output.next_continuation_token.is_none());
+                    }
+                },
+            )
+            .await;
+        });
+    }
+
+    fn assert_source_policy_result(result: S3Result<S3Response<ListObjectsV2Output>>, policy: SourceErrorPolicy) {
+        match policy {
+            SourceErrorPolicy::Propagate => {
+                let error = result.expect_err("propagate must expose malformed pagination");
+                assert_eq!(error.status_code(), Some(http::StatusCode::FAILED_DEPENDENCY));
+                assert_eq!(error.code(), &S3ErrorCode::Custom("SourceUnavailable".into()));
+                assert_eq!(error.message(), Some("invalid_pagination"));
+            }
+            SourceErrorPolicy::NotFound => {
+                let response = result.expect("not_found must preserve the local listing");
+                assert_eq!(
+                    response
+                        .headers
+                        .get("x-rustfs-on-demand-migration-list")
+                        .expect("local_only header"),
+                    "local_only"
+                );
+                let output = response.output;
+                assert_eq!(
+                    output
+                        .contents
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|object| object.key.expect("local key"))
+                        .collect::<Vec<_>>(),
+                    vec!["z-local"]
+                );
+                assert_eq!(output.is_truncated, Some(false));
+                assert_eq!(output.key_count, Some(1));
+                assert!(output.next_continuation_token.is_none());
+            }
+        }
     }
 }

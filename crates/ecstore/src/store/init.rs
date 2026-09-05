@@ -2979,6 +2979,33 @@ mod tests {
     #[cfg(feature = "test-util")]
     const DECOMMISSION_TEST_FAULT_STAGE_TIERED: &str = "decommission_tiered_object";
 
+    fn decommission_retry_fault_hook(
+        bucket: &str,
+        object: &str,
+        faults: Arc<AtomicUsize>,
+    ) -> crate::core::pools::DecommissionTestFaultDecision {
+        let target_bucket = bucket.to_string();
+        let target_object = object.to_string();
+        Arc::new(move |stage, bucket, object, _attempt, succeeded| {
+            if !succeeded
+                || stage != DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT
+                || bucket != target_bucket
+                || object != target_object
+            {
+                return false;
+            }
+
+            // Entry retries reset the local attempt; real copy errors can skip
+            // successful attempts. Only injected faults spend this global budget.
+            faults
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |faults| {
+                    (faults < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS.saturating_sub(1))
+                        .then_some(faults.saturating_add(1))
+                })
+                .is_ok()
+        })
+    }
+
     async fn seed_decommission_source(
         store: &Arc<crate::store::ECStore>,
         bucket: &str,
@@ -5121,6 +5148,33 @@ mod tests {
     }
 
     #[test]
+    fn decommission_retry_fault_budget_counts_successes_across_attempt_changes() {
+        for attempts in [[1, 2, 3], [1, 1, 2], [1, 3, 3]] {
+            let faults = Arc::new(AtomicUsize::new(0));
+            let hook = decommission_retry_fault_hook("bucket", "object", Arc::clone(&faults));
+
+            for (stage, bucket, object, succeeded) in [
+                ("other-stage", "bucket", "object", true),
+                (DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT, "other-bucket", "object", true),
+                (DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT, "bucket", "other-object", true),
+                (DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT, "bucket", "object", false),
+            ] {
+                assert!(!hook(stage, bucket, object, 1, succeeded));
+            }
+            assert_eq!(faults.load(Ordering::SeqCst), 0, "unrelated or failed copies must not consume faults");
+
+            for (index, attempt) in attempts.into_iter().enumerate() {
+                assert_eq!(
+                    hook(DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT, "bucket", "object", attempt, true),
+                    index < 2,
+                    "attempts={attempts:?}, index={index}"
+                );
+            }
+            assert_eq!(faults.load(Ordering::SeqCst), 2, "attempts={attempts:?}");
+        }
+    }
+
+    #[test]
     #[serial_test::serial(storage_class_env)]
     fn decommission_entry_retries_source_changed_without_canceling_other_bucket() {
         let handle = std::thread::Builder::new()
@@ -5214,31 +5268,8 @@ mod tests {
                     ));
 
                     let ordinary_faults = Arc::new(AtomicUsize::new(0));
-                    let ordinary_faults_for_hook = Arc::clone(&ordinary_faults);
-                    let fault_bucket = other_bucket.clone();
-                    let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
-                        move |stage, bucket, object, attempt, succeeded| {
-                            let candidate = succeeded
-                                && stage == DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT
-                                && bucket == fault_bucket.as_str()
-                                && object == other_object;
-                            if !candidate {
-                                return false;
-                            }
-
-                            // Keep the fault budget global across any
-                            // entry-level re-list; its inner attempt counter
-                            // restarts after SourceChanged.
-                            ordinary_faults_for_hook
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |faults| {
-                                    let next_fault = faults.saturating_add(1);
-                                    (faults < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS.saturating_sub(1)
-                                        && attempt == next_fault)
-                                        .then_some(next_fault)
-                                })
-                                .is_ok()
-                        },
-                    ));
+                    let fault_hook = decommission_retry_fault_hook(&other_bucket, other_object, Arc::clone(&ordinary_faults));
+                    let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(fault_hook);
 
                     let rx = CancellationToken::new();
                     let source_changed_exhaustions = Arc::new(AtomicUsize::new(0));
@@ -8045,10 +8076,15 @@ mod tests {
         );
         assert!(com::read_config(store.pools[0].clone(), &second_page_path).await.is_ok());
 
-        com::save_config(store.pools[target_pool_idx].clone(), &second_page_path, receipt_bytes.clone())
+        let full_tail = ObjectOptions {
+            max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        com::save_config_with_opts(store.pools[target_pool_idx].clone(), &second_page_path, receipt_bytes.clone(), &full_tail)
             .await
             .expect("second page receipt should restore");
-        com::save_config(store.pools[target_pool_idx].clone(), &second_page_path, b"{corrupt".to_vec())
+        com::save_config_with_opts(store.pools[target_pool_idx].clone(), &second_page_path, b"{corrupt".to_vec(), &full_tail)
             .await
             .expect("second page receipt should corrupt deterministically");
         let corrupt = store

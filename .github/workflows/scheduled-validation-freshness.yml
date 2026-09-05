@@ -42,6 +42,7 @@ jobs:
       - name: Check latest scheduled runs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUSTFS_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set +e
           python3 scripts/check_scheduled_validation_freshness.py \

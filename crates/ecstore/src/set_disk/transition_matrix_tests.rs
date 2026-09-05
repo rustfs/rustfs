@@ -18,6 +18,7 @@ use super::{
 };
 use crate::bucket::lifecycle::lifecycle::{TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time};
 use crate::ecstore_validation_blackbox::make_local_set_disks;
+use crate::object_api::WriteCompletion;
 use crate::services::tier::test_util::register_mock_tier;
 use crate::storage_api_contracts::bucket::BucketOperations;
 use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
@@ -72,7 +73,7 @@ async fn transition_and_restore_reclaim_prior_metadata_generations() {
             object,
             &mut reader,
             &ObjectOptions {
-                no_lock: true,
+                write_completion: WriteCompletion::TailDrained,
                 ..Default::default()
             },
         )
@@ -185,7 +186,7 @@ async fn prepared_snapshot_transition_duplicate_and_late_get_use_committed_remot
             object,
             &mut reader,
             &ObjectOptions {
-                no_lock: true,
+                write_completion: WriteCompletion::TailDrained,
                 ..Default::default()
             },
         )

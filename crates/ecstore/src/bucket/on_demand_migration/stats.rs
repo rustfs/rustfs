@@ -177,7 +177,7 @@ impl From<&SourceError> for PullFailureReason {
             SourceError::Connect(_) => PullFailureReason::SourceConnect,
             SourceError::ServerError(_) => PullFailureReason::SourceServerError,
             SourceError::Unsupported(_) => PullFailureReason::SourceUnsupported,
-            SourceError::Other(_) => PullFailureReason::SourceOther,
+            SourceError::InvalidPagination(_) | SourceError::Other(_) => PullFailureReason::SourceOther,
         }
     }
 }
