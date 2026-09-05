@@ -89,9 +89,11 @@ Setting `"enabled": false` in the config has the same read-path effect as deleti
 
 The status endpoint reports **the node that answered the request**. Counters, queue depth and breaker state are per-node runtime state, so in a distributed deployment query every node; the saved configuration and `updated_at` are cluster-wide.
 
-### Backfill (ships with ODM-12)
+### Backfill
 
-Read-through only migrates what clients touch. The background backfill job walks the source listing and pulls the remainder, with a persisted checkpoint (`.rustfs.sys/buckets/<bucket>/on-demand-migration-backfill.json`), a single-owner lease, resume after restart, and `POST .../{bucket}/backfill?op=start|cancel` plus `GET .../{bucket}/backfill` admin routes. That slice (rustfs/backlog#2159) is not part of the build this page was written against: the shape above is the agreed design, and the exact request/response bodies must be re-checked against `docs/architecture/admin-route-action-snapshot.md` once it lands.
+Backfill waits for the result of every pull, including a pull already queued by an online request. A failed or cancelled shared pull is counted as a failure, never as successful migration. The persisted continuation cursor stays at the first failed page; a takeover replays from there and skips objects already present locally. `completed_with_failures` is not a cutover-ready state.
+
+Read-through only migrates what clients touch. The background backfill job walks the source listing and pulls the remainder, with a persisted checkpoint (`.rustfs.sys/buckets/<bucket>/on-demand-migration-backfill.json`), a single-owner lease, resume after restart, and `POST .../{bucket}/backfill?op=start|cancel` plus `GET .../{bucket}/backfill` admin routes. See `docs/architecture/admin-route-action-snapshot.md` for the route contract.
 
 ## Configuration reference
 
@@ -129,7 +131,7 @@ The persisted blob is `on-demand-migration.json` in the bucket's metadata. Unkno
 | `policy.source_timeout.idle_ms` | integer | `30000` | `100..=600000`; enforced per body chunk on both the background pump and the inline tee |
 | `policy.bandwidth_limit_bytes_per_sec` | integer \| null | `null` | When set, at least `65536` |
 
-Values that are **not** configurable: the breaker opens after 5 consecutive counted failures inside a 30 s window, stays open for 30 s and then admits one probe (`breaker.rs`); the negative cache holds at most 100 000 keys per bucket with LRU eviction (`negative_cache.rs`); a background pull retries a retryable source failure at most 3 times with 1 s / 4 s / 16 s base delays plus up to 25 % jitter (`pull.rs`). The SDK's own retry policy is disabled on the source client, so one logical source call is exactly one wire request and the retry budget above is the only one.
+Values that are **not** configurable: the breaker opens after 5 consecutive counted failures inside a 30 s window, stays open for 30 s and then admits one probe (`breaker.rs`); the negative cache holds at most 100 000 keys per bucket with LRU eviction (`negative_cache.rs`); a background pull retries a retryable source failure at most 3 times with 1 s / 4 s / 16 s base delays plus up to 25 % jitter (`pull.rs`). The SDK's own retry policy is disabled on the source client. Each SDK operation makes one wire request; an ambiguous HEAD 404 additionally probes the bucket, within the same configured first-byte budget.
 
 Validation also rejects two shapes outright: a source whose endpoint and bucket name **this** bucket on this deployment (`SelfReference`), and a source that matches one of the bucket's own replication targets (`ReplicationLoop`) — that pairing would amplify a write-back into a loop.
 
@@ -159,6 +161,14 @@ No write, delete, ACL or versioning permission is required or used. Scope the po
 ## Request semantics
 
 Behaviour a client can observe. The "Test" column names the case that pins it: `*_test.rs` files live under `crates/e2e_test/src/on_demand_migration/`, and the unit tests live next to the code in `rustfs/src/app/object/get.rs`, `head.rs` and `shared.rs`.
+
+ODM merged continuation tokens use a NUL-prefixed JSON envelope inside the existing base64 encoding. NUL is not valid in a local object key, so a legitimate JSON-shaped key can never be mistaken for a merged cursor. Upgrade every node before using list-through, and restart any in-progress ODM listing issued by an older build: its unframed JSON tokens cannot be distinguished from legitimate local keys. Ordinary local listing tokens remain unchanged. Tokens issued by this build can still resume the local side after list-through is disabled.
+
+Source `HEAD` responses with status 404 require a successful bucket probe before being negative-cached. The source credential therefore needs permission for `HeadBucket` (S3 `ListBucket`); a prefix-restricted ListBucket policy can deny that probe, in which case the response is a source failure rather than a cached miss. A missing/inaccessible source bucket, a missing source version, or an ambiguous GET 404 is not proof that the requested key is absent. Conditional GET validators are checked against the actual source GET metadata as well as the advisory HEAD; a missing required validator fails with 424. Source LIST entries without a key or a non-negative size fail the page rather than fabricating an empty object.
+
+Write-back currently requires namespace locking enabled and exactly one pool with one erasure set. Other topologies fail write-back explicitly as `unsupported`: source reads remain available, but backfill cannot complete successfully or certify cutover. This restriction avoids relying on a set-local condition across distinct pool or lock domains; it does not restrict ordinary S3 writes. Full cross-pool migration requires a globally fenced commit protocol.
+
+On the supported topology, write-back uses a create-only check under the local storage commit lock for both single-part PUT and multipart completion. A client write that commits while ODM is reading the source is preserved. With `respect_local_delete_marker=true`, a concurrent versioned deletion is preserved too. An explicit `respect_local_delete_marker=false` still permits revival; an unversioned deletion has no tombstone and therefore cannot be distinguished from a key that has never existed locally.
 
 | Situation | Behaviour | Test |
 |---|---|---|
@@ -229,7 +239,7 @@ Five provenance keys are written on every pulled object under both internal pref
 | Concurrency limit | Local write amplification | `max_concurrent_pulls` permits shared by inline and background pulls |
 | Bounded queue | Unbounded memory on a burst | `pull_queue_capacity` waiting jobs; overflow is counted as `queue_full` and never fails a client response |
 | Bandwidth limit | Source and network saturation | `bandwidth_limit_bytes_per_sec` (minimum 64 KiB/s) on the source client |
-| Retry budget | Transient source blips | Background pulls retry a retryable failure up to 3 times (1 s / 4 s / 16 s plus jitter). Inline pulls never retry: the bytes are already on their way to the client. The SDK retry policy on the source client is disabled (`RemoteS3RetryPolicy::Disabled`), so this is the only retry budget and one logical source call is exactly one wire request — replication targets keep the SDK's three attempts, declared on their own spec |
+| Retry budget | Transient source blips | Background pulls retry a retryable failure up to 3 times (1 s / 4 s / 16 s plus jitter). Inline pulls never retry: the bytes are already on their way to the client. The SDK retry policy is disabled (`RemoteS3RetryPolicy::Disabled`); HEAD 404 also requires one bucket probe. Replication targets keep their separately declared three SDK attempts |
 | Idle timeout | A source that answers and then goes quiet mid-body | `source_timeout.idle_ms` per body chunk on both paths. The budget measures the source read, upstream of the inline tee, so a slow client is never mistaken for an idle source; when it fires the client stream ends in an error and the write-back is discarded |
 | Anti-loop marker | Migration chains between RustFS/MinIO deployments | Every source request carries `x-rustfs-source-proxy-request` and `x-minio-source-proxy-request`; a request carrying it is always answered locally |
 | Outbound endpoint policy | SSRF | See [outbound-connection-policy.md](outbound-connection-policy.md) |

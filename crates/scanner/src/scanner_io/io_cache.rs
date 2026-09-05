@@ -117,6 +117,7 @@ impl ScannerIOCache for SetDisks {
             digest: scan_plan_digest,
             bucket_coverage_digest,
             requires_full_scan,
+            execution_digest,
             leader_epoch,
             tier_registry_generation,
             publication_epoch,
@@ -138,20 +139,24 @@ impl ScannerIOCache for SetDisks {
                 .ok_or_else(|| StorageError::other("scanner cache publication is blocked by data movement"))?,
         };
         let mut old_cache = DataUsageCache::default();
-        if let Err(e) = old_cache.load(self.clone(), DATA_USAGE_CACHE_NAME).await {
-            warn!(
-                target: "rustfs::scanner::io",
-                event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_IO,
-                pool = self.pool_index,
-                set = self.set_index,
-                cache_name = DATA_USAGE_CACHE_NAME,
-                state = "old_cache_load_failed",
-                error = %e,
-                "Scanner old data usage cache load failed; rebuilding from bucket caches"
-            );
-        }
+        let initial_revisions = match old_cache.load_with_revisions(self.clone(), DATA_USAGE_CACHE_NAME).await {
+            Ok(revisions) => Some(revisions),
+            Err(e) => {
+                warn!(
+                    target: "rustfs::scanner::io",
+                    event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_IO,
+                    pool = self.pool_index,
+                    set = self.set_index,
+                    cache_name = DATA_USAGE_CACHE_NAME,
+                    state = "old_cache_load_failed",
+                    error = %e,
+                    "Scanner old data usage cache load failed; rebuilding from bucket caches"
+                );
+                None
+            }
+        };
         let scoped_scan = prepare_scoped_set_scan(
             &old_cache,
             &buckets,
@@ -198,6 +203,7 @@ impl ScannerIOCache for SetDisks {
             };
             cache.info.last_update = Some(now);
             cache.info.snapshot_complete = true;
+            cache.info.scan_execution_digest = Some(execution_digest);
             cache.info.lkg_snapshot_complete = false;
             cache.info.lkg_next_cycle = None;
             cache.info.lkg_last_update = None;
@@ -211,6 +217,7 @@ impl ScannerIOCache for SetDisks {
                 self,
                 &updates,
                 cache,
+                initial_revisions.as_ref(),
                 cache_cycle_floor.as_ref(),
                 expected_publication_epoch,
             )
@@ -1391,6 +1398,7 @@ impl ScannerIOCache for SetDisks {
                 cache.info.next_cycle = want_cycle;
                 cache.info.last_update.get_or_insert_with(SystemTime::now);
                 cache.info.snapshot_complete = true;
+                cache.info.scan_execution_digest = Some(execution_digest);
                 cache.info.lkg_snapshot_complete = false;
                 cache.info.lkg_next_cycle = None;
                 cache.info.lkg_last_update = None;
@@ -1402,6 +1410,7 @@ impl ScannerIOCache for SetDisks {
                 self.clone(),
                 &updates,
                 cache_snapshot,
+                initial_revisions.as_ref(),
                 cache_cycle_floor.as_ref(),
                 expected_publication_epoch,
             )

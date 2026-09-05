@@ -197,7 +197,7 @@ pub(crate) async fn read_config_revision<S: ScannerObjectIO>(store: Arc<S>, path
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DataUsageCacheRevisions {
     main: DataUsageCacheRevision,
     backup: Option<DataUsageCacheRevision>,
@@ -594,6 +594,10 @@ pub struct DataUsageCacheInfo {
     pub lkg_leader_epoch: Option<u64>,
     #[serde(default)]
     pub lkg_scan_plan_digest: Option<DataUsageScanPlanDigest>,
+    /// Activity-sensitive identity for same-cycle set snapshot reuse. The
+    /// structural plan remains reusable across ordinary bucket writes.
+    #[serde(default)]
+    pub scan_execution_digest: Option<DataUsageScanPlanDigest>,
 }
 
 impl Serialize for DataUsageCacheInfo {
@@ -614,7 +618,8 @@ impl Serialize for DataUsageCacheInfo {
             + usize::from(self.lkg_next_cycle.is_some())
             + usize::from(self.lkg_last_update.is_some())
             + usize::from(self.lkg_leader_epoch.is_some())
-            + usize::from(self.lkg_scan_plan_digest.is_some());
+            + usize::from(self.lkg_scan_plan_digest.is_some())
+            + usize::from(self.scan_execution_digest.is_some());
         let mut state = serializer.serialize_map(Some(field_count))?;
         state.serialize_entry("name", &self.name)?;
         state.serialize_entry("next_cycle", &self.next_cycle)?;
@@ -664,6 +669,9 @@ impl Serialize for DataUsageCacheInfo {
         }
         if let Some(scan_plan_digest) = self.lkg_scan_plan_digest {
             state.serialize_entry("lkg_scan_plan_digest", &scan_plan_digest)?;
+        }
+        if let Some(scan_execution_digest) = self.scan_execution_digest {
+            state.serialize_entry("scan_execution_digest", &scan_execution_digest)?;
         }
         state.end()
     }

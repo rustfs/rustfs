@@ -153,8 +153,8 @@ pub struct SourceClientSpec {
     /// Wire requests one logical source call may cost. The pull pipeline and
     /// the backfill job own the retry budget (`pull.rs` `PULL_MAX_RETRIES`,
     /// `backfill.rs` `LIST_MAX_RETRIES`) and the breaker counts logical calls,
-    /// so ODM declares [`RemoteS3RetryPolicy::Disabled`] and keeps one counted
-    /// failure equal to one request against a struggling source.
+    /// so ODM declares [`RemoteS3RetryPolicy::Disabled`]. An ambiguous HEAD
+    /// 404 additionally probes the bucket before declaring a key absent.
     pub retry: RemoteS3RetryPolicy,
     /// Bytes per second the pull pipeline may consume from this source;
     /// `None` means unlimited. Enforced by the consumer, not by this client.
@@ -262,7 +262,7 @@ const THROTTLE_CODES: &[&str] = &[
     "TooManyRequests",
     "RequestThrottled",
 ];
-const NOT_FOUND_CODES: &[&str] = &["NoSuchKey", "NotFound", "NoSuchBucket", "NoSuchVersion"];
+const NOT_FOUND_CODES: &[&str] = &["NoSuchKey"];
 const ACCESS_DENIED_CODES: &[&str] = &[
     "AccessDenied",
     "InvalidAccessKeyId",
@@ -285,7 +285,6 @@ fn classify_status(status: u16, code: Option<&str>, message: String) -> SourceEr
         }
     }
     match status {
-        404 => SourceError::NotFound,
         401 | 403 => SourceError::AccessDenied,
         429 | 503 => SourceError::Throttled,
         500..=599 => SourceError::ServerError(status),
@@ -631,8 +630,7 @@ impl SourceClient {
     }
 
     /// `config` must come from [`SourceClientSpec::endpoint_spec`], which is
-    /// where the retry policy that keeps one logical call equal to one wire
-    /// request is declared.
+    /// where the policy disabling SDK-level retries is declared.
     fn from_config_builder(config: aws_sdk_s3::config::Builder, endpoint: String, spec: &SourceClientSpec) -> Self {
         let client = S3Client::from_conf(config.interceptor(SourceProxyMarkerInterceptor::new()).build());
         Self {
@@ -754,15 +752,16 @@ impl SourceClient {
 #[async_trait::async_trait]
 impl SourceBackend for S3SourceBackend {
     async fn head(&self, key: &str) -> Result<SourceHead, SourceError> {
-        let output = self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(classify_sdk_error)?;
-        source_head_from_head_output(output)
+        match self.client.head_object().bucket(&self.bucket).key(key).send().await {
+            Ok(output) => source_head_from_head_output(output),
+            Err(err) if err.raw_response().is_some_and(|response| response.status().as_u16() == 404) => {
+                // HEAD has no error body: a missing bucket must not poison
+                // the per-key negative cache as though only the key was absent.
+                self.probe().await?;
+                Err(SourceError::NotFound)
+            }
+            Err(err) => Err(classify_sdk_error(err)),
+        }
     }
 
     /// Streams the object; `range` is passed through as an HTTP `Range`
@@ -809,8 +808,8 @@ impl SourceBackend for S3SourceBackend {
             .contents
             .unwrap_or_default()
             .into_iter()
-            .filter_map(s3_source_object)
-            .collect();
+            .map(s3_source_object)
+            .collect::<Result<Vec<_>, _>>()?;
         let common_prefixes = output
             .common_prefixes
             .unwrap_or_default()
@@ -849,14 +848,20 @@ impl SourceBackend for S3SourceBackend {
     }
 }
 
-fn s3_source_object(object: SdkObject) -> Option<SourceObject> {
-    let key = object.key?;
+fn s3_source_object(object: SdkObject) -> Result<SourceObject, SourceError> {
+    let key = object
+        .key
+        .ok_or_else(|| SourceError::Other("source listing object has no key".to_string()))?;
+    let size = object
+        .size
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or_else(|| SourceError::Other("source listing object has no valid size".to_string()))?;
     let etag = normalize_etag(object.e_tag);
     let is_multipart_etag = etag.as_deref().is_some_and(is_multipart_etag);
-    Some(SourceObject {
+    Ok(SourceObject {
         key,
         etag,
-        size: object.size.and_then(|size| u64::try_from(size).ok()).unwrap_or(0),
+        size,
         last_modified: system_time(object.last_modified),
         storage_class: object.storage_class.map(|class| class.as_str().to_string()),
         is_multipart_etag,
@@ -1489,7 +1494,10 @@ mod tests {
     #[tokio::test]
     async fn source_error_classification_covers_every_class() {
         let cases: Vec<(Scripted, &str, bool)> = vec![
-            (status(404, ""), "not_found", false),
+            (status(404, ""), "other", false),
+            (status(404, "<Error><Code>NoSuchKey</Code></Error>"), "not_found", false),
+            (status(404, "<Error><Code>NoSuchBucket</Code></Error>"), "other", false),
+            (status(404, "<Error><Code>NoSuchVersion</Code></Error>"), "other", false),
             (status(403, ACCESS_DENIED_BODY), "access_denied", false),
             (status(401, ""), "access_denied", false),
             (status(429, ""), "throttled", true),
@@ -1512,12 +1520,33 @@ mod tests {
             }
         }
 
-        // HEAD carries no error body, so the classification must work from the
-        // status alone as well.
-        let (client, _) = scripted_client(&spec(None), vec![status(404, "")]).await;
+        let (client, requests) = scripted_client(&spec(None), vec![status(404, ""), status(200, "")]).await;
         assert!(matches!(client.head_object("missing").await, Err(SourceError::NotFound)));
+        assert_eq!(recorded(&requests).len(), 2, "ambiguous HEAD 404 must check the bucket");
+        let (client, _) = scripted_client(&spec(None), vec![status(404, ""), status(404, "")]).await;
+        assert!(matches!(client.head_object("missing").await, Err(SourceError::Other(_))));
+        let (client, _) = scripted_client(&spec(None), vec![status(404, ""), status(403, "")]).await;
+        assert!(matches!(client.head_object("missing").await, Err(SourceError::AccessDenied)));
         let (client, _) = scripted_client(&spec(None), vec![status(403, "")]).await;
         assert!(matches!(client.head_object("secret").await, Err(SourceError::AccessDenied)));
+    }
+
+    #[test]
+    fn source_listing_rejects_missing_and_negative_sizes() {
+        for size in [None, Some(-1)] {
+            let object = SdkObject::builder().key("key").set_size(size).build();
+            assert!(matches!(s3_source_object(object), Err(SourceError::Other(_))));
+        }
+        assert!(matches!(
+            s3_source_object(SdkObject::builder().size(0).build()),
+            Err(SourceError::Other(_))
+        ));
+        assert_eq!(
+            s3_source_object(SdkObject::builder().key("empty").size(0).build())
+                .expect("empty object")
+                .size,
+            0
+        );
     }
 
     #[tokio::test]

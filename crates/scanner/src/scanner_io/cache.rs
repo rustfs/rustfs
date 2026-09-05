@@ -682,11 +682,13 @@ pub(super) async fn persist_and_publish_cache_snapshot(
     store: Arc<SetDisks>,
     updates: &mpsc::Sender<DataUsageCache>,
     mut cache_snapshot: DataUsageCache,
+    initial_revisions: Option<&DataUsageCacheRevisions>,
     cache_cycle_floor: &AtomicU64,
     expected_publication_epoch: u64,
 ) -> Option<SystemTime> {
     let source = cache_snapshot.info.source?;
     let coverage_digest = cache_snapshot.info.scan_coverage_digest?;
+    let execution_digest = cache_snapshot.info.scan_execution_digest?;
     let guard = match acquire_scanner_cache_locks(store.as_ref(), DATA_USAGE_CACHE_NAME, source).await {
         Ok(guard) => guard,
         Err(err) => {
@@ -752,6 +754,7 @@ pub(super) async fn persist_and_publish_cache_snapshot(
         return None;
     }
     if persisted.info.scan_coverage_digest == Some(coverage_digest)
+        && persisted.info.scan_execution_digest == Some(execution_digest)
         && matches!(
             current_cache_root_entry_with_generation(
                 &persisted,
@@ -767,6 +770,20 @@ pub(super) async fn persist_and_publish_cache_snapshot(
     {
         cache_snapshot = persisted;
     } else {
+        // A later execution may have completed while this scan was walking.
+        // Only replace the cache revision from which this scan started.
+        if initial_revisions != Some(&revisions) {
+            warn!(
+                target: "rustfs::scanner::io",
+                event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_IO,
+                state = "scan_baseline_revision_changed",
+                cache_name = DATA_USAGE_CACHE_NAME,
+                "Scanner skipped set snapshot without an unchanged baseline revision"
+            );
+            return None;
+        }
         if guard.is_lock_lost() {
             error!(
                 target: "rustfs::scanner::io",

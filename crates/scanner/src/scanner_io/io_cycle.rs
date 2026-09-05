@@ -194,7 +194,7 @@ where
     // canceled decommission remains suspended after its worker exits, so
     // starting a scan in that state could build a snapshot that cannot be
     // routed to the authoritative metadata object.
-    if store.scanner_data_usage_publication_blocked().await {
+    if store.scanner_data_movement_pause_status().await.paused {
         debug!(
             target: "rustfs::scanner::io",
             event = EVENT_SCANNER_SET_STATE,
@@ -278,8 +278,9 @@ where
     let structural_scan_plan_digest =
         scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_structural_digest(&activity_before));
     let scan_plan_digest = scanner_bucket_work_digest(structural_scan_plan_digest, scan_mode, requires_full_scan);
-    let bucket_coverage_digest =
-        scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_snapshot_digest(&activity_before));
+    let activity_digest = crate::scanner::scanner_activity_snapshot_digest(&activity_before);
+    let bucket_coverage_digest = scanner_bucket_plan_digest(&all_buckets, activity_digest);
+    let execution_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
     let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets(&all_buckets, dirty_generation_before_bucket_list));
     let scan_scope = resolve_scanner_bucket_scan_scope(
         store,
@@ -349,6 +350,7 @@ where
         };
         return Ok(ScannerCycleResult::new(status, dirty_usage_clear)
             .with_publication_epoch(publication_epoch)
+            .with_activity_digest(activity_digest)
             .with_observational_snapshot_published(observational_snapshot_published)
             .with_remote_publication_lease_targets(remote_publication_lease_targets)
             .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements));
@@ -435,6 +437,7 @@ where
             digest: structural_scan_plan_digest,
             bucket_coverage_digest,
             requires_full_scan,
+            execution_digest,
             leader_epoch,
             tier_registry_generation,
             publication_epoch,
@@ -632,6 +635,7 @@ where
     };
     Ok(ScannerCycleResult::new(cycle_status, dirty_usage_clear)
         .with_publication_epoch(publication_epoch)
+        .with_activity_digest(activity_digest)
         .with_observational_snapshot_published(observational_snapshot_published)
         .with_remote_publication_lease_targets(remote_publication_lease_targets)
         .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)

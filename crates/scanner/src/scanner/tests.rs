@@ -15,7 +15,8 @@
 use super::heal_info::{classify_background_heal_read_error, decode_background_heal_info};
 use super::*;
 use crate::EcstoreResult;
-use crate::storage_api::scan::BucketOperations as _;
+use crate::storage_api::owner::ecstore_hold_namespace_commit;
+use crate::storage_api::scan::{BucketOperations as _, ObjectIO as _};
 use crate::{
     DATA_USAGE_BLOOM_RECOVERY_PATH, DATA_USAGE_CACHE_KEY_FORMAT, DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT,
     DataUsageCachePrepareOutcome, DataUsageCacheSource, DataUsageEntry, DataUsageScanPlanDigest, Endpoint, EndpointServerPools,
@@ -1163,6 +1164,116 @@ async fn run_data_scanner_cycle_publishes_activity_for_owner_lifetime() {
     assert!(!global_metrics().report().await.current_cycle_active);
 
     global_metrics().set_cycle(None).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledging_usage() {
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let bucket = format!("scanner-coordinator-pending-{}", Uuid::new_v4().simple());
+    store
+        .make_bucket(&bucket, &crate::storage_api::scan::MakeBucketOptions::default())
+        .await
+        .expect("fixture bucket should be created");
+    let mut reader = PutObjReader::from_vec(b"first".to_vec());
+    store.pools[0].disk_set[0]
+        .put_object(
+            &bucket,
+            "object",
+            &mut reader,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("fixture object should finish its rename fanout");
+    crate::scanner_io::record_dirty_usage_bucket(&bucket);
+    let dirty_before = crate::scanner_io::dirty_usage_buckets_for_tests();
+    let baseline = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("fixture usage baseline should be readable");
+    let pending = ecstore_hold_namespace_commit(store.as_ref());
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default());
+    let mut cycle_info = CurrentCycle {
+        next: 1,
+        ..Default::default()
+    };
+    let mut revision = DataUsageCacheRevision::Missing;
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        run_data_scanner_cycle_with_budget(&ctx, &store, &mut cycle_info, &mut revision, 1, Arc::clone(&budget), true),
+    )
+    .await
+    .expect("the coordinator must finish its namespace walk while a PUT is pending");
+    assert_eq!(budget.progress().0, 1, "the coordinator must reach actual object traversal");
+    assert_eq!(outcome, ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
+    assert_eq!(cycle_info.next, 1, "a rejected publication must not advance the cycle");
+    assert_eq!(revision, DataUsageCacheRevision::Missing);
+    assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
+    assert_eq!(
+        read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .expect("the prior authoritative usage must remain readable"),
+        baseline,
+        "the pending candidate must not replace the authoritative baseline"
+    );
+
+    let committed_body = b"committed-after-walk";
+    let mut reader = PutObjReader::from_vec(committed_body.to_vec());
+    store.pools[0].disk_set[0]
+        .put_object(
+            &bucket,
+            "object",
+            &mut reader,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the pending tail must change the physical object before it drains");
+    assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
+    drop(pending);
+    let retry_budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default());
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        run_data_scanner_cycle_with_budget(&ctx, &store, &mut cycle_info, &mut revision, 1, Arc::clone(&retry_budget), true),
+    )
+    .await
+    .expect("the same cycle must converge after the pending PUT drains");
+    assert_eq!(
+        retry_budget.progress().0,
+        1,
+        "the same-cycle retry must not reuse the pre-tail bucket cache"
+    );
+    assert!(matches!(
+        outcome,
+        ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
+    ));
+    assert_eq!(cycle_info.next, 2);
+    assert!(!crate::scanner_io::dirty_usage_buckets_for_tests().contains_key(&bucket));
+    let usage = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("the converged usage should be persisted");
+    let usage: DataUsageInfo = serde_json::from_slice(&usage).expect("the persisted usage should decode");
+    assert_eq!(usage.usage_snapshot_converged, Some(true));
+    assert_eq!(usage.scanner_cycle, Some(1));
+    assert_eq!(usage.objects_total_count, 1);
+    assert_eq!(
+        usage.objects_total_size,
+        u64::try_from(committed_body.len()).expect("fixture body length")
+    );
+    let bucket_usage = usage
+        .buckets_usage
+        .get(&bucket)
+        .expect("the scanned bucket should be published");
+    assert_eq!(bucket_usage.objects_count, 1);
+    assert_eq!(bucket_usage.size, u64::try_from(committed_body.len()).expect("fixture body length"));
+    global_metrics().set_cycle(None).await;
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
 }
 
 #[tokio::test]
@@ -8640,6 +8751,66 @@ fn scoped_scan_remote_dirty_coverage_invalidates_local_bucket_current() {
             ..
         }
     ));
+}
+
+#[test]
+fn post_lease_activity_proof_rejects_a_put_tail_that_finished_before_lease_acquisition() {
+    let before = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+    let expected_digest = Some(scanner_activity_snapshot_digest(&before));
+    assert_eq!(scanner_post_lease_activity_defer_reason(expected_digest, Ok(before.clone())), None);
+
+    let mut after = before.clone();
+    after
+        .get_mut("node-2")
+        .expect("writer should be present")
+        .namespace_generation += 1;
+    assert_eq!(
+        before["node-2"].movement_generation, after["node-2"].movement_generation,
+        "the existing movement-only lease remains valid after a PUT tail drains"
+    );
+    assert!(scanner_activity_allows_usage_publication(&after));
+    let reason = scanner_post_lease_activity_defer_reason(expected_digest, Ok(after));
+    assert_eq!(reason, Some(ScannerCycleDeferReason::ActivityBaselineUnavailable));
+
+    let result = ScannerCycleResult::new(ScannerCycleStatus::Complete, None).with_remote_dirty_usage_acknowledgements(vec![
+        ScannerDirtyUsageAcknowledgement {
+            host: "node-2".to_string(),
+            instance_id: "epoch-a".to_string(),
+            generation: 5,
+        },
+    ]);
+    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(
+        result,
+        DataUsagePersistOutcome::Deferred(reason.expect("changed namespace should defer publication")),
+    );
+    assert_eq!(
+        outcome,
+        ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+    );
+    assert!(
+        acknowledgements.is_empty(),
+        "a rejected publication must not acknowledge the peer's dirty usage"
+    );
+}
+
+#[test]
+fn post_lease_activity_proof_requires_a_complete_matching_baseline() {
+    let before = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+    let digest = scanner_activity_snapshot_digest(&before);
+    let mut blocked = before.clone();
+    blocked.get_mut("node-2").expect("peer should be present").publication_blocked = true;
+    let blocked_digest = scanner_activity_snapshot_digest(&blocked);
+    for (expected, observed) in [
+        (None, Ok(before)),
+        (Some(digest), Err("peer is unavailable".to_string())),
+        (Some(digest), Ok(BTreeMap::new())),
+        (Some(blocked_digest), Ok(blocked)),
+    ] {
+        assert_eq!(
+            scanner_post_lease_activity_defer_reason(expected, observed),
+            Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        );
+    }
 }
 
 #[test]
