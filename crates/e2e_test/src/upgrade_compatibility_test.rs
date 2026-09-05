@@ -15,7 +15,8 @@
 use crate::common::{
     RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request, init_logging, replication_fast_env, rustfs_binary_path,
 };
-use crate::fake_s3_target::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target};
+use crate::fake_s3_target::{BucketMode, FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target};
+use crate::on_demand_migration::common::{ODM_SERVER_ENV, OdmTestEnv, SeedObject};
 use crate::replication_extension_test::{
     LOOPBACK_REPLICATION_TARGET_ENV, ReplicationTargetOptions, put_bucket_replication, set_replication_target_with_options,
 };
@@ -38,6 +39,7 @@ type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const SOURCE_BINARY_ENV: &str = "RUSTFS_UPGRADE_SOURCE_BINARY";
+const RC5_COMMIT: &str = "40a2470feb567201165a5b809b7598bb4b1f68f5";
 const SSE_MASTER_KEY_ENV: &str = "RUSTFS_SSE_S3_MASTER_KEY";
 const SSE_MASTER_KEY: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
 const PLAIN_BUCKET: &str = "upgrade-plain-data";
@@ -274,6 +276,93 @@ async fn exercise_mixed_cluster(
         vec![u8::try_from(MULTIPART_WORKERS - 1)?; 64 * 1024]
     );
 
+    Ok(())
+}
+
+/// Pins the published old writer's limitation and the supported recovery
+/// procedure. This is not a promise that mixed-version ODM is supported.
+/// Replace the loss assertion when ODM gains independent persistence;
+/// preserving configuration across rc.5 writes is then an improvement.
+#[tokio::test]
+#[ignore = "requires the pinned 1.0.0-rc.5 release binary"]
+async fn rc5_rollback_requires_restoring_odm_configuration() -> TestResult {
+    init_logging();
+    let previous_binary = source_binary()?;
+    let version = tokio::process::Command::new(&previous_binary)
+        .arg("--version")
+        .output()
+        .await?;
+    assert!(version.status.success(), "previous binary must report its version");
+    assert!(
+        String::from_utf8(version.stdout)?.contains(RC5_COMMIT),
+        "this compatibility scenario requires the published rc.5 writer"
+    );
+    let mut env = OdmTestEnv::start().await?;
+    let bucket = "odm-rc5-rollback";
+    let source_bucket = "odm-rc5-source";
+    env.source.create_bucket_with_mode(source_bucket, BucketMode::Unversioned);
+    env.seed_source(
+        source_bucket,
+        &[SeedObject::new(
+            "source-only",
+            bytes::Bytes::from_static(b"source read after recovery"),
+        )],
+    );
+    env.rustfs.create_test_bucket(bucket).await?;
+    let saved_config = env.fake_source_spec(source_bucket);
+    assert_eq!(env.configure_source(bucket, &saved_config).await?.status, 200);
+    let before = env.get_config(bucket).await?;
+    assert_eq!(before.status, 200);
+    let expected_config = before
+        .json()?
+        .get("config")
+        .cloned()
+        .ok_or("configuration response omitted config")?;
+    env.client
+        .put_object()
+        .bucket(bucket)
+        .key("local")
+        .body(ByteStream::from_static(b"local data survives rollback"))
+        .send()
+        .await?;
+    env.rustfs.restart_server_preserving_data(vec![], ODM_SERVER_ENV).await?;
+    let restarted = env.get_config(bucket).await?;
+    assert_eq!(restarted.status, 200, "a current writer preserves ODM across restart");
+    assert_eq!(restarted.json()?.get("config"), Some(&expected_config));
+
+    restart_from_binary(&mut env.rustfs, &previous_binary, &[]).await?;
+    env.client
+        .put_bucket_tagging()
+        .bucket(bucket)
+        .tagging(
+            Tagging::builder()
+                .tag_set(Tag::builder().key("writer").value("rc5").build()?)
+                .build()?,
+        )
+        .send()
+        .await?;
+    env.rustfs.restart_server_preserving_data(vec![], ODM_SERVER_ENV).await?;
+    let missing = env.get_config(bucket).await?;
+    assert_eq!(missing.status, 404, "rc.5 rewrites metadata without ODM keys");
+    assert!(missing.body.contains("NoSuchConfiguration"));
+    assert_eq!(read_object(&env.client, bucket, "local", None).await?.1, b"local data survives rollback");
+    let tags = env.client.get_bucket_tagging().bucket(bucket).send().await?;
+    assert!(tags.tag_set().iter().any(|tag| tag.key() == "writer" && tag.value() == "rc5"));
+
+    assert_eq!(
+        env.configure_source(bucket, &saved_config).await?.status,
+        200,
+        "restore from saved full configuration"
+    );
+    env.rustfs.restart_server_preserving_data(vec![], ODM_SERVER_ENV).await?;
+    let restored = env.get_config(bucket).await?;
+    assert_eq!(restored.status, 200, "restored ODM configuration persists");
+    assert_eq!(restored.json()?.get("config"), Some(&expected_config));
+    env.wait_until_source_consulted(bucket).await?;
+    assert_eq!(
+        read_object(&env.client, bucket, "source-only", None).await?.1,
+        b"source read after recovery"
+    );
     Ok(())
 }
 
