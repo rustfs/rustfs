@@ -103,14 +103,20 @@ The persisted blob is `on-demand-migration.json` in the bucket's metadata. Unkno
 |---|---|---|---|
 | `version` | integer | `1` | Must be `1` |
 | `enabled` | bool | `true` | `false` keeps the config but stops all source traffic |
-| `source.provider` | `s3` \| `aws` \| `minio` \| `rustfs` \| `r2` \| `gcs` | — (required) | Drives endpoint and addressing defaults |
-| `source.endpoint` | string \| null | — | `http(s)://host[:port]`, no path, query, fragment or userinfo. Required for every provider except `aws`, where it is derived from `region` |
-| `source.region` | string | — (required) | Non-empty. `auto` is accepted only for `r2`, `minio`, `rustfs` and is signed as `us-east-1` |
-| `source.bucket` | string | — (required) | Non-empty, no `/` and no whitespace |
+| `source.provider` | `s3` \| `aws` \| `minio` \| `rustfs` \| `r2` \| `gcs` \| `azure` \| `gcs_native` | — (required) | Drives endpoint and addressing defaults, and which backend the client builds: every value but `azure` and `gcs_native` speaks S3 |
+| `source.endpoint` | string \| null | — | `http(s)://host[:port]`, no path, query, fragment or userinfo. Required except for `aws` (derived from `region`), `azure` (derived as `https://<account>.blob.core.windows.net`) and `gcs_native` (`https://storage.googleapis.com`). Set it explicitly to point at Azurite or fake-gcs-server, subject to the same outbound policy as any other source endpoint |
+| `source.region` | string | — (required) | Non-empty. `auto` is accepted for `r2`, `minio`, `rustfs` and for the native providers, and is signed as `us-east-1`. `azure` and `gcs_native` never sign with a region, so `auto` is the honest value there |
+| `source.bucket` | string | — (required) | Non-empty, no `/` and no whitespace. For `azure` this is the container name, for `gcs_native` the bucket name; the provider block never repeats it |
 | `source.path_style` | `auto` \| `path` \| `virtual` | `auto` | `auto` resolves to path-style for IP-literal or `localhost` endpoints and for `s3`/`minio`/`rustfs`; virtual-host for `aws`/`gcs`/`r2` |
-| `source.credentials` | object \| null | `null` | `null` means anonymous, which the client builder does not support yet: the admin `PUT` refuses it with `InvalidArgument`, and a config that reached the metadata another way resolves as unavailable. `access_key` and `secret_key` must be non-empty; `session_token` is optional but must be non-empty when present |
+| `source.credentials` | object \| null | `null` | Read only by the S3 providers; `azure` and `gcs_native` must leave it `null` and carry their credentials in their own block. `null` means anonymous, which the client builder does not support yet: the admin `PUT` refuses it with `InvalidArgument`, and a config that reached the metadata another way resolves as unavailable. `access_key` and `secret_key` must be non-empty; `session_token` is optional but must be non-empty when present |
 | `source.tls.skip_verify` | bool | `false` | Disables certificate verification for the source connection |
 | `source.tls.ca_cert_pem` | string \| null | `null` | Must contain `-----BEGIN CERTIFICATE-----` |
+| `source.azure` | object \| null | `null` | Required for `provider = "azure"` and rejected for every other provider |
+| `source.azure.account` | string | — (required) | Storage account name; `[A-Za-z0-9-]` only, because it becomes the first label of the derived host |
+| `source.azure.account_key` | string \| null | `null` | Base64 storage-account key, signed per request with Shared Key. Mutually exclusive with `sas_token`; exactly one of the two is required |
+| `source.azure.sas_token` | string \| null | `null` | SAS query string without the leading `?` and without whitespace, appended to every request URL |
+| `source.gcs` | object \| null | `null` | Required for `provider = "gcs_native"` and rejected for every other provider |
+| `source.gcs.service_account_json` | string | — (required) | Service-account key JSON; must parse and carry `type: service_account`, `client_email` and `private_key`. Tokens are minted read-only (`devstorage.read_only`) |
 | `filter.prefix` | string \| null | `null` | Null or non-empty. Only local keys with this prefix consult the source |
 | `filter.source_prefix` | string \| null | `null` | Null or non-empty. Prepended to the local key to form the source key |
 | `policy.head` | `proxy` \| `local_only` | `proxy` | `local_only` answers a HEAD miss with 404 and no source traffic |
@@ -119,7 +125,7 @@ The persisted blob is `on-demand-migration.json` in the bucket's metadata. Unkno
 | `policy.list_through` | bool | `false` | Merges the source listing into `ListObjectsV2` so clients see the whole namespace during the migration. Off by default: it puts the source in the path of every listing |
 | `policy.respect_local_delete_marker` | bool | `true` | A local delete marker is the final answer; only a versioned bucket can produce one |
 | `policy.preserve_etag` | bool | `true` | Keeps the source ETag on the stored object unless the bucket encrypts by default |
-| `policy.copy_tags` | bool | `false` | Copies source object tags; needs `s3:GetObjectTagging` and costs one extra source call per inline pull |
+| `policy.copy_tags` | bool | `false` | Copies source object tags; needs `s3:GetObjectTagging` and costs one extra source call per inline pull. `azure` reads blob tags instead; `gcs_native` has no tags and always finds none |
 | `policy.emit_events` | bool | `true` | Whether a write-back emits `ObjectCreated` notifications |
 | `policy.negative_cache_ttl_secs` | integer | `30` | `0..=3600`; `0` disables the negative cache |
 | `policy.inline_max_bytes` | integer | `16777216` (16 MiB) | `0..=268435456` (256 MiB). At or below this size a GET miss is teed inline; above it the response streams through and a background pull stores the object |
@@ -145,8 +151,14 @@ Validation also rejects two shapes outright: a source whose endpoint and bucket 
 | `rustfs` | Required | Path-style | `auto` allowed | A RustFS source answers the migration request locally thanks to the anti-loop marker | `real_source_test.rs` in the `e2e-nightly` lane |
 | `r2` | `https://<account-id>.r2.cloudflarestorage.com` | Virtual-host | `auto` allowed (signed as `us-east-1`) | | `cloud-source (r2)`, only while `ODM_INTEROP_R2_*` are configured; no difference recorded yet |
 | `gcs` | `https://storage.googleapis.com` | Virtual-host | Real region required | Uses the GCS XML interoperability API with an HMAC key pair, not a service-account JSON key | `cloud-source (gcs)`, only while `ODM_INTEROP_GCS_HMAC_*` are configured; no difference recorded yet |
+| `azure` | Optional; derived as `https://<account>.blob.core.windows.net` | Native Blob REST, not S3 | Unused; write `auto` | Needs `source.azure`; the container is `source.bucket`. Reads need `Read` on the blob and `List` on the container, plus `Tags` when `policy.copy_tags` is on | None yet: no interop job covers Azure |
+| `gcs_native` | Optional; derived as `https://storage.googleapis.com` | Native GCS API, not S3 | Unused; write `auto` | Needs `source.gcs`. Reads use the XML API for objects and `objects.list` for listings, both with an OAuth token minted from the service-account key; the key needs `storage.objects.get` and `storage.objects.list` | None yet: no interop job covers native GCS |
 
-Azure Blob has no preset; a native provider is deferred (rustfs/backlog#2166).
+Every backend answers the same trait contract, pinned by `backend_contract.rs` in `crates/ecstore/src/bucket/on_demand_migration/`, and the three differences that contract allows are the ones documented here.
+
+`azure` differs in two of them. Its ETag is a concurrency token rather than a digest of the bytes, so it is stored as `odm-source-etag` provenance and never used as the expected MD5 of a pulled object — the write-back integrity check falls back to the local digest. And its listing paginates only with an opaque marker: there is no "start after this key" form, so a caller that asks for one gets `Unsupported` instead of a listing that silently starts over.
+
+`gcs_native` differs in the other two. Its listing also has no exclusive "start after" form (`startOffset` is inclusive), so it refuses one the same way. And GCS has no object tagging at all: `policy.copy_tags` finds no tags rather than failing the pull, because GCS custom metadata is already carried by the head mapping. Its ETag is normally usable: the `x-goog-hash` MD5 is converted to hex and checked against the pulled bytes, except on a composite object, which has no MD5 and whose ETag is then treated as opaque.
 
 The "Interop evidence" column names the job in `.github/workflows/on-demand-migration-interop.yml` (rustfs/backlog#2167) that last exercised the preset against a real implementation, and is where a provider difference belongs once the lane finds one. That lane is report-only and scheduled: it runs `crates/e2e_test/src/on_demand_migration/interop_test.rs` — the same case bodies as the merge-gate suite, with the source injected through `RUSTFS_ODM_INTEROP_*` — against a pinned MinIO container, and against each cloud provider whose repository secrets are configured. A provider without secrets is skipped with a note in the run summary rather than failing, so "no difference recorded yet" means exactly that and not "verified clean"; see [ci-gates.md](../testing/ci-gates.md) for the row.
 
