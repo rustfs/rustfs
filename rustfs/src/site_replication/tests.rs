@@ -1679,7 +1679,8 @@ fn test_site_replication_bootstrap_plan_includes_replayable_snapshot_items() {
         },
     );
 
-    let plan = site_replication_bootstrap_plan(&info).expect("bootstrap plan should build");
+    let plan =
+        site_replication_bootstrap_plan(&info, &SiteReplicationIamCredentials::default()).expect("bootstrap plan should build");
 
     assert_eq!(plan.iam_items.iter().map(|item| item.r#type.as_str()).collect::<Vec<_>>(), {
         vec!["policy", "iam-user", "group-info", "policy-mapping"]
@@ -1717,7 +1718,8 @@ fn test_site_replication_bootstrap_plan_skips_lifecycle_by_default() {
         },
     );
 
-    let plan = site_replication_bootstrap_plan(&info).expect("bootstrap plan should build");
+    let plan =
+        site_replication_bootstrap_plan(&info, &SiteReplicationIamCredentials::default()).expect("bootstrap plan should build");
 
     assert!(!plan.bucket_items.iter().any(|item| item.r#type == "lc-config"));
 }
@@ -1748,7 +1750,8 @@ fn test_site_replication_bootstrap_plan_emits_timestamped_lifecycle_delete() {
         },
     );
 
-    let plan = site_replication_bootstrap_plan(&info).expect("bootstrap plan should build");
+    let plan =
+        site_replication_bootstrap_plan(&info, &SiteReplicationIamCredentials::default()).expect("bootstrap plan should build");
 
     let item = plan
         .bucket_items
@@ -1935,8 +1938,8 @@ fn test_site_replication_repair_preflight_token_is_deterministic_for_equal_state
         },
     );
 
-    let plan_a = site_replication_bootstrap_plan(&info).expect("first plan");
-    let plan_b = site_replication_bootstrap_plan(&info).expect("second plan");
+    let plan_a = site_replication_bootstrap_plan(&info, &SiteReplicationIamCredentials::default()).expect("first plan");
+    let plan_b = site_replication_bootstrap_plan(&info, &SiteReplicationIamCredentials::default()).expect("second plan");
     let token_a = site_replication_repair_preflight_token(&state, &plan_a, b"test-signing-key").expect("first token");
     let token_b = site_replication_repair_preflight_token(&state, &plan_b, b"test-signing-key").expect("second token");
 
@@ -3218,4 +3221,149 @@ fn test_reconcile_adds_missing_peer_rules_to_existing_config() {
     let rule_ids: Vec<&str> = existing_rules.iter().filter_map(|r| r.id.as_deref()).collect();
     assert!(rule_ids.contains(&"site-repl-dep-b"));
     assert!(rule_ids.contains(&"site-repl-dep-c"));
+}
+
+/// backlog#2289: the IAM snapshot (retry resend, repair, site-add bootstrap)
+/// used to be built from `list_users`, whose `UserInfo` never carries a
+/// secret key, so the plan dropped every user and a status change or secret
+/// rotation committed while a peer was unreachable never reached it. The
+/// credentials now come from a separate store read; SRInfo stays secret-free.
+#[test]
+fn test_bootstrap_plan_carries_users_from_the_credential_snapshot() {
+    let mut info = SRInfo::default();
+    // Exactly what `list_users` builds: status, policy, updated_at — never secret_key.
+    info.user_info_map.insert(
+        "alice".to_string(),
+        rustfs_madmin::UserInfo {
+            status: rustfs_madmin::AccountStatus::Disabled,
+            policy_name: Some("readwrite".to_string()),
+            updated_at: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp")),
+            ..Default::default()
+        },
+    );
+    info.user_info_map.insert(
+        "external-idp-user".to_string(),
+        rustfs_madmin::UserInfo {
+            status: rustfs_madmin::AccountStatus::Enabled,
+            ..Default::default()
+        },
+    );
+    let user_updated_at = OffsetDateTime::from_unix_timestamp(1_700_000_500).expect("timestamp");
+    let mut credentials = SiteReplicationIamCredentials::default();
+    credentials.users.insert(
+        "alice".to_string(),
+        SiteReplicationUserCredential {
+            secret_key: "alice-secret".to_string(),
+            status: rustfs_madmin::AccountStatus::Disabled,
+            updated_at: Some(user_updated_at),
+        },
+    );
+
+    let plan = site_replication_bootstrap_plan(&info, &credentials).expect("bootstrap plan should build");
+
+    let users: Vec<_> = plan.iam_items.iter().filter(|item| item.r#type == "iam-user").collect();
+    assert_eq!(users.len(), 1, "only the user with a credential travels: {:?}", plan.iam_items);
+    let alice = users[0].iam_user.as_ref().expect("iam user body");
+    assert_eq!(alice.access_key, "alice");
+    let req = alice.user_req.as_ref().expect("user request");
+    assert_eq!(req.secret_key, "alice-secret");
+    assert_eq!(req.status, rustfs_madmin::AccountStatus::Disabled);
+    assert_eq!(req.policy.as_deref(), Some("readwrite"));
+    // the user record's own axis, not the policy-mapping time list_users reports
+    assert_eq!(users[0].updated_at, Some(user_updated_at));
+}
+
+fn service_account_snapshot(access_key: &str, parent: &str, status: &str) -> SiteReplicationServiceAccountSnapshot {
+    SiteReplicationServiceAccountSnapshot {
+        create: rustfs_madmin::SRSvcAccCreate {
+            parent: parent.to_string(),
+            access_key: access_key.to_string(),
+            secret_key: format!("{access_key}-secret"),
+            groups: Vec::new(),
+            claims: HashMap::new(),
+            session_policy: SRSessionPolicy::default(),
+            status: status.to_string(),
+            name: String::new(),
+            description: String::new(),
+            expiration: None,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        },
+        envelope: None,
+        updated_at: Some(OffsetDateTime::from_unix_timestamp(1_700_000_600).expect("timestamp")),
+    }
+}
+
+/// backlog#2289: service accounts were absent from every snapshot (the
+/// listing filters them). They now travel as the create item the live hook
+/// emits — after their parents — carrying secret and status.
+#[test]
+fn test_bootstrap_plan_emits_service_accounts_after_their_parents() {
+    let mut info = SRInfo::default();
+    info.user_info_map
+        .insert("alice".to_string(), rustfs_madmin::UserInfo::default());
+    let mut credentials = SiteReplicationIamCredentials::default();
+    credentials.users.insert(
+        "alice".to_string(),
+        SiteReplicationUserCredential {
+            secret_key: "alice-secret".to_string(),
+            status: rustfs_madmin::AccountStatus::Enabled,
+            updated_at: None,
+        },
+    );
+    credentials
+        .service_accounts
+        .push(service_account_snapshot("alice-svc", "alice", "off"));
+
+    let plan = site_replication_bootstrap_plan(&info, &credentials).expect("bootstrap plan should build");
+
+    let types: Vec<_> = plan.iam_items.iter().map(|item| item.r#type.as_str()).collect();
+    assert_eq!(types, vec!["iam-user", "service-account"]);
+    let change = plan.iam_items[1].svc_acc_change.as_ref().expect("service account change");
+    let create = change.create.as_ref().expect("create body");
+    assert_eq!((create.access_key.as_str(), create.parent.as_str()), ("alice-svc", "alice"));
+    assert_eq!(create.secret_key, "alice-svc-secret");
+    assert_eq!(create.status, "off", "a disabled account must arrive disabled");
+    assert!(change.delete.is_none() && change.update.is_none());
+}
+
+/// A service account present in the previous snapshot but gone from the
+/// fresh one is replayed as an explicit delete, like the other IAM kinds.
+#[test]
+fn test_retry_snapshot_tombstones_removed_service_accounts() {
+    let observed_at = OffsetDateTime::from_unix_timestamp(1_700_001_000).expect("timestamp");
+    let mut info = SRInfo::default();
+    info.user_info_map
+        .insert("alice".to_string(), rustfs_madmin::UserInfo::default());
+    let mut credentials = SiteReplicationIamCredentials::default();
+    credentials.users.insert(
+        "alice".to_string(),
+        SiteReplicationUserCredential {
+            secret_key: "alice-secret".to_string(),
+            status: rustfs_madmin::AccountStatus::Enabled,
+            updated_at: None,
+        },
+    );
+    let mut with_account = credentials.clone();
+    with_account
+        .service_accounts
+        .push(service_account_snapshot("alice-svc", "alice", "on"));
+    let previous = site_replication_bootstrap_plan(&info, &with_account).expect("previous plan");
+    let fresh = site_replication_bootstrap_plan(&info, &credentials).expect("fresh plan");
+
+    let replay = RetrySnapshot::replay_after_change(
+        &RetrySnapshot::Iam(previous.iam_items),
+        &RetrySnapshot::Iam(fresh.iam_items),
+        observed_at,
+    );
+    let RetrySnapshot::Iam(items) = replay else {
+        panic!("IAM snapshot expected");
+    };
+    let tombstone = items
+        .iter()
+        .find(|item| item.r#type == "service-account")
+        .expect("service account tombstone");
+    let change = tombstone.svc_acc_change.as_ref().expect("change");
+    assert_eq!(change.delete.as_ref().map(|delete| delete.access_key.as_str()), Some("alice-svc"));
+    assert!(change.create.is_none());
+    assert_eq!(tombstone.updated_at, Some(observed_at));
 }

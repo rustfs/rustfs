@@ -66,8 +66,8 @@ use rustfs_madmin::{
     ReplicateRemoveStatus, ResyncBucketStatus, SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC, SR_IAM_ITEM_STS_ACC_LEGACY,
     SRBucketInfo, SRBucketMeta, SRBucketStatsSummary, SRGroupInfo, SRGroupStatsSummary, SRIAMItem, SRIAMUser,
     SRILMExpiryStatsSummary, SRInfo, SRMetric, SRMetricsSummary, SRPeerError, SRPeerJoinReq, SRPendingOperation, SRPolicyMapping,
-    SRPolicyStatsSummary, SRRemoveReq, SRResyncOpStatus, SRSTSCredential, SRSessionPolicy, SRSiteSummary, SRStateEditReq,
-    SRStateInfo, SRStatusInfo, SRSvcAccChange, SRSvcAccCreate, SRUserStatsSummary, SiteReplicationInfo, SyncStatus, WorkerStat,
+    SRPolicyStatsSummary, SRRemoveReq, SRResyncOpStatus, SRSTSCredential, SRSiteSummary, SRStateEditReq, SRStateInfo,
+    SRStatusInfo, SRSvcAccChange, SRSvcAccCreate, SRUserStatsSummary, SiteReplicationInfo, SyncStatus, WorkerStat,
 };
 use rustfs_policy::policy::{
     Policy,
@@ -98,7 +98,6 @@ use uuid::Uuid;
 // paths keep resolving while this file keeps only the HTTP handlers.
 pub(crate) use crate::site_replication::*;
 
-const SERVICE_ACCOUNT_ENVELOPE_VERSION: u64 = 2;
 // Serializes peer-join admission (staleness check -> IAM upsert -> state
 // commit) across every node of this site; see admit_peer_join. Never an
 // actual object — only a namespace-lock key, like the repair execution lock.
@@ -1980,7 +1979,7 @@ async fn bootstrap_existing_metadata_after_add(
             return errors;
         }
     };
-    let plan = match site_replication_bootstrap_plan(&info) {
+    let plan = match build_site_replication_bootstrap_plan(&info).await {
         Ok(plan) => plan,
         Err(err) => {
             let mut errors = SiteReplicationErrorSummary::default();
@@ -5660,41 +5659,6 @@ fn group_info_requires_upsert(update: &rustfs_madmin::GroupAddRemove) -> bool {
     !update.is_remove
 }
 
-pub(crate) fn encode_service_account_replication_policy(
-    claims: &HashMap<String, Value>,
-    session_policy: Option<&str>,
-) -> S3Result<(SRSessionPolicy, Option<rustfs_madmin::SRSvcAccReplicationEnvelope>)> {
-    if !claims.contains_key(OIDC_VIRTUAL_PARENT_CLAIM) {
-        return session_policy
-            .map(SRSessionPolicy::from_json)
-            .transpose()
-            .map(|policy| policy.unwrap_or_default())
-            .map(|policy| (policy, None))
-            .map_err(|err| s3_error!(InvalidArgument, "marshal policy failed: {:?}", err));
-    }
-
-    let policy = match session_policy {
-        Some(policy) => serde_json::from_str::<Policy>(policy)
-            .map_err(|err| s3_error!(InvalidArgument, "invalid service account replication policy: {:?}", err))?,
-        None => Policy::default(),
-    };
-    if policy.statements.is_empty() && (!policy.id.is_empty() || !policy.version.is_empty())
-        || policy.version.is_empty() && !policy.statements.is_empty()
-    {
-        return Err(s3_error!(InvalidArgument, "service account replication policy is not normalized"));
-    }
-    let policy = serde_json::to_string(&policy)
-        .map_err(|err| s3_error!(InternalError, "marshal service account replication policy failed: {:?}", err))?;
-    let policy = SRSessionPolicy::from_json(&policy)
-        .map_err(|err| s3_error!(InternalError, "marshal service account replication policy failed: {:?}", err))?;
-    Ok((
-        policy,
-        Some(rustfs_madmin::SRSvcAccReplicationEnvelope {
-            version: SERVICE_ACCOUNT_ENVELOPE_VERSION,
-        }),
-    ))
-}
-
 #[derive(Debug)]
 struct ReplicatedServiceAccountPolicy {
     policy: Option<Policy>,
@@ -5979,6 +5943,8 @@ async fn apply_iam_service_account_item(
                     .map_err(ApiError::from)?;
             }
             Err(err) if is_err_no_such_service_account(&err) => {
+                let access_key = create.access_key.clone();
+                let status = create.status.clone();
                 iam_sys
                     .new_service_account(
                         &create.parent,
@@ -5996,6 +5962,28 @@ async fn apply_iam_service_account_item(
                     )
                     .await
                     .map_err(ApiError::from)?;
+                // A snapshot (bootstrap / repair / retry resend) carries the
+                // account's current status; creation always enables, so a
+                // disabled account must be switched off in a second step or
+                // the peer keeps accepting credentials the source rejects.
+                if !status.is_empty() && status != "on" {
+                    iam_sys
+                        .update_service_account(
+                            &access_key,
+                            UpdateServiceAccountOpts {
+                                session_policy: None,
+                                secret_key: None,
+                                name: None,
+                                description: None,
+                                expiration: None,
+                                status: Some(status),
+                                parent_user: None,
+                                allow_site_replicator_account: false,
+                            },
+                        )
+                        .await
+                        .map_err(ApiError::from)?;
+                }
             }
             Err(err) => return Err(ApiError::from(err).into()),
         }
@@ -7692,7 +7680,7 @@ impl Operation for SiteReplicationRepairHandler {
         let local_peer = current_local_peer(&req, &state);
         let body: SiteReplicationRepairRequest = read_site_replication_json(req, "", false).await?;
         let info = build_sr_info(&state, &local_peer).await?;
-        let plan = site_replication_bootstrap_plan(&info)?;
+        let plan = build_site_replication_bootstrap_plan(&info).await?;
         let signing_key = current_token_signing_key().ok_or_else(|| {
             S3Error::with_message(S3ErrorCode::InternalError, "token signing key is not initialized".to_string())
         })?;
@@ -7885,6 +7873,7 @@ impl Operation for SRRotateServiceAccountHandler {
 mod tests {
     use super::*;
     use crate::site_replication::identity::deployment_id_for_endpoint;
+    use rustfs_madmin::SRSessionPolicy;
 
     /// A peer the status probe could not reach must render as offline.
     ///

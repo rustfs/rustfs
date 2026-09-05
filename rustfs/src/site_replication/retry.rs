@@ -954,6 +954,7 @@ pub(crate) enum IamSnapshotKey {
     User(String),
     Group(String),
     PolicyMapping { target: String, user_type: i64, is_group: bool },
+    ServiceAccount(String),
 }
 
 pub(crate) fn iam_snapshot_key(item: &SRIAMItem) -> Option<IamSnapshotKey> {
@@ -972,6 +973,11 @@ pub(crate) fn iam_snapshot_key(item: &SRIAMItem) -> Option<IamSnapshotKey> {
             user_type: mapping.user_type,
             is_group: mapping.is_group,
         }),
+        "service-account" => item
+            .svc_acc_change
+            .as_ref()
+            .and_then(|change| change.create.as_ref())
+            .map(|create| IamSnapshotKey::ServiceAccount(create.access_key.clone())),
         _ => None,
     }
 }
@@ -1005,6 +1011,24 @@ pub(crate) fn iam_snapshot_tombstones(item: &SRIAMItem, observed_at: OffsetDateT
             if let Some(mapping) = tombstone.policy_mapping.as_mut() {
                 mapping.policy.clear();
             }
+        }
+        "service-account" => {
+            let Some(access_key) = item
+                .svc_acc_change
+                .as_ref()
+                .and_then(|change| change.create.as_ref())
+                .map(|create| create.access_key.clone())
+            else {
+                return Vec::new();
+            };
+            tombstone.svc_acc_change = Some(SRSvcAccChange {
+                delete: Some(SRSvcAccDelete {
+                    access_key,
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                }),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            });
         }
         _ => return Vec::new(),
     }
@@ -1701,7 +1725,7 @@ pub(crate) async fn drain_site_replication_retry_queue_locked(
     // tick and only when a snapshot resend is actually due.
     let plan = if needs_plan {
         let info = build_sr_info(&runtime.state, &runtime.local_peer).await?;
-        Some(site_replication_bootstrap_plan(&info)?)
+        Some(build_site_replication_bootstrap_plan(&info).await?)
     } else {
         None
     };
@@ -1841,7 +1865,7 @@ pub(crate) async fn drain_one_site_replication_retry_event(
                     }
                 }
                 let fresh_info = build_sr_info(&runtime.state, &runtime.local_peer).await?;
-                let fresh_plan = site_replication_bootstrap_plan(&fresh_info)?;
+                let fresh_plan = build_site_replication_bootstrap_plan(&fresh_info).await?;
                 let fresh_snapshot = RetrySnapshot::from_plan(&action, &fresh_plan).expect("snapshot action has a snapshot");
                 if fresh_snapshot.fingerprint()? == current_fingerprint {
                     if is_iam {
