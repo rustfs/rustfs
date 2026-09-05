@@ -31,6 +31,7 @@ workspace = true
 
 [features]
 default = []
+gcs = ["dep:google-cloud-storage", "dep:google-cloud-auth"]
 # Compiles the controlled list-objects namespace-journal chaos injector into a
 # production binary (it is always available to tests). Off by default so the
 # RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_* env vars cannot rewrite journal
@@ -212,10 +213,9 @@ aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
 parking_lot = { workspace = true }
 base64-simd.workspace = true
 serde_urlencoded.workspace = true
-google-cloud-storage = { workspace = true }
-google-cloud-auth = { workspace = true }
+google-cloud-storage = { workspace = true, optional = true }
+google-cloud-auth = { workspace = true, optional = true }
 faster-hex = { workspace = true }
-quick-xml = { workspace = true }
 ratelimit = { workspace = true }
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["rustls-aws-lc"] }
 
