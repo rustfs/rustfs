@@ -13459,6 +13459,7 @@ mod test {
             let fence = disk
                 .snapshot_leases
                 .lock()
+                .await
                 .entries
                 .get(&SnapshotLeaseKey {
                     volume: RUSTFS_META_BUCKET.to_string(),

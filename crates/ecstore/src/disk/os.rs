@@ -826,12 +826,13 @@ impl Drop for DstDirFsyncWorkerGuard {
 
 fn run_dst_dir_fsync_group_worker(group: Arc<DstDirFsyncGroup>) -> impl std::future::Future<Output = ()> {
     // Capture before spawning: shutdown may drop the future without polling it.
-    let mut worker_guard = DstDirFsyncWorkerGuard {
+    let worker_guard = DstDirFsyncWorkerGuard {
         group: group.clone(),
         in_flight: 0,
         armed: true,
     };
     async move {
+        let mut worker_guard = worker_guard;
         loop {
             #[cfg(test)]
             fsync_dir_recorder::run_before_group_batch(&group.dir);
