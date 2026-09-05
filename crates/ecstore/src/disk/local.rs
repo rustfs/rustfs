@@ -13171,10 +13171,12 @@ mod test {
             let object_dir = disk.io_get_object_path(bucket, &object).expect("object IO path");
             let xl_path = object_dir.join(STORAGE_FORMAT_FILE);
             let old_version = Uuid::new_v4();
-            let old = test_file_info(&object, old_version, None, Some(Bytes::from_static(b"old-payload")));
+            let mut old = test_file_info(&object, old_version, None, Some(Bytes::from_static(b"old-payload")));
+            old.set_inline_data();
             let old_meta = test_meta(old.clone());
             let new_version = if case == "backup" { old_version } else { Uuid::new_v4() };
             let mut new = test_file_info(&object, new_version, None, Some(Bytes::from_static(b"new-payload")));
+            new.set_inline_data();
             let rollback_dir = Uuid::new_v4();
             let mut opts = DeleteOptions {
                 undo_write: true,
@@ -13367,10 +13369,13 @@ mod test {
         let xl_path = object_dir.join(STORAGE_FORMAT_FILE);
         fs::create_dir_all(&object_dir).await.expect("object directory");
         let version_id = Uuid::new_v4();
-        let old_meta = test_meta(test_file_info(object, version_id, None, Some(Bytes::from_static(b"old-payload"))));
+        let mut old = test_file_info(object, version_id, None, Some(Bytes::from_static(b"old-payload")));
+        old.set_inline_data();
+        let old_meta = test_meta(old);
         fs::write(&xl_path, &old_meta).await.expect("old metadata");
         set_rename_data_fail_after_metadata_commit(object);
-        let new = test_file_info(object, version_id, None, Some(Bytes::from_static(b"new-payload")));
+        let mut new = test_file_info(object, version_id, None, Some(Bytes::from_static(b"new-payload")));
+        new.set_inline_data();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let _hook = hooks::install_at(hooks::Stage::Rollback, &xl_path, move || {
@@ -13472,13 +13477,15 @@ mod test {
                 .io_get_object_path(RUSTFS_META_TMP_BUCKET, "source/xl.meta.bkp")
                 .expect("staged backup IO path");
             if pause_at != "prepared" {
-                let old = test_file_info(object, version_id, None, Some(Bytes::from_static(b"old-payload")));
+                let mut old = test_file_info(object, version_id, None, Some(Bytes::from_static(b"old-payload")));
+                old.set_inline_data();
                 fs::create_dir_all(&object_dir).await.expect("existing object directory");
                 fs::write(&xl_path, test_meta(old))
                     .await
                     .expect("old metadata requiring a rollback backup");
             }
             let mut new = test_file_info(object, version_id, None, Some(Bytes::from_static(b"new-payload")));
+            new.set_inline_data();
             rustfs_utils::http::metadata_compat::insert_str(
                 &mut new.metadata,
                 super::super::QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
