@@ -33,6 +33,9 @@ use std::collections::HashMap;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
+/// Explicit pending migration; never activates the production writer or GC.
+pub mod migration;
+
 // Root-level control files avoid requiring a new directory before the first
 // atomic commit. They remain inside the storage owner's metadata volume.
 const PAYLOAD_PATHS: [&str; 2] = [".heal-mrf-snapshot.0.bin", ".heal-mrf-snapshot.1.bin"];
@@ -66,6 +69,23 @@ struct Manifest {
 }
 
 impl Manifest {
+    fn encode(owner: Uuid, sequence: u64, payload: &[u8]) -> Result<Vec<u8>, SnapshotError> {
+        let mut bytes = Vec::with_capacity(MANIFEST_LEN);
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(VERSION);
+        bytes.extend_from_slice(owner.as_bytes());
+        bytes.extend_from_slice(&sequence.to_le_bytes());
+        bytes.extend_from_slice(
+            &u64::try_from(payload.len())
+                .map_err(|_| SnapshotError::TooLarge)?
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&Sha256::digest(payload));
+        bytes.extend_from_slice(&Sha256::digest(&bytes));
+        Self::decode(&bytes, payload.len())?;
+        Ok(bytes)
+    }
+
     fn decode(bytes: &[u8], limit: usize) -> Result<Self, SnapshotError> {
         if bytes.len() != MANIFEST_LEN || &bytes[..8] != MAGIC {
             return Err(SnapshotError::Corrupt);
