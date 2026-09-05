@@ -27,6 +27,10 @@
 //! onto the shared page cursor and whose `prefixes` are the delimiter roll-up.
 //! Both accept the same bearer token.
 //!
+//! Every call this backend makes needs only `storage.objects.get` and
+//! `storage.objects.list`, the two permissions of the `objectViewer` role, so a
+//! key scoped to exactly the migration's needs works.
+//!
 //! `x-goog-hash` carries a base64 MD5 for every non-composite object; it is
 //! converted to hex and becomes the head's ETag, so a pulled object is checked
 //! against the digest GCS itself computed. A composite object has no MD5, and
@@ -107,10 +111,6 @@ impl GcsNativeSourceBackend {
     /// JSON API URL of the bucket's object collection.
     fn objects_url(&self) -> Result<Url, SourceError> {
         self.http.url(["storage", "v1", "b", self.bucket.as_str(), "o"])
-    }
-
-    fn bucket_url(&self) -> Result<Url, SourceError> {
-        self.http.url(["storage", "v1", "b", self.bucket.as_str()])
     }
 
     async fn request(&self, method: Method, url: Url, mut headers: HeaderMap) -> Result<reqwest::Request, SourceError> {
@@ -225,9 +225,16 @@ impl SourceBackend for GcsNativeSourceBackend {
         Ok(HashMap::new())
     }
 
+    /// A one-object listing, not `buckets.get`: the migration pipeline only
+    /// ever needs `storage.objects.list` and `storage.objects.get`, and a key
+    /// scoped to exactly those (the `objectViewer` role) cannot read the bucket
+    /// resource. Probing with `buckets.get` would reject a correct key.
     async fn probe(&self) -> Result<(), SourceError> {
-        let request = self.request(Method::GET, self.bucket_url()?, HeaderMap::new()).await?;
-        self.http.send(request, NO_ERROR_CODE_HEADER).await?;
+        let mut url = self.objects_url()?;
+        url.query_pairs_mut().append_pair("maxResults", "1");
+        let request = self.request(Method::GET, url, HeaderMap::new()).await?;
+        let response = self.http.send(request, NO_ERROR_CODE_HEADER).await?;
+        read_text(response, MAX_JSON_BYTES).await.and_then(|body| parse_objects_list(&body))?;
         Ok(())
     }
 }
@@ -456,7 +463,10 @@ mod tests {
         assert!(recorded[0].target.contains("delimiter=%2F"), "{}", recorded[0].target);
         assert!(recorded[0].target.contains("pageToken=cursor-0"), "{}", recorded[0].target);
         assert!(recorded[0].target.contains("maxResults=2"), "{}", recorded[0].target);
-        assert_eq!(recorded[1].target, "/storage/v1/b/legacy");
+        assert_eq!(
+            recorded[1].target, "/storage/v1/b/legacy/o?maxResults=1",
+            "the probe uses the listing permission the pipeline already needs"
+        );
     }
 
     #[tokio::test]
