@@ -572,8 +572,12 @@ mod tests {
                     .next()
                     .expect("request line")
                     .to_string();
-                assert!(first_line.starts_with("GET /source-bucket?"));
-                assert!(first_line.contains("list-type=2"));
+                // The SDK joins the bucket endpoint with the LIST operation's `/` path.
+                assert!(
+                    first_line.starts_with("GET /source-bucket/?"),
+                    "expected a path-style bucket-root LIST request, got {first_line:?}"
+                );
+                assert!(first_line.contains("list-type=2"), "expected a ListObjectsV2 query, got {first_line:?}");
                 requests.push(first_line);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
