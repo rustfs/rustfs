@@ -39,7 +39,6 @@ use crate::on_demand_migration::{
     source_list_plan,
 };
 use futures::StreamExt;
-use http::HeaderMap;
 use rustfs_utils::http::{SUFFIX_SOURCE_PROXY_REQUEST, get_header};
 use std::sync::Arc;
 use std::time::Instant;
@@ -515,6 +514,7 @@ mod tests {
         FilterConfig, MAX_LIST_NO_PROGRESS_PAGES, OnDemandMigrationConfig, PathStyle, PolicyConfig, Provider, SourceConfig,
         SourceCredentials, TlsConfig,
     };
+    use http::HeaderMap;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
