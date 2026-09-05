@@ -69,6 +69,13 @@ pub mod bucket {
             };
         }
 
+        pub mod recovery_control {
+            pub use crate::bucket::lifecycle::recovery_control::{
+                IlmRecoveryClassification, IlmRecoveryControlPage, IlmRecoveryControlView, IlmRecoveryProtocol,
+                inspect_recovery_control, list_recovery_controls,
+            };
+        }
+
         pub mod transition_transaction {
             pub use crate::bucket::lifecycle::transition_transaction::{
                 TransitionOperatorDeleteResult, TransitionOperatorError, TransitionOperatorProbe, TransitionOperatorStatus,
