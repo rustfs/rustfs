@@ -969,7 +969,8 @@ mod tests {
         let (_state_guard, mut input) = source_policy_input(endpoint.clone(), policy, None, None).await;
         input.max_keys = Some(max_keys);
         let sys = OnDemandMigrationSys::get();
-        let mut config = sys.state(&input.bucket).expect("installed source state").config().clone();
+        let installed = sys.state(&input.bucket).expect("installed source state");
+        let mut config = installed.config().clone();
         config.source = serde_json::from_value(serde_json::json!({
             "provider": provider,
             "endpoint": endpoint,
@@ -978,7 +979,8 @@ mod tests {
             "azure": if provider == Provider::Azure { serde_json::json!({ "account": "acct", "account_key": "c2VjcmV0LWtleQ==" }) } else { serde_json::Value::Null },
             "gcs": if provider == Provider::GcsNative { serde_json::json!({ "service_account_json": service_account }) } else { serde_json::Value::Null }
         })).expect("native source configuration");
-        sys.apply(&input.bucket, Some(&config)).await;
+        sys.apply_for_incarnation(&input.bucket, installed.incarnation_id(), Some(&config))
+            .await;
         let state = sys.state(&input.bucket).expect("native source state");
         state
             .client()
@@ -1983,7 +1985,7 @@ mod tests {
                 ],
                 async {
                     let (endpoint, server) = scripted_list_source(vec![
-                        source_xml(Some("B"), true, None), source_xml(Some("C"), true, None), source_xml(Some("A"), true, None),
+                        source_xml(Some("B"), true, None), source_xml(Some("C"), true, None),
                     ]).await;
                     let (_state_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
                     let wire = concat!("\0odm-list:", r#"{"t":"odm-list","v":2,"local":null,"local_done":true,"source":"A","source_done":false,"last_key":null,"no_progress":15}"#);
@@ -1997,15 +1999,68 @@ mod tests {
                     assert!(token.framed);
                     assert_eq!(token.v, 2);
                     assert_eq!(token.no_progress, Some(15));
-                    assert_eq!(token.source.as_deref(), Some("B"));
+                    assert_eq!(token.source.as_deref(), Some("A"));
+                    assert_eq!(next, input.continuation_token.as_ref().expect("original cursor").as_str());
+                    let state = OnDemandMigrationSys::get().state(&input.bucket).expect("source state");
+                    assert_eq!(state.stats().snapshot(state.breaker().state()).source_latency.count, 0, "zero-sized request must not fetch the source");
                     input.continuation_token = Some(next);
                     input.max_keys = Some(2);
                     assert_source_policy_result(execute_source_list(input).await, SourceErrorPolicy::Propagate);
                     let requests = tokio::time::timeout(Duration::from_secs(5), server).await
                         .expect("finite source server must finish").expect("source server must not panic");
-                    assert_eq!(requests.len(), 3, "zero-sized request fetches one page, the next request at most two");
-                    for (request, cursor) in requests.iter().zip(["A", "B", "C"]) {
+                    assert_eq!(requests.len(), 2, "only the resumed nonzero request fetches the source");
+                    assert_eq!(state.stats().snapshot(state.breaker().state()).source_latency.count, 2);
+                    for (request, cursor) in requests.iter().zip(["A", "B"]) {
                         assert!(request.contains(&format!("continuation-token={cursor}")), "{request}");
+                    }
+                },
+            ).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zero_sized_merged_cursors_preserve_each_side_and_wire_format() {
+        run_large_stack_test("list-through-zero-side-matrix", || async {
+            temp_env::async_with_vars(
+                [
+                    (ENV_LIST_PROGRESS_TOKENS, Some("true")),
+                    (ENV_LIST_FRAMED_TOKENS, Some("true")),
+                    ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                    ("HTTP_PROXY", None), ("HTTPS_PROXY", None), ("ALL_PROXY", None),
+                    ("http_proxy", None), ("https_proxy", None), ("all_proxy", None),
+                    ("NO_PROXY", Some("*")), ("no_proxy", Some("*")),
+                ],
+                async {
+                    for framed in [false, true] {
+                        for (local_done, source_done) in [(false, true), (true, false), (false, false), (true, true)] {
+                            let (endpoint, server, stop) = list_source(std::iter::repeat(source_xml(Some("unexpected"), true, None))).await;
+                            let (_state_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                            let json = format!(r#"{{"t":"odm-list","v":2,"local":"local-marker","local_done":{local_done},"source":"source-marker","source_done":{source_done},"last_key":null,"no_progress":15}}"#);
+                            let wire = if framed { format!("\0odm-list:{json}") } else { json };
+                            let original = base64_simd::STANDARD.encode_to_string(wire.as_bytes());
+                            input.continuation_token = Some(original.clone());
+                            input.max_keys = Some(0);
+                            let output = execute_source_list(input).await.expect("zero page remains local").output;
+                            let has_more = !local_done || !source_done;
+                            assert_eq!(output.key_count, Some(0));
+                            assert_eq!(output.is_truncated, Some(has_more), "framed={framed}, local_done={local_done}, source_done={source_done}");
+                            assert_eq!(output.next_continuation_token.as_deref(), has_more.then_some(original.as_str()));
+                            if let Some(next) = output.next_continuation_token {
+                                let token = decode_wire_token(&next);
+                                assert_eq!(token.framed, framed);
+                                assert_eq!(token.v, 2);
+                                assert_eq!(token.no_progress, Some(15));
+                                assert_eq!(token.local_done, local_done);
+                                assert_eq!(token.source_done, source_done);
+                                assert_eq!(token.local.as_deref(), Some("local-marker"));
+                                assert_eq!(token.source.as_deref(), Some("source-marker"));
+                            }
+                            stop.cancel();
+                            let requests = tokio::time::timeout(Duration::from_secs(5), server).await
+                                .expect("unused source must finish").expect("source server must not panic");
+                            assert!(requests.is_empty(), "zero-sized request must not access the source: {requests:?}");
+                        }
                     }
                 },
             ).await;
