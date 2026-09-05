@@ -1852,7 +1852,7 @@ fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Fut
         // The scheduler starts before IAM and the object store are guaranteed ready (IAM
         // bootstrap may still be recovering), so an early tick returns quietly instead of
         // logging a failure for every reconciler.
-        let Some(_lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
+        let Some(lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
             return;
         };
 
@@ -1910,8 +1910,9 @@ fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Fut
                 "admin site replication state"
             );
         }
-        // Failed peer deliveries recorded in the retry queue; runs behind the
-        // same lifecycle guard and pending_* gates as the reconcilers above.
+        // The retry path re-checks membership per request under the bucket-op
+        // lock; release lifecycle before a potentially large replay.
+        drop(lifecycle);
         drain_site_replication_retry_queue().await;
     })
 }
@@ -6232,6 +6233,10 @@ impl Operation for SiteReplicationAddHandler {
         // this add was planned against is still the current one. The error
         // says so: by this point the remote sites already accepted their
         // joins, and re-running the add is what reconverges the local side.
+        // Serialize peer visibility with local bucket deletion: whichever
+        // side wins this lock determines whether the new peer is included in
+        // the delete intent or bootstraps from the post-delete bucket set.
+        let bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
         let next_state = state;
         let (state, edit_generation) = update_site_replication_state(move |state| {
             if state.updated_at != expected_updated_at || pending_endpoint_refresh(state).is_some() {
@@ -6245,6 +6250,7 @@ impl Operation for SiteReplicationAddHandler {
             Ok((state.clone(), edit_generation))
         })
         .await?;
+        drop(bucket_op_guard);
 
         // The finalize fan-out delivers peer-edit payloads, so it carries the
         // generation allocated in the commit above: the receiving site orders
