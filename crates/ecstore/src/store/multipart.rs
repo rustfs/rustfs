@@ -238,7 +238,7 @@ async fn list_pool_multipart_uploads_for_incarnation(
 }
 
 impl ECStore {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-util"))]
     pub(crate) fn reset_data_movement_multipart_discovery_count_for_test(&self) {
         data_movement_multipart_discovery_counts()
             .lock()
@@ -246,7 +246,7 @@ impl ECStore {
             .insert(self.id, 0);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-util"))]
     pub(crate) fn data_movement_multipart_discovery_count_for_test(&self) -> usize {
         data_movement_multipart_discovery_counts()
             .lock()

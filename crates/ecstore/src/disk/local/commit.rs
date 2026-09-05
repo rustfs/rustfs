@@ -17,13 +17,14 @@
 
 #[cfg(all(test, windows))]
 use super::run_destination_commit_directory_preparation;
+#[cfg(any(not(windows), test))]
+use super::should_fail_local_inline_rollback_hardlink;
 use super::{
     EVENT_DISK_LOCAL_ACCESS_FAILED, EVENT_DISK_LOCAL_HEAL_PURGE_FAILED, EVENT_DISK_LOCAL_RENAME_REJECTED, LOG_COMPONENT_ECSTORE,
     LOG_SUBSYSTEM_DISK_LOCAL, LocalDisk, SyncMode, effective_durability, inline_metadata_rollback_dir, observe_old_current_size,
     remove_dir_all_if_exists, remove_dst_base_before_commit, remove_file_if_exists, rename_data_versions_signature,
     run_inline_preparation_before_backup, should_fail_after_metadata_commit, should_fail_before_old_metadata_backup,
-    should_fail_commit_rename, should_fail_local_inline_rollback_hardlink, should_remove_staged_meta_before_commit,
-    skip_access_checks,
+    should_fail_commit_rename, should_remove_staged_meta_before_commit, skip_access_checks,
 };
 #[cfg(test)]
 use super::{run_inline_before_file_sync_admission, run_owned_file_write_before_open, run_rename_data_after_first_publication};
@@ -86,6 +87,7 @@ fn rollback_inline_metadata_commit_std(
     Ok(())
 }
 
+#[cfg(any(not(windows), test))]
 pub(super) fn create_local_inline_rollback_backup(
     dst_file_path: &Path,
     staging_file_path: &Path,

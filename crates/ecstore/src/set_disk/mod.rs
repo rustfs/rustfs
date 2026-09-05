@@ -874,7 +874,7 @@ pub(crate) use ops::multipart::NewMultipartUploadCommitObservation;
 pub use ops::multipart::{MultipartCommitBarrier, MultipartCommitPause};
 #[cfg(test)]
 pub(crate) use ops::object::DeleteObjectCommitBarrier;
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 pub(crate) use ops::object::TransitionCleanupStoreBarrier as SetDiskTransitionCleanupStoreBarrier;
 #[cfg(all(test, feature = "test-util"))]
 pub(crate) use ops::object::TransitionUploadedCommitBarrier as SetDiskTransitionUploadedCommitBarrier;

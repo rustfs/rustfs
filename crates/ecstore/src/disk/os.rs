@@ -91,6 +91,7 @@ pub(crate) mod fsync_dir_recorder {
     static RECORDED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static LIMITED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static GROUPED: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+    #[cfg(unix)]
     static BEFORE_LIMITED: std::sync::LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
         std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
     static BEFORE_GROUP_BATCH: std::sync::LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
@@ -150,6 +151,7 @@ pub(crate) mod fsync_dir_recorder {
         contains_path(&RECORDED.lock().expect("fsync dir recorder poisoned"), dir)
     }
 
+    #[cfg(unix)]
     pub(crate) fn record_limited(dir: &Path) {
         record_path(&LIMITED, dir, "limited fsync dir recorder");
         let hook = remove_hook(&BEFORE_LIMITED, dir, "limited fsync hook poisoned");
@@ -162,6 +164,7 @@ pub(crate) mod fsync_dir_recorder {
         contains_path(&LIMITED.lock().expect("limited fsync dir recorder poisoned"), dir)
     }
 
+    #[cfg(unix)]
     pub(crate) fn set_before_limited(dir: &Path, hook: impl FnOnce() + Send + 'static) {
         BEFORE_LIMITED
             .lock()
@@ -237,6 +240,7 @@ pub(crate) mod fsync_dir_recorder {
             .insert(dir.to_path_buf(), kind);
     }
 
+    #[cfg(unix)]
     pub(crate) fn take_grouped_failure(dir: &Path) -> Option<io::ErrorKind> {
         remove_path_keyed(&GROUPED_FAILURES, dir, "grouped fsync failure hook poisoned")
     }

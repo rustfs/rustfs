@@ -13,11 +13,14 @@
 // limitations under the License.
 
 use crate::diagnostics::get::{
-    GET_STAGE_READER_MMAP_ACCESS_CHECK, GET_STAGE_READER_MMAP_BLOCKING_TASK, GET_STAGE_READER_MMAP_BLOCKING_WAIT,
-    GET_STAGE_READER_MMAP_COPY_BUFFER, GET_STAGE_READER_MMAP_DIRECT_READ_COPY, GET_STAGE_READER_MMAP_FILE_OPEN,
-    GET_STAGE_READER_MMAP_MAP, GET_STAGE_READER_MMAP_METADATA_LOOKUP, GET_STAGE_READER_MMAP_METADATA_VALIDATE,
+    GET_STAGE_READER_MMAP_ACCESS_CHECK, GET_STAGE_READER_MMAP_METADATA_LOOKUP, GET_STAGE_READER_MMAP_METADATA_VALIDATE,
     GET_STAGE_READER_MMAP_PATH_RESOLVE, GET_STAGE_READER_OPEN_MMAP_COPY_FALLBACK, GET_STAGE_READER_OPEN_MMAP_COPY_SUCCESS,
     GET_STAGE_READER_OPEN_STREAM, GET_STAGE_READER_STREAM_FIRST_READ, record_get_stage_duration_if_enabled,
+};
+#[cfg(unix)]
+use crate::diagnostics::get::{
+    GET_STAGE_READER_MMAP_BLOCKING_TASK, GET_STAGE_READER_MMAP_BLOCKING_WAIT, GET_STAGE_READER_MMAP_COPY_BUFFER,
+    GET_STAGE_READER_MMAP_DIRECT_READ_COPY, GET_STAGE_READER_MMAP_FILE_OPEN, GET_STAGE_READER_MMAP_MAP,
 };
 #[cfg(feature = "hotpath")]
 use crate::disk::FileWriter;
@@ -406,11 +409,17 @@ async fn open_disk_reader(
             path_resolve_stage: GET_STAGE_READER_MMAP_PATH_RESOLVE,
             metadata_lookup_stage: GET_STAGE_READER_MMAP_METADATA_LOOKUP,
             metadata_validate_stage: GET_STAGE_READER_MMAP_METADATA_VALIDATE,
+            #[cfg(unix)]
             blocking_wait_stage: GET_STAGE_READER_MMAP_BLOCKING_WAIT,
+            #[cfg(unix)]
             blocking_task_stage: GET_STAGE_READER_MMAP_BLOCKING_TASK,
+            #[cfg(unix)]
             file_open_stage: GET_STAGE_READER_MMAP_FILE_OPEN,
+            #[cfg(unix)]
             mmap_map_stage: GET_STAGE_READER_MMAP_MAP,
+            #[cfg(unix)]
             mmap_copy_stage: GET_STAGE_READER_MMAP_COPY_BUFFER,
+            #[cfg(unix)]
             direct_read_copy_stage: GET_STAGE_READER_MMAP_DIRECT_READ_COPY,
         });
         let mmap_result = {
