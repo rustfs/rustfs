@@ -38,6 +38,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_python_bin.sh
 	./scripts/check_embedded_secrets.sh --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_security_coverage.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_scheduled_validation_freshness.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_security_workflow.py

@@ -98,12 +98,11 @@ jobs:
 
       - name: Build current RustFS binary
         run: |
-          cargo build --locked -p rustfs --bin rustfs
-          : > target/debug/rustfs.features
+          python3 scripts/e2e_binary.py build
 
       - name: Run upgrade compatibility test
         run: |
-          cargo test --locked -p e2e_test \
+          python3 scripts/e2e_binary.py run -- cargo test --locked -p e2e_test \
             "upgrade_compatibility_test::${{ matrix.test }}" \
             -- --ignored --exact --nocapture
 

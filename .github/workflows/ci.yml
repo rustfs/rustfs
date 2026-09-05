@@ -166,6 +166,7 @@ jobs:
       - name: Check test wiring
         run: |
           python3 ./scripts/check_test_wiring.py --self-test
+          python3 ./scripts/test_e2e_binary.py
           python3 ./scripts/check_scheduled_validation_freshness.py --self-test
           python3 ./scripts/test_security_workflow.py
           python3 ./scripts/check_test_wiring.py
@@ -646,13 +647,15 @@ jobs:
           install-build-packaging-tools: 'false'
 
       - name: Build debug binary
-        run: cargo build -p rustfs --bins --features e2e-test-hooks
+        run: python3 scripts/e2e_binary.py build --bins --features e2e-test-hooks
 
       - name: Upload debug binary
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rustfs-debug-binary
-          path: target/debug/rustfs
+          path: |
+            target/debug/rustfs
+            target/debug/rustfs.e2e.json
           if-no-files-found: error
           retention-days: 1
 
@@ -684,13 +687,15 @@ jobs:
           install-build-packaging-tools: 'false'
 
       - name: Build debug binary with rio-v2
-        run: cargo build -p rustfs --bins --features rio-v2,e2e-test-hooks
+        run: python3 scripts/e2e_binary.py build --bins --features rio-v2,e2e-test-hooks
 
       - name: Upload debug binary
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rustfs-debug-binary-rio-v2
-          path: target/debug/rustfs
+          path: |
+            target/debug/rustfs
+            target/debug/rustfs.e2e.json
           if-no-files-found: error
           retention-days: 1
 
@@ -839,7 +844,7 @@ jobs:
           NEXTEST_ARCHIVE: ${{ runner.temp }}/rustfs-e2e-smoke.tar.zst
           RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-smoke-logs
         run: |
-          cargo nextest run --profile e2e-smoke --archive-file "${NEXTEST_ARCHIVE}" \
+          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke --archive-file "${NEXTEST_ARCHIVE}" \
             --status-level all --final-status-level all --failure-output final
 
       - name: Upload e2e smoke diagnostics
@@ -875,7 +880,7 @@ jobs:
           RUSTFS_TEST_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
           RUSTFS_TEST_PORT="${RUSTFS_TEST_PORT}" \
           RUSTFS_TEST_LOG="${RUN_ROOT}/rustfs.log" \
-          ./scripts/e2e-run.sh ./target/debug/rustfs "${RUN_ROOT}/data"
+          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- ./scripts/e2e-run.sh ./target/debug/rustfs "${RUN_ROOT}/data"
 
       - name: Upload test logs
         if: failure()
@@ -977,7 +982,7 @@ jobs:
       # extend that filter, never add ad-hoc e2e jobs here. Reuses the downloaded
       # debug binary; each test spawns its own rustfs server on a random port.
       - name: Run e2e full suite
-        run: cargo nextest run --profile e2e-full -p e2e_test
+        run: python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-full -p e2e_test
 
       - name: Upload junit
         if: always()
@@ -1038,7 +1043,7 @@ jobs:
       - name: Run end-to-end tests
         run: |
           s3s-e2e --version
-          ./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs
+          python3 scripts/e2e_binary.py run --features rio-v2,e2e-test-hooks -- ./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs
 
       - name: Upload test logs
         if: failure()
@@ -1081,7 +1086,7 @@ jobs:
           S3_PORT="${S3_PORT}" \
           DATA_ROOT="${RUN_ROOT}" \
           S3TESTS_CONF=artifacts/s3tests-single/s3tests.conf \
-          ./scripts/s3-tests/run.sh
+          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- ./scripts/s3-tests/run.sh
 
       - name: Upload s3 test artifacts
         if: always()
@@ -1163,7 +1168,7 @@ jobs:
           S3_PORT="${S3_PORT}" \
           DATA_ROOT="${RUN_ROOT}" \
           S3TESTS_CONF=artifacts/s3tests-single/s3tests.conf \
-          ./scripts/s3-tests/run.sh
+          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- ./scripts/s3-tests/run.sh
 
       - name: Upload s3 test artifacts
         if: always()

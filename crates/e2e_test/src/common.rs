@@ -31,7 +31,6 @@ use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
 use serde_json;
-use std::ffi::OsStr;
 use std::fs as stdfs;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -44,7 +43,6 @@ use tokio::net::TcpStream;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use walkdir::WalkDir;
 
 // Common constants for all E2E tests
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
@@ -365,59 +363,75 @@ fn resolve_rustfs_binary_path(workspace: &Path, configured_target_dir: Option<&P
     path
 }
 
-/// Resolve the RustFS binary relative to the workspace, optionally requesting build features.
+/// Resolve the server verified by `scripts/e2e_binary.py run` for this test invocation.
+/// Requested features are a required subset of the server's resolved Cargo features.
 pub fn rustfs_binary_path_with_features(requested_features: Option<&str>) -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rustfs") {
-        return PathBuf::from(path);
-    }
-    let requested_features = requested_features.and_then(normalize_rustfs_build_features);
-
     let workspace = workspace_root();
     let configured_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
-    let binary_path = resolve_rustfs_binary_path(&workspace, configured_target_dir.as_deref());
+    let binary_path = std::env::var_os("CARGO_BIN_EXE_rustfs")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| resolve_rustfs_binary_path(&workspace, configured_target_dir.as_deref()));
+    let receipt_path = std::env::var_os("RUSTFS_E2E_BINARY_RECEIPT").map(PathBuf::from);
+    receipt_path
+        .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "missing E2E run receipt"))
+        .and_then(|receipt| verify_e2e_binary_receipt(&receipt, &workspace, &binary_path, requested_features))
+        .unwrap_or_else(|error| {
+            panic!(
+                "E2E server prerequisite failed: {error}. Build with `python3 scripts/e2e_binary.py build --features <features>` and run tests with `python3 scripts/e2e_binary.py run --features <features> -- cargo nextest run ...`"
+            )
+        })
+}
 
-    let features_match = binary_features_match(&binary_path, requested_features.as_deref());
-    let source_is_newer = workspace_sources_newer_than_binary(&binary_path);
-    let can_reuse_inside_e2e = running_inside_e2e_test_binary() && requested_features.is_none() && features_match;
-    if binary_path.is_file() && features_match && (!source_is_newer || can_reuse_inside_e2e) {
-        if source_is_newer {
-            warn!(
-                "RustFS binary at {:?} appears older than workspace sources; reusing it inside cargo test to avoid nested builds",
-                binary_path
-            );
-        }
-        info!("Using existing RustFS binary at {:?}", binary_path);
-        return binary_path;
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct E2eBinaryReceipt {
+    schema: u32,
+    workspace: PathBuf,
+    binary: PathBuf,
+    size: u64,
+    modified_ns: u128,
+    features: Vec<String>,
+}
+
+fn verify_e2e_binary_receipt(
+    receipt_path: &Path,
+    workspace: &Path,
+    binary_path: &Path,
+    requested_features: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    let receipt: E2eBinaryReceipt = serde_json::from_slice(&stdfs::read(receipt_path)?)?;
+    let binary = binary_path.canonicalize()?;
+    let metadata = binary.metadata()?;
+    let modified_ns = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_nanos();
+    // The runner hashes source and binary before/after the entire suite. Each
+    // nextest process checks only this invocation's path, features, and file stat.
+    if receipt.schema != 1
+        || receipt.workspace != workspace.canonicalize()?
+        || receipt.binary != binary
+        || !metadata.is_file()
+        || receipt.size != metadata.len()
+        || receipt.modified_ns != modified_ns
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "E2E server differs from this run's verified binary",
+        ));
     }
-
-    info!("Building RustFS binary to ensure it's up to date...");
-    build_rustfs_binary(requested_features.as_deref(), &binary_path);
-
-    info!("Using RustFS binary at {:?}", binary_path);
-    binary_path
-}
-
-fn workspace_sources_newer_than_binary(binary_path: &PathBuf) -> bool {
-    let Ok(binary_meta) = std::fs::metadata(binary_path) else {
-        return true;
-    };
-    let Ok(binary_modified) = binary_meta.modified() else {
-        return true;
-    };
-
-    let workspace = workspace_root();
-    let watch_roots = [
-        workspace.join("Cargo.toml"),
-        workspace.join("Cargo.lock"),
-        workspace.join("rustfs"),
-        workspace.join("crates"),
-    ];
-
-    watch_roots.iter().any(|path| path_is_newer_than(binary_modified, path))
-}
-
-fn running_inside_e2e_test_binary() -> bool {
-    std::env::var("CARGO_PKG_NAME").is_ok_and(|value| value == "e2e_test")
+    if let Some(requested) = requested_features.and_then(normalize_rustfs_build_features)
+        && requested
+            .split(',')
+            .any(|feature| !receipt.features.iter().any(|actual| actual == feature))
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "E2E server is missing a requested build feature",
+        ));
+    }
+    Ok(binary)
 }
 
 pub fn requested_rustfs_build_features() -> Option<String> {
@@ -445,96 +459,6 @@ pub fn rustfs_build_feature_enabled(requested_features: Option<&str>, required_f
     requested_features
         .split(',')
         .any(|feature| feature.eq_ignore_ascii_case(RUSTFS_FULL_FEATURE) || feature.eq_ignore_ascii_case(required_feature))
-}
-
-fn rustfs_binary_features_stamp_path(binary_path: &Path) -> PathBuf {
-    binary_path.with_extension("features")
-}
-
-fn binary_features_match(binary_path: &Path, requested_features: Option<&str>) -> bool {
-    let stamp_path = rustfs_binary_features_stamp_path(binary_path);
-    let recorded = stdfs::read_to_string(stamp_path)
-        .ok()
-        .and_then(|value| normalize_rustfs_build_features(&value));
-    let requested = requested_features.and_then(normalize_rustfs_build_features);
-
-    match requested.as_deref() {
-        Some(features) => recorded.as_deref() == Some(features),
-        None => recorded.is_none(),
-    }
-}
-
-fn path_is_newer_than(binary_modified: std::time::SystemTime, path: &Path) -> bool {
-    if path.is_file() {
-        return std::fs::metadata(path)
-            .and_then(|meta| meta.modified())
-            .map(|modified| modified > binary_modified)
-            .unwrap_or(false);
-    }
-
-    if !path.is_dir() {
-        return false;
-    }
-
-    WalkDir::new(path)
-        .into_iter()
-        .filter_entry(|entry| {
-            let name = entry.file_name();
-            name != OsStr::new("target") && name != OsStr::new(".git")
-        })
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .any(|entry| {
-            std::fs::metadata(entry.path())
-                .and_then(|meta| meta.modified())
-                .map(|modified| modified > binary_modified)
-                .unwrap_or(false)
-        })
-}
-
-/// Build the RustFS binary using cargo
-fn build_rustfs_binary(requested_features: Option<&str>, binary_path: &Path) {
-    let workspace = workspace_root();
-    info!("Building RustFS binary from workspace: {:?}", workspace);
-
-    let _profile = if cfg!(debug_assertions) {
-        info!("Building in debug mode");
-        "dev"
-    } else {
-        info!("Building in release mode");
-        "release"
-    };
-
-    let mut cmd = Command::new("cargo");
-    cmd.current_dir(&workspace).args(["build", "--bin", "rustfs"]);
-
-    if let Some(features) = requested_features {
-        cmd.arg("--features").arg(features);
-        info!("Building with features: {}", features);
-    }
-
-    if !cfg!(debug_assertions) {
-        cmd.arg("--release");
-    }
-
-    info!(
-        "Executing: cargo build --bin rustfs {}",
-        if cfg!(debug_assertions) { "" } else { "--release" }
-    );
-
-    let output = cmd.output().expect("Failed to execute cargo build command");
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        panic!("Failed to build RustFS binary. Error: {stderr}");
-    }
-
-    let stamp_path = rustfs_binary_features_stamp_path(binary_path);
-    if let Err(err) = stdfs::write(&stamp_path, requested_features.unwrap_or_default()) {
-        warn!("Failed to write RustFS feature stamp {:?}: {}", stamp_path, err);
-    }
-
-    info!("✅ RustFS binary built successfully");
 }
 
 fn awscurl_binary_path() -> PathBuf {
@@ -2073,16 +1997,66 @@ mod tests {
     }
 
     #[test]
-    fn binary_feature_stamp_matching_uses_normalized_features() {
-        let binary_path = std::env::temp_dir().join(format!("rustfs-feature-stamp-test-{}", Uuid::new_v4()));
-        let stamp_path = rustfs_binary_features_stamp_path(&binary_path);
+    fn explicit_binary_without_run_receipt_is_rejected() {
+        const CHILD_ENV: &str = "RUSTFS_E2E_RECEIPT_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            rustfs_binary_path_with_features(None);
+            return;
+        }
+        let executable = std::env::current_exe().expect("locate isolated test process");
+        let output = Command::new(&executable)
+            .args([
+                "--exact",
+                "common::tests::explicit_binary_without_run_receipt_is_rejected",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("CARGO_BIN_EXE_rustfs", &executable)
+            .env_remove("RUSTFS_E2E_BINARY_RECEIPT")
+            .output()
+            .expect("run the missing-receipt scenario with isolated environment variables");
+        assert!(!output.status.success(), "an explicit binary must not bypass run verification");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("missing E2E run receipt"));
+    }
 
-        stdfs::write(&stamp_path, " SFTP, ftps ").expect("write feature stamp");
-        assert!(binary_features_match(&binary_path, Some("sftp,ftps")));
-        assert!(binary_features_match(&binary_path, Some(" SFTP, FTPS ")));
-        assert!(!binary_features_match(&binary_path, Some("sftp")));
-
-        stdfs::remove_file(stamp_path).ok();
+    #[test]
+    fn e2e_run_receipt_rejects_replaced_binary_and_missing_features() {
+        let directory = std::env::temp_dir().join(format!("rustfs-e2e-receipt-test-{}", Uuid::new_v4()));
+        stdfs::create_dir(&directory).expect("create receipt fixture");
+        let binary = directory.join("rustfs");
+        let receipt = directory.join("receipt.json");
+        stdfs::write(&binary, "server").expect("write fixture binary");
+        let metadata = binary.metadata().expect("stat fixture binary");
+        let record = serde_json::json!({
+            "schema": 1,
+            "workspace": directory.canonicalize().expect("canonical workspace"),
+            "binary": binary.canonicalize().expect("canonical binary"),
+            "size": metadata.len(),
+            "modified_ns": metadata.modified().expect("modified time").duration_since(std::time::UNIX_EPOCH).expect("positive timestamp").as_nanos(),
+            "features": ["default", "full", "ftps", "webdav", "sftp"]
+        });
+        stdfs::write(&receipt, serde_json::to_vec(&record).expect("serialize receipt")).expect("write receipt");
+        verify_e2e_binary_receipt(&receipt, &directory, &binary, Some("sftp,webdav")).expect("resolved feature subset");
+        verify_e2e_binary_receipt(&receipt, &directory, &binary, Some("full")).expect("full was actually requested");
+        assert_eq!(
+            verify_e2e_binary_receipt(&receipt, &directory, &binary, Some("rio-v2"))
+                .expect_err("full does not enable rio-v2")
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        let other = directory.join("old-server");
+        stdfs::write(&other, "server").expect("write alternate binary");
+        assert!(verify_e2e_binary_receipt(&receipt, &directory, &other, None).is_err());
+        stdfs::write(&binary, "different server").expect("replace fixture binary");
+        assert!(verify_e2e_binary_receipt(&receipt, &directory, &binary, None).is_err());
+        stdfs::remove_file(&receipt).expect("remove expired receipt");
+        assert_eq!(
+            verify_e2e_binary_receipt(&receipt, &directory, &binary, None)
+                .expect_err("expired receipt")
+                .kind(),
+            ErrorKind::NotFound
+        );
+        stdfs::remove_dir_all(directory).expect("remove receipt fixture");
     }
 
     /// Build a cluster environment struct in-memory (no ports, no processes) so

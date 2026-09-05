@@ -132,7 +132,7 @@ jobs:
             s3api create-bucket --bucket "${RUSTFS_ODM_INTEROP_BUCKET}"
 
       - name: Build the RustFS binary under test
-        run: cargo build --locked -p rustfs --bins
+        run: python3 scripts/e2e_binary.py build --bins
 
       # The lane selects tests by module, so a rename would quietly shrink it.
       # The committed digest in .config/e2e-odm-interop-selection.txt fails
@@ -143,7 +143,7 @@ jobs:
           python3 ./scripts/check_test_wiring.py --check-profile e2e-odm-interop "${NEXTEST_LISTING}"
 
       - name: Run the interop cases against MinIO
-        run: cargo nextest run --profile e2e-odm-interop -p e2e_test --no-tests=fail
+        run: python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-odm-interop -p e2e_test --no-tests=fail
 
       - name: Build the MinIO interop report
         if: always()
@@ -251,7 +251,7 @@ jobs:
 
       - name: Build the RustFS binary under test
         if: steps.credentials.outputs.present == 'true'
-        run: cargo build --locked -p rustfs --bins
+        run: python3 scripts/e2e_binary.py build --bins
 
       # A filterset that matches nothing is valid, so the count is asserted
       # rather than inferred from a green run.
@@ -272,7 +272,7 @@ jobs:
       - name: Run the three-case minimum
         if: steps.credentials.outputs.present == 'true'
         run: |
-          cargo nextest run --profile e2e-odm-interop -p e2e_test \
+          python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-odm-interop -p e2e_test \
             -E "${CLOUD_CASE_FILTER}" --no-tests=fail
 
       - name: Build the ${{ matrix.provider }} interop report
