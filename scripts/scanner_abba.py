@@ -223,7 +223,8 @@ def evaluate(cells):
             p1 = {"required_reduction": float(required), "observed_reduction": float(reduction),
                   "repeatability_drift": report_number(work_drift)}
             if group[0]["scenario"] == "cold-hot":
-                passed &= reduction >= required
+                # Compare counts before division can round repeating decimal ratios.
+                passed &= a["walk_objects"] - b["walk_objects"] >= a["cold_walk_objects"] * Decimal("0.80")
         p2 = [convergence(cell["result"]) if cell["background"] == "on" else None for cell in group]
         candidate_p2 = [value for cell, value in zip(group, p2) if cell["leg"].startswith("B")]
         p2_pending = any(value is None for value in candidate_p2)
@@ -270,6 +271,19 @@ def collect_live(prepared, request, request_path, adapter):
             for sample in heals:
                 status = read_json(sample)
                 require(isinstance(status.get("healOperations"), dict) and status["healOperations"], "invalid heal status response")
+            metrics = list((output / "metrics").glob("admin-metrics.*.ndjson"))
+            endpoints = [endpoint for endpoint in connection["metrics_endpoints"].split(",") if endpoint]
+            require(metrics and len(metrics) == len(endpoints) * len(samples), "missing distributed metrics samples")
+            for sample in metrics:
+                # The collector requests n=1, so each file contains one final JSON record.
+                status = read_json(sample)
+                require(status.get("errors") == [], "distributed metrics errors")
+                require(status.get("final") is True, "incomplete distributed metrics")
+                hosts = status.get("by_host")
+                require(isinstance(hosts, dict) and hosts, "missing by-host metrics")
+                for host in hosts.values():
+                    require(isinstance(host, dict) and isinstance(host.get("scanner"), dict) and host["scanner"],
+                            "missing per-host scanner metrics")
             return result
         finally:
             # Stop telemetry children as well when measurement fails or times out.

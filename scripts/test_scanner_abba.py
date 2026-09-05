@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import scanner_abba as harness
 
@@ -69,6 +69,9 @@ def fake_adapter():
             result["metrics"]["p99_ms"] = 10.500001
         elif fault == "p1-regression" and not baseline:
             result["metrics"]["walk_objects"] = 30
+        elif fault in ("p1-exact-fraction", "p1-over-fraction"):
+            result["metrics"].update(walk_objects=9 if baseline else 5 + (fault == "p1-over-fraction"),
+                                     cold_walk_objects=5 if baseline else 0)
         elif fault == "unstable-p1-control" and request["comparison"] == "build":
             if request["leg"] == "A1":
                 result["metrics"].update(walk_objects=1000, cold_walk_objects=1000)
@@ -154,6 +157,60 @@ class ScannerAbbaTest(unittest.TestCase):
     def test_just_over_threshold_fails(self):
         with patch.object(harness, "SCENARIOS", ("cold-hot",)):
             self.assertEqual(self.run_harness("just-over-threshold"), 1)
+
+    def test_p1_fractional_boundary(self):
+        for fault, expected in (("p1-exact-fraction", 0), ("p1-over-fraction", 1)):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                self.root = Path(directory)
+                with patch.object(harness, "SCENARIOS", ("cold-hot",)):
+                    self.assertEqual(self.run_harness(fault), expected)
+
+    def test_live_collector_rejects_missing_or_failed_node_metrics(self):
+        telemetry = self.root / "telemetry"
+        for name in ("status", "heal", "metrics"):
+            (telemetry / name).mkdir(parents=True)
+        (telemetry / "scanner-summary.csv").write_text("timestamp\n")
+        valid = {"errors": [], "final": True, "by_host": {"node-b:9000": {"scanner": {"objects": 10}}}}
+        for index in range(16):
+            harness.write_json(telemetry / f"status/scanner-status.{index}.json", {"metrics": {"objects": 10}})
+            for node in ("node-a", "node-b"):
+                harness.write_json(telemetry / f"heal/background-heal-status.{node}.{index}.json",
+                                   {"healOperations": {"queueLength": 0}})
+                harness.write_json(telemetry / f"metrics/admin-metrics.{node}.{index}.ndjson",
+                                   {**valid, "by_host": {f"{node}:9000": {"scanner": {"objects": 10}}}})
+        sample = telemetry / "metrics/admin-metrics.node-b.15.ndjson"
+        prepared = {"collector": {"alias": "test", "endpoint": "http://node-a:9000",
+                                  "metrics_endpoints": "http://node-a:9000,http://node-b:9000"}}
+        cases = (
+            ("valid", valid, None),
+            ("missing", None, "missing distributed metrics samples"),
+            ("empty", "", "Expecting value"),
+            ("http-error", {"Code": "AccessDenied"}, "distributed metrics errors"),
+            ("partial-error", {**valid, "errors": ["node unavailable"]}, "distributed metrics errors"),
+            ("unfinished", {**valid, "final": False}, "incomplete distributed metrics"),
+            ("missing-host", {**valid, "by_host": {}}, "missing by-host metrics"),
+            ("missing-scanner", {**valid, "by_host": {"node-a:9000": {}}}, "missing per-host scanner metrics"),
+            ("collector-exit", valid, "scanner collector failed"),
+        )
+        for name, payload, error in cases:
+            with self.subTest(fault=name):
+                if payload is None:
+                    sample.unlink()
+                elif isinstance(payload, str):
+                    sample.write_text(payload)
+                else:
+                    harness.write_json(sample, payload)
+                process = Mock(pid=123, wait=Mock(return_value=1 if name == "collector-exit" else 0))
+                with patch.object(harness.subprocess, "Popen", return_value=process), \
+                        patch.object(harness, "invoke", return_value={"sample_count": 10}), \
+                        patch.object(harness.time, "monotonic", side_effect=(0, 900)), \
+                        patch.object(harness.os, "killpg"):
+                    if error:
+                        with self.assertRaisesRegex(ValueError, error):
+                            harness.collect_live(prepared, {"duration_seconds": 900}, self.root / "request.json", self.adapter)
+                    else:
+                        self.assertEqual(harness.collect_live(prepared, {"duration_seconds": 900},
+                                                             self.root / "request.json", self.adapter), {"sample_count": 10})
 
     def test_unstable_p1_work_control_is_inconclusive(self):
         with patch.object(harness, "SCENARIOS", ("cold-hot",)):
