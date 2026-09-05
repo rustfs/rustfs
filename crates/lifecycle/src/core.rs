@@ -4159,6 +4159,270 @@ mod tests {
         assert_eq!(event.action, IlmAction::NoneAction);
     }
 
+    mod adversarial_regressions {
+        use super::*;
+        use s3s::dto::NoncurrentVersionExpiration;
+
+        fn run(test: impl std::future::Future<Output = ()>) {
+            with_default_ilm_process_time(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("lifecycle regression runtime should build")
+                    .block_on(test);
+            });
+        }
+
+        fn noncurrent_object() -> ObjectOpts {
+            ObjectOpts {
+                name: "logs/object".to_string(),
+                mod_time: Some(datetime!(2020-01-01 00:00:00 UTC)),
+                successor_mod_time: Some(datetime!(2020-01-02 00:00:00 UTC)),
+                version_id: Some(Uuid::from_u128(1)),
+                size: 1024 * 1024,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn noncurrent_transition_retains_the_requested_newer_versions() {
+            run(async {
+                let mut rule = enabled_rule(None, None, Some("retain-two-hot-versions"));
+                rule.filter = Some(LifecycleRuleFilter::default());
+                rule.noncurrent_version_transitions = Some(vec![NoncurrentVersionTransition {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: Some(2),
+                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                }]);
+                let lc = Arc::new(BucketLifecycleConfiguration {
+                    rules: vec![rule],
+                    expiry_updated_at: None,
+                });
+                lc.validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect("valid noncurrent transition policy");
+                let objects = (0..4)
+                    .map(|index| ObjectOpts {
+                        mod_time: Some(datetime!(2020-01-05 00:00:00 UTC) - Duration::days(index)),
+                        successor_mod_time: (index > 0).then_some(datetime!(2020-01-06 00:00:00 UTC) - Duration::days(index)),
+                        version_id: Some(Uuid::from_u128(u128::try_from(index + 1).expect("small version index"))),
+                        is_latest: index == 0,
+                        num_versions: 4,
+                        ..noncurrent_object()
+                    })
+                    .collect::<Vec<_>>();
+                let actions = crate::Evaluator::new(lc)
+                    .eval(&objects)
+                    .await
+                    .expect("complete version chain should evaluate")
+                    .into_iter()
+                    .map(|event| event.action)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actions,
+                    [
+                        IlmAction::NoneAction,
+                        IlmAction::NoneAction,
+                        IlmAction::NoneAction,
+                        IlmAction::TransitionVersionAction
+                    ],
+                    "the two newest noncurrent versions must remain in their current storage class"
+                );
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn expiration_retention_does_not_skip_an_independent_transition() {
+            run(async {
+                let mut rule = enabled_rule(None, None, Some("transition-then-expire"));
+                rule.filter = Some(LifecycleRuleFilter::default());
+                rule.noncurrent_version_transitions = Some(vec![NoncurrentVersionTransition {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                }]);
+                let mut lc = BucketLifecycleConfiguration {
+                    rules: vec![rule],
+                    expiry_updated_at: None,
+                };
+                let object = noncurrent_object();
+                let now = datetime!(2020-01-10 00:00:00 UTC);
+                let transition_only = lc.eval_inner(&object, now, 0).await;
+                assert_eq!(transition_only.action, IlmAction::TransitionVersionAction);
+
+                lc.rules[0].noncurrent_version_expiration = Some(NoncurrentVersionExpiration {
+                    noncurrent_days: Some(90),
+                    newer_noncurrent_versions: Some(2),
+                });
+                lc.validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect("valid combined policy");
+                let combined = lc.eval_inner(&object, now, 0).await;
+                assert_eq!(combined.action, transition_only.action, "retention limits expiration, not transition");
+                assert_eq!(combined.storage_class, transition_only.storage_class);
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn current_transition_selection_is_independent_of_array_order() {
+            run(async {
+                let mut rule = enabled_rule(None, None, Some("two-current-transitions"));
+                rule.transitions = Some(vec![
+                    Transition {
+                        date: Some(datetime!(2020-03-01 00:00:00 UTC).into()),
+                        days: None,
+                        storage_class: Some(TransitionStorageClass::from_static("COLD")),
+                    },
+                    Transition {
+                        date: Some(datetime!(2020-01-03 00:00:00 UTC).into()),
+                        days: None,
+                        storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                    },
+                ]);
+                let mut lc = BucketLifecycleConfiguration {
+                    rules: vec![rule],
+                    expiry_updated_at: None,
+                };
+                lc.validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect("multiple transitions are accepted");
+                let object = ObjectOpts {
+                    is_latest: true,
+                    ..noncurrent_object()
+                };
+                let now = datetime!(2020-01-10 00:00:00 UTC);
+                let first = lc.eval_inner(&object, now, 0).await;
+                lc.rules[0]
+                    .transitions
+                    .as_mut()
+                    .expect("transition array is present")
+                    .reverse();
+                let reversed = lc.eval_inner(&object, now, 0).await;
+                assert_eq!(
+                    [(first.action, first.storage_class), (reversed.action, reversed.storage_class)],
+                    [
+                        (IlmAction::TransitionAction, "WARM".to_string()),
+                        (IlmAction::TransitionAction, "WARM".to_string())
+                    ],
+                    "an accepted later array element must be evaluated when it is the only due transition"
+                );
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn noncurrent_transition_selection_is_independent_of_array_order() {
+            run(async {
+                let mut rule = enabled_rule(None, None, Some("two-noncurrent-transitions"));
+                rule.noncurrent_version_transitions = Some(vec![
+                    NoncurrentVersionTransition {
+                        noncurrent_days: Some(30),
+                        newer_noncurrent_versions: None,
+                        storage_class: Some(TransitionStorageClass::from_static("COLD")),
+                    },
+                    NoncurrentVersionTransition {
+                        noncurrent_days: Some(1),
+                        newer_noncurrent_versions: None,
+                        storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                    },
+                ]);
+                let mut lc = BucketLifecycleConfiguration {
+                    rules: vec![rule],
+                    expiry_updated_at: None,
+                };
+                lc.validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect("multiple noncurrent transitions are accepted");
+                let object = noncurrent_object();
+                let now = datetime!(2020-01-10 00:00:00 UTC);
+                let first = lc.eval_inner(&object, now, 0).await;
+                lc.rules[0]
+                    .noncurrent_version_transitions
+                    .as_mut()
+                    .expect("transition array is present")
+                    .reverse();
+                let reversed = lc.eval_inner(&object, now, 0).await;
+                assert_eq!(
+                    [(first.action, first.storage_class), (reversed.action, reversed.storage_class)],
+                    [
+                        (IlmAction::TransitionVersionAction, "WARM".to_string()),
+                        (IlmAction::TransitionVersionAction, "WARM".to_string())
+                    ],
+                    "noncurrent transition eligibility must not depend on XML array order"
+                );
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn expiration_rejects_simultaneous_days_and_date() {
+            run(async {
+                let mut lc = BucketLifecycleConfiguration {
+                    rules: vec![enabled_rule(
+                        Some(LifecycleExpiration {
+                            days: Some(1),
+                            ..Default::default()
+                        }),
+                        None,
+                        Some("ambiguous-expiry"),
+                    )],
+                    expiry_updated_at: None,
+                };
+                lc.validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect("a single Days expiration is valid");
+                lc.rules[0].expiration.as_mut().expect("expiration is present").date =
+                    Some(datetime!(2099-01-01 00:00:00 UTC).into());
+                lc.validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect_err("Days and Date are mutually exclusive; accepting both silently overrides Days");
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn overdue_transition_does_not_starve_permanent_expiration() {
+            run(async {
+                let mut rule = enabled_rule(
+                    Some(LifecycleExpiration {
+                        days: Some(90),
+                        ..Default::default()
+                    }),
+                    None,
+                    Some("archive-then-delete"),
+                );
+                rule.transitions = Some(vec![Transition {
+                    days: Some(30),
+                    date: None,
+                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                }]);
+                let lc = BucketLifecycleConfiguration {
+                    rules: vec![rule],
+                    expiry_updated_at: None,
+                };
+                lc.validate(&ObjectLockConfiguration::default())
+                    .await
+                    .expect("valid transition and expiration policy");
+                let object = ObjectOpts {
+                    is_latest: true,
+                    version_id: None,
+                    transition_status: TRANSITION_PENDING.to_string(),
+                    ..noncurrent_object()
+                };
+                let before_expiration = lc.eval_inner(&object, datetime!(2020-02-15 00:00:00 UTC), 0).await;
+                assert_eq!(before_expiration.action, IlmAction::TransitionAction);
+                let overdue = lc.eval_inner(&object, datetime!(2020-05-01 00:00:00 UTC), 0).await;
+                assert_eq!(
+                    overdue.action,
+                    IlmAction::DeleteAction,
+                    "an unavailable tier must not prevent permanent expiration indefinitely"
+                );
+            });
+        }
+    }
+
     /// Property-based tests for the rule evaluator (backlog#1148 ilm-14,
     /// follow-up to backlog#1030 / rustfs#4455).
     ///

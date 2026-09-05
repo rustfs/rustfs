@@ -206,6 +206,53 @@ mod tests {
 
     use super::*;
     use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};
+
+    #[tokio::test]
+    async fn adversarial_restore_expiry_survives_legal_hold() {
+        let mut policy = (*latest_expiration_lifecycle()).clone();
+        policy.rules[0].status = ExpirationStatus::from_static(ExpirationStatus::DISABLED);
+        let policy = Arc::new(policy);
+        policy
+            .validate(&lock_enabled_without_default_retention())
+            .await
+            .expect("valid disabled lifecycle rule");
+        let mut objects = [true, false].map(|is_latest| ObjectOpts {
+            is_latest,
+            num_versions: 2,
+            mod_time: Some(
+                OffsetDateTime::from_unix_timestamp(if is_latest { 1_200_000 } else { 1_000_000 })
+                    .expect("fixed version timestamp"),
+            ),
+            successor_mod_time: (!is_latest)
+                .then(|| OffsetDateTime::from_unix_timestamp(1_200_000).expect("fixed successor timestamp")),
+            transition_status: crate::TRANSITION_COMPLETE.to_string(),
+            restore_expires: Some(OffsetDateTime::from_unix_timestamp(2_000_000).expect("fixed expired restore timestamp")),
+            ..current_object_opts(ReplicationStatusType::Completed)
+        });
+        let evaluator = Evaluator::new(policy).with_lock_retention(Some(lock_enabled_without_default_retention()));
+        let expected = [IlmAction::DeleteRestoredAction, IlmAction::DeleteRestoredVersionAction];
+        let unlocked = evaluator
+            .eval(&objects)
+            .await
+            .expect("unlocked restored versions should evaluate");
+        assert_eq!(unlocked.iter().map(|event| event.action).collect::<Vec<_>>(), expected);
+
+        for object in &mut objects {
+            object
+                .user_defined
+                .insert(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string());
+        }
+        let locked = evaluator
+            .eval(&objects)
+            .await
+            .expect("locked restored versions should evaluate");
+        assert_eq!(
+            locked.iter().map(|event| event.action).collect::<Vec<_>>(),
+            expected,
+            "expiring a restored local copy preserves the retained logical version and remote object"
+        );
+    }
+
     fn expired_marker_lifecycle() -> Arc<BucketLifecycleConfiguration> {
         Arc::new(BucketLifecycleConfiguration {
             expiry_updated_at: None,
