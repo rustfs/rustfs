@@ -719,8 +719,7 @@ mod tests {
         )
         .await;
         client_ctx.if_absent = false;
-        let committed = DefaultObjectUsecase::from_global()
-            .internal_put_object(client_ctx, body_stream(b"client"))
+        let committed = Box::pin(DefaultObjectUsecase::from_global().internal_put_object(client_ctx, body_stream(b"client")))
             .await
             .expect("client put after staging");
         let result = write_back.complete_multipart_upload(&req, &upload_id, vec![part]).await;
