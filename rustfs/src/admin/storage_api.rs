@@ -353,6 +353,25 @@ pub(crate) mod metadata_sys {
         super::ecstore_bucket::metadata_sys::update_if_incarnation(bucket, config_file, data, expected_incarnation_id).await
     }
 
+    /// [`update_if_incarnation`] stamping the config with a replicated edit's
+    /// source `updated_at` instead of the local clock (backlog#2292).
+    pub(crate) async fn update_if_incarnation_at(
+        bucket: &str,
+        config_file: &str,
+        data: Vec<u8>,
+        expected_incarnation_id: uuid::Uuid,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::update_if_incarnation_at(
+            bucket,
+            config_file,
+            data,
+            expected_incarnation_id,
+            updated_at,
+        )
+        .await
+    }
+
     pub(crate) async fn update_quota_if_incarnation(
         bucket: &str,
         data: Vec<u8>,
@@ -360,6 +379,25 @@ pub(crate) mod metadata_sys {
         proof: &super::ecstore_notification::CrossPoolFenceFleetProofToken,
     ) -> Result<OffsetDateTime> {
         super::ecstore_bucket::metadata_sys::update_quota_if_incarnation(bucket, data, expected_incarnation_id, proof).await
+    }
+
+    /// [`update_quota_if_incarnation`] stamping the quota with a replicated
+    /// edit's source `updated_at` instead of the local clock (backlog#2292).
+    pub(crate) async fn update_quota_if_incarnation_at(
+        bucket: &str,
+        data: Vec<u8>,
+        expected_incarnation_id: uuid::Uuid,
+        proof: &super::ecstore_notification::CrossPoolFenceFleetProofToken,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::update_quota_if_incarnation_at(
+            bucket,
+            data,
+            expected_incarnation_id,
+            proof,
+            updated_at,
+        )
+        .await
     }
 
     pub(crate) async fn capture_bucket_metadata_incarnation(bucket: &str) -> Result<uuid::Uuid> {

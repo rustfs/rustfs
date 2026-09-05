@@ -5619,6 +5619,17 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
         _ => unreachable!(),
     };
 
+    // Persist the SOURCE `updated_at` as the stored `*_config_updated_at`
+    // stamp (backlog#2292). The staleness gate above compares the next item's
+    // source time against that stamp, so stamping the local apply time would
+    // reject a newer source edit that was merely delivered after this write
+    // (two quick edits under delivery delay, or a peer clock ahead of ours).
+    // Items without a source time keep the local stamp; lc-config keeps it
+    // too: its staleness axis is the in-document `expiry_updated_at` the merge
+    // above records, and the whole-config time is only its deletion / legacy
+    // lower bound.
+    let source_updated_at = if item.r#type == "lc-config" { None } else { item.updated_at };
+
     if !skip_config_write {
         if let Some(data) = data {
             if item.r#type == "quota-config" {
@@ -5637,13 +5648,25 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
                             "durable quota capability is not confirmed across the cluster".to_string(),
                         )
                     })?;
-                    metadata_sys::update_quota_if_incarnation(&item.bucket, data, expected_incarnation_id, &proof)
-                        .await
-                        .map_err(ApiError::from)?;
+                    match source_updated_at {
+                        Some(source_updated_at) => {
+                            metadata_sys::update_quota_if_incarnation_at(
+                                &item.bucket,
+                                data,
+                                expected_incarnation_id,
+                                &proof,
+                                source_updated_at,
+                            )
+                            .await
+                        }
+                        None => {
+                            metadata_sys::update_quota_if_incarnation(&item.bucket, data, expected_incarnation_id, &proof).await
+                        }
+                    }
+                    .map_err(ApiError::from)?;
                 } else {
-                    metadata_sys::update_if_incarnation(&item.bucket, config_file, data, expected_incarnation_id)
-                        .await
-                        .map_err(ApiError::from)?;
+                    write_replicated_bucket_config(&item.bucket, config_file, data, expected_incarnation_id, source_updated_at)
+                        .await?;
                 }
             } else {
                 if let Some(guard) = lifecycle_guard.as_ref() {
@@ -5651,9 +5674,8 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
                         .await
                         .map_err(ApiError::from)?;
                 } else {
-                    metadata_sys::update_if_incarnation(&item.bucket, config_file, data, expected_incarnation_id)
-                        .await
-                        .map_err(ApiError::from)?;
+                    write_replicated_bucket_config(&item.bucket, config_file, data, expected_incarnation_id, source_updated_at)
+                        .await?;
                 }
             }
         } else {
@@ -5686,6 +5708,26 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
         ensure_site_replication_bucket_setup_for_incarnation(&item.bucket, expected_incarnation_id).await?;
     }
 
+    Ok(())
+}
+
+/// Write one replicated bucket config, stamped with the item's source
+/// `updated_at` when it carries one and with the local clock otherwise
+/// (backlog#2292; see [`apply_bucket_meta_item`]).
+async fn write_replicated_bucket_config(
+    bucket: &str,
+    config_file: &str,
+    data: Vec<u8>,
+    expected_incarnation_id: Uuid,
+    source_updated_at: Option<OffsetDateTime>,
+) -> S3Result<()> {
+    match source_updated_at {
+        Some(source_updated_at) => {
+            metadata_sys::update_if_incarnation_at(bucket, config_file, data, expected_incarnation_id, source_updated_at).await
+        }
+        None => metadata_sys::update_if_incarnation(bucket, config_file, data, expected_incarnation_id).await,
+    }
+    .map_err(ApiError::from)?;
     Ok(())
 }
 
@@ -14149,5 +14191,73 @@ mod tests {
                 "rotation ack {round} must survive the concurrent retry-event writers; acked: {acked:?}"
             );
         }
+    }
+
+    /// backlog#2292: the receiver persists the SOURCE `updated_at` of an
+    /// applied bucket config and judges the next item's source time against
+    /// it. Stamping the local apply time instead rejected a source edit that
+    /// was newer than the applied one but delivered after the local stamp
+    /// (two quick source edits under delivery delay; a peer clock ahead of
+    /// ours) and acknowledged it with 200.
+    #[test]
+    fn test_bucket_meta_staleness_is_judged_against_the_applied_source_timestamp() {
+        let apply_wall_clock = OffsetDateTime::now_utc();
+        let source_edit_t1 = apply_wall_clock - time::Duration::seconds(30);
+        let source_edit_t2 = source_edit_t1 + time::Duration::seconds(2);
+        let source_edit_t0 = source_edit_t1 - time::Duration::seconds(2);
+        assert!(
+            source_edit_t2 < apply_wall_clock,
+            "T2 is newer at the source yet older than the local apply clock"
+        );
+
+        // Edit T1 arrives first and is applied the way apply_bucket_meta_item
+        // persists a replicated config: stamped with its source time.
+        let mut meta = crate::admin::storage_api::bucket::metadata::BucketMetadata::new("photos");
+        meta.update_config_at(
+            BUCKET_POLICY_CONFIG,
+            br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec(),
+            source_edit_t1,
+        )
+        .expect("apply edit T1");
+        let local_updated_at = bucket_meta_local_updated_at(&meta, BUCKET_POLICY_CONFIG);
+        assert_eq!(
+            local_updated_at, source_edit_t1,
+            "the stored stamp is the source time, not the apply clock"
+        );
+
+        // Edit T2 is newer at the source but delivered late: it must apply.
+        assert!(
+            !is_stale_update(local_updated_at, Some(source_edit_t2)),
+            "edit T2 ({source_edit_t2}) is newer than applied edit T1 ({source_edit_t1}) but is rejected against local stamp {local_updated_at}"
+        );
+        // Edit T0 predates the applied edit: it stays rejected.
+        assert!(
+            is_stale_update(local_updated_at, Some(source_edit_t0)),
+            "edit T0 ({source_edit_t0}) is older than applied edit T1 ({source_edit_t1}) and must be rejected"
+        );
+        // An item without a source time is never judged stale (unchanged).
+        assert!(!is_stale_update(local_updated_at, None));
+    }
+
+    /// backlog#2292: the replicated-config write in `apply_bucket_meta_item`
+    /// must go through the source-stamped entries; a plain
+    /// `update_if_incarnation` there would reintroduce local stamping.
+    #[test]
+    fn test_apply_bucket_meta_item_writes_through_the_source_stamped_entries() {
+        let source = include_str!("site_replication.rs");
+        let apply = source
+            .split("async fn apply_bucket_meta_item")
+            .nth(1)
+            .and_then(|rest| rest.split("fn group_info_requires_upsert").next())
+            .expect("apply_bucket_meta_item source");
+        assert!(
+            apply.contains("update_quota_if_incarnation_at("),
+            "durable quota must carry the source stamp"
+        );
+        assert!(apply.contains("update_if_incarnation_at("), "bucket configs must carry the source stamp");
+        assert!(
+            !apply.contains("metadata_sys::update_if_incarnation(&item.bucket"),
+            "no replicated config write may bypass the source stamp"
+        );
     }
 }
