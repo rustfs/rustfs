@@ -28,7 +28,7 @@ use super::storage_api::bucket_usecase::StorageObjectOptions;
 use super::storage_api::bucket_usecase::bucket::versioning_sys::BucketVersioningSys;
 use super::storage_api::bucket_usecase::contract::list::{ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as _};
 use super::storage_api::bucket_usecase::contract::object::ObjectOperations as _;
-use super::storage_api::bucket_usecase::s3::{S3Error, S3ErrorCode, S3Result};
+use super::storage_api::bucket_usecase::s3::{S3Error, S3ErrorCode, S3Request, S3Result};
 use super::storage_api::bucket_usecase::s3_api::bucket::ListObjectsV2Params;
 use crate::app::object::shared::{odm_source_unavailable_error, odm_state_error_class};
 use crate::error::ApiError;
@@ -38,7 +38,6 @@ use crate::on_demand_migration::{
     SourceListRequest, SourceObject, SourcePage, decode_continuation_token, source_list_plan,
 };
 use futures::StreamExt;
-use http::HeaderMap;
 use rustfs_utils::http::{SUFFIX_SOURCE_PROXY_REQUEST, get_header};
 use std::sync::Arc;
 use std::time::Instant;
@@ -101,16 +100,38 @@ fn invalid_continuation_token(err: &ListThroughTokenError) -> S3Error {
 /// bucket has no source, `list_through` is off, or the request carries the
 /// `source-proxy-request` anti-loop marker and therefore comes from a peer
 /// that must be answered locally.
-pub(crate) fn list_through_state(bucket: &str, headers: &HeaderMap) -> Option<Arc<BucketOdmState>> {
-    if get_header(headers, SUFFIX_SOURCE_PROXY_REQUEST).is_some() {
-        return None;
+pub(crate) async fn list_through_state<T>(
+    store: &ECStore,
+    bucket: &str,
+    req: &S3Request<T>,
+    params: &ListObjectsV2Params,
+) -> S3Result<Option<Arc<BucketOdmState>>> {
+    if get_header(&req.headers, SUFFIX_SOURCE_PROXY_REQUEST).is_some() {
+        return Ok(None);
     }
     let sys = OnDemandMigrationSys::get();
     if !sys.is_module_enabled() {
-        return None;
+        return Ok(None);
     }
-    let state = sys.state(bucket)?;
-    state.config().policy.list_through.then_some(state)
+    let Some(state) = sys.state(bucket).filter(|state| state.config().policy.list_through) else {
+        return Ok(None);
+    };
+    if params.max_keys == 0
+        || matches!(
+            source_list_plan(&params.prefix, state.config().filter.prefix.as_deref(), params.delimiter.as_deref()),
+            SourceListPlan::Skip,
+        )
+    {
+        return Ok(None);
+    }
+    let Some(expected_incarnation) = super::storage_api::bucket_usecase::access::odm_read_generation(req, bucket)? else {
+        return Ok(None);
+    };
+    let incarnation = store.bucket_incarnation_id(bucket).await.map_err(ApiError::from)?;
+    if incarnation != expected_incarnation {
+        return Ok(None);
+    }
+    Ok(state.filter_incarnation(incarnation))
 }
 
 /// A merged page plus whether the source had to be left out of it.
@@ -444,15 +465,17 @@ mod tests {
     use crate::app::bucket_usecase::DefaultBucketUsecase;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ecstore};
     use crate::app::storage_api::bucket_usecase::s3::{
-        ListObjectsInput, ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response, XmlSerialize, XmlSerializer,
+        GetObjectInput, HeadObjectInput, ListObjectsInput, ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response,
+        XmlSerialize, XmlSerializer,
     };
     use crate::app::storage_api::test::StoragePutObjReader;
-    use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::app::storage_api::test::contract::object::ObjectIO as _;
     use crate::on_demand_migration::{
         FilterConfig, MAX_LIST_NO_PROGRESS_PAGES, OnDemandMigrationConfig, PathStyle, PolicyConfig, Provider, SourceConfig,
         SourceCredentials, TlsConfig,
     };
+    use http::HeaderMap;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -727,7 +750,12 @@ mod tests {
                 ..Default::default()
             },
         };
-        sys.apply(&bucket, Some(&config)).await;
+        sys.apply_for_incarnation(
+            &bucket,
+            store.bucket_incarnation_id(&bucket).await.expect("bucket identity"),
+            Some(&config),
+        )
+        .await;
         assert!(
             sys.state(&bucket).expect("ODM state installed").client().is_ok(),
             "fake source client must build"
@@ -795,6 +823,128 @@ mod tests {
             .expect("source connections must finish")
             .expect("source server must not panic");
         (result, requests)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stale_bucket_state_cannot_send_get_head_or_list_to_the_source() {
+        run_large_stack_test("list-through-incarnation", || async {
+            temp_env::async_with_vars(
+                [
+                    ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                    ("HTTP_PROXY", None),
+                    ("HTTPS_PROXY", None),
+                    ("ALL_PROXY", None),
+                    ("http_proxy", None),
+                    ("https_proxy", None),
+                    ("all_proxy", None),
+                    ("NO_PROXY", Some("*")),
+                    ("no_proxy", Some("*")),
+                ],
+                async {
+                    let (endpoint, server, stop) = list_source(std::iter::repeat(source_xml(None, false, Some("source")))).await;
+                    let (_guard, input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                    let sys = OnDemandMigrationSys::get();
+                    let old = sys.state(&input.bucket).expect("original source state");
+                    let store = shared_gating_ecstore().await;
+                    let get = S3Request {
+                        input: GetObjectInput {
+                            bucket: input.bucket.clone(),
+                            key: "missing".into(),
+                            ..Default::default()
+                        },
+                        method: http::Method::GET,
+                        uri: http::Uri::from_static("/missing"),
+                        headers: HeaderMap::new(),
+                        extensions: http::Extensions::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                        trailing_headers: None,
+                    };
+                    let authorized_generation =
+                        super::super::storage_api::bucket_usecase::access::load_bucket_generation_from_store(
+                            &store,
+                            &get,
+                            &input.bucket,
+                        )
+                        .await
+                        .expect("capture the identity before authorization");
+                    store
+                        .delete_bucket(
+                            &input.bucket,
+                            &DeleteBucketOptions {
+                                force: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("delete original bucket");
+                    store
+                        .make_bucket(&input.bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("recreate bucket");
+                    let replacement = store
+                        .bucket_incarnation_id(&input.bucket)
+                        .await
+                        .expect("replacement identity");
+                    assert_ne!(replacement, old.incarnation_id());
+                    sys.remove(&input.bucket);
+                    let mut without_source = get.clone();
+                    super::super::storage_api::bucket_usecase::access::prepare_odm_read_generation(
+                        &store,
+                        &mut without_source,
+                        &input.bucket,
+                    )
+                    .await;
+                    for state_incarnation in [old.incarnation_id(), replacement] {
+                        sys.apply_for_incarnation(&input.bucket, state_incarnation, Some(old.config()))
+                            .await;
+                        // Both a stale runtime and a newly published replacement must reject
+                        // requests already authorized for the deleted incarnation.
+                        for capture in 0..3 {
+                            if capture == 0 && state_incarnation == replacement {
+                                continue;
+                            }
+                            let mut get = if capture == 2 { without_source.clone() } else { get.clone() };
+                            if capture == 1 {
+                                get.extensions.insert(authorized_generation.clone());
+                            }
+                            let mut head = get.clone().map_input(|_| HeadObjectInput {
+                                bucket: input.bucket.clone(),
+                                key: "missing".into(),
+                                ..Default::default()
+                            });
+                            head.method = http::Method::HEAD;
+                            let mut list = get.clone().map_input(|_| input.clone());
+                            list.uri = http::Uri::from_static("/?list-type=2");
+                            let usecase = crate::app::object::DefaultObjectUsecase::from_global();
+                            let get_error = tokio::time::timeout(Duration::from_secs(10), usecase.execute_get_object(get))
+                                .await
+                                .expect("GET stays local")
+                                .expect_err("local object is absent");
+                            assert_eq!(*get_error.code(), S3ErrorCode::NoSuchKey);
+                            let head_error = tokio::time::timeout(Duration::from_secs(10), usecase.execute_head_object(head))
+                                .await
+                                .expect("HEAD stays local")
+                                .expect_err("local object is absent");
+                            assert_eq!(*head_error.code(), S3ErrorCode::NoSuchKey);
+                            let listing = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                DefaultBucketUsecase::from_global().execute_list_objects_v2(list),
+                            )
+                            .await
+                            .expect("LIST stays local")
+                            .expect("replacement bucket lists locally");
+                            assert_eq!(listing.output.key_count, Some(0));
+                        }
+                    }
+                    stop.cancel();
+                    assert!(server.await.expect("source server must remain unused").is_empty());
+                },
+            )
+            .await;
+        });
     }
 
     #[test]
