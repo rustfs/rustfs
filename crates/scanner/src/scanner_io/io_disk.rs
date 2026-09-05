@@ -146,7 +146,7 @@ impl ScannerIODisk for Disk {
         Ok(size_summary)
     }
 
-    #[tracing::instrument(skip(self, budget, updates, cache, set_disks))]
+    #[tracing::instrument(skip(self, budget, updates, cache, set_disks, options), fields(scan_mode = ?options.scan_mode))]
     async fn nsscanner_disk(
         self: Arc<Self>,
         ctx: CancellationToken,
@@ -154,9 +154,12 @@ impl ScannerIODisk for Disk {
         set_disks: Vec<Arc<Disk>>,
         cache: DataUsageCache,
         updates: Option<mpsc::Sender<DataUsageEntry>>,
-        scan_mode: HealScanMode,
-        prefix_scan_scope: Option<ScannerBucketPrefixScanScope>,
+        options: ScannerDiskScanOptions,
     ) -> Result<ScannerDiskScanOutcome> {
+        let ScannerDiskScanOptions {
+            scan_mode,
+            prefix_scan_scope,
+        } = options;
         let done_drive = Metrics::time(Metric::ScanBucketDrive);
         let drive_start = std::time::Instant::now();
         let bucket = cache.info.name.clone();
