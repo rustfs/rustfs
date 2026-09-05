@@ -26,6 +26,7 @@
 //! forwarded: v1 rejects SSE-C source objects outright.
 
 use super::azure::AzureSourceBackend;
+#[cfg(feature = "gcs")]
 use super::gcs::GcsNativeSourceBackend;
 use super::list_through::{ListPageError, validate_list_page};
 use crate::bucket::remote_s3_client::{
@@ -722,6 +723,9 @@ impl SourceClient {
                 )?;
                 Ok(Self::from_backend(Box::new(backend), spec))
             }
+            #[cfg(not(feature = "gcs"))]
+            SourceBackendSpec::Gcs(_) => Err(RemoteS3ClientError::BackendNotCompiled("gcs_native")),
+            #[cfg(feature = "gcs")]
             SourceBackendSpec::Gcs(gcs) => {
                 let backend = GcsNativeSourceBackend::new(
                     &spec.endpoint,
@@ -1111,6 +1115,28 @@ mod tests {
             bandwidth_limit: NonZeroU64::new(1_000_000),
             backend: SourceBackendSpec::S3,
         }
+    }
+
+    #[cfg(not(feature = "gcs"))]
+    #[tokio::test]
+    async fn gcs_backend_not_compiled_keeps_hmac_s3_available() {
+        let mut native = spec(None);
+        native.provider = SourceProvider::GcsNative;
+        native.credentials = None;
+        native.backend = SourceBackendSpec::Gcs(GcsSourceSpec {
+            service_account_json: "{}".to_string(),
+        });
+        assert!(matches!(
+            SourceClient::new(&native).await,
+            Err(RemoteS3ClientError::BackendNotCompiled("gcs_native"))
+        ));
+
+        let mut hmac = spec(None);
+        hmac.provider = SourceProvider::Gcs;
+        hmac.endpoint = "https://storage.googleapis.com".to_string();
+        SourceClient::new(&hmac)
+            .await
+            .expect("GCS HMAC uses the always-available S3 backend");
     }
 
     async fn scripted_client(spec: &SourceClientSpec, responses: Vec<Scripted>) -> (SourceClient, Recorded) {

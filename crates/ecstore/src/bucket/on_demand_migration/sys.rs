@@ -85,6 +85,8 @@ pub static GLOBAL_ON_DEMAND_MIGRATION_SYS: OnceLock<OnDemandMigrationSys> = Once
 /// `resolve` as [`OdmLookup::Unavailable`] and through status snapshots.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum OdmStateError {
+    #[error("the {0} backend is not included in this build")]
+    BackendNotCompiled(&'static str),
     /// `source.credentials` is `null`; the shared client builder has no
     /// anonymous mode yet (rustfs/backlog#2149 follow-up).
     #[error("anonymous source access is not supported yet; configure source credentials")]
@@ -310,11 +312,12 @@ impl BucketOdmState {
         write_back: Option<Arc<dyn OdmWriteBack>>,
     ) -> Arc<Self> {
         let spec = source_client_spec(config);
-        let client = if config.source.credentials.is_none() {
+        let client = if config.source.credentials.is_none() && !config.source.provider.is_native() {
             Err(OdmStateError::AnonymousUnsupported)
         } else {
             SourceClient::new(&spec).await.map(Arc::new).map_err(|err| match err {
                 RemoteS3ClientError::MissingCredentials => OdmStateError::AnonymousUnsupported,
+                RemoteS3ClientError::BackendNotCompiled(provider) => OdmStateError::BackendNotCompiled(provider),
                 other => OdmStateError::ClientBuild(other.to_string()),
             })
         };
@@ -1074,6 +1077,28 @@ mod tests {
         assert!(snapshot.client_error.as_deref().unwrap().contains("anonymous"));
         // A failed client is rebuilt on the next apply of the same config.
         assert_eq!(sys.apply("b", Some(&cfg)).await, ApplyOutcome::Rebuilt);
+    }
+
+    #[cfg(not(feature = "gcs"))]
+    #[tokio::test]
+    async fn gcs_backend_not_compiled_is_unavailable_not_anonymous() {
+        let sys = enabled_sys();
+        let mut cfg = config(None);
+        cfg.source.provider = Provider::GcsNative;
+        cfg.source.credentials = None;
+        cfg.source.gcs = Some(super::super::config::GcsSourceConfig {
+            service_account_json: "{}".to_string(),
+        });
+        let encoded = cfg.to_json().expect("GCS config is serializable without the backend");
+        let restored: OnDemandMigrationConfig = serde_json::from_slice(&encoded).expect("GCS config stays readable");
+        assert_eq!(restored, cfg);
+        assert_eq!(sys.apply("b", Some(&cfg)).await, ApplyOutcome::Installed);
+        match sys.resolve("b", "k") {
+            Some(OdmLookup::Unavailable { error, .. }) => {
+                assert_eq!(error, OdmStateError::BackendNotCompiled("gcs_native"));
+            }
+            other => panic!("expected unavailable backend, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
