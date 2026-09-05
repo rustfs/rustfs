@@ -902,7 +902,6 @@ where
     observation
 }
 
-#[cfg(test)]
 pub(crate) fn scanner_activity_snapshot_digest(snapshot: &ScannerActivitySnapshot) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(u64::try_from(snapshot.len()).unwrap_or(u64::MAX).to_be_bytes());

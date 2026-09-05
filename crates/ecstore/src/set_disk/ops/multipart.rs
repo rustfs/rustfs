@@ -4050,6 +4050,7 @@ mod tests {
             let _ = drain_global_dirty_scopes();
 
             let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let rename_tasks = rename_fanout_barrier::observe_tasks(object);
             let complete_store = Arc::clone(&set_disks);
             let mut complete = tokio::spawn(async move {
                 let mut opts = ObjectOptions::default();
@@ -4061,16 +4062,6 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())
                 .await
                 .expect("multipart completion should pause one tail disk during rename");
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), &mut complete).await.is_err(),
-                "multipart completion must not publish success while a tail rename is still paused"
-            );
-
-            let initial = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
-            assert!(
-                initial.is_empty(),
-                "capacity must not be marked as committed before the full multipart rename finishes"
-            );
 
             let abort_store = Arc::clone(&set_disks);
             let abort = tokio::spawn(async move {
@@ -4079,21 +4070,46 @@ mod tests {
                     .await
             });
             signaling.wait_for_attempts(2).await;
-            assert!(!abort.is_finished(), "the in-flight completion must retain the multipart upload guard");
 
-            let retained_staging = futures::future::join_all(
-                disk_stores
-                    .iter()
-                    .map(|disk| disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &staged_part)),
-            )
+            // A paused rename does not establish that the other disks reached quorum.
+            let retained_staging = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let mut retained = 0;
+                    for result in futures::future::join_all(
+                        disk_stores
+                            .iter()
+                            .map(|disk| disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &staged_part)),
+                    )
+                    .await
+                    {
+                        match result {
+                            Ok(_) => retained += 1,
+                            Err(DiskError::FileNotFound) => {}
+                            Err(error) => panic!("staged rename source lookup failed: {error}"),
+                        }
+                    }
+                    if retained <= 1 && rename_tasks.running() == 1 {
+                        break retained;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
             .await
-            .into_iter()
-            .filter(|result| result.is_ok())
-            .count();
+            .expect("unpaused multipart renames should finish before the tail is released");
             assert_eq!(
                 retained_staging, 1,
                 "only the paused tail disk should still retain the multipart rename source"
             );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut complete).await.is_err(),
+                "multipart completion must not publish success while a tail rename is still paused"
+            );
+            let initial = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+            assert!(
+                initial.is_empty(),
+                "capacity must not be marked as committed before the full multipart rename finishes"
+            );
+            assert!(!abort.is_finished(), "the in-flight completion must retain the multipart upload guard");
 
             signaling.set_target(rustfs_lock::ObjectKey::new(bucket, object));
             let object_attempt = signaling.attempts.load(Ordering::Acquire) + 1;

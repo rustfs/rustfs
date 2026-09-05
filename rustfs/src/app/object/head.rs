@@ -665,6 +665,8 @@ mod tests {
                     session_token: None,
                 }),
                 tls: TlsConfig::default(),
+                azure: None,
+                gcs: None,
             },
             filter: FilterConfig {
                 prefix: None,
@@ -743,6 +745,7 @@ mod tests {
                 },
             ),
             is_multipart_etag: true,
+            etag_is_opaque: false,
         }
     }
 
