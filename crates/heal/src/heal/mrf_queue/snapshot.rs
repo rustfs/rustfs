@@ -289,7 +289,7 @@ mod tests {
     use crate::heal::mrf_queue::encode_intent;
     use crate::heal::storage_api::owner::{EcstoreConditionalFileUpdate, EcstoreDiskBytes};
     use crate::heal::{DiskOption, Endpoint, new_disk};
-    use rustfs_common::mrf_channel::{MrfIntent, MrfKind};
+    use rustfs_common::mrf_channel::{MrfIntent, MrfKind, MrfScope};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -549,6 +549,66 @@ mod tests {
                 .as_ref(),
             bytes
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_inspection_rejects_complete_subsets_and_scope_ambiguity() {
+        let scoped = |set_index| {
+            let intent = MrfIntent {
+                bucket: Arc::from("bucket"),
+                object: Arc::from("a"),
+                version_id: None,
+                kind: MrfKind::PartialWrite,
+                scope: Some(MrfScope {
+                    pool_index: 0,
+                    set_index,
+                }),
+                lease: None,
+                enqueued_at_ms: 1234,
+                attempts: 0,
+            };
+            let mut bytes = Vec::new();
+            assert!(encode_intent(&intent, &mut bytes), "scoped fixture must encode");
+            bytes
+        };
+        let mut superset = payload("a");
+        superset.extend_from_slice(&payload("b"));
+        for (case, first_bytes, second_bytes) in [
+            ("complete-subset", payload("a"), superset),
+            ("different-set", scoped(1), scoped(2)),
+            ("unknown-scope", payload("a"), scoped(1)),
+        ] {
+            let root = TempDir::new().expect("test directory");
+            let first = disk(&root, "first").await;
+            let second = disk(&root, "second").await;
+            for (disk, bytes) in [(&first, &first_bytes), (&second, &second_bytes)] {
+                assert_eq!(decode_journal(bytes).1, 0, "{case}: complete fixture");
+                EcstoreDiskAPI::write_all(
+                    disk.as_ref(),
+                    RUSTFS_META_BUCKET,
+                    MRF_SCOPED_JOURNAL_PATH,
+                    EcstoreDiskBytes::copy_from_slice(bytes),
+                )
+                .await
+                .expect("write legacy replica");
+            }
+            for disks in [vec![first.clone(), second.clone()], vec![second.clone(), first.clone()]] {
+                assert!(
+                    matches!(read_recovery_snapshot(&disks, 4096).await, Err(SnapshotError::Conflict)),
+                    "{case}: neither replica order proves a latest snapshot"
+                );
+            }
+            for (disk, bytes) in [(&first, &first_bytes), (&second, &second_bytes)] {
+                assert_eq!(
+                    EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, MRF_SCOPED_JOURNAL_PATH)
+                        .await
+                        .expect("legacy evidence retained")
+                        .as_ref(),
+                    bytes.as_slice(),
+                    "{case}: inspection must preserve both source replicas"
+                );
+            }
+        }
     }
 
     #[tokio::test]
