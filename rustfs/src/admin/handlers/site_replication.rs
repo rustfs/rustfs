@@ -6168,160 +6168,170 @@ impl Operation for SiteReplicationAddHandler {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let replicate_ilm_expiry = sr_add_replicate_ilm_expiry(&req.uri);
+        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
         let lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
-        // Everything up to the commit below is preflight: peer probes, IAM
-        // work and the join fan-out all talk to the network, so none of it may
-        // run inside the state transaction. The snapshot read here is what the
-        // `updated_at` CAS in the commit validates.
-        let current_state = load_site_replication_state().await?;
-        if pending_endpoint_refresh(&current_state).is_some() {
-            return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
-        }
-        let local_peer = current_local_peer(&req, &current_state);
         let mut sites: Vec<PeerSite> = read_site_replication_json(req, &cred.secret_key, true).await?;
-        // The web console's "Set Up Site Replication" omits the local deployment from the payload;
-        // inject it so the add preflight (which requires the local deployment) succeeds. No-op for `mc`.
-        ensure_local_site_present(&mut sites, &local_peer);
-        validate_add_sites(&sites, &local_peer)?;
-        let preflight_infos = add_preflight_infos(&sites, &current_state, &local_peer).await?;
-        validate_add_preflight_topology(&preflight_infos, &local_peer)?;
-        let expected_updated_at = current_state.updated_at;
-        require_add_peer_tls_capability(&sites, &local_peer).await?;
-        // Early exit on a state that moved under the preflight probes, BEFORE
-        // the IAM write and the join fan-out change anything remote. Advisory
-        // only — the binding check is the CAS inside the commit — but it fences
-        // the common race off the side-effect path and refreshes the merge
-        // base so the CAS window is only the join round trips.
-        let latest_state = load_site_replication_state().await?;
-        ensure_edit_precondition(&latest_state, expected_updated_at, None, "add preflight")?;
-        let current_state = latest_state;
-        let (service_account_access_key, service_account_secret_key) =
-            ensure_site_replicator_service_account(&cred.access_key, false).await?;
-        let expected_buckets: HashSet<String> = preflight_infos.iter().flat_map(|info| info.buckets.keys().cloned()).collect();
-        let bootstrap_buckets: HashSet<String> = preflight_infos
-            .iter()
-            .filter(|info| !same_identity_endpoint(&info.endpoint, &local_peer.endpoint))
-            .flat_map(|info| info.buckets.keys().cloned())
-            .collect();
-        let add_in_progress_guard = SiteReplicationAddInProgressGuard::start(lifecycle_guard, bootstrap_buckets.clone())?;
-        let mut state = merge_add_sites(
-            current_state,
-            local_peer.clone(),
-            sites.clone(),
-            service_account_access_key.clone(),
-            cred.access_key.clone(),
-            replicate_ilm_expiry,
-        );
-        state.sync_state_initialized = true;
-        let join_req = SRPeerJoinEnvelope {
-            request: SRPeerJoinReq {
-                svc_acct_access_key: service_account_access_key,
-                svc_acct_secret_key: service_account_secret_key.clone(),
-                svc_acct_parent: String::new(),
-                peers: state.peers.clone(),
-                updated_at: state.updated_at,
-            },
-            defer_sync_state_enable: true,
-        };
-        let peer_join_path =
-            with_site_replication_bootstrap_token(SITE_REPLICATION_PEER_JOIN_PATH, &add_in_progress_guard.token.to_string());
-
-        let mut joined_endpoints = HashSet::new();
-        let mut initial_sync_errors = SiteReplicationErrorSummary::default();
-        for (site, preflight) in sites.iter().zip(preflight_infos.iter()) {
-            if same_identity_endpoint(&site.endpoint, &local_peer.endpoint)
-                || !joined_endpoints.insert(site_identity_key(&site.endpoint))
-            {
-                continue;
-            }
-
-            let mut peer_join_req = join_req.clone();
-            peer_join_req.request.svc_acct_parent = site.access_key.clone();
-            let connection = PeerConnection::try_from(site)?;
-            let body = PeerAdminRequest::put(&connection, &peer_join_path, &site.access_key)
-                .send(&site.secret_key, &peer_join_req)
-                .await?;
-
-            let mut fallback_peer = existing_peer_for_endpoint(&state, &site.endpoint)
-                .unwrap_or_else(|| normalize_peer_site(site.clone(), replicate_ilm_expiry));
-            fallback_peer.deployment_id = preflight.deployment_id.clone();
-            let join_response = parse_peer_join_response(&body, fallback_peer).map_err(|e| {
-                S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!("parse peer join response from {} failed: {e}", site.endpoint),
-                )
-            })?;
-            if !join_response.initial_sync_error_message.is_empty() {
-                initial_sync_errors.push(format!("{}: {}", site.endpoint, join_response.initial_sync_error_message));
-            }
-            // An explicit no-op join. The peer answered 200 but wrote nothing —
-            // its persisted state is already newer than the snapshot it was
-            // sent — so the add is only PARTIALLY configured and saying
-            // "configured successfully" would be a lie (rustfs/rustfs#5963).
-            // `None` (a MinIO peer, or one older than the field) is not a
-            // no-op signal and is deliberately not reported.
-            if join_response.applied == Some(false) {
-                initial_sync_errors.push(format!(
-                    "{}: peer did not apply the join (its site replication state is newer than the snapshot it was sent); \
-                     the site is not configured against this peer",
-                    site.endpoint
-                ));
-            }
-            state = reconcile_peer_with_actual_identity(state, join_response.peer);
-            let reconciled_peer = existing_peer_for_endpoint(&state, &site.endpoint).ok_or_else(|| {
-                S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!("peer join response from {} did not identify the requested site", site.endpoint),
-                )
-            })?;
-            validate_proposed_peer(&reconciled_peer).map_err(|err| {
-                S3Error::with_message(
-                    S3ErrorCode::InvalidRequest,
-                    format!("invalid peer join response from {}: {err}", site.endpoint),
-                )
-            })?;
-        }
-
-        mark_unknown_peer_sync_enabled(&mut state.peers);
-
-        // Commit. The CAS runs inside the transaction, against the state the
-        // transaction itself loaded — the peer round trips above took however
-        // long they took, and only this check can tell whether the topology
-        // this add was planned against is still the current one. The error
-        // says so: by this point the remote sites already accepted their
-        // joins, and re-running the add is what reconverges the local side.
-        let next_state = state;
-        let commit_store = current_object_store_handle()
+        let admin_access_key = cred.access_key.clone();
+        let admission_store = current_object_store_handle()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
-        let list_store = commit_store.clone();
-        let (state, edit_generation) = with_site_replication_bucket_mutation_admission_lock(commit_store, move || async move {
-            // Join callbacks have completed before this write admission is
-            // taken. A local create/delete that finished while replication
-            // was still disabled changes the preflight union and aborts the
-            // commit; one that starts after admission waits until the
-            // committed state makes its hook active.
-            let present = list_store
-                .list_bucket(&BucketOptions::default())
-                .await
-                .map_err(ApiError::from)?
-                .into_iter()
-                .map(|bucket| bucket.name)
-                .collect::<HashSet<_>>();
-            ensure_add_bucket_set_matches_preflight(&expected_buckets, &present)?;
-            update_site_replication_state(move |state| {
-                if state.updated_at != expected_updated_at || pending_endpoint_refresh(state).is_some() {
-                    return Err(s3_error!(
-                        InvalidRequest,
-                        "site replication state changed during peer join; the peers may already be joined — re-run replicate add"
-                    ));
+        let list_store = admission_store.clone();
+        let (state, edit_generation, local_peer, service_account_secret_key, mut initial_sync_errors, _add_guard) =
+            with_site_replication_bucket_mutation_admission_lock(admission_store, move || async move {
+                // The writer starts before the local bucket snapshot and stays
+                // held through every peer join and the topology commit. A
+                // delete followed by a same-name create therefore cannot hide
+                // behind an unchanged final name set. Peer bootstrap callbacks
+                // use their internal path and do not acquire this public-
+                // mutation admission lock.
+                let current_state = load_site_replication_state().await?;
+                if pending_endpoint_refresh(&current_state).is_some() {
+                    return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
                 }
-                adopt_add_commit_state(state, next_state);
-                let edit_generation = next_peer_edit_generation(state);
-                Ok((state.clone(), edit_generation))
+                let local_peer = local_peer_at_endpoint(local_endpoint, &current_state);
+                // The web console's "Set Up Site Replication" omits the local deployment from the payload;
+                // inject it so the add preflight (which requires the local deployment) succeeds. No-op for `mc`.
+                ensure_local_site_present(&mut sites, &local_peer);
+                validate_add_sites(&sites, &local_peer)?;
+                let preflight_infos = add_preflight_infos(&sites, &current_state, &local_peer).await?;
+                validate_add_preflight_topology(&preflight_infos, &local_peer)?;
+                let expected_updated_at = current_state.updated_at;
+                require_add_peer_tls_capability(&sites, &local_peer).await?;
+                // Early exit on a state that moved under the preflight probes, BEFORE
+                // the IAM write and the join fan-out change anything remote. Advisory
+                // only — the binding check is the CAS inside the commit — but it fences
+                // the common race off the side-effect path and refreshes the merge
+                // base so the CAS window is only the join round trips.
+                let latest_state = load_site_replication_state().await?;
+                ensure_edit_precondition(&latest_state, expected_updated_at, None, "add preflight")?;
+                let current_state = latest_state;
+                let (service_account_access_key, service_account_secret_key) =
+                    ensure_site_replicator_service_account(&admin_access_key, false).await?;
+                let expected_buckets: HashSet<String> =
+                    preflight_infos.iter().flat_map(|info| info.buckets.keys().cloned()).collect();
+                let bootstrap_buckets: HashSet<String> = preflight_infos
+                    .iter()
+                    .filter(|info| !same_identity_endpoint(&info.endpoint, &local_peer.endpoint))
+                    .flat_map(|info| info.buckets.keys().cloned())
+                    .collect();
+                let add_in_progress_guard =
+                    SiteReplicationAddInProgressGuard::start(lifecycle_guard, bootstrap_buckets.clone())?;
+                let mut state = merge_add_sites(
+                    current_state,
+                    local_peer.clone(),
+                    sites.clone(),
+                    service_account_access_key.clone(),
+                    admin_access_key,
+                    replicate_ilm_expiry,
+                );
+                state.sync_state_initialized = true;
+                let join_req = SRPeerJoinEnvelope {
+                    request: SRPeerJoinReq {
+                        svc_acct_access_key: service_account_access_key,
+                        svc_acct_secret_key: service_account_secret_key.clone(),
+                        svc_acct_parent: String::new(),
+                        peers: state.peers.clone(),
+                        updated_at: state.updated_at,
+                    },
+                    defer_sync_state_enable: true,
+                };
+                let peer_join_path = with_site_replication_bootstrap_token(
+                    SITE_REPLICATION_PEER_JOIN_PATH,
+                    &add_in_progress_guard.token.to_string(),
+                );
+
+                let mut joined_endpoints = HashSet::new();
+                let mut initial_sync_errors = SiteReplicationErrorSummary::default();
+                for (site, preflight) in sites.iter().zip(preflight_infos.iter()) {
+                    if same_identity_endpoint(&site.endpoint, &local_peer.endpoint)
+                        || !joined_endpoints.insert(site_identity_key(&site.endpoint))
+                    {
+                        continue;
+                    }
+
+                    let mut peer_join_req = join_req.clone();
+                    peer_join_req.request.svc_acct_parent = site.access_key.clone();
+                    let connection = PeerConnection::try_from(site)?;
+                    let body = PeerAdminRequest::put(&connection, &peer_join_path, &site.access_key)
+                        .send(&site.secret_key, &peer_join_req)
+                        .await?;
+
+                    let mut fallback_peer = existing_peer_for_endpoint(&state, &site.endpoint)
+                        .unwrap_or_else(|| normalize_peer_site(site.clone(), replicate_ilm_expiry));
+                    fallback_peer.deployment_id = preflight.deployment_id.clone();
+                    let join_response = parse_peer_join_response(&body, fallback_peer).map_err(|e| {
+                        S3Error::with_message(
+                            S3ErrorCode::InternalError,
+                            format!("parse peer join response from {} failed: {e}", site.endpoint),
+                        )
+                    })?;
+                    if !join_response.initial_sync_error_message.is_empty() {
+                        initial_sync_errors.push(format!("{}: {}", site.endpoint, join_response.initial_sync_error_message));
+                    }
+                    // An explicit no-op join. The peer answered 200 but wrote nothing —
+                    // its persisted state is already newer than the snapshot it was
+                    // sent — so the add is only PARTIALLY configured and saying
+                    // "configured successfully" would be a lie (rustfs/rustfs#5963).
+                    // `None` (a MinIO peer, or one older than the field) is not a
+                    // no-op signal and is deliberately not reported.
+                    if join_response.applied == Some(false) {
+                        initial_sync_errors.push(format!(
+                            "{}: peer did not apply the join (its site replication state is newer than the snapshot it was sent); \
+                             the site is not configured against this peer",
+                            site.endpoint
+                        ));
+                    }
+                    state = reconcile_peer_with_actual_identity(state, join_response.peer);
+                    let reconciled_peer = existing_peer_for_endpoint(&state, &site.endpoint).ok_or_else(|| {
+                        S3Error::with_message(
+                            S3ErrorCode::InternalError,
+                            format!("peer join response from {} did not identify the requested site", site.endpoint),
+                        )
+                    })?;
+                    validate_proposed_peer(&reconciled_peer).map_err(|err| {
+                        S3Error::with_message(
+                            S3ErrorCode::InvalidRequest,
+                            format!("invalid peer join response from {}: {err}", site.endpoint),
+                        )
+                    })?;
+                }
+
+                mark_unknown_peer_sync_enabled(&mut state.peers);
+
+                // Commit. The state transaction's CAS still fences topology
+                // writers that do not use bucket admission. By this point
+                // remote sites may already have accepted their joins, so a
+                // mismatch asks the operator to re-run add and reconverge.
+                let next_state = state;
+                let present = list_store
+                    .list_bucket(&BucketOptions::default())
+                    .await
+                    .map_err(ApiError::from)?
+                    .into_iter()
+                    .map(|bucket| bucket.name)
+                    .collect::<HashSet<_>>();
+                ensure_add_bucket_set_matches_preflight(&expected_buckets, &present)?;
+                let (state, edit_generation) = update_site_replication_state(move |state| {
+                    if state.updated_at != expected_updated_at || pending_endpoint_refresh(state).is_some() {
+                        return Err(s3_error!(
+                            InvalidRequest,
+                            "site replication state changed during peer join; the peers may already be joined — re-run replicate add"
+                        ));
+                    }
+                    adopt_add_commit_state(state, next_state);
+                    let edit_generation = next_peer_edit_generation(state);
+                    Ok((state.clone(), edit_generation))
+                })
+                .await?;
+                Ok((
+                    state,
+                    edit_generation,
+                    local_peer,
+                    service_account_secret_key,
+                    initial_sync_errors,
+                    add_in_progress_guard,
+                ))
             })
-            .await
-        })
-        .await?;
+            .await?;
 
         // The finalize fan-out delivers peer-edit payloads, so it carries the
         // generation allocated in the commit above: the receiving site orders
@@ -9003,7 +9013,7 @@ mod tests {
     }
 
     #[test]
-    fn add_commit_fails_when_a_bootstrap_bucket_disappeared() {
+    fn add_admission_starts_before_preflight_and_rejects_bucket_set_changes() {
         let expected = HashSet::from(["remote-owned".to_string(), "shared".to_string()]);
         let present = HashSet::from(["shared".to_string()]);
 
@@ -9029,11 +9039,12 @@ mod tests {
         let admission = add
             .find("with_site_replication_bucket_mutation_admission_lock")
             .expect("distributed mutation admission");
+        let preflight = add.find("add_preflight_infos").expect("bucket preflight");
         let validation = add
             .find("ensure_add_bucket_set_matches_preflight")
             .expect("bucket-set validation");
         let commit = add.find("adopt_add_commit_state").expect("topology commit");
-        assert!(admission < validation && validation < commit);
+        assert!(admission < preflight && preflight < validation && validation < commit);
     }
 
     #[test]

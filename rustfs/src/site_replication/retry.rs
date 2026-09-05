@@ -290,6 +290,9 @@ pub(crate) fn is_destructive_bucket_retry_path(path: &str) -> bool {
 }
 
 fn retry_event_is_safely_replayable(event: &SiteReplicationRetryEvent) -> bool {
+    if is_destructive_bucket_retry_path(&event.path) {
+        return false;
+    }
     matches!(
         classify_site_replication_retry_event(event),
         Some(RetryDrainAction::PeerEdit | RetryDrainAction::BucketOpReplay { .. })
@@ -467,6 +470,10 @@ pub(crate) fn record_failed_iam_delivery(
         .iter_mut()
         .find(|record| iam_deletion_replay_matches(record, peer) && record.entity == entity)
     {
+        // This id is the replay-record revision. A settlement that sent the
+        // previous body must not remove a same-entity deletion that failed
+        // while its snapshot was in flight.
+        existing.id = Uuid::new_v4().to_string();
         existing.item = item_value;
         existing.recorded_at = Some(now);
         return Ok(());
@@ -589,15 +596,14 @@ pub(crate) async fn record_failed_site_replication_iam_delivery(peer: &PeerInfo,
 pub(crate) fn settle_replayed_iam_retry_events(
     state: &mut SiteReplicationState,
     peer: &PeerInfo,
-    path: &str,
-    snapshot_updated_at: Option<OffsetDateTime>,
+    observed: &SiteReplicationRetryEvent,
     replayed_record_ids: &[String],
 ) -> bool {
     state
         .iam_deletion_replays
         .retain(|record| !(iam_deletion_replay_matches(record, peer) && replayed_record_ids.contains(&record.id)));
 
-    if collapsed_retry_queue_path(path) != Some(SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH) {
+    if collapsed_retry_queue_path(&observed.path) != Some(SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH) {
         return false;
     }
     let Some(index) = state
@@ -608,11 +614,7 @@ pub(crate) fn settle_replayed_iam_retry_events(
         return false;
     };
     let event = &state.retry_queue[index];
-    let newer_failure_recorded = match (event.updated_at, snapshot_updated_at) {
-        (Some(current), Some(seen)) => current > seen,
-        (Some(_), None) => true,
-        (None, _) => false,
-    };
+    let newer_failure_recorded = event.id != observed.id || event.updated_at != observed.updated_at;
     if newer_failure_recorded && event.last_error != SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
         // The newer failure's own deletion (if any) has its own record; the
         // next drain pass replays it.
@@ -626,24 +628,22 @@ pub(crate) fn settle_replayed_iam_retry_events(
         state.retry_queue.remove(index);
         return true;
     }
-    escalate_site_replication_retry_events_up_to(&mut state.retry_queue, peer, path, snapshot_updated_at);
+    escalate_site_replication_retry_events_up_to(&mut state.retry_queue, peer, &observed.path, observed.updated_at);
     false
 }
 
 pub(crate) async fn settle_replayed_site_replication_iam_retry_event(
     peer: &PeerInfo,
-    path: &str,
-    snapshot_updated_at: Option<OffsetDateTime>,
+    observed: &SiteReplicationRetryEvent,
     replayed_record_ids: Vec<String>,
 ) {
     let peer_owned = peer.clone();
-    let path_owned = path.to_string();
+    let observed_owned = observed.clone();
     let result = update_site_replication_state(move |state| {
         Ok(settle_replayed_iam_retry_events(
             state,
             &peer_owned,
-            &path_owned,
-            snapshot_updated_at,
+            &observed_owned,
             &replayed_record_ids,
         ))
     })
@@ -669,7 +669,7 @@ pub(crate) async fn settle_replayed_site_replication_iam_retry_event(
                 event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                 peer = %peer.endpoint,
                 deployment_id = %peer.deployment_id,
-                path,
+                path = %observed.path,
                 error = ?err,
                 "failed to settle replayed site replication IAM retry event"
             );
@@ -1842,13 +1842,7 @@ pub(crate) async fn drain_one_site_replication_retry_event(
                 let fresh_snapshot = RetrySnapshot::from_plan(&action, &fresh_plan).expect("snapshot action has a snapshot");
                 if fresh_snapshot.fingerprint()? == current_fingerprint {
                     if is_iam {
-                        settle_replayed_site_replication_iam_retry_event(
-                            peer,
-                            &event.path,
-                            event.updated_at,
-                            replayed_record_ids,
-                        )
-                        .await;
+                        settle_replayed_site_replication_iam_retry_event(peer, event, replayed_record_ids).await;
                     } else {
                         escalate_site_replication_retry_event_up_to(peer, &event.path, event.updated_at).await;
                     }

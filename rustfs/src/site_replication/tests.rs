@@ -661,14 +661,9 @@ fn test_settle_replayed_iam_retry_events_settles_or_escalates() {
     let mut state = deletion_replay_state(&target);
     record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline").expect("record failure");
     state.retry_queue[0].updated_at = Some(snapshot_at);
+    let observed = state.retry_queue[0].clone();
     let replayed: Vec<String> = state.iam_deletion_replays.iter().map(|record| record.id.clone()).collect();
-    assert!(settle_replayed_iam_retry_events(
-        &mut state,
-        &target,
-        SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
-        Some(snapshot_at),
-        &replayed,
-    ));
+    assert!(settle_replayed_iam_retry_events(&mut state, &target, &observed, &replayed));
     assert!(state.retry_queue.is_empty());
     assert!(state.iam_deletion_replays.is_empty());
 
@@ -678,14 +673,9 @@ fn test_settle_replayed_iam_retry_events_settles_or_escalates() {
     record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline").expect("record failure");
     state.retry_queue[0].updated_at = Some(snapshot_at);
     state.retry_queue[0].deletions_recorded = false;
+    let observed = state.retry_queue[0].clone();
     let replayed: Vec<String> = state.iam_deletion_replays.iter().map(|record| record.id.clone()).collect();
-    assert!(!settle_replayed_iam_retry_events(
-        &mut state,
-        &target,
-        SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
-        Some(snapshot_at),
-        &replayed,
-    ));
+    assert!(!settle_replayed_iam_retry_events(&mut state, &target, &observed, &replayed));
     assert!(state.iam_deletion_replays.is_empty());
     assert_eq!(state.retry_queue.len(), 1);
     assert_eq!(state.retry_queue[0].last_error, SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER);
@@ -694,16 +684,12 @@ fn test_settle_replayed_iam_retry_events_settles_or_escalates() {
     // residual (unreplayed) record kept for the next pass.
     let mut state = deletion_replay_state(&target);
     record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline").expect("record failure");
+    state.retry_queue[0].updated_at = Some(snapshot_at);
+    let observed = state.retry_queue[0].clone();
     let replayed: Vec<String> = state.iam_deletion_replays.iter().map(|record| record.id.clone()).collect();
     record_failed_iam_delivery(&mut state, &target, &user_delete_item("bob"), "peer offline").expect("record failure");
     state.retry_queue[0].updated_at = Some(snapshot_at + time::Duration::seconds(5));
-    assert!(!settle_replayed_iam_retry_events(
-        &mut state,
-        &target,
-        SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
-        Some(snapshot_at),
-        &replayed,
-    ));
+    assert!(!settle_replayed_iam_retry_events(&mut state, &target, &observed, &replayed));
     assert_eq!(state.retry_queue.len(), 1);
     assert_ne!(state.retry_queue[0].last_error, SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER);
     assert!(
@@ -712,6 +698,24 @@ fn test_settle_replayed_iam_retry_events_settles_or_escalates() {
     );
     assert_eq!(state.iam_deletion_replays.len(), 1);
     assert_eq!(state.iam_deletion_replays[0].entity, "iam-user:bob");
+
+    // A newer deletion of the same entity gets a fresh replay-record id. An
+    // older settlement therefore removes neither its body nor its queue
+    // revision, even if the persisted timestamps happen to be equal.
+    let mut state = deletion_replay_state(&target);
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "first failure").expect("record failure");
+    state.retry_queue[0].updated_at = Some(snapshot_at);
+    let observed = state.retry_queue[0].clone();
+    let replayed = vec![state.iam_deletion_replays[0].id.clone()];
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "newer failure").expect("record newer failure");
+    state.retry_queue[0].updated_at = Some(snapshot_at);
+    assert_ne!(state.iam_deletion_replays[0].id, replayed[0]);
+
+    assert!(!settle_replayed_iam_retry_events(&mut state, &target, &observed, &replayed));
+    assert_eq!(state.retry_queue.len(), 1);
+    assert_ne!(state.retry_queue[0].id, observed.id);
+    assert_eq!(state.iam_deletion_replays.len(), 1);
+    assert_eq!(state.iam_deletion_replays[0].entity, "iam-user:alice");
 }
 
 /// Merging legacy wire-path rows into the collapsed entry must not launder an
@@ -916,12 +920,14 @@ fn test_lightweight_bucket_retry_plan_is_targeted_and_preserves_make_options() {
 
 #[test]
 fn test_lightweight_bucket_retry_plan_orders_real_metadata_and_counts_it() {
+    let versioning = bucket_versioning_xml().expect("canonical versioning config");
+    let replication = serialize(&site_repl_config("remote-dep")).expect("derived replication config");
     let bucket = SRBucketInfo {
         bucket: "photos".to_string(),
         policy: Some(serde_json::json!({"Version":"2012-10-17","Statement":[]})),
         tags: Some(BASE64_STANDARD.encode_to_string("<Tagging/>")),
-        versioning: Some(BASE64_STANDARD.encode_to_string("<VersioningConfiguration/>")),
-        replication_config: Some(BASE64_STANDARD.encode_to_string("<ReplicationConfiguration/>")),
+        versioning: Some(BASE64_STANDARD.encode_to_string(&versioning)),
+        replication_config: Some(BASE64_STANDARD.encode_to_string(&replication)),
         ..Default::default()
     };
     let plan = site_replication_bucket_retry_plan_from_info(&bucket, false).expect("targeted retry plan");
@@ -937,6 +943,17 @@ fn test_lightweight_bucket_retry_plan_orders_real_metadata_and_counts_it() {
     );
     assert_eq!(tasks.len(), 4, "make + policy + tags + configure must all count against the budget");
     assert!(tasks.len() > SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER);
+
+    let mut operator_replication = site_repl_config("remote-dep");
+    operator_replication.rules.push(operator_rule("operator-backup"));
+    let mut bucket_with_operator_rule = bucket;
+    bucket_with_operator_rule.replication_config =
+        Some(BASE64_STANDARD.encode_to_string(&serialize(&operator_replication).expect("operator replication config")));
+    let plan = site_replication_bucket_retry_plan_from_info(&bucket_with_operator_rule, false).expect("targeted retry plan");
+    assert!(
+        plan.bucket_items.iter().any(|item| item.r#type == "replication-config"),
+        "operator-authored replication rules cannot be replaced by configure-replication"
+    );
 }
 
 #[test]

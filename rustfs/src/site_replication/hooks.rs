@@ -55,9 +55,10 @@ where
     .map_err(|err| S3Error::from(ApiError::from(err)))?
 }
 
-/// Exclude every local bucket namespace mutation while an add validates its
-/// final bucket set and commits the topology. The write scope contains no peer
-/// traffic, so callbacks used by the join phase can finish before it starts.
+/// Exclude every local bucket namespace mutation from an add's local preflight
+/// snapshot until its topology commit. Peer bootstrap callbacks do not enter
+/// this public-mutation admission path, so they can finish while the writer is
+/// held; post-commit fan-out and backfill must run after it is released.
 pub(crate) async fn with_site_replication_bucket_mutation_admission_lock<F, Fut, T>(
     store: Arc<ECStore>,
     operation: F,
@@ -410,14 +411,36 @@ pub(crate) fn site_replication_bucket_retry_plan_from_info(
 ) -> S3Result<SiteReplicationBootstrapPlan> {
     let mut plan = site_replication_bucket_retry_plan_for(&bucket.bucket, bucket.created_at, bucket.object_lock_config.is_some());
     append_bootstrap_bucket_items(&mut plan, bucket, replicate_ilm_expiry)?;
-    // The make operation force-enables versioning and the configure operation
-    // derives the current site-replication rules. Avoid spending two of the
-    // lightweight request budget on duplicate representations of those same
-    // guarantees; every other configured bucket metadata item stays ordered
-    // between make and configure.
-    plan.bucket_items
-        .retain(|item| !matches!(item.r#type.as_str(), "version-config" | "replication-config"));
+    // Omit only metadata the make/configure operations can reproduce exactly.
+    // Non-default versioning fields and operator-authored replication rules
+    // remain in the plan; their extra request cost intentionally defers the
+    // event to the complete drain when the lightweight budget is too small.
+    plan.bucket_items.retain(|item| !retry_bucket_metadata_is_redundant(item));
     Ok(plan)
+}
+
+fn retry_bucket_metadata_is_redundant(item: &SRBucketMeta) -> bool {
+    match item.r#type.as_str() {
+        "version-config" => item.versioning.as_deref().is_some_and(|raw| {
+            deserialize::<VersioningConfiguration>(&decode_bucket_meta_wire_value(raw)).is_ok_and(|config| {
+                config
+                    == VersioningConfiguration {
+                        status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                        ..Default::default()
+                    }
+            })
+        }),
+        "replication-config" => item.replication_config.as_deref().is_some_and(|raw| {
+            deserialize::<ReplicationConfiguration>(&decode_bucket_meta_wire_value(raw))
+                .is_ok_and(|config| config.role.trim().is_empty() && config.rules.iter().all(is_derived_site_replication_rule))
+        }),
+        // `Some("")` is the in-memory sentinel used when the bucket is lock
+        // enabled but has no object-lock configuration body. The make query
+        // carries lockEnabled=true; sending an empty metadata body is neither
+        // useful nor parseable.
+        "object-lock-config" => item.object_lock_config.as_deref() == Some(""),
+        _ => false,
+    }
 }
 
 pub(crate) async fn site_replication_bucket_retry_plan(bucket: &str) -> S3Result<SiteReplicationBootstrapPlan> {
