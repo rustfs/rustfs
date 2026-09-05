@@ -3541,7 +3541,7 @@ impl TierConfigMgr {
         // Get tier configuration and create new driver
         let tier_config = self.tiers.get(tier_name).ok_or_else(|| ERR_TIER_NOT_FOUND.clone())?;
 
-        let driver = new_warm_backend(tier_config, false).await?;
+        let driver = construct_warm_backend(tier_config).await?;
 
         self.replace_driver(tier_name, driver)?;
         Ok(self
@@ -4486,6 +4486,11 @@ impl TierConfigMgr {
                     let committed_coordinator_intent =
                         committed_tier_mutation_intent(coordinator_intent.as_ref(), &committed_config_etag)
                             .map_err(TierConfigUpdateError::Save)?;
+                    // Persist Committed before notifying refresh; a Prepared disk record
+                    // would restore the prepared block and invalidate our publish allowance.
+                    let coordinator_commit =
+                        commit_coordinator_tier_mutation_intent(api.clone(), coordinator_intent.as_ref(), &committed_config_etag)
+                            .await;
                     if let Some(intent) = committed_coordinator_intent.as_ref() {
                         TierConfigMgr::apply_committed_mutation_intent_block(&handle, intent)
                             .await
@@ -4496,9 +4501,9 @@ impl TierConfigMgr {
                                 .map_err(TierConfigUpdateError::Publish)?,
                         );
                     }
-                    commit_coordinator_tier_mutation_intent(api.clone(), coordinator_intent.as_ref(), &committed_config_etag)
-                        .await
-                        .map_err(TierConfigUpdateError::Save)?;
+                    // Config is already saved: retain the committed fence and wake recovery
+                    // even when the coordinator commit failed or its outcome is unknown.
+                    coordinator_commit.map_err(TierConfigUpdateError::Save)?;
                     if coordinated_config_update {
                         drop(update.take());
                         drop(config_lock.take());
@@ -10603,6 +10608,11 @@ mod tests {
             .expect_err("coordinator committed-state CAS failure must be observable");
         assert!(matches!(err, TierConfigUpdateError::Save(_)));
         assert!(manager.read().await.tiers.contains_key("COLD-A"));
+        assert!(TierConfigMgr::has_committed_mutation_block(&manager).await);
+        let refresh = TierConfigMgr::mutation_refresh_notifier(&manager).await;
+        tokio::time::timeout(Duration::from_secs(1), refresh.notified())
+            .await
+            .expect("failed coordinator commit must notify recovery after saving config");
         let blocked = match TierConfigMgr::acquire_operation_lease(&manager, "COLD-A").await {
             Ok(_) => panic!("failed coordinator commit CAS must retain the local committed fence"),
             Err(err) => err,
@@ -14329,6 +14339,12 @@ mod tests {
         after_commit: bool,
     }
 
+    #[derive(Debug, Default)]
+    struct CasCoordinatorCommitBarrier {
+        arrived: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
     #[derive(Debug)]
     struct CasConfigStore {
         objects: tokio::sync::Mutex<HashMap<String, (Vec<u8>, String)>>,
@@ -14341,6 +14357,7 @@ mod tests {
         fail_delete_prefix: tokio::sync::Mutex<Option<(String, usize)>>,
         delete_log: tokio::sync::Mutex<Vec<String>>,
         list_barrier: tokio::sync::Mutex<Option<Arc<CasListBarrier>>>,
+        coordinator_commit_barrier: tokio::sync::Mutex<Option<Arc<CasCoordinatorCommitBarrier>>>,
         intent_list_calls: AtomicUsize,
         fail_reference_walk: AtomicBool,
         reference_walk_send_count: AtomicUsize,
@@ -14363,6 +14380,7 @@ mod tests {
                 fail_delete_prefix: tokio::sync::Mutex::new(None),
                 delete_log: tokio::sync::Mutex::new(Vec::new()),
                 list_barrier: tokio::sync::Mutex::new(None),
+                coordinator_commit_barrier: tokio::sync::Mutex::new(None),
                 intent_list_calls: AtomicUsize::new(0),
                 fail_reference_walk: AtomicBool::new(false),
                 reference_walk_send_count: AtomicUsize::new(0),
@@ -14554,6 +14572,19 @@ mod tests {
             }
             let mut payload = Vec::new();
             tokio::io::AsyncReadExt::read_to_end(&mut data.stream, &mut payload).await?;
+            if object.starts_with(crate::services::tier::tier_mutation_intent::TIER_COORDINATOR_MUTATION_INTENT_RECORD_PREFIX)
+                && opts
+                    .http_preconditions
+                    .as_ref()
+                    .and_then(HTTPPreconditions::if_match_value)
+                    .is_some()
+            {
+                let barrier = self.coordinator_commit_barrier.lock().await.take();
+                if let Some(barrier) = barrier {
+                    barrier.arrived.notify_one();
+                    barrier.release.notified().await;
+                }
+            }
             let race_rewrite = if opts
                 .http_preconditions
                 .as_ref()
@@ -15651,14 +15682,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn force_remove_and_save_bypasses_lifecycle_only_reference() {
-        // rustfs/rustfs#6832: reproduces the admin RemoveTier path (not just the lower-level
-        // reference-proof function) for a tier with zero transitioned objects but a lifecycle
-        // rule still pointing at it — the exact shape of
-        // `test_manual_transition_async_tier_failure_reports_terminal_partial` in e2e_test,
-        // which force-removes a tier a lifecycle rule still references to simulate a
-        // decommissioned backend.
+    async fn assert_lifecycle_only_reference_obeys_force(clear: bool, force: bool) {
         let store = Arc::new(CasConfigStore::default());
         let tier = build_rustfs_tier("COLD-A");
         let mut persisted = empty_mgr();
@@ -15699,20 +15723,53 @@ mod tests {
 
         let manager = TierConfigMgr::new();
         manager.write().await.tiers.insert("COLD-A".to_string(), tier);
-        TierConfigMgr::remove_and_save_with(&manager, store.clone(), "COLD-A", true)
-            .await
-            .expect("force remove must bypass a lifecycle-config-only reference");
+        let mutation = if clear {
+            TierCandidateMutation::Clear(force)
+        } else {
+            TierCandidateMutation::Remove("COLD-A".to_string(), force)
+        };
+        let result = TIER_DRIVER_TEST_FACTORY
+            .scope(
+                healthy_driver_factory(),
+                TierConfigMgr::update_candidate_with_config_lock(&manager, store.clone(), mutation),
+            )
+            .await;
+        if force {
+            result.expect("force mutation must bypass a lifecycle-config-only reference");
+        } else {
+            let err = result.expect_err("non-force mutation must reject a lifecycle-only reference");
+            let TierConfigUpdateError::Publish(err) = err else {
+                panic!("non-force mutation must fail during reference proof: {err:?}");
+            };
+            assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+            assert!(err.message.contains("move-current"), "{err}");
+        }
 
-        assert!(!manager.read().await.tiers.contains_key("COLD-A"));
-        assert!(
-            !load_tier_config_for_update(store)
+        assert_eq!(manager.read().await.tiers.contains_key("COLD-A"), !force);
+        assert_eq!(
+            load_tier_config_for_update(store)
                 .await
                 .expect("config should still reload")
                 .0
                 .tiers
                 .contains_key("COLD-A"),
-            "force removal must persist the empty candidate"
+            !force,
+            "persisted state must match the force mutation result"
         );
+    }
+
+    #[tokio::test]
+    async fn remove_with_config_lock_obeys_force_for_lifecycle_only_reference() {
+        for force in [false, true] {
+            assert_lifecycle_only_reference_obeys_force(false, force).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_with_config_lock_obeys_force_for_lifecycle_only_reference() {
+        for force in [false, true] {
+            assert_lifecycle_only_reference_obeys_force(true, force).await;
+        }
     }
 
     #[tokio::test]
@@ -17253,6 +17310,98 @@ mod tests {
                 .expect("winning node should publish");
         }
         assert_ne!(manager_a.read().await.empty(), manager_b.read().await.empty());
+    }
+
+    async fn assert_coordinator_commit_refresh_succeeds(mutation: TierCandidateMutation) {
+        let adding = matches!(mutation, TierCandidateMutation::Add(..));
+        let manager = TierConfigMgr::new();
+        let store = Arc::new(CasConfigStore::default());
+        if !adding {
+            let mut persisted = empty_mgr();
+            persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+            persisted
+                .save_tiering_config_if_current(store.clone(), None)
+                .await
+                .expect("existing tier fixture should persist");
+            let mut guard = manager.write().await;
+            install_lease_backend(&mut guard, "COLD-A", LeaseTestBackend::ready("old"));
+        }
+        let barrier = Arc::new(CasCoordinatorCommitBarrier::default());
+        *store.coordinator_commit_barrier.lock().await = Some(barrier.clone());
+        let update_manager = manager.clone();
+        let update_store = store.clone();
+        let update = tokio::spawn(async move {
+            TIER_DRIVER_TEST_FACTORY
+                .scope(
+                    healthy_driver_factory(),
+                    TIER_MUTATION_TEST_PEERS.scope(
+                        Vec::new(),
+                        TierConfigMgr::update_candidate_with_config_lock(&update_manager, update_store, mutation),
+                    ),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), barrier.arrived.notified())
+            .await
+            .expect("mutation should reach coordinator commit after saving config");
+        assert_eq!(
+            load_tier_config_for_update(store.clone())
+                .await
+                .expect("saved config should be readable before coordinator commit")
+                .0
+                .tiers
+                .contains_key("COLD-A"),
+            adding
+        );
+        assert_eq!(
+            TierConfigMgr::load_coordinator_mutation_intents(store.clone())
+                .await
+                .expect("coordinator intent should remain readable")[0]
+                .state,
+            TierMutationIntentState::Prepared
+        );
+
+        let lock_requests = lock_unpoisoned(&store.lock_requests).len();
+        // Also exercise an independently scheduled refresh while the durable
+        // coordinator record is still Prepared, before its commit notification.
+        TierConfigMgr::request_committed_mutation_refresh(&manager).await;
+        TIER_MUTATION_TEST_PEERS
+            .scope(Vec::new(), async {
+                let worker = TierConfigMgr::refresh_tier_config_handle_with(manager.clone(), store.clone());
+                tokio::pin!(worker);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while lock_unpoisoned(&store.lock_requests).len() == lock_requests {
+                        tokio::select! {
+                            _ = &mut worker => panic!("refresh worker must remain available"),
+                            _ = tokio::task::yield_now() => {}
+                        }
+                    }
+                })
+                .await
+                .expect("refresh should reconcile the Prepared record before waiting for the config lock");
+                barrier.release.notify_one();
+                let result = tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::select! {
+                        _ = &mut worker => panic!("refresh worker must remain available"),
+                        result = update => result.expect("tier mutation task should join"),
+                    }
+                })
+                .await
+                .expect("tier mutation should finish with refresh running");
+                result.expect("saved tier mutation must publish successfully on the first attempt");
+            })
+            .await;
+        assert_eq!(manager.read().await.tiers.contains_key("COLD-A"), adding);
+    }
+
+    #[tokio::test]
+    async fn tier_add_succeeds_with_refresh_during_coordinator_commit() {
+        assert_coordinator_commit_refresh_succeeds(TierCandidateMutation::Add(build_rustfs_tier("COLD-A"), true)).await;
+    }
+
+    #[tokio::test]
+    async fn tier_remove_succeeds_with_refresh_during_coordinator_commit() {
+        assert_coordinator_commit_refresh_succeeds(TierCandidateMutation::Remove("COLD-A".to_string(), true)).await;
     }
 
     async fn committed_refresh_fixture(fail_cleanup: bool) -> (Arc<RwLock<TierConfigMgr>>, Arc<CasConfigStore>, uuid::Uuid) {
