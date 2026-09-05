@@ -4827,105 +4827,135 @@ async fn backfill_existing_buckets_after_add(
 
     let resync_id = Uuid::new_v4().to_string();
     for bucket in &buckets {
-        let name = &bucket.name;
+        let operation_name = bucket.name.clone();
+        let lock_bucket = operation_name.clone();
+        let operation_state = state.clone();
+        let operation_local_peer = local_peer.clone();
+        let operation_resync_id = resync_id.clone();
+        let operation_bootstrap_token = bootstrap_token.map(str::to_owned);
+        let bucket_errors = with_site_replication_bucket_mutation_lock(store.clone(), &lock_bucket, move || async move {
+            let mut errors = SiteReplicationErrorSummary::default();
+            let name = &operation_name;
 
-        if let Err(err) = ensure_site_replication_bucket_versioning(name).await {
-            warn!(
-                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                bucket = %name,
-                result = "backfill_versioning_setup_failed",
-                error = ?err,
-                "admin site replication state"
-            );
-            errors.push(format!("{name}: versioning setup failed: {err}"));
-            continue;
-        }
-        match ensure_site_replication_bucket_setup(name).await {
-            Ok(true) => {}
-            Ok(false) => {
-                // Runtime targets unavailable: the setup silently no-ops, which would make the
-                // downstream make-bucket broadcast and resync fail. Record it and skip so the
-                // operator sees this bucket was not propagated instead of an unqualified success.
+            if let Err(err) = ensure_site_replication_bucket_versioning(name).await {
                 warn!(
                     event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
                     bucket = %name,
-                    result = "backfill_bucket_setup_skipped",
-                    "admin site replication state"
-                );
-                errors.push(format!("{name}: replication setup skipped (site replication runtime unavailable)"));
-                continue;
-            }
-            Err(err) => {
-                warn!(
-                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                    bucket = %name,
-                    result = "backfill_bucket_setup_failed",
+                    result = "backfill_versioning_setup_failed",
                     error = ?err,
                     "admin site replication state"
                 );
-                errors.push(format!("{name}: bucket setup failed: {err}"));
+                errors.push(format!("{name}: versioning setup failed: {err}"));
+                return errors;
             }
-        }
-        // Broadcast the bucket to peers so they create it too (idempotent on the peer side).
-        // Read the real lock_enabled flag so peers recreate the bucket with the same object-lock
-        // setting — object lock cannot be added after bucket creation.
-        let lock_enabled = match metadata_sys::get(name).await {
-            Ok(bm) => bm.lock_enabled,
-            Err(err) => {
-                warn!(
-                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                    bucket = %name,
-                    result = "backfill_bucket_metadata_read_failed",
-                    fallback = "lock_enabled=false",
-                    error = ?err,
-                    "admin site replication state"
-                );
-                false
+            match ensure_site_replication_bucket_setup(name).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Runtime targets unavailable: the setup silently no-ops, which would make the
+                    // downstream make-bucket broadcast and resync fail. Record it and skip so the
+                    // operator sees this bucket was not propagated instead of an unqualified success.
+                    warn!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        bucket = %name,
+                        result = "backfill_bucket_setup_skipped",
+                        "admin site replication state"
+                    );
+                    errors.push(format!("{name}: replication setup skipped (site replication runtime unavailable)"));
+                    return errors;
+                }
+                Err(err) => {
+                    warn!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        bucket = %name,
+                        result = "backfill_bucket_setup_failed",
+                        error = ?err,
+                        "admin site replication state"
+                    );
+                    errors.push(format!("{name}: bucket setup failed: {err}"));
+                }
             }
-        };
-        if let Err(err) = broadcast_site_replication_make_bucket(name, lock_enabled, None, bootstrap_token).await {
-            warn!(
-                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                bucket = %name,
-                result = "backfill_make_bucket_broadcast_failed",
-                error = ?err,
-                "admin site replication state"
-            );
-            errors.push(format!("{name}: make-bucket broadcast failed: {err}"));
-        }
-        // Kick a resync toward every remote peer so existing objects travel across.
-        for peer in state.peers.values() {
-            if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
-                continue;
-            }
-            let manifest = site_bucket_resync_manifest_entry(name, peer, OffsetDateTime::now_utc()).await;
-            let result = if manifest.target_arn.is_empty() {
-                manifest
-            } else {
-                start_site_bucket_resync(name, &manifest.target_arn, &resync_id).await
+            // Broadcast the bucket to peers so they create it too (idempotent on the peer side).
+            // Read the real lock_enabled flag so peers recreate the bucket with the same object-lock
+            // setting — object lock cannot be added after bucket creation.
+            let lock_enabled = match metadata_sys::get(name).await {
+                Ok(bm) => bm.lock_enabled,
+                Err(err) => {
+                    warn!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        bucket = %name,
+                        result = "backfill_bucket_metadata_read_failed",
+                        fallback = "lock_enabled=false",
+                        error = ?err,
+                        "admin site replication state"
+                    );
+                    false
+                }
             };
-            if result.status == "failed" {
+            if let Err(err) =
+                broadcast_site_replication_make_bucket(name, lock_enabled, None, operation_bootstrap_token.as_deref()).await
+            {
                 warn!(
                     event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
                     bucket = %name,
-                    peer = %peer.endpoint,
-                    result = "backfill_resync_kick_failed",
-                    detail = %result.err_detail,
+                    result = "backfill_make_bucket_broadcast_failed",
+                    error = ?err,
                     "admin site replication state"
                 );
-                errors.push(format!("{name} -> {}: resync kick failed: {}", peer.endpoint, result.err_detail));
+                errors.push(format!("{name}: make-bucket broadcast failed: {err}"));
+            }
+            // Kick a resync toward every remote peer so existing objects travel across.
+            for peer in operation_state.peers.values() {
+                if peer.deployment_id == operation_local_peer.deployment_id
+                    || same_identity_endpoint(&peer.endpoint, &operation_local_peer.endpoint)
+                {
+                    continue;
+                }
+                let manifest = site_bucket_resync_manifest_entry(name, peer, OffsetDateTime::now_utc()).await;
+                let result = if manifest.target_arn.is_empty() {
+                    manifest
+                } else {
+                    start_site_bucket_resync(name, &manifest.target_arn, &operation_resync_id).await
+                };
+                if result.status == "failed" {
+                    warn!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        bucket = %name,
+                        peer = %peer.endpoint,
+                        result = "backfill_resync_kick_failed",
+                        detail = %result.err_detail,
+                        "admin site replication state"
+                    );
+                    errors.push(format!("{name} -> {}: resync kick failed: {}", peer.endpoint, result.err_detail));
+                }
+            }
+            errors
+        })
+        .await;
+        match bucket_errors {
+            Ok(bucket_errors) => errors.extend(bucket_errors),
+            Err(err) => {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    bucket = %lock_bucket,
+                    result = "backfill_bucket_mutation_lock_failed",
+                    error = ?err,
+                    "admin site replication state"
+                );
+                errors.push(format!("{lock_bucket}: bucket mutation lock failed: {err}"));
             }
         }
     }

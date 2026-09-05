@@ -22,6 +22,27 @@ pub(crate) const SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION: &str = "confi
 
 pub(crate) static SITE_REPLICATION_BUCKET_OP_LOCK: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
 
+const SITE_REPLICATION_BUCKET_MUTATION_LOCK_PREFIX: &str = "config/site-replication/bucket-mutation";
+
+pub(crate) fn site_replication_bucket_mutation_lock_path(bucket: &str) -> String {
+    format!("{SITE_REPLICATION_BUCKET_MUTATION_LOCK_PREFIX}/{bucket}.lock")
+}
+
+pub(crate) async fn with_site_replication_bucket_mutation_lock<F, Fut, T>(
+    store: Arc<ECStore>,
+    bucket: &str,
+    operation: F,
+) -> S3Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    with_config_object_write_lock(store, site_replication_bucket_mutation_lock_path(bucket), operation)
+        .await
+        .map_err(|err| ApiError::from(err).into())
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct SiteReplicationBootstrapPlan {
     pub(crate) iam_items: Vec<SRIAMItem>,
@@ -483,8 +504,14 @@ pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: boo
             .append_pair("operation", operation)
             .finish()
     );
-    let Some(runtime) = runtime_site_replication_targets().await? else {
-        return Ok(());
+    let runtime = {
+        // Serialize the peer snapshot with topology commits, then release the
+        // global lock before waiting for repair coordination or peer I/O.
+        let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
+        let Some(runtime) = runtime_site_replication_targets().await? else {
+            return Ok(());
+        };
+        runtime
     };
     let store =
         current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;

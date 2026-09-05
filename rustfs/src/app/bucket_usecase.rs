@@ -76,6 +76,7 @@ use crate::error::ApiError;
 use crate::shared_types::RemoteAddr;
 use crate::site_replication::{
     site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
+    with_site_replication_bucket_mutation_lock,
 };
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::StatusCode;
@@ -1331,23 +1332,34 @@ impl DefaultBucketUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let make_result = store
-            .make_bucket(
-                &bucket,
-                &MakeBucketOptions {
-                    force_create: false,
-                    lock_enabled,
-                    ..Default::default()
-                },
-            )
-            .await;
+        // Keep the local namespace mutation and its peer hook ordered across
+        // every node in this site. Otherwise a delete waiting for repair
+        // coordination can arrive after this create on remote sites.
+        let operation_bucket = bucket.clone();
+        let operation_store = store.clone();
+        let make_result = with_site_replication_bucket_mutation_lock(store, &bucket, move || async move {
+            let make_result = operation_store
+                .make_bucket(
+                    &operation_bucket,
+                    &MakeBucketOptions {
+                        force_create: false,
+                        lock_enabled,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if make_result.is_ok() {
+                crate::storage::invalidate_bucket_validation_cache(&operation_bucket);
+                if let Err(err) = site_replication_make_bucket_hook(&operation_bucket, lock_enabled).await {
+                    warn!(bucket = %operation_bucket, error = ?err, "site replication make bucket hook failed");
+                }
+            }
+            make_result
+        })
+        .await?;
 
         match make_result {
-            Ok(()) => {
-                // Invalidate the bucket validation cache so subsequent GETs
-                // see the newly created bucket immediately.
-                crate::storage::invalidate_bucket_validation_cache(&bucket);
-            }
+            Ok(()) => {}
             Err(StorageError::BucketExists(_)) => {
                 // Per S3 spec: bucket namespace is global. Owner recreating returns 200 OK;
                 // non-owner gets 409 BucketAlreadyExists.
@@ -1356,10 +1368,6 @@ impl DefaultBucketUsecase {
                 return result;
             }
             Err(e) => return Err(ApiError::from(e).into()),
-        }
-
-        if let Err(err) = site_replication_make_bucket_hook(&bucket, lock_enabled).await {
-            warn!(bucket = %bucket, error = ?err, "site replication make bucket hook failed");
         }
 
         let output = CreateBucketOutput::default();
@@ -1397,16 +1405,31 @@ impl DefaultBucketUsecase {
             authorize_request(&mut req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
         }
 
-        store
-            .delete_bucket(
-                &input.bucket,
-                &DeleteBucketOptions {
-                    force,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(ApiError::from)?;
+        // Keep the local namespace mutation and its peer hook ordered across
+        // every node in this site so an older delete cannot overtake a new
+        // same-name make while it waits for repair coordination.
+        let operation_bucket = input.bucket.clone();
+        let operation_store = store.clone();
+        let delete_result = with_site_replication_bucket_mutation_lock(store, &input.bucket, move || async move {
+            let delete_result = operation_store
+                .delete_bucket(
+                    &operation_bucket,
+                    &DeleteBucketOptions {
+                        force,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if delete_result.is_ok() {
+                crate::storage::invalidate_bucket_validation_cache(&operation_bucket);
+                if let Err(err) = site_replication_delete_bucket_hook(&operation_bucket, force).await {
+                    warn!(bucket = %operation_bucket, error = ?err, "site replication delete bucket hook failed");
+                }
+            }
+            delete_result
+        })
+        .await?;
+        delete_result.map_err(ApiError::from)?;
 
         // Drop every cached object body for the now-deleted bucket so dead
         // bytes do not sit resident until TTL. Covers both the normal and the
@@ -1415,15 +1438,8 @@ impl DefaultBucketUsecase {
         let cache_adapter = current_object_data_cache_for_context(self.context.as_deref());
         let _ = invalidate_object_data_cache_bucket_after_delete(&cache_adapter, &input.bucket).await;
 
-        // Invalidate bucket validation cache
-        crate::storage::invalidate_bucket_validation_cache(&input.bucket);
-
         // Re-evaluate lifecycle and replication after bucket removal.
         rustfs_scanner::record_scanner_maintenance_change(&input.bucket);
-
-        if let Err(err) = site_replication_delete_bucket_hook(&input.bucket, force).await {
-            warn!(bucket = %input.bucket, error = ?err, "site replication delete bucket hook failed");
-        }
 
         // Notify peers to drop their cached metadata for the now-deleted bucket.
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();

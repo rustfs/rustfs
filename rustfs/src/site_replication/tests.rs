@@ -33,6 +33,18 @@ use temp_env::with_var;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+#[test]
+fn test_bucket_mutation_lock_path_is_bucket_scoped() {
+    assert_eq!(
+        site_replication_bucket_mutation_lock_path("photos"),
+        "config/site-replication/bucket-mutation/photos.lock"
+    );
+    assert_ne!(
+        site_replication_bucket_mutation_lock_path("photos"),
+        site_replication_bucket_mutation_lock_path("videos")
+    );
+}
+
 fn valid_test_ca_pem(name: &str) -> String {
     rcgen::generate_simple_self_signed(vec![name.to_string()])
         .expect("generate test CA")
