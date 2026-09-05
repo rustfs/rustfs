@@ -158,17 +158,12 @@ pub struct BucketIncarnationFenceGuard {
 }
 
 impl BucketIncarnationFenceGuard {
-    /// Run an operation while the validated bucket incarnation stays locked.
-    /// Lock loss cancels the operation before it can continue on a replacement
-    /// bucket. The guard must remain held through every durable write tail.
-    pub async fn run<T>(&self, future: impl std::future::Future<Output = T>) -> crate::error::Result<T> {
-        super::bucket::await_bucket_namespace_operation(
-            self.namespace_lock_guard(),
-            &self.bucket,
-            "bucket incarnation fenced operation",
-            async { Ok(future.await) },
-        )
-        .await
+    /// Propagate lifecycle lock loss into the storage commit checks.
+    /// The caller still owns this guard until the complete write tail drains.
+    pub fn attach_to_object_options(&self, opts: &mut crate::object_api::ObjectOptions) {
+        if let Some(guard) = self.namespace_lock_guard() {
+            opts.add_bucket_lifecycle_lock_guard(guard);
+        }
     }
 
     pub(crate) fn is_lock_lost(&self) -> bool {
@@ -360,19 +355,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fence_run_cancels_pending_work_and_rejects_work_after_lock_loss() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct Dropped(Arc<AtomicBool>);
-        impl Drop for Dropped {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let lock = NamespaceLock::new("bucket-fence-operation".to_string(), Arc::new(LocalClient::new()));
+    async fn checkpoint_options_inherit_bucket_fence_lock_loss() {
+        let lock = NamespaceLock::new("bucket-fence-options".to_string(), Arc::new(LocalClient::new()));
         let inner = lock
-            .acquire_guard(&lock_request("operation"))
+            .acquire_guard(&lock_request("options"))
             .await
             .expect("acquire")
             .expect("quorum");
@@ -382,27 +368,20 @@ mod tests {
         };
         let registration = pieces.enter("b");
         let fence = pieces.into_guard("b", registration.token);
-        let polled = Arc::new(AtomicBool::new(false));
-        let dropped = Arc::new(AtomicBool::new(false));
-        let result = tokio::time::timeout(
+        let mut opts = crate::object_api::ObjectOptions::default();
+        fence.attach_to_object_options(&mut opts);
+        let inherited = opts
+            .bucket_lifecycle_lock_fence
+            .as_ref()
+            .expect("checkpoint inherits lifecycle guard");
+        assert!(!inherited.is_lock_lost());
+        tokio::time::timeout(
             Duration::from_secs(2),
-            fence.run(async {
-                let _drop = Dropped(Arc::clone(&dropped));
-                polled.store(true, Ordering::SeqCst);
-                std::future::pending::<()>().await;
-            }),
+            fence.namespace_lock_guard().expect("held guard").lock_lost_notified(),
         )
         .await
-        .expect("lock loss must wake an in-flight operation");
-        assert!(result.is_err());
-        assert!(polled.load(Ordering::SeqCst), "the operation started under valid coverage");
-        assert!(dropped.load(Ordering::SeqCst), "lock loss drops the pending mutation future");
-        assert!(
-            fence
-                .run(async { panic!("lost coverage must not poll another mutation") })
-                .await
-                .is_err()
-        );
+        .expect("distributed guard expires");
+        assert!(inherited.is_lock_lost(), "the actual pre-rename options must observe lifecycle lock loss");
     }
 
     #[test]

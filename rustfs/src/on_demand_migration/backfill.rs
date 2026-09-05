@@ -671,10 +671,22 @@ async fn write_checkpoint(
     checkpoint: &BackfillCheckpoint,
     expected_etag: Option<&str>,
 ) -> Result<String, BackfillError> {
-    let fence = api.acquire_bucket_incarnation_fence(bucket, incarnation_id).await?;
-    fence
-        .run(write_checkpoint_while_fenced(api, bucket, checkpoint, expected_etag))
-        .await?
+    let api = Arc::clone(api);
+    let bucket = bucket.to_string();
+    let checkpoint = checkpoint.clone();
+    let expected_etag = expected_etag.map(str::to_string);
+    // The storage commit owns detached work. Keep its user-bucket fence alive
+    // even when a caller aborts its waiter before the erasure tail has drained.
+    tokio::spawn(async move {
+        let fence = api.acquire_bucket_incarnation_fence(&bucket, incarnation_id).await?;
+        let mut opts = ObjectOptions::default();
+        fence.attach_to_object_options(&mut opts);
+        let result = write_checkpoint_while_fenced(&api, &bucket, &checkpoint, expected_etag.as_deref(), opts).await;
+        drop(fence);
+        result
+    })
+    .await
+    .map_err(|err| StorageError::other(format!("backfill checkpoint task failed: {err}")))?
 }
 
 /// The caller holds the destination bucket's lifecycle fence through the CAS
@@ -684,6 +696,7 @@ async fn write_checkpoint_while_fenced(
     bucket: &str,
     checkpoint: &BackfillCheckpoint,
     expected_etag: Option<&str>,
+    mut opts: ObjectOptions,
 ) -> Result<String, BackfillError> {
     let data = checkpoint.to_json()?;
     let preconditions = match expected_etag {
@@ -696,12 +709,9 @@ async fn write_checkpoint_while_fenced(
             ..Default::default()
         },
     };
-    let opts = ObjectOptions {
-        max_parity: true,
-        write_completion: WriteCompletion::TailDrained,
-        http_preconditions: Some(preconditions),
-        ..Default::default()
-    };
+    opts.max_parity = true;
+    opts.write_completion = WriteCompletion::TailDrained;
+    opts.http_preconditions = Some(preconditions);
     match save_config_with_opts(Arc::clone(api), &checkpoint_path(bucket), data, &opts).await {
         Ok(()) => {}
         Err(StorageError::PreconditionFailed) => return Err(BackfillError::Conflict(bucket.to_string())),
@@ -915,35 +925,41 @@ impl BackfillRunner {
             return Ok(handle.snapshot.lock().clone());
         }
         let incarnation_id = self.api.bucket_incarnation_id_from_disk(bucket).await?;
-        let _lock = self.lease_lock(bucket, get_lock_acquire_timeout()).await?;
-        let fence = self.api.acquire_bucket_incarnation_fence(bucket, incarnation_id).await?;
-        fence
-            .run(async {
-                let Some(stored) = read_checkpoint(&self.api, bucket).await? else {
-                    return Err(BackfillError::NotFound(bucket.to_string()));
-                };
-                if !stored.checkpoint.state.is_active() {
-                    return Ok(stored.checkpoint);
-                }
-                let mut checkpoint = stored.checkpoint;
-                let now = OffsetDateTime::now_utc();
-                checkpoint.state = BackfillState::Cancelled;
-                checkpoint.updated_at = now;
-                write_checkpoint_while_fenced(&self.api, bucket, &checkpoint, Some(&stored.etag)).await?;
-                info!(
-                    event = EVENT_ODM_BACKFILL_STATE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_ON_DEMAND_MIGRATION,
-                    state = checkpoint.state.as_str(),
-                    result = "cancelled",
-                    bucket = %bucket,
-                    job_id = %checkpoint.job_id,
-                    owner = %checkpoint.owner.as_ref().map(|o| o.node.as_str()).unwrap_or_default(),
-                    "On-demand migration backfill job cancelled remotely"
-                );
-                Ok(checkpoint)
-            })
-            .await?
+        let lock = self.lease_lock(bucket, get_lock_acquire_timeout()).await?;
+        let api = Arc::clone(&self.api);
+        let bucket = bucket.to_string();
+        tokio::spawn(async move {
+            let _lock = lock;
+            let fence = api.acquire_bucket_incarnation_fence(&bucket, incarnation_id).await?;
+            let mut opts = ObjectOptions::default();
+            fence.attach_to_object_options(&mut opts);
+            let Some(stored) = read_checkpoint(&api, &bucket).await? else {
+                return Err(BackfillError::NotFound(bucket.to_string()));
+            };
+            if !stored.checkpoint.state.is_active() {
+                return Ok(stored.checkpoint);
+            }
+            let mut checkpoint = stored.checkpoint;
+            let now = OffsetDateTime::now_utc();
+            checkpoint.state = BackfillState::Cancelled;
+            checkpoint.updated_at = now;
+            write_checkpoint_while_fenced(&api, &bucket, &checkpoint, Some(&stored.etag), opts).await?;
+            info!(
+                event = EVENT_ODM_BACKFILL_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_ON_DEMAND_MIGRATION,
+                state = checkpoint.state.as_str(),
+                result = "cancelled",
+                bucket = %bucket,
+                job_id = %checkpoint.job_id,
+                owner = %checkpoint.owner.as_ref().map(|o| o.node.as_str()).unwrap_or_default(),
+                "On-demand migration backfill job cancelled remotely"
+            );
+            drop(fence);
+            Ok(checkpoint)
+        })
+        .await
+        .map_err(|err| StorageError::other(format!("backfill cancellation task failed: {err}")))?
     }
 
     /// Latest checkpoint: the in-memory progress of a local job, else the
@@ -1535,7 +1551,9 @@ pub async fn run_backfill_recovery_loop(runner: Arc<BackfillRunner>, cancel: Can
 
 #[cfg(test)]
 mod tests {
-    use super::super::storage_api::test_support::{BucketOperations as _, isolated_store_over_temp_disks};
+    use super::super::storage_api::test_support::{
+        BucketOperations as _, PutObjectCommitBarrier, PutObjectCommitPause, isolated_store_over_temp_disks,
+    };
     use super::*;
     use crate::on_demand_migration::source_client::SourceObject;
     use crate::on_demand_migration::sys::PullError;
@@ -1839,6 +1857,58 @@ mod tests {
     fn runner_on(node: &str, bucket: &str, context: Arc<MockContext>, store: Arc<ECStore>) -> Arc<BackfillRunner> {
         let contexts = MockContexts(Mutex::new(HashMap::from([(bucket.to_string(), context)])));
         BackfillRunner::new(store, node, Arc::new(contexts))
+    }
+
+    #[tokio::test]
+    async fn cancelled_checkpoint_waiter_keeps_bucket_fenced_until_commit_finishes() {
+        for (suffix, pause) in [
+            ("before", PutObjectCommitPause::BeforeQuotaRename),
+            ("after", PutObjectCommitPause::AfterRenameQuorum),
+        ] {
+            let bucket = format!("backfill-cancel-tail-{suffix}");
+            let context = MockContext::new(0, 1);
+            let (_dirs, store, _runner) = runner_with("node-a", &bucket, Arc::clone(&context)).await;
+            let original_incarnation = context.incarnation_id();
+            let checkpoint = BackfillCheckpoint::new(&BackfillRequest::default(), ts(1_700_000_000), "node-a", ts(1_700_000_001));
+            let barrier = PutObjectCommitBarrier::install(RUSTFS_META_BUCKET, &checkpoint_path(&bucket), pause);
+            let writer_api = Arc::clone(&store);
+            let writer_bucket = bucket.clone();
+            let waiter = tokio::spawn(async move {
+                write_checkpoint(&writer_api, &writer_bucket, original_incarnation, &checkpoint, None).await
+            });
+            barrier.wait_until_paused().await;
+            waiter.abort();
+            assert!(waiter.await.expect_err("caller aborted").is_cancelled());
+
+            let delete_api = Arc::clone(&store);
+            let delete_bucket = bucket.clone();
+            let mut deletion = tokio::spawn(async move { delete_api.delete_bucket(&delete_bucket, &Default::default()).await });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut deletion).await.is_err(),
+                "DeleteBucket must wait for the checkpoint owner after its caller aborts"
+            );
+            barrier.release();
+            tokio::time::timeout(Duration::from_secs(10), deletion)
+                .await
+                .expect("commit must drain and release its lifecycle guard")
+                .expect("delete task")
+                .expect("delete original bucket");
+            store
+                .make_bucket(&bucket, &Default::default())
+                .await
+                .expect("recreate bucket");
+            assert_ne!(
+                original_incarnation,
+                store.bucket_incarnation_id_from_disk(&bucket).await.expect("new identity")
+            );
+            assert!(
+                read_checkpoint(&store, &bucket)
+                    .await
+                    .expect("read recreated bucket")
+                    .is_none(),
+                "no old checkpoint may outlive bucket deletion"
+            );
+        }
     }
 
     #[tokio::test]

@@ -436,5 +436,6 @@ pub(crate) mod on_demand_migration {
         };
         pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
         pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{BucketMetadataSys, init_bucket_metadata_sys};
+        pub(crate) use crate::storage::storage_api::ecstore_set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
     }
 }
