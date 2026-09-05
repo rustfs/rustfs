@@ -58,7 +58,7 @@ required-features = ["swift"]
 
 [features]
 default = ["ftps", "webdav", "gcs"]
-gcs = ["rustfs-ecstore/gcs"]
+gcs = ["rustfs-ecstore/gcs", "dep:google-cloud-auth"]
 metrics-gpu = ["rustfs-obs/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
@@ -288,6 +288,9 @@ reqwest = { workspace = true, features = ["json", "stream"] }
 socket2 = { workspace = true, features = ["all"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util", "fs"] }
 tokio-rustls = { workspace = true, default-features = false, features = ["logging", "tls12", "aws-lc-rs"] }
+aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
+aws-smithy-types = { workspace = true }
+google-cloud-auth = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 tokio-stream.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat", "time"] }

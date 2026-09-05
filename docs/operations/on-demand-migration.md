@@ -1,7 +1,7 @@
 # On-Demand Migration
 
 **Use this when:** you are moving an existing S3-compatible bucket into RustFS without a stop-the-world copy, or you are debugging a bucket that serves reads from an external source (424 `SourceUnavailable`, an open circuit breaker, missing pulled objects, a source 403).
-**Source of truth:** `crates/ecstore/src/bucket/on_demand_migration/` (`config.rs` for the wire model and its bounds, `sys.rs` for the per-node runtime, `source_client.rs` for the outbound client, `pull.rs` for the write-back pipeline, `breaker.rs` and `negative_cache.rs` for the protections), `rustfs/src/app/object/get.rs` and `head.rs` for the read paths, `rustfs/src/app/object/on_demand_migration_put.rs` for the local write, `rustfs/src/admin/handlers/on_demand_migration.rs` for the admin API, and `crates/obs/src/metrics/schema/on_demand_migration.rs` for the metric contract.
+**Source of truth:** `rustfs/src/on_demand_migration/` (`config.rs` for the wire model and its bounds, `sys.rs` for the per-node runtime, `source_client.rs` for the outbound client, `pull.rs` for the write-back pipeline, `breaker.rs` and `negative_cache.rs` for the protections), `rustfs/src/app/object/get.rs` and `head.rs` for the read paths, `rustfs/src/app/object/on_demand_migration_put.rs` for the local write, `rustfs/src/admin/handlers/on_demand_migration.rs` for the admin API, and `crates/obs/src/metrics/schema/on_demand_migration.rs` for the metric contract.
 
 On-Demand Migration (ODM) attaches an external S3-compatible **source bucket** to a local RustFS bucket. When a client GETs a key that does not exist locally, RustFS fetches it from the source, streams it to the client, and stores it locally in the same pass; every later read is served locally. It is a pull-style, lazy migration path — the RustFS equivalent of Cloudflare R2 Sippy, Tigris shadow buckets, and Alibaba Cloud OSS / Tencent COS mirror-back-to-origin.
 
@@ -111,7 +111,7 @@ Read-through only migrates what clients touch. The background backfill job walks
 
 ## Configuration reference
 
-The persisted blob is `on-demand-migration.json` in the bucket's metadata. Unknown fields are rejected rather than dropped, so a config written by a newer build fails loudly on an older one. Every default and bound below comes from `crates/ecstore/src/bucket/on_demand_migration/config.rs`.
+The persisted blob is `on-demand-migration.json` in the bucket's metadata. Unknown fields are rejected rather than dropped, so a config written by a newer build fails loudly on an older one. Every default and bound below comes from `rustfs/src/on_demand_migration/config.rs`.
 
 | Field | Type | Default | Bounds / rules |
 |---|---|---|---|
@@ -168,7 +168,7 @@ Validation also rejects two shapes outright: a source whose endpoint and bucket 
 | `azure` | Optional; derived as `https://<account>.blob.core.windows.net` | Native Blob REST, not S3 | Unused; write `auto` | Needs `source.azure`; the container is `source.bucket`. Reads need `Read` on the blob and `List` on the container, plus `Tags` when `policy.copy_tags` is on | None yet: no interop job covers Azure |
 | `gcs_native` | Optional; derived as `https://storage.googleapis.com` | Native GCS API, not S3 | Unused; write `auto` | Needs `source.gcs`. Reads use the XML API for objects and `objects.list` for listings, both with an OAuth token minted from the service-account key; the key needs `storage.objects.get` and `storage.objects.list` | None yet: no interop job covers native GCS |
 
-Every backend answers the same trait contract, pinned by `backend_contract.rs` in `crates/ecstore/src/bucket/on_demand_migration/`, and the three differences that contract allows are the ones documented here.
+Every backend answers the same trait contract, pinned by `backend_contract.rs` in `rustfs/src/on_demand_migration/`, and the three differences that contract allows are the ones documented here.
 
 `azure` differs in two of them. Its ETag is a concurrency token rather than a digest of the bytes, so it is stored as `odm-source-etag` provenance and never used as the expected MD5 of a pulled object — the write-back integrity check falls back to the local digest. And its listing paginates only with an opaque marker: there is no "start after this key" form, so a caller that asks for one gets `Unsupported` instead of a listing that silently starts over.
 

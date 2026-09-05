@@ -45,16 +45,12 @@
 
 use super::pull::{EnqueueOutcome, PullReason, QueuedPullOutcome};
 use super::source_client::{SourceError, SourcePage};
+use super::storage_api::{
+    BUCKET_META_PREFIX, ECStore, HTTPPreconditions, NamespaceLocking as _, ObjectOperations as _, ObjectOptions,
+    RUSTFS_META_BUCKET, StorageError, WriteCompletion, get_lock_acquire_timeout, get_on_demand_migration_config_in,
+    local_node_name, read_config_with_metadata, save_config_with_opts,
+};
 use super::sys::{BucketOdmState, OnDemandMigrationSys};
-use crate::bucket::metadata_sys::bucket_metadata_sys_of;
-use crate::config::com::{read_config_with_metadata, save_config_with_opts};
-use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
-use crate::error::Error as StorageError;
-use crate::object_api::ObjectOptions;
-use crate::runtime::sources::local_node_name;
-use crate::set_disk::get_lock_acquire_timeout;
-use crate::storage_api_contracts::{namespace::NamespaceLocking as _, object::HTTPPreconditions, object::ObjectOperations as _};
-use crate::store::ECStore;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -474,12 +470,10 @@ impl BackfillContext for BucketBackfillContext {
     }
 
     async fn config_updated_at(&self) -> Result<Option<OffsetDateTime>, StorageError> {
-        let sys = bucket_metadata_sys_of(&self.api.ctx)?;
-        let guard = sys.read().await;
-        Ok(guard
-            .get_on_demand_migration_config(self.state.bucket())
-            .await?
-            .map(|(_, updated_at)| updated_at))
+        Ok(
+            super::config::decode_stored_config(get_on_demand_migration_config_in(&self.api.ctx, self.state.bucket()).await?)?
+                .map(|(_, updated_at)| updated_at),
+        )
     }
 }
 
@@ -683,7 +677,7 @@ async fn write_checkpoint(
     };
     let opts = ObjectOptions {
         max_parity: true,
-        write_completion: crate::object_api::WriteCompletion::TailDrained,
+        write_completion: WriteCompletion::TailDrained,
         http_preconditions: Some(preconditions),
         ..Default::default()
     };
@@ -1506,10 +1500,10 @@ pub async fn run_backfill_recovery_loop(runner: Arc<BackfillRunner>, cancel: Can
 
 #[cfg(test)]
 mod tests {
+    use super::super::storage_api::test_support::isolated_store_over_temp_disks;
     use super::*;
-    use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
-    use crate::bucket::on_demand_migration::source_client::SourceObject;
-    use crate::bucket::on_demand_migration::sys::PullError;
+    use crate::on_demand_migration::source_client::SourceObject;
+    use crate::on_demand_migration::sys::PullError;
     use std::collections::{BTreeSet, HashSet};
     use std::sync::atomic::AtomicBool;
 

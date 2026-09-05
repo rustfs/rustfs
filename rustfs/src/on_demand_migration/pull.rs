@@ -1093,7 +1093,7 @@ impl OnDemandMigrationSys {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bucket::on_demand_migration::config::{
+    use crate::on_demand_migration::config::{
         FilterConfig, OnDemandMigrationConfig, PathStyle as ConfigPathStyle, PolicyConfig, Provider, SourceConfig,
         SourceCredentials, TlsConfig,
     };
@@ -1499,7 +1499,7 @@ mod tests {
         assert_eq!(failures(&state).get("queue_full"), Some(&1));
         assert!(!queue.is_stopped());
 
-        assert_eq!(sys.remove(BUCKET), crate::bucket::on_demand_migration::ApplyOutcome::Removed);
+        assert_eq!(sys.remove(BUCKET), crate::on_demand_migration::ApplyOutcome::Removed);
         tokio::time::timeout(Duration::from_secs(5), queue.wait_until_stopped())
             .await
             .expect("dispatcher and in-flight job must exit after cancel");

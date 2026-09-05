@@ -26,7 +26,7 @@
 //! the log line and the admin response.
 
 use super::source_client::{SourceError, SourceHead, SourceTimeouts, USER_AGENT_SUFFIX, classify_status, is_multipart_etag};
-use crate::bucket::remote_s3_client::{RemoteS3ClientError, validate_remote_endpoint, validate_target_ca_pem};
+use super::storage_api::remote_s3_client::{RemoteS3ClientError, validate_remote_endpoint, validate_target_ca_pem};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_types::body::SdkBody;
 use futures::StreamExt;
