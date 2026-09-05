@@ -7,6 +7,12 @@ On-Demand Migration (ODM) attaches an external S3-compatible **source bucket** t
 
 The module is on by default (rustfs/backlog#2163); set `RUSTFS_ON_DEMAND_MIGRATION_ENABLED=false` on every node to turn it off (`rustfs/src/module_switches.rs`). With the switch off, the runtime never intervenes on a read and the admin `PUT` route refuses with `OnDemandMigrationDisabled`. Reads of the configuration and of the status endpoint keep working while the switch is off, so a disabled deployment can still be inspected. The switch only decides whether the module may act at all: a bucket with no `on-demand-migration.json` is never resolved by the runtime and makes no source call, so turning the module on changes nothing for buckets you have not configured.
 
+## Optional Google dependencies
+
+The default and `full` server builds include the `gcs` Cargo feature to preserve native GCS migration and existing GCS tier support. For a server without Google SDK dependencies, build with `cargo build -p rustfs --no-default-features --features ftps,webdav`. Add `gcs` to that feature list to restore native GCS support. The ECStore library has no default Google dependency; library users that need GCS tiers must enable its `gcs` feature.
+
+Both builds can read, redact and preserve GCS configuration. A build without `gcs` rejects native ODM client construction with `OnDemandMigrationBackendNotCompiled` (HTTP 501); persisted native sources report an unavailable client. GCS tier initialization returns `XRustFSAdminTierTypeUnsupported` (HTTP 501). Do not deploy that build to a cluster with GCS tiers containing transitioned objects: the configuration remains intact, but reading their remote data requires a GCS-capable binary. The `gcs` provider using HMAC credentials and the S3 interoperability API remains available in every build; only `gcs_native` and native GCS tier clients need the feature.
+
 ## List continuation token rollout
 
 `RUSTFS_ON_DEMAND_MIGRATION_LIST_V2_TOKENS` defaults to `false`; unset or invalid boolean values also keep it off. It controls only whether a v1 listing may first issue a v2 continuation token after an empty truncated merged page. Every node with this reader support accepts existing v2 tokens and continues their budget even with the switch off. Ordinary pages that consume an object or common prefix retain the original v1 token shape.

@@ -451,6 +451,7 @@ mod tests {
     use crate::app::storage_api::test::StoragePutObjReader;
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::app::storage_api::test::contract::object::ObjectIO as _;
+    use s3s::dto::ListObjectsInput;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -793,6 +794,97 @@ mod tests {
             .expect("source connections must finish")
             .expect("source server must not panic");
         (result, requests)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_v1_stays_local_with_xml_safe_key_markers() {
+        run_large_stack_test("list-through-v1-local-markers", || async {
+            temp_env::async_with_vars(
+                [
+                    ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                    ("HTTP_PROXY", None),
+                    ("HTTPS_PROXY", None),
+                    ("ALL_PROXY", None),
+                    ("http_proxy", None),
+                    ("https_proxy", None),
+                    ("all_proxy", None),
+                    ("NO_PROXY", Some("*")),
+                    ("no_proxy", Some("*")),
+                ],
+                async {
+                    let (endpoint, server, stop) =
+                        list_source(std::iter::repeat(source_xml(None, false, Some("a-source")))).await;
+                    let (_state_guard, source_input) =
+                        source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                    let store = shared_gating_ecstore().await;
+                    store
+                        .put_object(
+                            &source_input.bucket,
+                            "a&local",
+                            &mut StoragePutObjReader::from_vec(vec![1]),
+                            &StorageObjectOptions::default(),
+                        )
+                        .await
+                        .expect("seed a second local object");
+
+                    for delimiter in [None, Some("/".to_string())] {
+                        let mut input = ListObjectsInput {
+                            bucket: source_input.bucket.clone(),
+                            max_keys: Some(1),
+                            delimiter,
+                            ..Default::default()
+                        };
+                        for (index, expected_key) in ["a&local", "z-local"].into_iter().enumerate() {
+                            let request_marker = input.marker.clone().unwrap_or_default();
+                            let response = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                DefaultBucketUsecase::from_global().execute_list_objects(S3Request {
+                                    input: input.clone(),
+                                    method: http::Method::GET,
+                                    uri: http::Uri::from_static("/"),
+                                    headers: HeaderMap::new(),
+                                    extensions: http::Extensions::new(),
+                                    credentials: None,
+                                    region: None,
+                                    service: None,
+                                    trailing_headers: None,
+                                }),
+                            )
+                            .await
+                            .expect("v1 pagination must finish")
+                            .expect("list-through must not change v1 listing");
+                            assert!(!response.headers.contains_key("x-rustfs-on-demand-migration-list"));
+                            let output = response.output;
+                            let contents = output.contents.as_ref().expect("local page contents");
+                            assert_eq!(contents.len(), 1);
+                            assert_eq!(contents[0].key.as_deref(), Some(expected_key));
+                            assert_eq!(output.marker.as_deref(), Some(request_marker.as_str()));
+                            assert_eq!(output.is_truncated, Some(index == 0));
+                            assert_eq!(output.next_marker.as_deref(), (index == 0).then_some(expected_key));
+
+                            let mut xml = Vec::new();
+                            s3s::xml::Serialize::serialize(&output, &mut s3s::xml::Serializer::new(&mut xml))
+                                .expect("serialize the real v1 response");
+                            assert!(!xml.contains(&0), "XML 1.0 forbids NUL in NextMarker");
+                            let mut reader = quick_xml::Reader::from_reader(xml.as_slice());
+                            loop {
+                                if reader.read_event().expect("v1 response must be well-formed XML")
+                                    == quick_xml::events::Event::Eof
+                                {
+                                    break;
+                                }
+                            }
+                            input.marker = output.next_marker;
+                        }
+                    }
+                    stop.cancel();
+                    let requests = server.await.expect("source server must not panic");
+                    assert!(requests.is_empty(), "ListObjects v1 must issue no remote LIST requests: {requests:?}");
+                },
+            )
+            .await;
+        });
     }
 
     #[test]
