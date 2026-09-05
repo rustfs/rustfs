@@ -360,6 +360,16 @@ async fn refresh_buckets_metadata_once(sys: Arc<RwLock<BucketMetadataSys>>) {
 }
 
 async fn sync_bucket_target_sys(bucket: &str, bm: &BucketMetadata) {
+    if bm.bucket_targets_unreadable() {
+        // "The configuration cannot be read" is not "no targets configured".
+        // Publishing an empty snapshot here is what silently stopped
+        // replication (rustfs/backlog#2282): mark the bucket instead, so every
+        // targets reader gets a typed error, and leave any snapshot from an
+        // earlier readable load in place rather than withdrawing it.
+        BucketTargetSys::get().mark_targets_unreadable(bucket).await;
+        return;
+    }
+
     BucketTargetSys::get()
         .update_all_targets(bucket, bm.bucket_target_config.as_ref())
         .await;
@@ -2118,7 +2128,9 @@ impl BucketMetadataSys {
     pub async fn get_public_access_block_config(&self, bucket: &str) -> Result<(PublicAccessBlockConfiguration, OffsetDateTime)> {
         let (bm, _) = self.get_config(bucket).await?;
 
-        if let Some(config) = &bm.public_access_block_config {
+        if !bm.public_access_block_config_xml.is_empty() && bm.public_access_block_config.is_none() {
+            Err(Error::other("persisted bucket public access block configuration is invalid"))
+        } else if let Some(config) = &bm.public_access_block_config {
             Ok((config.clone(), bm.public_access_block_config_updated_at))
         } else {
             Err(Error::ConfigNotFound)
@@ -2429,7 +2441,9 @@ impl BucketMetadataSys {
     pub async fn get_sse_config(&self, bucket: &str) -> Result<(ServerSideEncryptionConfiguration, OffsetDateTime)> {
         let (bm, _) = self.get_config(bucket).await?;
 
-        if let Some(config) = &bm.sse_config {
+        if !bm.encryption_config_xml.is_empty() && bm.sse_config.is_none() {
+            Err(Error::other("persisted bucket encryption configuration is invalid"))
+        } else if let Some(config) = &bm.sse_config {
             Ok((config.clone(), bm.encryption_config_updated_at))
         } else {
             Err(Error::ConfigNotFound)
@@ -2500,7 +2514,9 @@ impl BucketMetadataSys {
     pub async fn get_quota_config(&self, bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
         let (bm, _) = self.get_config(bucket).await?;
 
-        if let Some(config) = &bm.quota_config {
+        if !bm.quota_config_json.is_empty() && bm.quota_config.is_none() {
+            Err(Error::other("persisted bucket quota configuration is invalid"))
+        } else if let Some(config) = &bm.quota_config {
             Ok((config.clone(), bm.quota_config_updated_at))
         } else {
             Err(Error::ConfigNotFound)
@@ -2522,7 +2538,9 @@ impl BucketMetadataSys {
     pub async fn get_bucket_targets_config(&self, bucket: &str) -> Result<BucketTargets> {
         let (bm, _) = self.get_config(bucket).await?;
 
-        if let Some(config) = &bm.bucket_target_config {
+        if bm.bucket_targets_unreadable() {
+            Err(Error::other("persisted bucket replication target configuration is invalid"))
+        } else if let Some(config) = &bm.bucket_target_config {
             Ok(config.clone())
         } else {
             Err(Error::ConfigNotFound)
@@ -2593,6 +2611,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::isolated_store_over_temp_disks;
     use super::*;
+    use crate::bucket::bucket_target_sys::BucketTargetError;
     use crate::bucket::metadata::{
         BUCKET_ACCELERATE_CONFIG, BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_NOTIFICATION_CONFIG,
         BUCKET_POLICY_CONFIG, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG,
@@ -2786,6 +2805,36 @@ mod tests {
             sys.get_object_lock_config_state(bucket).await.is_err(),
             "malformed Object Lock metadata must not be reported as absent"
         );
+    }
+
+    /// The `parse_all_configs` audit (rustfs/backlog#2282): every accessor
+    /// whose configuration grants something — plaintext storage, anonymous
+    /// access, capacity, replication targets — reports a corrupt payload as
+    /// invalid rather than as absent, because "absent" is what grants it.
+    #[tokio::test]
+    async fn malformed_permissive_configs_are_not_reported_as_absent() {
+        let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore);
+        let bucket = "malformed-permissive-config";
+        let mut metadata = BucketMetadata::new(bucket);
+        metadata.encryption_config_xml = b"<ServerSideEncryptionConfiguration".to_vec();
+        metadata.public_access_block_config_xml = b"<PublicAccessBlockConfiguration".to_vec();
+        metadata.quota_config_json = b"{not-json".to_vec();
+        metadata.bucket_targets_config_json = b"{not-json".to_vec();
+        metadata
+            .parse_all_configs()
+            .expect("a corrupt sub-config must not fail the load");
+        sys.set(bucket.to_string(), Arc::new(metadata)).await;
+
+        for (config, result) in [
+            ("encryption", sys.get_sse_config(bucket).await.err()),
+            ("public access block", sys.get_public_access_block_config(bucket).await.err()),
+            ("quota", sys.get_quota_config(bucket).await.err()),
+            ("bucket targets", sys.get_bucket_targets_config(bucket).await.err()),
+        ] {
+            let err = result.unwrap_or_else(|| panic!("malformed {config} metadata must not read as a value"));
+            assert_ne!(err, Error::ConfigNotFound, "malformed {config} metadata must not be reported as absent");
+        }
     }
 
     #[tokio::test]
@@ -4064,6 +4113,114 @@ mod tests {
         assert_eq!(targets.targets[0].arn, format!("arn:rustfs:replication:us-east-1:{bucket}:fresh"));
 
         target_sys.delete(bucket).await;
+    }
+
+    /// rustfs/backlog#2282: an unreadable `bucket-targets.json` reaches every
+    /// targets reader as a typed error; it neither withdraws a snapshot a
+    /// previous readable load published, nor collapses into the "no targets
+    /// configured" state that a bucket with an absent configuration reports.
+    #[tokio::test]
+    #[serial]
+    async fn unreadable_bucket_targets_fail_closed_and_stay_distinct_from_absent() {
+        let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore);
+        let target_sys = BucketTargetSys::get();
+        let unreadable = "targets-unreadable";
+        let absent = "targets-absent";
+        target_sys.delete(unreadable).await;
+        target_sys.delete(absent).await;
+
+        // A readable load publishes this bucket's targets.
+        let mut readable = BucketMetadata::new(unreadable);
+        readable.bucket_target_config = Some(BucketTargets {
+            targets: vec![target(unreadable, "live")],
+        });
+        sync_bucket_target_sys(unreadable, &readable).await;
+        assert_eq!(
+            target_sys
+                .list_bucket_targets(unreadable)
+                .await
+                .expect("readable targets publish")
+                .targets
+                .len(),
+            1
+        );
+
+        // The same bucket reloaded with a blob that cannot be decoded.
+        let mut corrupt = BucketMetadata::new(unreadable);
+        corrupt.bucket_targets_config_json = br#"{"targets":[{"endpoint":"#.to_vec();
+        corrupt
+            .parse_all_configs()
+            .expect("an unreadable targets blob must not fail the metadata load");
+        sys.set(unreadable.to_string(), Arc::new(corrupt)).await;
+
+        assert!(
+            matches!(
+                target_sys.list_bucket_targets(unreadable).await,
+                Err(BucketTargetError::BucketRemoteTargetsUnreadable { .. })
+            ),
+            "an unreadable configuration must not read as an empty or a missing target set"
+        );
+        assert!(
+            target_sys.list_targets(unreadable, "").await.is_err(),
+            "the admin listing must surface the fault instead of an empty list"
+        );
+        let err = sys
+            .get_bucket_targets_config(unreadable)
+            .await
+            .expect_err("an unreadable targets configuration must not read as a value");
+        assert_ne!(err, Error::ConfigNotFound, "unreadable must not be reported as absent");
+
+        // A bucket that never configured a target keeps its previous behavior.
+        let mut no_targets = BucketMetadata::new(absent);
+        no_targets.parse_all_configs().expect("absent targets parse");
+        sys.set(absent.to_string(), Arc::new(no_targets)).await;
+        assert!(
+            matches!(
+                target_sys.list_bucket_targets(absent).await,
+                Err(BucketTargetError::BucketRemoteTargetNotFound { .. })
+            ),
+            "an absent configuration must still report as a missing target set"
+        );
+        assert!(
+            target_sys
+                .list_targets(absent, "")
+                .await
+                .expect("an absent configuration lists no targets")
+                .is_empty()
+        );
+        assert!(
+            sys.get_bucket_targets_config(absent)
+                .await
+                .expect("an absent targets configuration still reads as an empty set")
+                .is_empty(),
+            "the absent path must keep returning an empty target set, exactly as before"
+        );
+
+        // One bucket's unreadable configuration does not reach another bucket.
+        assert!(!matches!(
+            target_sys.list_bucket_targets(absent).await,
+            Err(BucketTargetError::BucketRemoteTargetsUnreadable { .. })
+        ));
+
+        // A repaired configuration takes effect on the next load, no restart.
+        let mut repaired = BucketMetadata::new(unreadable);
+        repaired.bucket_target_config = Some(BucketTargets {
+            targets: vec![target(unreadable, "repaired")],
+        });
+        sync_bucket_target_sys(unreadable, &repaired).await;
+        assert_eq!(
+            target_sys
+                .list_bucket_targets(unreadable)
+                .await
+                .expect("a repaired configuration clears the unreadable marker")
+                .targets
+                .len(),
+            1
+        );
+
+        target_sys.delete(unreadable).await;
+        target_sys.delete(absent).await;
     }
 
     #[tokio::test]
