@@ -12674,6 +12674,65 @@ mod metadata_mutation_generation_tests {
 
     #[tokio::test]
     #[serial_test::serial(metadata_cache_invalidation_probe)]
+    async fn segment_observation_equal_size_mutations_retire_metadata_generation() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "segment-observation-bucket";
+        let object = "hot/object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create segment fixture bucket");
+        }
+        let (before, old_key) = put_and_prime(&set_disks, bucket, object, b"before").await;
+        let probe = MetadataCacheInvalidationProbe::install(bucket, object);
+        let mut replacement = PutObjReader::from_vec(b"after!".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut replacement, &ObjectOptions::default())
+            .await
+            .expect("commit same-length replacement with normal owner locking");
+        assert_eq!(probe.count(), 2, "same-length PUT must retire its metadata generation");
+        assert_retired(&set_disks, &old_key).await;
+        drop(probe);
+        let after = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read replacement metadata");
+        assert_eq!(before.size, after.size);
+        assert_ne!(before.etag, after.etag, "equal size is not equal content");
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("read replacement body through the owner");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("drain replacement body");
+        assert_eq!(body, b"after!");
+        drop(reader);
+
+        let (before, old_key) = put_and_prime(&set_disks, bucket, object, b"after!").await;
+        let probe = MetadataCacheInvalidationProbe::install(bucket, object);
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(HashMap::from([("x-amz-meta-segment".to_string(), "changed".to_string())])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("commit metadata-only mutation with normal owner locking");
+        assert_eq!(probe.count(), 4, "metadata-only mutation must retire both owner fences");
+        assert_retired(&set_disks, &old_key).await;
+        let after = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read committed metadata-only mutation");
+        assert_eq!(before.size, after.size);
+        assert_eq!(before.etag, after.etag);
+        assert!(!before.user_defined.contains_key("x-amz-meta-segment"));
+        assert_eq!(after.user_defined.get("x-amz-meta-segment").map(String::as_str), Some("changed"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(metadata_cache_invalidation_probe)]
     async fn metadata_semantic_mutation_generation_matrix_retires_cached_snapshot() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "metadata-mutation-generation-bucket";
