@@ -864,6 +864,11 @@ mod tests {
                 save_tier_mutation_intent_record, save_tier_mutation_intent_record_if_current,
             },
             tier_mutation_peer::{TierMutationPeerError, TierMutationPeerState, handle_tier_mutation_peer_request},
+            tier_probe_intent::{
+                TierProbeIntent, TierProbeIntentState, TierProbeOperationIdentity, TierProbeOwnerFence, TierProbeRemoteVersion,
+                delete_tier_probe_intent_record_if_current, load_tier_probe_intent_record,
+                save_tier_probe_intent_record_if_absent, save_tier_probe_intent_record_if_current,
+            },
             warm_backend::{TransitionCandidateProbe, WarmBackend},
         },
         set_disk::SetDiskTransitionUploadedCommitBarrier as TransitionUploadedCommitBarrier,
@@ -17194,6 +17199,147 @@ mod tests {
             .await
             .expect_err("deleted tier mutation intent record should not load");
         assert!(matches!(err, Error::ConfigNotFound));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_probe_intent_store_enforces_create_cas_and_terminal_delete_preconditions() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-probe-intent-cas", &[4])).await;
+        let probe_id = uuid::Uuid::new_v4();
+        let creator_epoch = uuid::Uuid::new_v4();
+        let initial = TierProbeIntent {
+            probe_id,
+            revision: 1,
+            state: TierProbeIntentState::UploadOutcomeUnknown,
+            operation: TierProbeOperationIdentity::Verify {
+                config_etag: "config-etag".to_string(),
+                backend_identity: [1; 32],
+            },
+            tier_name: "COLD-A".to_string(),
+            destination_id: [1; 32],
+            probe_object: format!("rustfs-tier-probe-{probe_id}"),
+            creator_id: "node-a".to_string(),
+            creator_epoch,
+            created_at_unix_nanos: 1_780_000_000_000_000_000,
+            owner: TierProbeOwnerFence {
+                owner_id: "node-a".to_string(),
+                owner_epoch: creator_epoch,
+                not_after_unix_nanos: 1_780_000_900_000_000_000,
+            },
+            remote_version: TierProbeRemoteVersion::default(),
+        };
+
+        save_tier_probe_intent_record_if_absent(store.clone(), &initial)
+            .await
+            .expect("initial probe intent should persist with create-only semantics");
+        let duplicate = save_tier_probe_intent_record_if_absent(store.clone(), &initial)
+            .await
+            .expect_err("duplicate create must fail closed");
+        assert!(matches!(duplicate, Error::PreconditionFailed));
+
+        let observed_initial = load_tier_probe_intent_record(store.clone(), probe_id)
+            .await
+            .expect("initial probe intent should load with an ETag");
+        assert_eq!(observed_initial.intent(), &initial);
+
+        let nonterminal_delete = delete_tier_probe_intent_record_if_current(store.clone(), &observed_initial)
+            .await
+            .expect_err("nonterminal evidence must not be deleted");
+        assert!(nonterminal_delete.to_string().contains("must be terminal"));
+
+        let mut fabricated_current_intent = initial.clone();
+        fabricated_current_intent.tier_name = "COLD-B".to_string();
+        let mut fabricated_successor = fabricated_current_intent.clone();
+        fabricated_successor
+            .advance(
+                TierProbeIntentState::Uploaded,
+                TierProbeRemoteVersion::versioned(uuid::Uuid::new_v4().to_string()),
+            )
+            .expect("fabricated successor should be internally valid");
+        let fabricated_current = observed_initial.with_intent_for_test(fabricated_current_intent.clone());
+        let crossed_cas = save_tier_probe_intent_record_if_current(store.clone(), &fabricated_current, &fabricated_successor)
+            .await
+            .expect_err("a live ETag must not authorize a different caller record");
+        assert!(matches!(crossed_cas, Error::PreconditionFailed));
+        assert_eq!(
+            load_tier_probe_intent_record(store.clone(), probe_id)
+                .await
+                .expect("crossed CAS must retain the authoritative record")
+                .intent(),
+            &initial
+        );
+
+        let mut fabricated_terminal_intent = fabricated_current_intent;
+        fabricated_terminal_intent
+            .advance(TierProbeIntentState::AbortedNoRemote, TierProbeRemoteVersion::default())
+            .expect("fabricated terminal should be internally valid");
+        let fabricated_terminal = observed_initial.with_intent_for_test(fabricated_terminal_intent);
+        let crossed_delete = delete_tier_probe_intent_record_if_current(store.clone(), &fabricated_terminal)
+            .await
+            .expect_err("a live ETag must not delete for a different caller record");
+        assert!(matches!(crossed_delete, Error::PreconditionFailed));
+        assert_eq!(
+            load_tier_probe_intent_record(store.clone(), probe_id)
+                .await
+                .expect("crossed delete must retain the authoritative record")
+                .intent(),
+            &initial
+        );
+
+        let remote_version = TierProbeRemoteVersion::versioned(uuid::Uuid::new_v4().to_string());
+        let mut uploaded = observed_initial.intent().clone();
+        uploaded
+            .advance(TierProbeIntentState::Uploaded, remote_version.clone())
+            .expect("known PUT result should advance");
+        save_tier_probe_intent_record_if_current(store.clone(), &observed_initial, &uploaded)
+            .await
+            .expect("the matching initial ETag should admit one successor");
+
+        let stale_cas = save_tier_probe_intent_record_if_current(store.clone(), &observed_initial, &uploaded)
+            .await
+            .expect_err("a consumed ETag must not overwrite the current generation");
+        assert!(matches!(stale_cas, Error::PreconditionFailed));
+
+        let observed_uploaded = load_tier_probe_intent_record(store.clone(), probe_id)
+            .await
+            .expect("uploaded generation should load");
+        assert_eq!(observed_uploaded.intent(), &uploaded);
+        let mut cleanup = observed_uploaded.intent().clone();
+        cleanup
+            .advance(TierProbeIntentState::CleanupPending, remote_version.clone())
+            .expect("known candidate should become cleanup-pending");
+        save_tier_probe_intent_record_if_current(store.clone(), &observed_uploaded, &cleanup)
+            .await
+            .expect("cleanup generation should persist by exact ETag");
+
+        let observed_cleanup = load_tier_probe_intent_record(store.clone(), probe_id)
+            .await
+            .expect("cleanup generation should load");
+        let mut completed = observed_cleanup.intent().clone();
+        completed
+            .advance(TierProbeIntentState::Completed, remote_version)
+            .expect("exact cleanup should become terminal");
+        save_tier_probe_intent_record_if_current(store.clone(), &observed_cleanup, &completed)
+            .await
+            .expect("terminal generation should persist by exact ETag");
+
+        let stale_terminal = observed_cleanup.with_intent_for_test(completed.clone());
+        let stale_delete = delete_tier_probe_intent_record_if_current(store.clone(), &stale_terminal)
+            .await
+            .expect_err("a stale ETag must not delete terminal evidence");
+        assert!(matches!(stale_delete, Error::PreconditionFailed));
+
+        let observed_completed = load_tier_probe_intent_record(store.clone(), probe_id)
+            .await
+            .expect("terminal generation should remain after stale delete");
+        assert_eq!(observed_completed.intent(), &completed);
+        delete_tier_probe_intent_record_if_current(store.clone(), &observed_completed)
+            .await
+            .expect("the exact terminal ETag should delete the record");
+        assert!(matches!(load_tier_probe_intent_record(store, probe_id).await, Err(Error::ConfigNotFound)));
     }
 
     #[cfg(feature = "test-util")]
