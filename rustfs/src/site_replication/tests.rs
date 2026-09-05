@@ -878,6 +878,26 @@ fn test_retry_drain_bounds_each_peer_round_to_one_small_request_chain() {
 }
 
 #[test]
+fn test_lightweight_retry_peer_rotation_covers_all_queued_peers() {
+    let limit = SITE_REPLICATION_RETRY_DRAIN_PEER_CONCURRENCY;
+    for peer_count in 1..=(limit * 3 + 1) {
+        let rounds = peer_count.div_ceil(limit);
+        let mut seen = HashSet::new();
+        for round in 7..(7 + rounds as i64) {
+            let start = lightweight_retry_peer_rotation(peer_count, round);
+            for offset in 0..limit.min(peer_count) {
+                seen.insert((start + offset) % peer_count);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            peer_count,
+            "every peer must enter the bounded lightweight window within {rounds} rounds"
+        );
+    }
+}
+
+#[test]
 fn test_lightweight_bucket_retry_plan_is_targeted_and_preserves_make_options() {
     let created_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
     let plan = site_replication_bucket_retry_plan_for("photos", Some(created_at), true);
@@ -890,6 +910,36 @@ fn test_lightweight_bucket_retry_plan_is_targeted_and_preserves_make_options() {
     assert!(plan.bucket_make_ops[0].contains("createdAt="));
     assert_eq!(plan.bucket_configure_ops.len(), 1);
     assert!(plan.bucket_configure_ops[0].contains("operation=configure-replication"));
+}
+
+#[test]
+fn test_delete_bucket_broadcast_fences_target_membership_through_delivery() {
+    let hooks = include_str!("hooks.rs");
+    let delete_broadcast = hooks
+        .split("async fn broadcast_site_replication_delete_bucket")
+        .nth(1)
+        .and_then(|rest| rest.split("pub async fn site_replication_delete_bucket_hook").next())
+        .expect("delete-bucket broadcast should exist");
+    assert!(
+        delete_broadcast.contains("send_retry_request_if_peer_current("),
+        "a destructive bucket delivery must re-check that its peer is still current"
+    );
+    assert!(
+        delete_broadcast.contains("enqueue_site_replication_retry_event(peer, path, &err).await"),
+        "a failed destructive delivery must remain visible for operator repair"
+    );
+
+    let retry = include_str!("retry.rs");
+    let fenced_send = retry
+        .split("pub(crate) async fn send_retry_request_if_peer_current")
+        .nth(1)
+        .and_then(|rest| rest.split("async fn send_peer_edit_retry_if_peer_current").next())
+        .expect("topology-fenced retry sender should exist");
+    assert!(
+        fenced_send.contains("with_site_replication_state_read_lock(move |state| async move {")
+            && fenced_send.contains("PeerAdminRequest::put(&transport.connection, &path, &access_key)"),
+        "the membership check and destructive request must share the distributed state read lock"
+    );
 }
 
 #[test]

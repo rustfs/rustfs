@@ -702,6 +702,18 @@ pub(crate) const SITE_REPLICATION_RETRY_DRAIN_MAX_REQUESTS_PER_PEER: usize = 2;
 /// most this many peer request chains per round, bounding its lock hold time.
 pub(crate) const SITE_REPLICATION_RETRY_DRAIN_PEER_CONCURRENCY: usize = 4;
 
+/// Rotate the bounded lightweight window instead of always admitting the
+/// lexicographically first peers. Advancing by one full window per scheduler
+/// round gives every queued peer a turn within `ceil(peer_count / limit)`
+/// rounds, even when earlier peers each have a large bucket backlog.
+pub(crate) fn lightweight_retry_peer_rotation(peer_count: usize, round: i64) -> usize {
+    if peer_count == 0 {
+        return 0;
+    }
+    let window = SITE_REPLICATION_RETRY_DRAIN_PEER_CONCURRENCY.min(peer_count);
+    (round.rem_euclid(peer_count as i64) as usize * window) % peer_count
+}
+
 /// A replay shape the retry machinery can derive from persisted state. The
 /// lightweight 30-second scheduler admits only bounded bucket-op chains;
 /// snapshot and topology-wide work remains operator territory.
@@ -1471,7 +1483,7 @@ async fn drain_site_replication_retry_queue_lightweight_inner() -> S3Result<()> 
         if actionable.is_empty() {
             return Ok(());
         }
-        drain_site_replication_retry_queue_lightweight_locked(Arc::new(runtime), actionable).await
+        drain_site_replication_retry_queue_lightweight_locked(Arc::new(runtime), actionable, now).await
     })
     .await
     .map_err(ApiError::from)?
@@ -1545,6 +1557,7 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
 async fn drain_site_replication_retry_queue_lightweight_locked(
     runtime: Arc<SiteReplicationRuntime>,
     events: Vec<SiteReplicationRetryEvent>,
+    now: OffsetDateTime,
 ) -> S3Result<()> {
     let mut events_by_peer: BTreeMap<String, Vec<SiteReplicationRetryEvent>> = BTreeMap::new();
     for event in events {
@@ -1554,7 +1567,7 @@ async fn drain_site_replication_retry_queue_lightweight_locked(
             .push(event);
     }
 
-    let peer_replays = events_by_peer
+    let mut peer_groups = events_by_peer
         .into_iter()
         .filter_map(|(deployment_id, peer_events)| {
             let peer = runtime.state.peers.get(&deployment_id)?.clone();
@@ -1563,8 +1576,19 @@ async fn drain_site_replication_retry_queue_lightweight_locked(
             {
                 return None;
             }
+            Some((peer, peer_events))
+        })
+        .collect::<Vec<_>>();
+    let interval_secs = crate::site_replication_reconcile::RETRY_DRAIN_INTERVAL.as_secs() as i64;
+    let round = now.unix_timestamp().div_euclid(interval_secs);
+    let rotation = lightweight_retry_peer_rotation(peer_groups.len(), round);
+    peer_groups.rotate_left(rotation);
+
+    let peer_replays = peer_groups
+        .into_iter()
+        .map(|(peer, peer_events)| {
             let runtime = Arc::clone(&runtime);
-            Some(async move {
+            async move {
                 let Some((event, action, bucket)) = peer_events.into_iter().find_map(|event| {
                     let action = classify_site_replication_retry_event(&event)?;
                     let bucket = match &action {
@@ -1597,7 +1621,7 @@ async fn drain_site_replication_retry_queue_lightweight_locked(
                     Ok(false) => (0, 0),
                     Err(_) => (0, 1),
                 }
-            })
+            }
         })
         .take(SITE_REPLICATION_RETRY_DRAIN_PEER_CONCURRENCY);
 

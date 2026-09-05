@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(600);
-const RETRY_DRAIN_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const RETRY_DRAIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A reconciler reports its own failures; the outcome carries no value because neither
 /// caller can act on one — a site that cannot repair its replication wiring still serves S3.

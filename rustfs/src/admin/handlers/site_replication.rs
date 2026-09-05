@@ -1912,8 +1912,8 @@ fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Fut
                 "admin site replication state"
             );
         }
-        // The retry path re-checks membership per request under the bucket-op
-        // lock; release lifecycle before a potentially large replay.
+        // The retry path re-checks membership from distributed state before
+        // each request; release lifecycle before a potentially large replay.
         drop(lifecycle);
         drain_site_replication_retry_queue().await;
     })
@@ -3628,16 +3628,15 @@ const PEER_EDIT_FENCE_STALENESS_WINDOW_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000
 /// must be a site this state currently replicates with — the same membership
 /// rule the load-time mark pruning applies, so every mark recorded behind
 /// this check is one a reload would keep — and not this site itself, which
-/// never delivers edits to itself. The caller IGNORES an inadmissible fence
-/// rather than failing the request: the delivery applies exactly as an
-/// unstamped (pre-fence) delivery would, no high-water mark is read or
-/// written, and the worst a forged fence achieves is forfeiting an ordering
-/// guarantee its sender was never owed. The generation itself is NOT
-/// bounded here: a genuine origin whose hybrid clock persisted a wall-clock
-/// excursion allocates arbitrarily far in the future, and refusing to
-/// record its marks would strip the ordering fence from exactly the
-/// deliveries that still race — the staleness window on the read side is
-/// what defuses forged marks instead.
+/// never delivers edits to itself. The caller acknowledges an inadmissible
+/// fenced request without applying it: after a remove commits, an older
+/// in-flight retry from the departed origin must not recreate topology. Old
+/// peers remain compatible because their unstamped edits still follow the
+/// pre-fence path. The generation itself is NOT bounded here: a genuine
+/// origin whose hybrid clock persisted a wall-clock excursion allocates
+/// arbitrarily far in the future, and refusing to record its marks would
+/// strip the ordering fence from exactly the deliveries that still race —
+/// the staleness window on the read side is what defuses forged marks instead.
 fn peer_edit_fence_is_admissible(state: &SiteReplicationState, local_deployment_id: &str, fence: &(String, u64)) -> bool {
     let (origin, generation) = fence;
     if origin != local_deployment_id && state.peers.contains_key(origin) {
@@ -7251,8 +7250,14 @@ impl Operation for SRPeerEditHandler {
             // The fence is self-reported — the shared service account means
             // the sender cannot be identified — so it is honoured only after
             // the admissibility check, against the same state it will gate.
-            let commit_fence =
-                commit_fence.filter(|fence| peer_edit_fence_is_admissible(state, &local_peer.deployment_id, fence));
+            let commit_fence = match commit_fence {
+                Some(fence) if peer_edit_fence_is_admissible(state, &local_peer.deployment_id, &fence) => Some(fence),
+                // A fenced edit can only come from a current remote peer. If
+                // that origin left while the retry was in flight, applying
+                // its body here would resurrect the removed topology.
+                Some(_) => return Ok(StateCommit::Unchanged(PeerEditOutcome::Acked)),
+                None => None,
+            };
             // Ordering fence: the sending site allocates the generation under
             // its state-object lock, so a delivery that lost the race carries
             // a generation this site has already passed. Applying it would
@@ -9248,12 +9253,18 @@ mod tests {
         );
         // Fence hardening: origin and generation are self-reported by a
         // caller the shared service account cannot identify, so the handler
-        // must pass the fence through the admissibility check — against the
-        // same state the fence gates, i.e. inside the transaction — before
-        // reading or raising any high-water mark.
+        // must admit the fence against the same state it gates. An origin
+        // removed while a retry was in flight is acknowledged without
+        // applying the stale body; otherwise it could recreate topology.
         assert!(
-            handler_block.contains(".filter(|fence| peer_edit_fence_is_admissible(state, &local_peer.deployment_id, fence))"),
+            handler_block.contains(
+                "Some(fence) if peer_edit_fence_is_admissible(state, &local_peer.deployment_id, &fence) => Some(fence)"
+            ),
             "SRPeerEditHandler must admit a fence only through peer_edit_fence_is_admissible inside the state transaction"
+        );
+        assert!(
+            handler_block.contains("Some(_) => return Ok(StateCommit::Unchanged(PeerEditOutcome::Acked))"),
+            "SRPeerEditHandler must not apply a fenced edit after its origin leaves the current topology"
         );
         // P1-15 PR2: both halves of the fence and the edit they fence share
         // ONE transaction. Checking the fence against a state read outside the
@@ -10418,8 +10429,9 @@ mod tests {
     /// A fence is self-reported: every site authenticates peer traffic with
     /// the same site-replicator credential, so a compromised peer can stamp
     /// ANY origin with ANY generation. An origin the receiver does not
-    /// replicate with — or the receiver itself — is ignored and plants no
-    /// mark; a mark a compromised peer plants for a CURRENT origin cannot
+    /// replicate with — or the receiver itself — is inadmissible and plants
+    /// no mark; the handler acknowledges such a request without applying its
+    /// body. A mark a compromised peer plants for a CURRENT origin cannot
     /// silence that origin, because the staleness window refuses to fence on
     /// a mark implausibly far above the genuine deliveries.
     #[test]
