@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import glob
+import json
 import os
 import re
 import subprocess
@@ -41,6 +43,16 @@ def shell_body(lines: list[str]) -> str:
 
 
 class WorkflowSteps:
+    def uploaded_files(self) -> set[Path]:
+        upload = next(lines for lines in self.steps.values() if any("uses: actions/upload-artifact@" in line for line in lines))
+        start = upload.index("          path: |") + 1
+        paths = []
+        for line in upload[start:]:
+            if not line.startswith("            "):
+                break
+            paths.extend(Path(path) for path in glob.glob(self.render(line.strip())))
+        return {file for path in paths for file in (path.rglob("*") if path.is_dir() else [path]) if file.is_file()}
+
     def render(self, value: str) -> str:
         return re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda match: self.context[match[1]], value)
 
@@ -109,6 +121,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
             '#!/usr/bin/env bash\nset -euo pipefail\n'
             'log_dir=$(mktemp -d "$TMPDIR/rustfs-security.XXXXXX")\n'
             'echo "CURRENT SUITE LOG" > "$log_dir/suite.log"\n'
+            'echo "CURRENT SUITE STDOUT"; echo "CURRENT SUITE STDERR" >&2\n'
             'case "$FAKE_REPORT" in\n'
             f'  present) printf "%s\\n" "CURRENT SUITE DIAGNOSTIC" "{CASE_ROW}" > "$REPORT_FILE" ;;\n'
             '  empty) : > "$REPORT_FILE" ;;\n'
@@ -132,7 +145,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
         for name in ("Upload functional report to dashboard", "Upload report and logs"):
             self.assertIn("        if: ${{ always() && steps.evidence.outcome == 'success' }}", self.steps[name])
         artifact_settings = yaml_block(self.steps["Upload report and logs"], "with", 8)
-        self.assertIn("          path: ${{ env.SECURITY_ARTIFACTS_DIR }}/", artifact_settings)
+        self.assertIn("          path: |", artifact_settings)
         self.assertIn("          if-no-files-found: error", artifact_settings)
 
     def test_suite_report_and_result_matrix(self) -> None:
@@ -151,7 +164,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                 if outcome != "skipped" or mode == "present":
                     suite = self.run_step("Run security suite")
                     self.assertEqual(suite.returncode, exit_code, suite.stderr)
-                    logs = list(self.artifacts.glob("rustfs-security.*/suite.log"))
+                    logs = list(Path(str(self.artifacts) + "-scratch").glob("rustfs-security.*/suite.log"))
                     self.assertEqual(len(logs), 1)
                     self.assertEqual(logs[0].read_text(), "CURRENT SUITE LOG\n")
                 self.context["steps.test.outcome"] = outcome
@@ -173,37 +186,91 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                 summary = Path(self.env["GITHUB_STEP_SUMMARY"]).read_text()
                 self.assertEqual(summary, contents)
                 self.assertNotIn("UNWRAPPED SUITE SUMMARY", summary)
+                expected = {self.artifacts / "report.md"}
+                if outcome != "skipped" or mode == "present":
+                    expected.add(self.artifacts / "suite.log")
+                    self.assertEqual((self.artifacts / "suite.log").read_text(), "CURRENT SUITE STDOUT\nCURRENT SUITE STDERR\n")
+                if mode in ("present", "empty"):
+                    expected.add(self.artifacts / "suite-report.md")
+                (self.artifacts / "unexpected-token.json").write_text("FAKE-SECRET-CANARY")
+                scratch = Path(str(self.artifacts) + "-scratch")
+                (scratch / "case.out").write_text("FAKE-SECRET-CANARY")
+                self.assertEqual(self.uploaded_files(), expected)
+
+
+    def test_oidc_negative_responses_never_print_issued_credentials(self):
+        source = (ROOT / "scripts/test/oidc_keycloak_live.sh").read_text()
+        for variable, filename in (("TAMPERED_STATUS", "sts-tampered.xml"), ("BAD_STATUS", "sts-bad.xml")):
+            start = source.index('[[ "${' + variable + '}" == 403 ]]')
+            end = source.index("\n", source.index("grep -q '<Code>AccessDenied</Code>'", start))
+            guard = source[start:end]
+            credential_xml = "<Credentials><AccessKeyId>FAKE-ACCESS-CANARY</AccessKeyId><SecretAccessKey>FAKE-SECRET-CANARY</SecretAccessKey><SessionToken>FAKE-SESSION-CANARY</SessionToken></Credentials>"
+            for status, body, expected in (("200", credential_xml, 1), ("403", credential_xml, 1),
+                                           ("403", "<Code>AccessDenied</Code>", 0)):
+                with self.subTest(variable=variable, status=status, expected=expected):
+                    (self.directory / filename).write_text(body)
+                    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", guard],
+                                            env={**self.env, variable: status, "WORK_DIR": str(self.directory)},
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    for canary in ("FAKE-ACCESS-CANARY", "FAKE-SECRET-CANARY", "FAKE-SESSION-CANARY"):
+                        self.assertNotIn(canary, result.stdout + result.stderr)
+                    if status == "200":
+                        self.assertIn("HTTP 403, got 200", result.stderr)
+
+    def test_oidc_incomplete_credentials_report_only_the_missing_field(self):
+        source = (ROOT / "scripts/test/oidc_keycloak_live.sh").read_text()
+        start = source.index("IFS=$'\\t' read -r STS_ACCESS_KEY")
+        end = source.index("\n)\n", start) + 3
+        extract = source[start:end]
+        values = {"AccessKeyId": "FAKE-ACCESS-CANARY", "SecretAccessKey": "FAKE-SECRET-CANARY",
+                  "SessionToken": "FAKE-SESSION-CANARY", "Expiration": "2099-01-01T00:00:00Z",
+                  "SubjectFromWebIdentityToken": "alice"}
+        for missing in (None, "Expiration", "SubjectFromWebIdentityToken"):
+            with self.subTest(missing=missing):
+                xml = "<Credentials>" + "".join(f"<{key}>{value}</{key}>" for key, value in values.items() if key != missing) + "</Credentials>"
+                (self.directory / "sts-good.xml").write_text(xml)
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", extract],
+                                        env={**self.env, "WORK_DIR": str(self.directory)}, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1 if missing else 0, result.stderr)
+                for canary in ("FAKE-ACCESS-CANARY", "FAKE-SECRET-CANARY", "FAKE-SESSION-CANARY"):
+                    self.assertNotIn(canary, result.stdout + result.stderr)
+                if missing:
+                    self.assertIn(f"missing required STS field: {missing}", result.stderr)
 
     def test_existing_evidence_directory_is_rejected(self) -> None:
-        self.artifacts.mkdir()
-        stale = self.artifacts / "suite-report.md"
-        stale.write_text("OLD RUN REPORT")
-        self.assertNotEqual(self.run_step("Initialize security evidence").returncode, 0)
-        self.assertEqual(stale.read_text(), "OLD RUN REPORT")
-        self.assertFalse(Path(self.env["GITHUB_ENV"]).exists())
-        (self.artifacts / "report.md").write_text("OLD RUN REPORT")
-        self.context.update({
-            "env.SECURITY_ARTIFACTS_DIR": str(self.artifacts), "secrets.PF_TESTING_GH_TOKEN": "fake-local-token",
-        })
-        fake_bin = self.directory / "bin"
-        fake_bin.mkdir()
-        gh = fake_bin / "gh"
-        gh.write_text(
-            '#!/usr/bin/env bash\nset -euo pipefail\n'
-            'if [ "$1 $2" = "issue create" ]; then\n'
-            '  while [ "$#" -gt 0 ]; do\n'
-            '    if [ "$1" = "--body-file" ]; then cat "$2" > "$CAPTURE_BODY"; fi\n'
-            '    shift\n'
-            '  done\n'
-            'fi\n'
-        )
-        gh.chmod(0o755)
-        body = self.directory / "issue-body.md"
-        self.env.update(PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}", CAPTURE_BODY=str(body))
-        result = self.run_step("File failure issue in rustfs/backlog")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("OLD RUN REPORT", body.read_text())
-        self.assertIn("https://github.com/rustfs/rustfs/actions/runs/314159", body.read_text())
+        for suffix in ("", "-scratch"):
+            self.setUp()
+            existing = Path(str(self.artifacts) + suffix)
+            existing.mkdir()
+            stale = existing / "suite-report.md"
+            stale.write_text("OLD RUN REPORT")
+            self.assertNotEqual(self.run_step("Initialize security evidence").returncode, 0)
+            self.assertEqual(stale.read_text(), "OLD RUN REPORT")
+            self.assertFalse(Path(self.env["GITHUB_ENV"]).exists())
+            (self.artifacts / "report.md").write_text("OLD RUN REPORT")
+            self.context.update({
+                "env.SECURITY_ARTIFACTS_DIR": str(self.artifacts), "secrets.PF_TESTING_GH_TOKEN": "fake-local-token",
+            })
+            fake_bin = self.directory / "bin"
+            fake_bin.mkdir()
+            gh = fake_bin / "gh"
+            gh.write_text(
+                '#!/usr/bin/env bash\nset -euo pipefail\n'
+                'if [ "$1 $2" = "issue create" ]; then\n'
+                '  while [ "$#" -gt 0 ]; do\n'
+                '    if [ "$1" = "--body-file" ]; then cat "$2" > "$CAPTURE_BODY"; fi\n'
+                '    shift\n'
+                '  done\n'
+                'fi\n'
+            )
+            gh.chmod(0o755)
+            body = self.directory / "issue-body.md"
+            self.env.update(PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}", CAPTURE_BODY=str(body))
+            result = self.run_step("File failure issue in rustfs/backlog")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("OLD RUN REPORT", body.read_text())
+            self.assertIn("https://github.com/rustfs/rustfs/actions/runs/314159", body.read_text())
 
 
 class FunctionalWorkflowTests(unittest.TestCase):
@@ -391,8 +458,8 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
         self.env["PATH"] = f"{fake_bin}{os.pathsep}{os.environ['PATH']}"
 
     def test_evidence_wiring_and_failed_initialization_cannot_publish_stale_files(self):
-        for suite in self.SUITES:
-            with self.subTest(suite=suite):
+        for suite, suffix in ((suite, suffix) for suite in self.SUITES for suffix in ("", "-scratch")):
+            with self.subTest(suite=suite, collision=suffix or "artifact"):
                 self.prepare(suite)
                 self.assertNotIn("/tmp/rustfs-", self.source)
                 names = list(self.steps)
@@ -403,12 +470,13 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                     if name in ("Generate report", "Upload functional report to dashboard") or any("uses: actions/upload-artifact@" in line for line in lines):
                         self.assertIn("        if: ${{ always() && steps.evidence.outcome == 'success' }}", lines)
                     if any("uses: actions/upload-artifact@" in line for line in lines):
-                        self.assertIn("          path: ${{ env.FUNCTIONAL_ARTIFACTS_DIR }}/", lines)
+                        self.assertIn("          path: |", lines)
                         self.assertIn("          if-no-files-found: error", lines)
-                self.artifacts.mkdir()
+                existing = Path(str(self.artifacts) + suffix)
+                existing.mkdir()
                 for filename in ("report.md", "suite.log"):
-                    (self.artifacts / filename).write_text("OLD RUN EVIDENCE")
-                self.env.update(REPORT_FILE=str(self.artifacts / "report.md"), LOG_FILE=str(self.artifacts / "suite.log"))
+                    (existing / filename).write_text("OLD RUN EVIDENCE")
+                self.env.update(REPORT_FILE=str(existing / "report.md"), LOG_FILE=str(existing / "suite.log"))
                 initialized = self.run_step("Initialize functional evidence")
                 self.assertNotEqual(initialized.returncode, 0)
                 self.assertFalse(Path(self.env["GITHUB_ENV"]).exists())
@@ -417,7 +485,7 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                 body = Path(self.env["CAPTURE_BODY"]).read_text()
                 self.assertNotIn("OLD RUN EVIDENCE", body)
                 self.assertIn("no report or log file was produced", body)
-                self.assertEqual((self.artifacts / "report.md").read_text(), "OLD RUN EVIDENCE")
+                self.assertEqual((existing / "report.md").read_text(), "OLD RUN EVIDENCE")
 
     def test_reports_use_only_current_complete_suite_evidence(self):
         for suite in self.SUITES[:-1]:
@@ -439,7 +507,7 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                     self.env.update(LOG_FILE=str(stale), REPORT_FILE=str(stale))
                     self.assertEqual(self.run_step("Initialize functional evidence").returncode, 0)
                     self.assertEqual(self.env["LOG_FILE"], str(self.artifacts / "suite.log"))
-                    self.assertEqual(self.env["TMPDIR"], str(self.artifacts))
+                    self.assertEqual(self.env["TMPDIR"], str(self.artifacts) + "-scratch")
                     if log is not None:
                         Path(self.env["LOG_FILE"]).write_text(log)
                     self.context["steps.test.outcome"] = outcome
@@ -463,6 +531,8 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
             with self.subTest(suite=suite):
                 self.prepare(suite)
                 self.assertEqual(self.run_step("Initialize functional evidence").returncode, 0)
+                if suite == "heal":
+                    self.assertEqual(self.env["RUSTFS_WARP_LOG_FILE"], str(self.artifacts / "warp.log"))
                 scripts = self.directory / "auto-testing"
                 scripts.mkdir()
                 filename = f"rustfs_{suite}_test.sh" if suite in ("heal", "performance") else f"rustfs-{suite}-test.sh"
@@ -489,9 +559,78 @@ class FunctionalEvidenceTests(WorkflowSteps, unittest.TestCase):
                 result = self.run_step(name)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual((self.artifacts / "suite.log").read_text(), "CURRENT SUITE LOG\n")
-                self.assertEqual(len(list(self.artifacts.glob("fixture.*/trace.log"))), 1)
+                self.assertEqual(len(list(Path(self.env["TMPDIR"]).glob("fixture.*/trace.log"))), 1)
+                self.assertEqual(list(self.artifacts.glob("fixture.*")), [])
                 if suite == "performance":
                     self.assertEqual((self.artifacts / "results/summary.md").read_text(), "CURRENT RESULTS\n")
+
+    def test_upload_allowlist_preserves_diagnostics_without_scratch(self):
+        extra = {
+            "kms": ["cases.md"], "storage": ["cases.md"], "s3-compat": ["cases.md"],
+            "upgrade": ["cases.md", "matrix.md"], "replication": ["cases.md"], "heal": ["steps.md", "warp.log"],
+            "performance": ["version.txt", "results/master.log", "results/summary.md", "results/summary.tsv",
+                            "results/get_1KiB.txt", "results/put_1MiB.txt", "results/mixed_4MiB.txt"],
+        }
+        for suite in self.SUITES:
+            with self.subTest(suite=suite):
+                self.prepare(suite)
+                self.assertEqual(self.run_step("Initialize functional evidence").returncode, 0)
+                expected = {self.artifacts / name for name in ["report.md", "suite.log", *extra[suite]]}
+                for path in expected:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("PARTIAL FAILURE DIAGNOSTIC")
+                for directory in (self.artifacts, Path(self.env["TMPDIR"]), self.artifacts / "results"):
+                    directory.mkdir(exist_ok=True)
+                    (directory / "init.json").write_text('{"root_token":"FAKE-SECRET-CANARY"}')
+                self.assertEqual(self.uploaded_files(), expected)
+                self.assertTrue(all("FAKE-SECRET-CANARY" not in path.read_text() for path in self.uploaded_files()))
+
+    def test_kms_failure_after_vault_init_keeps_only_failure_evidence(self):
+        self.prepare("kms")
+        self.assertEqual(self.run_step("Initialize functional evidence").returncode, 0)
+        scripts = self.directory / "auto-testing"
+        scripts.mkdir()
+        # Vault file writes and EXIT cleanup from auto-testing@06cd3c097350:23-24,57,479-487.
+        # The Docker boundary returns synthetic credentials; setup fails before vault_stop.
+        (scripts / "rustfs-kms-test.sh").write_text(r'''#!/bin/bash
+set -Eeuo pipefail
+TEST_TMP="$(mktemp -d "${TMPDIR:-/tmp}/rustfs-test.XXXXXX")"
+trap 'rm -rf "${TEST_TMP}"' EXIT
+VAULT_DATA_DIR="${RUSTFS_VAULT_DATA_DIR:-${TMPDIR:-/tmp}/rustfs-vault-data}"
+VAULT_CONTAINER="rustfs-vault"
+heal_run() { "$@"; }
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--log-file" ]; then LOG_FILE="$2"; shift; fi
+  shift
+done
+mkdir -p "${VAULT_DATA_DIR}"
+tmp_init="${TEST_TMP}/vault-init.json"
+tmp_err="${TEST_TMP}/vault-init.stderr"
+heal_run docker exec -e "VAULT_ADDR=http://127.0.0.1:8200" "${VAULT_CONTAINER}" \
+  vault operator init -key-shares=1 -key-threshold=1 -format=json \
+  > "${tmp_init}" 2>"${tmp_err}"
+cat "${tmp_init}" | heal_run tee "${VAULT_DATA_DIR}/init.json" >/dev/null
+printf '%s\n' 'vault initialized; root token acquired' 'fixture setup failed after init' > "${LOG_FILE}"
+exit 42
+''')
+        docker = self.directory / "bin/docker"
+        docker.write_text("""#!/bin/sh
+[ "$1" = exec ] || exit 99
+printf '%s\\n' '{"root_token":"FAKE-ROOT-CANARY","unseal_keys_b64":["FAKE-UNSEAL-CANARY"]}'
+""")
+        docker.chmod(0o755)
+        result = self.run_step("Run KMS suite")
+        self.assertEqual(result.returncode, 42, result.stderr)
+        vault_init = Path(self.env["TMPDIR"]) / "rustfs-vault-data/init.json"
+        self.assertEqual(json.loads(vault_init.read_text()), {"root_token": "FAKE-ROOT-CANARY", "unseal_keys_b64": ["FAKE-UNSEAL-CANARY"]})
+        self.assertNotIn(self.artifacts, vault_init.parents)
+        self.assertEqual(list(Path(self.env["TMPDIR"]).glob("rustfs-test.*")), [])
+        self.assertNotEqual(self.run_step("Generate report").returncode, 0)
+        self.assertEqual(self.uploaded_files(), {self.artifacts / name for name in ("suite.log", "cases.md", "report.md")})
+        self.assertIn("fixture setup failed after init", (self.artifacts / "suite.log").read_text())
+        for path in self.uploaded_files():
+            self.assertNotIn("FAKE-ROOT-CANARY", path.read_text())
+            self.assertNotIn("FAKE-UNSEAL-CANARY", path.read_text())
 
     def test_heal_accumulates_actual_staged_steps_without_overwriting_failures(self):
         self.prepare("heal")
