@@ -603,6 +603,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_listing_rejects_empty_prefix_entries() {
+        for body in [
+            r#"{"items":[{"name":"valid","size":"1"}],"prefixes":[""],"nextPageToken":"next"}"#,
+            r#"{"prefixes":[""],"nextPageToken":"next"}"#,
+            r#"{"prefixes":["目录/子/",""],"nextPageToken":"next"}"#,
+        ] {
+            let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(200, Vec::new(), body.to_string())]).await;
+            let result = backend(&endpoint)
+                .list(&SourceListRequest {
+                    delimiter: Some("/"),
+                    continuation_token: Some("opaque+/="),
+                    max_keys: 2,
+                    ..Default::default()
+                })
+                .await;
+            let err = result.expect_err("an empty prefix must reject the entire page and its cursor");
+            assert!(matches!(err, SourceError::Other(_)), "{body}: {err:?}");
+            assert!(!err.is_retryable());
+            assert_requests(
+                &recorded,
+                &[("GET", "/storage/v1/b/legacy/o?delimiter=%2F&pageToken=opaque%2B%2F%3D&maxResults=2")],
+            );
+        }
+
+        let body = r#"{"prefixes":["目录/子/"],"nextPageToken":"opaque+/="}"#;
+        let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(200, Vec::new(), body.to_string())]).await;
+        let page = backend(&endpoint)
+            .list(&SourceListRequest {
+                delimiter: Some("/"),
+                max_keys: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("a valid prefix-only page must remain usable");
+        assert!(page.objects.is_empty());
+        assert_eq!(page.common_prefixes, ["目录/子/"]);
+        assert!(page.is_truncated);
+        assert_eq!(page.next_continuation_token.as_deref(), Some("opaque+/="));
+        assert_requests(&recorded, &[("GET", "/storage/v1/b/legacy/o?delimiter=%2F&maxResults=1")]);
+    }
+
+    #[tokio::test]
     async fn native_listing_preserves_zero_size_unicode_prefixes_and_opaque_cursors() {
         let body = r#"{"items":[{"name":"目录/空 & file","size":"0"}],"prefixes":["目录/子/"],"nextPageToken":"opaque+/="}"#;
         let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(200, Vec::new(), body.to_string())]).await;

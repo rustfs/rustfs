@@ -723,6 +723,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_listing_rejects_duplicate_fields_and_nested_entries() {
+        for entry in [
+            "<Blob><Name>a</Name><Name>b</Name><Properties><Content-Length>1</Content-Length></Properties></Blob>",
+            "<Blob><Name /><Name>b</Name><Properties><Content-Length>1</Content-Length></Properties></Blob>",
+            "<Blob><Name>a</Name><Properties><Content-Length>1</Content-Length><Content-Length>2</Content-Length></Properties></Blob>",
+            "<BlobPrefix><Name>a/</Name><Name>b/</Name></BlobPrefix>",
+            "<BlobPrefix><Name /><Name>b/</Name></BlobPrefix>",
+            "<Blob><Name>a</Name><Properties><Content-Length>1</Content-Length></Properties><Blob><Name>b</Name><Properties><Content-Length>2</Content-Length></Properties></Blob></Blob>",
+            "<Blob><Name>a</Name><Properties><Content-Length>1</Content-Length></Properties><BlobPrefix><Name>b/</Name></BlobPrefix></Blob>",
+            "<BlobPrefix><Name>a/</Name><Blob><Name>b</Name><Properties><Content-Length>2</Content-Length></Properties></Blob></BlobPrefix>",
+            "<BlobPrefix><Name>a/</Name><BlobPrefix><Name>b/</Name></BlobPrefix></BlobPrefix>",
+        ] {
+            let body = format!(
+                "<EnumerationResults><Blobs><Blob><Name>valid</Name><Properties><Content-Length>0</Content-Length></Properties></Blob>{entry}</Blobs><NextMarker>next</NextMarker></EnumerationResults>"
+            );
+            let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(200, Vec::new(), body)]).await;
+            let result = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]))
+                .list(&SourceListRequest {
+                    delimiter: Some("/"),
+                    continuation_token: Some("opaque+/="),
+                    max_keys: 2,
+                    ..Default::default()
+                })
+                .await;
+            let err = result.expect_err("ambiguous entries must reject the entire page and its cursor");
+            assert!(matches!(err, SourceError::Other(_)), "{entry}: {err:?}");
+            assert!(!err.is_retryable(), "{entry}: {err:?}");
+            assert_requests(
+                &recorded,
+                &[(
+                    "GET",
+                    "/legacy?restype=container&comp=list&delimiter=%2F&marker=opaque%2B%2F%3D&maxresults=2",
+                )],
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn native_listing_preserves_zero_size_unicode_prefixes_and_opaque_cursors() {
         let body = "<EnumerationResults><Blobs><Blob><Name>目录/空 &amp; file</Name><Properties><Content-Length>0</Content-Length></Properties></Blob><BlobPrefix><Name>目录/子/</Name></BlobPrefix></Blobs><NextMarker>opaque+/=</NextMarker></EnumerationResults>";
         let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(200, Vec::new(), body.to_string())]).await;
@@ -1136,6 +1174,62 @@ mod tests {
                     requests.push(("HEAD", "/legacy?restype=container"));
                 }
                 assert_requests(&recorded, &requests);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_not_found_alias_never_proves_native_object_absence() {
+        for selector in [None, Some("versionid"), Some("snapshot")] {
+            for operation in ["head", "get", "list", "tags", "probe"] {
+                if selector.is_some() && !matches!(operation, "head" | "get") {
+                    continue;
+                }
+                for (status, expected, retryable) in [
+                    (403, "access_denied", false),
+                    (404, "other", false),
+                    (416, "other", false),
+                    (500, "server_error", true),
+                ] {
+                    let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(
+                        status,
+                        vec![(HEADER_ERROR_CODE, "NoSuchKey".to_string())],
+                        "untrusted-error-body".to_string(),
+                    )])
+                    .await;
+                    let credential = selector.map_or_else(
+                        || Credential::SharedKey(vec![7_u8; 32]),
+                        |selector| Credential::Sas(vec![(selector.to_string(), "old-version".to_string())]),
+                    );
+                    let backend = backend(&endpoint, credential);
+                    let result = match operation {
+                        "head" => backend.head("missing").await.map(|_| ()),
+                        "get" => backend.get("missing", None).await.map(|_| ()),
+                        "list" => backend.list(&SourceListRequest::default()).await.map(|_| ()),
+                        "tags" => backend.tagging("missing").await.map(|_| ()),
+                        "probe" => backend.probe().await,
+                        _ => unreachable!(),
+                    };
+                    let err = result.expect_err("an S3 error alias is not Azure absence evidence");
+                    assert_eq!(err.class_label(), expected, "{operation} {selector:?} HTTP {status}: {err:?}");
+                    assert_eq!(err.is_retryable(), retryable, "{operation} {selector:?} HTTP {status}: {err:?}");
+                    if status == 500 {
+                        assert!(matches!(err, SourceError::ServerError(500)));
+                    }
+                    assert!(!err.to_string().contains("untrusted-error-body"));
+                    let (method, mut target) = match operation {
+                        "head" => ("HEAD", "/legacy/missing".to_string()),
+                        "get" => ("GET", "/legacy/missing".to_string()),
+                        "list" => ("GET", "/legacy?restype=container&comp=list".to_string()),
+                        "tags" => ("GET", "/legacy/missing?comp=tags".to_string()),
+                        "probe" => ("HEAD", "/legacy?restype=container".to_string()),
+                        _ => unreachable!(),
+                    };
+                    if let Some(selector) = selector {
+                        target.push_str(&format!("?{selector}=old-version"));
+                    }
+                    assert_requests(&recorded, &[(method, target.as_str())]);
+                }
             }
         }
     }
