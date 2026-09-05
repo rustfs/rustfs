@@ -242,6 +242,50 @@ pub(crate) mod fsync_dir_recorder {
     }
 }
 
+/// Pause a real namespace mutation inside its physical executor.
+#[cfg(all(test, not(windows)))]
+pub(crate) mod prepared_publication_test_hooks {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub(crate) enum Stage {
+        PreparedRename,
+        Rename,
+        Remove,
+        Rollback,
+        DirFsync,
+    }
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    type Key = (Stage, PathBuf);
+    static BEFORE_PUBLICATION: LazyLock<Mutex<HashMap<Key, Hook>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(crate) struct Guard(Key);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            BEFORE_PUBLICATION.lock().remove(&self.0);
+        }
+    }
+
+    pub(crate) fn install(path: &Path, hook: impl FnOnce() + Send + 'static) -> Guard {
+        install_at(Stage::PreparedRename, path, hook)
+    }
+
+    pub(crate) fn install_at(stage: Stage, path: &Path, hook: impl FnOnce() + Send + 'static) -> Guard {
+        let key = (stage, path.to_path_buf());
+        assert!(BEFORE_PUBLICATION.lock().insert(key.clone(), Box::new(hook)).is_none());
+        Guard(key)
+    }
+
+    pub(crate) fn run(stage: Stage, path: &Path) {
+        let hook = BEFORE_PUBLICATION.lock().remove(&(stage, path.to_path_buf()));
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 #[cfg(all(test, windows))]
 pub(crate) mod windows_rename_test_hooks {
     use super::*;
@@ -576,6 +620,7 @@ impl OpenedDstDirFsyncGroup {
 }
 
 struct DstDirFsyncWaiter {
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
     result_tx: oneshot::Sender<SharedDstDirFsyncResult>,
 }
 
@@ -634,6 +679,7 @@ impl DstDirFsyncGroupCommit {
     fn enqueue_opened(
         &self,
         opened: OpenedDstDirFsyncGroup,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> io::Result<(oneshot::Receiver<SharedDstDirFsyncResult>, Option<Arc<DstDirFsyncGroup>>)> {
         let (result_tx, result_rx) = oneshot::channel();
         let mut registry = self.inner.lock();
@@ -664,7 +710,10 @@ impl DstDirFsyncGroupCommit {
             group
         };
         let mut group_state = group.inner.lock();
-        group_state.pending.push_back(DstDirFsyncWaiter { result_tx });
+        group_state.pending.push_back(DstDirFsyncWaiter {
+            result_tx,
+            namespace_owner,
+        });
         let start_worker = !group_state.worker_running;
         if start_worker {
             group_state.worker_running = true;
@@ -709,16 +758,20 @@ impl DstDirFsyncGroupCommit {
         &self,
         dir: &Path,
     ) -> io::Result<(oneshot::Receiver<SharedDstDirFsyncResult>, Option<Arc<DstDirFsyncGroup>>)> {
-        self.enqueue_opened(OpenedDstDirFsyncGroup::open(dir)?)
+        self.enqueue_opened(OpenedDstDirFsyncGroup::open(dir)?, None)
     }
 }
 
 #[cfg(unix)]
-async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup) -> io::Result<()> {
+async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup, namespace_owners: Vec<Arc<dyn Send + Sync>>) -> io::Result<()> {
     #[cfg(test)]
     let dir = group.dir.clone();
     let dir_file = group.dir_file.clone();
     fsync_spawn_blocking(move || {
+        // The batch worker may be cancelled while this syscall is still running.
+        let _namespace_owners = namespace_owners;
+        #[cfg(all(test, not(windows)))]
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::DirFsync, &dir);
         #[cfg(test)]
         {
             if let Some(kind) = fsync_dir_recorder::take_grouped_failure(&dir) {
@@ -733,66 +786,117 @@ async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup) -> io::Result<()> {
+async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup, namespace_owners: Vec<Arc<dyn Send + Sync>>) -> io::Result<()> {
+    let _namespace_owners = namespace_owners;
     fsync_dir(&group.dir).await
 }
 
-async fn run_dst_dir_fsync_group_worker(group: Arc<DstDirFsyncGroup>) {
-    loop {
-        #[cfg(test)]
-        fsync_dir_recorder::run_before_group_batch(&group.dir);
-        tokio::task::yield_now().await;
-        let batch: Vec<DstDirFsyncWaiter> = {
-            let mut group_state = group.inner.lock();
-            group_state.pending.drain(..).collect()
-        };
-        if batch.is_empty() {
-            let mut group_state = group.inner.lock();
+struct DstDirFsyncWorkerGuard {
+    group: Arc<DstDirFsyncGroup>,
+    in_flight: usize,
+    armed: bool,
+}
+
+impl Drop for DstDirFsyncWorkerGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Cancellation must release queued owners, but the physical batch keeps
+        // its own owners until its blocking syscall returns.
+        let pending = {
+            let mut registry = DST_DIR_FSYNC_GROUP_COMMIT.inner.lock();
+            let mut group_state = self.group.inner.lock();
+            let pending = std::mem::take(&mut group_state.pending);
             group_state.worker_running = false;
-            drop(group_state);
-            DST_DIR_FSYNC_GROUP_COMMIT.remove_idle_group(&group);
-            return;
-        }
-
-        #[cfg(test)]
-        fsync_dir_recorder::record_grouped(&group.dir, batch.len());
-        let result = fsync_open_dst_dir_group(&group)
-            .await
-            .map_err(SharedDstDirFsyncError::from_error);
-        let batch_len = batch.len();
-        DST_DIR_FSYNC_GROUP_COMMIT.complete_batch(batch_len);
-
-        let should_stop = {
-            let mut group_state = group.inner.lock();
-            if group_state.pending.is_empty() {
-                group_state.worker_running = false;
-                true
-            } else {
-                false
+            if registry
+                .groups
+                .get(&self.group.key)
+                .is_some_and(|group| Arc::ptr_eq(group, &self.group))
+            {
+                registry.total_waiters = registry.total_waiters.saturating_sub(pending.len() + self.in_flight);
+                registry.groups.remove(&self.group.key);
             }
+            pending
         };
-        if should_stop {
-            DST_DIR_FSYNC_GROUP_COMMIT.remove_idle_group(&group);
-        }
-        for waiter in batch {
-            let _ = waiter.result_tx.send(result.clone());
-        }
-        if should_stop {
-            return;
+        // Lease and channel destructors must run outside the registry locks.
+        drop(pending);
+    }
+}
+
+fn run_dst_dir_fsync_group_worker(group: Arc<DstDirFsyncGroup>) -> impl std::future::Future<Output = ()> {
+    // Capture before spawning: shutdown may drop the future without polling it.
+    let mut worker_guard = DstDirFsyncWorkerGuard {
+        group: group.clone(),
+        in_flight: 0,
+        armed: true,
+    };
+    async move {
+        loop {
+            #[cfg(test)]
+            fsync_dir_recorder::run_before_group_batch(&group.dir);
+            tokio::task::yield_now().await;
+            let mut batch: Vec<DstDirFsyncWaiter> = {
+                let mut group_state = group.inner.lock();
+                group_state.pending.drain(..).collect()
+            };
+            if batch.is_empty() {
+                let mut group_state = group.inner.lock();
+                worker_guard.armed = false;
+                group_state.worker_running = false;
+                drop(group_state);
+                DST_DIR_FSYNC_GROUP_COMMIT.remove_idle_group(&group);
+                return;
+            }
+            worker_guard.in_flight = batch.len();
+
+            #[cfg(test)]
+            fsync_dir_recorder::record_grouped(&group.dir, batch.len());
+            let namespace_owners = batch.iter_mut().filter_map(|waiter| waiter.namespace_owner.take()).collect();
+            let result = fsync_open_dst_dir_group(&group, namespace_owners)
+                .await
+                .map_err(SharedDstDirFsyncError::from_error);
+            let batch_len = batch.len();
+            DST_DIR_FSYNC_GROUP_COMMIT.complete_batch(batch_len);
+            worker_guard.in_flight = 0;
+
+            let should_stop = {
+                let mut group_state = group.inner.lock();
+                if group_state.pending.is_empty() {
+                    worker_guard.armed = false;
+                    group_state.worker_running = false;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_stop {
+                DST_DIR_FSYNC_GROUP_COMMIT.remove_idle_group(&group);
+            }
+            for waiter in batch {
+                let _ = waiter.result_tx.send(result.clone());
+            }
+            if should_stop {
+                return;
+            }
         }
     }
 }
 
-async fn fsync_dst_dir_group_commit_with_enabled(dir: impl AsRef<Path>, enabled: bool) -> io::Result<()> {
+async fn fsync_dst_dir_group_commit_with_enabled(
+    dir: impl AsRef<Path>,
+    enabled: bool,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> io::Result<()> {
     if !enabled {
-        return fsync_dir(dir).await;
+        return fsync_dir_with_owner(dir.as_ref(), namespace_owner).await;
     }
 
     let dir = dir.as_ref().to_path_buf();
     let opened = tokio::task::spawn_blocking(move || OpenedDstDirFsyncGroup::open(&dir))
         .await
         .map_err(|err| io::Error::other(format!("blocking dst dir group open failed: {err}")))??;
-    let (result_rx, worker) = DST_DIR_FSYNC_GROUP_COMMIT.enqueue_opened(opened)?;
+    let (result_rx, worker) = DST_DIR_FSYNC_GROUP_COMMIT.enqueue_opened(opened, namespace_owner)?;
     if let Some(group) = worker {
         tokio::spawn(run_dst_dir_fsync_group_worker(group));
     }
@@ -804,8 +908,11 @@ async fn fsync_dst_dir_group_commit_with_enabled(dir: impl AsRef<Path>, enabled:
     }
 }
 
-pub(crate) async fn fsync_dst_dir_group_commit(dir: impl AsRef<Path>) -> io::Result<()> {
-    fsync_dst_dir_group_commit_with_enabled(dir, dst_dir_fsync_group_commit_enabled()).await
+pub(crate) async fn fsync_dst_dir_group_commit(
+    dir: impl AsRef<Path>,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> io::Result<()> {
+    fsync_dst_dir_group_commit_with_enabled(dir, dst_dir_fsync_group_commit_enabled(), namespace_owner).await
 }
 
 pub(crate) async fn fsync_dst_dir_group_commit_or_namespace_file_sync_limit(
@@ -814,7 +921,7 @@ pub(crate) async fn fsync_dst_dir_group_commit_or_namespace_file_sync_limit(
     admission: &FileSyncAdmission,
 ) -> io::Result<()> {
     if dst_dir_fsync_group_commit_enabled() {
-        fsync_dst_dir_group_commit_with_enabled(dir, true).await
+        fsync_dst_dir_group_commit_with_enabled(dir, true, Some(lease)).await
     } else {
         fsync_dir_with_namespace_file_sync_limit(dir, lease, admission).await
     }
@@ -822,7 +929,7 @@ pub(crate) async fn fsync_dst_dir_group_commit_or_namespace_file_sync_limit(
 
 #[cfg(test)]
 pub(crate) async fn fsync_dst_dir_group_commit_for_test(dir: impl AsRef<Path>, enabled: bool) -> io::Result<()> {
-    fsync_dst_dir_group_commit_with_enabled(dir, enabled).await
+    fsync_dst_dir_group_commit_with_enabled(dir, enabled, None).await
 }
 
 #[cfg(test)]
@@ -1229,6 +1336,8 @@ pub(crate) struct NamespaceMutationLease {
     _namespace_guard: OwnedMutexGuard<()>,
     _volume_guard: Option<OwnedRwLockReadGuard<()>>,
     external_guard: Mutex<Option<Arc<dyn Send + Sync>>>,
+    // Independent of the quota claim; both survive cancellation of the waiter.
+    _namespace_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 impl NamespaceMutationLease {
@@ -1238,10 +1347,18 @@ impl NamespaceMutationLease {
 }
 
 async fn acquire_namespace_mutation_lease(path: &Path) -> Arc<NamespaceMutationLease> {
+    acquire_namespace_mutation_lease_with_owner(path, None).await
+}
+
+async fn acquire_namespace_mutation_lease_with_owner(
+    path: &Path,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> Arc<NamespaceMutationLease> {
     Arc::new(NamespaceMutationLease {
         _namespace_guard: disk_namespace_mutation_lock(path).lock_owned().await,
         _volume_guard: None,
         external_guard: Mutex::new(None),
+        _namespace_owner: namespace_owner,
     })
 }
 
@@ -1252,12 +1369,22 @@ pub(crate) async fn acquire_rename_data_mutation_lease(
     volume: &str,
     destination_object: &Path,
 ) -> Arc<NamespaceMutationLease> {
+    acquire_rename_data_mutation_lease_with_owner(root, volume, destination_object, None).await
+}
+
+pub(crate) async fn acquire_rename_data_mutation_lease_with_owner(
+    root: &Path,
+    volume: &str,
+    destination_object: &Path,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> Arc<NamespaceMutationLease> {
     let namespace_guard = disk_namespace_mutation_lock(destination_object).lock_owned().await;
     let volume_guard = disk_volume_mutation_lock(root, volume).read_owned().await;
     Arc::new(NamespaceMutationLease {
         _namespace_guard: namespace_guard,
         _volume_guard: Some(volume_guard),
         external_guard: Mutex::new(None),
+        _namespace_owner: namespace_owner,
     })
 }
 
@@ -1747,6 +1874,69 @@ pub async fn rename_all(
     Ok(())
 }
 
+pub(crate) async fn fsync_dir_with_owner(path: &Path, namespace_owner: Option<Arc<dyn Send + Sync>>) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if namespace_owner.is_none() {
+            return fsync_dir(path).await;
+        }
+        let path = path.to_path_buf();
+        fsync_spawn_blocking(move || {
+            let _namespace_owner = namespace_owner;
+            fsync_dir_std(path)
+        })
+        .await?
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = namespace_owner;
+        fsync_dir(path).await
+    }
+}
+
+/// Retain namespace ownership in the actual filesystem executor after timeout.
+pub(crate) async fn remove_file_with_owner(
+    path: impl AsRef<Path>,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> io::Result<()> {
+    if namespace_owner.is_none() {
+        return tokio::fs::remove_file(path).await;
+    }
+    let path = path.as_ref().to_path_buf();
+    let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
+    run_blocking_namespace_operation(lease, move || {
+        #[cfg(all(test, not(windows)))]
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Remove, &path);
+        std::fs::remove_file(path)
+    })
+    .await
+}
+
+/// Retain namespace ownership in the actual filesystem executor after timeout.
+pub(crate) async fn remove_dir_with_owner(
+    path: impl AsRef<Path>,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> io::Result<()> {
+    if namespace_owner.is_none() {
+        return tokio::fs::remove_dir(path).await;
+    }
+    let path = path.as_ref().to_path_buf();
+    let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
+    run_blocking_namespace_operation(lease, move || std::fs::remove_dir(path)).await
+}
+
+#[tracing::instrument(name = "rename_all", level = "debug", skip_all)]
+pub(crate) async fn rename_all_with_owner(
+    src_file_path: impl AsRef<Path>,
+    dst_file_path: impl AsRef<Path>,
+    base_dir: impl AsRef<Path>,
+    publication_root: &PublicationRoot,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> Result<()> {
+    let lease = acquire_namespace_mutation_lease_with_owner(dst_file_path.as_ref(), namespace_owner).await;
+    rename_all_with_lease(src_file_path, dst_file_path, base_dir, publication_root, lease).await
+}
+
 pub(crate) async fn rename_all_with_lease(
     src_file_path: impl AsRef<Path>,
     dst_file_path: impl AsRef<Path>,
@@ -1939,6 +2129,8 @@ pub(crate) async fn rename_all_with_prepared_source(
         move || {
             validate_prepared_rename_source(&prepared_source, &src_file_path)?;
             let preparation = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
+            #[cfg(test)]
+            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::PreparedRename, &dst_file_path);
             rename_prepared(&src_file_path, &dst_file_path, &preparation)
         }
     };
@@ -1971,6 +2163,32 @@ pub async fn rename_all_ignore_missing_source(
 ) -> Result<()> {
     let src_file_path = src_file_path.as_ref();
     match reliable_rename_inner(src_file_path, dst_file_path.as_ref(), base_dir, publication_root, false).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound && rename_source_is_missing(src_file_path, publication_root) => Ok(()),
+        Err(err) => Err(to_file_error(err).into()),
+    }
+}
+
+#[tracing::instrument(name = "rename_all_ignore_missing_source", level = "debug", skip_all)]
+pub(crate) async fn rename_all_ignore_missing_source_with_owner(
+    src_file_path: impl AsRef<Path>,
+    dst_file_path: impl AsRef<Path>,
+    base_dir: impl AsRef<Path>,
+    publication_root: &PublicationRoot,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> Result<()> {
+    let src_file_path = src_file_path.as_ref();
+    let lease = acquire_namespace_mutation_lease_with_owner(dst_file_path.as_ref(), namespace_owner).await;
+    match reliable_rename_inner_with_lease(
+        src_file_path.to_path_buf(),
+        dst_file_path.as_ref().to_path_buf(),
+        base_dir.as_ref().to_path_buf(),
+        publication_root.clone(),
+        false,
+        lease,
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound && rename_source_is_missing(src_file_path, publication_root) => Ok(()),
         Err(err) => Err(to_file_error(err).into()),
@@ -2042,6 +2260,11 @@ async fn reliable_rename_inner_with_lease(
         let base_dir = base_dir.clone();
         move || {
             let preparation = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
+            #[cfg(all(test, not(windows)))]
+            {
+                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &src_file_path);
+                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &dst_file_path);
+            }
             rename_prepared(&src_file_path, &dst_file_path, &preparation)
         }
     };
@@ -6134,6 +6357,126 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::Other);
         wait_for_dst_dir_fsync_group_commit_idle().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit)]
+    async fn grouped_fsync_physical_batch_keeps_all_owners_after_worker_cancellation() {
+        let temp_dir = tempdir().expect("fixture directory");
+        let dir = temp_dir.path().canonicalize().expect("canonical fsync path");
+        let first_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let second_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let first_owner = first_ctx.begin_namespace_commit();
+        let second_owner = second_ctx.begin_namespace_commit();
+        let first_probe = Arc::downgrade(&first_owner);
+        let second_probe = Arc::downgrade(&second_owner);
+        let (first_rx, group) = DST_DIR_FSYNC_GROUP_COMMIT
+            .enqueue_opened(
+                OpenedDstDirFsyncGroup::open(&dir).expect("open first waiter directory"),
+                Some(first_owner),
+            )
+            .expect("queue first real waiter");
+        let group = group.expect("first waiter starts the group");
+        let (second_rx, second_worker) = DST_DIR_FSYNC_GROUP_COMMIT
+            .enqueue_opened(
+                OpenedDstDirFsyncGroup::open(&dir).expect("open second waiter directory"),
+                Some(second_owner),
+            )
+            .expect("queue second real waiter");
+        assert!(second_worker.is_none(), "same directory must join the same batch");
+        assert_eq!(group.inner.lock().pending.len(), 2);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook =
+            prepared_publication_test_hooks::install_at(prepared_publication_test_hooks::Stage::DirFsync, &dir, move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            });
+        let worker = tokio::spawn(run_dst_dir_fsync_group_worker(group.clone()));
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("batch must reach its physical fsync")
+            .expect("physical fsync entry");
+        assert_eq!(fsync_dir_recorder::grouped_batch_sizes(&dir), vec![2]);
+        assert!(
+            group.inner.lock().pending.is_empty(),
+            "both waiters were transferred into the physical batch"
+        );
+        let queued_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let queued_owner = queued_ctx.begin_namespace_commit();
+        let queued_probe = Arc::downgrade(&queued_owner);
+        let queued_generation = queued_ctx.namespace_commit_generation();
+        let (queued_rx, queued_worker) = DST_DIR_FSYNC_GROUP_COMMIT
+            .enqueue_opened(
+                OpenedDstDirFsyncGroup::open(&dir).expect("open queued waiter directory"),
+                Some(queued_owner),
+            )
+            .expect("queue a waiter after the physical batch was frozen");
+        assert!(queued_worker.is_none());
+        assert_eq!(group.inner.lock().pending.len(), 1);
+        drop((first_rx, second_rx));
+        worker.abort();
+        assert!(worker.await.expect_err("cancel the async batch owner").is_cancelled());
+        assert!(queued_rx.await.is_err(), "an undispatched waiter must observe worker cancellation");
+        assert!(queued_probe.upgrade().is_none());
+        assert!(!queued_ctx.namespace_commits_pending());
+        assert!(queued_ctx.namespace_commit_generation() > queued_generation);
+        assert!(group.inner.lock().pending.is_empty());
+        assert!(!group.inner.lock().worker_running);
+        assert_eq!(DST_DIR_FSYNC_GROUP_COMMIT.counts_for_test(), (0, 0));
+        let first_pending = first_ctx.namespace_commits_pending() && first_probe.upgrade().is_some();
+        let second_pending = second_ctx.namespace_commits_pending() && second_probe.upgrade().is_some();
+        let generations = (first_ctx.namespace_commit_generation(), second_ctx.namespace_commit_generation());
+        drop(release_tx);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&group.dir_file) != 1 || first_probe.upgrade().is_some() || second_probe.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("physical fsync must release every batch owner");
+        assert!(fsync_dir_recorder::was_fsynced(&dir), "the detached syscall must really execute");
+        assert!(
+            first_pending && second_pending,
+            "one physical batch must preserve both independent namespace owners"
+        );
+        assert!(!first_ctx.namespace_commits_pending());
+        assert!(!second_ctx.namespace_commits_pending());
+        assert!(first_ctx.namespace_commit_generation() > generations.0);
+        assert!(second_ctx.namespace_commit_generation() > generations.1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit)]
+    async fn grouped_fsync_unpolled_worker_releases_queued_owner() {
+        let temp_dir = tempdir().expect("fixture directory");
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let owner = ctx.begin_namespace_commit();
+        let probe = Arc::downgrade(&owner);
+        let generation = ctx.namespace_commit_generation();
+        let (rx, group) = DST_DIR_FSYNC_GROUP_COMMIT
+            .enqueue_opened(
+                OpenedDstDirFsyncGroup::open(temp_dir.path()).expect("open queued waiter directory"),
+                Some(owner),
+            )
+            .expect("queue a real waiter");
+        let group = group.expect("first waiter starts the group");
+        let worker = run_dst_dir_fsync_group_worker(group.clone());
+        assert!(ctx.namespace_commits_pending());
+        drop(worker);
+        assert!(rx.await.is_err(), "shutdown before first poll must release the waiter");
+        assert!(probe.upgrade().is_none());
+        assert!(!ctx.namespace_commits_pending());
+        assert!(ctx.namespace_commit_generation() > generation);
+        assert!(group.inner.lock().pending.is_empty());
+        assert!(!group.inner.lock().worker_running);
+        assert_eq!(DST_DIR_FSYNC_GROUP_COMMIT.counts_for_test(), (0, 0));
+        assert!(
+            fsync_dir_recorder::grouped_batch_sizes(temp_dir.path()).is_empty(),
+            "the dropped future must not dispatch a physical batch"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

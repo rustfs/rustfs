@@ -75,6 +75,14 @@ use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
+/// Independent admission and physical ownership for one disk rename.
+#[derive(Default)]
+pub(crate) struct RenameDataGuards {
+    pub(crate) scanner_publication_lease_token: Option<Uuid>,
+    pub(crate) external_guard: Option<Arc<dyn Send + Sync>>,
+    pub(crate) namespace_owner: Option<Arc<dyn Send + Sync>>,
+}
+
 /// Local preflight evidence stays outside DiskAPI and the RPC response format.
 pub(crate) struct RenameDataObservation {
     pub(crate) result: Result<RenameDataResp>,
@@ -718,6 +726,25 @@ impl Disk {
         }
     }
 
+    /// Keep local undo publication owned independently of the wrapper deadline.
+    /// Remote undo retains its existing RPC contract; this is not a remote drain proof.
+    pub(crate) async fn undo_write_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        match self {
+            Self::Local(disk) => {
+                disk.undo_write_with_namespace_owner(volume, path, fi, opts, namespace_owner)
+                    .await
+            }
+            Self::Remote(disk) => disk.delete_version(volume, path, fi, false, opts).await,
+        }
+    }
+
     pub(crate) async fn rename_data_borrowed(
         &self,
         src_volume: &str,
@@ -737,12 +764,12 @@ impl Disk {
         fi: &FileInfo,
         dst_volume: &str,
         dst_path: &str,
-        scanner_publication_lease_token: Option<Uuid>,
+        guards: RenameDataGuards,
     ) -> RenameDataObservation {
         match self {
             Disk::Local(local_disk) => {
                 local_disk
-                    .rename_data_observed(src_volume, src_path, fi, dst_volume, dst_path, None)
+                    .rename_data_observed_with_guards(src_volume, src_path, fi, dst_volume, dst_path, guards)
                     .await
             }
             Disk::Remote(remote_disk) => RenameDataObservation::unknown(
@@ -753,7 +780,7 @@ impl Disk {
                         fi,
                         dst_volume,
                         dst_path,
-                        scanner_publication_lease_token,
+                        guards.scanner_publication_lease_token,
                     )
                     .await,
             ),

@@ -324,6 +324,30 @@ impl DiskStoreRenameDataExt for LocalDiskWrapper {
 }
 
 impl LocalDiskWrapper {
+    pub(in crate::disk) async fn undo_write_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        self.track_disk_health_mutation(
+            "delete_version",
+            DiskMetricMutation::Delete,
+            || async {
+                // Preserve the old DiskAPI future's boxing boundary.
+                Box::pin(
+                    self.disk
+                        .undo_write_with_namespace_owner(volume, path, fi, opts, namespace_owner),
+                )
+                .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     pub(in crate::disk) async fn rename_data_observed(
         &self,
         src_volume: &str,
@@ -333,6 +357,34 @@ impl LocalDiskWrapper {
         dst_path: &str,
         external_guard: Option<Arc<dyn Send + Sync>>,
     ) -> super::RenameDataObservation {
+        self.rename_data_observed_with_guards(
+            src_volume,
+            src_path,
+            fi,
+            dst_volume,
+            dst_path,
+            super::RenameDataGuards {
+                external_guard,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub(in crate::disk) async fn rename_data_observed_with_guards(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        guards: super::RenameDataGuards,
+    ) -> super::RenameDataObservation {
+        let super::RenameDataGuards {
+            external_guard,
+            namespace_owner,
+            ..
+        } = guards;
         let operation = self.clone();
         let src_volume = src_volume.to_owned();
         let src_path = src_path.to_owned();
@@ -357,13 +409,15 @@ impl LocalDiskWrapper {
                     DiskMetricMutation::Write,
                     || async {
                         // Preserve the former DiskAPI future's single boxing boundary.
-                        let observed =
-                            Box::pin(
-                                operation
-                                    .disk
-                                    .rename_data_observed(&src_volume, &src_path, &fi, &dst_volume, &dst_path),
-                            )
-                            .await;
+                        let observed = Box::pin(operation.disk.rename_data_observed(
+                            &src_volume,
+                            &src_path,
+                            &fi,
+                            &dst_volume,
+                            &dst_path,
+                            namespace_owner,
+                        ))
+                        .await;
                         preflight_rejection = observed.preflight_rejection;
                         observed.result
                     },
