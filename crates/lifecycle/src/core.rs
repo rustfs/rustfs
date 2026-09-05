@@ -69,9 +69,6 @@ const ERR_LIFECYCLE_FILTER_DUPLICATE_TAG_KEY: &str = "Filter must not repeat a t
 const ERR_LIFECYCLE_FILTER_INVALID_TAG: &str = "Tag key must be 1-128 characters and tag value must be at most 256 characters";
 const ERR_LIFECYCLE_FILTER_NEGATIVE_SIZE: &str = "ObjectSizeGreaterThan and ObjectSizeLessThan must not be negative";
 const ERR_LIFECYCLE_FILTER_SIZE_RANGE: &str = "ObjectSizeGreaterThan must be smaller than ObjectSizeLessThan";
-const ERR_LIFECYCLE_CORRUPT_NEWER_NONCURRENT_VERSIONS: &str =
-    "persisted lifecycle rule carries a negative 'NewerNoncurrentVersions'";
-
 /// Longest tag key S3 accepts.
 const MAX_TAG_KEY_LEN: usize = 128;
 /// Longest tag value S3 accepts.
@@ -4346,24 +4343,24 @@ mod tests {
         assert_eq!(event.action, IlmAction::NoneAction);
     }
 
-    /// Property-based tests for the rule evaluator (backlog#1148 ilm-14,
-    /// follow-up to backlog#1030 / rustfs#4455).
-    ///
-    /// backlog#1030 found that the old hand-written winner comparator was not a
-    /// strict weak ordering and could panic — proof that enumerated cases do
-    /// not cover the space of colliding events. These properties pin, over
-    /// randomized rule sets and object states:
-    ///
-    /// * `eval_inner` never panics and is deterministic for a fixed input;
-    /// * the winning event matches an independently recomputed candidate set:
-    ///   earliest `due` wins, ties break toward delete-class actions (the
-    ///   `min_by_key` selection that replaced the rustfs#4455 comparator);
-    /// * `expected_expiry_time` is monotonically non-decreasing in `days` and
-    ///   always lands on the processing boundary, both at production defaults
-    ///   and under an explicit `RUSTFS_ILM_PROCESS_TIME`.
-    ///
-    /// Case counts are tuned so the whole module runs in seconds inside the
-    /// default CI test job.
+    // Property-based tests for the rule evaluator (backlog#1148 ilm-14,
+    // follow-up to backlog#1030 / rustfs#4455).
+    //
+    // backlog#1030 found that the old hand-written winner comparator was not a
+    // strict weak ordering and could panic — proof that enumerated cases do
+    // not cover the space of colliding events. These properties pin, over
+    // randomized rule sets and object states:
+    //
+    // * `eval_inner` never panics and is deterministic for a fixed input;
+    // * the winning event matches an independently recomputed candidate set:
+    //   earliest `due` wins, ties break toward delete-class actions (the
+    //   `min_by_key` selection that replaced the rustfs#4455 comparator);
+    // * `expected_expiry_time` is monotonically non-decreasing in `days` and
+    //   always lands on the processing boundary, both at production defaults
+    //   and under an explicit `RUSTFS_ILM_PROCESS_TIME`.
+    //
+    // Case counts are tuned so the whole module runs in seconds inside the
+    // default CI test job.
     // ---- backlog#2201: retention-count and Filter invariants -----------------
 
     fn rule_with_noncurrent_expiration(expiration: NoncurrentVersionExpiration) -> LifecycleRule {
