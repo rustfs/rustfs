@@ -57,7 +57,7 @@ They must not be collapsed unless the replacement proves the same exclusions.
 | Scanner leadership claim | scanner | competing scanner leaders and stale cycle writers |
 | Storage publication epoch | ECStore | usage computed across rebalance, decommission, or other data-movement generations |
 | Publication lease | scanner peers through ECStore-facing activity probes | remote dirty-usage or maintenance state that has not acknowledged the candidate |
-| CAS revision | backing config object store | lost updates to `.usage.v2.json`, `.usage.json`, or cycle-state objects |
+| CAS revision | backing config object store | lost updates to usage snapshots, scanner caches, or cycle-state objects |
 | Per-set freshness | scanner aggregation | a merged usage snapshot that combines stale and current set results |
 | Tier registry generation | scanner tier accounting | bytes classified against a different warm-tier registry |
 | Usage floor identity | scanner publication and ECStore quota fallback | empty or legacy values becoming plausible authoritative quota input |
@@ -65,6 +65,28 @@ They must not be collapsed unless the replacement proves the same exclusions.
 A reader that cannot prove the required fence for its surface must fail closed
 or use the documented observed path below. It must not synthesize an empty usage
 snapshot for a missing or corrupt authoritative object.
+
+## Cache Execution Identity
+
+The structural scan-plan digest can remain stable across ordinary bucket writes
+so a scoped scan can retain unaffected baseline buckets. It is not sufficient
+proof for reusing a completed result within the same cycle. Bucket work uses an
+execution digest combining the structural plan and the full activity snapshot,
+with the bucket's dirty generation included in its cache identity. Completed set
+caches carry the same execution digest separately from their structural plan.
+The persisted set-root fast path requires equal execution identities as well as
+the existing source, cycle, leader, tier, and cache-structure checks.
+
+A set scan also captures its starting cache revisions. When the persisted
+execution differs, replacement requires those revisions to remain unchanged;
+otherwise a slow scan could overwrite a newer completed result. The existing
+cache lock, conditional save, and movement admission still fence the commit.
+
+The optional `scan_execution_digest` field is appended to the map-encoded cache
+metadata. Legacy caches remain readable but cannot satisfy same-cycle set-root
+reuse without this identity. Older readers can ignore the added map key, but
+older writers do not enforce its fence; readability is not a mixed-version
+publication-safety guarantee.
 
 ## Persisted Objects
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::data_usage_define::DATA_USAGE_CACHE_KEY_FORMAT;
+use crate::data_usage_define::{DATA_USAGE_CACHE_KEY_FORMAT, DataUsageCacheRevisions};
 use crate::scanner_budget::ScannerCycleBudget;
 use crate::scanner_folder::{ScannerItem, scan_data_folder};
 use crate::sleeper::SCANNER_SLEEPER;
@@ -271,8 +271,8 @@ pub struct ScannerBucketScanPlan {
     all_buckets: Arc<Vec<BucketInfo>>,
     scope: ScannerBucketScanScope,
     digest: DataUsageScanPlanDigest,
-    // Bucket work must invalidate on namespace completion even when its scoped baseline remains reusable.
-    bucket_cache_digest: DataUsageScanPlanDigest,
+    // Cache work must invalidate on namespace completion even when its scoped baseline remains reusable.
+    execution_digest: DataUsageScanPlanDigest,
     leader_epoch: u64,
     tier_registry_generation: u64,
     /// Epoch captured once for the whole scanner cycle.  `None` is retained

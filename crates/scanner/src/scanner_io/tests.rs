@@ -914,6 +914,124 @@ fn complete_set_usage_cache(buckets: &[(&str, usize)], scan_plan_digest: DataUsa
     cache
 }
 
+#[tokio::test]
+#[serial]
+async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers() {
+    let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+    let set = Arc::clone(&store.pools[0].disk_set[0]);
+    let epoch = scanner_publication_epoch(Arc::clone(&set)).await.expect("idle set admission");
+    let mut legacy = complete_set_usage_cache(&[("photos", 5)], DataUsageScanPlanDigest([1; 32]));
+    legacy.info.source = Some(DataUsageCacheSource::new(0, 0));
+    legacy
+        .save(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("seed legacy set cache");
+    let mut persisted = DataUsageCache::default();
+    let initial = persisted
+        .load_with_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("capture the shared starting revision");
+    let mut fresh = legacy.clone();
+    fresh.info.scan_execution_digest = Some(DataUsageScanPlanDigest([2; 32]));
+    fresh.replace(
+        "photos",
+        DATA_USAGE_ROOT,
+        DataUsageEntry {
+            size: 20,
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    let cycle_floor = AtomicU64::new(fresh.info.next_cycle);
+    let (tx, mut rx) = mpsc::channel(1);
+    assert!(
+        persist_and_publish_cache_snapshot(Arc::clone(&set), &tx, fresh.clone(), Some(&initial), &cycle_floor, epoch)
+            .await
+            .is_some(),
+        "a legacy cache without execution identity must be refreshed"
+    );
+    let published = rx.try_recv().expect("fresh snapshot should be forwarded");
+    assert_eq!(published.find("photos").expect("published bucket").size, 20);
+    assert_eq!(published.info.scan_execution_digest, fresh.info.scan_execution_digest);
+    let current = persisted
+        .load_with_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("capture the current revision for the unidentified execution");
+
+    let mut stale = legacy.clone();
+    stale.info.scan_execution_digest = Some(DataUsageScanPlanDigest([3; 32]));
+    for (candidate, revisions) in [(stale, &initial), (legacy, &current)] {
+        assert!(
+            persist_and_publish_cache_snapshot(Arc::clone(&set), &tx, candidate, Some(revisions), &cycle_floor, epoch)
+                .await
+                .is_none(),
+            "a stale or unidentified execution must not replace the newer snapshot"
+        );
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+    fresh.info.scan_execution_digest = Some(DataUsageScanPlanDigest([4; 32]));
+    assert!(
+        persist_and_publish_cache_snapshot(Arc::clone(&set), &tx, fresh.clone(), None, &cycle_floor, epoch)
+            .await
+            .is_none(),
+        "an unreadable starting revision must not authorize an overwrite"
+    );
+
+    fresh.info.scan_execution_digest = published.info.scan_execution_digest;
+    fresh.replace("photos", DATA_USAGE_ROOT, DataUsageEntry::default());
+    assert!(
+        persist_and_publish_cache_snapshot(Arc::clone(&set), &tx, fresh, Some(&initial), &cycle_floor, epoch)
+            .await
+            .is_some(),
+        "an overlapping identical execution must reuse the completed snapshot"
+    );
+    assert_eq!(
+        rx.try_recv()
+            .expect("reused snapshot")
+            .find("photos")
+            .expect("reused bucket")
+            .size,
+        20
+    );
+    persisted
+        .load(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("read the final durable set cache");
+    assert_eq!(persisted.find("photos").expect("durable bucket").size, 20);
+    assert_eq!(persisted.info.scan_execution_digest, published.info.scan_execution_digest);
+
+    let ctx = CancellationToken::new();
+    let empty_execution = DataUsageScanPlanDigest([5; 32]);
+    set.nsscanner_cache(
+        ctx.clone(),
+        ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default()),
+        ScannerBucketScanPlan {
+            buckets: Vec::new(),
+            all_buckets: Arc::new(Vec::new()),
+            scope: ScannerBucketScanScope::default(),
+            digest: DataUsageScanPlanDigest([6; 32]),
+            execution_digest: empty_execution,
+            leader_epoch: 11,
+            tier_registry_generation: 13,
+            publication_epoch: Some(epoch),
+            dirty_usage_buckets: Arc::new(HashMap::new()),
+            bucket_failures: ScannerBucketFailureState::default(),
+            pending_maintenance_work: Arc::new(AtomicBool::new(false)),
+            cache_cycle_floor: Arc::new(AtomicU64::new(8)),
+        },
+        tx,
+        8,
+        HealScanMode::Normal,
+    )
+    .await
+    .expect("empty set scope should replace its prior nonempty cache");
+    let empty = rx.try_recv().expect("empty set snapshot should be published");
+    assert_eq!(empty.info.scan_execution_digest, Some(empty_execution));
+    assert!(empty.info.snapshot_complete);
+    let root = empty.checked_flatten(DATA_USAGE_ROOT).expect("complete empty root");
+    assert_eq!((root.size, root.objects), (0, 0));
+}
+
 fn complete_usage_baseline(
     source: DataUsageCacheSource,
     scan_plan_digest: DataUsageScanPlanDigest,
