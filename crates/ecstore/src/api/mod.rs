@@ -153,12 +153,13 @@ pub mod bucket {
             LastSourceError, LatencyBucketSnapshot, NEGATIVE_CACHE_MAX_ENTRIES, NegativeCache, OdmBucketSnapshot, OdmLookup,
             OdmOp, OdmOutcome, OdmStateError, OdmStats, OdmStatsSnapshot, OnDemandMigrationSys, PullError, PullFailureReason,
             PullFollower, PullLeader, PullOutcome, PullPath, PullResult, PullSlot, SOURCE_LATENCY_BUCKET_BOUNDS_MS,
-            SourceLatencySnapshot, source_client_spec,
+            SourceLatencySnapshot, source_backend_spec, source_client_spec,
         };
         pub use crate::bucket::on_demand_migration::{
-            ConfigPublishHook, FilterConfig, HeadPolicy, ON_DEMAND_MIGRATION_CONFIG_HOOK, ON_DEMAND_MIGRATION_CONFIG_VERSION,
-            OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig, Provider, RangeGetPolicy,
-            SourceConfig, SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
+            AzureSourceConfig, ConfigPublishHook, FilterConfig, GcsSourceConfig, HeadPolicy, ON_DEMAND_MIGRATION_CONFIG_HOOK,
+            ON_DEMAND_MIGRATION_CONFIG_VERSION, OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig,
+            Provider, RangeGetPolicy, SourceConfig, SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig,
+            ValidationContext,
         };
         pub use crate::bucket::on_demand_migration::{
             EnqueueOutcome, LocalObject, MAX_MULTIPART_PARTS, OdmWriteBack, PULL_MAX_RETRIES, PULL_RETRY_BASE_DELAYS,
@@ -185,9 +186,9 @@ pub mod bucket {
         }
         pub mod source_client {
             pub use crate::bucket::on_demand_migration::source_client::{
-                SourceClient, SourceClientSpec, SourceError, SourceGet, SourceHead, SourceListRequest, SourceObject, SourcePage,
-                SourceProbe, SourceProvider, SourceSse, SourceTimeouts, USER_AGENT_SUFFIX, is_multipart_etag, range_header_value,
-                resolve_path_style,
+                AzureAuth, AzureSourceSpec, GcsSourceSpec, SourceBackendSpec, SourceClient, SourceClientSpec, SourceError,
+                SourceGet, SourceHead, SourceListRequest, SourceObject, SourcePage, SourceProbe, SourceProvider, SourceSse,
+                SourceTimeouts, USER_AGENT_SUFFIX, is_multipart_etag, range_header_value, resolve_path_style,
             };
         }
     }
@@ -562,6 +563,12 @@ pub mod set_disk {
     pub mod test_util {
         pub use crate::bucket::quota::reservation::fail_next_quota_ledger_save_for_test;
         pub use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause};
+
+        /// Keep a namespace commit pending until the returned owner is dropped.
+        #[must_use]
+        pub fn hold_namespace_commit(store: &crate::store::ECStore) -> impl Send + Sync {
+            store.ctx.begin_namespace_commit()
+        }
     }
 }
 

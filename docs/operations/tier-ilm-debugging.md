@@ -22,6 +22,16 @@
 | `FileMeta` / `FileInfo` / version metadata | `crates/filemeta/src/` |
 | Dual-key internal metadata helpers (`insert_bytes` / `get_bytes`) | `crates/utils/src/http/metadata_compat.rs` |
 
+## Lifecycle rule limits and evaluation
+
+Each lifecycle rule supports at most one `Transition` and one `NoncurrentVersionTransition`. A version can make one initial transition; chaining additional tiers after it reaches `complete` is not supported. Splitting stages across overlapping rules does not enable a transition chain. `PutBucketLifecycleConfiguration` rejects multiple entries in either transition array with `InvalidArgument`, including in disabled rules. Existing stored multi-entry arrays are not executed; replace each with a single intended destination. Independent expiration actions in the rule remain eligible.
+
+`Expiration.Days` and `Expiration.Date` are mutually exclusive. A request containing both is rejected instead of silently selecting the date. When expiration and transition are both eligible, expiration takes precedence; a failed earlier transition does not keep an expired object indefinitely. Deadlines select the earliest action within the same action class.
+
+Noncurrent expiration and transition have independent `NewerNoncurrentVersions` limits. A transition with a positive limit waits for a complete version-group evaluation to establish that enough newer noncurrent versions remain. Single-object evaluation, including the current manual transition and immediate-enqueue paths, conservatively defers these counted transitions to the lifecycle scanner. An unmet expiration retention limit does not suppress a separately eligible transition.
+
+An expired restored local copy can be cleaned up under Object Lock because the retained logical version and remote data remain intact. Cleanup requires a completed transition and still waits for pending or failed replication. The storage layer revalidates the source identity and restore metadata before removing the local copy; restore headers alone do not authorize cleanup.
+
 ## Free-version recovery controls
 
 The dedicated free-version recovery loop is enabled by default and is independent of the data scanner and heal switches. Setting `RUSTFS_SCANNER_ENABLED=false` does not stop this repair loop. Set `RUSTFS_TIER_FREE_VERSION_RECOVERY_ENABLED=false` before process startup to disable only the dedicated persisted-marker walk. That setting does not disable lifecycle workers or prevent another scanner path from discovering a free version, and it can leave remote cleanup markers pending for longer, so use it as a break-glass pressure control rather than a cleanup mechanism.

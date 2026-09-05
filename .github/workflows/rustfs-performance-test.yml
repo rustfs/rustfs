@@ -84,9 +84,6 @@ env:
 jobs:
   performance-test:
     runs-on: pf-testing
-    # Requirement: a failing benchmark must not fail the workflow;
-    # failures are filed to rustfs/backlog.
-    continue-on-error: true
     timeout-minutes: 900
     # Run on manual dispatch, or when the nightly build completed successfully.
     # Skipped when nightly failed.

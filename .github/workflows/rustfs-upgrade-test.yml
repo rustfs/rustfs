@@ -79,7 +79,6 @@ env:
 jobs:
   upgrade-test:
     runs-on: smoke-testing
-    continue-on-error: true
     timeout-minutes: 420
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
@@ -142,7 +141,6 @@ jobs:
 
       - name: Run upgrade compatibility suite
         id: test
-        continue-on-error: true
         env:
           LOG_FILE: /tmp/rustfs-upgrade.log
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}

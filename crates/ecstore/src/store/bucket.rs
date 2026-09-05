@@ -1059,6 +1059,7 @@ mod tests {
     use crate::storage_api_contracts::{
         bucket::{BucketOperations as _, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp},
         list::ListOperations as _,
+        namespace::NamespaceLocking as _,
         object::{ObjectIO as _, ObjectOperations as _},
     };
     use crate::store::{ECStore, init_local_disks_with_instance_ctx};
@@ -1486,10 +1487,19 @@ mod tests {
             .put_object(bucket, object, &mut reader, &ObjectOptions::default())
             .await
             .expect("object should be written");
+        let lock = ecstore.pools[0].disk_set[0]
+            .new_ns_lock(bucket, object)
+            .await
+            .expect("fixture namespace lock should be created");
+        drop(
+            lock.get_write_lock(Duration::from_secs(30))
+                .await
+                .expect("fixture rename tail should finish before checking its generation"),
+        );
         assert_eq!(
             ecstore.scanner_namespace_mutation_generation(),
-            generation_before_put.saturating_add(1),
-            "successful object creation should advance scanner namespace activity"
+            generation_before_put.saturating_add(3),
+            "successful object creation must observe the logical mutation and both fanout boundaries"
         );
         ecstore
             .get_object_info(bucket, object, &ObjectOptions::default())
