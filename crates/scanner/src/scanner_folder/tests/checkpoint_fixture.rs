@@ -765,7 +765,10 @@ async fn write_checkpoint_object(root: &std::path::Path, object: &str, versions:
         info.version_id = *version_id;
         info.versioned = version_id.is_some();
         info.size = *size;
-        info.mod_time = Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(i64::try_from(index).expect("fixture index")));
+        info.mod_time = Some(
+            OffsetDateTime::from_unix_timestamp(1_700_000_000 + i64::try_from(index).expect("fixture index"))
+                .expect("non-sentinel fixture modification time"),
+        );
         metadata.add_version(info).expect("fixture version");
     }
     write_test_object_metadata_bytes(root, "bucket", object, &metadata.marshal_msg().expect("fixture metadata")).await;
