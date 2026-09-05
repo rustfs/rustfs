@@ -447,11 +447,11 @@ mod tests {
     use crate::app::storage_api::test::StoragePutObjReader;
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::app::storage_api::test::contract::object::ObjectIO as _;
-    use s3s::dto::ListObjectsInput;
     use crate::on_demand_migration::{
         FilterConfig, MAX_LIST_NO_PROGRESS_PAGES, OnDemandMigrationConfig, PathStyle, PolicyConfig, Provider, SourceConfig,
         SourceCredentials, TlsConfig,
     };
+    use s3s::dto::ListObjectsInput;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
