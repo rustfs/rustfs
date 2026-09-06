@@ -2116,6 +2116,257 @@ mod tests {
             .expect("merged continuation token")
     }
 
+    #[derive(Clone, Copy)]
+    enum DisabledListScenario {
+        FirstLocalPage,
+        PartiallyConsumedLocalPage,
+        CommonPrefixes,
+        Reenable,
+    }
+
+    async fn assert_disabled_list_progress(scenario: DisabledListScenario, framed: bool, disable_module: bool) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (local_keys, source_names, expected_first, expected_disabled) = match scenario {
+            DisabledListScenario::FirstLocalPage => (vec!["a", "c"], ["b", "d"], ["a", "b"], vec!["c", "z-local"]),
+            DisabledListScenario::PartiallyConsumedLocalPage => {
+                (vec!["a", "b", "c", "e"], ["d", "f"], ["a", "b"], vec!["e", "z-local"])
+            }
+            DisabledListScenario::CommonPrefixes => (vec!["p/a/1", "p/c/1"], ["p/b/", "p/d/"], ["p/a/", "p/b/"], vec!["p/c/"]),
+            DisabledListScenario::Reenable => (vec!["a", "c", "e"], ["b", "f"], ["a", "b"], vec!["c", "e"]),
+        };
+        let prefixes = matches!(scenario, DisabledListScenario::CommonPrefixes);
+        let entries = source_names
+            .iter()
+            .map(|name| {
+                if prefixes {
+                    format!("<CommonPrefixes><Prefix>{name}</Prefix></CommonPrefixes>")
+                } else {
+                    format!("<Contents><Key>{name}</Key><Size>1</Size></Contents>")
+                }
+            })
+            .collect::<String>();
+        let body = format!(
+            "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>false</IsTruncated>{entries}</ListBucketResult>"
+        );
+        let source_disabled = Arc::new(AtomicBool::new(false));
+        let source_requests = Arc::new(AtomicUsize::new(0));
+        let forbidden = Arc::clone(&source_disabled);
+        let count = Arc::clone(&source_requests);
+        let (endpoint, server, stop) = list_source_with_response(std::iter::repeat(body), move |_, body| {
+            assert!(!forbidden.load(Ordering::SeqCst), "disabled listing must not call the source");
+            count.fetch_add(1, Ordering::SeqCst);
+            body
+        })
+        .await;
+        let (_state_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+        let store = shared_gating_ecstore().await;
+        for key in local_keys {
+            store
+                .put_object(
+                    &input.bucket,
+                    key,
+                    &mut StoragePutObjReader::from_vec(vec![1]),
+                    &StorageObjectOptions::default(),
+                )
+                .await
+                .expect("seed disabled-list local keys");
+        }
+        if prefixes {
+            input.prefix = Some("p/".to_string());
+            input.delimiter = Some("/".to_string());
+        }
+        input.start_after = Some(if prefixes { "p/0" } else { "0" }.to_string());
+        let page_names = |page: &ListObjectsV2Output| {
+            let mut names = page
+                .contents
+                .iter()
+                .flatten()
+                .map(|object| object.key.clone().expect("listed object key"))
+                .chain(
+                    page.common_prefixes
+                        .iter()
+                        .flatten()
+                        .map(|prefix| prefix.prefix.clone().expect("listed common prefix")),
+                )
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let first = execute_source_list(input.clone()).await.expect("first merged page").output;
+        assert_eq!(page_names(&first), expected_first);
+        assert_eq!(first.key_count, Some(2));
+        assert_eq!(first.is_truncated, Some(true));
+        let mut cursor = first.next_continuation_token.expect("merged cursor");
+        let mut token = decode_wire_token(&cursor);
+        assert_eq!(token.framed, framed);
+        if matches!(scenario, DisabledListScenario::PartiallyConsumedLocalPage) {
+            let first_local = token.local.clone().expect("first local page was fully consumed");
+            assert!(
+                first_local.starts_with("b[rustfs_cache:"),
+                "expected a real opaque cache cursor: {first_local}"
+            );
+            input.continuation_token = Some(cursor);
+            let second = execute_source_list(input.clone()).await.expect("second merged page").output;
+            assert_eq!(page_names(&second), ["c", "d"]);
+            cursor = second.next_continuation_token.expect("partially consumed local page");
+            token = decode_wire_token(&cursor);
+            assert_eq!(token.local.as_deref(), Some(first_local.as_str()), "keep the page that still contains e");
+            assert_eq!(token.last_key.as_deref(), Some("d"));
+            // ECStore prioritizes its opaque continuation over StartAfter. A
+            // fix that merely passes both would still replay c from this page.
+            let token_wins = Arc::clone(&store)
+                .list_objects_v2(&input.bucket, "", Some(first_local), None, 2, false, Some("d".to_string()), false)
+                .await
+                .expect("verify the real storage continuation contract");
+            assert_eq!(
+                token_wins
+                    .objects
+                    .iter()
+                    .map(|object| object.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["c", "e"]
+            );
+        } else {
+            assert_eq!(token.local, None, "the first local page remains partially consumed");
+            assert_eq!(token.last_key.as_deref(), Some(expected_first[1]));
+        }
+        assert!(!token.local_done);
+        assert!(!token.source_done);
+        let requests_before_disable = source_requests.load(Ordering::SeqCst);
+        assert_eq!(
+            requests_before_disable,
+            if matches!(scenario, DisabledListScenario::PartiallyConsumedLocalPage) {
+                2
+            } else {
+                1
+            }
+        );
+        let sys = OnDemandMigrationSys::get();
+        let installed = sys.state(&input.bucket).expect("installed source state");
+        let saved_config = installed.config().clone();
+        source_disabled.store(true, Ordering::SeqCst);
+        if disable_module {
+            sys.set_module_enabled(false);
+        } else {
+            let mut disabled_config = saved_config.clone();
+            disabled_config.policy.list_through = false;
+            sys.apply_for_incarnation(&input.bucket, installed.incarnation_id(), Some(&disabled_config))
+                .await;
+        }
+        input.continuation_token = Some(cursor);
+        let disabled = execute_source_list(input.clone()).await.expect("local-only continuation");
+        assert!(!disabled.headers.contains_key("x-rustfs-on-demand-migration-list"));
+        assert_eq!(
+            page_names(&disabled.output),
+            expected_disabled,
+            "framed={framed}, module={disable_module}"
+        );
+        assert_eq!(
+            disabled.output.key_count,
+            Some(i32::try_from(expected_disabled.len()).expect("page size"))
+        );
+        assert_eq!(disabled.output.prefix.as_deref(), Some(if prefixes { "p/" } else { "" }));
+        assert_eq!(disabled.output.delimiter, input.delimiter);
+        assert_eq!(disabled.output.start_after, input.start_after, "echo the client's original StartAfter");
+        assert_eq!(source_requests.load(Ordering::SeqCst), requests_before_disable);
+        if matches!(scenario, DisabledListScenario::Reenable) {
+            assert_eq!(disabled.output.is_truncated, Some(true));
+            let next = disabled.output.next_continuation_token.expect("local side still has z-local");
+            let next_token = decode_wire_token(&next);
+            assert_eq!(next_token.framed, framed, "retain the chain's existing wire format");
+            assert_eq!(next_token.source, token.source, "disabled requests do not consume source pages");
+            assert_eq!(next_token.last_key.as_deref(), Some("e"));
+            source_disabled.store(false, Ordering::SeqCst);
+            if disable_module {
+                sys.set_module_enabled(true);
+            } else {
+                sys.apply_for_incarnation(&input.bucket, installed.incarnation_id(), Some(&saved_config))
+                    .await;
+            }
+            input.continuation_token = Some(next);
+            let resumed = execute_source_list(input).await.expect("reenabled continuation").output;
+            assert_eq!(page_names(&resumed), ["f", "z-local"], "both sides continue beyond the local-only page");
+            assert_eq!(resumed.is_truncated, Some(false));
+            assert!(resumed.next_continuation_token.is_none());
+            assert_eq!(source_requests.load(Ordering::SeqCst), requests_before_disable + 1);
+        } else {
+            assert_eq!(disabled.output.is_truncated, Some(false));
+            assert!(disabled.output.next_continuation_token.is_none());
+        }
+        stop.cancel();
+        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("source server must finish")
+            .expect("source access must respect the disabled phase");
+        assert_eq!(requests.len(), source_requests.load(Ordering::SeqCst));
+        for request in requests {
+            assert!(
+                !request.contains("continuation-token="),
+                "the partially consumed source page is reread: {request}"
+            );
+            if prefixes {
+                assert!(request.contains("prefix=p%2F") && request.contains("delimiter=%2F"), "{request}");
+            }
+        }
+    }
+
+    async fn disabled_list_progress_matrix(scenario: DisabledListScenario) {
+        for framed in [false, true] {
+            temp_env::async_with_vars(
+                [
+                    (ENV_LIST_PROGRESS_TOKENS, Some("true")),
+                    (ENV_LIST_FRAMED_TOKENS, Some(if framed { "true" } else { "false" })),
+                    ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                    ("HTTP_PROXY", None),
+                    ("HTTPS_PROXY", None),
+                    ("ALL_PROXY", None),
+                    ("http_proxy", None),
+                    ("https_proxy", None),
+                    ("all_proxy", None),
+                    ("NO_PROXY", Some("*")),
+                    ("no_proxy", Some("*")),
+                ],
+                Box::pin(async move {
+                    for disable_module in [false, true] {
+                        assert_disabled_list_progress(scenario, framed, disable_module).await;
+                    }
+                }),
+            )
+            .await;
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_disabled_resumes_partially_consumed_first_local_page() {
+        run_large_stack_test("list-disabled-first", || {
+            disabled_list_progress_matrix(DisabledListScenario::FirstLocalPage)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_disabled_resumes_partially_consumed_opaque_local_page() {
+        run_large_stack_test("list-disabled-opaque", || {
+            disabled_list_progress_matrix(DisabledListScenario::PartiallyConsumedLocalPage)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_disabled_resumes_common_prefixes_without_repeating() {
+        run_large_stack_test("list-disabled-prefixes", || {
+            disabled_list_progress_matrix(DisabledListScenario::CommonPrefixes)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_disabled_then_reenabled_retains_progress_on_both_sides() {
+        run_large_stack_test("list-disabled-reenable", || disabled_list_progress_matrix(DisabledListScenario::Reenable));
+    }
+
     #[test]
     fn framed_local_continuations_preserve_json_markers_and_zero_sized_budgets() {
         let json_key = r#"{"t":"odm-list","v":1,"local_done":true}"#;
