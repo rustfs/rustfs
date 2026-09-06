@@ -4070,14 +4070,13 @@ mod tests {
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
                     filter: Some(s3s::dto::LifecycleRuleFilter {
-                        prefix: Some("logs/".to_string()),
-                        tag: Some(s3s::dto::Tag {
-                            key: Some("env".to_string()),
-                            value: Some("prod".to_string()),
+                        and: Some(s3s::dto::LifecycleRuleAndOperator {
+                            prefix: Some("logs/".to_string()),
+                            ..Default::default()
                         }),
                         ..Default::default()
                     }),
-                    id: Some("two-predicates".to_string()),
+                    id: Some("one-member-and".to_string()),
                     noncurrent_version_expiration: None,
                     noncurrent_version_transitions: None,
                     prefix: None,
@@ -4087,7 +4086,7 @@ mod tests {
             &ObjectLockConfiguration::default(),
         )
         .await
-        .expect_err("a Filter with two predicates is a schema violation");
+        .expect_err("a Filter And with one predicate is a schema violation");
         assert_eq!(*lifecycle_validation_error(&malformed).code(), S3ErrorCode::MalformedXML);
 
         let invalid_value = validate_lifecycle_config(
