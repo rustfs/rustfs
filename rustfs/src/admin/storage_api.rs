@@ -314,6 +314,7 @@ pub(crate) mod metadata_sys {
         super::ecstore_bucket::metadata_sys::get(bucket).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn update(bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
         crate::storage::storage_api::update_bucket_metadata_config(bucket, config_file, data).await
     }
