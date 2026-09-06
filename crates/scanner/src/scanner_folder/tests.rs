@@ -25,6 +25,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::Mutex;
 
 mod checkpoint_fixture;
+pub(super) mod enumeration_restart;
 
 /// Reset the process-global alert cooldown map; test-only.
 fn reset_alert_cooldowns() {
@@ -346,6 +347,9 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
             refresh_failed: false,
         },
         pending_heals_changed: false,
+        coverage_frontier: None,
+        resume_frontier: None,
+        coverage_gap: false,
         pending_size_reconciliation_keys: HashSet::new(),
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,

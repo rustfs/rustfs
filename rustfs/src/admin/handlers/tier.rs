@@ -613,6 +613,16 @@ impl Operation for RemoveTier {
             return if err.code == ERR_TIER_NOT_FOUND.code {
                 Err(S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "tier not found"))
             } else if let Some(response) = tier_backend_error_response(&err) {
+                warn!(
+                    event = EVENT_ADMIN_TIER_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_TIER,
+                    action = "remove_tier",
+                    tier_name = %tier_name,
+                    result = "remove_blocked",
+                    error = ?err,
+                    "admin tier state"
+                );
                 Err(response)
             } else {
                 warn!(

@@ -298,6 +298,7 @@ impl HealManager {
                     if cancelled_completion {
                         completed_status = HealTaskStatus::Cancelled;
                         completed_status_entry.status = HealTaskStatus::Cancelled;
+                        completed_status_entry.outcome = Some(Arc::new(task.get_outcome().await));
                     }
                     let terminal_completion = !matches!(completed_status, HealTaskStatus::Retrying { .. });
                     let successful_completion = matches!(completed_status, HealTaskStatus::Completed);

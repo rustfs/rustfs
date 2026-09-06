@@ -218,10 +218,12 @@ pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<
     fs::rename(from, to).await
 }
 
+#[cfg(any(not(windows), test))]
 pub fn rename_std(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
+#[cfg(any(not(windows), test))]
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn read_file(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
     fs::read(path.as_ref()).await

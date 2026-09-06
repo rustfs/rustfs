@@ -874,7 +874,7 @@ pub(crate) use ops::multipart::NewMultipartUploadCommitObservation;
 pub use ops::multipart::{MultipartCommitBarrier, MultipartCommitPause};
 #[cfg(test)]
 pub(crate) use ops::object::DeleteObjectCommitBarrier;
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 pub(crate) use ops::object::TransitionCleanupStoreBarrier as SetDiskTransitionCleanupStoreBarrier;
 #[cfg(all(test, feature = "test-util"))]
 pub(crate) use ops::object::TransitionUploadedCommitBarrier as SetDiskTransitionUploadedCommitBarrier;
@@ -4496,6 +4496,12 @@ impl SetDisks {
     #[allow(dead_code)] // Read by tests; consumed by later slices.
     pub(crate) fn instance_ctx(&self) -> &Arc<InstanceContext> {
         &self.ctx
+    }
+
+    /// Read the persisted bucket identity through this set's metadata owner.
+    /// Missing or non-authoritative legacy identities remain errors.
+    pub async fn bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Uuid> {
+        metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await
     }
 
     /// Admit one short scanner cache publication under this set's instance

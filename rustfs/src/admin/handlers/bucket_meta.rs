@@ -67,6 +67,17 @@ use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 const DIAGNOSTIC_EXPORT_PREFIX: &str = "_diagnostic";
 const DIAGNOSTIC_EXPORT_MANIFEST: &str = "_diagnostic-manifest.json";
 
+/// Archive entry naming the configurations a bucket stores but this build
+/// could not read (rustfs/backlog#2309).
+///
+/// The name deliberately sits outside the configuration-file namespace the
+/// importers switch on — `ImportBucketMetadata` matches known configuration
+/// names and ignores everything else — so no importer can mistake the marker
+/// for a configuration. Ordinary exports carry it; diagnostic exports report
+/// the same failures through [`DIAGNOSTIC_EXPORT_MANIFEST`] instead, which
+/// deliberately withholds the parser detail this marker records.
+const EXPORT_UNREADABLE_MANIFEST: &str = "rustfs-unreadable-configs.json";
+
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_BUCKET_META: &str = "bucket_meta";
 const EVENT_ADMIN_BUCKET_META_STATE: &str = "admin_bucket_meta_state";
@@ -76,31 +87,82 @@ fn export_internal_error(message: impl Into<String>) -> s3s::S3Error {
     s3_error!(InternalError, "{message}")
 }
 
-fn checked_raw_xml<T, E, F>(validated: &T, raw: Vec<u8>, parse: F) -> S3Result<Vec<u8>>
+/// One configuration that is stored for a bucket but could not be exported.
+#[derive(serde::Serialize)]
+struct UnreadableExportEntry {
+    config: &'static str,
+    error: String,
+}
+
+#[derive(serde::Serialize)]
+struct UnreadableExportManifest<'a> {
+    bucket: &'a str,
+    unreadable: &'a [UnreadableExportEntry],
+}
+
+/// Why one of a bucket's configurations could not be exported.
+///
+/// The two variants are what an ordinary export dispatches on: a bucket whose
+/// stored bytes this build cannot turn into a configuration is named and
+/// skipped, while a failure of our own output machinery still fails the whole
+/// export closed.
+#[derive(Debug)]
+enum ExportConfigError {
+    /// The configuration is stored but this build cannot read it: a
+    /// MinIO-origin or otherwise undecodable blob, or a revision that moved
+    /// underneath the export. No retry of ours turns those bytes into a
+    /// configuration, so one such bucket must not abort a whole-cluster export
+    /// (rustfs/backlog#2309).
+    Unreadable(String),
+    /// This build failed to produce its own output for a configuration it had
+    /// already decoded. Nothing about the stored bytes is in doubt, so the
+    /// export fails closed rather than reporting healthy metadata as
+    /// unreadable.
+    Internal(s3s::S3Error),
+}
+
+impl ExportConfigError {
+    fn unreadable(message: impl Into<String>) -> Self {
+        Self::Unreadable(message.into())
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::Internal(export_internal_error(message))
+    }
+}
+
+fn checked_raw_xml<T, E, F>(validated: &T, raw: Vec<u8>, parse: F) -> Result<Vec<u8>, ExportConfigError>
 where
     T: PartialEq,
     E: std::fmt::Display,
     F: FnOnce(&[u8]) -> Result<T, E>,
 {
-    let selected = parse(&raw)
-        .map_err(|e| export_internal_error(format!("persisted bucket metadata changed to invalid XML during export: {e}")))?;
+    let selected = parse(&raw).map_err(|e| {
+        ExportConfigError::unreadable(format!("persisted bucket metadata changed to invalid XML during export: {e}"))
+    })?;
     if selected != *validated {
-        return Err(export_internal_error("bucket metadata changed during export"));
+        return Err(ExportConfigError::unreadable("bucket metadata changed during export"));
     }
     Ok(raw)
 }
 
-fn checked_versioning_xml(validated: &VersioningConfiguration, raw: Vec<u8>) -> S3Result<Vec<u8>> {
+fn checked_versioning_xml(validated: &VersioningConfiguration, raw: Vec<u8>) -> Result<Vec<u8>, ExportConfigError> {
     if raw.is_empty() {
         if *validated != VersioningConfiguration::default() {
-            return Err(export_internal_error("bucket metadata changed during export"));
+            return Err(ExportConfigError::unreadable("bucket metadata changed during export"));
         }
-        return serialize(validated).map_err(|e| export_internal_error(format!("serialize config failed: {e}")));
+        return serialize(validated).map_err(|e| ExportConfigError::internal(format!("serialize config failed: {e}")));
     }
     checked_raw_xml(validated, raw, deserialize::<VersioningConfiguration>)
 }
 
-async fn exported_bucket_config(bucket: &str, conf: &str) -> S3Result<Option<Vec<u8>>> {
+/// Bytes to export for one of a bucket's configurations.
+///
+/// `Ok(None)` means the bucket has not configured it. An `Err` never becomes an
+/// exported configuration — a fabricated default here would reach an importer
+/// as a real one — and its variant tells the caller whether the failure belongs
+/// to the stored bytes or to this build's own output; see [`ExportConfigError`].
+async fn exported_bucket_config(bucket: &str, conf: &str) -> Result<Option<Vec<u8>>, ExportConfigError> {
     match conf {
         BUCKET_POLICY_CONFIG => {
             let config: BucketPolicy = match metadata_sys::get_bucket_policy(bucket).await {
@@ -109,11 +171,11 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> S3Result<Option<Vec
                     if e == StorageError::ConfigNotFound {
                         return Ok(None);
                     }
-                    return Err(s3_error!(InternalError, "failed to load bucket metadata: {e}"));
+                    return Err(ExportConfigError::unreadable(format!("failed to load bucket metadata: {e}")));
                 }
             };
-            let config_json =
-                serde_json::to_vec(&config).map_err(|e| s3_error!(InternalError, "failed to serialize config: {e}"))?;
+            let config_json = serde_json::to_vec(&config)
+                .map_err(|e| ExportConfigError::internal(format!("failed to serialize config: {e}")))?;
             Ok(Some(config_json))
         }
         BUCKET_NOTIFICATION_CONFIG => {
@@ -123,14 +185,14 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> S3Result<Option<Vec
                     if e == StorageError::ConfigNotFound {
                         return Ok(None);
                     }
-                    return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
+                    return Err(ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")));
                 }
                 Ok(None) => return Ok(None),
             };
 
             let raw_config = metadata_sys::get(bucket)
                 .await
-                .map_err(|e| export_internal_error(format!("get bucket metadata failed: {e}")))?
+                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?
                 .notification_config_xml
                 .clone();
             let config_xml = checked_raw_xml(&config, raw_config, deserialize::<s3s::dto::NotificationConfiguration>)?;
@@ -144,12 +206,12 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> S3Result<Option<Vec
                     if e == StorageError::ConfigNotFound {
                         return Ok(None);
                     }
-                    return Err(s3_error!(InternalError, "failed to load bucket metadata: {e}"));
+                    return Err(ExportConfigError::unreadable(format!("failed to load bucket metadata: {e}")));
                 }
             };
             let raw_config = metadata_sys::get(bucket)
                 .await
-                .map_err(|e| export_internal_error(format!("failed to load bucket metadata: {e}")))?
+                .map_err(|e| ExportConfigError::unreadable(format!("failed to load bucket metadata: {e}")))?
                 .lifecycle_config_xml
                 .clone();
             let config_xml = checked_raw_xml(&config, raw_config, deserialize::<BucketLifecycleConfiguration>)?;
@@ -163,12 +225,12 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> S3Result<Option<Vec
                     if e == StorageError::ConfigNotFound {
                         return Ok(None);
                     }
-                    return Err(s3_error!(InternalError, "failed to load bucket metadata: {e}"));
+                    return Err(ExportConfigError::unreadable(format!("failed to load bucket metadata: {e}")));
                 }
             };
             let raw_config = metadata_sys::get(bucket)
                 .await
-                .map_err(|e| export_internal_error(format!("failed to load bucket metadata: {e}")))?
+                .map_err(|e| ExportConfigError::unreadable(format!("failed to load bucket metadata: {e}")))?
                 .tagging_config_xml
                 .clone();
             let config_xml = checked_raw_xml(&config, raw_config, deserialize::<Tagging>)?;
@@ -182,11 +244,11 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> S3Result<Option<Vec
                     if e == StorageError::ConfigNotFound {
                         return Ok(None);
                     }
-                    return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
+                    return Err(ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")));
                 }
             };
             let config_json =
-                serde_json::to_vec(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
+                serde_json::to_vec(&config).map_err(|e| ExportConfigError::internal(format!("serialize config failed: {e}")))?;
 
             Ok(Some(config_json))
         }
@@ -197,12 +259,12 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> S3Result<Option<Vec
                     if e == StorageError::ConfigNotFound {
                         return Ok(None);
                     }
-                    return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
+                    return Err(ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")));
                 }
             };
             let raw_config = metadata_sys::get(bucket)
                 .await
-                .map_err(|e| export_internal_error(format!("get bucket metadata failed: {e}")))?
+                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?
                 .object_lock_config_xml
                 .clone();
             let config_xml = checked_raw_xml(&config, raw_config, deserialize::<ObjectLockConfiguration>)?;
@@ -216,12 +278,12 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> S3Result<Option<Vec
                     if e == StorageError::ConfigNotFound {
                         return Ok(None);
                     }
-                    return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
+                    return Err(ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")));
                 }
             };
             let raw_config = metadata_sys::get(bucket)
                 .await
-                .map_err(|e| export_internal_error(format!("get bucket metadata failed: {e}")))?
+                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?
                 .encryption_config_xml
                 .clone();
             let config_xml = checked_raw_xml(&config, raw_config, deserialize::<ServerSideEncryptionConfiguration>)?;
@@ -235,12 +297,12 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> S3Result<Option<Vec
                     if e == StorageError::ConfigNotFound {
                         return Ok(None);
                     }
-                    return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
+                    return Err(ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")));
                 }
             };
             let raw_config = metadata_sys::get(bucket)
                 .await
-                .map_err(|e| export_internal_error(format!("get bucket metadata failed: {e}")))?
+                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?
                 .versioning_config_xml
                 .clone();
             let config_xml = checked_versioning_xml(&config, raw_config)?;
@@ -254,12 +316,12 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> S3Result<Option<Vec
                     if e == StorageError::ConfigNotFound {
                         return Ok(None);
                     }
-                    return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
+                    return Err(ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")));
                 }
             };
             let raw_config = metadata_sys::get(bucket)
                 .await
-                .map_err(|e| export_internal_error(format!("get bucket metadata failed: {e}")))?
+                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?
                 .replication_config_xml
                 .clone();
             let config_xml = checked_raw_xml(&config, raw_config, deserialize::<ReplicationConfiguration>)?;
@@ -273,12 +335,12 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> S3Result<Option<Vec
                     if e == StorageError::ConfigNotFound {
                         return Ok(None);
                     }
-                    return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
+                    return Err(ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")));
                 }
             };
 
             let config_json = serde_json::to_vec(&config.redacted_credentials())
-                .map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
+                .map_err(|e| ExportConfigError::internal(format!("serialize config failed: {e}")))?;
 
             Ok(Some(config_json))
         }
@@ -377,19 +439,52 @@ impl Operation for ExportBucketMetadata {
         ];
 
         for bucket in buckets {
+            let mut unreadable: Vec<UnreadableExportEntry> = Vec::new();
             for &conf in confs.iter() {
                 let conf_path = path_join_buf(&[bucket.name.as_str(), conf]);
                 let config = match exported_bucket_config(&bucket.name, conf).await {
                     Ok(Some(config)) => config,
                     Ok(None) => continue,
-                    Err(error) if !query.diagnostic => return Err(error),
-                    Err(_) => {
-                        errors.push(serde_json::json!({
-                            "bucket": bucket.name,
-                            "config": conf,
-                            "code": "configuration_unavailable",
-                        }));
-                        continue;
+                    Err(error) => {
+                        if query.diagnostic {
+                            // A diagnostic archive names every configuration it
+                            // could not export under one fixed code, carrying
+                            // neither the payload nor the parser detail, so it
+                            // stays shareable (rustfs/rustfs#7225).
+                            errors.push(serde_json::json!({
+                                "bucket": bucket.name,
+                                "config": conf,
+                                "code": "configuration_unavailable",
+                            }));
+                            continue;
+                        }
+                        match error {
+                            // One bucket's undecodable blob must not abort the
+                            // whole-cluster export: record which configuration
+                            // could not be read and keep going, so an operator
+                            // migrating away still gets every readable
+                            // configuration (rustfs/backlog#2309).
+                            ExportConfigError::Unreadable(error) => {
+                                warn!(
+                                    event = EVENT_ADMIN_BUCKET_META_STATE,
+                                    component = LOG_COMPONENT_ADMIN,
+                                    subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                                    action = "export_bucket_metadata",
+                                    result = "config_unreadable",
+                                    bucket = %bucket.name,
+                                    config_name = %conf,
+                                    error = %error,
+                                    "admin bucket meta state"
+                                );
+                                unreadable.push(UnreadableExportEntry { config: conf, error });
+                                continue;
+                            }
+                            // Our own encoder failed on a configuration this
+                            // build had already decoded. The stored bytes are
+                            // not in question, so fail the export instead of
+                            // reporting readable metadata as unreadable.
+                            ExportConfigError::Internal(error) => return Err(error),
+                        }
                     }
                 };
                 let conf_path = if query.diagnostic {
@@ -402,6 +497,23 @@ impl Operation for ExportBucketMetadata {
                     .map_err(|e| s3_error!(InternalError, "failed to start archive entry: {e}"))?;
                 zip_writer
                     .write_all(&config)
+                    .map_err(|e| s3_error!(InternalError, "failed to write archive entry: {e}"))?;
+            }
+
+            // Only reachable outside diagnostic mode, which reports the same
+            // failures through the archive-wide manifest instead.
+            if !unreadable.is_empty() {
+                let manifest = serde_json::to_vec(&UnreadableExportManifest {
+                    bucket: bucket.name.as_str(),
+                    unreadable: &unreadable,
+                })
+                .map_err(|e| export_internal_error(format!("failed to serialize unreadable manifest: {e}")))?;
+                let manifest_path = path_join_buf(&[bucket.name.as_str(), EXPORT_UNREADABLE_MANIFEST]);
+                zip_writer
+                    .start_file(manifest_path, SimpleFileOptions::default())
+                    .map_err(|e| s3_error!(InternalError, "failed to start archive entry: {e}"))?;
+                zip_writer
+                    .write_all(&manifest)
                     .map_err(|e| s3_error!(InternalError, "failed to write archive entry: {e}"))?;
             }
         }
@@ -1364,6 +1476,10 @@ mod backup_zip_compatibility_tests {
     const ROOT_ACCESS_KEY: &str = "BUCKETMETABACKUPROOT";
     const ROOT_SECRET_KEY: &str = "bucketMetaBackupRootSecret123";
     const BUCKET: &str = "backup-compatibility";
+    const UNREADABLE_BUCKET: &str = "minio-origin-targets";
+    /// The exact `BucketTargetsConfigJSON` payload carried by the MinIO
+    /// `.metadata.bin` fixture in `crates/ecstore/src/bucket/metadata_test.rs`.
+    const MINIO_ARRAY_TARGETS: &[u8] = br#"[{"endpoint":"http://target.example.com","targetBucket":"tb","region":"us-east-1"}]"#;
     const NOTIFICATION_XML: &[u8] = b"<NotificationConfiguration>\n</NotificationConfiguration>";
     const LIFECYCLE_XML: &[u8] = b"<LifecycleConfiguration>\n<Rule><ID>expire</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule>\n</LifecycleConfiguration>";
     const SSE_XML: &[u8] = b"<ServerSideEncryptionConfiguration>\n<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule>\n</ServerSideEncryptionConfiguration>";
@@ -1495,14 +1611,63 @@ mod backup_zip_compatibility_tests {
                 .expect("publish unreadable targets fixture");
             assert!(metadata_sys::get_bucket_targets_config(UNREADABLE).await.is_err());
 
-            let strict_error = ExportBucketMetadata {}
+            // rustfs/backlog#2309: an ordinary export no longer fails closed on
+            // a configuration that is stored but unreadable. It names that one
+            // configuration in the bucket's own marker entry and keeps every
+            // readable configuration of every bucket, so one MinIO-origin blob
+            // cannot cost an operator the whole-cluster backup.
+            let ordinary = ExportBucketMetadata {}
                 .call(
                     admin_request(Method::GET, Uri::from_static("/rustfs/admin/v3/export-bucket-metadata"), Vec::new()),
                     Params::new(),
                 )
                 .await
-                .expect_err("a complete export must fail closed on unreadable targets");
-            assert_eq!(*strict_error.code(), s3s::S3ErrorCode::InternalError);
+                .expect("one unreadable configuration must not abort the ordinary export");
+            assert_eq!(ordinary.output.0, StatusCode::OK);
+            assert!(!ordinary.headers.contains_key("x-rustfs-bucket-metadata-export"));
+            let ordinary_bytes = ordinary.output.1.collect().await.expect("read ordinary archive").to_bytes();
+            let mut ordinary_archive = ZipArchive::new(Cursor::new(&ordinary_bytes)).expect("open ordinary archive");
+            assert!(
+                ordinary_archive
+                    .by_name(&format!("{HEALTHY}/{BUCKET_VERSIONING_CONFIG}"))
+                    .is_ok(),
+                "a healthy bucket must still export while another bucket is unreadable"
+            );
+            assert!(
+                ordinary_archive
+                    .by_name(&format!("{HEALTHY}/{EXPORT_UNREADABLE_MANIFEST}"))
+                    .is_err(),
+                "a bucket whose configurations all read must carry no unreadable marker"
+            );
+            assert!(
+                ordinary_archive
+                    .by_name(&format!("{UNREADABLE}/{BUCKET_TARGETS_FILE}"))
+                    .is_err(),
+                "an unreadable targets blob must never be exported as a configuration"
+            );
+            let mut ordinary_marker = Vec::new();
+            ordinary_archive
+                .by_name(&format!("{UNREADABLE}/{EXPORT_UNREADABLE_MANIFEST}"))
+                .expect("the ordinary export must name the configuration it could not read")
+                .read_to_end(&mut ordinary_marker)
+                .expect("read unreadable marker");
+            assert!(
+                !ordinary_marker
+                    .windows(SECRET.len())
+                    .any(|window| window == SECRET.as_bytes())
+            );
+            let ordinary_marker: serde_json::Value = serde_json::from_slice(&ordinary_marker).expect("the marker must be JSON");
+            assert_eq!(ordinary_marker["bucket"], UNREADABLE);
+            assert_eq!(
+                ordinary_marker["unreadable"].as_array().map(Vec::len),
+                Some(1),
+                "only the configuration that could not be read may be marked: {ordinary_marker}"
+            );
+            assert_eq!(ordinary_marker["unreadable"][0]["config"], BUCKET_TARGETS_FILE);
+            assert!(
+                ordinary_marker["unreadable"][0]["error"].is_string(),
+                "the marker must carry the reason an operator needs to repair the bucket"
+            );
 
             let response = ExportBucketMetadata {}
                 .call(
@@ -1676,6 +1841,12 @@ mod backup_zip_compatibility_tests {
         assert!(archive.by_name(DIAGNOSTIC_EXPORT_MANIFEST).is_err());
         assert!(archive.by_name(&format!("{HEALTHY}/{BUCKET_VERSIONING_CONFIG}")).is_ok());
         assert!(archive.by_name(&format!("{UNREADABLE}/{BUCKET_TARGETS_FILE}")).is_ok());
+        assert!(
+            archive
+                .by_name(&format!("{UNREADABLE}/{EXPORT_UNREADABLE_MANIFEST}"))
+                .is_err(),
+            "the marker must disappear once the configuration reads again"
+        );
     }
 
     #[tokio::test]
@@ -1818,6 +1989,89 @@ mod backup_zip_compatibility_tests {
         }
         let _: ReplicationConfiguration =
             deserialize(&restored.replication_config_xml).expect("old parser must read the newly exported archive payload");
+
+        // rustfs/backlog#2309: a MinIO-origin `.metadata.bin` stores its
+        // targets as a bare JSON array, which `BucketTargets` cannot decode.
+        // Since rustfs/rustfs#7172 that reads as "stored but unreadable" —
+        // which must mark one bucket's one configuration, not abort the
+        // whole-cluster export an operator needs to migrate away.
+        env.make_bucket(UNREADABLE_BUCKET, false).await;
+        metadata_sys::update(UNREADABLE_BUCKET, BUCKET_TARGETS_FILE, MINIO_ARRAY_TARGETS.to_vec())
+            .await
+            .expect("persist the MinIO-shaped targets blob");
+        metadata_sys::get_bucket_targets_config(UNREADABLE_BUCKET)
+            .await
+            .expect_err("a MinIO array-shaped targets blob must read as unreadable, not as an empty set");
+
+        let cluster_export = ExportBucketMetadata {}
+            .call(
+                admin_request(Method::GET, Uri::from_static("/rustfs/admin/v3/export-bucket-metadata"), Vec::new()),
+                Params::new(),
+            )
+            .await
+            .expect("one bucket's unreadable configuration must not abort the whole-cluster export");
+        assert_eq!(cluster_export.output.0, StatusCode::OK);
+        let cluster_archive = cluster_export
+            .output
+            .1
+            .collect()
+            .await
+            .expect("read cluster archive body")
+            .to_bytes()
+            .to_vec();
+        let mut archive = ZipArchive::new(Cursor::new(&cluster_archive)).expect("open cluster archive");
+
+        // Every readable configuration of every other bucket still exports.
+        for (config_file, payload) in persisted_xml_fixtures() {
+            let mut exported_payload = Vec::new();
+            archive
+                .by_name(&format!("{BUCKET}/{config_file}"))
+                .unwrap_or_else(|_| panic!("cluster export must still contain {config_file}"))
+                .read_to_end(&mut exported_payload)
+                .unwrap_or_else(|_| panic!("read exported {config_file}"));
+            assert_eq!(exported_payload, payload, "one bad bucket must not change another bucket's export");
+        }
+        assert!(
+            archive.by_name(&format!("{BUCKET}/{EXPORT_UNREADABLE_MANIFEST}")).is_err(),
+            "a bucket whose configurations all read must carry no unreadable marker"
+        );
+
+        // The unreadable configuration is named rather than fabricated: no
+        // targets entry is exported for it at all.
+        assert!(
+            archive
+                .by_name(&format!("{UNREADABLE_BUCKET}/{BUCKET_TARGETS_FILE}"))
+                .is_err(),
+            "an unreadable targets blob must never be exported as a configuration"
+        );
+        let mut marker = Vec::new();
+        archive
+            .by_name(&format!("{UNREADABLE_BUCKET}/{EXPORT_UNREADABLE_MANIFEST}"))
+            .expect("the export must name the configuration it could not read")
+            .read_to_end(&mut marker)
+            .expect("read unreadable marker");
+        let marker: serde_json::Value = serde_json::from_slice(&marker).expect("the marker must be JSON");
+        assert_eq!(marker["bucket"], UNREADABLE_BUCKET);
+        assert_eq!(
+            marker["unreadable"].as_array().map(Vec::len),
+            Some(1),
+            "only the configuration that could not be read may be marked: {marker}"
+        );
+        assert_eq!(marker["unreadable"][0]["config"], BUCKET_TARGETS_FILE);
+        drop(archive);
+
+        // The marker cannot be misread as a configuration on the way back in:
+        // the importer switches on configuration names and ignores everything
+        // else, so the bucket's stored bytes come through untouched and the
+        // operator still has to repair them explicitly.
+        import_archive(cluster_archive).await;
+        let after_round_trip = metadata_sys::get_config_from_disk(UNREADABLE_BUCKET)
+            .await
+            .expect("the marked bucket must still load after the round trip");
+        assert_eq!(
+            after_round_trip.bucket_targets_config_json, MINIO_ARRAY_TARGETS,
+            "importing the marker must not overwrite or fabricate the bucket's targets configuration"
+        );
     }
 }
 

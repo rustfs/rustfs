@@ -34,6 +34,149 @@ The `scanner` and `heal` subsystems are served by `GetConfigKVHandler` (`rustfs/
 
 ## Test Matrix
 
+### Formal Scanner/Heal ABBA
+
+The `--abba` mode runs five independent scenario cells: `cold-hot`, `fresh-hot`,
+`multi-hot-new`, `running-heal`, and `mrf-replay`. Each scenario runs at least
+three A1/B1/B2/A2 groups for both baseline/candidate with background work on,
+and candidate-only background off/on. A measured leg lasts at least 900
+seconds; the minimum matrix contains 120 legs (30 hours before setup/oracles).
+The existing `performance-ab.yml` supplies the pattern for immutable build
+provenance and failure propagation, but its short Warp workload is not this
+scanner gate. No scheduled workflow starts this matrix automatically.
+
+```bash
+scripts/run_scanner_validation_harness.sh --abba \
+  --manifest scanner-abba.json --adapter /path/to/isolated-deployment-adapter \
+  --out-dir /path/to/new-artifacts --data-root /path/to/new-test-data
+```
+
+Both roots must be new and non-overlapping. Every leg receives a unique data
+directory. The runner checks disk capacity before each leg, never removes data,
+and stops the adapter after success or failure. Retain raw artifacts and inspect
+task ownership before removing any test data. The operator must reserve the
+target machines and map the assigned directory to separate data paths on every
+node; the runner cannot prove remote isolation from local path names.
+
+The manifest has the following JSON contract (all fields are required):
+
+| Field | Value |
+|---|---|
+| `schema`, `evidence` | `1`, and `measured` or `synthetic`. |
+| `rounds`, `duration_seconds`, `min_free_bytes` | 3..10 groups, 900..86400 seconds for measured runs, and the independently estimated free-space reservation in bytes. Synthetic runs may use 1 second. |
+| `baseline`, `candidate` | Each contains executable `binary`, full 40-character `revision`, and verified `sha256`. The runner rehashes binaries before every leg. |
+| `fixed` | `config_sha256`, `dataset_sha256`, `release_flags`, `durability`, `disk_type`, `cache_state`, `load_command`, `resource_isolation`, `topology` (`EC8+4`), and positive `offered_load_ops`. Hashes use 64 lowercase hexadecimal characters. |
+| `oracles` | A map with all five scenario names. Each value contains positive integer `objects`, `versions`, `bytes`, and `sha256` of the independently prepared canonical object/version/content manifest. |
+| `expected_healed_objects` | A map with all five scenario names and independently seeded repair counts. Running-heal and MRF-replay require a positive count. |
+
+Record exact build flags and effective durability settings, not just defaults.
+Use deterministic workload seeds so every isolated leg has the same expected
+object/version/content result. Fix the foreground arrival rate (offered load),
+cache preparation procedure, configuration, and hardware across every leg.
+Do not include credentials in the manifest, adapter output, or saved commands;
+the collector reads `RUSTFS_ACCESS_KEY` and `RUSTFS_SECRET_KEY` from its environment.
+
+#### Deployment Adapter Contract
+
+The runner invokes an executable as `adapter ACTION request.json response.json`
+with no shell evaluation. Actions are separate processes: `prepare`, `measure`,
+`oracle`, and `stop`. Every action must return zero and write a JSON object of
+at most 1 MiB. Logs are kept separately and require an operator-managed disk
+quota. Missing output, timeout, nonzero exit, unknown/missing metrics, zero
+samples, and request errors fail the run. Adapters must terminate their own
+children on failure and `stop` must be idempotent even after partial preparation.
+The runner keeps its session leader unreaped while stopping a failed command
+or collector: it sends TERM, allows the existing ten-second grace period, then
+kills the remaining process group before reaping. This prevents a parent exit
+from hiding live descendants or allowing the group ID to be reused before its
+last signal. A successful `prepare` preserves adapter-owned services until
+`stop`; services that leave the command's process group remain the adapter's
+cleanup responsibility.
+
+The request contains the fixed manifest fields, selected build, scenario, round,
+leg, comparison (`build` or `background`), background mode (`on` or `off`),
+duration, unique `data_dir`, expected object oracle, and expected repair count.
+Adapter responsibilities:
+
+1. `prepare` deploys the selected binary into an authorized isolated topology,
+   checks actual binary/config/durability, initializes deterministic scenario
+   data and the requested cache state, and returns `{"ready": true}`. For measured
+   runs it also returns `collector` with exactly `alias`, `endpoint`, and
+   comma-separated `metrics_endpoints`; the runner starts the existing scanner
+   collector at 60-second cadence while `measure` runs.
+2. `measure` maintains the fixed offered load for the entire requested duration.
+   `cold-hot` retains cold buckets while mutating a hot bucket; `fresh-hot`
+   creates a bucket after scanner startup; `multi-hot-new` combines several hot
+   buckets with a newly created bucket; `running-heal` applies foreground load
+   during active repair; `mrf-replay` replays independently seeded durable repair
+   work. Capture same-window status for bucket-freshness issue #7108. Actual
+   fault injection and dataset generation belong to the reviewed adapter.
+3. `oracle` independently enumerates all objects and versions, reads and checks
+   their complete bytes, and verifies repairs. Return `complete: true`, integer
+   `errors: 0`, and `actual` matching the manifest's expected oracle. Never copy
+   expected values into a measured oracle or infer completion from empty queues.
+4. `stop` stops task-owned workload/server processes and returns `stopped: true`.
+   Preserve data and artifacts for diagnosis. An adapter may restore previous
+   settings but must not delete arbitrary paths or stop unrelated deployments.
+
+The `measure` response echoes the observed `evidence`, `fixed`, `build`,
+`data_dir`, and `background`, plus `sample_count` (1..3600), `elapsed_seconds`,
+and `metrics`. All metrics must be finite nonnegative numbers: `p99_ms`,
+`throughput_ops`, `rss_bytes`, `cpu_seconds`, `iops`, `rpc_count`,
+`cache_clone_bytes`, `encode_bytes`, `save_bytes`, `oldest_age_seconds`,
+`walk_objects`, `cold_walk_objects`, `healed_objects`, `errors`, and `requests`.
+Requests, throughput, and p99 must be positive; errors must be zero. Repair
+counts must match the manifest when background work is on. Keep underlying
+request samples, counter reset checks, profiler captures, and per-node telemetry
+in the cell artifact directory; aggregate values alone do not establish their
+measurement provenance. Missing production instrumentation is a pending gate,
+not permission to report a fabricated zero.
+
+For P2, `measure.convergence` contains booleans `writes_stopped`,
+`last_mutation_observed`, `first_complete_publication`; numeric
+`last_mutation_time`, `last_mutation_observed_time`, `writes_stopped_time`, `window_start`, `window_end`,
+`budget_available_seconds`, `walk_objects`, and `full_walk_objects`. Times use
+one monotonic clock. The window starts after writes stop and the final mutation
+is observed, and ends at the first complete publication. The reference is an
+independent full walk of the same static namespace. Record available budget
+seconds to interpret elapsed time. During continuing writes, omit this proof
+and report useful-work ratio and justified invalidation/re-scan work separately;
+the runner reports P2 pending and does not impose a fixed cumulative walk bound.
+
+The nightly heal workflow clones **`rustfs/auto-testing`** separately and invokes
+`auto-testing/rustfs_heal_test.sh`; that script is not a local `scripts/test`
+entry point. If an adapter uses it, record and verify the external checkout's
+owner and full commit before use. The current workflow clones the default branch,
+so its contents must not be attributed to a RustFS source SHA.
+
+#### Evidence Gates
+
+`report.json` records each group's verdict and the raw responses remain in their
+cell directories. Candidate/build p99 regression must be at most 5% and
+throughput loss at most 3%; candidate background on/off limits are 10% and 5%.
+P1 requires cold-hot walk reduction of at least the baseline cold-walk share
+times 80%, rather than a fixed 80% reduction for every workload. P2 requires
+candidate post-stop work at most 1.2 times the independent full-walk reference.
+Missing candidate convergence proof yields `inconclusive`. A2/A1 or B2/B1 p99
+or throughput drift above 5% also yields `inconclusive`, with exit code 3.
+Correctness errors and non-noisy performance regressions exit 1. Every group
+must pass; a favorable median cannot hide a failing group.
+
+Synthetic success is explicitly `synthetic_validated`, with `performance:
+pending`. It validates orchestration and gate logic only. It proves no runtime,
+distributed, crash, mixed-version, or performance behavior and cannot close the
+performance acceptance gate. Run the fake-adapter self-tests with:
+
+```bash
+scripts/test_scanner_validation_harness.sh
+```
+
+They cover the complete 120-cell schedule, data isolation, missing builds and
+oracles, zero samples/requests, swallowed request errors, offered-load drift,
+incomplete repairs, missing metrics, noise, and P1/P2/p99 regressions. A real
+deployment adapter and actual ABBA artifacts remain required before any measured
+performance or release claim.
+
 Collect at least two runs on the same RustFS commit and the same workload. Keep hardware, commit, object count, object size, bucket count, scanner-enabled state, and foreground workload constant between runs.
 
 | Run | Purpose | Example scanner settings |

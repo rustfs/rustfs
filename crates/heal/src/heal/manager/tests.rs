@@ -103,6 +103,7 @@ struct MockStorage;
 
 fn completed_retention_fixture(completed_at: SystemTime) -> CompletedHealStatus {
     CompletedHealStatus {
+        outcome: None,
         heal_type: HealType::Cluster,
         status: HealTaskStatus::Completed,
         progress: Some(HealProgress {
@@ -288,6 +289,59 @@ pub(super) async fn pause_completed_retention_before_publish(task_id: &str, stat
 }
 
 #[tokio::test]
+async fn canonical_outcome_cancel_wins_before_worker_finalizes_success() {
+    use crate::heal::outcome::{HealAbortReason, HealExecutionOutcome};
+    use crate::heal::task::{OUTCOME_FINISH_TEST_HOOK, OutcomeFinishTestHook};
+    let bucket = "canonical-outcome-cancel-before-finish";
+    let manager = HealManager::new(Arc::new(MockStorage), None);
+    let request = HealRequest::object(bucket.to_string(), "object".to_string(), None);
+    let task_id = request.id.clone();
+    let duplicate = HealRequest::object(bucket.to_string(), "object".to_string(), None);
+    let alias = duplicate.id.clone();
+    let retention_hook = Arc::new(CompletedRetentionHook::default());
+    {
+        let mut hooks = COMPLETED_RETENTION_HOOKS.lock().await;
+        hooks.insert(bucket.to_string(), retention_hook.clone());
+        hooks.insert(task_id.clone(), retention_hook.clone());
+    }
+    let finish_hook = Arc::new(OutcomeFinishTestHook {
+        task_id: task_id.clone(),
+        reached: Notify::new(),
+        release: Notify::new(),
+    });
+    *OUTCOME_FINISH_TEST_HOOK.lock().await = Some(finish_hook.clone());
+    manager.submit_heal_request(request).await.expect("admit original");
+    manager.submit_heal_request(duplicate).await.expect("admit alias");
+    process_manager_queue_once(&manager).await;
+    tokio::time::timeout(Duration::from_secs(5), retention_hook.started.notified())
+        .await
+        .expect("storage started");
+    retention_hook.execute.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), finish_hook.reached.notified())
+        .await
+        .expect("storage returned before outcome finalization");
+    manager.cancel_task(&alias).await.expect("cancel wins publication");
+    finish_hook.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), retention_hook.handoff.notified())
+        .await
+        .expect("scheduler completes cancelled handoff");
+    for token in [&task_id, &alias] {
+        let report = manager.get_task_report(token).await.expect("cancelled token retained");
+        assert_eq!(report.status, HealTaskStatus::Cancelled);
+        assert_eq!(
+            report.outcome.as_ref().expect("frozen outcome").execution,
+            HealExecutionOutcome::Aborted(HealAbortReason::Cancelled)
+        );
+    }
+    retention_hook.finish.notify_one();
+    *OUTCOME_FINISH_TEST_HOOK.lock().await = None;
+    COMPLETED_RETENTION_HOOKS
+        .lock()
+        .await
+        .retain(|key, _| key != bucket && key != &task_id);
+}
+
+#[tokio::test]
 async fn completed_retention_cancel_wins_over_a_prepared_retry_snapshot() {
     let bucket = "completed-retention-retry-cancel";
     let manager = HealManager::new(Arc::new(MockStorage), None);
@@ -325,6 +379,10 @@ async fn completed_retention_cancel_wins_over_a_prepared_retry_snapshot() {
     for token in [&task_id, &alias] {
         let report = manager.get_task_report(token).await.expect("cancelled token retained");
         assert_eq!(report.status, HealTaskStatus::Cancelled);
+        assert_eq!(
+            report.outcome.as_ref().expect("cancelled outcome retained").execution,
+            crate::heal::outcome::HealExecutionOutcome::Aborted(crate::heal::outcome::HealAbortReason::Cancelled)
+        );
         assert_eq!(report.progress.expect("frozen progress").objects_scanned, 1);
     }
     assert!(!manager.retrying_heals.lock().await.contains_key(&task_id));
@@ -391,6 +449,7 @@ async fn completed_retention_scheduler_preserves_progress_aliases_and_atomic_han
             .expect("scheduler archives terminal");
         assert!(!manager.active_heals.lock().await.contains_key(&task_id));
         let expected = task.get_progress().await;
+        let expected_outcome = task.get_outcome().await;
         for token in [&task_id, &alias] {
             assert_eq!(manager.get_task_progress(token).await.expect("terminal progress query"), expected);
             let report = manager
@@ -398,6 +457,7 @@ async fn completed_retention_scheduler_preserves_progress_aliases_and_atomic_han
                 .await
                 .expect("terminal token remains queryable at handoff");
             assert_eq!(report.progress.as_ref(), Some(&expected));
+            assert_eq!(report.outcome.as_deref(), Some(&expected_outcome));
             assert!(report.result_items.is_empty());
             match outcome {
                 "success" => assert_eq!(report.status, HealTaskStatus::Completed),
@@ -1976,6 +2036,7 @@ async fn insert_retrying_request(manager: &HealManager, request: HealRequest) ->
         task_id,
         Arc::new(CompletedHealStatus {
             progress: None,
+            outcome: None,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: request.heal_type,
             status: HealTaskStatus::Retrying {
@@ -2700,6 +2761,7 @@ async fn test_retrying_completion_outranks_the_queue_for_the_same_id() {
         task_id.clone(),
         Arc::new(CompletedHealStatus {
             progress: None,
+            outcome: None,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: request.heal_type.clone(),
             status: HealTaskStatus::Retrying {
@@ -2737,6 +2799,7 @@ async fn test_get_task_status_reads_recent_completed_status() {
         "completed-token".to_string(),
         Arc::new(CompletedHealStatus {
             progress: None,
+            outcome: None,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: HealType::Bucket {
                 bucket: "bucket".to_string(),
@@ -2768,6 +2831,7 @@ async fn test_get_task_report_for_path_reads_completed_items() {
         "completed-token".to_string(),
         Arc::new(CompletedHealStatus {
             progress: None,
+            outcome: None,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: HealType::Object {
                 bucket: "bucket".to_string(),
