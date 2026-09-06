@@ -301,6 +301,24 @@ The pacing gate holds neither namespace locks nor I/O/page permits while sleepin
 
 A missing provider, zero pause, or both class thresholds set to zero preserves unpaced execution. Missing counts follow the existing shared pressure interpreter; they are observations, not health, quorum or resource-ownership proof. The current provider exposes node-level workload classes, so this does not claim independent per-set foreground measurements or a hard global resource budget. Runtime waits increment `rustfs_heal_mainline_throttle_total` with `source=admin`, `result=delayed`, and a foreground-pressure or `recovery_window` reason. Real p99/throughput protection requires the separate W20 fixed-load ABBA measurements.
 
+## Pending Heal Hints
+
+The scanner's persisted pending-heal cache is a best-effort retry backstop, bounded to 10,000 hints per bucket and a 24-hour age limit. These limits do not authorize garbage collection of committed durable repair obligations. A durable owner must retain its independent replay record until verified object completion or an equivalent durable successor permits removal.
+
+Accepted, merged, or policy-dropped admission does not clear an existing hint. Task completion and legacy repair notices also lack the incarnation, set scope, generation, and storage verification needed to prove repair responsibility was discharged. The legacy success path therefore retains hints conservatively; this is not a complete durable MRF handoff protocol.
+
+Pending retries use their persisted attempt count and last-attempt timestamp, starting at 15 minutes and doubling up to six hours. Each bucket submits at most 128 due hints per cycle. Already admitted or policy-dropped hints retry at Low priority; queue-full hints keep High priority but obey the same due-time bound. A changed retry batch synchronizes its pending cache once, including when cancelled, rather than copying the entire table after every admission.
+
+Rediscovery and admission observations update the recorded result but do not postpone an already armed retry. The actual retry loop advances the attempt count and timestamp before awaiting admission, so cancellation or repeated queue-full results cannot reset the retry budget.
+
+| Producer | Current identity and compensation | Durable handoff boundary |
+|---|---|---|
+| Scanner corrupt metadata | Metadata kind with no invented version/set; an existing pending-cache hint remains available for bounded retries. | Cache publication is separate from MRF ingress. Its age/count limits mean it is not an irrevocable repair-obligation ledger. |
+| Read decode failure | Decode kind, available version and erasure-set scope; a later failing read can rediscover the repair. | Nonblocking ingress and in-memory read-repair admission do not acknowledge durable acceptance. |
+| Partial write | Partial-write kind, available version and erasure-set scope; an in-memory heal request is the fast path. | The caller's documented restart-survival requirement is not fulfilled by ignoring the ingress result or by removing the unaccepted journal record at manager admission. Verified durable ownership remains pending. |
+
+Legacy notices carry only bucket/object/version, not a verified storage disposition, incarnation, scope, or durable responsibility generation. They are drained without clearing hints. Terminal callbacks release only their exact node-local ingress lease so rediscovery remains possible; lease generations are not durable successor receipts. Pending migration staging is not activated, and this change does not enable durable tombstones or garbage collection. Positive cleanup requires a storage-owner receipt with the complete responsibility identity and validated commit/fence evidence; neither task status nor the bounded diagnostic outcome window supplies it.
+
 ## Deliberate non-parity with MinIO
 
 These differences from MinIO are design decisions, recorded so they are not re-filed as gaps.

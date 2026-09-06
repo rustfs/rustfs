@@ -15,6 +15,8 @@
 use crate::SCANNER_SLEEPER;
 
 use super::*;
+
+mod mrf_ownership;
 use crate::storage_api::VersionPurgeStatusType;
 use crate::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, TierStats, new_disk, storageclass};
 use rustfs_filemeta::{FileInfo, FileMeta, MetadataResolutionParams};
@@ -350,6 +352,9 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         coverage_frontier: None,
         resume_frontier: None,
         coverage_gap: false,
+        pending_heal_sync_deferred: false,
+        pending_heal_batch_dirty: false,
+        pending_heal_sync_count: 0,
         pending_size_reconciliation_keys: HashSet::new(),
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,
@@ -1132,23 +1137,8 @@ fn pending_heal(
     }
 }
 
-/// The nil-UUID branch of the defensive-UUID invariant: a nil version in
-/// a repaired notice means "no value" and must match unversioned ledger
-/// entries only.
-#[test]
-fn test_mrf_repaired_version_id_maps_nil_to_none() {
-    assert_eq!(mrf_repaired_version_id(None), None);
-    assert_eq!(mrf_repaired_version_id(Some([0u8; 16])), None);
-    let uuid = Uuid::new_v4();
-    assert_eq!(mrf_repaired_version_id(Some(*uuid.as_bytes())), Some(uuid.to_string()));
-}
-
-/// Full wiring of backlog#1894 axis B: notes taken for the scanned bucket
-/// clear exactly the matching Object ledger entries — bucket-level
-/// entries, other buckets' entries, and version-mismatched entries
-/// survive; a real (non-nil) version matches only the same version.
 #[tokio::test]
-async fn test_mrf_repaired_notices_clear_matching_ledger_entries() {
+async fn mrf_ownership_legacy_notices_preserve_pending_entries() {
     use rustfs_common::mrf_channel::note_mrf_repaired;
 
     let (mut scanner, temp_dir) = build_test_scanner().await;
@@ -1176,8 +1166,7 @@ async fn test_mrf_repaired_notices_clear_matching_ledger_entries() {
 
     note_mrf_repaired("bucket", "object-a", None);
     note_mrf_repaired("bucket", "object-b", Some(*Uuid::parse_str(&version).unwrap().as_bytes()));
-    // A nil-UUID notice for object-c means "no value": it clears the
-    // unversioned entry but must not touch the versioned one.
+    // Neither nil nor a matching version proves incarnation, scope or owner.
     note_mrf_repaired("bucket", "object-c", Some([0u8; 16]));
     // A notice for a target the ledger does not track must be a no-op.
     note_mrf_repaired("bucket", "object-untracked", None);
@@ -1194,12 +1183,12 @@ async fn test_mrf_repaired_notices_clear_matching_ledger_entries() {
         .iter()
         .map(|entry| (entry.kind, entry.bucket.as_str(), entry.object.as_deref(), entry.version_id.as_deref()))
         .collect();
-    // Cleared: object-a (no version), object-b (exact version match), and
-    // object-c's unversioned entry (the nil branch matched no-version
-    // only — the versioned object-c entry survives).
     assert_eq!(
         survivors,
         vec![
+            (PendingScannerHealKind::Object, "bucket", Some("object-a"), None),
+            (PendingScannerHealKind::Object, "bucket", Some("object-b"), Some(version.as_str())),
+            (PendingScannerHealKind::Object, "bucket", Some("object-c"), None),
             (
                 PendingScannerHealKind::Object,
                 "bucket",
@@ -1338,7 +1327,7 @@ async fn test_pending_heal_update_keeps_stale_entry_until_retry_prune() {
     );
 
     assert_eq!(scanner.new_cache.info.pending_heals.len(), 1);
-    assert_eq!(scanner.new_cache.info.pending_heals[0].attempts, 2);
+    assert_eq!(scanner.new_cache.info.pending_heals[0].attempts, 1);
     assert_eq!(scanner.new_cache.info.pending_heals[0].object.as_deref(), Some("object"));
     assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
 }
@@ -1371,7 +1360,7 @@ async fn test_pending_heal_queue_full_deduplicates_object_entry() {
     let pending = &scanner.new_cache.info.pending_heals[0];
     assert_eq!(pending.object.as_deref(), Some("object"));
     assert_eq!(pending.version_id.as_deref(), Some("version-a"));
-    assert_eq!(pending.attempts, 2);
+    assert_eq!(pending.attempts, 1);
     assert_eq!(pending.last_admission_result, "dropped");
     assert_eq!(pending.last_admission_reason, "queue_full");
     assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
@@ -1379,7 +1368,7 @@ async fn test_pending_heal_queue_full_deduplicates_object_entry() {
 }
 
 #[tokio::test]
-async fn test_pending_heal_admitted_results_clear_matching_entry() {
+async fn mrf_ownership_admission_preserves_existing_pending() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
 
@@ -1400,7 +1389,8 @@ async fn test_pending_heal_admitted_results_clear_matching_entry() {
         HealAdmissionResult::Accepted,
     );
 
-    assert!(scanner.new_cache.info.pending_heals.is_empty());
+    assert_eq!(scanner.new_cache.info.pending_heals.len(), 1);
+    assert_eq!(scanner.new_cache.info.pending_heals[0].last_admission_result, "accepted");
 
     scanner.update_pending_scanner_heal_after_admission(
         PendingScannerHealKind::Bucket,
@@ -1419,11 +1409,12 @@ async fn test_pending_heal_admitted_results_clear_matching_entry() {
         HealAdmissionResult::Merged,
     );
 
-    assert!(scanner.new_cache.info.pending_heals.is_empty());
+    assert_eq!(scanner.new_cache.info.pending_heals.len(), 2);
+    assert_eq!(scanner.new_cache.info.pending_heals[1].last_admission_result, "merged");
 }
 
 #[tokio::test]
-async fn test_pending_heal_policy_dropped_clears_without_creating_entry() {
+async fn mrf_ownership_policy_drop_does_not_discharge_existing_pending() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
 
@@ -1454,7 +1445,7 @@ async fn test_pending_heal_policy_dropped_clears_without_creating_entry() {
         HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped),
     );
 
-    assert!(scanner.new_cache.info.pending_heals.is_empty());
+    assert_eq!(scanner.new_cache.info.pending_heals.len(), 1);
 }
 
 #[test]

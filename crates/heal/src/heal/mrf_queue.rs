@@ -25,12 +25,13 @@
 //! set, rewritten on a group-commit cadence (every flush interval or flush
 //! threshold new intents). A rewrite is atomic at the record level only — a
 //! torn tail simply truncates during replay because every record carries its
-//! own CRC32. Losing the last flush window (≤500 ms) is acceptable because
-//! every producer keeps its own safety net: read-repair re-detects on the
-//! next failing read, and the scanner's corrupt-metadata branch leaves a
-//! pending-ledger entry behind even when its MRF intent is accepted
-//! (backlog#1894 axis A), so a lost intent is retried by the ledger rather
-//! than waiting for the failed-object TTL to re-scan the path.
+//! own CRC32. Neither ingress nor manager admission is a durable ownership
+//! receipt. The last flush window can be lost. Read-repair can rediscover a
+//! failed read; the scanner retains bounded, expiring retry hints. Partial
+//! writes also use a best-effort in-memory fast path, not a durable successor.
+//! These mechanisms must not be reported as verified repair completion.
+//! The partial-write caller's restart-survival requirement remains unmet by
+//! admission alone; a verified durable handoff is still required.
 
 use super::{DiskStore, HealDiskExt as _, local_disk_map_read};
 use crate::heal::manager::{HealManager, MrfRepairNoticeTarget};
@@ -585,8 +586,8 @@ impl MrfRuntime {
             self.dirty = true;
             match submit_mrf_heal_request(manager, &intent).await {
                 // Accepted intents leave the pending set; the next flush persists the
-                // smaller snapshot. The scanner ledger is cleared later, when the
-                // canonical heal task reaches a successful terminal completion.
+                // smaller snapshot. This is not a durable successor receipt and
+                // does not discharge the producer's existing retry hints.
                 Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {}
                 Ok(HealAdmissionResult::Full) | Ok(HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)) => {
                     intent.attempts = intent.attempts.saturating_add(1);

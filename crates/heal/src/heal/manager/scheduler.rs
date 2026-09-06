@@ -313,7 +313,6 @@ impl HealManager {
                         completed_status_entry.outcome = Some(Arc::new(task.get_outcome().await));
                     }
                     let terminal_completion = !matches!(completed_status, HealTaskStatus::Retrying { .. });
-                    let successful_completion = matches!(completed_status, HealTaskStatus::Completed);
                     // Keep retry ownership continuous: status snapshots acquire
                     // these locks in the same active -> retrying order.
                     let mut retrying_heals_guard = if let (Some((request, _, error)), Some(cancel_token)) =
@@ -375,11 +374,11 @@ impl HealManager {
                         drop(stats);
                         if terminal_completion {
                             let notice_targets = take_mrf_repair_notice_targets(&mrf_repair_notice_targets_clone, &task_id);
-                            if successful_completion {
-                                emit_mrf_repaired_events(notice_targets);
-                            } else {
-                                release_mrf_repair_notice_targets(notice_targets);
-                            }
+                            // Neither task status nor the diagnostic outcome
+                            // window supplies a storage-owned repair receipt.
+                            // Release only the ingress lease for rediscovery;
+                            // preserve the producer's existing retry hints.
+                            release_mrf_repair_notice_targets(notice_targets);
                         }
                     }
 
@@ -703,20 +702,6 @@ fn move_mrf_repair_notice_targets(
         if !targets.contains(&target) {
             targets.push(target);
         }
-    }
-}
-
-fn emit_mrf_repaired_events(targets: Vec<MrfRepairNoticeTarget>) {
-    for target in targets {
-        rustfs_common::mrf_channel::note_mrf_repaired(&target.bucket, &target.object, target.version_id);
-        rustfs_common::mrf_channel::release_mrf_identity(
-            target.kind,
-            &target.bucket,
-            &target.object,
-            target.version_id,
-            target.scope,
-            target.lease,
-        );
     }
 }
 

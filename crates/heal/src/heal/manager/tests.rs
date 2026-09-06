@@ -3096,7 +3096,7 @@ async fn test_cancel_task_removes_queued_request() {
 }
 
 #[tokio::test]
-async fn test_mrf_repaired_notice_waits_for_successful_completion() {
+async fn mrf_ownership_unverified_completion_does_not_emit_repaired() {
     let bucket = "mrf-completion-success";
     let object = "object";
     let version_id = Some([9u8; 16]);
@@ -3126,21 +3126,81 @@ async fn test_mrf_repaired_notice_waits_for_successful_completion() {
     );
 
     process_manager_queue_once(&manager).await;
-    for _ in 0..100 {
-        let events = rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket);
-        if !events.is_empty() {
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0].object.as_ref(), object);
-            assert_eq!(events[0].version_id, version_id);
-            return;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let stats = manager.get_statistics().await;
+            if stats.successful_tasks + stats.failed_tasks > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("successful MRF-owned heal should emit one repaired event");
+    })
+    .await
+    .expect("scheduler completes the task");
+    assert!(rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket).is_empty());
+    assert!(!lock_mrf_repair_notice_targets(&manager.mrf_repair_notice_targets).contains_key(&receipt.task_id));
 }
 
 #[tokio::test]
-async fn test_mrf_repaired_notice_removed_on_queued_cancel_without_event() {
+async fn mrf_ownership_dry_run_and_empty_window_do_not_emit_repaired() {
+    for empty_window in [false, true] {
+        let bucket = if empty_window {
+            "mrf-empty-outcome"
+        } else {
+            "mrf-dry-run-outcome"
+        };
+        let manager = HealManager::new(Arc::new(MockStorage), None);
+        let request = HealRequest::new(
+            if empty_window {
+                HealType::Cluster
+            } else {
+                HealType::Object {
+                    bucket: bucket.to_string(),
+                    object: "object".to_string(),
+                    version_id: None,
+                }
+            },
+            HealOptions {
+                recursive: true,
+                dry_run: !empty_window,
+                recreate_missing: true,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let receipt = manager
+            .submit_mrf_heal_request_with_receipt(request, Arc::from(bucket), Arc::from("object"), None)
+            .await
+            .expect("notice target registered");
+        process_manager_queue_once(&manager).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stats = manager.get_statistics().await;
+                if stats.successful_tasks + stats.failed_tasks > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduler completed");
+        let report = manager.get_task_report(&receipt.task_id).await.expect("completed report");
+        assert_eq!(report.status, HealTaskStatus::Completed);
+        let outcome = report.outcome.expect("canonical outcome");
+        if empty_window {
+            assert!(outcome.objects.is_empty());
+        } else {
+            assert_eq!(
+                outcome.objects[0].disposition,
+                crate::heal::outcome::HealObjectDisposition::DryRunObserved
+            );
+        }
+        assert!(rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn mrf_ownership_queued_cancel_does_not_emit_repaired() {
     let bucket = "mrf-completion-cancel";
     let object = "object";
     let _ = rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket);

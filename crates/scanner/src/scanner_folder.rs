@@ -710,6 +710,10 @@ pub struct FolderScanner {
     coverage_frontier: Option<String>,
     resume_frontier: Option<String>,
     coverage_gap: bool,
+    pending_heal_sync_deferred: bool,
+    pending_heal_batch_dirty: bool,
+    #[cfg(test)]
+    pending_heal_sync_count: usize,
     pending_size_reconciliation_keys: HashSet<String>,
     pending_size_reconciliation_scopes: HashSet<String>,
     pending_size_reconciliation_truncated: bool,
@@ -1080,7 +1084,7 @@ impl FolderScanner {
             scan_mode,
             result,
         );
-        if result.is_admitted() {
+        if result.is_admitted() || matches!(priority, HealChannelPriority::Low) {
             return Ok(result);
         }
 
@@ -2435,6 +2439,10 @@ pub async fn scan_data_folder(
         coverage_frontier: resume_frontier.clone(),
         resume_frontier,
         coverage_gap: false,
+        pending_heal_sync_deferred: false,
+        pending_heal_batch_dirty: false,
+        #[cfg(test)]
+        pending_heal_sync_count: 0,
         pending_size_reconciliation_keys: HashSet::new(),
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,

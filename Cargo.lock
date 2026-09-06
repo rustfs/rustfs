@@ -10745,6 +10745,7 @@ dependencies = [
  "rustfs-data-usage",
  "rustfs-ecstore",
  "rustfs-filemeta",
+ "rustfs-heal",
  "rustfs-heal-contracts",
  "rustfs-lifecycle",
  "rustfs-lock",
