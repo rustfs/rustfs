@@ -3106,6 +3106,97 @@ mod target_repair_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn repair_transaction_rejects_a_bucket_recreated_after_target_validation() {
+        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+            let (_temp, env) = test_env().await;
+            let server = RemoteTargetServer::start().await;
+            let target = server.target();
+            let incarnation = metadata_sys::capture_bucket_metadata_incarnation(BUCKET)
+                .await
+                .expect("capture original bucket");
+            BucketTargetSys::get()
+                .validate_target(BUCKET, &target)
+                .await
+                .expect("validate original source and remote target");
+
+            env.ecstore
+                .delete_bucket(BUCKET, &Default::default())
+                .await
+                .expect("delete original bucket");
+            env.make_bucket(BUCKET, true).await;
+            seed_unreadable(&env).await;
+            let recreated = metadata_sys::get_config_from_disk(BUCKET)
+                .await
+                .expect("load recreated bucket");
+            assert_ne!(recreated.bucket_incarnation_id, incarnation);
+            let file = recreated.save_file_path();
+            let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                .await
+                .expect("read recreated bucket bytes");
+
+            let error = persist_remote_target_repair(BUCKET, target, incarnation)
+                .await
+                .expect_err("validation of a deleted bucket must not authorize repair of its replacement");
+            assert_eq!(error.code(), &S3ErrorCode::NoSuchBucket);
+            assert_eq!(
+                crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                    .await
+                    .expect("read rejected incarnation repair bytes"),
+                before
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn repair_transaction_rejects_versioning_suspended_after_target_validation() {
+        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+            let (_temp, env) = test_env().await;
+            let server = RemoteTargetServer::start().await;
+            let target = server.target();
+            seed_unreadable(&env).await;
+            let incarnation = metadata_sys::capture_bucket_metadata_incarnation(BUCKET)
+                .await
+                .expect("capture source bucket");
+            BucketTargetSys::get()
+                .validate_target(BUCKET, &target)
+                .await
+                .expect("validate versioned source and remote target");
+
+            metadata_sys::update(
+                BUCKET,
+                BUCKET_VERSIONING_CONFIG,
+                b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+            )
+            .await
+            .expect("suspend source versioning after validation");
+            let suspended = metadata_sys::get_config_from_disk(BUCKET)
+                .await
+                .expect("load suspended source bucket");
+            assert_eq!(suspended.bucket_incarnation_id, incarnation);
+            assert!(!suspended.versioning_config.as_ref().expect("persisted versioning").enabled());
+            let file = suspended.save_file_path();
+            let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                .await
+                .expect("read suspended bucket bytes");
+
+            let error = persist_remote_target_repair(BUCKET, target, incarnation)
+                .await
+                .expect_err("a target validated before suspension must not be committed");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(
+                crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                    .await
+                    .expect("read rejected versioning repair bytes"),
+                before
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn failed_repair_transaction_never_reports_a_successful_replacement() {
         temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
             let (_temp, env) = test_env().await;
