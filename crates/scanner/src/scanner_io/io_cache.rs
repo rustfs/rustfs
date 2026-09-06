@@ -39,6 +39,12 @@ pub(super) fn prepare_scoped_set_scan(
     else {
         return None;
     };
+    // The existing cache does not bind each bucket to a durable incarnation.
+    // Listing creation times can come from volume metadata, so even Some(time)
+    // cannot prove that an unselected same-name bucket is the cached bucket.
+    if all_buckets.iter().any(|bucket| !selected_buckets.contains(&bucket.name)) {
+        return None;
+    }
     if selected_buckets.is_empty()
         || !old_cache.info.snapshot_complete
         || old_cache.info.last_update.is_none()
@@ -49,7 +55,7 @@ pub(super) fn prepare_scoped_set_scan(
         || old_cache.info.source != Some(generation.source)
         || old_cache.info.scan_plan_digest != Some(baseline_scan_plan_digest)
         || old_cache.info.cache_key_format != DATA_USAGE_CACHE_KEY_FORMAT
-        || old_cache.checked_flatten_complete_scope(DATA_USAGE_ROOT).is_none()
+        || !old_cache.has_complete_root_inventory(&old_cache.find(DATA_USAGE_ROOT)?.children)
     {
         return None;
     }
@@ -74,21 +80,12 @@ pub(super) fn prepare_scoped_set_scan(
         cache: HashMap::new(),
     };
     cache.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
-    let root_hash = crate::hash_path(DATA_USAGE_ROOT);
     let mut current_bucket_names = HashSet::with_capacity(all_buckets.len());
     for bucket in all_buckets {
         if !current_bucket_names.insert(bucket.name.as_str()) {
             return None;
         }
-        if selected_buckets.contains(&bucket.name) {
-            cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
-            continue;
-        }
-
-        let bucket_hash = crate::hash_path(&bucket.name);
-        old_cache.find(&bucket.name)?;
-        cache.copy_with_children(old_cache, &bucket_hash, &Some(root_hash.clone()));
-        cache.find(&bucket.name)?;
+        cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
     }
 
     Some(PreparedScopedSetScan {
@@ -118,6 +115,8 @@ impl ScannerIOCache for SetDisks {
             all_buckets,
             scope,
             digest: scan_plan_digest,
+            bucket_coverage_digest,
+            requires_full_scan,
             execution_digest,
             leader_epoch,
             tier_registry_generation,
@@ -127,6 +126,8 @@ impl ScannerIOCache for SetDisks {
             pending_maintenance_work,
             cache_cycle_floor,
         } = scan_plan;
+        let scan_plan_digest = scanner_bucket_work_digest(scan_plan_digest, scan_mode, requires_full_scan);
+        let bucket_work_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
         let pool_label = self.pool_index.to_string();
         let set_label = self.set_index.to_string();
 
@@ -169,8 +170,9 @@ impl ScannerIOCache for SetDisks {
                 scan_plan_digest,
             },
         );
-        let mut scoped_cache = scoped_scan.map(|prepared| {
+        let mut scoped_cache = scoped_scan.map(|mut prepared| {
             buckets = prepared.buckets;
+            prepared.cache.info.scan_coverage_digest = Some(bucket_coverage_digest);
             prepared.cache
         });
         if buckets.is_empty() {
@@ -186,6 +188,7 @@ impl ScannerIOCache for SetDisks {
                             tier_registry_generation: Some(tier_registry_generation),
                             source: Some(source),
                             scan_plan_digest: Some(scan_plan_digest),
+                            scan_coverage_digest: Some(bucket_coverage_digest),
                             cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
                             ..Default::default()
                         },
@@ -475,6 +478,7 @@ impl ScannerIOCache for SetDisks {
                     source: Some(source),
                     snapshot_complete: false,
                     scan_plan_digest: Some(scan_plan_digest),
+                    scan_coverage_digest: Some(bucket_coverage_digest),
                     cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
                     lkg_snapshot_complete: old_cache.info.lkg_snapshot_complete,
                     lkg_next_cycle: old_cache.info.lkg_next_cycle,
@@ -644,7 +648,7 @@ impl ScannerIOCache for SetDisks {
 
                     let cache_name = path_join_buf(&[&bucket.name, DATA_USAGE_CACHE_NAME]);
                     let bucket_scan_plan_digest =
-                        scanner_bucket_cache_digest(execution_digest, dirty_usage_buckets_clone.get(&bucket.name).copied());
+                        scanner_bucket_cache_digest(bucket_work_digest, dirty_usage_buckets_clone.get(&bucket.name).copied());
 
                     if let Some(server_epoch) = remote_server_epoch {
                         let request_sequence = remote_session_sequence;
@@ -890,6 +894,17 @@ impl ScannerIOCache for SetDisks {
                             continue;
                         }
                     };
+                    // Lack of an authoritative legacy identity disables the new
+                    // checkpoint protocol; the existing full rebuild remains available.
+                    let checkpoint_identity = scanner_bucket_checkpoint_identity(
+                        &store_clone_clone,
+                        &bucket.name,
+                        expected_publication_epoch_clone,
+                        tier_registry_generation,
+                        scan_mode,
+                    )
+                    .await
+                    .ok();
                     let scan_state = current_cache_root_or_prepare_with_generation(
                         &mut cache,
                         &bucket.name,
@@ -900,6 +915,7 @@ impl ScannerIOCache for SetDisks {
                         DataUsageCacheReuseOptions {
                             require_source: require_cache_source,
                             tier_registry_generation: Some(tier_registry_generation),
+                            checkpoint_identity,
                         },
                     );
                     let outcome = match scan_state {
@@ -1049,6 +1065,21 @@ impl ScannerIOCache for SetDisks {
                             }
                         }
                     };
+                    if let Some(expected) = checkpoint_identity
+                        && scanner_bucket_checkpoint_identity(
+                            &store_clone_clone,
+                            &bucket.name,
+                            expected_publication_epoch_clone,
+                            tier_registry_generation,
+                            scan_mode,
+                        )
+                        .await
+                        .ok()
+                            != Some(expected)
+                    {
+                        record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                        continue;
+                    }
                     let scan_outcome = match scan_result {
                         Ok(scan_outcome) => scan_outcome,
                         Err(e) => {
