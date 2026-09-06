@@ -1939,7 +1939,7 @@ mod tests {
         let gate = extract_block_between_markers(
             production,
             "async fn authorize_recovery_admin_request",
-            "fn transition_transaction_id_from_params",
+            "async fn authorize_transition_admin_request",
         );
         assert!(gate.contains("let credentials = authorize_admin_request("));
         assert!(gate.contains("recovery_actor_sha256(&credentials)"));
@@ -2153,7 +2153,7 @@ mod tests {
         let inspect = src
             .split("impl Operation for TransitionReconcileInspectHandler")
             .nth(1)
-            .and_then(|block| block.split("pub struct IlmRecoveryControlListHandler").next())
+            .and_then(|block| block.split("impl Operation for TransitionReconcileApplyHandler").next())
             .expect("inspect handler block");
         assert!(inspect.contains("AdminAction::ListTierAction"));
         assert!(!inspect.contains("AdminAction::SetTierAction"));
@@ -2502,7 +2502,7 @@ mod tests {
         let wrapper = extract_block_between_markers(
             production,
             "async fn authorize_transition_admin_request",
-            "async fn authorize_recovery_admin_request",
+            "fn transition_transaction_id_from_params",
         );
 
         assert_eq!(
