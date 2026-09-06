@@ -2305,8 +2305,8 @@ mod tests {
             assert_eq!(fixture.object_info.parts.len(), 2);
             let tail = &fixture.object_info.parts[1];
             assert_eq!(tail.actual_size, 0, "{kind}: final part has no plaintext");
-            if kind == "compressed" && !cfg!(feature = "rio-v2") {
-                assert_eq!(tail.size, 0, "legacy compression emits no bytes for an empty part");
+            if kind == "compressed" {
+                assert_eq!(tail.size, 0, "unpadded compression emits no bytes for an empty part");
             } else {
                 assert!(tail.size > 0, "{kind}: the empty part still has a stored frame");
             }
