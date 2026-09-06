@@ -20,6 +20,7 @@ use crate::{DataUsageCacheSource, DataUsageScanPlanDigest};
 use std::io::Cursor;
 use tokio::io::AsyncReadExt;
 
+mod deep_compacted;
 mod segment_observation;
 
 const CACHE_NAME: &str = "bucket/checkpoint-fixture.bin";

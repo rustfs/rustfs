@@ -1828,7 +1828,12 @@ impl FolderScanner {
                         }
                     }
                     FolderScanSource::Existing => {
-                        if !forward_sweep && !into.compacted && self.old_cache.is_compacted(&h) {
+                        // Usage sampling is not proof that a Deep check ran.
+                        if self.scan_mode != HealScanMode::Deep
+                            && !forward_sweep
+                            && !into.compacted
+                            && self.old_cache.is_compacted(&h)
+                        {
                             let next_cycle = self.old_cache.info.next_cycle as u32;
                             if !h.mod_(next_cycle, data_usage_update_dir_cycles()) {
                                 // Transfer and add as child...
