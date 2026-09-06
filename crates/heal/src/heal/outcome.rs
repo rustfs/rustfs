@@ -15,6 +15,7 @@
 //! Execution results are separate from repair responsibility. A legacy
 //! successful storage call supplies no authoritative repair receipt.
 
+use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, time::SystemTime};
 use uuid::Uuid;
 
@@ -22,14 +23,16 @@ const MAX_OUTCOME_ITEMS: usize = 128;
 const MAX_OUTCOME_BYTES: usize = 64 * 1024;
 const MAX_OUTCOME_DETAIL_BYTES: usize = 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HealObjectKind {
     Object,
     Metadata,
     Decode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HealObjectIdentity {
     pub kind: HealObjectKind,
     pub bucket: String,
@@ -41,7 +44,8 @@ pub struct HealObjectIdentity {
     pub set_index: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HealDeferredReason {
     DanglingDeleteGrace,
     TransientUsageCache,
@@ -49,14 +53,21 @@ pub enum HealDeferredReason {
     Deadline,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HealFailureClass {
     Recoverable,
     RetryExhausted,
     Permanent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "state",
+    content = "details",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum HealObjectDisposition {
     /// The legacy storage response does not prove the requested check or commit.
     Unknown,
@@ -72,7 +83,8 @@ pub enum HealObjectDisposition {
     DryRunObserved,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HealObjectOutcome {
     pub identity: HealObjectIdentity,
     pub disposition: HealObjectDisposition,
@@ -89,7 +101,8 @@ impl HealObjectOutcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HealTraversalCoverage {
     #[default]
     Unknown,
@@ -97,14 +110,16 @@ pub enum HealTraversalCoverage {
     Complete,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HealAbortReason {
     Cancelled,
     Deadline,
     Untraversable,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "reason", rename_all = "snake_case")]
 pub enum HealExecutionOutcome {
     #[default]
     Pending,
@@ -114,7 +129,8 @@ pub enum HealExecutionOutcome {
     Aborted(HealAbortReason),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HealOutcomeCounters {
     pub processed: u64,
     pub healed: u64,
@@ -127,7 +143,8 @@ pub struct HealOutcomeCounters {
     pub overflowed: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HealTaskOutcome {
     pub execution: HealExecutionOutcome,
     pub coverage: HealTraversalCoverage,
@@ -135,11 +152,99 @@ pub struct HealTaskOutcome {
     /// A bounded diagnostic window, not a complete responsibility ledger.
     pub objects: VecDeque<HealObjectOutcome>,
     pub objects_truncated: bool,
+    #[serde(skip)]
     retained_object_bytes: usize,
+    #[serde(skip)]
     untraversable: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum HealOutcomeWireError {
+    #[error("heal outcome is missing execution or counters")]
+    MissingFields,
+    #[error("heal outcome has invalid or unsupported execution fields")]
+    InvalidFields(#[from] serde_json::Error),
+    #[error("finished heal summary contradicts its canonical outcome")]
+    ContradictoryCompletion,
+}
+
+/// Reconcile a peer's successful legacy summary using the canonical owner types.
+/// A running retry may legitimately retain the preceding attempt's outcome.
+pub fn legacy_wire_status<'a>(
+    summary: &'a str,
+    wire: &serde_json::Value,
+    truncated: bool,
+) -> Result<(&'a str, Option<String>), HealOutcomeWireError> {
+    if summary != "finished" {
+        return Ok((summary, None));
+    }
+    let execution = HealExecutionOutcome::deserialize(wire.get("execution").ok_or(HealOutcomeWireError::MissingFields)?)?;
+    let counters = HealOutcomeCounters::deserialize(wire.get("counters").ok_or(HealOutcomeWireError::MissingFields)?)?;
+    if matches!(execution, HealExecutionOutcome::Pending | HealExecutionOutcome::Running)
+        || (execution == HealExecutionOutcome::Completed && counters.failed > 0)
+    {
+        return Err(HealOutcomeWireError::ContradictoryCompletion);
+    }
+    let (adapted, detail) = legacy_execution_status(summary, None, execution, &counters);
+    Ok((
+        adapted,
+        if adapted != summary {
+            heal_status_detail(detail, truncated)
+        } else {
+            None
+        },
+    ))
+}
+
+pub(crate) fn heal_status_detail(detail: Option<String>, truncated: bool) -> Option<String> {
+    if !truncated {
+        return detail;
+    }
+    let truncation = "heal result items were truncated";
+    Some(detail.map_or_else(|| truncation.to_string(), |detail| format!("{detail}; {truncation}")))
+}
+
+fn legacy_execution_status<'a>(
+    summary: &'a str,
+    detail: Option<String>,
+    execution: HealExecutionOutcome,
+    counters: &HealOutcomeCounters,
+) -> (&'a str, Option<String>) {
+    if summary != "finished" {
+        return (summary, detail);
+    }
+    match execution {
+        HealExecutionOutcome::CompletedWithErrors => (
+            "stopped",
+            Some(format!("heal traversal completed with errors: {} failed objects", counters.failed)),
+        ),
+        HealExecutionOutcome::Aborted(reason) => {
+            let reason = match reason {
+                HealAbortReason::Cancelled => "cancelled",
+                HealAbortReason::Deadline => "timed out",
+                HealAbortReason::Untraversable => "untraversable",
+            };
+            ("stopped", Some(format!("heal task {reason}")))
+        }
+        HealExecutionOutcome::Completed if counters.unknown > 0 => (
+            summary,
+            Some(format!(
+                "heal traversal completed; authoritative storage proof is unavailable for {} objects",
+                counters.unknown
+            )),
+        ),
+        HealExecutionOutcome::Pending | HealExecutionOutcome::Running => {
+            ("running", Some("heal execution has not reached a terminal outcome".to_string()))
+        }
+        HealExecutionOutcome::Completed => (summary, detail),
+    }
+}
+
 impl HealTaskOutcome {
+    pub(crate) fn legacy_status<'a>(&self, summary: &'a str, detail: Option<String>) -> (&'a str, Option<String>) {
+        legacy_execution_status(summary, detail, self.execution, &self.counters)
+    }
+
     pub(crate) fn start(&mut self) {
         if self.execution != HealExecutionOutcome::Aborted(HealAbortReason::Cancelled) {
             self.execution = HealExecutionOutcome::Running;
@@ -290,6 +395,69 @@ mod canonical_outcome_tests {
                 .is_none_or(|detail| detail.len() <= MAX_OUTCOME_DETAIL_BYTES)
         }));
         assert!(outcome.objects.len() < MAX_OUTCOME_ITEMS);
+    }
+
+    #[test]
+    fn outcome_v3_serialization_keeps_unverified_dispositions_and_window_bounds() {
+        let mut outcome = HealTaskOutcome::default();
+        for disposition in [
+            HealObjectDisposition::Unknown,
+            HealObjectDisposition::Deferred {
+                reason: HealDeferredReason::DanglingDeleteGrace,
+                retry_not_before: None,
+            },
+            HealObjectDisposition::DryRunObserved,
+        ] {
+            outcome.record(item(disposition));
+        }
+        outcome.finish(None);
+        let wire = serde_json::to_value(&outcome).expect("canonical wire view");
+        assert_eq!(wire["execution"]["state"], "completed");
+        assert_eq!(wire["counters"]["healed"], 0);
+        assert_eq!(wire["counters"]["skipped"], 3);
+        assert_eq!(wire["objects"][1]["disposition"]["details"]["reason"], "dangling_delete_grace");
+        assert!(wire["objects"][1]["identity"]["bucketIncarnationId"].is_null());
+        for _ in 0..MAX_OUTCOME_ITEMS + 1 {
+            let mut result = item(HealObjectDisposition::Unknown);
+            result.detail = Some("\"".repeat(MAX_OUTCOME_DETAIL_BYTES));
+            outcome.record(result);
+        }
+        let bytes = serde_json::to_vec(&outcome).expect("bounded canonical samples");
+        assert!(
+            bytes.len() < 8 * MAX_OUTCOME_BYTES,
+            "JSON escaping remains bounded independently of object count"
+        );
+        assert!(outcome.objects_truncated);
+    }
+
+    #[test]
+    fn outcome_v3_wire_consistency_rejects_unknown_success_without_rejecting_extensions() {
+        let mut outcome = HealTaskOutcome::default();
+        outcome.finish(None);
+        let mut wire = serde_json::to_value(&outcome).expect("canonical snapshot");
+        wire["execution"]["futureField"] = serde_json::json!({"new": true});
+        wire["counters"]["futureCounter"] = serde_json::json!(42);
+        assert_eq!(
+            legacy_wire_status("finished", &wire, false).expect("unknown extension fields"),
+            ("finished", None)
+        );
+        wire["execution"]["state"] = serde_json::json!("future_execution");
+        assert!(legacy_wire_status("finished", &wire, false).is_err());
+        assert_eq!(
+            legacy_wire_status("running", &wire, false).expect("unknown nonterminal outcome"),
+            ("running", None)
+        );
+        wire["execution"] = serde_json::json!({"state":"completed"});
+        wire["counters"]["failed"] = serde_json::json!(1);
+        assert!(matches!(
+            legacy_wire_status("finished", &wire, false),
+            Err(HealOutcomeWireError::ContradictoryCompletion)
+        ));
+        wire.as_object_mut().expect("object").remove("execution");
+        assert!(matches!(
+            legacy_wire_status("finished", &wire, false),
+            Err(HealOutcomeWireError::MissingFields)
+        ));
     }
 
     #[test]

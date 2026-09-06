@@ -76,6 +76,8 @@ struct HealTaskStatusPayload<'a> {
     min_seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     progress: Option<&'a HealProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<&'a super::outcome::HealTaskOutcome>,
 }
 
 fn u64_is_zero(value: &u64) -> bool {
@@ -87,17 +89,18 @@ fn encode_heal_task_status_payload(
     mut items: Vec<HealResultItem>,
     progress: Option<&HealProgress>,
     mut truncated: bool,
-    next_seq: u64,
-    min_seq: u64,
+    sequence: (u64, u64),
+    outcome: Option<&super::outcome::HealTaskOutcome>,
 ) -> Result<(Vec<u8>, bool)> {
     loop {
         let data = serde_json::to_vec(&HealTaskStatusPayload {
             summary,
             items: &items,
             truncated,
-            next_seq,
-            min_seq,
+            next_seq: sequence.0,
+            min_seq: sequence.1,
             progress,
+            outcome,
         })
         .map_err(|e| Error::Serialization(format!("failed to serialize heal task status: {e}")))?;
         if data.len() <= MAX_HEAL_STATUS_PAYLOAD_SIZE {
@@ -111,25 +114,21 @@ fn encode_heal_task_status_payload(
     }
 }
 
-fn heal_status_detail(detail: Option<String>, truncated: bool) -> Option<String> {
-    if !truncated {
-        return detail;
-    }
-    let truncation = "heal result items were truncated";
-    Some(detail.map_or_else(|| truncation.to_string(), |detail| format!("{detail}; {truncation}")))
-}
-
 fn encode_heal_status_response(
     summary: &str,
     items: Vec<HealResultItem>,
     progress: Option<&HealProgress>,
     detail: Option<String>,
     truncated: bool,
-    next_seq: u64,
-    min_seq: u64,
+    sequence: (u64, u64),
+    outcome: Option<&super::outcome::HealTaskOutcome>,
 ) -> Result<(Vec<u8>, Option<String>)> {
-    let (data, truncated) = encode_heal_task_status_payload(summary, items, progress, truncated, next_seq, min_seq)?;
-    Ok((data, heal_status_detail(detail, truncated)))
+    let (summary, detail) = match outcome {
+        Some(outcome) => outcome.legacy_status(summary, detail),
+        None => (summary, detail),
+    };
+    let (data, truncated) = encode_heal_task_status_payload(summary, items, progress, truncated, sequence, outcome)?;
+    Ok((data, super::outcome::heal_status_detail(detail, truncated)))
 }
 
 impl HealChannelProcessor {
@@ -439,6 +438,7 @@ impl HealChannelProcessor {
                 .await
         };
 
+        let outcome = report.as_ref().ok().and_then(|report| report.outcome.clone());
         let (summary, detail, items, truncated, progress, next_seq, min_seq) = match report {
             Ok(HealTaskReport {
                 status: HealTaskStatus::Pending | HealTaskStatus::Running,
@@ -576,8 +576,15 @@ impl HealChannelProcessor {
             }
         };
 
-        let (data, detail) =
-            encode_heal_status_response(&summary, items, progress.as_ref(), detail, truncated, next_seq, min_seq)?;
+        let (data, detail) = encode_heal_status_response(
+            &summary,
+            items,
+            progress.as_ref(),
+            detail,
+            truncated,
+            (next_seq, min_seq),
+            outcome.as_deref(),
+        )?;
 
         let response = HealChannelResponse {
             request_id: client_token,
@@ -866,12 +873,141 @@ mod tests {
             ..Default::default()
         }];
 
-        let (data, detail) = encode_heal_status_response("running", items, None, None, false, 0, 0).unwrap();
+        let (data, detail) = encode_heal_status_response("running", items, None, None, false, (0, 0), None).unwrap();
 
         assert!(data.len() <= MAX_HEAL_STATUS_PAYLOAD_SIZE);
         let payload: serde_json::Value = serde_json::from_slice(&data).unwrap();
         assert_eq!(payload["truncated"], true);
         assert!(payload["items"].as_array().unwrap().is_empty());
+        assert_eq!(detail.as_deref(), Some("heal result items were truncated"));
+    }
+
+    #[test]
+    fn outcome_v3_fixture_matches_canonical_owner_and_preserves_legacy_terminals() {
+        use crate::heal::outcome::*;
+        let cases: serde_json::Value = serde_json::from_str(include_str!("../../../madmin/tests/fixtures/heal-outcome-v3.json"))
+            .expect("shared client fixtures");
+        for case in cases.as_array().expect("fixture cases") {
+            if case.get("remoteResponse").is_some() {
+                continue;
+            }
+            let mut outcome = HealTaskOutcome::default();
+            let name = case["name"].as_str().expect("case name");
+            if matches!(name, "unknown" | "completed_with_errors") {
+                let disposition = if name == "unknown" {
+                    HealObjectDisposition::Unknown
+                } else {
+                    outcome.attempt_failed();
+                    HealObjectDisposition::Failed(HealFailureClass::RetryExhausted)
+                };
+                outcome.record(HealObjectOutcome {
+                    identity: HealObjectIdentity {
+                        kind: HealObjectKind::Object,
+                        bucket: "bucket".into(),
+                        object: "object".into(),
+                        version_id: None,
+                        bucket_incarnation_id: None,
+                        pool_index: None,
+                        set_index: None,
+                    },
+                    disposition,
+                    detail: None,
+                });
+            }
+            let abort = match name {
+                "cancelled" => Some(HealAbortReason::Cancelled),
+                "deadline" => Some(HealAbortReason::Deadline),
+                "untraversable" => Some(HealAbortReason::Untraversable),
+                _ => None,
+            };
+            outcome.finish(abort);
+            let expected = &case["response"];
+            let initial_detail = abort.map(|reason| {
+                match reason {
+                    HealAbortReason::Cancelled => "heal task cancelled",
+                    HealAbortReason::Deadline => "heal task timed out",
+                    HealAbortReason::Untraversable => "heal listing is untraversable",
+                }
+                .to_string()
+            });
+            let (bytes, detail) = encode_heal_status_response(
+                if abort.is_some() { "stopped" } else { "finished" },
+                Vec::new(),
+                None,
+                initial_detail,
+                true,
+                (9, 4),
+                Some(&outcome),
+            )
+            .expect("canonical owner encoding");
+            let decoded: serde_json::Value = serde_json::from_slice(&bytes).expect("wire payload");
+            assert_eq!(decoded["summary"], expected["summary"], "{name}");
+            assert_eq!(detail.unwrap_or_default(), expected["detail"].as_str().expect("detail"), "{name}");
+            assert_eq!(decoded["outcome"], expected["outcome"], "{name}");
+            assert_eq!((decoded["next_seq"].as_u64(), decoded["min_seq"].as_u64()), (Some(9), Some(4)));
+            assert!(decoded["outcome"].get("retainedObjectBytes").is_none());
+            assert!(decoded["outcome"].get("untraversable").is_none());
+        }
+    }
+
+    #[test]
+    fn outcome_v3_abort_cannot_be_hidden_by_a_finished_status() {
+        use crate::heal::outcome::{HealAbortReason, HealTaskOutcome};
+        for reason in [
+            HealAbortReason::Cancelled,
+            HealAbortReason::Deadline,
+            HealAbortReason::Untraversable,
+        ] {
+            let mut outcome = HealTaskOutcome::default();
+            outcome.finish(Some(reason));
+            let (data, detail) = encode_heal_status_response("finished", Vec::new(), None, None, false, (0, 0), Some(&outcome))
+                .expect("canonical abort adapter");
+            let json: serde_json::Value = serde_json::from_slice(&data).expect("public state");
+            assert_eq!(json["summary"], "stopped");
+            assert_eq!(json["outcome"]["execution"]["state"], "aborted");
+            assert!(detail.is_some());
+        }
+    }
+
+    #[test]
+    fn outcome_v3_payload_bound_keeps_cumulative_outcome_and_cursors() {
+        use crate::heal::outcome::*;
+        let mut outcome = HealTaskOutcome::default();
+        outcome.start();
+        for index in 0..256 {
+            outcome.record(HealObjectOutcome {
+                identity: HealObjectIdentity {
+                    kind: HealObjectKind::Object,
+                    bucket: "bucket".into(),
+                    object: format!("object-{index}"),
+                    version_id: None,
+                    bucket_incarnation_id: None,
+                    pool_index: None,
+                    set_index: None,
+                },
+                disposition: HealObjectDisposition::Unknown,
+                detail: Some("\"".repeat(1024)),
+            });
+        }
+        let retained = outcome.objects.len();
+        let items = vec![
+            HealResultItem::default(),
+            HealResultItem {
+                detail: "x".repeat(MAX_HEAL_STATUS_PAYLOAD_SIZE + 1),
+                ..Default::default()
+            },
+        ];
+        let (bytes, detail) = encode_heal_status_response("running", items, None, None, false, (9, 4), Some(&outcome))
+            .expect("bounded status with cumulative outcome");
+        assert!(bytes.len() <= MAX_HEAL_STATUS_PAYLOAD_SIZE);
+        let wire: serde_json::Value = serde_json::from_slice(&bytes).expect("bounded payload");
+        assert_eq!(wire["items"].as_array().expect("items").len(), 1);
+        assert_eq!(wire["truncated"], true);
+        assert_eq!((wire["next_seq"].as_u64(), wire["min_seq"].as_u64()), (Some(9), Some(4)));
+        assert_eq!(wire["outcome"]["counters"]["processed"], 256);
+        assert_eq!(wire["outcome"]["counters"]["healed"], 0);
+        assert_eq!(wire["outcome"]["objects"].as_array().expect("outcome window").len(), retained);
+        assert!(retained < 256 && outcome.objects_truncated);
         assert_eq!(detail.as_deref(), Some("heal result items were truncated"));
     }
 

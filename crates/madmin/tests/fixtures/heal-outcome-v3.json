@@ -1,0 +1,472 @@
+[
+  {
+    "name": "completed",
+    "cliExit": 0,
+    "response": {
+      "summary": "finished",
+      "detail": "heal result items were truncated",
+      "startTime": "2026-01-01T00:00:00Z",
+      "settings": {
+        "recursive": true,
+        "scanMode": 1
+      },
+      "items": [],
+      "truncated": true,
+      "nextSeq": 9,
+      "minSeq": 4,
+      "progress": {
+        "objectsScanned": 11,
+        "objectsHealed": 7
+      },
+      "outcome": {
+        "execution": {
+          "state": "completed"
+        },
+        "coverage": "complete",
+        "counters": {
+          "processed": 0,
+          "healed": 0,
+          "unchanged": 0,
+          "skipped": 0,
+          "failed": 0,
+          "unknown": 0,
+          "attemptFailures": 0,
+          "overflowed": false
+        },
+        "objects": [],
+        "objectsTruncated": false
+      }
+    }
+  },
+  {
+    "name": "unknown",
+    "cliExit": 0,
+    "response": {
+      "summary": "finished",
+      "detail": "heal traversal completed; authoritative storage proof is unavailable for 1 objects; heal result items were truncated",
+      "startTime": "2026-01-01T00:00:00Z",
+      "settings": {
+        "recursive": true,
+        "scanMode": 1
+      },
+      "items": [],
+      "truncated": true,
+      "nextSeq": 9,
+      "minSeq": 4,
+      "progress": {
+        "objectsScanned": 11,
+        "objectsHealed": 7
+      },
+      "outcome": {
+        "execution": {
+          "state": "completed"
+        },
+        "coverage": "complete",
+        "counters": {
+          "processed": 1,
+          "healed": 0,
+          "unchanged": 0,
+          "skipped": 1,
+          "failed": 0,
+          "unknown": 1,
+          "attemptFailures": 0,
+          "overflowed": false
+        },
+        "objects": [
+          {
+            "identity": {
+              "kind": "object",
+              "bucket": "bucket",
+              "object": "object",
+              "versionId": null,
+              "bucketIncarnationId": null,
+              "poolIndex": null,
+              "setIndex": null
+            },
+            "disposition": {
+              "state": "unknown"
+            },
+            "detail": null
+          }
+        ],
+        "objectsTruncated": false
+      }
+    }
+  },
+  {
+    "name": "completed_with_errors",
+    "cliExit": 1,
+    "response": {
+      "summary": "stopped",
+      "detail": "heal traversal completed with errors: 1 failed objects; heal result items were truncated",
+      "startTime": "2026-01-01T00:00:00Z",
+      "settings": {
+        "recursive": true,
+        "scanMode": 1
+      },
+      "items": [],
+      "truncated": true,
+      "nextSeq": 9,
+      "minSeq": 4,
+      "progress": {
+        "objectsScanned": 11,
+        "objectsHealed": 7
+      },
+      "outcome": {
+        "execution": {
+          "state": "completed_with_errors"
+        },
+        "coverage": "complete",
+        "counters": {
+          "processed": 1,
+          "healed": 0,
+          "unchanged": 0,
+          "skipped": 0,
+          "failed": 1,
+          "unknown": 0,
+          "attemptFailures": 1,
+          "overflowed": false
+        },
+        "objects": [
+          {
+            "identity": {
+              "kind": "object",
+              "bucket": "bucket",
+              "object": "object",
+              "versionId": null,
+              "bucketIncarnationId": null,
+              "poolIndex": null,
+              "setIndex": null
+            },
+            "disposition": {
+              "state": "failed",
+              "details": "retry_exhausted"
+            },
+            "detail": null
+          }
+        ],
+        "objectsTruncated": false
+      }
+    }
+  },
+  {
+    "name": "cancelled",
+    "cliExit": 1,
+    "response": {
+      "summary": "stopped",
+      "detail": "heal task cancelled; heal result items were truncated",
+      "startTime": "2026-01-01T00:00:00Z",
+      "settings": {
+        "recursive": true,
+        "scanMode": 1
+      },
+      "items": [],
+      "truncated": true,
+      "nextSeq": 9,
+      "minSeq": 4,
+      "progress": {
+        "objectsScanned": 11,
+        "objectsHealed": 7
+      },
+      "outcome": {
+        "execution": {
+          "state": "aborted",
+          "reason": "cancelled"
+        },
+        "coverage": "partial",
+        "counters": {
+          "processed": 0,
+          "healed": 0,
+          "unchanged": 0,
+          "skipped": 0,
+          "failed": 0,
+          "unknown": 0,
+          "attemptFailures": 0,
+          "overflowed": false
+        },
+        "objects": [],
+        "objectsTruncated": false
+      }
+    }
+  },
+  {
+    "name": "deadline",
+    "cliExit": 1,
+    "response": {
+      "summary": "stopped",
+      "detail": "heal task timed out; heal result items were truncated",
+      "startTime": "2026-01-01T00:00:00Z",
+      "settings": {
+        "recursive": true,
+        "scanMode": 1
+      },
+      "items": [],
+      "truncated": true,
+      "nextSeq": 9,
+      "minSeq": 4,
+      "progress": {
+        "objectsScanned": 11,
+        "objectsHealed": 7
+      },
+      "outcome": {
+        "execution": {
+          "state": "aborted",
+          "reason": "deadline"
+        },
+        "coverage": "partial",
+        "counters": {
+          "processed": 0,
+          "healed": 0,
+          "unchanged": 0,
+          "skipped": 0,
+          "failed": 0,
+          "unknown": 0,
+          "attemptFailures": 0,
+          "overflowed": false
+        },
+        "objects": [],
+        "objectsTruncated": false
+      }
+    }
+  },
+  {
+    "name": "untraversable",
+    "cliExit": 1,
+    "response": {
+      "summary": "stopped",
+      "detail": "heal listing is untraversable; heal result items were truncated",
+      "startTime": "2026-01-01T00:00:00Z",
+      "settings": {
+        "recursive": true,
+        "scanMode": 1
+      },
+      "items": [],
+      "truncated": true,
+      "nextSeq": 9,
+      "minSeq": 4,
+      "progress": {
+        "objectsScanned": 11,
+        "objectsHealed": 7
+      },
+      "outcome": {
+        "execution": {
+          "state": "aborted",
+          "reason": "untraversable"
+        },
+        "coverage": "partial",
+        "counters": {
+          "processed": 0,
+          "healed": 0,
+          "unchanged": 0,
+          "skipped": 0,
+          "failed": 0,
+          "unknown": 0,
+          "attemptFailures": 0,
+          "overflowed": false
+        },
+        "objects": [],
+        "objectsTruncated": false
+      }
+    }
+  },
+  {
+    "name": "remote_completed_with_errors",
+    "cliExit": 1,
+    "response": {
+      "summary": "stopped",
+      "detail": "heal traversal completed with errors: 1 failed objects; heal result items were truncated",
+      "startTime": "2026-01-01T00:00:00Z",
+      "settings": {
+        "recursive": true,
+        "scanMode": 1
+      },
+      "items": [],
+      "truncated": true,
+      "nextSeq": 9,
+      "minSeq": 4,
+      "progress": {
+        "objectsScanned": 11,
+        "objectsHealed": 7
+      },
+      "outcome": {
+        "execution": {
+          "state": "completed_with_errors",
+          "futureExtension": {
+            "value": 7
+          }
+        },
+        "coverage": "complete",
+        "counters": {
+          "processed": 1,
+          "healed": 0,
+          "unchanged": 0,
+          "skipped": 0,
+          "failed": 1,
+          "unknown": 0,
+          "attemptFailures": 1,
+          "overflowed": false,
+          "futureCounter": 11
+        },
+        "objects": [
+          {
+            "identity": {
+              "kind": "object",
+              "bucket": "bucket",
+              "object": "object",
+              "versionId": null,
+              "bucketIncarnationId": null,
+              "poolIndex": null,
+              "setIndex": null
+            },
+            "disposition": {
+              "state": "failed",
+              "details": "retry_exhausted"
+            },
+            "detail": null
+          }
+        ],
+        "objectsTruncated": false
+      }
+    },
+    "remoteResponse": {
+      "summary": "finished",
+      "detail": "",
+      "startTime": "2026-01-01T00:00:00Z",
+      "settings": {
+        "recursive": true,
+        "scanMode": 1
+      },
+      "items": [],
+      "truncated": true,
+      "nextSeq": 9,
+      "minSeq": 4,
+      "progress": {
+        "objectsScanned": 11,
+        "objectsHealed": 7
+      },
+      "outcome": {
+        "execution": {
+          "state": "completed_with_errors",
+          "futureExtension": {
+            "value": 7
+          }
+        },
+        "coverage": "complete",
+        "counters": {
+          "processed": 1,
+          "healed": 0,
+          "unchanged": 0,
+          "skipped": 0,
+          "failed": 1,
+          "unknown": 0,
+          "attemptFailures": 1,
+          "overflowed": false,
+          "futureCounter": 11
+        },
+        "objects": [
+          {
+            "identity": {
+              "kind": "object",
+              "bucket": "bucket",
+              "object": "object",
+              "versionId": null,
+              "bucketIncarnationId": null,
+              "poolIndex": null,
+              "setIndex": null
+            },
+            "disposition": {
+              "state": "failed",
+              "details": "retry_exhausted"
+            },
+            "detail": null
+          }
+        ],
+        "objectsTruncated": false
+      }
+    }
+  },
+  {
+    "name": "remote_cancelled",
+    "cliExit": 1,
+    "response": {
+      "summary": "stopped",
+      "detail": "heal task cancelled; heal result items were truncated",
+      "startTime": "2026-01-01T00:00:00Z",
+      "settings": {
+        "recursive": true,
+        "scanMode": 1
+      },
+      "items": [],
+      "truncated": true,
+      "nextSeq": 9,
+      "minSeq": 4,
+      "progress": {
+        "objectsScanned": 11,
+        "objectsHealed": 7
+      },
+      "outcome": {
+        "execution": {
+          "state": "aborted",
+          "reason": "cancelled",
+          "futureExtension": {
+            "value": 7
+          }
+        },
+        "coverage": "partial",
+        "counters": {
+          "processed": 0,
+          "healed": 0,
+          "unchanged": 0,
+          "skipped": 0,
+          "failed": 0,
+          "unknown": 0,
+          "attemptFailures": 0,
+          "overflowed": false,
+          "futureCounter": 11
+        },
+        "objects": [],
+        "objectsTruncated": false
+      }
+    },
+    "remoteResponse": {
+      "summary": "finished",
+      "detail": "",
+      "startTime": "2026-01-01T00:00:00Z",
+      "settings": {
+        "recursive": true,
+        "scanMode": 1
+      },
+      "items": [],
+      "truncated": true,
+      "nextSeq": 9,
+      "minSeq": 4,
+      "progress": {
+        "objectsScanned": 11,
+        "objectsHealed": 7
+      },
+      "outcome": {
+        "execution": {
+          "state": "aborted",
+          "reason": "cancelled",
+          "futureExtension": {
+            "value": 7
+          }
+        },
+        "coverage": "partial",
+        "counters": {
+          "processed": 0,
+          "healed": 0,
+          "unchanged": 0,
+          "skipped": 0,
+          "failed": 0,
+          "unknown": 0,
+          "attemptFailures": 0,
+          "overflowed": false,
+          "futureCounter": 11
+        },
+        "objects": [],
+        "objectsTruncated": false
+      }
+    }
+  }
+]
