@@ -30,11 +30,11 @@ use crate::admin::storage_api::bucket::target::{
     ARN, BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat, duration_from_secs_or_nanos,
 };
 use crate::admin::storage_api::bucket::target_sys::{BucketTargetError, BucketTargetSys};
+use crate::admin::storage_api::bucket::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::contract::list::ListOperations as _;
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::runtime::PeerRestClient;
-use crate::admin::storage_api::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
 use crate::admin::utils::{extract_query_params, read_compatible_admin_body};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
@@ -3473,10 +3473,13 @@ mod target_repair_tests {
     }
 
     async fn assert_published_targets(targets: &BucketTargets) {
-        let cached = BucketTargetSys::get()
-            .list_bucket_targets(BUCKET)
-            .await
-            .expect("read published targets");
+        let cached = match BucketTargetSys::get().list_bucket_targets(BUCKET).await {
+            Ok(cached) => cached,
+            Err(BucketTargetError::BucketRemoteTargetNotFound { bucket }) if bucket == BUCKET && targets.targets.is_empty() => {
+                BucketTargets::default()
+            }
+            Err(error) => panic!("read published targets: {error}"),
+        };
         assert_eq!(
             serde_json::to_value(cached).expect("encode cache"),
             serde_json::to_value(targets).expect("encode disk")
@@ -3705,6 +3708,8 @@ mod target_repair_tests {
                 if !deleted {
                     assert_eq!(targets.targets[0].arn, arn);
                     assert!(!targets.targets[0].replication_sync);
+                } else {
+                    assert!(BucketTargetSys::get().get_remote_target_client(BUCKET, &arn).await.is_none());
                 }
                 assert_published_targets(&targets).await;
             }),
