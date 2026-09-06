@@ -233,7 +233,10 @@ pub(crate) mod lifecycle {
         super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunOptions;
     pub(crate) type ManualTransitionRunReport = super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunReport;
     pub(crate) use super::ecstore_bucket::lifecycle::recovery_control::{
-        IlmRecoveryClassification, IlmRecoveryProtocol, inspect_recovery_control, list_recovery_controls,
+        IlmRecoveryClassification, IlmRecoveryControlView, IlmRecoveryProtocol, inspect_recovery_control, list_recovery_controls,
+    };
+    pub(crate) use super::ecstore_bucket::lifecycle::recovery_export::{
+        IlmRecoveryExportObservation, create_recovery_export, inspect_recovery_export_observation, load_recovery_export,
     };
     pub(crate) use super::ecstore_bucket::lifecycle::transition_transaction::{
         TransitionOperatorDeleteResult, TransitionOperatorError, delete_transition_candidate_for_operator,

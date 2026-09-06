@@ -187,6 +187,30 @@ static NODE_CAPABILITY_SERVER_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4
 // operations do not add another peer RPC.
 const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 4;
 
+fn encode_heal_capability_response(
+    topology_member: &str,
+    remote_version_state_probe: bool,
+    recovery_export_probe: bool,
+) -> Result<Vec<u8>, Status> {
+    if recovery_export_probe {
+        rustfs_protos::encode_remote_version_state_capability(
+            topology_member,
+            crate::storage::storage_api::ilm_recovery_export_local_process_epoch().as_bytes(),
+        )
+        .map_err(|_| Status::internal("ILM recovery export capability length cannot be represented"))
+    } else if remote_version_state_probe {
+        rustfs_protos::encode_remote_version_state_capability(topology_member, NODE_CAPABILITY_SERVER_EPOCH.as_bytes())
+            .map_err(|_| Status::internal("remote version state capability length cannot be represented"))
+    } else {
+        rustfs_protos::encode_cross_pool_fence_capability(
+            CROSS_POOL_FENCE_SUPPORTED_VERSION,
+            topology_member,
+            NODE_CAPABILITY_SERVER_EPOCH.as_bytes(),
+        )
+        .map_err(|_| Status::internal("cross-pool fence capability length cannot be represented"))
+    }
+}
+
 fn admit_heal_control_replay(
     replay_cache: &mut HashMap<String, Arc<HealControlReplayEntry>>,
     request_id: &str,
@@ -1003,7 +1027,8 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
         }
         let remote_version_state_probe = rustfs_protos::is_remote_version_state_capability_probe(&request.get_ref().command);
         let cross_pool_fence_probe = rustfs_protos::is_cross_pool_fence_capability_probe(&request.get_ref().command);
-        if remote_version_state_probe || cross_pool_fence_probe {
+        let recovery_export_probe = rustfs_protos::is_ilm_recovery_export_capability_probe(&request.get_ref().command);
+        if remote_version_state_probe || cross_pool_fence_probe || recovery_export_probe {
             let topology_member = self
                 .endpoint_pools()
                 .await
@@ -1013,17 +1038,7 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
             if topology_member.is_empty() {
                 return Err(Status::failed_precondition("local topology member identity is unavailable"));
             }
-            let result = if remote_version_state_probe {
-                rustfs_protos::encode_remote_version_state_capability(&topology_member, NODE_CAPABILITY_SERVER_EPOCH.as_bytes())
-                    .map_err(|_| Status::internal("remote version state capability length cannot be represented"))?
-            } else {
-                rustfs_protos::encode_cross_pool_fence_capability(
-                    CROSS_POOL_FENCE_SUPPORTED_VERSION,
-                    &topology_member,
-                    NODE_CAPABILITY_SERVER_EPOCH.as_bytes(),
-                )
-                .map_err(|_| Status::internal("cross-pool fence capability length cannot be represented"))?
-            };
+            let result = encode_heal_capability_response(&topology_member, remote_version_state_probe, recovery_export_probe)?;
             let canonical_response = rustfs_protos::canonical_heal_control_response_body(
                 request.get_ref().version,
                 &request.get_ref().topology_fingerprint,
@@ -4038,6 +4053,19 @@ mod tests {
         .expect("different response should encode");
         crate::storage::storage_api::verify_tonic_rpc_response_proof(&different_response, &response.response_proof)
             .expect_err("proof from one challenge must not be reusable");
+    }
+
+    #[test]
+    fn ilm_recovery_export_probe_uses_the_shared_local_process_epoch() {
+        let result = super::encode_heal_capability_response("node-a:9000", false, true)
+            .expect("ILM recovery export capability should encode");
+        let (member, epoch) =
+            rustfs_protos::decode_remote_version_state_capability(&result).expect("ILM recovery export capability should decode");
+        assert_eq!(member, "node-a:9000");
+        assert_eq!(
+            Uuid::from_slice(epoch).expect("capability epoch should be a UUID"),
+            crate::storage::storage_api::ilm_recovery_export_local_process_epoch(),
+        );
     }
 
     #[tokio::test]

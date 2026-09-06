@@ -22,7 +22,7 @@ use super::{
     bucket_lifecycle_ops::{
         ManualTransitionQueueSnapshot, ManualTransitionRunReport, decode_manual_transition_continuation_token,
     },
-    manual_transition_job, recovery_control, tier_delete_journal, transition_transaction,
+    manual_transition_job, recovery_control, recovery_export, tier_delete_journal, transition_transaction,
 };
 use crate::error::{Error, Result};
 use crate::services::tier::tier_probe_intent;
@@ -42,6 +42,7 @@ pub(crate) enum DurableIlmRecordKind {
     ManualTransitionTask,
     ManualTransitionWorkerResult,
     RecoveryControl,
+    RecoveryExport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,8 +113,14 @@ pub(crate) const RECOVERY_CONTROL_NAMESPACE: DurableIlmNamespace = DurableIlmNam
     max_record_size: recovery_control::MAX_ILM_RECOVERY_CONTROL_SIZE,
     kind: DurableIlmRecordKind::RecoveryControl,
 };
+pub(crate) const RECOVERY_EXPORT_NAMESPACE: DurableIlmNamespace = DurableIlmNamespace {
+    name: "recovery-export",
+    prefix: recovery_export::ILM_RECOVERY_EXPORT_PREFIX,
+    max_record_size: recovery_export::MAX_ILM_RECOVERY_EXPORT_SIZE,
+    kind: DurableIlmRecordKind::RecoveryExport,
+};
 
-pub(crate) const DURABLE_ILM_NAMESPACES: [DurableIlmNamespace; 10] = [
+pub(crate) const DURABLE_ILM_NAMESPACES: [DurableIlmNamespace; 11] = [
     TIER_DELETE_JOURNAL_NAMESPACE,
     TIER_DELETE_JOURNAL_V6_NAMESPACE,
     TIER_DELETE_DISPATCH_MANIFEST_NAMESPACE,
@@ -124,6 +131,7 @@ pub(crate) const DURABLE_ILM_NAMESPACES: [DurableIlmNamespace; 10] = [
     MANUAL_TRANSITION_TASK_NAMESPACE,
     MANUAL_TRANSITION_WORKER_RESULT_NAMESPACE,
     RECOVERY_CONTROL_NAMESPACE,
+    RECOVERY_EXPORT_NAMESPACE,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +269,14 @@ pub(crate) enum DurableIlmRecordCheckpoint {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_fence_sha256: Option<String>,
     },
+    RecoveryExport {
+        content_sha256: String,
+        source_generation_sha256: String,
+        topology_generation: String,
+        member_epochs_sha256: String,
+        creator_sha256: String,
+        retain_until_unix_nanos: i64,
+    },
 }
 
 impl DurableIlmRecordCheckpoint {
@@ -275,7 +291,8 @@ impl DurableIlmRecordCheckpoint {
             | Self::ManualTransitionScope { content_sha256, .. }
             | Self::ManualTransitionTask { content_sha256 }
             | Self::ManualTransitionWorkerResult { content_sha256 }
-            | Self::RecoveryControl { content_sha256, .. } => content_sha256,
+            | Self::RecoveryControl { content_sha256, .. }
+            | Self::RecoveryExport { content_sha256, .. } => content_sha256,
         }
     }
 
@@ -1345,6 +1362,27 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
                     attempt_count: control.attempt_count,
                     consecutive_failure_count: control.consecutive_failure_count,
                     owner_fence_sha256,
+                },
+            )
+        }
+        DurableIlmRecordKind::RecoveryExport => {
+            let (protocol, export_id) = recovery_export::recovery_export_id_from_record_object_name(path)?;
+            let export = recovery_export::IlmRecoveryExport::decode(&export_id, data)?;
+            let canonical = recovery_export::recovery_export_record_object_name(protocol, &export_id)?;
+            if canonical != path || export.protocol != protocol {
+                return Err(Error::other("ILM recovery export path is not canonical"));
+            }
+            let source_generation_sha256 = checkpoint_hash(&export.source_generation)?;
+            (
+                "export_id",
+                export_id,
+                DurableIlmRecordCheckpoint::RecoveryExport {
+                    content_sha256,
+                    source_generation_sha256,
+                    topology_generation: export.topology_generation,
+                    member_epochs_sha256: export.member_epochs_sha256,
+                    creator_sha256: export.creator_sha256,
+                    retain_until_unix_nanos: export.retain_until_unix_nanos,
                 },
             )
         }

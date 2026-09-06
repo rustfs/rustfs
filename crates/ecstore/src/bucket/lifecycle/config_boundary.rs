@@ -41,6 +41,21 @@ where
     com::read_config(api, file).await
 }
 
+pub(crate) async fn read_config_limited_preserve_empty<S>(api: Arc<S>, file: &str, max_bytes: usize) -> Result<Vec<u8>>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
+    com::read_config_limited_preserve_empty(api, file, max_bytes).await
+}
+
 pub(crate) async fn read_config_with_metadata<S>(api: Arc<S>, file: &str, opts: &ObjectOptions) -> Result<(Vec<u8>, ObjectInfo)>
 where
     S: ObjectIO<
@@ -54,6 +69,26 @@ where
         >,
 {
     com::read_config_with_metadata(api, file, opts).await
+}
+
+pub(crate) async fn read_config_limited_preserve_empty_with_metadata<S>(
+    api: Arc<S>,
+    file: &str,
+    opts: &ObjectOptions,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, ObjectInfo)>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
+    com::read_config_limited_preserve_empty_with_metadata_opts(api, file, opts, max_bytes).await
 }
 
 pub(crate) async fn save_config<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
