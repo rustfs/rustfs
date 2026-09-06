@@ -446,6 +446,7 @@ pub struct HealTask {
     pub cancel_token: tokio_util::sync::CancellationToken,
     /// Storage layer interface
     pub storage: Arc<dyn HealStorageAPI>,
+    mainline_pacer: Option<Arc<super::pacing::MainlinePacer>>,
 }
 
 impl HealTask {
@@ -493,6 +494,7 @@ impl HealTask {
             task_start_instant: Arc::new(RwLock::new(None)),
             cancel_token: tokio_util::sync::CancellationToken::new(),
             storage,
+            mainline_pacer: None,
         }
     }
 
@@ -527,6 +529,18 @@ impl HealTask {
         let mut task = Self::from_request(request, storage);
         task.replacement_resume_endpoint = replacement_resume_endpoint;
         task
+    }
+
+    pub(crate) fn with_mainline_pacer(mut self, pacer: Option<Arc<super::pacing::MainlinePacer>>) -> Self {
+        self.mainline_pacer = pacer;
+        self
+    }
+
+    async fn pace_mainline(&self) -> Result<()> {
+        if let Some(pacer) = &self.mainline_pacer {
+            self.await_with_control(pacer.wait(&self.cancel_token)).await?;
+        }
+        Ok(())
     }
 
     pub fn metric_type_label(&self) -> &'static str {
@@ -933,24 +947,32 @@ impl HealTask {
         });
         self.emit_trace_task_state("started", Duration::ZERO, None);
 
-        let result = match &self.heal_type {
-            HealType::Cluster => self.heal_cluster().await,
-            HealType::Object {
-                bucket,
-                object,
-                version_id,
-            } => self.heal_object(bucket, object, version_id.as_deref()).await,
-            HealType::Bucket { bucket } => self.heal_bucket(bucket).await,
-            HealType::Prefix { bucket, prefix } => self.heal_prefix(bucket, prefix).await,
+        let result = async {
+            if self.heal_type.is_per_object() {
+                self.pace_mainline().await?;
+            }
+            match &self.heal_type {
+                HealType::Cluster => self.heal_cluster().await,
+                HealType::Object {
+                    bucket,
+                    object,
+                    version_id,
+                } => self.heal_object(bucket, object, version_id.as_deref()).await,
+                HealType::Bucket { bucket } => self.heal_bucket(bucket).await,
+                HealType::Prefix { bucket, prefix } => self.heal_prefix(bucket, prefix).await,
 
-            HealType::Metadata { bucket, object } => self.heal_metadata(bucket, object).await,
-            HealType::ECDecode {
-                bucket,
-                object,
-                version_id,
-            } => self.heal_ec_decode(bucket, object, version_id.as_deref()).await,
-            HealType::ErasureSet { buckets, set_disk_id } => self.heal_erasure_set(buckets.clone(), set_disk_id.clone()).await,
-        };
+                HealType::Metadata { bucket, object } => self.heal_metadata(bucket, object).await,
+                HealType::ECDecode {
+                    bucket,
+                    object,
+                    version_id,
+                } => self.heal_ec_decode(bucket, object, version_id.as_deref()).await,
+                HealType::ErasureSet { buckets, set_disk_id } => {
+                    self.heal_erasure_set(buckets.clone(), set_disk_id.clone()).await
+                }
+            }
+        }
+        .await;
 
         #[cfg(test)]
         pause_outcome_finish(&self.id).await;

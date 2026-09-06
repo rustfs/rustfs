@@ -39,6 +39,8 @@ use temp_env::with_var;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+mod scoped_entry_fallback;
+
 #[derive(Clone)]
 struct FixedWorkloadProvider {
     snapshot: WorkloadAdmissionRegistrySnapshot,

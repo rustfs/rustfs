@@ -602,13 +602,13 @@ pub struct HealConfig {
     pub set_bulkhead_enable: bool,
     /// Whether erasure-set page parallelism is enabled.
     pub page_parallel_enable: bool,
-    /// Whether foreground read pressure can delay best-effort heal task starts.
+    /// Whether foreground pressure delays best-effort starts and paces running admin work.
     pub mainline_throttle_enable: bool,
-    /// Foreground read permit utilization percentage that delays best-effort heal starts.
+    /// Foreground read utilization high watermark for start admission and admin pacing.
     pub mainline_read_utilization_high_percent: usize,
-    /// Foreground write utilization percentage that delays best-effort heal starts.
+    /// Foreground write utilization high watermark for start admission and admin pacing.
     pub mainline_write_utilization_high_percent: usize,
-    /// Delay before rechecking foreground pressure after delaying heal starts.
+    /// Start recheck interval; running admin pacing caps each holder's pause at one second.
     pub mainline_max_sleep: Duration,
 }
 

@@ -827,8 +827,8 @@ mod tests {
             },
             recovery_control::{
                 IlmRecoveryClassification, IlmRecoveryControl, IlmRecoveryControlIdentity, IlmRecoveryErrorCode,
-                IlmRecoveryProtocol, MAX_RECOVERY_ATTEMPTS, load_recovery_control, observe_recovery_source,
-                save_recovery_control_if_absent,
+                IlmRecoveryProtocol, MAX_RECOVERY_ATTEMPTS, list_recovery_controls, load_recovery_control,
+                observe_recovery_source, save_recovery_control_if_absent,
             },
             tier_delete_journal::{
                 DecommissionCheckpointTargetFailureHook, TIER_DELETE_DISPATCH_MANIFEST_PREFIX, TIER_DELETE_JOURNAL_PREFIX,
@@ -16758,6 +16758,141 @@ mod tests {
                 .await
                 .expect("metadata failure must preserve every object");
         }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn legacy_tier_delete_journals_create_redacted_recovery_controls_without_remote_calls() {
+        let temp_dir = tempfile::tempdir().expect("create legacy journal recovery store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "legacy-tier-journal-recovery", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "LEGACY-RECOVERY";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("legacy recovery tier lease should resolve")
+            .backend_identity();
+        let fixtures = [
+            serde_json::json!({
+                "version": 1,
+                "obj_name": "legacy/remote-v1",
+                "version_id": "opaque-v1",
+                "tier_name": tier_name,
+            }),
+            serde_json::json!({
+                "version": 2,
+                "obj_name": "legacy/remote-v2",
+                "version_id": "opaque-v2",
+                "tier_name": tier_name,
+                "backend_identity": backend_identity,
+            }),
+        ];
+        let mut journal_paths = Vec::new();
+        for fixture in &fixtures {
+            let data = serde_json::to_vec(&fixture).expect("legacy journal fixture should encode");
+            let entry = crate::bucket::lifecycle::tier_delete_journal::decode_tier_delete_journal_entry(&data)
+                .expect("legacy journal fixture should decode");
+            let path = tier_delete_journal_object_name(&entry);
+            com::save_config(store.clone(), &path, data)
+                .await
+                .expect("legacy journal fixture should persist");
+            journal_paths.push(path);
+        }
+        let corrupt_path = format!(
+            "{TIER_DELETE_JOURNAL_PREFIX}/{}.json",
+            rustfs_utils::crypto::hex_sha256(b"corrupt legacy tier journal", ToOwned::to_owned)
+        );
+        com::save_config(store.clone(), &corrupt_path, b"{corrupt".to_vec())
+            .await
+            .expect("corrupt legacy journal fixture should persist");
+
+        let (first, concurrent) = tokio::join!(
+            recover_tier_delete_journal_entries(store.clone(), 100, None),
+            recover_tier_delete_journal_entries(store.clone(), 100, None),
+        );
+        for stats in [first, concurrent] {
+            let stats = stats.expect("concurrent legacy journal recovery scan should finish");
+            assert_eq!((stats.scanned, stats.deleted, stats.failed), (3, 0, 0));
+        }
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 3);
+        assert_eq!(backend.remove_count().await, 0, "legacy recovery must not call the remote tier");
+        assert_eq!(backend.exact_remove_count(), 0, "legacy recovery must not issue exact remote DELETE");
+        assert!(backend.op_log().await.is_empty(), "legacy recovery must not invoke any backend operation");
+
+        let mut first_controls = list_recovery_controls(store.clone(), IlmRecoveryProtocol::TierDeleteJournal, None, 100, None)
+            .await
+            .expect("legacy recovery controls should be listable")
+            .records;
+        first_controls.sort_by(|left, right| left.control_id.cmp(&right.control_id));
+        assert_eq!(first_controls.len(), 3);
+        assert_eq!(
+            first_controls
+                .iter()
+                .filter(|control| control.classification == IlmRecoveryClassification::RetainedAmbiguous)
+                .count(),
+            2
+        );
+        assert_eq!(
+            first_controls
+                .iter()
+                .filter(|control| control.classification == IlmRecoveryClassification::Corrupt)
+                .count(),
+            1
+        );
+        for view in &first_controls {
+            assert_eq!(view.protocol, IlmRecoveryProtocol::TierDeleteJournal);
+            assert_eq!(view.revision, 1);
+            assert_eq!(view.attempt_count, 0);
+            let encoded = serde_json::to_string(view).expect("recovery control view should encode");
+            for secret in ["legacy/remote-v1", "legacy/remote-v2", "opaque-v1", "opaque-v2", tier_name] {
+                assert!(!encoded.contains(secret), "recovery control view must redact `{secret}`");
+            }
+            let persisted = load_recovery_control(store.clone(), IlmRecoveryProtocol::TierDeleteJournal, &view.control_id)
+                .await
+                .expect("legacy recovery control should load");
+            match view.source_schema.as_str() {
+                "rustfs-tier-delete-journal-v1" => {
+                    assert_eq!(persisted.control.identity.record_class, "tier_delete_journal_v1");
+                    assert_eq!(view.last_error_code, IlmRecoveryErrorCode::RemoteVersionUnknown);
+                }
+                "rustfs-tier-delete-journal-v2" => {
+                    assert_eq!(persisted.control.identity.record_class, "tier_delete_journal_v2");
+                    assert_eq!(view.last_error_code, IlmRecoveryErrorCode::RemoteVersionUnknown);
+                }
+                "rustfs-tier-delete-journal-unknown" => {
+                    assert_eq!(persisted.control.identity.record_class, "tier_delete_journal_corrupt");
+                    assert_eq!(view.last_error_code, IlmRecoveryErrorCode::SourceCorrupt);
+                }
+                schema => panic!("unexpected legacy recovery source schema: {schema}"),
+            }
+        }
+
+        com::save_config(
+            store.clone(),
+            &journal_paths[0],
+            serde_json::to_vec_pretty(&fixtures[0]).expect("rewritten legacy journal fixture should encode"),
+        )
+        .await
+        .expect("equivalent legacy journal rewrite should persist");
+        let second = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("repeated legacy journal recovery scan should finish");
+        assert_eq!((second.scanned, second.deleted, second.failed), (3, 0, 0));
+        let mut second_controls = list_recovery_controls(store, IlmRecoveryProtocol::TierDeleteJournal, None, 100, None)
+            .await
+            .expect("repeated legacy recovery controls should remain listable")
+            .records;
+        second_controls.sort_by(|left, right| left.control_id.cmp(&right.control_id));
+        assert_eq!(second_controls, first_controls, "repeated scans must not reset durable controls");
+        assert_eq!(backend.remove_count().await, 0, "repeated recovery must remain remote-call free");
+        assert_eq!(backend.exact_remove_count(), 0);
+        assert!(
+            backend.op_log().await.is_empty(),
+            "repeated recovery must not invoke any backend operation"
+        );
     }
 
     #[cfg(feature = "test-util")]

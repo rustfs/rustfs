@@ -56,6 +56,16 @@ impl RecordedRequest {
 
 pub(super) type Recorder = Arc<Mutex<Vec<RecordedRequest>>>;
 
+/// Checks the full request sequence, including the absence of extra probes.
+pub(super) fn assert_requests(recorder: &Recorder, expected: &[(&str, &str)]) {
+    let recorded = recorder.lock().expect("recorder lock");
+    let actual: Vec<_> = recorded
+        .iter()
+        .map(|request| (request.method.as_str(), request.target.as_str()))
+        .collect();
+    assert_eq!(actual, expected, "unexpected native source request sequence");
+}
+
 /// Binds a loopback listener that answers `responses` in order and returns its
 /// origin plus the recorder. The task ends once the script is exhausted.
 pub(super) async fn scripted_server(responses: Vec<ScriptedResponse>) -> (Url, Recorder) {

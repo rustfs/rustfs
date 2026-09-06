@@ -369,26 +369,6 @@ struct SsecPassthroughRecord {
     recorded_at: Instant,
 }
 
-/// What a target write does when the bucket's persisted target set exists but
-/// cannot be decoded.
-///
-/// `docs/architecture/remote-credential-sealing-adr.md` forbids rewriting a
-/// configuration that could not be fully read, because re-serializing a
-/// partial in-memory view is the one mechanism by which a configured target
-/// really disappears. That rule guards against an *unintentional* overwrite,
-/// so an operator who names the hazard keeps a repair path
-/// (rustfs/backlog#2309); everything that does not name it stays refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum UnreadableTargetsPolicy {
-    /// Refuse the write with [`BucketTargetError::BucketRemoteTargetsUnreadable`].
-    #[default]
-    FailClosed,
-    /// Discard the unreadable set; the target being written becomes the whole
-    /// configuration. Reachable only from an admin request that asked for it
-    /// explicitly, and audited by the caller.
-    Replace,
-}
-
 #[derive(Debug, Default)]
 pub struct BucketTargetSys {
     pub arn_remotes_map: Arc<RwLock<HashMap<String, ArnTarget>>>,
@@ -811,41 +791,23 @@ impl BucketTargetSys {
         bucket: &str,
         target: &BucketTarget,
         update: bool,
-        unreadable_policy: UnreadableTargetsPolicy,
     ) -> Result<BucketTargets, BucketTargetError> {
         self.validate_target(bucket, target).await?;
 
-        let mut bucket_targets = self.targets_base_for_write(bucket, unreadable_policy).await?;
+        let mut bucket_targets = self.targets_base_for_write(bucket).await?;
 
         Self::upsert_target_entry(&mut bucket_targets.targets, target, update)?;
 
         Ok(bucket_targets)
     }
 
-    /// The persisted target set a write merges into.
-    ///
-    /// An absent configuration starts from the empty set. An unreadable one is
-    /// refused, because re-serializing a partial view of a set this node could
-    /// not decode is how a configured target disappears for good — unless the
-    /// caller carries the operator's explicit
-    /// [`UnreadableTargetsPolicy::Replace`] opt-in, which discards it
-    /// deliberately (rustfs/backlog#2309).
-    async fn targets_base_for_write(
-        &self,
-        bucket: &str,
-        unreadable_policy: UnreadableTargetsPolicy,
-    ) -> Result<BucketTargets, BucketTargetError> {
+    /// Ordinary writes must not turn an unreadable cached snapshot into an
+    /// empty configuration. Explicit repair belongs to the metadata transaction
+    /// that can inspect the current persisted state.
+    async fn targets_base_for_write(&self, bucket: &str) -> Result<BucketTargets, BucketTargetError> {
         match self.list_bucket_targets(bucket).await {
             Ok(targets) => Ok(targets),
             Err(BucketTargetError::BucketRemoteTargetNotFound { .. }) => Ok(BucketTargets::default()),
-            // The opt-in discards only a set this node genuinely cannot read.
-            // A readable set still merges through the arm above, so the policy
-            // can never drop a target that was visible here.
-            Err(BucketTargetError::BucketRemoteTargetsUnreadable { .. })
-                if unreadable_policy == UnreadableTargetsPolicy::Replace =>
-            {
-                Ok(BucketTargets::default())
-            }
             Err(err) => Err(err),
         }
     }
@@ -908,7 +870,9 @@ impl BucketTargetSys {
         Ok(())
     }
 
-    fn upsert_target_entry(
+    /// Merge a validated target into a caller-owned snapshot. The caller must
+    /// protect that snapshot through persistence.
+    pub fn upsert_target_entry(
         bucket_targets: &mut Vec<BucketTarget>,
         target: &BucketTarget,
         update: bool,
@@ -1272,25 +1236,27 @@ impl BucketTargetSys {
             return (String::new(), false);
         };
 
-        {
-            let targets_map = self.targets_map.read().await;
-            if let Some(targets) = targets_map.get(bucket) {
-                for tgt in targets {
-                    if tgt.target_type == target.target_type
-                        && tgt.target_bucket == target.target_bucket
-                        && target.endpoint == tgt.endpoint
-                        && tgt
-                            .credentials
-                            .as_ref()
-                            .map(|c| {
-                                let default_creds = Credentials::default();
-                                c.access_key == target.credentials.as_ref().unwrap_or(&default_creds).access_key
-                            })
-                            .unwrap_or(false)
-                    {
-                        return (tgt.arn.clone(), true);
-                    }
-                }
+        let targets_map = self.targets_map.read().await;
+        let targets = targets_map.get(bucket).map(Vec::as_slice).unwrap_or_default();
+        Self::remote_arn_for_targets(targets, target, depl_id)
+    }
+
+    /// Resolve create idempotency against the snapshot the caller will persist.
+    pub fn remote_arn_for_targets(targets: &[BucketTarget], target: &BucketTarget, depl_id: &str) -> (String, bool) {
+        for tgt in targets {
+            if tgt.target_type == target.target_type
+                && tgt.target_bucket == target.target_bucket
+                && target.endpoint == tgt.endpoint
+                && tgt
+                    .credentials
+                    .as_ref()
+                    .map(|c| {
+                        let default_creds = Credentials::default();
+                        c.access_key == target.credentials.as_ref().unwrap_or(&default_creds).access_key
+                    })
+                    .unwrap_or(false)
+            {
+                return (tgt.arn.clone(), true);
             }
         }
 
@@ -4371,47 +4337,19 @@ mod tests {
         }
     }
 
-    /// rustfs/backlog#2309: after rustfs/rustfs#7172 an undecodable
-    /// `bucket-targets.json` left the bucket with no API repair path at all.
-    /// The refusal is the default and stays the default; the operator's
-    /// explicit opt-in is the only thing that discards the set, and it starts
-    /// the replacement from empty rather than from a partial view of bytes
-    /// this node never decoded.
     #[tokio::test]
-    async fn an_unreadable_target_set_is_replaced_only_with_the_explicit_opt_in() {
+    async fn an_unreadable_target_set_refuses_cached_writes() {
         let sys = BucketTargetSys::default();
         let bucket = "targets-repair-opt-in";
         sys.mark_targets_unreadable(bucket).await;
-
-        assert!(
-            matches!(
-                sys.targets_base_for_write(bucket, UnreadableTargetsPolicy::FailClosed).await,
-                Err(BucketTargetError::BucketRemoteTargetsUnreadable { .. })
-            ),
-            "without the opt-in an unreadable target set must still refuse the write"
-        );
-        assert_eq!(
-            UnreadableTargetsPolicy::default(),
-            UnreadableTargetsPolicy::FailClosed,
-            "a caller that says nothing must get the refusal"
-        );
-
-        let base = sys
-            .targets_base_for_write(bucket, UnreadableTargetsPolicy::Replace)
-            .await
-            .expect("the explicit opt-in must let an operator replace an unreadable set");
-        assert!(
-            base.is_empty(),
-            "the replacement must start from an empty set, never from a partial decode"
-        );
+        assert!(matches!(
+            sys.targets_base_for_write(bucket).await,
+            Err(BucketTargetError::BucketRemoteTargetsUnreadable { .. })
+        ));
     }
 
-    /// The opt-in is not a wipe switch. On a set this node can read, both
-    /// policies take the same merge path, so a stray `replace-unreadable=true`
-    /// cannot drop a visible target — which is what makes the flag safe to
-    /// repeat in an operator's repair script.
     #[tokio::test]
-    async fn the_opt_in_never_discards_a_readable_target_set() {
+    async fn a_readable_target_set_remains_the_write_base() {
         let sys = BucketTargetSys::default();
         let bucket = "targets-repair-readable";
         let existing = repair_target(bucket, "keep");
@@ -4419,14 +4357,8 @@ mod tests {
             .write()
             .await
             .insert(bucket.to_string(), vec![existing.clone()]);
-
-        for policy in [UnreadableTargetsPolicy::FailClosed, UnreadableTargetsPolicy::Replace] {
-            let base = sys
-                .targets_base_for_write(bucket, policy)
-                .await
-                .expect("a readable target set must be readable under either policy");
-            assert_eq!(base.targets.len(), 1, "{policy:?} must keep the persisted target");
-            assert_eq!(base.targets[0].arn, existing.arn, "{policy:?} must not rewrite the persisted target");
-        }
+        let base = sys.targets_base_for_write(bucket).await.expect("read targets");
+        assert_eq!(base.targets.len(), 1);
+        assert_eq!(base.targets[0].arn, existing.arn);
     }
 }

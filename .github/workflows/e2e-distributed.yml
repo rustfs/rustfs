@@ -22,11 +22,13 @@
 # Upgrade cases download the same pinned previous release as e2e-upgrade.yml.
 #
 # Isolated pool filesystems: expand/decommission/rebalance cases require
-# independent `statfs` capacity. `sm-standard-4` is an ARC pod
-# (`scripts/ci/check_runner_ephemerality.sh`) and usually has no
-# `/dev/loop-control`, so `mount -o loop` fails with ENOENT ("mount failed:
-# No such file or directory"). The prepare step therefore mounts four 1 GiB
-# tmpfs instances and exports them as `RUSTFS_E2E_POOL_ROOTS`.
+# independent `statfs` capacity. This job runs on GitHub-hosted
+# `ubuntu-latest` because the self-hosted `sm-standard-4` ARC pods cannot
+# create filesystems: `mount -o loop` fails with ENOENT (no
+# `/dev/loop-control`), and `mount -t tmpfs` fails with "cannot mount tmpfs
+# read-only" (no `CAP_SYS_ADMIN` in the initial namespace). The same reason
+# `uring-integration` and `e2e-s3tests.yml` left that label. The prepare
+# step mounts four 1 GiB tmpfs instances and exports `RUSTFS_E2E_POOL_ROOTS`.
 
 name: e2e-distributed
 
@@ -76,7 +78,9 @@ concurrency:
 jobs:
   distributed:
     name: Distributed 4-node 4-disk e2e
-    runs-on: sm-standard-4
+    # GitHub-hosted VM: loop and tmpfs mounts work here. sm-standard-4 is an
+    # ARC pod and rejects both (`mount -o loop` ENOENT, tmpfs "read-only").
+    runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -97,7 +101,9 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: ci-e2e-distributed
+          # Dedicated key: ubuntu-latest and sm-standard-4 share runner.os, so
+          # a shared key would mix VM and ARC pod target/ artifacts.
+          cache-shared-key: ci-e2e-distributed-hosted
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           install-build-packaging-tools: 'false'
 
@@ -110,10 +116,14 @@ jobs:
           for pool in 0 1 2 3; do
             mountpoint="${mount_base}/pool-${pool}"
             mkdir -p "${mountpoint}"
-            # sm-standard-4 is an ARC pod without usable loop devices, so
-            # `mount -o loop` fails with ENOENT. Sized tmpfs still reports a
-            # distinct st_dev and independent 1G statfs capacity.
-            sudo mount -t tmpfs -o size=1G,nosuid,nodev,mode=1777 tmpfs "${mountpoint}"
+            # Sized tmpfs reports a distinct st_dev and independent 1G
+            # statfs capacity. Requires a VM runner (ubuntu-latest).
+            if ! sudo mount -t tmpfs -o size=1G,nosuid,nodev,mode=1777 tmpfs "${mountpoint}"; then
+              echo "tmpfs mount failed on $(uname -a)" >&2
+              findmnt || true
+              grep Cap /proc/self/status || true
+              exit 1
+            fi
             sudo chmod 1777 "${mountpoint}"
             roots+=("${mountpoint}")
           done

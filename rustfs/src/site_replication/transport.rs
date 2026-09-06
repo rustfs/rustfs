@@ -876,6 +876,14 @@ pub(crate) async fn broadcast_site_replication_json<T: Serialize>(path: &str, bo
     broadcast_site_replication_json_with_runtime(&runtime, path, body).await
 }
 
+/// PUT `body` to `path` on every remote peer of the runtime.
+///
+/// Every peer is attempted: one peer's failure — transport construction
+/// included — must not skip the peers that follow it in deployment-id order,
+/// or they silently miss the change with no retry record (backlog#2293). A
+/// success settles the peer/path's queued retry event, a failure enqueues one
+/// under the request `path` (so the drain classifies it as today), and the
+/// first error is returned once all peers were attempted.
 pub(crate) async fn broadcast_site_replication_json_with_runtime<T: Serialize>(
     runtime: &SiteReplicationRuntime,
     path: &str,
@@ -883,20 +891,30 @@ pub(crate) async fn broadcast_site_replication_json_with_runtime<T: Serialize>(
 ) -> S3Result<()> {
     let state = &runtime.state;
     let local_peer = &runtime.local_peer;
+    let mut first_error: Option<S3Error> = None;
 
     for peer in state.peers.values() {
         if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
             continue;
         }
 
-        let transport = PeerTransport::for_runtime_peer(peer).await?;
-        PeerAdminRequest::put(&transport.connection, path, &state.service_account_access_key)
-            .with_client(&transport.client)
-            .send_with_retry_event(peer, &runtime.service_account_secret_key, body)
-            .await?;
+        let sent = match PeerTransport::for_runtime_peer(peer).await {
+            Ok(transport) => PeerAdminRequest::put(&transport.connection, path, &state.service_account_access_key)
+                .with_client(&transport.client)
+                .send_with_retry_event(peer, &runtime.service_account_secret_key, body)
+                .await
+                .map(|_| ()),
+            Err(err) => {
+                enqueue_site_replication_retry_event(peer, path, &err).await;
+                Err(err)
+            }
+        };
+        if let Err(err) = sent {
+            first_error.get_or_insert(err);
+        }
     }
 
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 pub(crate) fn parse_endpoint_refresh_status(peer: &PeerInfo, body: &[u8]) -> S3Result<()> {

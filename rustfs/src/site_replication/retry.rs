@@ -397,12 +397,12 @@ pub(crate) fn iam_deletion_replay_matches(record: &SiteReplicationIamDeletionRep
 /// newer revision of one another.
 pub(crate) fn iam_item_deletion_entity(item: &SRIAMItem) -> Option<String> {
     match item.r#type.as_str() {
-        "policy" if item.policy.is_none() => Some(format!("policy:{}", item.name)),
+        "policy" if item.policy.is_none() => Some(iam_policy_deletion_mark_entity(&item.name)),
         "iam-user" => item
             .iam_user
             .as_ref()
             .filter(|user| user.is_delete_req)
-            .map(|user| format!("iam-user:{}", user.access_key)),
+            .map(|user| iam_user_deletion_mark_entity(&user.access_key)),
         "group-info" => item
             .group_info
             .as_ref()
@@ -416,7 +416,7 @@ pub(crate) fn iam_item_deletion_entity(item: &SRIAMItem) -> Option<String> {
             .policy_mapping
             .as_ref()
             .filter(|mapping| mapping.policy.is_empty())
-            .map(|mapping| format!("policy-mapping:{}:{}:{}", mapping.user_or_group, mapping.user_type, mapping.is_group)),
+            .map(|mapping| iam_policy_mapping_deletion_mark_entity(&mapping.user_or_group, mapping.user_type, mapping.is_group)),
         "service-account" => item
             .svc_acc_change
             .as_ref()
@@ -424,6 +424,82 @@ pub(crate) fn iam_item_deletion_entity(item: &SRIAMItem) -> Option<String> {
             .map(|delete| format!("svc-acc:{}", delete.access_key)),
         _ => None,
     }
+}
+
+/// The entities whose deletion a deletion-shaped IAM item commits, keyed the
+/// way the receive-side staleness gate looks them up once the local record is
+/// gone (backlog#2291); empty for creates and updates. Group member removal
+/// yields one entity per removed member so a stale re-add of that member can
+/// be judged, and a group delete (no members) yields the group itself.
+pub(crate) fn iam_item_deletion_mark_entities(item: &SRIAMItem) -> Vec<String> {
+    if item.r#type == "group-info" {
+        let Some(update) = item
+            .group_info
+            .as_ref()
+            .map(|group| &group.update_req)
+            .filter(|update| update.is_remove)
+        else {
+            return Vec::new();
+        };
+        if update.members.is_empty() {
+            return vec![iam_group_deletion_mark_entity(&update.group)];
+        }
+        return update
+            .members
+            .iter()
+            .map(|member| iam_group_member_deletion_mark_entity(&update.group, member))
+            .collect();
+    }
+    iam_item_deletion_entity(item).into_iter().collect()
+}
+
+pub(crate) fn iam_policy_deletion_mark_entity(name: &str) -> String {
+    format!("policy:{name}")
+}
+
+pub(crate) fn iam_user_deletion_mark_entity(access_key: &str) -> String {
+    format!("iam-user:{access_key}")
+}
+
+/// `user_type` is the SR wire integer, as carried by the item on both sides.
+pub(crate) fn iam_policy_mapping_deletion_mark_entity(user_or_group: &str, user_type: i64, is_group: bool) -> String {
+    format!("policy-mapping:{user_or_group}:{user_type}:{is_group}")
+}
+
+pub(crate) fn iam_group_deletion_mark_entity(group: &str) -> String {
+    format!("group:{group}")
+}
+
+pub(crate) fn iam_group_member_deletion_mark_entity(group: &str, member: &str) -> String {
+    format!("group-member:{group}:{member}")
+}
+
+/// Persist the deletion marks of `item` (its source `updated_at` per entity
+/// of [`iam_item_deletion_mark_entities`]) through the state transaction.
+/// No-op for creates/updates and for items without a source timestamp
+/// (older peers): a mark without a source clock could not be ordered against
+/// later items. Called before a local deletion is broadcast and after a
+/// replicated deletion is applied, so both sides out-rank a stale grant that
+/// arrives later.
+pub(crate) async fn record_iam_deletion_marks_for_item(item: &SRIAMItem) -> S3Result<()> {
+    let entities = iam_item_deletion_mark_entities(item);
+    let Some(deleted_at) = item.updated_at.filter(|_| !entities.is_empty()) else {
+        return Ok(());
+    };
+    commit_iam_deletion_marks(entities, deleted_at).await
+}
+
+/// [`record_iam_deletion_marks`] under the state transaction; the write is
+/// skipped when no mark moves.
+pub(crate) async fn commit_iam_deletion_marks(entities: Vec<String>, deleted_at: OffsetDateTime) -> S3Result<()> {
+    update_site_replication_state_when_changed(move |state| {
+        Ok(if record_iam_deletion_marks(state, &entities, deleted_at) {
+            StateCommit::Changed(())
+        } else {
+            StateCommit::Unchanged(())
+        })
+    })
+    .await
 }
 
 /// Failure bookkeeping for one IAM item delivery: upsert the collapsed retry
@@ -791,8 +867,8 @@ impl RetrySnapshot {
 
     pub(crate) fn fingerprint(&self) -> S3Result<Vec<Vec<u8>>> {
         let mut payloads = match self {
-            Self::Iam(items) => items.iter().map(serde_json::to_vec).collect::<Result<Vec<_>, _>>(),
-            Self::BucketMetadata(items) => items.iter().map(serde_json::to_vec).collect::<Result<Vec<_>, _>>(),
+            Self::Iam(items) => items.iter().map(canonical_json_vec).collect::<Result<Vec<_>, _>>(),
+            Self::BucketMetadata(items) => items.iter().map(canonical_json_vec).collect::<Result<Vec<_>, _>>(),
         }
         .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize retry snapshot failed: {err}")))?;
         payloads.sort_unstable();
@@ -954,6 +1030,7 @@ pub(crate) enum IamSnapshotKey {
     User(String),
     Group(String),
     PolicyMapping { target: String, user_type: i64, is_group: bool },
+    ServiceAccount(String),
 }
 
 pub(crate) fn iam_snapshot_key(item: &SRIAMItem) -> Option<IamSnapshotKey> {
@@ -972,6 +1049,11 @@ pub(crate) fn iam_snapshot_key(item: &SRIAMItem) -> Option<IamSnapshotKey> {
             user_type: mapping.user_type,
             is_group: mapping.is_group,
         }),
+        "service-account" => item
+            .svc_acc_change
+            .as_ref()
+            .and_then(|change| change.create.as_ref())
+            .map(|create| IamSnapshotKey::ServiceAccount(create.access_key.clone())),
         _ => None,
     }
 }
@@ -1005,6 +1087,24 @@ pub(crate) fn iam_snapshot_tombstones(item: &SRIAMItem, observed_at: OffsetDateT
             if let Some(mapping) = tombstone.policy_mapping.as_mut() {
                 mapping.policy.clear();
             }
+        }
+        "service-account" => {
+            let Some(access_key) = item
+                .svc_acc_change
+                .as_ref()
+                .and_then(|change| change.create.as_ref())
+                .map(|create| create.access_key.clone())
+            else {
+                return Vec::new();
+            };
+            tombstone.svc_acc_change = Some(SRSvcAccChange {
+                delete: Some(SRSvcAccDelete {
+                    access_key,
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                }),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            });
         }
         _ => return Vec::new(),
     }
@@ -1701,7 +1801,7 @@ pub(crate) async fn drain_site_replication_retry_queue_locked(
     // tick and only when a snapshot resend is actually due.
     let plan = if needs_plan {
         let info = build_sr_info(&runtime.state, &runtime.local_peer).await?;
-        Some(site_replication_bootstrap_plan(&info)?)
+        Some(build_site_replication_bootstrap_plan(&info).await?)
     } else {
         None
     };
@@ -1841,7 +1941,7 @@ pub(crate) async fn drain_one_site_replication_retry_event(
                     }
                 }
                 let fresh_info = build_sr_info(&runtime.state, &runtime.local_peer).await?;
-                let fresh_plan = site_replication_bootstrap_plan(&fresh_info)?;
+                let fresh_plan = build_site_replication_bootstrap_plan(&fresh_info).await?;
                 let fresh_snapshot = RetrySnapshot::from_plan(&action, &fresh_plan).expect("snapshot action has a snapshot");
                 if fresh_snapshot.fingerprint()? == current_fingerprint {
                     if is_iam {

@@ -20,9 +20,9 @@ pub use rustfs_replication::{
 pub(crate) use rustfs_replication::{
     ReplicationDeleteSource, ReplicationMultipartPartInput, ReplicationResyncTargetObject, delete_marker_purge_mrf_entry,
     delete_marker_purge_version_id, delete_replication_creates_marker, delete_replication_missing_source_decision,
-    delete_replication_object_opts, heal_uses_delete_replication_path, is_object_lock_denied_delete,
-    is_retryable_delete_replication_head_error, is_version_delete_replication, replicate_delete_outcome, replication_etags_match,
-    replication_multipart_complete_actual_size, replication_multipart_part_plan, replication_single_put_size_error,
-    resync_existing_delete_replication_info, resync_target_for_object, should_retry_delete_marker_purge,
-    single_part_replica_etag_mismatch, target_delete_version_id,
+    delete_replication_object_opts, delete_replication_target_version_id, heal_uses_delete_replication_path,
+    is_object_lock_denied_delete, is_retryable_delete_replication_head_error, is_version_delete_replication,
+    replicate_delete_outcome, replication_etags_match, replication_multipart_complete_actual_size,
+    replication_multipart_part_plan, replication_single_put_size_error, resync_existing_delete_replication_info,
+    resync_target_for_object, should_retry_delete_marker_purge, single_part_replica_etag_mismatch,
 };

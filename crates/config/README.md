@@ -172,6 +172,14 @@ Drive timeout profile preset:
   - Then `RUSTFS_DRIVE_MAX_TIMEOUT_DURATION` legacy fallback.
   - Then the profile-derived default (`default` or `high_latency`).
 
+## Admin peer probe timeout
+
+- `RUSTFS_ADMIN_PEER_PROBE_TIMEOUT_SECS`
+  - total per-peer budget for the `server_info`/`storage_info` admin probe round; `server_info` may reconnect once and `storage_info` remains a single attempt.
+  - default is `10` seconds, preserving the previous two-attempt worst-case budget.
+  - values must be positive; `0` or an invalid value falls back to the default, and values above `60` are clamped to `60`.
+  - the setting is read by the aggregating node only; it does not change the internode RPC wire contract. Any retry shares one round deadline rather than receiving a fresh timeout.
+
 ## Startup filesystem boundary policy
 
 - `RUSTFS_UNSUPPORTED_FS_POLICY` controls startup behavior when RustFS detects local endpoint filesystems that are outside the supported production boundary.

@@ -99,6 +99,7 @@ impl NativeHttp {
     pub(super) fn for_test(endpoint: Url) -> Self {
         Self {
             client: reqwest::Client::builder()
+                .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("test http client should build"),
@@ -116,19 +117,27 @@ impl NativeHttp {
                 .path_segments_mut()
                 .map_err(|_| SourceError::Other("source endpoint cannot carry a path".to_string()))?;
             path.clear();
-            path.extend(segments);
+            for segment in segments {
+                // URL normalization drops standalone dot segments. Sending
+                // that URL could fetch another object and backfill its bytes
+                // under the originally requested key.
+                if matches!(segment, "." | "..") {
+                    return Err(SourceError::Unsupported("source path contains an unsupported dot segment".to_string()));
+                }
+                path.push(segment);
+            }
         }
         Ok(url)
     }
 
     /// Sends the request and returns the response only for a 2xx status.
-    /// Non-2xx statuses are classified from the status and the provider's own
+    /// Non-2xx statuses are classified from the status and an optional provider
     /// error-code header; response bodies are not read, so no provider message
     /// can smuggle credentials or markup into a log line.
     pub(super) async fn send(
         &self,
         request: reqwest::Request,
-        error_code_header: &str,
+        error_code_header: Option<&str>,
     ) -> Result<reqwest::Response, SourceError> {
         self.send_classified(request, error_code_header, false).await
     }
@@ -137,7 +146,7 @@ impl NativeHttp {
     pub(super) async fn send_object(
         &self,
         request: reqwest::Request,
-        error_code_header: &str,
+        error_code_header: Option<&str>,
     ) -> Result<reqwest::Response, SourceError> {
         self.send_classified(request, error_code_header, true).await
     }
@@ -145,26 +154,42 @@ impl NativeHttp {
     async fn send_classified(
         &self,
         request: reqwest::Request,
-        error_code_header: &str,
+        error_code_header: Option<&str>,
         not_found_on_404_without_code: bool,
     ) -> Result<reqwest::Response, SourceError> {
-        let response = self.client.execute(request).await.map_err(classify_transport_error)?;
+        let response = self.execute(request).await?;
+        let status = response.status();
+        match Self::check_response(response, error_code_header) {
+            Err(SourceError::Other(_)) if not_found_on_404_without_code && status.as_u16() == 404 => Err(SourceError::NotFound),
+            result => result,
+        }
+    }
+
+    pub(super) async fn execute(&self, request: reqwest::Request) -> Result<reqwest::Response, SourceError> {
+        self.client.execute(request).await.map_err(classify_transport_error)
+    }
+
+    pub(super) fn check_response(
+        response: reqwest::Response,
+        error_code_header: Option<&str>,
+    ) -> Result<reqwest::Response, SourceError> {
         let status = response.status();
         if status.is_success() {
             return Ok(response);
         }
-        let code = response
-            .headers()
-            .get(error_code_header)
+        let code = error_code_header
+            .and_then(|header| response.headers().get(header))
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         let message = match &code {
             Some(code) => format!("source returned HTTP {status} ({code})"),
             None => format!("source returned HTTP {status}"),
         };
-        match classify_status(status.as_u16(), code.as_deref(), message) {
-            SourceError::Other(_) if not_found_on_404_without_code && status.as_u16() == 404 => Err(SourceError::NotFound),
-            err => Err(err),
+        match classify_status(status.as_u16(), code.as_deref(), message.clone()) {
+            // Native object absence needs provider-specific evidence or a
+            // successful bucket probe, never an alias from the S3 classifier.
+            SourceError::NotFound => Err(classify_status(status.as_u16(), None, message)),
+            error => Err(error),
         }
     }
 }
@@ -430,5 +455,45 @@ mod tests {
         let url = http.url(["container", "dir", "a b?c#d.txt"]).expect("url should build");
         assert_eq!(url.as_str(), "https://acct.blob.core.windows.net/container/dir/a%20b%3Fc%23d.txt");
         assert_eq!(url.query(), None, "a key with '?' must not become a query");
+    }
+
+    #[test]
+    fn native_http_refuses_dot_segments_instead_of_addressing_another_object() {
+        let http = NativeHttp::for_test(Url::parse("https://source.example.com").expect("origin"));
+        for key in [
+            ".",
+            "..",
+            "./key",
+            "../key",
+            "dir/./key",
+            "dir/../key",
+            "dir/.",
+            "dir/..",
+            "\u{fffe}/../key",
+        ] {
+            let error = http
+                .url(std::iter::once("bucket").chain(key.split('/')))
+                .expect_err("dot segments must not disappear");
+            assert!(matches!(error, SourceError::Unsupported(_)), "{key:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn native_http_preserves_ordinary_dots_empty_segments_and_literal_escapes() {
+        let http = NativeHttp::for_test(Url::parse("https://source.example.com").expect("origin"));
+        for (key, path) in [
+            ("file.txt", "/bucket/file.txt"),
+            (".hidden/.../tail.", "/bucket/.hidden/.../tail."),
+            ("/dir//key/", "/bucket//dir//key/"),
+            ("%2e/%2E%2E/key", "/bucket/%252e/%252E%252E/key"),
+            ("a+b &?#", "/bucket/a+b%20&%3F%23"),
+        ] {
+            let url = http
+                .url(std::iter::once("bucket").chain(key.split('/')))
+                .expect("representable key");
+            assert_eq!(url.path(), path, "{key:?}");
+            assert!(url.query().is_none());
+            assert!(url.fragment().is_none());
+        }
     }
 }
