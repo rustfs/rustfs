@@ -794,8 +794,29 @@ mod tests {
         let attempt = tokio::time::timeout(
             Duration::from_secs(600),
             std::panic::AssertUnwindSafe(async {
-                let mut first = RepairStartupPhase::new(cluster, &artifact, "initial")?;
-                let previous = run_repair_startup_phase(cluster, &binary, &mut first, None).await?;
+                // Preserve pool0's exact command line when it later joins pool1.
+                // Fresh pools with different format leaders cannot yet combine
+                // their bootstrap authority, so prepare through normal expansion.
+                let first_pool = volumes.split_whitespace().next().expect("pool0 volume argument");
+                cluster.set_env("RUSTFS_VOLUMES", first_pool);
+                let mut seed = RepairStartupPhase::new(cluster, &artifact, "seed", 1)?;
+                let seeded = run_repair_startup_phase(cluster, &binary, &mut seed, None, true).await?;
+                let stopped = stop_repair_cluster(cluster)?;
+                assert_eq!(stopped.len(), 1, "the seed child must be reaped before expansion");
+                std::fs::write(artifact.join("seed-stopped.json"), serde_json::to_vec_pretty(&stopped)?)?;
+                let seed_formats = cluster.nodes[0]
+                    .data_dirs
+                    .iter()
+                    .map(|disk| std::fs::read(std::path::Path::new(disk).join(".rustfs.sys/format.json")))
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                cluster.extra_env.retain(|(key, _)| key != "RUSTFS_VOLUMES");
+                assert_eq!(cluster.rustfs_volumes_arg(), volumes);
+                let mut first = RepairStartupPhase::new(cluster, &artifact, "expansion", 2)?;
+                assert_ne!(seed.nonce, first.nonce);
+                let previous = run_repair_startup_phase(cluster, &binary, &mut first, Some(&seeded), true).await?;
+                for (disk, expected) in cluster.nodes[0].data_dirs.iter().zip(seed_formats) {
+                    assert_eq!(std::fs::read(std::path::Path::new(disk).join(".rustfs.sys/format.json"))?, expected);
+                }
                 let bucket = format!("repair-cas-{run}");
                 let key = "preserved/body";
                 let body = vec![0x6bu8; 256 * 1024];
@@ -817,7 +838,7 @@ mod tests {
                 // the stopped fixture's exact pool1 object subtrees.
                 let stopped = stop_repair_cluster(cluster)?;
                 assert_eq!(stopped.len(), 2, "both initial children must be reaped before disk mutation");
-                std::fs::write(artifact.join("initial-stopped.json"), serde_json::to_vec_pretty(&stopped)?)?;
+                std::fs::write(artifact.join("expansion-stopped.json"), serde_json::to_vec_pretty(&stopped)?)?;
                 let mut before = Vec::new();
                 for (pool, node) in cluster.nodes.iter().enumerate() {
                     for disk in &node.data_dirs {
@@ -847,16 +868,16 @@ mod tests {
                     assert_eq!(repair_disk_snapshot(root)?, expected, "only pool1's complete pool.bin objects may change");
                 }
                 assert_eq!(cluster.rustfs_volumes_arg(), volumes, "repair reuses identical topology, ports and roots");
-                let mut restart = RepairStartupPhase::new(cluster, &artifact, "repair")?;
+                let mut restart = RepairStartupPhase::new(cluster, &artifact, "repair", 2)?;
                 assert_ne!(restart.nonce, first.nonce);
-                let repaired = run_repair_startup_phase(cluster, &binary, &mut restart, Some(&previous)).await?;
+                let repaired = run_repair_startup_phase(cluster, &binary, &mut restart, Some(&previous), false).await?;
                 tokio::time::timeout(Duration::from_secs(20), repair_full_get(cluster, &bucket, key, &body))
                     .await
                     .map_err(std::io::Error::other)??;
                 std::fs::write(
                     artifact.join("repair-proof.json"),
                     serde_json::to_vec_pretty(&serde_json::json!({
-                        "initial": previous, "repair": repaired, "volumes": volumes,
+                        "seed": seeded, "expansion": previous, "repair": repaired, "volumes": volumes, "seed_volumes": first_pool,
                         "negative_control": "NOT_RUN", "body_length": body.len(), "full_get_nodes": [0, 1],
                     }))?,
                 )?;
@@ -869,10 +890,22 @@ mod tests {
         // Attempt every child even when an earlier wait or assertion failed.
         let stopped = stop_repair_cluster(cluster);
         eprintln!("two-pool repair CAS evidence: {}", artifact.display());
+        let cleanup_receipt = match &stopped {
+            Ok(receipts) => serde_json::json!({"ok": true, "waited": receipts}),
+            Err(error) => serde_json::json!({"ok": false, "error": error.to_string()}),
+        };
+        let cleanup_recorded = serde_json::to_vec_pretty(&cleanup_receipt)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| std::fs::write(artifact.join("final-cleanup.json"), bytes));
+        if let Err(error) = &cleanup_recorded {
+            eprintln!("repair cleanup receipt could not be saved: {error}");
+        }
         match attempt {
             Ok(Ok(result)) => {
                 result?;
-                std::fs::write(artifact.join("repair-stopped.json"), serde_json::to_vec_pretty(&stopped?)?)?;
+                let stopped = stopped?;
+                cleanup_recorded?;
+                std::fs::write(artifact.join("repair-stopped.json"), serde_json::to_vec_pretty(&stopped)?)?;
                 Ok(())
             }
             Ok(Err(panic)) => std::panic::resume_unwind(panic),
@@ -990,7 +1023,9 @@ mod tests {
             cluster: &mut RustFSTestClusterEnvironment,
             artifact: &std::path::Path,
             phase: &str,
+            pool_count: usize,
         ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+            assert!(matches!(pool_count, 1 | 2));
             let artifact = artifact.join(phase);
             std::fs::create_dir(&artifact)?;
             let nonce = uuid::Uuid::new_v4().to_string();
@@ -1003,7 +1038,7 @@ mod tests {
                 endpoints: Vec::new(),
                 releases: StartupCasReleases(Vec::new()),
             };
-            for node in 0..2 {
+            for node in 0..pool_count {
                 let log = result.artifact.join(format!("node-{node}.log"));
                 let release = result.artifact.join(format!("release-{node}"));
                 assert!(!release.try_exists()?, "each startup has a new unreleased gate");
@@ -1031,15 +1066,23 @@ mod tests {
         binary: &std::path::Path,
         phase: &mut RepairStartupPhase,
         previous: Option<&serde_json::Value>,
+        topology_update: bool,
     ) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
-        let mut startup = Box::pin(cluster.start_with_binary(binary));
-        let mut observer = Box::pin(wait_two_pool_startup_cas(phase, previous));
+        let pool_count = phase.logs.len();
+        let mut startup = Box::pin(async {
+            if pool_count == 1 {
+                cluster.start_node_from_binary(0, binary).await
+            } else {
+                cluster.start_with_binary(binary).await
+            }
+        });
+        let mut observer = Box::pin(wait_repair_startup_cas(phase, previous, topology_update));
         let (observed, finished) = tokio::select! {
             observed = tokio::time::timeout(Duration::from_secs(120), &mut observer) => {
                 (observed.map_err(std::io::Error::other).and_then(|result| result), false)
             }
             result = &mut startup => {
-                (Err(std::io::Error::other(format!("startup ended before both unreleased repair gates: {result:?}"))), true)
+                (Err(std::io::Error::other(format!("startup ended before the unreleased phase gates: {result:?}"))), true)
             }
         };
         drop(observer);
@@ -1057,17 +1100,19 @@ mod tests {
         let observed = observed?;
         released?;
         drained?;
-        for (node, process) in cluster.nodes.iter().enumerate() {
+        for (node, process) in cluster.nodes.iter().take(pool_count).enumerate() {
             assert_eq!(observed["pids"][node], process.process.as_ref().expect("live phase child").id());
         }
         Ok(observed)
     }
 
-    async fn wait_two_pool_startup_cas(
+    async fn wait_repair_startup_cas(
         phase: &RepairStartupPhase,
         previous: Option<&serde_json::Value>,
+        topology_update: bool,
     ) -> std::io::Result<serde_json::Value> {
         use serde_json::{Value, json};
+        let pool_count = phase.logs.len();
         loop {
             let logs = phase
                 .logs
@@ -1101,7 +1146,9 @@ mod tests {
                 assert!(records.iter().all(|event| event["pid"] == ready[0]["pid"]));
                 pids.push(ready[0]["pid"].clone());
             }
-            assert_ne!(pids[0], pids[1]);
+            if pool_count == 2 {
+                assert_ne!(pids[0], pids[1]);
+            }
             let source = &events[0];
             let classified: Vec<_> = source
                 .iter()
@@ -1115,10 +1162,12 @@ mod tests {
             assert_eq!(classified["elected_writer"], true);
             assert_eq!(classified["needs_repair"], true);
             assert_eq!(classified["repair_write_safe"], true);
-            assert_eq!(classified["topology_update"], previous.is_none());
+            assert_eq!(classified["topology_update"], topology_update);
             assert!(
-                events[1]
+                events
                     .iter()
+                    .skip(1)
+                    .flatten()
                     .all(|event| event["kind"] != "cas" || event["object"] != "pool.bin"),
                 "only elected pool0 may persist pool.bin"
             );
@@ -1129,11 +1178,13 @@ mod tests {
                     event["kind"] == "replica-read" && event["startup_phase"] == "load" && event["attempt"] == *attempt
                 })
                 .collect();
-            assert_eq!(initial.len(), 2, "complete initial reads of both real pools");
-            assert_eq!(initial[0]["batch"], initial[1]["batch"]);
+            assert_eq!(initial.len(), pool_count, "complete initial reads of every real pool");
+            if pool_count == 2 {
+                assert_eq!(initial[0]["batch"], initial[1]["batch"]);
+            }
             let mut prepares = Vec::new();
             let mut commits = Vec::new();
-            for pool in 0..2 {
+            for pool in 0..pool_count {
                 let read: Vec<_> = initial.iter().filter(|event| event["pool"] == pool).collect();
                 assert_eq!(read.len(), 1);
                 let read = *read[0];
@@ -1199,12 +1250,14 @@ mod tests {
                     .iter()
                     .filter(|event| event["kind"] == "cas" && event["object"] == "pool.bin")
                     .count(),
-                4
+                2 * pool_count
             );
-            assert_eq!(prepares[0]["payload_sha256"], prepares[1]["payload_sha256"]);
-            assert_eq!(commits[0]["payload_sha256"], commits[1]["payload_sha256"]);
+            if pool_count == 2 {
+                assert_eq!(prepares[0]["payload_sha256"], prepares[1]["payload_sha256"]);
+                assert_eq!(commits[0]["payload_sha256"], commits[1]["payload_sha256"]);
+            }
             let mut replicas = Vec::new();
-            for pool in 0..2 {
+            for pool in 0..pool_count {
                 let matching: Vec<_> = source
                     .iter()
                     .copied()
@@ -1220,7 +1273,7 @@ mod tests {
                 let replica = matching[0];
                 assert_eq!(replica["state"], "valid");
                 assert_eq!(replica["committed"], true);
-                assert_eq!(replica["pool_count"], 2);
+                assert_eq!(replica["pool_count"], pool_count);
                 assert_eq!(replica["raw_sha256"], replica["payload_sha256"]);
                 assert_eq!(replica["etag"], commits[pool]["etag"]);
                 assert_eq!(replica["cas"], "existing");
@@ -1261,7 +1314,9 @@ mod tests {
                 "transaction_id",
                 "payload_sha256",
             ] {
-                assert_eq!(replicas[0][field], replicas[1][field], "same decoded final revision: {field}");
+                if pool_count == 2 {
+                    assert_eq!(replicas[0][field], replicas[1][field], "same decoded final revision: {field}");
+                }
             }
             let confirmed: Vec<_> = source
                 .iter()
@@ -1275,7 +1330,7 @@ mod tests {
                 .collect();
             assert_eq!(confirmed.len(), 1);
             let mut receivers = Vec::new();
-            for drive in 0..2 {
+            for drive in 0..phase.disks.get(1).map_or(0, Vec::len) {
                 for cas in [prepares[1], commits[1]] {
                     let matching: Vec<_> = events[1]
                         .iter()
@@ -1300,7 +1355,7 @@ mod tests {
                     }
                 }
             }
-            if receivers.len() != 4 {
+            if receivers.len() != 2 * phase.disks.get(1).map_or(0, Vec::len) {
                 // Remote started tracing may flush after direct receiver JSON.
                 sleep(Duration::from_millis(25)).await;
                 continue;
