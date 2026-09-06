@@ -2210,6 +2210,9 @@ mod tests {
         block_delete: Arc<std::sync::atomic::AtomicBool>,
         delete_started: Arc<tokio::sync::Notify>,
         release_delete: Arc<tokio::sync::Notify>,
+        block_group_save: Arc<std::sync::atomic::AtomicBool>,
+        group_save_started: Arc<tokio::sync::Notify>,
+        group_save_release: Arc<tokio::sync::Notify>,
     }
 
     impl StsTestMockStore {
@@ -2223,6 +2226,9 @@ mod tests {
                 block_delete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 delete_started: Arc::new(tokio::sync::Notify::new()),
                 release_delete: Arc::new(tokio::sync::Notify::new()),
+                block_group_save: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                group_save_started: Arc::new(tokio::sync::Notify::new()),
+                group_save_release: Arc::new(tokio::sync::Notify::new()),
             }
         }
 
@@ -2326,6 +2332,10 @@ mod tests {
         }
 
         async fn save_group_info(&self, _name: &str, _item: GroupInfo) -> Result<()> {
+            if self.block_group_save.load(std::sync::atomic::Ordering::SeqCst) {
+                self.group_save_started.notify_one();
+                self.group_save_release.notified().await;
+            }
             Ok(())
         }
 
@@ -2505,6 +2515,69 @@ mod tests {
         let store = StsTestMockStore::new(false);
         let cache = IamCache::new(store).await.expect("IAM cache should initialize");
         IamSys::new(cache)
+    }
+
+    async fn assert_group_write_during_reload_is_published(remove: bool) {
+        let iam_sys = Arc::new(temp_env::async_with_vars([("RUSTFS_SKIP_BACKGROUND_TASK", Some("1"))], test_iam_sys()).await);
+        let member = "sts-fallback-test-parent";
+        let group = if remove { "testgroup" } else { "new-published-group" };
+        let source_time = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        iam_sys
+            .store
+            .api
+            .block_group_save
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let before = iam_sys.store.cache.snapshot();
+        let writer_iam = iam_sys.clone();
+        let writer = tokio::spawn(async move {
+            if remove {
+                writer_iam
+                    .remove_users_from_group_at(group, vec![member.to_string()], source_time)
+                    .await
+            } else {
+                writer_iam
+                    .add_users_to_group_at(group, vec![member.to_string()], source_time)
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), iam_sys.store.api.group_save_started.notified())
+            .await
+            .expect("group save should reach the barrier");
+        // The pending store write has not changed the cache, so the production
+        // full-reload snapshot guard permits this replacement.
+        assert!(iam_sys.store.cache.with_write_lock(|cache| cache.matches_snapshot(&before)));
+        iam_sys
+            .store
+            .api
+            .load_all(&iam_sys.store.cache)
+            .await
+            .expect("reload while group save is pending");
+        iam_sys.store.api.group_save_release.notify_one();
+        assert_eq!(writer.await.expect("join group writer").expect("group write should succeed"), source_time);
+        let info = iam_sys
+            .get_group_info(group)
+            .await
+            .expect("successful group write must remain readable after reload");
+        assert_eq!(info.update_at, Some(source_time), "source timestamp must remain on the record");
+        assert_eq!(info.members, if remove { Vec::new() } else { vec![member.to_string()] });
+        let groups = iam_sys.store.cache.snapshot().user_group_memberships.get(member).cloned();
+        assert_eq!(
+            groups.is_some_and(|groups| groups.contains(group)),
+            !remove,
+            "membership index must reflect the write"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn add_group_write_during_reload_publishes_after_store_save() {
+        assert_group_write_during_reload_is_published(false).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn remove_group_write_during_reload_publishes_after_store_save() {
+        assert_group_write_during_reload_is_published(true).await;
     }
 
     /// Review finding on rustfs#7195: a replicated group edit carries a source

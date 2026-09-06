@@ -1812,12 +1812,12 @@ where
                 gi
             }
         };
-        let now = OffsetDateTime::now_utc();
         drop(cache);
 
         self.api.save_group_info(group, gi.clone()).await?;
 
         self.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
             cache.add_or_update_group(group, &gi, now);
 
             let user_group_memberships = Arc::clone(&cache.state().user_group_memberships);
@@ -1960,15 +1960,14 @@ where
         let d: HashSet<&String> = HashSet::from_iter(members.iter());
         gi.members = s.difference(&d).map(|v| v.to_string()).collect::<Vec<String>>();
         gi.update_at = Some(updated_at);
-        // Cache publication time is the local clock, not the record stamp
-        // (see `add_users_to_group_at`).
-        let now = OffsetDateTime::now_utc();
-
         if !update_cache_only {
             self.api.save_group_info(name, gi.clone()).await?;
         }
 
         self.cache.with_write_lock(|cache| {
+            // Sample after storage completes so a concurrent reload cannot
+            // make this publication older than the cache it must update.
+            let now = OffsetDateTime::now_utc();
             cache.add_or_update_group(name, &gi, now);
 
             let user_group_memberships = Arc::clone(&cache.state().user_group_memberships);
