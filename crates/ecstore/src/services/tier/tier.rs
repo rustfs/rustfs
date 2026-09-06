@@ -15,8 +15,6 @@
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
 
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
@@ -802,7 +800,7 @@ pub enum TierConfigUpdateError {
 }
 
 enum TierCandidateMutation {
-    Add(TierConfig, bool),
+    Add(Box<TierConfig>, bool),
     Edit(String, TierCreds),
     Remove(String, bool),
     Clear(bool),
@@ -823,7 +821,7 @@ struct PrevalidatedTierCandidateMutation {
 impl TierCandidateMutation {
     fn add(mut config: TierConfig, force: bool) -> std::result::Result<Self, AdminError> {
         normalize_s3_gcs_add_tier_name(&mut config)?;
-        Ok(Self::Add(config, force))
+        Ok(Self::Add(Box::new(config), force))
     }
 
     fn normalize_add_tier_name(&mut self) -> std::result::Result<(), AdminError> {
@@ -910,7 +908,7 @@ impl TierCandidateMutation {
         match self {
             Self::Add(config, force) => {
                 let tier_name = config.name.clone();
-                candidate.add_with_deadline(config, force, deadline).await?;
+                candidate.add_with_deadline(*config, force, deadline).await?;
                 Ok(Some(tier_name))
             }
             Self::Edit(tier_name, credentials) => {
@@ -2990,7 +2988,7 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
     let tier_type = if wasabi_version {
         TierType::Wasabi
     } else {
-        tier_type_from_hint(ext.tier_type_hint.as_deref()).unwrap_or_else(|| match ext.tier_type {
+        tier_type_from_hint(ext.tier_type_hint.as_deref()).unwrap_or(match ext.tier_type {
             EXTERNAL_TIER_TYPE_S3 => TierType::S3,
             EXTERNAL_TIER_TYPE_AZURE => TierType::Azure,
             EXTERNAL_TIER_TYPE_GCS => TierType::GCS,
@@ -3372,28 +3370,23 @@ impl TierConfigMgr {
 
     pub async fn remove(&mut self, tier_name: &str, force: bool) -> std::result::Result<(), AdminError> {
         self.ensure_generation_is_idle(tier_name)?;
-        let d = self.get_driver(tier_name).await;
-        if let Err(err) = d {
-            if err.code == ERR_TIER_NOT_FOUND.code {
-                return Ok(());
-            } else {
-                return Err(err);
-            }
-        }
+        let driver = match self.get_driver(tier_name).await {
+            Ok(driver) => driver,
+            Err(err) if err.code == ERR_TIER_NOT_FOUND.code => return Ok(()),
+            Err(err) => return Err(err),
+        };
         if !force {
-            if let Ok(driver) = d {
-                match driver.in_use().await {
-                    Err(err) => {
-                        let mut e = ERR_TIER_PERM_ERR.clone();
-                        e.message.push('.');
-                        e.message.push_str(&err.to_string());
-                        return Err(e);
-                    }
-                    Ok(in_use) if in_use => {
-                        return Err(ERR_TIER_BACKEND_NOT_EMPTY.clone());
-                    }
-                    _ => {}
+            match driver.in_use().await {
+                Err(err) => {
+                    let mut e = ERR_TIER_PERM_ERR.clone();
+                    e.message.push('.');
+                    e.message.push_str(&err.to_string());
+                    return Err(e);
                 }
+                Ok(in_use) if in_use => {
+                    return Err(ERR_TIER_BACKEND_NOT_EMPTY.clone());
+                }
+                _ => {}
             }
         }
         self.tiers.remove(tier_name);
@@ -3402,21 +3395,12 @@ impl TierConfigMgr {
     }
 
     pub async fn verify(&mut self, tier_name: &str) -> std::result::Result<(), std::io::Error> {
-        let d = match self.get_driver(tier_name).await {
-            Ok(d) => d,
-            Err(err) => {
-                return Err(std::io::Error::other(err));
-            }
-        };
-        if let Err(err) = check_warm_backend(Some(d)).await {
-            return Err(std::io::Error::other(err));
-        } else {
-            return Ok(());
-        }
+        let driver = self.get_driver(tier_name).await.map_err(std::io::Error::other)?;
+        check_warm_backend(Some(driver)).await.map_err(std::io::Error::other)
     }
 
     pub fn empty(&self) -> bool {
-        self.list_tiers().len() == 0
+        self.tiers.is_empty()
     }
 
     pub fn tier_type(&self, tier_name: &str) -> String {
@@ -3429,7 +3413,7 @@ impl TierConfigMgr {
 
     pub fn list_tiers(&self) -> Vec<TierConfig> {
         let mut tier_cfgs = Vec::<TierConfig>::new();
-        for (_, tier) in self.tiers.iter() {
+        for tier in self.tiers.values() {
             let tier = tier.redacted();
             tier_cfgs.push(tier);
         }
@@ -7135,7 +7119,8 @@ mod tests {
         let err = expect_decode_err(&encode_fixture(&wrong_hint));
         assert!(err.to_string().contains("inconsistent Wasabi type discriminators"), "{err}");
 
-        let poison_fields: [(&str, fn(&mut ExternalTierS3)); 6] = [
+        type WasabiPoisonField = (&'static str, fn(&mut ExternalTierS3));
+        let poison_fields: [WasabiPoisonField; 6] = [
             ("storage_class", |s3| s3.storage_class = "GLACIER".to_string()),
             ("aws_role", |s3| s3.aws_role = true),
             ("web_identity_token", |s3| s3.aws_role_web_identity_token_file = "/tmp/token".to_string()),
@@ -8256,7 +8241,11 @@ mod tests {
                             peer_calls.clone(),
                             Ok(PeerTierMutationState::Committed),
                         )],
-                        TierConfigMgr::update_candidate_with_config_lock(&manager, store, TierCandidateMutation::Add(tier, true)),
+                        TierConfigMgr::update_candidate_with_config_lock(
+                            &manager,
+                            store,
+                            TierCandidateMutation::Add(Box::new(tier), true),
+                        ),
                     ),
                 )
                 .await
@@ -8295,7 +8284,7 @@ mod tests {
             let add = TIER_DRIVER_TEST_FACTORY.scope(
                 factory,
                 apply_tier_candidate_mutation(
-                    TierCandidateMutation::Add(build_rustfs_tier("COLD-DEADLINE"), false),
+                    TierCandidateMutation::Add(Box::new(build_rustfs_tier("COLD-DEADLINE")), false),
                     &mut candidate,
                     deadline,
                 ),
@@ -9114,7 +9103,9 @@ mod tests {
     fn decode_hex_fixture(hex: &str) -> Vec<u8> {
         assert_eq!(hex.len() % 2, 0, "hex fixture must contain complete bytes");
         hex.as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let pair = std::str::from_utf8(pair).expect("hex fixture should be ASCII");
                 u8::from_str_radix(pair, 16).expect("hex fixture should contain only hexadecimal digits")
@@ -11128,7 +11119,7 @@ mod tests {
                             store.clone(),
                             candidate,
                             version,
-                            TierCandidateMutation::Add(build_rustfs_tier("COLD-A"), true),
+                            TierCandidateMutation::Add(Box::new(build_rustfs_tier("COLD-A")), true),
                             update,
                             None,
                         )
@@ -11725,8 +11716,9 @@ mod tests {
             assert!(merged[0].has_peer_record && merged[0].has_coordinator_record);
         }
 
-        let err = TierConfigMgr::merge_mutation_recovery_intents(&[committed.clone()], &[prepared.clone()])
-            .expect_err("a peer committed record cannot outrun the coordinator commit order");
+        let err =
+            TierConfigMgr::merge_mutation_recovery_intents(std::slice::from_ref(&committed), std::slice::from_ref(&prepared))
+                .expect_err("a peer committed record cannot outrun the coordinator commit order");
         assert!(err.to_string().contains("conflicting states"), "{err}");
 
         let mut conflicting_identity = prepared.clone();
@@ -13571,9 +13563,11 @@ mod tests {
         let build = tokio::spawn(async move { TierConfigMgr::acquire_operation_lease(&build_manager, cold_tier).await });
         barrier.arrived.notified().await;
 
-        tokio::time::timeout(Duration::from_millis(100), manager.read())
-            .await
-            .expect("cold driver construction must not block manager readers");
+        drop(
+            tokio::time::timeout(Duration::from_millis(100), manager.read())
+                .await
+                .expect("cold driver construction must not block manager readers"),
+        );
         let tier_b = tokio::time::timeout(Duration::from_millis(100), TierConfigMgr::acquire_operation_lease(&manager, "COLD-B"))
             .await
             .expect("cold tier A construction must not block tier B")
@@ -13776,9 +13770,11 @@ mod tests {
         let verify_manager = manager.clone();
         let verify = tokio::spawn(async move { TierConfigMgr::verify_without_manager_lock(&verify_manager, "COLD-A").await });
         started.notified().await;
-        tokio::time::timeout(Duration::from_millis(100), manager.read())
-            .await
-            .expect("slow verify must not hold the manager lock");
+        drop(
+            tokio::time::timeout(Duration::from_millis(100), manager.read())
+                .await
+                .expect("slow verify must not hold the manager lock"),
+        );
         release.add_permits(1);
         verify.await.expect("verify task should join").expect("verify should finish");
     }
@@ -14186,9 +14182,11 @@ mod tests {
                 vec!["COLD-A".to_string()]
             );
         }
-        tokio::time::timeout(Duration::from_secs(1), manager.read())
-            .await
-            .expect("manager reads must not wait for tier A leases");
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), manager.read())
+                .await
+                .expect("manager reads must not wait for tier A leases"),
+        );
         let next_b = tokio::time::timeout(Duration::from_secs(1), TierConfigMgr::acquire_operation_lease(&manager, "COLD-B"))
             .await
             .expect("tier B lease acquisition must not wait for tier A")
@@ -14621,7 +14619,7 @@ mod tests {
             "https://example-compat.invalid"
         );
         let runtime = registered_tier_driver_runtime(&manager_guard).expect("runtime sidecar should remain registered");
-        assert!(lock_unpoisoned(&runtime).generations.get("COLD-A").is_none());
+        assert!(!lock_unpoisoned(&runtime).generations.contains_key("COLD-A"));
     }
 
     #[derive(Debug)]
@@ -15261,15 +15259,12 @@ mod tests {
                 .filter(|object| object.bucket == bucket && object.name.starts_with(prefix))
                 .cloned()
                 .collect();
-            objects.sort_by(|left, right| tier_test_object_marker(left).cmp(&tier_test_object_marker(right)));
+            objects.sort_by_key(tier_test_object_marker);
             if marker.is_some() || version_marker.is_some() {
                 let marker = (marker.unwrap_or_default(), version_marker.unwrap_or_default());
                 objects.retain(|object| tier_test_object_marker(object) > marker);
             }
-            let limit = match usize::try_from(max_keys) {
-                Ok(limit) => limit,
-                Err(_) => 0,
-            };
+            let limit: usize = usize::try_from(max_keys).unwrap_or_default();
             let is_truncated = objects.len() > limit;
             if is_truncated {
                 objects.truncate(limit);
@@ -15299,17 +15294,16 @@ mod tests {
             result: Self::WalkResultSender,
             opts: Self::WalkOptions,
         ) -> Result<()> {
-            if self.fail_reference_walk.load(Ordering::SeqCst) {
-                if result
+            if self.fail_reference_walk.load(Ordering::SeqCst)
+                && result
                     .send(StorageObjectInfoOrErr {
                         item: None,
                         err: Some(Error::other("injected tier reference walk failure")),
                     })
                     .await
                     .is_err()
-                {
-                    return Ok(());
-                }
+            {
+                return Ok(());
             }
             let mut objects = self
                 .listed_versions
@@ -15320,7 +15314,7 @@ mod tests {
                 .filter(|object| opts.include_free_versions || !object.transitioned_object.free_version)
                 .cloned()
                 .collect::<Vec<_>>();
-            objects.sort_by(|left, right| tier_test_object_marker(left).cmp(&tier_test_object_marker(right)));
+            objects.sort_by_key(tier_test_object_marker);
             if let Some(marker) = opts.marker.as_deref() {
                 objects.retain(|object| object.name.as_str() > marker);
             }
@@ -15498,17 +15492,18 @@ mod tests {
             api_view.rustfs.expect("admin RustFS payload should exist").secret_key,
             TIER_CREDENTIAL_REDACTED
         );
-        let observed = lock_unpoisoned(&observed);
-        assert_eq!(observed.len(), 1);
-        assert_eq!(
-            observed[0]
-                .rustfs
-                .as_ref()
-                .expect("backend factory should observe the RustFS payload")
-                .secret_key,
-            SECRET_KEY
-        );
-        drop(observed);
+        {
+            let observed = lock_unpoisoned(&observed);
+            assert_eq!(observed.len(), 1);
+            assert_eq!(
+                observed[0]
+                    .rustfs
+                    .as_ref()
+                    .expect("backend factory should observe the RustFS payload")
+                    .secret_key,
+                SECRET_KEY
+            );
+        }
 
         let operations = backend.op_log().await;
         assert_eq!(operations.len(), 5);
@@ -16709,7 +16704,7 @@ mod tests {
         candidate.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
         candidate.tiers.insert("COLD-B".to_string(), build_rustfs_tier("COLD-B"));
 
-        let targets = TierCandidateMutation::Add(build_rustfs_tier("COLD-B"), true)
+        let targets = TierCandidateMutation::Add(Box::new(build_rustfs_tier("COLD-B")), true)
             .affected_targets(&current, &candidate)
             .expect("add proof should ignore unchanged durable tiers");
         assert_eq!(targets.len(), 1);
@@ -16735,7 +16730,7 @@ mod tests {
                 TierConfigMgr::update_candidate_with_config_lock(
                     &manager,
                     store.clone(),
-                    TierCandidateMutation::Add(build_rustfs_tier("COLD-B"), true),
+                    TierCandidateMutation::Add(Box::new(build_rustfs_tier("COLD-B")), true),
                 ),
             )
             .await
@@ -16794,14 +16789,15 @@ mod tests {
             .await
             .expect("legacy nested-name Add must run the full coordinator fanout");
 
-        let prepared_intents = lock_unpoisoned(&prepared_intents);
-        assert_eq!(prepared_intents.len(), 1);
-        assert_eq!(prepared_intents[0].kind, TierMutationIntentKind::Add);
-        assert_eq!(prepared_intents[0].affected_targets.len(), 1);
-        assert_eq!(prepared_intents[0].affected_targets[0].tier_name, "COLD-LEGACY");
-        assert!(prepared_intents[0].affected_targets[0].old_backend_identity.is_none());
-        assert!(prepared_intents[0].affected_targets[0].new_backend_identity.is_some());
-        drop(prepared_intents);
+        {
+            let prepared_intents = lock_unpoisoned(&prepared_intents);
+            assert_eq!(prepared_intents.len(), 1);
+            assert_eq!(prepared_intents[0].kind, TierMutationIntentKind::Add);
+            assert_eq!(prepared_intents[0].affected_targets.len(), 1);
+            assert_eq!(prepared_intents[0].affected_targets[0].tier_name, "COLD-LEGACY");
+            assert!(prepared_intents[0].affected_targets[0].old_backend_identity.is_none());
+            assert!(prepared_intents[0].affected_targets[0].new_backend_identity.is_some());
+        }
 
         let peer_calls = lock_unpoisoned(&peer_calls).clone();
         let prepare_index = peer_calls
@@ -16883,7 +16879,7 @@ mod tests {
         let err = TierConfigMgr::update_candidate_with_config_lock(
             &manager,
             store.clone(),
-            TierCandidateMutation::Add(build_rustfs_tier("COLD-B"), true),
+            TierCandidateMutation::Add(Box::new(build_rustfs_tier("COLD-B")), true),
         )
         .await
         .expect_err("a new tier config update must wait for pending mutation recovery");
@@ -17159,7 +17155,7 @@ mod tests {
                     TierConfigMgr::update_candidate_with_config_lock(
                         &update_manager,
                         update_store,
-                        TierCandidateMutation::Add(build_rustfs_tier("COLD-A"), true),
+                        TierCandidateMutation::Add(Box::new(build_rustfs_tier("COLD-A")), true),
                     ),
                 )
                 .await
@@ -17210,7 +17206,7 @@ mod tests {
                         TierConfigMgr::update_candidate_with_config_lock(
                             &update_manager,
                             update_store,
-                            TierCandidateMutation::Add(build_rustfs_tier("COLD-A"), true),
+                            TierCandidateMutation::Add(Box::new(build_rustfs_tier("COLD-A")), true),
                         ),
                     ),
                 )
@@ -17273,7 +17269,7 @@ mod tests {
                 TierConfigMgr::prevalidate_candidate_owned(
                     empty_mgr(),
                     None,
-                    TierCandidateMutation::Add(build_rustfs_tier("COLD-A"), true),
+                    TierCandidateMutation::Add(Box::new(build_rustfs_tier("COLD-A")), true),
                 ),
             )
             .await;
@@ -17937,7 +17933,7 @@ mod tests {
 
     #[tokio::test]
     async fn tier_add_succeeds_with_refresh_during_coordinator_commit() {
-        assert_coordinator_commit_refresh_succeeds(TierCandidateMutation::Add(build_rustfs_tier("COLD-A"), true)).await;
+        assert_coordinator_commit_refresh_succeeds(TierCandidateMutation::Add(Box::new(build_rustfs_tier("COLD-A")), true)).await;
     }
 
     #[tokio::test]

@@ -814,7 +814,7 @@ impl DefaultObjectUsecase {
                     }
                 }
 
-                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                rustfs_scanner::record_dirty_usage_object(&bucket, &key);
                 Ok::<_, S3Error>((oi, dest_versioned))
             }
         });

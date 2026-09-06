@@ -32,7 +32,7 @@ pub mod bucket {
     pub mod bucket_target_sys {
         pub use crate::bucket::bucket_target_sys::{
             AdvancedPutOptions, BucketTargetError, BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError,
-            SsecPassthroughCapability, TargetClient, append_version_id_query,
+            SsecPassthroughCapability, TargetClient, VersionIdentityCapability, append_version_id_query,
         };
     }
 
@@ -520,7 +520,8 @@ pub mod rpc {
     pub use crate::cluster::rpc::{
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
         PeerRestClient, PeerS3Client, S3PeerSys, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
-        ScannerBucketListing, ScannerPeerActivity, ScannerPeerDirtyUsageSnapshot, ScannerPublicationLease, TONIC_RPC_PREFIX,
+        ScannerBucketListing, ScannerDirtyUsageAcknowledgement, ScannerPeerActivity, ScannerPeerDirtyUsageBucket,
+        ScannerPeerDirtyUsageSnapshot, ScannerPublicationLease, ScannerScopedDirtyUsageAckEntry, TONIC_RPC_PREFIX,
         TonicInterceptor, build_put_file_auth_trailer, check_and_record_signed_rpc_nonce, decode_heal_bucket_rpc_options,
         encode_heal_bucket_rpc_options, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
         gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,

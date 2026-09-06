@@ -14,7 +14,7 @@
 
 use crate::data_usage_define::{DATA_USAGE_CACHE_KEY_FORMAT, DataUsageCacheRevisions};
 use crate::scanner_budget::ScannerCycleBudget;
-use crate::scanner_folder::{ScannerItem, scan_data_folder};
+use crate::scanner_folder::{ScannerBucketPrefixScanScope, ScannerItem, scan_data_folder_scoped};
 use crate::sleeper::SCANNER_SLEEPER;
 use crate::{
     DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageCachePrepareOutcome,
@@ -103,6 +103,7 @@ pub type DirtyUsageBuckets = HashMap<String, u64>;
 #[derive(Clone, Debug)]
 struct DirtyUsageSnapshot {
     buckets: Arc<DirtyUsageBuckets>,
+    scopes: Arc<DirtyUsageBucketScopes>,
     generation: u64,
     covers_all_pending: bool,
 }
@@ -110,6 +111,7 @@ struct DirtyUsageSnapshot {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ScannerBucketScanScope {
     selected_buckets: Option<Arc<HashSet<String>>>,
+    selected_bucket_prefixes: Option<Arc<HashMap<String, ScannerBucketPrefixScanScope>>>,
     baseline_scan_plan_digest: Option<DataUsageScanPlanDigest>,
 }
 
@@ -120,14 +122,23 @@ impl ScannerBucketScanScope {
     }
 
     fn is_default(&self) -> bool {
-        self.selected_buckets.is_none() && self.baseline_scan_plan_digest.is_none()
+        self.selected_buckets.is_none() && self.selected_bucket_prefixes.is_none() && self.baseline_scan_plan_digest.is_none()
     }
 
-    fn from_dirty_buckets(selected_buckets: HashSet<String>, baseline_scan_plan_digest: DataUsageScanPlanDigest) -> Self {
+    fn from_dirty_buckets(
+        selected_buckets: HashSet<String>,
+        selected_bucket_prefixes: HashMap<String, ScannerBucketPrefixScanScope>,
+        baseline_scan_plan_digest: DataUsageScanPlanDigest,
+    ) -> Self {
         Self {
             selected_buckets: Some(Arc::new(selected_buckets)),
+            selected_bucket_prefixes: (!selected_bucket_prefixes.is_empty()).then(|| Arc::new(selected_bucket_prefixes)),
             baseline_scan_plan_digest: Some(baseline_scan_plan_digest),
         }
+    }
+
+    pub(crate) fn prefix_scope_for(&self, bucket: &str) -> Option<ScannerBucketPrefixScanScope> {
+        self.selected_bucket_prefixes.as_ref()?.get(bucket).cloned()
     }
 }
 
@@ -148,19 +159,26 @@ struct ScannerPeerDirtyUsageExpectation {
     pending: bool,
 }
 
-fn verified_remote_dirty_usage_buckets(
+#[derive(Debug, PartialEq, Eq)]
+struct VerifiedRemoteDirtyUsage {
+    dirty_buckets: HashSet<String>,
+    acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+}
+
+fn verified_remote_dirty_usage(
     expected_peers: &HashMap<String, ScannerPeerDirtyUsageExpectation>,
     peer_snapshots: Vec<(String, EcstoreScannerPeerDirtyUsageSnapshot)>,
-) -> Option<HashSet<String>> {
+) -> Option<VerifiedRemoteDirtyUsage> {
     if expected_peers.is_empty() || peer_snapshots.len() != expected_peers.len() {
         return None;
     }
 
     let mut received_peers = HashSet::with_capacity(peer_snapshots.len());
     let mut dirty_buckets = HashSet::new();
+    let mut acknowledgements = Vec::new();
     for (host, snapshot) in peer_snapshots {
         let expected = expected_peers.get(&host)?;
-        if !received_peers.insert(host)
+        if !received_peers.insert(host.clone())
             || snapshot.instance_id != expected.instance_id
             || snapshot.generation != expected.generation
             || snapshot.generation == u64::MAX
@@ -171,10 +189,44 @@ fn verified_remote_dirty_usage_buckets(
         {
             return None;
         }
-        dirty_buckets.extend(snapshot.buckets.into_keys());
+        let entries = snapshot
+            .buckets
+            .iter()
+            .map(|(bucket, state)| crate::storage_api::EcstoreScannerScopedDirtyUsageAckEntry {
+                bucket: bucket.clone(),
+                bucket_incarnation: state.bucket_incarnation,
+                generation: state.generation,
+            })
+            .collect::<Vec<_>>();
+        dirty_buckets.extend(snapshot.buckets.keys().cloned());
+        if !entries.is_empty() {
+            acknowledgements.push(crate::scanner::ScannerDirtyUsageAcknowledgement {
+                host,
+                instance_id: snapshot.instance_id,
+                kind: crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped {
+                    owner_id: snapshot.owner_id,
+                    entries,
+                },
+            });
+        }
     }
 
-    (received_peers.len() == expected_peers.len()).then_some(dirty_buckets)
+    (received_peers.len() == expected_peers.len()).then_some(VerifiedRemoteDirtyUsage {
+        dirty_buckets,
+        acknowledgements,
+    })
+}
+
+fn scanner_scoped_dirty_usage_ack_exceeds_cost_threshold(
+    acknowledgements: &[crate::scanner::ScannerDirtyUsageAcknowledgement],
+) -> bool {
+    acknowledgements.iter().any(|acknowledgement| {
+        matches!(
+            &acknowledgement.kind,
+            crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped { entries, .. }
+                if entries.len() > crate::SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES
+        )
+    })
 }
 
 fn complete_scanner_cache_snapshot_plan_digest(
@@ -248,6 +300,7 @@ fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<
 fn scoped_scan_scope_from_dirty_buckets(
     requested_scope: ScannerBucketScanScope,
     dirty_buckets: HashSet<String>,
+    dirty_scopes: Option<&DirtyUsageBucketScopes>,
     dirty_snapshot_complete: bool,
     all_buckets: &[BucketInfo],
     baseline_proof: ScannerCacheBaselineProof<'_>,
@@ -269,7 +322,22 @@ fn scoped_scan_scope_from_dirty_buckets(
         return requested_scope;
     };
 
-    ScannerBucketScanScope::from_dirty_buckets(selected_buckets, baseline_scan_plan_digest)
+    let selected_bucket_prefixes = dirty_scopes
+        .into_iter()
+        .flat_map(|dirty_scopes| {
+            selected_buckets
+                .iter()
+                .filter_map(|bucket| dirty_scopes.get(bucket).map(|scope| (bucket.clone(), scope)))
+        })
+        .filter_map(|(bucket, scope)| match scope {
+            DirtyUsageBucketScope::WholeBucket => None,
+            DirtyUsageBucketScope::TopLevelEntries(entries) => {
+                ScannerBucketPrefixScanScope::from_dirty_top_level_entries(entries.clone()).map(|scope| (bucket, scope))
+            }
+        })
+        .collect();
+
+    ScannerBucketScanScope::from_dirty_buckets(selected_buckets, selected_bucket_prefixes, baseline_scan_plan_digest)
 }
 
 pub(crate) fn is_scanner_metadata_corrupt_error(err: &StorageError) -> bool {
@@ -765,6 +833,12 @@ pub trait ScannerIOCache: Send + Sync + Debug + 'static {
     ) -> Result<()>;
 }
 
+#[derive(Debug)]
+pub struct ScannerDiskScanOptions {
+    pub scan_mode: HealScanMode,
+    pub prefix_scan_scope: Option<ScannerBucketPrefixScanScope>,
+}
+
 #[async_trait::async_trait]
 pub trait ScannerIODisk: Send + Sync + Debug + 'static {
     async fn nsscanner_disk(
@@ -774,7 +848,7 @@ pub trait ScannerIODisk: Send + Sync + Debug + 'static {
         set_disks: Vec<Arc<Disk>>,
         cache: DataUsageCache,
         updates: Option<mpsc::Sender<DataUsageEntry>>,
-        scan_mode: HealScanMode,
+        options: ScannerDiskScanOptions,
     ) -> Result<ScannerDiskScanOutcome>;
 
     async fn get_size(&self, item: ScannerItem) -> Result<SizeSummary>;
@@ -1065,8 +1139,8 @@ pub(crate) use cache::{
 pub use dirty_usage::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageSnapshot, ScannerDirtyUsageState,
     acknowledge_dirty_usage_generation, acknowledge_scoped_dirty_usage, clear_dirty_usage_bucket, record_dirty_usage_bucket,
-    record_scanner_maintenance_change, scanner_activity_epoch, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
-    scanner_maintenance_generation,
+    record_dirty_usage_object, record_scanner_maintenance_change, scanner_activity_epoch, scanner_dirty_usage_snapshot,
+    scanner_dirty_usage_state, scanner_maintenance_generation,
 };
 #[cfg(test)]
 pub(crate) use dirty_usage::{clear_dirty_usage_buckets_for_tests, dirty_usage_buckets_for_tests};

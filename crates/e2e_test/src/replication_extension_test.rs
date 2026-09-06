@@ -368,23 +368,23 @@ impl Drop for SlowReplicationTargetGuard {
 // Mirrors madmin-go `ResyncTargetsInfo`/`ResyncTarget` json tags — the same
 // shape `mc replicate resync status` decodes.
 #[derive(Debug, Clone, serde::Deserialize)]
-struct ReplicationResetStatusResponse {
+pub(crate) struct ReplicationResetStatusResponse {
     #[serde(rename = "target", default)]
-    targets: Vec<ReplicationResetStatusTarget>,
+    pub(crate) targets: Vec<ReplicationResetStatusTarget>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-struct ReplicationResetStatusTarget {
+pub(crate) struct ReplicationResetStatusTarget {
     #[serde(rename = "arn", default)]
-    arn: String,
+    pub(crate) arn: String,
     #[serde(rename = "resetid", default)]
-    reset_id: String,
+    pub(crate) reset_id: String,
     #[serde(rename = "resyncStatus", default)]
-    status: String,
+    pub(crate) status: String,
     #[serde(rename = "replicationCount", default)]
-    replicated_count: i64,
+    pub(crate) replicated_count: i64,
     #[serde(rename = "object", default)]
-    object: String,
+    pub(crate) object: String,
 }
 
 fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
@@ -2294,7 +2294,7 @@ async fn site_replication_state_edit(
 /// return the target `(arn, reset_id)`, asserting the response carries the
 /// madmin `ResyncTargetsInfo` shape (`target[0].arn` / `target[0].resetid`)
 /// that `mc replicate resync start` decodes.
-async fn start_bucket_replication_reset(
+pub(crate) async fn start_bucket_replication_reset(
     env: &RustFSTestEnvironment,
     bucket: &str,
 ) -> Result<(String, String), Box<dyn Error + Send + Sync>> {
@@ -2314,7 +2314,7 @@ async fn start_bucket_replication_reset(
     Ok((arn, reset_id))
 }
 
-async fn get_replication_reset_status(
+pub(crate) async fn get_replication_reset_status(
     env: &RustFSTestEnvironment,
     bucket: &str,
     arn: &str,
@@ -3833,6 +3833,157 @@ async fn test_bucket_replication_converges_delete_marker_and_version_purge() -> 
         .send()
         .await?;
     assert_eq!(retained.body.collect().await?.into_bytes().as_ref(), b"versioned replication payload v2");
+
+    Ok(())
+}
+
+/// Regression for rustfs/backlog#2340 (not Wasabi specific): a directory
+/// marker (`prefix/` with a body) in a versioned bucket is stored as the null
+/// version, like MinIO (`putOpts`: "for directory objects skip creating new
+/// versions"), and must still replicate to completion instead of staying
+/// `PENDING`.
+#[tokio::test]
+async fn test_bucket_replication_replicates_directory_marker_in_versioned_bucket() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-dir-marker-src";
+    let target_bucket = "replication-dir-marker-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let marker_key = "dir/trailing/";
+    let body = b"directory marker body";
+    let put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(marker_key)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await?;
+    assert!(
+        put.version_id()
+            .is_none_or(|id| id == "null" || id == uuid::Uuid::nil().to_string()),
+        "a directory marker is the null version even in a versioned bucket: {:?}",
+        put.version_id()
+    );
+
+    wait_for_source_replication_status(&source_client, source_bucket, marker_key, "COMPLETED", false).await?;
+
+    let replica = target_client
+        .get_object()
+        .bucket(target_bucket)
+        .key(marker_key)
+        .send()
+        .await?;
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body);
+    let listed = target_client
+        .list_object_versions()
+        .bucket(target_bucket)
+        .prefix(marker_key)
+        .send()
+        .await?;
+    let marker_versions: Vec<_> = listed.versions().iter().filter(|v| v.key() == Some(marker_key)).collect();
+    assert_eq!(marker_versions.len(), 1, "the marker must land exactly once: {marker_versions:?}");
+    assert_eq!(
+        marker_versions[0].version_id(),
+        Some("null"),
+        "the replica keeps the null version identity"
+    );
+
+    Ok(())
+}
+
+/// Regression for rustfs/backlog#2340 (not Wasabi specific): permanently
+/// deleting a version whose payload lives in a data dir must leave the source
+/// clean once the purge replicates. Managed-SSE objects are never inlined and a
+/// plain object above the inline threshold takes the same layout. The version
+/// retained with a pending purge used to lose its data dir, so the purge state
+/// could never be applied (`VersionNotFound` on every retry) and the bucket
+/// stayed `BucketNotEmpty` while `ListObjectVersions` was already empty.
+#[tokio::test]
+async fn test_bucket_replication_version_purge_of_non_inline_object_releases_source_bucket() -> TestResult {
+    init_logging();
+
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("purge-datadir", true, true).await?;
+    let target_arn = wait_for_remote_target_arn(&source_env, &source_bucket).await?;
+    put_bucket_replication_with_delete_statuses(&source_env, &source_bucket, &target_arn, "Enabled", Some("Enabled")).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    let sse_key = "sse-object.bin";
+    let large_key = "large-object.bin";
+    let sse_put = source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(sse_key)
+        .body(ByteStream::from_static(b"encrypted source payload"))
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .send()
+        .await?;
+    let large_put = source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(large_key)
+        .body(ByteStream::from(vec![0x5a; 2 * 1024 * 1024]))
+        .send()
+        .await?;
+    let purged = [
+        (sse_key, sse_put.version_id().ok_or("SSE PUT omitted version ID")?.to_string()),
+        (large_key, large_put.version_id().ok_or("large PUT omitted version ID")?.to_string()),
+    ];
+    assert_replication_converged(&source_client, &source_bucket, &target_client, &target_bucket).await?;
+
+    for (key, version_id) in &purged {
+        source_client
+            .delete_object()
+            .bucket(&source_bucket)
+            .key(*key)
+            .version_id(version_id)
+            .send()
+            .await?;
+    }
+    assert_replication_converged(&source_client, &source_bucket, &target_client, &target_bucket).await?;
+    let target_state = list_replication_state(&target_client, &target_bucket).await?;
+    assert!(target_state.is_empty(), "target retained an explicitly purged version: {target_state:?}");
+
+    // The purge state is applied on the source asynchronously after the target
+    // acknowledges the delete; only then does the retained version go away and
+    // the bucket become deletable. A listing that is empty while DeleteBucket
+    // keeps answering BucketNotEmpty is exactly the regression.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let listing = source_client.list_object_versions().bucket(&source_bucket).send().await?;
+        let listed = listing.versions().len() + listing.delete_markers().len();
+        match source_client.delete_bucket().bucket(&source_bucket).send().await {
+            Ok(_) => break,
+            Err(err) if err.code() == Some("BucketNotEmpty") => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "source bucket stayed BucketNotEmpty after the version purge replicated; \
+                         ListObjectVersions shows {listed} entries"
+                    )
+                    .into());
+                }
+                sleep(Duration::from_millis(500)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
 
     Ok(())
 }

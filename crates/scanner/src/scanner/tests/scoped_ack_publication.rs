@@ -463,7 +463,7 @@ async fn scoped_ack_publication_rejects_builder_mutation_after_real_root_publish
             "remote_ack_target" => scan.with_remote_dirty_usage_acknowledgements(vec![ScannerDirtyUsageAcknowledgement {
                 host: "proof-peer:9000".to_string(),
                 instance_id: crate::scanner_activity_epoch().to_string(),
-                generation: changed_generation,
+                kind: crate::scanner::ScannerDirtyUsageAcknowledgementKind::Generation(changed_generation),
             }]),
             "publication_epoch" => scan.with_publication_epoch(Some(changed_epoch)),
             "remote_lease_targets" => scan.with_remote_publication_lease_targets(vec![(

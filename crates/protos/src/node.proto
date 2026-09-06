@@ -885,6 +885,7 @@ message ScannerActivityResponse {
 message ScannerDirtyUsageBucket {
   string bucket = 1;
   uint64 generation = 2;
+  bytes bucket_incarnation = 3;
 }
 
 message ScannerDirtyUsageSnapshotRequest {
@@ -901,6 +902,7 @@ message ScannerDirtyUsageSnapshotResponse {
   bool complete = 5;
   repeated ScannerDirtyUsageBucket buckets = 6;
   bytes response_proof = 7;
+  string owner_id = 8;
 }
 
 // Receiver-only protocol. Producers must retain whole-cycle ACK until they

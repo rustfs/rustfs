@@ -45,7 +45,7 @@
 1|crates/ecstore/src/object_api/types.rs
 3|crates/ecstore/src/runtime/sources.rs
 4|crates/ecstore/src/services/batch_processor.rs
-14|crates/ecstore/src/services/notification_sys.rs
+13|crates/ecstore/src/services/notification_sys.rs
 16|crates/ecstore/src/services/rebalance/control.rs
 1|crates/ecstore/src/services/rebalance/entry.rs
 8|crates/ecstore/src/services/rebalance/meta.rs

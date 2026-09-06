@@ -532,7 +532,7 @@ impl DefaultMultipartUsecase {
             .await
         {
             Ok(_) => {
-                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                rustfs_scanner::record_dirty_usage_object(&bucket, &key);
                 Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
             }
             Err(err) => {

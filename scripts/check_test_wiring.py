@@ -882,6 +882,22 @@ def evidence_integer(value: object, name: str, minimum: int, maximum: int) -> in
     return value
 
 
+def scanner_heal_oracle_names(root: Path) -> tuple[str, ...]:
+    registry = read_json(root / ".config/scanner-heal-required-tests.json")
+    evidence_integer(registry.get("schema"), "registry schema", 1, 1)
+    cases = registry.get("cases")
+    require(isinstance(cases, dict) and cases, "invalid scanner/heal registry")
+    names = set()
+    for case_id, requirement in cases.items():
+        require(isinstance(case_id, str) and case_id, "invalid scanner/heal case identity")
+        oracle = requirement.get("oracle")
+        require(isinstance(oracle, str) and oracle.endswith(".json"), f"invalid oracle for {case_id}")
+        path = Path(oracle)
+        require(not path.is_absolute() and ".." not in path.parts, f"oracle path escapes run directory for {case_id}")
+        names.add(oracle)
+    return tuple(sorted(names))
+
+
 def begin_scanner_heal_receipt(root: Path, directory: Path, binary: Path, test_binary: Path) -> None:
     """Record an existing build; this command never builds or runs a test."""
     require(not directory.exists(), "scanner/heal run directory must be new")
@@ -914,18 +930,28 @@ def begin_scanner_heal_receipt(root: Path, directory: Path, binary: Path, test_b
                                        "started_at": datetime.now(timezone.utc).timestamp(), **builds})
 
 
-def finish_scanner_heal_receipt(directory: Path, exit_code: int) -> None:
+def finish_scanner_heal_receipt(directory: Path, exit_code: int, root: Path = ROOT) -> None:
     require(type(exit_code) is int and 0 <= exit_code <= 255, "invalid test exit code")
     require(not (directory / "execution.json").exists(), "execution receipt already exists")
     run = read_json(directory / "run.json")
     artifacts = {}
-    for name in ("listing.json", "junit.xml", "background-target-restart.json"):
+    oracle_names = scanner_heal_oracle_names(root)
+    for name in ("listing.json", "junit.xml"):
         path = directory / name
         if exit_code != 0 and not path.exists():
             continue
         require(path.is_file() and 0 < path.stat().st_size <= MAX_JSON_BYTES, f"missing/oversized {name}")
         require(path.stat().st_mtime >= run["started_at"], f"stale {name}")
         artifacts[name] = digest(path)
+    for name in oracle_names:
+        path = directory / name
+        if not path.exists():
+            continue
+        require(path.is_file() and 0 < path.stat().st_size <= MAX_JSON_BYTES, f"missing/oversized {name}")
+        require(path.stat().st_mtime >= run["started_at"], f"stale {name}")
+        artifacts[name] = digest(path)
+    if exit_code == 0:
+        require(any(name in artifacts for name in oracle_names), "missing scanner/heal case oracle")
     write_json(directory / "execution.json", {"run_id": run["run_id"], "exit_code": exit_code,
                                              "finished_at": datetime.now(timezone.utc).timestamp(),
                                              "artifacts": artifacts})
@@ -1251,7 +1277,7 @@ class SelfTests(unittest.TestCase):
             "topology": {"nodes": 4, "drives_per_node": 1}, "pid_before": 10, "pid_after": 11,
             "objects": objects, "node_listings": [[item["key"] for item in objects]] * 4,
         })
-        finish_scanner_heal_receipt(run_dir, 0)
+        finish_scanner_heal_receipt(run_dir, 0, root)
         return root, run_dir
 
     def test_scanner_heal_case_does_not_approve_pending_release(self) -> None:
@@ -1263,6 +1289,25 @@ class SelfTests(unittest.TestCase):
             self.assertTrue(any(error.startswith("pending R-E:") for error in errors))
             self.assertTrue(any(error.startswith("pending R-D:") for error in errors))
             self.assertTrue(any(error.startswith("pending R-L:") for error in errors))
+
+    def test_scanner_heal_finish_collects_oracles_from_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            alternate = dict(registry["cases"]["background-target-restart"])
+            alternate["oracle"] = "alternate-target-restart.json"
+            registry["cases"]["alternate-target-restart"] = alternate
+            write_json(root / ".config/scanner-heal-required-tests.json", registry)
+            oracle = read_json(run_dir / "background-target-restart.json")
+            oracle["case"] = "alternate-target-restart"
+            write_json(run_dir / "alternate-target-restart.json", oracle)
+            (run_dir / "background-target-restart.json").unlink()
+            (run_dir / "execution.json").unlink()
+
+            finish_scanner_heal_receipt(run_dir, 0, root)
+
+            self.assertIn("alternate-target-restart.json", read_json(run_dir / "execution.json")["artifacts"])
+            self.assertEqual(check_scanner_heal_evidence(root, run_dir, "alternate-target-restart"), [])
 
     def test_scanner_heal_rejects_broken_execution_and_artifacts(self) -> None:
         for fault in ("exit", "missing", "zero", "skipped", "failed", "retry", "filtered", "ignored", "stale",

@@ -146,7 +146,7 @@ impl ScannerIODisk for Disk {
         Ok(size_summary)
     }
 
-    #[tracing::instrument(skip(self, budget, updates, cache, set_disks))]
+    #[tracing::instrument(skip(self, budget, updates, cache, set_disks, options), fields(scan_mode = ?options.scan_mode))]
     async fn nsscanner_disk(
         self: Arc<Self>,
         ctx: CancellationToken,
@@ -154,8 +154,12 @@ impl ScannerIODisk for Disk {
         set_disks: Vec<Arc<Disk>>,
         cache: DataUsageCache,
         updates: Option<mpsc::Sender<DataUsageEntry>>,
-        scan_mode: HealScanMode,
+        options: ScannerDiskScanOptions,
     ) -> Result<ScannerDiskScanOutcome> {
+        let ScannerDiskScanOptions {
+            scan_mode,
+            prefix_scan_scope,
+        } = options;
         let done_drive = Metrics::time(Metric::ScanBucketDrive);
         let drive_start = std::time::Instant::now();
         let bucket = cache.info.name.clone();
@@ -198,7 +202,19 @@ impl ScannerIODisk for Disk {
             cache.info.object_lock = Some(Arc::new(object_lock_config));
         }
 
-        let result = scan_data_folder(
+        // Prefix reuse never crosses semantic maintenance boundaries. A
+        // lifecycle, replication, Object Lock, or erasure health walk can
+        // make a clean data subtree require scanner-side work even without a
+        // direct object mutation in the local journal. The folder scanner
+        // separately rejects scopes in erasure mode.
+        let prefix_scan_scope = (scan_mode == HealScanMode::Normal
+            && cache.info.lifecycle.is_none()
+            && cache.info.replication.is_none()
+            && cache.info.object_lock.is_none())
+        .then_some(prefix_scan_scope)
+        .flatten();
+
+        let result = scan_data_folder_scoped(
             ctx.clone(),
             budget,
             set_disks,
@@ -207,6 +223,7 @@ impl ScannerIODisk for Disk {
             updates,
             scan_mode,
             SCANNER_SLEEPER.clone(),
+            prefix_scan_scope,
         )
         .await;
 

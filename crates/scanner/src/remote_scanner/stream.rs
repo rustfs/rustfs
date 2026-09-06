@@ -16,8 +16,9 @@
 use crate::RUSTFS_META_BUCKET;
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig};
 use crate::scanner_io::{
-    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks,
-    cache_root_entry_info, current_cache_root_or_prepare_with_generation, scanner_set_disk_inventory,
+    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerDiskScanOptions, ScannerDiskScanOutcome, ScannerIODisk,
+    acquire_scanner_cache_locks, cache_root_entry_info, current_cache_root_or_prepare_with_generation,
+    scanner_set_disk_inventory,
 };
 use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
 use crate::{
@@ -779,7 +780,18 @@ async fn scan_and_persist_local_bucket(
 
     let set_disks = scanner_set_disk_inventory(set.as_ref()).await;
     let scan_ctx = ctx.child_token();
-    let scan = ScannerIODisk::nsscanner_disk(disk.clone(), scan_ctx.clone(), budget, set_disks, cache, None, scan_mode);
+    let scan = ScannerIODisk::nsscanner_disk(
+        disk.clone(),
+        scan_ctx.clone(),
+        budget,
+        set_disks,
+        cache,
+        None,
+        ScannerDiskScanOptions {
+            scan_mode,
+            prefix_scan_scope: None,
+        },
+    );
     tokio::pin!(scan);
     let fence_watch = watch_remote_scanner_request_fence(next_cycle, leader_epoch, store.clone(), NS_SCANNER_FENCE_POLL_INTERVAL);
     tokio::pin!(fence_watch);

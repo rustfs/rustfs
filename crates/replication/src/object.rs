@@ -234,18 +234,62 @@ fn comparable_metadata(metadata: Option<&HashMap<String, String>>) -> HashMap<St
 /// real (non-nil) version uuid, and drift means the target answered with
 /// anything else — including nothing at all.
 pub fn version_identity_drifted(source_version_id: &str, assigned_version_id: Option<&str>) -> bool {
-    if source_version_id.is_empty() {
-        return false;
+    version_identity_capability_from_put(source_version_id, assigned_version_id) == Some(VersionIdentityCapability::MintsOwn)
+}
+
+/// Whether a replication target adopts the source version id it is handed on
+/// PutObject / CompleteMultipartUpload, or mints its own.
+///
+/// A target that mints its own ids (AWS S3, Wasabi, Impossible Cloud) still
+/// stores the bytes, but every later version-addressed request from the
+/// source names an id the target never had. Its HEAD then answers 404 —
+/// indistinguishable from a replica that is really missing — so a heal, MRF
+/// retry or existing-object resync re-drive would PUT the object again and
+/// mint yet another target version (rustfs/backlog#2340). The replication
+/// worker learns the verdict from each PUT response (and replication-check's
+/// VersionFidelity phase) and, once `MintsOwn` is known, locates a replica by
+/// exact key and ETag before concluding that it is missing. The verdict cache
+/// is owned by the runtime's bucket target system; this crate owns only the
+/// vocabulary and the judgment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VersionIdentityCapability {
+    #[default]
+    Unknown,
+    Adopts,
+    MintsOwn,
+}
+
+impl VersionIdentityCapability {
+    /// True when a 404 from a version-addressed HEAD on this target cannot be
+    /// read as "replica missing": the source-side id was never the target's.
+    pub fn version_addressing_unreliable(self) -> bool {
+        self == VersionIdentityCapability::MintsOwn
     }
-    // A nil source uuid travels as the literal "null" (unversioned-source
-    // semantics); no identity contract applies to it.
+}
+
+/// Judge the identity contract from one replication write: `None` when no
+/// contract applies (the source addressed no real version — an empty or nil
+/// uuid travels as the literal "null", unversioned-source semantics),
+/// otherwise whether the target echoed the source id or answered with
+/// anything else — including nothing at all.
+pub fn version_identity_capability_from_put(
+    source_version_id: &str,
+    assigned_version_id: Option<&str>,
+) -> Option<VersionIdentityCapability> {
+    if source_version_id.is_empty() {
+        return None;
+    }
     if uuid::Uuid::parse_str(source_version_id)
         .map(|uuid| uuid.is_nil())
         .unwrap_or(true)
     {
-        return false;
+        return None;
     }
-    assigned_version_id != Some(source_version_id)
+    Some(if assigned_version_id == Some(source_version_id) {
+        VersionIdentityCapability::Adopts
+    } else {
+        VersionIdentityCapability::MintsOwn
+    })
 }
 
 const REPLICATION_TARGET_OFFLINE_ERROR_MARKERS: &[&str] = &[
@@ -377,9 +421,9 @@ mod tests {
 
     use super::{
         ReplicationSourceObject, ReplicationTargetObject, SsecPassthroughCapability, SsecPassthroughGate,
-        content_matches_by_etag, is_replication_target_offline_error, replication_action_for_target, replication_etags_match,
-        single_part_replica_etag_mismatch, ssec_passthrough_evidence_present, ssec_passthrough_gate,
-        target_is_newer_than_source_null_version, version_identity_drifted,
+        VersionIdentityCapability, content_matches_by_etag, is_replication_target_offline_error, replication_action_for_target,
+        replication_etags_match, single_part_replica_etag_mismatch, ssec_passthrough_evidence_present, ssec_passthrough_gate,
+        target_is_newer_than_source_null_version, version_identity_capability_from_put, version_identity_drifted,
     };
     use crate::filemeta::{ReplicationAction, ReplicationType};
     use crate::http::AMZ_OBJECT_LOCK_MODE;
@@ -506,6 +550,32 @@ mod tests {
                 "sent {sent:?} got {got:?} must judge drift = {expected}"
             );
         }
+    }
+
+    #[test]
+    fn version_identity_capability_is_judged_only_for_real_source_versions() {
+        let source = "8e4d2f4c-2d5c-4f1b-9d0a-9c8b7a6f5e4d";
+        assert_eq!(
+            version_identity_capability_from_put(source, Some(source)),
+            Some(VersionIdentityCapability::Adopts)
+        );
+        // Wasabi / AWS shape: a minted id, or no id at all, both mean the
+        // source-side id is not addressable on the target.
+        assert_eq!(
+            version_identity_capability_from_put(source, Some("001788697733811332140-fR6j6uXKV-")),
+            Some(VersionIdentityCapability::MintsOwn)
+        );
+        assert_eq!(
+            version_identity_capability_from_put(source, None),
+            Some(VersionIdentityCapability::MintsOwn)
+        );
+        // No contract for an unversioned source write.
+        assert_eq!(version_identity_capability_from_put("", Some("anything")), None);
+        assert_eq!(version_identity_capability_from_put("00000000-0000-0000-0000-000000000000", None), None);
+        assert_eq!(version_identity_capability_from_put("null", Some("null")), None);
+        assert!(VersionIdentityCapability::MintsOwn.version_addressing_unreliable());
+        assert!(!VersionIdentityCapability::Adopts.version_addressing_unreliable());
+        assert!(!VersionIdentityCapability::Unknown.version_addressing_unreliable());
     }
 
     #[test]

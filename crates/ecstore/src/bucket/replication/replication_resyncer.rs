@@ -56,6 +56,8 @@ use super::replication_storage_boundary::{
 };
 #[cfg(test)]
 use super::replication_storage_boundary::{NamespaceLockFence, NamespaceLockSignalTestFence, ReplicationDeletedObject};
+#[cfg(test)]
+use super::replication_target_boundary::VersionIdentityCapability;
 use super::replication_target_boundary::{
     ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED, HeadObjectSdkError, PutObjectOptions, PutObjectPartOptions,
     RemotePutObjectResponse, ReplicationTargetStore, S3ClientError, SsecPassthroughCapability, SsecPassthroughGate, TargetClient,
@@ -63,7 +65,7 @@ use super::replication_target_boundary::{
     replication_delete_marker_purge_remove_options, replication_delete_remove_options, replication_force_delete_remove_options,
     replication_object_is_ssec_encrypted, replication_put_object_header_size, replication_put_object_options,
     replication_target_head_is_newer_null_version, resolve_read_api_version_id, ssec_passthrough_evidence_present,
-    ssec_passthrough_gate, version_identity_drifted,
+    ssec_passthrough_gate, version_identity_capability_from_put, version_identity_drifted,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
@@ -123,6 +125,7 @@ const EVENT_DELETE_MARKER_PURGE_FAILED: &str = "replication_delete_marker_purge_
 const EVENT_DELETE_MARKER_PURGE_MRF: &str = "replication_delete_marker_purge_mrf";
 const METRIC_DELETE_MARKER_PURGE_TOTAL: &str = "rustfs_replication_delete_marker_purge_total";
 const EVENT_REPLICATION_VERSION_IDENTITY_DRIFT: &str = "replication_version_identity_drift";
+const EVENT_REPLICATION_DRIFTED_REPLICA_LOCATED: &str = "replication_drifted_replica_located";
 const EVENT_REPLICATION_OBJECT_FAILED: &str = "replication_object_failed";
 const EVENT_REPLICATION_PURGE_OBJECT_LOCK_DENIED: &str = "replication_purge_object_lock_denied";
 
@@ -332,6 +335,12 @@ fn verify_single_part_replica(
 const REPLICA_ETAG_MISMATCH_ERROR: &str = "replica etag mismatch: the target persisted different bytes than were sent";
 
 fn audit_target_version_identity(tgt_client: &TargetClient, source_version_id: &str, assigned_version_id: Option<&str>) {
+    // Every write refreshes the cached verdict, so the convergence fallback
+    // below (`replica_head_fallback`) knows whether a 404 on a
+    // version-addressed HEAD can mean "replica missing" on this target.
+    if let Some(capability) = version_identity_capability_from_put(source_version_id, assigned_version_id) {
+        ReplicationTargetStore::record_version_identity_capability(&tgt_client.arn, capability);
+    }
     if !version_identity_drifted(source_version_id, assigned_version_id) {
         return;
     }
@@ -404,9 +413,68 @@ async fn head_object_fallback(
 ) -> std::result::Result<Option<HeadObjectOutput>, HeadObjectSdkError> {
     match head_object_for_worker(tgt_client, &tgt_client.bucket, object, None).await {
         Ok(oi) => Ok(Some(oi)),
-        Err(e) if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) => Ok(None),
+        Err(e) if head_object_not_found(&e) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+fn head_object_not_found(err: &HeadObjectSdkError) -> bool {
+    err.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(err, 404)
+}
+
+/// Second look at a replica whose version-addressed HEAD failed, for the two
+/// target shapes where that failure is not a verdict on the replica:
+///
+/// - AWS-style 400/403 (the RustFS uuid is rejected as malformed): HEAD the
+///   current version without a version id; callers compare ETags.
+/// - 404 on a target known to mint its own version ids (the Wasabi shape,
+///   rustfs/backlog#2340): the source id never existed there, so locate the
+///   replica by exact key and ETag through ListObjectVersions and HEAD the id
+///   the target assigned. Without this, every heal, MRF retry and
+///   existing-object resync re-drive PUTs the object again and mints one
+///   more target version.
+///
+/// `None` when the error stands as-is: a real miss on an adopting target, or
+/// a target whose identity contract is still unknown. A failed lookup is
+/// returned as a HEAD-shaped error so callers keep their "target operation
+/// failed" handling (retry later) instead of re-driving the PUT.
+async fn replica_head_fallback(
+    tgt_client: &TargetClient,
+    object: &str,
+    source_etag: Option<&str>,
+    err: &HeadObjectSdkError,
+) -> Option<std::result::Result<Option<HeadObjectOutput>, HeadObjectSdkError>> {
+    if is_version_id_format_mismatch(err) {
+        return Some(head_object_fallback(tgt_client, object).await);
+    }
+    if !head_object_not_found(err)
+        || !ReplicationTargetStore::version_identity_capability(&tgt_client.arn).version_addressing_unreliable()
+    {
+        return None;
+    }
+    let etag = source_etag.filter(|etag| !etag.trim().is_empty())?;
+    Some(match tgt_client.find_version_by_etag(&tgt_client.bucket, object, etag).await {
+        Ok(Some(assigned_version_id)) => {
+            debug!(
+                event = EVENT_REPLICATION_DRIFTED_REPLICA_LOCATED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %tgt_client.bucket,
+                object = %object,
+                arn = %tgt_client.arn,
+                assigned_version_id = %assigned_version_id,
+                "Located replica by content identity on a target that mints its own version ids"
+            );
+            match head_object_for_worker(tgt_client, &tgt_client.bucket, object, Some(assigned_version_id)).await {
+                Ok(oi) => Ok(Some(oi)),
+                // The located version disappeared between LIST and HEAD.
+                Err(e) if head_object_not_found(&e) => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+        Ok(None) => Ok(None),
+        Err(list_err) => Err(Box::new(SdkError::construction_failure(*list_err))),
+    })
 }
 
 /// Resolve the N2 fail-closed gate for an SSE-C passthrough attempt against
@@ -1400,30 +1468,25 @@ async fn verify_resync_head_result(
                 (0, None)
             }
         }
-        Err(err) if is_version_id_format_mismatch(&err) => {
-            // AWS-style target rejects the RustFS UUID versionId
-            // (400). Re-verify without the versionId before
-            // concluding the object failed to replicate, instead
-            // of counting a well-replicated object as failed.
-            match head_object_fallback(target_client.as_ref(), &roi.name).await {
-                Ok(Some(_)) => {
+        Err(err) => {
+            // A version-addressed HEAD is not the last word on every target:
+            // re-verify through the fallback before counting a well-replicated
+            // object as failed (see `replica_head_fallback`).
+            match replica_head_fallback(target_client.as_ref(), &roi.name, roi.etag.as_deref(), &err).await {
+                Some(Ok(Some(_))) => {
                     st.replicated_count += 1;
                     st.replicated_size += roi.size;
                     (roi.size, None)
                 }
-                Ok(None) => {
+                Some(Ok(None)) | None => {
                     st.failed_count += 1;
                     (0, Some(err))
                 }
-                Err(e2) => {
+                Some(Err(e2)) => {
                     st.failed_count += 1;
                     (0, Some(e2))
                 }
             }
-        }
-        Err(err) => {
-            st.failed_count += 1;
-            (0, Some(err))
         }
     }
 }
@@ -3597,11 +3660,8 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 }
             }
             Err(e) => {
-                if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) {
-                    // Object not on target yet → fall through to PUT.
-                } else if is_version_id_format_mismatch(&e) {
-                    // Version-ID format mismatch: retry without versionId and compare ETags.
-                    match head_object_fallback(&tgt_client, &object).await {
+                if let Some(fallback) = replica_head_fallback(&tgt_client, &object, object_info.etag.as_deref(), &e).await {
+                    match fallback {
                         Ok(Some(oi)) if replication_etags_match(object_info.etag.as_deref(), oi.e_tag.as_deref()) => {
                             if ssec_audit_required
                                 && !settle_ssec_passthrough_evidence(&oi, &tgt_client, &bucket, &object, &mut rinfo).await
@@ -3631,6 +3691,8 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                             return rinfo;
                         }
                     }
+                } else if head_object_not_found(&e) {
+                    // Object not on target yet → fall through to PUT.
                 } else {
                     rinfo.error = Some(e.to_string());
                     warn!(
@@ -4230,9 +4292,8 @@ async fn resolve_replicate_all_action(
             }
         }
         Err(e) => {
-            if is_version_id_format_mismatch(&e) {
-                // Version-ID format mismatch: retry without versionId and compare ETags.
-                match head_object_fallback(tgt_client, object).await {
+            if let Some(fallback) = replica_head_fallback(tgt_client, object, object_info.etag.as_deref(), &e).await {
+                match fallback {
                     Ok(Some(oi)) => {
                         let etags_match = replication_etags_match(object_info.etag.as_deref(), oi.e_tag.as_deref());
                         if require_existing_target && !etags_match {
@@ -4284,7 +4345,7 @@ async fn resolve_replicate_all_action(
                         return None;
                     }
                 }
-            } else if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) {
+            } else if head_object_not_found(&e) {
                 if require_existing_target {
                     rinfo.error = Some("replica metadata target does not contain this object version".to_string());
                     rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
@@ -5381,6 +5442,178 @@ mod tests {
 
     async fn register_test_target(target: &Arc<TargetClient>) {
         ReplicationTargetStore::register_test_target(target).await;
+    }
+
+    const DRIFTED_ASSIGNED_VERSION_ID: &str = "001788697733811332140-fR6j6uXKV-";
+    const DRIFTED_ETAG: &str = "9a0364b9e99bb480dd25e1f0284c8555";
+
+    /// The Wasabi shape (rustfs/backlog#2340): a version-addressed HEAD with
+    /// the source uuid answers 404 (not the AWS 400), ListObjectVersions shows
+    /// the id the target minted, and a HEAD by that id succeeds. Serves exactly
+    /// `requests` connections and returns the request lines it saw.
+    fn spawn_drifted_target_server(requests: usize) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test HTTP listener should bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("test HTTP listener should have an address"));
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().expect("test HTTP client should connect");
+                let mut request = [0_u8; 8192];
+                let bytes_read = stream.read(&mut request).expect("test HTTP request should be read");
+                let text = String::from_utf8_lossy(&request[..bytes_read]).to_string();
+                let request_line = text.lines().next().unwrap_or_default().to_string();
+                let response = if request_line.starts_with("HEAD ") {
+                    if request_line.contains(&format!("versionId={DRIFTED_ASSIGNED_VERSION_ID}")) {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nETag: \"{DRIFTED_ETAG}\"\r\nContent-Length: 4\r\nLast-Modified: Sun, 06 Sep 2026 10:00:00 GMT\r\nConnection: close\r\n\r\n"
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    }
+                } else if request_line.starts_with("GET ") && request_line.contains("versions") {
+                    let body = format!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>target-bucket</Name><Prefix>object</Prefix><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Version><Key>object</Key><VersionId>{DRIFTED_ASSIGNED_VERSION_ID}</VersionId><IsLatest>true</IsLatest><LastModified>2026-09-06T10:00:00.000Z</LastModified><ETag>&quot;{DRIFTED_ETAG}&quot;</ETag><Size>4</Size><StorageClass>STANDARD</StorageClass></Version></ListVersionsResult>"
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    "HTTP/1.1 500 Unexpected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("test HTTP response should be written");
+                seen.push(request_line);
+            }
+            seen
+        });
+        (endpoint, handle)
+    }
+
+    fn drifted_roi_and_object() -> (ReplicateObjectInfo, ObjectInfo) {
+        let roi = ReplicateObjectInfo {
+            bucket: "source".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            op_type: ReplicationType::Heal,
+            replication_status: ReplicationStatusType::Pending,
+            etag: Some(DRIFTED_ETAG.to_string()),
+            size: 4,
+            ..Default::default()
+        };
+        let object_info = ObjectInfo {
+            bucket: roi.bucket.clone(),
+            name: roi.name.clone(),
+            version_id: roi.version_id,
+            etag: Some(DRIFTED_ETAG.to_string()),
+            size: 4,
+            ..Default::default()
+        };
+        (roi, object_info)
+    }
+
+    #[tokio::test]
+    async fn heal_redrive_locates_replica_by_etag_on_target_that_mints_own_version_ids() {
+        let (endpoint, server) = spawn_drifted_target_server(3);
+        let target = test_target_client(endpoint);
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let (roi, object_info) = drifted_roi_and_object();
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+
+        let action = resolve_replicate_all_action(
+            ReplicateAllActionContext {
+                roi: &roi,
+                tgt_client: &target,
+                bucket: &roi.bucket,
+                object: &roi.name,
+                start_time: OffsetDateTime::now_utc(),
+                ssec_audit_required: false,
+            },
+            object_info,
+            &mut rinfo,
+        )
+        .await;
+
+        assert!(
+            matches!(action, Some((ReplicationAction::None, _))),
+            "a replica located by content identity must not be re-driven: {action:?}"
+        );
+        assert!(rinfo.error.is_none(), "{:?}", rinfo.error);
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 3, "HEAD by source id, ListObjectVersions, HEAD by assigned id: {seen:?}");
+        assert!(seen[0].starts_with("HEAD ") && seen[0].contains(&roi.version_id.unwrap().to_string()));
+        assert!(seen[1].starts_with("GET ") && seen[1].contains("prefix=object"), "{}", seen[1]);
+        assert!(seen[2].starts_with("HEAD ") && seen[2].contains(DRIFTED_ASSIGNED_VERSION_ID));
+    }
+
+    #[tokio::test]
+    async fn head_not_found_still_replicates_when_identity_contract_is_unknown() {
+        // Same 404, but the target never revealed whether it adopts version
+        // ids: a 404 keeps meaning "replica missing" (adopting targets, e.g.
+        // RustFS/MinIO peers, must not skip a genuinely missing version).
+        let (endpoint, server) = spawn_head_status_server(404);
+        let target = test_target_client(endpoint);
+        let (roi, object_info) = drifted_roi_and_object();
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+
+        let action = resolve_replicate_all_action(
+            ReplicateAllActionContext {
+                roi: &roi,
+                tgt_client: &target,
+                bucket: &roi.bucket,
+                object: &roi.name,
+                start_time: OffsetDateTime::now_utc(),
+                ssec_audit_required: false,
+            },
+            object_info,
+            &mut rinfo,
+        )
+        .await;
+
+        assert!(matches!(action, Some((ReplicationAction::All, _))));
+        server.join().expect("test HTTP server should finish");
+    }
+
+    #[tokio::test]
+    async fn resync_verification_counts_drifted_replica_as_replicated() {
+        let (endpoint, server) = spawn_drifted_target_server(3);
+        let target = test_target_client(endpoint);
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let (roi, _) = drifted_roi_and_object();
+        let mut st = TargetReplicationResyncStatus::default();
+
+        let head_result =
+            head_object_for_worker(target.as_ref(), &target.bucket, &roi.name, roi.version_id.map(|v| v.to_string())).await;
+        let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, &target).await;
+
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!((size, st.replicated_count, st.failed_count), (4, 1, 0));
+        server.join().expect("test HTTP server should finish");
+    }
+
+    #[test]
+    fn put_response_audit_records_identity_verdict() {
+        let target = test_target_client("http://127.0.0.1:1".to_string());
+        let source = Uuid::new_v4().to_string();
+        audit_target_version_identity(&target, &source, Some(DRIFTED_ASSIGNED_VERSION_ID));
+        assert_eq!(
+            ReplicationTargetStore::version_identity_capability(&target.arn),
+            VersionIdentityCapability::MintsOwn
+        );
+        audit_target_version_identity(&target, &source, Some(&source));
+        assert_eq!(
+            ReplicationTargetStore::version_identity_capability(&target.arn),
+            VersionIdentityCapability::Adopts
+        );
+        // An unversioned write carries no contract and must not overwrite it.
+        audit_target_version_identity(&target, "null", None);
+        assert_eq!(
+            ReplicationTargetStore::version_identity_capability(&target.arn),
+            VersionIdentityCapability::Adopts
+        );
     }
 
     #[test]

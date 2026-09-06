@@ -1257,6 +1257,8 @@ pub struct ScannerDirtyUsageBucket {
     pub bucket: ::prost::alloc::string::String,
     #[prost(uint64, tag = "2")]
     pub generation: u64,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub bucket_incarnation: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScannerDirtyUsageSnapshotRequest {
@@ -1282,6 +1284,8 @@ pub struct ScannerDirtyUsageSnapshotResponse {
     pub buckets: ::prost::alloc::vec::Vec<ScannerDirtyUsageBucket>,
     #[prost(bytes = "bytes", tag = "7")]
     pub response_proof: ::prost::bytes::Bytes,
+    #[prost(string, tag = "8")]
+    pub owner_id: ::prost::alloc::string::String,
 }
 /// Receiver-only protocol. Producers must retain whole-cycle ACK until they
 /// have a durable per-bucket publication proof.

@@ -2033,7 +2033,7 @@ impl DefaultObjectUsecase {
                     schedule_object_replication(obj_info.clone(), store, dsc).await;
                 }
 
-                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                rustfs_scanner::record_dirty_usage_object(&bucket, &key);
                 rustfs_io_metrics::record_put_object_stage_duration_from("app_post_store_bookkeeping", post_store_stage_start);
 
                 let capacity_update_stage_start = put_stage_metrics_enabled.then(Instant::now);

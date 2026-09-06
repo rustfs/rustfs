@@ -91,8 +91,8 @@ pub use scanner::{
 pub use scanner_io::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageSnapshot, ScannerDirtyUsageState,
     acknowledge_dirty_usage_generation, acknowledge_scoped_dirty_usage, clear_dirty_usage_bucket, record_dirty_usage_bucket,
-    record_scanner_maintenance_change, scanner_activity_epoch, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
-    scanner_maintenance_generation,
+    record_dirty_usage_object, record_scanner_maintenance_change, scanner_activity_epoch, scanner_dirty_usage_snapshot,
+    scanner_dirty_usage_state, scanner_maintenance_generation,
 };
 pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,6 +100,7 @@ pub use storage_api::ScannerReplicationConfig as ReplicationConfig;
 pub use storage_api::scan::{
     SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES,
     SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
+    SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES,
 };
 pub use workload_admission::set_scanner_workload_admission_snapshot_provider;
 

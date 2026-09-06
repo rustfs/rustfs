@@ -103,8 +103,13 @@ pub(crate) use rustfs_ecstore::api::rebalance::{
     RebalStatus as EcstoreRebalStatus, RebalanceInfo as EcstoreRebalanceInfo, RebalanceMeta as EcstoreRebalanceMeta,
     RebalanceStats as EcstoreRebalanceStats,
 };
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::rpc::ScannerPeerDirtyUsageBucket as EcstoreScannerPeerDirtyUsageBucket;
 pub(crate) use rustfs_ecstore::api::rpc::{
-    ScannerBucketListing as EcstoreScannerBucketListing, ScannerPeerDirtyUsageSnapshot as EcstoreScannerPeerDirtyUsageSnapshot,
+    ScannerBucketListing as EcstoreScannerBucketListing,
+    ScannerDirtyUsageAcknowledgement as EcstoreScannerDirtyUsageAcknowledgement,
+    ScannerPeerDirtyUsageSnapshot as EcstoreScannerPeerDirtyUsageSnapshot,
+    ScannerScopedDirtyUsageAckEntry as EcstoreScannerScopedDirtyUsageAckEntry,
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::runtime::InstanceContext as EcstoreInstanceContext;
@@ -315,6 +320,7 @@ pub(crate) mod scan {
     pub use super::storage_contracts::{
         SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES,
         SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
+        SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES,
     };
 }
 

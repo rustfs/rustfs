@@ -147,8 +147,8 @@ pub(crate) mod server {
 
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::{
-            Endpoint, EndpointServerPools, Endpoints, PeerRestClient, PoolEndpoints, gen_signature_headers,
-            gen_tonic_signature_headers,
+            Endpoint, EndpointServerPools, Endpoints, PeerRestClient, PoolEndpoints, ScannerScopedDirtyUsageAckEntry,
+            gen_signature_headers, gen_tonic_signature_headers,
         };
 
         pub(crate) mod ecfs {

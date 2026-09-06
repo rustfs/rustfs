@@ -689,7 +689,7 @@ impl DefaultObjectUsecase {
                     schedule_object_replication(obj_info.clone(), store, completion_replication_decision).await;
                 }
 
-                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                rustfs_scanner::record_dirty_usage_object(&bucket, &key);
                 Ok::<_, ApiError>(obj_info)
             }
         });

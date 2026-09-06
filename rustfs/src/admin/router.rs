@@ -18,7 +18,7 @@ use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatu
 use super::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
 use super::storage_api::bucket::target_sys::{
     BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, SsecPassthroughCapability, TargetClient,
-    append_version_id_query,
+    VersionIdentityCapability, append_version_id_query,
 };
 use super::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use super::storage_api::bucket::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
@@ -2097,6 +2097,18 @@ async fn check_replication_target(
             BucketTargetSys::get()
                 .record_ssec_passthrough_capability(&target.arn, SsecPassthroughCapability::Unsupported)
                 .await;
+        }
+        _ => {}
+    }
+    // Same for the identity verdict: once a target is known to mint its own
+    // version ids, the worker locates replicas by content identity instead of
+    // re-driving PUTs whenever a version-addressed HEAD answers 404.
+    match (result.phases.version_fidelity.status, result.phases.version_fidelity.code) {
+        ("OK", _) => {
+            BucketTargetSys::get().record_version_identity_capability(&target.arn, VersionIdentityCapability::Adopts);
+        }
+        ("FAILED", Some(REPLICATION_CHECK_CODE_VERSION_MISMATCH)) => {
+            BucketTargetSys::get().record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
         }
         _ => {}
     }

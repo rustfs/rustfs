@@ -65,9 +65,10 @@ pub use multipart::{
 };
 pub use object::{
     ObjectLockIntegrity, ReplicationSourceObject, ReplicationTargetObject, SsecPassthroughCapability, SsecPassthroughGate,
-    content_matches_by_etag, is_replication_target_offline_error, object_lock_put_integrity, replication_action_for_target,
-    replication_etags_match, single_part_replica_etag_mismatch, ssec_passthrough_evidence_present, ssec_passthrough_gate,
-    target_is_newer_than_source_null_version, version_identity_drifted,
+    VersionIdentityCapability, content_matches_by_etag, is_replication_target_offline_error, object_lock_put_integrity,
+    replication_action_for_target, replication_etags_match, single_part_replica_etag_mismatch, ssec_passthrough_evidence_present,
+    ssec_passthrough_gate, target_is_newer_than_source_null_version, version_identity_capability_from_put,
+    version_identity_drifted,
 };
 pub use operation::{
     MustReplicateOptions, ReplicationDeleteScheduleInput, ReplicationDeleteSource, ReplicationDeleteStateSource,

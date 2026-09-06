@@ -585,6 +585,7 @@ impl ScannerIOCache for SetDisks {
             let partial_dirty_buckets_clone = bucket_failures.partial.clone();
             let pending_maintenance_work_clone = pending_maintenance_work.clone();
             let dirty_usage_buckets_clone = dirty_usage_buckets.clone();
+            let scope_clone = scope.clone();
             let cache_cycle_floor_clone = cache_cycle_floor.clone();
             let expected_publication_epoch_clone = expected_publication_epoch;
             let remote_server_epoch = match worker_mode {
@@ -619,6 +620,12 @@ impl ScannerIOCache for SetDisks {
                     };
                     let mut work_guard =
                         BucketWorkGuard::new(remaining_bucket_work_clone.clone(), bucket_work_complete_clone.clone());
+                    // Prefix hints are process-local. Never hand one to a
+                    // remote or legacy-coordinator disk path.
+                    let prefix_scan_scope = disk_clone
+                        .is_local()
+                        .then(|| scope_clone.prefix_scope_for(&bucket.name))
+                        .flatten();
 
                     metrics::histogram!(
                         METRIC_SCANNER_DISK_SCAN_WAIT_SECONDS,
@@ -1054,7 +1061,10 @@ impl ScannerIOCache for SetDisks {
                         set_disk_inventory_clone.as_ref().clone(),
                         cache.clone(),
                         None,
-                        scan_mode,
+                        ScannerDiskScanOptions {
+                            scan_mode,
+                            prefix_scan_scope,
+                        },
                     );
                     tokio::pin!(scan);
                     let mut lock_watch = tokio::time::interval(SCANNER_CACHE_LOCK_POLL_INTERVAL);

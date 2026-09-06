@@ -420,7 +420,7 @@ impl DefaultObjectUsecase {
                 )
                 .await
                 .map_err(ApiError::from)?;
-            rustfs_scanner::record_dirty_usage_bucket(&bucket);
+            rustfs_scanner::record_dirty_usage_object(&bucket, &object);
             #[cfg(test)]
             maybe_pause_after_restore_status_commit(&bucket, &object).await;
             drop(superseded_worker_guard.take());
@@ -494,7 +494,7 @@ impl DefaultObjectUsecase {
                     err.to_string()
                 );
             } else {
-                rustfs_scanner::record_dirty_usage_bucket(&bucket_clone);
+                rustfs_scanner::record_dirty_usage_object(&bucket_clone, &object_clone);
                 debug!(bucket = %bucket_clone, object = %object_clone, "Transitioned object restored");
             }
         });
