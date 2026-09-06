@@ -31,17 +31,19 @@
 //! Adding a target behavior the fleet has shown: add the mode to the fake
 //! target, add a row here, and record any cell that is red before the fix.
 
-use crate::common::{RustFSTestEnvironment, init_logging, replication_fast_env};
-use crate::fake_s3_target::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY};
+use crate::common::{init_logging, replication_fast_env};
+use crate::fake_s3_target::{BucketMode, FAKE_ACCESS_KEY, FAKE_SECRET_KEY};
 use crate::fake_s3_target::{FakeS3Target, Operation as FakeTargetOperation, RequestRecord};
-use crate::on_demand_migration::common::fake_source_client;
+use crate::on_demand_migration::common::{OdmEnvOptions, OdmTestEnv, fake_source_client};
 use crate::replication_extension_test::{
     LOOPBACK_REPLICATION_TARGET_ENV, ReplicationTargetOptions, enable_bucket_versioning, put_bucket_replication,
     set_replication_target_with_options,
 };
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::{ByteStream, DateTime};
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, ObjectLockLegalHoldStatus, ObjectLockMode};
+use aws_sdk_s3::types::{
+    Checksum, CompletedMultipartUpload, CompletedPart, ObjectAttributes, ObjectLockLegalHoldStatus, ObjectLockMode,
+};
 use bytes::Bytes;
 use std::error::Error;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -110,16 +112,19 @@ enum ObjectShape {
     /// Two-part multipart upload with a GOVERNANCE retention period; the
     /// lock headers travel on CreateMultipartUpload, which has no body.
     LockedMultipart,
+    /// ODM stores two local parts while preserving a single-PUT source's MD5 ETag.
+    OdmPreservedMd5Multipart,
 }
 
 impl ObjectShape {
-    const ALL: [ObjectShape; 6] = [
+    const ALL: [ObjectShape; 7] = [
         ObjectShape::Empty,
         ObjectShape::Plain,
         ObjectShape::Retention,
         ObjectShape::LegalHold,
         ObjectShape::Multipart,
         ObjectShape::LockedMultipart,
+        ObjectShape::OdmPreservedMd5Multipart,
     ];
 
     fn key(self) -> &'static str {
@@ -130,6 +135,7 @@ impl ObjectShape {
             ObjectShape::LegalHold => "matrix/legal-hold.bin",
             ObjectShape::Multipart => "matrix/multipart.bin",
             ObjectShape::LockedMultipart => "matrix/locked-multipart.bin",
+            ObjectShape::OdmPreservedMd5Multipart => "matrix/odm-preserved-md5.bin",
         }
     }
 
@@ -139,7 +145,8 @@ impl ObjectShape {
 
     /// Upload the shape to the source and return the bytes the target must
     /// end up holding.
-    async fn put(self, client: &Client, bucket: &str) -> Result<Bytes, Box<dyn Error + Send + Sync>> {
+    async fn put(self, env: &OdmTestEnv, bucket: &str) -> Result<Bytes, Box<dyn Error + Send + Sync>> {
+        let client = &env.client;
         let key = self.key();
         match self {
             ObjectShape::Empty => {
@@ -190,6 +197,7 @@ impl ObjectShape {
             }
             ObjectShape::Multipart => multipart_put(client, bucket, key, 0x44, false).await,
             ObjectShape::LockedMultipart => multipart_put(client, bucket, key, 0x55, true).await,
+            ObjectShape::OdmPreservedMd5Multipart => odm_preserved_md5_multipart(env, bucket, key).await,
         }
     }
 }
@@ -270,11 +278,15 @@ async fn run_row(mode: TargetMode) -> TestResult {
     target.create_bucket_with_object_lock(target_bucket.clone());
     mode.apply(&target);
 
-    let mut source_env = RustFSTestEnvironment::new().await?;
     let mut env_vars = replication_fast_env();
     env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
     env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
-    source_env.start_rustfs_server_with_env(vec![], &env_vars).await?;
+    let env = OdmTestEnv::start_with(OdmEnvOptions {
+        env: env_vars,
+        ..OdmEnvOptions::default()
+    })
+    .await?;
+    let source_env = &env.rustfs;
 
     let source_bucket = format!("matrix-{}-src", mode.slug());
     let source_client = source_env.create_s3_client();
@@ -284,9 +296,9 @@ async fn run_row(mode: TargetMode) -> TestResult {
         .object_lock_enabled_for_bucket(true)
         .send()
         .await?;
-    enable_bucket_versioning(&source_env, &source_bucket).await?;
+    enable_bucket_versioning(source_env, &source_bucket).await?;
     let target_arn = set_replication_target_with_options(
-        &source_env,
+        source_env,
         &source_bucket,
         ReplicationTargetOptions {
             endpoint: &target.address(),
@@ -299,14 +311,21 @@ async fn run_row(mode: TargetMode) -> TestResult {
         },
     )
     .await?;
-    put_bucket_replication(&source_env, &source_bucket, &target_arn).await?;
+    put_bucket_replication(source_env, &source_bucket, &target_arn).await?;
 
     let target_client = fake_source_client(&target);
     let mut failures = Vec::new();
     for shape in ObjectShape::ALL {
         let cell = format!("{}/{:?}", mode.slug(), shape);
-        let expected_body = shape.put(&source_client, &source_bucket).await?;
+        let expected_body = shape.put(&env, &source_bucket).await?;
         let status = wait_for_terminal_replication_status(&source_client, &source_bucket, shape.key()).await?;
+        if shape == ObjectShape::OdmPreservedMd5Multipart {
+            assert_eq!(
+                env.source.count_requests(FakeTargetOperation::GetObject, shape.key()),
+                2,
+                "one passthrough GET plus one background pull; replication must read the persisted local parts"
+            );
+        }
         let journal = target.requests();
         let outcome = match expectation(mode, shape) {
             Expectation::Completed => {
@@ -378,6 +397,36 @@ async fn check_completed_cell(
         .collect();
     if uploads.is_empty() {
         return Err("no upload reached the target although the source reports COMPLETED".into());
+    }
+    if shape == ObjectShape::OdmPreservedMd5Multipart {
+        let key_requests: Vec<_> = journal
+            .iter()
+            .filter(|record| record.key.as_deref() == Some(shape.key()))
+            .collect();
+        for operation in [
+            FakeTargetOperation::CreateMultipartUpload,
+            FakeTargetOperation::CompleteMultipartUpload,
+        ] {
+            if !key_requests.iter().any(|record| record.operation == operation) {
+                return Err(format!("preserved-MD5 multipart object did not use {operation:?}").into());
+            }
+        }
+        if key_requests
+            .iter()
+            .any(|record| record.operation == FakeTargetOperation::PutObject)
+        {
+            return Err("preserved-MD5 multipart object used a single PutObject".into());
+        }
+        let mut part_numbers: Vec<_> = key_requests
+            .iter()
+            .filter(|record| record.operation == FakeTargetOperation::UploadPart)
+            .map(|record| record.part_number)
+            .collect();
+        part_numbers.sort_unstable();
+        part_numbers.dedup();
+        if part_numbers != [Some(1), Some(2)] {
+            return Err(format!("preserved-MD5 multipart object uploaded unexpected parts: {part_numbers:?}").into());
+        }
     }
     if let Some(framed) = uploads.iter().find(|record| record.transport.aws_chunked) {
         return Err(format!("{cell}: an upload went out aws-chunked (rustfs#6853 framing): {framed:?}").into());
@@ -453,6 +502,71 @@ async fn wait_for_terminal_replication_status(
         Ok(result) => result,
         Err(_) => Err(format!("{key} reached no terminal replication status within 90 seconds").into()),
     }
+}
+
+async fn odm_preserved_md5_multipart(env: &OdmTestEnv, bucket: &str, key: &str) -> Result<Bytes, Box<dyn Error + Send + Sync>> {
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    let origin_bucket = format!("{bucket}-origin");
+    env.source.create_bucket_with_mode(&origin_bucket, BucketMode::Unversioned);
+    let mut spec = env.fake_source_spec(&origin_bucket);
+    // Below the 16 MiB inline default the pull is one tee'd PUT with a single
+    // part; force the passthrough + background multipart write-back instead.
+    spec.policy.inline_max_bytes = 4096;
+    spec.policy.multipart_part_size_bytes = PART_SIZE as u64;
+    spec.policy.preserve_etag = true;
+    env.configure_and_wait(bucket, &spec).await?;
+
+    // A normal source PUT produces the MD5 ETag; only ODM chooses the local parts.
+    let body = payload(PART_SIZE + 4096, 0x66);
+    let source_put = env
+        .source_client()
+        .put_object()
+        .bucket(&origin_bucket)
+        .key(key)
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await?;
+    let source_etag = source_put.e_tag().ok_or("source PUT omitted its ETag")?.trim_matches('"');
+    assert_eq!(source_etag.len(), 32, "source fixture must have a single-PUT MD5 ETag");
+    assert!(source_etag.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    let pulled = env.raw_get(bucket, key).await?;
+    assert_eq!(pulled.status, 200, "{}", String::from_utf8_lossy(&pulled.body));
+    assert_eq!(pulled.body, body);
+    assert!(
+        env.wait_local_listed(bucket, key, Duration::from_secs(30)).await?,
+        "ODM must persist the object"
+    );
+    let attributes = env
+        .client
+        .get_object_attributes()
+        .bucket(bucket)
+        .key(key)
+        .object_attributes(ObjectAttributes::Etag)
+        .object_attributes(ObjectAttributes::ObjectParts)
+        .object_attributes(ObjectAttributes::Checksum)
+        .send()
+        .await?;
+    assert_eq!(attributes.e_tag().map(|etag| etag.trim_matches('"')), Some(source_etag));
+    let parts = attributes
+        .object_parts()
+        .ok_or("the ODM copy must expose its two local parts")?;
+    assert_eq!(parts.total_parts_count(), Some(2));
+    assert_eq!(
+        parts
+            .parts()
+            .iter()
+            .map(|part| (part.part_number(), part.size()))
+            .collect::<Vec<_>>(),
+        [(Some(1), Some(PART_SIZE as i64)), (Some(2), Some(4096))]
+    );
+    assert!(
+        attributes
+            .checksum()
+            .is_none_or(|checksum| checksum == &Checksum::builder().build()),
+        "multipart routing must work without an object checksum record"
+    );
+    Ok(body)
 }
 
 async fn multipart_put(

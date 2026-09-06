@@ -114,6 +114,11 @@ pub(crate) struct ScannerBucketScanScope {
 }
 
 impl ScannerBucketScanScope {
+    #[cfg(test)]
+    pub(crate) fn selected_buckets_for_tests(&self) -> Option<&HashSet<String>> {
+        self.selected_buckets.as_deref()
+    }
+
     fn is_default(&self) -> bool {
         self.selected_buckets.is_none() && self.baseline_scan_plan_digest.is_none()
     }
@@ -218,8 +223,8 @@ fn complete_scanner_cache_snapshot_plan_digest(
 
 fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<'_>) -> Option<DataUsageScanPlanDigest> {
     let authoritative = serde_json::from_slice::<DataUsageInfo>(proof.authoritative_data?).ok()?;
-    if let Some(plan_digest) = complete_scanner_cache_snapshot_plan_digest(&authoritative, proof, true) {
-        return Some(plan_digest);
+    if let Some(validated_digest) = complete_scanner_cache_snapshot_plan_digest(&authoritative, proof, true) {
+        return Some(validated_digest);
     }
 
     // A complete but superseded observation may reuse its per-set cache only
@@ -896,6 +901,7 @@ pub(crate) struct ScannerCycleResult {
     failed_dirty_usage: bool,
     pending_maintenance_work: bool,
     required_cycle_floor: Option<u64>,
+    publication_expectation: Option<ScannerPublicationExpectation>,
 }
 
 impl ScannerCycleResult {
@@ -911,10 +917,12 @@ impl ScannerCycleResult {
             failed_dirty_usage: false,
             pending_maintenance_work: false,
             required_cycle_floor: None,
+            publication_expectation: None,
         }
     }
 
     pub(crate) fn with_publication_epoch(mut self, publication_epoch: Option<u64>) -> Self {
+        self.publication_expectation = None;
         self.publication_epoch = publication_epoch;
         self
     }
@@ -924,6 +932,7 @@ impl ScannerCycleResult {
     }
 
     fn with_activity_digest(mut self, activity_digest: [u8; 32]) -> Self {
+        self.publication_expectation = None;
         self.activity_digest = Some(activity_digest);
         self
     }
@@ -933,6 +942,7 @@ impl ScannerCycleResult {
     }
 
     pub(crate) fn with_observational_snapshot_published(mut self, published: bool) -> Self {
+        self.publication_expectation = None;
         self.observational_snapshot_published = published;
         self
     }
@@ -942,16 +952,19 @@ impl ScannerCycleResult {
     }
 
     fn with_failed_dirty_usage(mut self, failed_dirty_usage: bool) -> Self {
+        self.publication_expectation = None;
         self.failed_dirty_usage = failed_dirty_usage;
         self
     }
 
     fn with_pending_maintenance_work(mut self, pending_maintenance_work: bool) -> Self {
+        self.publication_expectation = None;
         self.pending_maintenance_work = pending_maintenance_work;
         self
     }
 
     fn with_required_cycle_floor(mut self, required_cycle_floor: Option<u64>) -> Self {
+        self.publication_expectation = None;
         self.required_cycle_floor = required_cycle_floor;
         self
     }
@@ -960,11 +973,13 @@ impl ScannerCycleResult {
         mut self,
         acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
     ) -> Self {
+        self.publication_expectation = None;
         self.remote_dirty_usage_acknowledgements = acknowledgements;
         self
     }
 
     pub(crate) fn with_remote_publication_lease_targets(mut self, targets: Vec<(String, String, u64)>) -> Self {
+        self.publication_expectation = None;
         self.remote_publication_lease_targets = targets;
         self
     }
@@ -973,7 +988,32 @@ impl ScannerCycleResult {
         &self.remote_publication_lease_targets
     }
 
-    pub(crate) fn acknowledge_durable_usage(self) -> Vec<crate::scanner::ScannerDirtyUsageAcknowledgement> {
+    pub(crate) fn publication_expectation(&self) -> Option<ScannerPublicationExpectation> {
+        self.publication_expectation.clone()
+    }
+
+    fn with_publication_expectation(mut self, expectation: Option<ScannerPublicationExpectation>) -> Self {
+        // Seal only after all coverage and acknowledgement inputs are final.
+        self.publication_expectation = expectation;
+        self
+    }
+
+    pub(crate) fn acknowledge_durable_usage(
+        self,
+        proof: &crate::scanner::RootPublicationProof,
+    ) -> Vec<crate::scanner::ScannerDirtyUsageAcknowledgement> {
+        if self.status != ScannerCycleStatus::Complete
+            || self
+                .publication_expectation
+                .as_ref()
+                .is_none_or(|expected| proof.verified_version_for(expected).is_none())
+        {
+            return Vec::new();
+        }
+        self.clear_verified_usage()
+    }
+
+    fn clear_verified_usage(self) -> Vec<crate::scanner::ScannerDirtyUsageAcknowledgement> {
         if let Some(snapshot) = self.dirty_usage_clear {
             clear_dirty_usage_buckets(&snapshot);
         }
@@ -1013,6 +1053,7 @@ mod publish_gate_tests;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use cache::ScannerPublicationExpectation;
 use cache::*;
 use dirty_usage::*;
 use guards::*;

@@ -23,16 +23,20 @@
 
 use super::common::{
     ALLOW_LOOPBACK_SOURCE_ENV, AdminResponse, BackfillOp, BackfillRequest, BoxError, ODM_MODULE_SWITCH_ENV, ODM_SERVER_ENV,
-    OdmEnvOptions, OdmSourceSpec, OdmTestEnv, SeedObject, start_configured_env, start_configured_env_with,
+    OdmEnvOptions, OdmSourceSpec, OdmTestEnv, SeedObject, start_configured_env, start_configured_env_with, start_source_rustfs,
 };
 use crate::common::{RustFSTestEnvironment, replication_fast_env, signed_request};
 use crate::fake_s3_target::{BucketMode, FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, Operation};
 use crate::object_lock::common::put_object_lock_configuration;
+use crate::replication_extension_test::{
+    ReplicationTargetOptions, enable_bucket_versioning, set_replication_target_with_options,
+};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, Event, FilterRule, FilterRuleName, NotificationConfiguration, NotificationConfigurationFilter,
-    ObjectLockRetentionMode, QueueConfiguration, S3KeyFilter, ServerSideEncryption, ServerSideEncryptionByDefault,
-    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging, VersioningConfiguration,
+    ObjectAttributes, ObjectLockRetentionMode, QueueConfiguration, S3KeyFilter, ServerSideEncryption,
+    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging,
+    VersioningConfiguration,
 };
 use bytes::Bytes;
 use local_ip_address::local_ip;
@@ -579,6 +583,130 @@ async fn test_odm_pulled_object_replicates_and_target_as_source_is_rejected() ->
         rejected.status, 400,
         "a bucket may not migrate from its own replication target: {}",
         rejected.body
+    );
+    Box::pin(assert_odm_multipart_replicates_to_rustfs(&env, bucket)).await?;
+    Ok(())
+}
+
+async fn assert_odm_multipart_replicates_to_rustfs(env: &OdmTestEnv, bucket: &str) -> TestResult {
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    let replica = start_source_rustfs().await?;
+    let replica_bucket = "odm-real-replica";
+    replica.create_test_bucket(replica_bucket).await?;
+    enable_bucket_versioning(&replica, replica_bucket).await?;
+    let arn = set_replication_target_with_options(
+        &env.rustfs,
+        bucket,
+        ReplicationTargetOptions {
+            endpoint: &replica.address,
+            access_key: &replica.access_key,
+            secret_key: &replica.secret_key,
+            target_bucket: replica_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&env.rustfs, bucket, &arn).await?;
+    let mut spec = env.fake_source_spec(SOURCE_BUCKET);
+    // Below the 16 MiB inline default the pull is one tee'd PUT with a single
+    // part; force the passthrough + background multipart write-back instead.
+    spec.policy.inline_max_bytes = 4096;
+    spec.policy.multipart_part_size_bytes = PART_SIZE as u64;
+    spec.policy.preserve_etag = true;
+    env.configure_and_wait(bucket, &spec).await?;
+
+    let key = "replicated/preserved-md5-multipart.bin";
+    let body = payload(PART_SIZE + 4096);
+    let source_put = env
+        .source_client()
+        .put_object()
+        .bucket(SOURCE_BUCKET)
+        .key(key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(body.clone()))
+        .send()
+        .await?;
+    let etag = source_put.e_tag().ok_or("source PUT omitted its ETag")?.trim_matches('"');
+    assert_eq!(etag.len(), 32, "the source must retain a single-PUT MD5 ETag");
+    assert!(etag.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let pulled = env.raw_get(bucket, key).await?;
+    assert_eq!(pulled.status, 200, "{}", String::from_utf8_lossy(&pulled.body));
+    assert_eq!(pulled.body, body);
+    assert!(env.wait_local_listed(bucket, key, SETTLE).await?, "the multipart pull must persist");
+
+    let deadline = Instant::now() + SETTLE;
+    let source_head = loop {
+        let head = env.client.head_object().bucket(bucket).key(key).send().await?;
+        match head.replication_status().map(|status| status.as_str()) {
+            Some("COMPLETED") => break head,
+            Some("FAILED") => return Err("the ODM multipart copy failed replication to RustFS".into()),
+            _ => {
+                assert!(Instant::now() < deadline, "the ODM multipart copy never completed replication to RustFS");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    };
+    let version = source_head
+        .version_id()
+        .ok_or("the versioned ODM copy omitted its version id")?;
+    assert_ne!(version, "null");
+    let replica_client = replica.create_s3_client();
+    for (client, object_bucket) in [(&env.client, bucket), (&replica_client, replica_bucket)] {
+        let attributes = client
+            .get_object_attributes()
+            .bucket(object_bucket)
+            .key(key)
+            .version_id(version)
+            .object_attributes(ObjectAttributes::Etag)
+            .object_attributes(ObjectAttributes::ObjectParts)
+            .send()
+            .await?;
+        assert_eq!(attributes.e_tag().map(|value| value.trim_matches('"')), Some(etag));
+        let parts = attributes
+            .object_parts()
+            .ok_or("the local copy and replica must both expose two parts")?;
+        assert_eq!(parts.total_parts_count(), Some(2));
+        assert_eq!(
+            parts
+                .parts()
+                .iter()
+                .map(|part| (part.part_number(), part.size()))
+                .collect::<Vec<_>>(),
+            [(Some(1), Some(PART_SIZE as i64)), (Some(2), Some(4096))]
+        );
+    }
+    // REPLICA status surfaces on HEAD, like the other inbound-replica checks.
+    let replica_head = replica_client
+        .head_object()
+        .bucket(replica_bucket)
+        .key(key)
+        .version_id(version)
+        .send()
+        .await?;
+    assert_eq!(replica_head.replication_status().map(|status| status.as_str()), Some("REPLICA"));
+    let replica_get = replica_client
+        .get_object()
+        .bucket(replica_bucket)
+        .key(key)
+        .version_id(version)
+        .send()
+        .await?;
+    assert_eq!(replica_get.version_id(), Some(version));
+    assert_eq!(replica_get.body.collect().await?.into_bytes(), body);
+    let boundary = replica_client
+        .get_object()
+        .bucket(replica_bucket)
+        .key(key)
+        .version_id(version)
+        .range(format!("bytes={}-{}", PART_SIZE - 32, PART_SIZE + 31))
+        .send()
+        .await?;
+    assert_eq!(boundary.body.collect().await?.into_bytes(), body.slice(PART_SIZE - 32..PART_SIZE + 32));
+    assert_eq!(
+        env.source.count_requests(Operation::GetObject, key),
+        2,
+        "one passthrough GET plus one background pull; replication and local reads must not fetch the migration source again"
     );
     Ok(())
 }

@@ -36,7 +36,10 @@ use tokio::time::{Duration, advance};
 
 const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 
+mod quota_reset_preservation;
+
 mod recovery_control;
+mod scoped_ack_publication;
 
 async fn setup_scanner_cycle_store() -> (tempfile::TempDir, Arc<ECStore>) {
     setup_scanner_cycle_store_with_usage_baseline(true).await
@@ -5289,6 +5292,103 @@ async fn scanner_usage_state_reset_resumes_every_cleanup_boundary_without_rewrit
 }
 
 #[tokio::test]
+#[serial]
+async fn scanner_usage_state_reset_resumes_real_store_cleanup_boundaries_after_reopen() {
+    let primary_path = DATA_USAGE_OBJ_NAME_PATH.as_str();
+    let cleanup_paths = [
+        format!("{primary_path}.bkp"),
+        LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+        format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str().to_string(),
+    ];
+
+    for completed in 0..=cleanup_paths.len() {
+        let (_temp_dir, store) = setup_scanner_cycle_store().await;
+        let cycle = CurrentCycle {
+            current: 12,
+            next: 42,
+            cycle_completed: vec![Utc::now()],
+            started: Utc::now(),
+        };
+        save_config(
+            store.clone(),
+            DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+            encode_scanner_cycle_state(&cycle, 3).expect("cycle state should encode"),
+        )
+        .await
+        .expect("cycle state should persist");
+        let marker = scanner_usage_bootstrap_marker(std::time::SystemTime::UNIX_EPOCH, Some(3));
+        save_config(
+            store.clone(),
+            primary_path,
+            serde_json::to_vec(&marker).expect("usage reset marker should encode"),
+        )
+        .await
+        .expect("usage reset marker should persist");
+
+        for path in cleanup_paths.iter().skip(completed) {
+            let mut usage = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+            usage.scanner_epoch = Some(1);
+            usage.scanner_cycle = Some(12);
+            save_config(store.clone(), path, serde_json::to_vec(&usage).expect("cleanup slot should encode"))
+                .await
+                .expect("cleanup slot should persist");
+        }
+        for path in ["buckets/quota-reservations/ledger", "buckets/example/incarnation"] {
+            save_config(store.clone(), path, b"retain".to_vec())
+                .await
+                .expect("unrelated state should persist before reopen");
+        }
+
+        let restarted = restart_scanner_cycle_store_from(&store).await;
+        let intent_before = read_config_with_revision(restarted.clone(), primary_path)
+            .await
+            .expect("reopened reset intent should be readable");
+
+        let result = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), restarted.clone())
+            .await
+            .expect("reopened usage reset should complete");
+
+        assert_eq!(result.leader_epoch, 3, "boundary {completed}");
+        assert_eq!(result.next_cycle, 42, "boundary {completed}");
+        assert_eq!(result.reset_paths.len(), cleanup_paths.len() + 1 - completed, "boundary {completed}");
+        assert_eq!(
+            read_config_with_revision(restarted.clone(), primary_path)
+                .await
+                .expect("completed reset intent should remain readable"),
+            intent_before,
+            "boundary {completed}: resumed cleanup must not rewrite the reset intent"
+        );
+
+        let (floor, state) = persisted_usage_floor_for_startup(restarted.clone(), false)
+            .await
+            .expect("completed reset marker should remain resumable");
+        assert_eq!(floor.leader_epoch, 3, "boundary {completed}");
+        assert_eq!(state, PersistedUsageFloorStartup::BootstrapPending, "boundary {completed}");
+        assert!(
+            persisted_usage_floor(restarted.clone()).await.is_err(),
+            "boundary {completed}: bootstrap marker must not become an authoritative floor"
+        );
+
+        for path in &cleanup_paths {
+            assert!(
+                matches!(read_config(restarted.clone(), path).await, Err(EcstoreError::ConfigNotFound)),
+                "boundary {completed}: reset should remove stale usage slot {path}"
+            );
+        }
+        for path in ["buckets/quota-reservations/ledger", "buckets/example/incarnation"] {
+            assert_eq!(
+                read_config(restarted.clone(), path)
+                    .await
+                    .expect("unrelated state should survive reopened reset"),
+                b"retain",
+                "boundary {completed}: reset must preserve non-scanner-state config"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn scanner_usage_state_reset_stops_usage_fence_after_owner_loss() {
     let store = Arc::new(MemoryConfigStore::default());
     let mut usage = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
@@ -6184,7 +6284,7 @@ async fn coordinator_classifies_an_expired_publication_lease() {
         .await;
 
     assert_eq!(
-        outcome,
+        outcome.outcome(),
         DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded)
     );
     assert!(store.put_counts.lock().await.is_empty(), "expired lease must prevent a PUT");
@@ -7325,7 +7425,7 @@ fn scanner_cycle_cache_floor_stays_pending_during_deferred_usage_publication() {
 
 #[test]
 #[serial]
-fn finalizing_a_saved_cycle_acknowledges_its_exact_dirty_snapshot() {
+fn finalizing_a_saved_enum_without_proof_keeps_dirty_pending() {
     crate::scanner_io::clear_dirty_usage_bucket("photos");
     crate::scanner_io::record_dirty_usage_bucket("photos");
     let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
@@ -7337,17 +7437,19 @@ fn finalizing_a_saved_cycle_acknowledges_its_exact_dirty_snapshot() {
     };
     let unsaved = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot.clone()))
         .with_remote_dirty_usage_acknowledgements(vec![remote_acknowledgement.clone()]);
-    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(unsaved, DataUsagePersistOutcome::NoUpdate);
+    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(unsaved, DataUsagePersistOutcome::NoUpdate.into());
     assert_eq!(outcome, ScannerCycleOutcome::Failed);
     assert!(acknowledgements.is_empty());
     assert!(crate::scanner_io::dirty_usage_buckets_pending());
 
     let saved = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot))
-        .with_remote_dirty_usage_acknowledgements(vec![remote_acknowledgement.clone()]);
-    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(saved, DataUsagePersistOutcome::Saved);
+        .with_remote_dirty_usage_acknowledgements(vec![remote_acknowledgement]);
+    let (outcome, pending, acknowledgements) = finalize_scanner_cycle_result(saved, DataUsagePersistOutcome::Saved.into());
     assert_eq!(outcome, ScannerCycleOutcome::Completed);
-    assert_eq!(acknowledgements, vec![remote_acknowledgement]);
-    assert!(!crate::scanner_io::dirty_usage_buckets_pending());
+    assert!(acknowledgements.is_empty());
+    assert!(pending);
+    assert!(crate::scanner_io::dirty_usage_buckets_pending());
+    crate::scanner_io::clear_dirty_usage_bucket("photos");
 }
 
 #[test]
@@ -7359,7 +7461,7 @@ fn finalizing_a_deferred_usage_save_keeps_dirty_work_pending() {
     let deferred = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot));
 
     let (outcome, _, acknowledgements) =
-        finalize_scanner_cycle_result(deferred, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
+        finalize_scanner_cycle_result(deferred, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement).into());
 
     assert_eq!(outcome, ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
     assert!(acknowledgements.is_empty());
@@ -7379,7 +7481,7 @@ fn finalizing_post_scan_observation_advances_partially_without_dirty_ack() {
     )
     .with_observational_snapshot_published(true);
 
-    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(observed, DataUsagePersistOutcome::Saved);
+    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(observed, DataUsagePersistOutcome::Saved.into());
 
     assert_eq!(outcome, ScannerCycleOutcome::Partial);
     assert!(acknowledgements.is_empty());
@@ -7415,17 +7517,20 @@ async fn scanner_cycle_keeps_remote_pending_acknowledgement() {
 
 #[test]
 #[serial]
-fn finalizing_an_already_durable_cycle_acknowledges_its_exact_dirty_snapshot() {
+fn finalizing_an_already_durable_enum_without_proof_keeps_dirty_pending() {
     crate::scanner_io::clear_dirty_usage_bucket("photos");
     crate::scanner_io::record_dirty_usage_bucket("photos");
     let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
 
     let durable = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot));
-    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(durable, DataUsagePersistOutcome::AlreadyDurable);
+    let (outcome, pending, acknowledgements) =
+        finalize_scanner_cycle_result(durable, DataUsagePersistOutcome::AlreadyDurable.into());
 
     assert_eq!(outcome, ScannerCycleOutcome::Completed);
     assert!(acknowledgements.is_empty());
-    assert!(!crate::scanner_io::dirty_usage_buckets_pending());
+    assert!(pending);
+    assert!(crate::scanner_io::dirty_usage_buckets_pending());
+    crate::scanner_io::clear_dirty_usage_bucket("photos");
 }
 
 #[test]
@@ -7436,7 +7541,8 @@ fn finalizing_a_prior_same_cycle_snapshot_keeps_new_dirty_work_pending() {
     let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
 
     let durable = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot));
-    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(durable, DataUsagePersistOutcome::PriorCycleDurable);
+    let (outcome, _, acknowledgements) =
+        finalize_scanner_cycle_result(durable, DataUsagePersistOutcome::PriorCycleDurable.into());
 
     assert_eq!(outcome, ScannerCycleOutcome::Completed);
     assert!(acknowledgements.is_empty());
@@ -7452,7 +7558,7 @@ fn finalizing_a_durable_superseded_snapshot_keeps_dirty_work_pending() {
     let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
 
     let superseded = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Superseded, Some(dirty_snapshot));
-    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(superseded, DataUsagePersistOutcome::Saved);
+    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(superseded, DataUsagePersistOutcome::Saved.into());
 
     assert_eq!(outcome, ScannerCycleOutcome::Superseded);
     assert!(acknowledgements.is_empty());
@@ -8881,7 +8987,7 @@ fn post_lease_activity_proof_rejects_a_put_tail_that_finished_before_lease_acqui
     ]);
     let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(
         result,
-        DataUsagePersistOutcome::Deferred(reason.expect("changed namespace should defer publication")),
+        DataUsagePersistOutcome::Deferred(reason.expect("changed namespace should defer publication")).into(),
     );
     assert_eq!(
         outcome,
