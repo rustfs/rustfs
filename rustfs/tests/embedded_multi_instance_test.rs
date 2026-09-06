@@ -653,7 +653,7 @@ mod signed_target_rpc {
         fi.size = i64::try_from(body.len()).expect("small fixture");
         fi.parts = vec![ObjectPartInfo {
             number: 1,
-            size: fi.size,
+            size: body.len(),
             actual_size: fi.size,
             ..Default::default()
         }];
