@@ -73,6 +73,7 @@ where
         scan_scope: ScannerBucketScanScope::default(),
         persisted_usage_baseline: None,
         requires_full_scan: true,
+        service_cohort: None,
         #[cfg(test)]
         resolved_scope_observer: None,
     };
@@ -90,6 +91,7 @@ pub(crate) struct ScannerCycleRequest {
     pub(crate) persisted_usage_baseline: Option<Bytes>,
     /// Scheduled maintenance must visit clean buckets even with a valid dirty scope.
     pub(crate) requires_full_scan: bool,
+    pub(crate) service_cohort: Option<Arc<StdMutex<ScannerServiceCohort>>>,
     #[cfg(test)]
     pub(crate) resolved_scope_observer: Option<tokio::sync::oneshot::Sender<ScannerBucketScanScope>>,
 }
@@ -184,6 +186,7 @@ where
         scan_scope,
         persisted_usage_baseline,
         requires_full_scan,
+        service_cohort,
         #[cfg(test)]
         resolved_scope_observer,
     } = request;
@@ -275,6 +278,12 @@ where
     }
     bucket_plan_complete &= buckets_by_source.keys().copied().collect::<HashSet<_>>() == *expected_sources;
     bucket_plan_complete &= scanner_bucket_inventory_is_complete(&all_buckets, &buckets_by_source);
+    if bucket_plan_complete && let Some(cohort) = &service_cohort {
+        cohort
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .refresh(&buckets_by_source);
+    }
     let structural_scan_plan_digest =
         scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_structural_digest(&activity_before));
     let scan_plan_digest = scanner_bucket_work_digest(structural_scan_plan_digest, scan_mode, requires_full_scan);
@@ -399,7 +408,32 @@ where
     let first_err_mutex: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
     let mut wait_futs = Vec::new();
 
-    for (results_index, set) in set_disks.iter().enumerate() {
+    let set_order = service_cohort.as_ref().map_or_else(
+        || (0..set_disks.len()).collect::<Vec<_>>(),
+        |cohort| {
+            cohort
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .order_set_indices(&set_disks)
+        },
+    );
+    for results_index in set_order {
+        let set = &set_disks[results_index];
+        // Acquire in dispatch order, not in independently scheduled tasks.
+        // A whole set still shares the existing parent budget; this is not
+        // a per-bucket quantum or a cross-source completion guarantee.
+        let permit_wait_start = Instant::now();
+        let permit = tokio::select! {
+            biased;
+            _ = child_token.cancelled() => break,
+            permit = set_scan_semaphore.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+        };
+        if child_token.is_cancelled() || budget.budget_elapsed() {
+            break;
+        }
         let results_index_clone = results_index;
         // Clone the Arc to move it into the spawned task
         let set_clone: Arc<SetDisks> = Arc::clone(set);
@@ -414,7 +448,6 @@ where
         let scan_mode_clone = scan_mode;
         let results_mutex_clone = results_mutex.clone();
         let first_err_mutex_clone = first_err_mutex.clone();
-        let set_scan_semaphore_clone = set_scan_semaphore.clone();
         let queued_set_scans_clone = queued_set_scans.clone();
         let active_set_scans_clone = active_set_scans.clone();
 
@@ -437,6 +470,7 @@ where
             digest: structural_scan_plan_digest,
             bucket_coverage_digest,
             requires_full_scan,
+            service_cohort: service_cohort.clone(),
             execution_digest,
             leader_epoch,
             tier_registry_generation,
@@ -448,15 +482,10 @@ where
         };
         // Spawn task to run the scanner
         let scanner_fut = tokio::spawn(async move {
-            let permit_wait = child_token_clone.clone();
-            let permit_wait_start = Instant::now();
-            let _permit = tokio::select! {
-                permit = set_scan_semaphore_clone.acquire_owned() => match permit {
-                    Ok(permit) => permit,
-                    Err(_) => return,
-                },
-                _ = permit_wait.cancelled() => return,
-            };
+            let _permit = permit;
+            if child_token_clone.is_cancelled() || budget_clone.budget_elapsed() {
+                return;
+            }
             metrics::histogram!(
                 METRIC_SCANNER_SET_SCAN_WAIT_SECONDS,
                 "pool" => pool_label.clone(),

@@ -1219,7 +1219,18 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
     let mut revision = DataUsageCacheRevision::Missing;
     let outcome = tokio::time::timeout(
         Duration::from_secs(30),
-        run_data_scanner_cycle_with_budget(&ctx, &store, &mut cycle_info, &mut revision, 1, Arc::clone(&budget), true),
+        run_data_scanner_cycle_with_budget(
+            &ctx,
+            &store,
+            &mut cycle_info,
+            &mut revision,
+            1,
+            Arc::clone(&budget),
+            ScannerCycleScheduling {
+                requires_full_scan: true,
+                service_cohort: None,
+            },
+        ),
     )
     .await
     .expect("the coordinator must finish its namespace walk while a PUT is pending");
@@ -1263,7 +1274,18 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
     let retry_budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default());
     let outcome = tokio::time::timeout(
         Duration::from_secs(30),
-        run_data_scanner_cycle_with_budget(&ctx, &store, &mut cycle_info, &mut revision, 1, Arc::clone(&retry_budget), true),
+        run_data_scanner_cycle_with_budget(
+            &ctx,
+            &store,
+            &mut cycle_info,
+            &mut revision,
+            1,
+            Arc::clone(&retry_budget),
+            ScannerCycleScheduling {
+                requires_full_scan: true,
+                service_cohort: None,
+            },
+        ),
     )
     .await
     .expect("the same cycle must converge after the pending PUT drains");
@@ -8511,6 +8533,56 @@ async fn test_wait_for_next_scanner_cycle_wakes_for_dirty_usage() {
         .expect("dirty usage should wake scanner before timer");
 
     assert_eq!(reason, ScannerCycleWakeReason::DirtyUsage);
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+}
+
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn service_cohort_aging_preserves_explicit_cycle_wait() {
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    let config = ScannerRuntimeConfig {
+        cycle_interval: Duration::from_secs(3600),
+        cycle_interval_source: ScannerRuntimeConfigSource::Env,
+        ..Default::default()
+    };
+    let observed = ScannerCycleObservedGenerations::for_wait(
+        &config,
+        None,
+        crate::scanner_io::dirty_usage_generation(),
+        crate::runtime_config::scanner_runtime_config_generation(),
+        crate::scanner_io::scanner_maintenance_generation(),
+    );
+    assert_eq!(observed.dirty_usage, None);
+    let inventory = HashMap::from([(
+        crate::data_usage_define::DataUsageCacheSource::new(0, 0),
+        vec![crate::storage_api::scanner_io::BucketInfo {
+            name: "waiting-bootstrap".to_string(),
+            ..Default::default()
+        }],
+    )]);
+    let mut cohort = crate::scanner_io::ScannerServiceCohort::default();
+    cohort.refresh(&inventory);
+    let ctx = CancellationToken::new();
+    let mut wait = Box::pin(wait_for_next_scanner_cycle(
+        &ctx,
+        config.cycle_interval,
+        observed.dirty_usage,
+        observed.runtime_config,
+        observed.maintenance,
+        || false,
+    ));
+    assert!(matches!(futures::poll!(&mut wait), Poll::Pending));
+    for _ in 0..59 {
+        tokio::time::advance(Duration::from_secs(60)).await;
+        cohort.refresh(&inventory);
+        crate::scanner_io::record_dirty_usage_bucket("hot");
+        assert!(
+            matches!(futures::poll!(&mut wait), Poll::Pending),
+            "aging/dirty must not shorten the explicit hour"
+        );
+    }
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert_eq!(wait.await, ScannerCycleWakeReason::Timer);
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
 }
 

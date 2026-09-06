@@ -286,6 +286,7 @@ pub struct ScannerBucketScanPlan {
     /// Includes mutation generations even when the set planner uses a structural digest.
     bucket_coverage_digest: DataUsageScanPlanDigest,
     requires_full_scan: bool,
+    service_cohort: Option<Arc<StdMutex<ScannerServiceCohort>>>,
     // Cache work must invalidate on namespace completion even when its scoped baseline remains reusable.
     execution_digest: DataUsageScanPlanDigest,
     leader_epoch: u64,
@@ -973,6 +974,7 @@ impl ScannerCycleResult {
 mod cache;
 mod dirty_usage;
 mod guards;
+pub(crate) use guards::ScannerServiceCohort;
 mod io_cache;
 mod io_cycle;
 #[cfg(test)]

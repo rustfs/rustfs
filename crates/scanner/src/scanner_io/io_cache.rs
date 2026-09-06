@@ -117,6 +117,7 @@ impl ScannerIOCache for SetDisks {
             digest: scan_plan_digest,
             bucket_coverage_digest,
             requires_full_scan,
+            service_cohort,
             execution_digest,
             leader_epoch,
             tier_registry_generation,
@@ -500,7 +501,13 @@ impl ScannerIOCache for SetDisks {
 
         let mut permutes = buckets.clone();
         permutes.shuffle(&mut rand::rng());
-        let scan_order = bucket_usage_scan_order(&permutes, &old_cache, &dirty_usage_buckets);
+        let mut scan_order = bucket_usage_scan_order(&permutes, &old_cache, &dirty_usage_buckets);
+        if let Some(cohort) = &service_cohort {
+            cohort
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .order_buckets(source, &mut scan_order);
+        }
 
         for bucket in scan_order.iter() {
             if let Some(c) = old_cache.find(&bucket.name) {
@@ -558,6 +565,7 @@ impl ScannerIOCache for SetDisks {
         let remaining_bucket_work = Arc::new(AtomicUsize::new(buckets.len()));
         let bucket_work_complete = CancellationToken::new();
         for (disk, worker_mode) in workers {
+            let service_cohort_clone = service_cohort.clone();
             let bucket_rx_mutex_clone = bucket_rx_mutex.clone();
             let bucket_tx_clone = bucket_tx.clone();
             let remaining_bucket_work_clone = remaining_bucket_work.clone();
@@ -587,6 +595,18 @@ impl ScannerIOCache for SetDisks {
                 let remote_session_id = uuid::Uuid::new_v4();
                 let mut remote_session_sequence = 0_u64;
                 loop {
+                    // Do not prefetch a FIFO member into an independently
+                    // scheduled permit waiter: that can reorder admissions.
+                    let permit_wait_start = Instant::now();
+                    let Some(_permit) =
+                        wait_for_bucket_scan_permit(&disk_scan_semaphore_clone, &ctx_clone, &bucket_work_complete_clone).await
+                    else {
+                        break;
+                    };
+                    if ctx_clone.is_cancelled() || budget_clone.budget_elapsed() {
+                        break;
+                    }
+                    let permit_wait_elapsed = permit_wait_start.elapsed();
                     let bucket = tokio::select! {
                         _ = bucket_work_complete_clone.cancelled() => break,
                         _ = ctx_clone.cancelled() => break,
@@ -600,41 +620,27 @@ impl ScannerIOCache for SetDisks {
                     let mut work_guard =
                         BucketWorkGuard::new(remaining_bucket_work_clone.clone(), bucket_work_complete_clone.clone());
 
-                    let permit_wait = ctx_clone.clone();
-                    let permit_wait_start = Instant::now();
-                    let _permit = tokio::select! {
-                        permit = disk_scan_semaphore_clone.clone().acquire_owned() => match permit {
-                            Ok(permit) => permit,
-                            Err(_) => {
-                                decrement_disk_bucket_scans_queued(
-                                    &queued_disk_bucket_scans_clone,
-                                    &pool_label_clone,
-                                    &set_label_clone,
-                                );
-                                break;
-                            },
-                        },
-                        _ = permit_wait.cancelled() => {
-                            decrement_disk_bucket_scans_queued(
-                                &queued_disk_bucket_scans_clone,
-                                &pool_label_clone,
-                                &set_label_clone,
-                            );
-                            break;
-                        },
-                    };
                     metrics::histogram!(
                         METRIC_SCANNER_DISK_SCAN_WAIT_SECONDS,
                         "pool" => pool_label_clone.clone(),
                         "set" => set_label_clone.clone()
                     )
-                    .record(permit_wait_start.elapsed().as_secs_f64());
+                    .record(permit_wait_elapsed.as_secs_f64());
                     decrement_disk_bucket_scans_queued(&queued_disk_bucket_scans_clone, &pool_label_clone, &set_label_clone);
                     let _active_guard = DiskBucketScanActiveGuard::new(
                         active_disk_bucket_scans_clone.clone(),
                         pool_label_clone.clone(),
                         set_label_clone.clone(),
                     );
+                    if ctx_clone.is_cancelled() || budget_clone.budget_elapsed() {
+                        break;
+                    }
+                    if let Some(cohort) = &service_cohort_clone {
+                        cohort
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .record_admitted(source, &bucket.name);
+                    }
 
                     debug!(
                         target: "rustfs::scanner::io",
