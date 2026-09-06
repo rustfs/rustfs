@@ -288,6 +288,46 @@ pub(crate) mod prepared_publication_test_hooks {
             hook();
         }
     }
+
+    #[cfg(test)]
+    type RenameDestinationHook = Box<dyn FnOnce(&Path) + Send>;
+    #[cfg(test)]
+    static RENAME_DESTINATIONS: LazyLock<Mutex<HashMap<PathBuf, RenameDestinationHook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    #[cfg(test)]
+    pub(crate) struct RenameDestinationGuard(PathBuf);
+
+    #[cfg(test)]
+    impl Drop for RenameDestinationGuard {
+        fn drop(&mut self) {
+            RENAME_DESTINATIONS.lock().remove(&self.0);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_rename_destination(source: &Path, hook: impl FnOnce(&Path) + Send + 'static) -> RenameDestinationGuard {
+        assert!(
+            RENAME_DESTINATIONS
+                .lock()
+                .insert(source.to_path_buf(), Box::new(hook))
+                .is_none()
+        );
+        RenameDestinationGuard(source.to_path_buf())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn drain_namespace_key(path: &Path) {
+        drop(super::acquire_namespace_mutation_lease(path).await);
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_rename_destination(source: &Path, destination: &Path) {
+        let hook = RENAME_DESTINATIONS.lock().remove(source);
+        if let Some(hook) = hook {
+            hook(destination);
+        }
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -2271,6 +2311,8 @@ async fn reliable_rename_inner_with_lease(
         let base_dir = base_dir.clone();
         move || {
             let preparation = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
+            #[cfg(all(test, not(windows)))]
+            prepared_publication_test_hooks::run_rename_destination(&src_file_path, &dst_file_path);
             #[cfg(all(test, not(windows)))]
             {
                 prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &src_file_path);

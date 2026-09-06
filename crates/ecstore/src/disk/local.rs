@@ -22177,4 +22177,135 @@ mod test {
         assert_eq!(mount_id_from_mountinfo_contents(mountinfo, Path::new("/mnt/replacement disk")), Some(202));
         assert_eq!(mount_id_from_mountinfo_contents(mountinfo, Path::new("/mnt/replacement")), None);
     }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn single_delete_internal_restore_keeps_owner_after_cancellation() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        use futures::FutureExt;
+
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 fixture path")).expect("endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let bucket = "single-delete-internal-restore";
+        let object = format!("object-{}", Uuid::new_v4());
+        ensure_test_volume(&disk, bucket).await;
+        let version = Uuid::new_v4();
+        let data_dir = Uuid::new_v4();
+        let rollback_dir = Uuid::new_v4();
+        let fi = test_file_info(&object, version, Some(data_dir), None);
+        let original = test_meta(fi.clone());
+        let object_dir = disk.io_get_object_path(bucket, &object).expect("object IO path");
+        let part = object_dir.join(data_dir.to_string()).join("part.1");
+        let metadata = object_dir.join(STORAGE_FORMAT_FILE);
+        let backup = object_dir.join(rollback_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+        fs::create_dir_all(part.parent().expect("data parent"))
+            .await
+            .expect("data directory");
+        fs::write(&part, b"x").await.expect("real shard");
+        fs::write(&metadata, &original).await.expect("real version metadata");
+        set_delete_version_fail_after_data_staged(&object);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let hook = hooks::install_at(hooks::Stage::Rename, &metadata, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let before = ctx.namespace_commit_generation();
+        let owner = ctx.begin_namespace_commit();
+        let deleting_disk = Arc::clone(&disk);
+        let deleting_object = object.clone();
+        let mut delete = tokio::spawn(async move {
+            deleting_disk
+                .delete_version_inner(
+                    bucket,
+                    &deleting_object,
+                    fi,
+                    DeleteVersionMutation {
+                        force_del_marker: false,
+                        opts: DeleteOptions {
+                            old_data_dir: Some(rollback_dir),
+                            ..Default::default()
+                        },
+                        namespace_owner: Some(owner),
+                    },
+                )
+                .await
+        });
+        let mut joined = false;
+        let mut entered = false;
+        let mut counts = None;
+        let observations = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    result = entered_rx => {
+                        result.expect("actual internal restore entry");
+                        entered = true;
+                    }
+                    result = &mut delete => {
+                        joined = true;
+                        panic!("delete returned before internal physical restore: {result:?}");
+                    }
+                }
+            })
+            .await
+            .expect("internal restore must reach the physical rename");
+            assert_eq!(std::fs::read(&backup).expect("real undo backup"), original);
+            assert_eq!(std::fs::read(&part).expect("reserved shard"), b"x");
+            delete.abort();
+            let result = tokio::time::timeout(Duration::from_secs(5), &mut delete).await;
+            joined = result.is_ok();
+            assert!(
+                result
+                    .expect("cancelled caller joins")
+                    .expect_err("cancelled caller")
+                    .is_cancelled()
+            );
+            counts = Some((ctx.namespace_commits_pending(), ctx.namespace_commit_generation()));
+            assert!(hooks::drain_namespace_key(&metadata).now_or_never().is_none());
+        })
+        .catch_unwind()
+        .await;
+
+        drop(release);
+        drop(hook);
+        let coordinator_drained = joined || tokio::time::timeout(Duration::from_secs(10), &mut delete).await.is_ok();
+        if !coordinator_drained {
+            delete.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut delete).await;
+        }
+        let physical_drained = tokio::time::timeout(Duration::from_secs(5), hooks::drain_namespace_key(&metadata))
+            .await
+            .is_ok();
+        let owner_drained = tokio::time::timeout(Duration::from_secs(5), async {
+            while ctx.namespace_commits_pending() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        if !entered || !coordinator_drained || !physical_drained || !owner_drained {
+            eprintln!("internal restore cleanup incomplete; retained root: {:?}", dir.keep());
+            if let Err(panic) = observations {
+                std::panic::resume_unwind(panic);
+            }
+            panic!("internal restore cleanup must drain before removing its root");
+        }
+        if let Err(panic) = observations {
+            std::panic::resume_unwind(panic);
+        }
+        assert_eq!(std::fs::read(&metadata).expect("late restored metadata"), original);
+        assert!(!backup.exists(), "the actual backup rename must have completed");
+        assert_eq!(std::fs::read(&part).expect("old shard survives"), b"x");
+        disk.read_version("", bucket, &object, &version.to_string(), &ReadOptions::default())
+            .await
+            .expect("restored version");
+        let (pending, generation) = counts.expect("observations completed");
+        assert!(pending, "internal error recovery lost the physical namespace owner");
+        assert_eq!(generation, before + 1);
+        assert_eq!(ctx.namespace_commit_generation(), before + 2);
+        assert!(!ctx.namespace_commits_pending());
+    }
 }
