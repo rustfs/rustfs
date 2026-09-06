@@ -399,7 +399,7 @@ impl AdminClient {
         match client_token {
             Some(_) => {
                 let status: HealTaskStatus = self.post_json(&heal_path(bucket, prefix), &query, Vec::new()).await?;
-                Ok(HealStopOutcome::Stopped(status))
+                Ok(HealStopOutcome::Stopped(Box::new(status)))
             }
             None => {
                 let success: HealStartSuccess = self.post_json(&heal_path(bucket, prefix), &query, Vec::new()).await?;
@@ -554,7 +554,7 @@ impl AdminClient {
 /// start-success-shaped receipt.
 #[derive(Debug, Clone)]
 pub enum HealStopOutcome {
-    Stopped(HealTaskStatus),
+    Stopped(Box<HealTaskStatus>),
     PathStopped(HealStartSuccess),
 }
 
@@ -819,6 +819,25 @@ mod tests {
         let request = server.recorded();
         assert!(request.query.contains("forceStop=true"));
         assert!(!request.query.contains("clientToken"));
+    }
+
+    #[tokio::test]
+    async fn stop_with_token_decodes_boxed_task_status() {
+        let body = r#"{"summary":"stopped","detail":"","settings":{"recursive":false},"items":[],"truncated":false}"#;
+        let server = TestServer::spawn(body, 200).await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+
+        let outcome = client
+            .heal_stop(Some("bucket"), None, Some("token-1"))
+            .await
+            .expect("token stop decodes");
+        let super::HealStopOutcome::Stopped(status) = outcome else {
+            panic!("token stop should return task status");
+        };
+        assert_eq!(status.summary, "stopped");
+        let request = server.recorded();
+        assert!(request.query.contains("forceStop=true"));
+        assert!(request.query.contains("clientToken=token-1"));
     }
 
     #[tokio::test]
