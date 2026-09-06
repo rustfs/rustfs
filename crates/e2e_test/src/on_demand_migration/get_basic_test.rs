@@ -103,10 +103,15 @@ async fn get_miss_pulls_inline_and_serves_locally_afterwards() -> TestResult {
 
 #[tokio::test]
 async fn get_large_object_streams_through_and_backfills_in_background() -> TestResult {
+    const PART_SIZE: usize = 5 * 1024 * 1024;
     let bucket = "odm-get-large";
-    let env = configured_env(bucket, |spec| spec.policy.inline_max_bytes = 4096).await?;
+    let env = configured_env(bucket, |spec| {
+        spec.policy.inline_max_bytes = 4096;
+        spec.policy.multipart_part_size_bytes = u64::try_from(PART_SIZE).expect("part size fits in u64");
+    })
+    .await?;
     let key = "large/archive.bin";
-    let body = payload(512 * 1024);
+    let body = payload(PART_SIZE + 4096);
     env.seed_source(SOURCE_BUCKET, &[SeedObject::new(key, body.clone())]);
 
     let response = env.raw_get(bucket, key).await?;
@@ -124,6 +129,35 @@ async fn get_large_object_streams_through_and_backfills_in_background() -> TestR
         source_get_ranges(&env, key),
         vec![None, None],
         "one passthrough GET plus one background pull, both unranged"
+    );
+
+    let source_requests = env.source.requests().len();
+    let second_part = env.client.get_object().bucket(bucket).key(key).part_number(2).send().await?;
+    assert_eq!(second_part.content_length(), Some(4096), "the completed second part is the tail");
+    assert_eq!(
+        second_part.content_range(),
+        Some(format!("bytes {PART_SIZE}-{}/{}", body.len() - 1, body.len()).as_str()),
+        "partNumber reads the stored multipart boundary"
+    );
+    assert_eq!(
+        second_part.body.collect().await?.into_bytes(),
+        body.slice(PART_SIZE..),
+        "the local second part contains the exact source tail"
+    );
+    let third_part = env
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .part_number(3)
+        .send()
+        .await
+        .expect_err("the completed object has exactly two parts");
+    assert_eq!(third_part.code(), Some("InvalidPart"));
+    assert_eq!(
+        env.source.requests().len(),
+        source_requests,
+        "local part reads must not consult the source"
     );
     Ok(())
 }
