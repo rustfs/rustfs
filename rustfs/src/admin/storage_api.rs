@@ -295,6 +295,8 @@ pub(crate) mod remote_s3_client {
 }
 
 pub(crate) mod metadata_sys {
+    #[cfg(test)]
+    pub(crate) use super::ecstore_bucket::metadata_sys::ConfigWriteLockProbe;
     use std::sync::Arc;
 
     use rustfs_policy::policy::BucketPolicy;

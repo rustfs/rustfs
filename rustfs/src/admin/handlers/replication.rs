@@ -1035,7 +1035,7 @@ impl Operation for RemoveRemoteTargetHandler {
         let incarnation = metadata_sys::capture_bucket_metadata_incarnation(bucket)
             .await
             .map_err(ApiError::from)?;
-        let _targets_guard = lock_bucket_targets_metadata(bucket).await;
+        let targets_guard = lock_bucket_targets_metadata(bucket).await;
         // Match resync start: local targets -> lifecycle -> metadata transaction
         // -> resync admission -> resync status CAS. Keep the transaction through
         // cancellation and target persistence so another start cannot interleave.
@@ -1072,11 +1072,23 @@ impl Operation for RemoveRemoteTargetHandler {
             }));
         }
         let json_targets = serde_json::to_vec(&targets).map_err(|_| s3_error!(InternalError, "Failed to serialize targets"))?;
-        transaction_guard.checked_bucket_incarnation().map_err(ApiError::from)?;
-        cancel_active_resync_intent(bucket, arn_str).await?;
-        metadata_sys::update_bucket_targets_under_transaction_lock(&transaction_guard, bucket, json_targets)
-            .await
-            .map_err(ApiError::from)?;
+        let bucket = bucket.clone();
+        let arn = arn_str.clone();
+        // The pool cancellation owns a detached task. Both outer guards must
+        // outlive it, even when the HTTP future is dropped while awaiting it.
+        tokio::spawn(async move {
+            let _targets_guard = targets_guard;
+            #[cfg(test)]
+            target_repair_tests::pause_target_removal(&bucket).await;
+            transaction_guard.checked_bucket_incarnation().map_err(ApiError::from)?;
+            cancel_active_resync_intent(&bucket, &arn).await?;
+            metadata_sys::update_bucket_targets_under_transaction_lock(&transaction_guard, &bucket, json_targets)
+                .await
+                .map_err(ApiError::from)?;
+            Ok::<(), S3Error>(())
+        })
+        .await
+        .map_err(|error| s3_error!(InternalError, "remote target removal task failed: {error}"))??;
 
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
     }
@@ -2934,6 +2946,23 @@ mod target_repair_tests {
         release: oneshot::Receiver<()>,
     }
 
+    static REMOVAL_PAUSE: std::sync::Mutex<Option<(String, RequestPause)>> = std::sync::Mutex::new(None);
+
+    pub(super) async fn pause_target_removal(bucket: &str) {
+        let pause = {
+            let mut pending = REMOVAL_PAUSE.lock().expect("removal pause lock");
+            if pending.as_ref().is_some_and(|(expected, _)| expected == bucket) {
+                pending.take().map(|(_, pause)| pause)
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.reached.send(()).expect("observe removal before cancellation");
+            pause.release.await.expect("release removal cancellation");
+        }
+    }
+
     impl Drop for RemoteTargetServer {
         fn drop(&mut self) {
             self.task.abort();
@@ -3739,6 +3768,55 @@ mod target_repair_tests {
             assert_published_targets(&targets).await;
         })
         .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_target_remove_keeps_both_guards_after_the_http_future_is_dropped() {
+        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+            let (_temp, _env) = test_env().await;
+            let server = RemoteTargetServer::start().await;
+            let arn = repair(&server.target(), "").await.expect("create initial target");
+            let mut replacement = persisted_targets().await.targets.remove(0);
+            replacement.arn = "arn:rustfs:replication:us-east-1:replacement:remote".to_string();
+            let expected = BucketTargets { targets: vec![replacement] };
+            let encoded = serde_json::to_vec(&expected).expect("encode next target writer");
+            let (reached, observed) = oneshot::channel();
+            let (release, resume) = oneshot::channel();
+            assert!(REMOVAL_PAUSE.lock().expect("removal pause lock").replace((
+                BUCKET.to_string(), RequestPause { reached, release: resume }
+            )).is_none());
+            let removing = tokio::spawn(async move { remove(&arn).await });
+            tokio::time::timeout(Duration::from_secs(10), observed).await
+                .expect("removal must reach cancellation boundary").expect("observe removal");
+            removing.abort();
+            assert!(removing.await.expect_err("HTTP future must be dropped").is_cancelled());
+
+            let mut local_writer = Box::pin(lock_bucket_targets_metadata(BUCKET));
+            assert!(futures::poll!(local_writer.as_mut()).is_pending(), "HTTP cancellation must not release the local target guard");
+            drop(local_writer);
+            let probe = metadata_sys::ConfigWriteLockProbe::install(BUCKET);
+            let (entered, mut entered_rx) = oneshot::channel();
+            let mut peer_writer = Box::pin(metadata_sys::update_config_with(BUCKET, BUCKET_TARGETS_FILE, move |metadata| {
+                entered.send(()).expect("observe peer transaction");
+                assert!(metadata.bucket_target_config.as_ref().expect("read removed targets").targets.is_empty(),
+                    "a competing writer must observe the completed removal before entering");
+                Ok(encoded)
+            }));
+            tokio::select! {
+                result = peer_writer.as_mut() => panic!("HTTP cancellation released the metadata guard before commit: {result:?}"),
+                () = probe.wait_until_attempted() => {}
+            }
+            assert!(matches!(entered_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+                "the peer writer must remain outside the metadata transaction");
+            release.send(()).expect("allow cancellation and target commit");
+            tokio::time::timeout(Duration::from_secs(10), peer_writer).await
+                .expect("peer writer must proceed after removal commits").expect("persist peer target");
+            entered_rx.await.expect("peer transaction entered");
+            let targets = persisted_targets().await;
+            assert_eq!(serde_json::to_value(&targets).expect("encode disk targets"), serde_json::to_value(expected).expect("encode expected targets"));
+            assert_published_targets(&targets).await;
+        }).await;
     }
 
     #[tokio::test]
