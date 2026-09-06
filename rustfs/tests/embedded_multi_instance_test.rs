@@ -540,3 +540,354 @@ async fn second_embedded_server_fails_closed_until_its_context_slot_is_installed
     server_b.shutdown().await;
     server_a.shutdown().await;
 }
+
+#[cfg(feature = "e2e-test-hooks")]
+mod signed_target_rpc {
+    use super::{common, find_available_port, pause_embedded_startup_after_http_bind, sha256_hex};
+    use bytes::Bytes;
+    use futures::FutureExt;
+    use hyper_util::rt::TokioIo;
+    use rustfs::app::context::resolve_object_store_handle;
+    use rustfs::embedded::RustFSServerBuilder;
+    use rustfs_ecstore::api::disk::{DiskAPI, DiskError, DiskOption, DiskStore, Endpoint, ReadOptions, new_disk};
+    use rustfs_ecstore::api::rpc::{gen_tonic_signature_headers, normalize_tonic_rpc_audience};
+    use rustfs_filemeta::{FileInfo, ObjectPartInfo};
+    use rustfs_protos::proto_gen::node_service::{RenameDataRequest, RenameDataResponse, node_service_client::NodeServiceClient};
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+    use time::OffsetDateTime;
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+    use tonic::transport::Channel;
+    use uuid::Uuid;
+
+    const WAIT: Duration = Duration::from_secs(30);
+    const INTERNAL_VOLUME: &str = ".rustfs.sys/tmp";
+    const USER_VOLUME: &str = "target-transport";
+
+    struct SingleConnection {
+        client: NodeServiceClient<Channel>,
+        local: SocketAddr,
+        peer: SocketAddr,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl SingleConnection {
+        async fn connect(address: SocketAddr) -> Self {
+            let socket = timeout(WAIT, TcpStream::connect(address))
+                .await
+                .expect("bounded real TCP connection")
+                .expect("connect to the production listener");
+            let local = socket.local_addr().expect("client socket identity");
+            let peer = socket.peer_addr().expect("listener socket identity");
+            let socket = Arc::new(Mutex::new(Some(socket)));
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let connector_attempts = attempts.clone();
+            let channel = timeout(
+                WAIT,
+                tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+                    .expect("local endpoint")
+                    .timeout(WAIT)
+                    .connect_with_connector(tower::service_fn(move |_: http::Uri| {
+                        connector_attempts.fetch_add(1, Ordering::SeqCst);
+                        // A channel may reconnect implicitly. This fixture has exactly one
+                        // already-connected socket and fails every subsequent dial attempt.
+                        let socket = socket.lock().expect("single socket lock").take();
+                        async move {
+                            socket.map(TokioIo::new).ok_or_else(|| {
+                                std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "implicit reconnect forbidden")
+                            })
+                        }
+                    })),
+            )
+            .await
+            .expect("bounded HTTP/2 handshake")
+            .expect("HTTP/2 over the original TCP connection");
+            Self {
+                client: NodeServiceClient::new(channel),
+                local,
+                peer,
+                attempts,
+            }
+        }
+
+        fn assert_original_connection(&self) {
+            assert_eq!(self.attempts.load(Ordering::SeqCst), 1, "the channel must not redial");
+        }
+
+        async fn rename(&mut self, request: tonic::Request<RenameDataRequest>) -> RenameDataResponse {
+            let response = timeout(WAIT, self.client.rename_data(request))
+                .await
+                .expect("bounded signed RenameData")
+                .expect("production authentication and RPC routing")
+                .into_inner();
+            self.assert_original_connection();
+            response
+        }
+    }
+
+    async fn local_fixture_disk(root: &Path) -> DiskStore {
+        let mut endpoint = Endpoint::try_from(root.to_str().expect("UTF-8 fixture root")).expect("local disk endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        new_disk(&endpoint, &DiskOption::default())
+            .await
+            .expect("open real fixture disk")
+    }
+
+    async fn stage(disk: &DiskStore, volume: &str, path: &str, body: &'static [u8]) -> FileInfo {
+        match disk.make_volume(volume).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("create fixture volume: {err}"),
+        }
+        let mut fi = FileInfo::new(path, 1, 0);
+        fi.erasure.index = 1;
+        fi.version_id = Some(Uuid::new_v4());
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        fi.size = i64::try_from(body.len()).expect("small fixture");
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: fi.size,
+            actual_size: fi.size,
+            ..Default::default()
+        }];
+        fi.data = Some(Bytes::from_static(body));
+        fi.set_inline_data();
+        disk.write_metadata(volume, volume, path, fi.clone())
+            .await
+            .expect("stage real xl.meta");
+        assert_body(disk, volume, path, &fi).await;
+        fi
+    }
+
+    async fn assert_body(disk: &DiskStore, volume: &str, path: &str, fi: &FileInfo) {
+        let read = disk
+            .read_version(
+                volume,
+                volume,
+                path,
+                &fi.version_id.expect("version").to_string(),
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("decode actual inline object bytes");
+        assert_eq!(read.data, fi.data);
+    }
+
+    fn signed_rename(
+        disk: &DiskStore,
+        volume: &str,
+        source: &str,
+        destination: &str,
+        fi: &FileInfo,
+    ) -> tonic::Request<RenameDataRequest> {
+        let payload = RenameDataRequest {
+            disk: disk.endpoint().to_string(),
+            src_volume: volume.to_owned(),
+            src_path: source.to_owned(),
+            dst_volume: volume.to_owned(),
+            dst_path: destination.to_owned(),
+            file_info: serde_json::to_string(fi).expect("real FileInfo JSON"),
+            ..Default::default()
+        };
+        let canonical = rustfs_protos::canonical_rename_data_request_body(&payload).expect("canonical mutation body");
+        // The current production interceptor uses the process RPC identity. Keep
+        // that authentication contract while testing listener-local disk routing.
+        let identity = rustfs_common::try_get_global_local_node_name().expect("startup published the RPC identity");
+        let audience = normalize_tonic_rpc_audience(&identity).expect("RPC audience");
+        let headers =
+            gen_tonic_signature_headers(&audience, "node_service.NodeService", "RenameData", Some(&sha256_hex(&canonical)))
+                .expect("production v2 signing with the configured shared secret");
+        assert_eq!(headers.get("x-rustfs-rpc-auth-version").expect("v2 metadata"), "2");
+        let mut request = tonic::Request::new(payload);
+        *request.metadata_mut() = tonic::metadata::MetadataMap::from_headers(headers);
+        request
+    }
+
+    #[test]
+    fn signed_target_rpc_uses_listener_instance_across_install_and_reconnect() {
+        common::run_embedded_test(|| async {
+            timeout(WAIT * 6, signed_target_rpc_body())
+                .await
+                .expect("bounded listener/startup/transport fixture");
+        });
+    }
+
+    async fn signed_target_rpc_body() {
+        // B installs the process default first; A must remain a different target
+        // both before and after its own application context is installed.
+        let root_b = tempfile::tempdir().expect("B root");
+        let server_b = timeout(
+            WAIT,
+            RustFSServerBuilder::new()
+                .address(format!("127.0.0.1:{}", find_available_port().expect("B port")))
+                .volume(root_b.path().to_str().expect("B path"))
+                .access_key("target-transport-access")
+                .secret_key("target-transport-secret")
+                .build(),
+        )
+        .await
+        .expect("bounded B startup")
+        .expect("start global B");
+        let global_b = resolve_object_store_handle().expect("B installed process AppContext");
+        let disk_b = local_fixture_disk(root_b.path()).await;
+        let global_endpoints = global_b.instance_endpoints().expect("B instance topology");
+        let global_paths: Vec<_> = global_endpoints
+            .0
+            .iter()
+            .flat_map(|pool| pool.endpoints.as_ref().iter())
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            global_paths,
+            vec![disk_b.endpoint().to_string()],
+            "the ambient store must really own B's disk"
+        );
+        let sentinel = stage(&disk_b, USER_VOLUME, "sentinel", b"global-B-must-survive").await;
+        let sentinel_path = root_b.path().join(USER_VOLUME).join("sentinel/xl.meta");
+        let sentinel_bytes = tokio::fs::read(&sentinel_path).await.expect("B's committed bytes");
+
+        let root_a = tempfile::tempdir().expect("A root");
+        let port_a = find_available_port().expect("A port");
+        let address_a: SocketAddr = format!("127.0.0.1:{port_a}").parse().expect("A address");
+        let mut barrier = pause_embedded_startup_after_http_bind(port_a);
+        let startup_a = RustFSServerBuilder::new()
+            .address(address_a.to_string())
+            .volume(root_a.path().to_str().expect("A path"))
+            .access_key("target-transport-access")
+            .secret_key("target-transport-secret")
+            .build();
+        tokio::pin!(startup_a);
+        timeout(WAIT, async {
+            tokio::select! {
+                () = barrier.wait_until_http_bound() => {}
+                result = startup_a.as_mut() => {
+                    let _unexpected_server = result.expect("A startup before barrier");
+                    panic!("A must pause after bind and before ECStore/AppContext");
+                }
+            }
+        })
+        .await
+        .expect("bounded A HTTP-bind barrier");
+
+        // Catch assertion failures only to release the real startup barrier and
+        // obtain a shutdown-capable server handle before resuming the failure.
+        let pre_ready = std::panic::AssertUnwindSafe(async {
+            assert!(Arc::ptr_eq(&global_b, &resolve_object_store_handle().expect("global B remains live")));
+            let disk_a = local_fixture_disk(root_a.path()).await;
+            let internal = stage(&disk_a, INTERNAL_VOLUME, "transport-staged", b"pre-ready-internal-body").await;
+            let user = stage(&disk_a, USER_VOLUME, "staged", b"listener-A-user-body").await;
+            let user_before = tokio::fs::read(root_a.path().join(USER_VOLUME).join("staged/xl.meta"))
+                .await
+                .expect("A staged user bytes");
+            let mut connection = SingleConnection::connect(address_a).await;
+            let mut invalid_signature = signed_rename(&disk_a, INTERNAL_VOLUME, "transport-staged", "bad-signature", &internal);
+            invalid_signature
+                .metadata_mut()
+                .insert("x-rustfs-rpc-signature-v2", "00".parse().expect("invalid MAC header"));
+            let status = timeout(WAIT, connection.client.rename_data(invalid_signature))
+                .await
+                .expect("bounded invalid-signature response")
+                .expect_err("production interceptor must reject a bad signature");
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            assert!(!root_a.path().join(INTERNAL_VOLUME).join("bad-signature/xl.meta").exists());
+            assert_body(&disk_a, INTERNAL_VOLUME, "transport-staged", &internal).await;
+
+            let committed = connection
+                .rename(signed_rename(
+                    &disk_a,
+                    INTERNAL_VOLUME,
+                    "transport-staged",
+                    "transport-published",
+                    &internal,
+                ))
+                .await;
+            assert!(
+                committed.success,
+                "Bootstrap must commit internal metadata through the bound A registry: {:?}",
+                committed.error
+            );
+            assert_body(&disk_a, INTERNAL_VOLUME, "transport-published", &internal).await;
+
+            let denied = connection
+                .rename(signed_rename(&disk_a, USER_VOLUME, "staged", "destination", &user))
+                .await;
+            assert!(!denied.success, "Bootstrap must reject a real user mutation");
+            let error: DiskError = denied.error.expect("typed bootstrap rejection").into();
+            assert_eq!(error, DiskError::FileAccessDenied);
+            assert_eq!(
+                tokio::fs::read(root_a.path().join(USER_VOLUME).join("staged/xl.meta"))
+                    .await
+                    .expect("unchanged A source"),
+                user_before
+            );
+            assert!(!root_a.path().join(USER_VOLUME).join("destination/xl.meta").exists());
+
+            assert_eq!(tokio::fs::read(&sentinel_path).await.expect("unchanged B bytes"), sentinel_bytes);
+            assert_body(&disk_b, USER_VOLUME, "sentinel", &sentinel).await;
+            connection.assert_original_connection();
+            (connection, disk_a, user)
+        })
+        .catch_unwind()
+        .await;
+
+        barrier.release();
+        let server_a = timeout(WAIT, startup_a.as_mut())
+            .await
+            .expect("bounded A context installation")
+            .expect("A startup after real internal metadata commit");
+        let (mut connection, disk_a, user) = match pre_ready {
+            Ok(fixture) => fixture,
+            Err(panic) => {
+                timeout(WAIT, server_a.shutdown()).await.expect("bounded A failure cleanup");
+                timeout(WAIT, server_b.shutdown()).await.expect("bounded B failure cleanup");
+                std::panic::resume_unwind(panic);
+            }
+        };
+        assert!(Arc::ptr_eq(
+            &global_b,
+            &resolve_object_store_handle().expect("A install preserves global B")
+        ));
+        assert_eq!(connection.peer, server_a.address());
+        assert_body(&disk_a, USER_VOLUME, "staged", &user).await;
+        let committed = connection
+            .rename(signed_rename(&disk_a, USER_VOLUME, "staged", "destination", &user))
+            .await;
+        assert!(
+            committed.success,
+            "the same accepted connection must observe Ready for its next request: {:?}",
+            committed.error
+        );
+        assert_body(&disk_a, USER_VOLUME, "destination", &user).await;
+
+        // Keep the first connection open so the OS cannot recycle its 4-tuple.
+        let mut reconnected = SingleConnection::connect(address_a).await;
+        assert_ne!(reconnected.local, connection.local);
+        assert_eq!(reconnected.peer, connection.peer);
+        let committed = reconnected
+            .rename(signed_rename(&disk_a, USER_VOLUME, "destination", "reconnected", &user))
+            .await;
+        assert!(committed.success, "new connections must retain listener A: {:?}", committed.error);
+        assert_body(&disk_a, USER_VOLUME, "reconnected", &user).await;
+        assert_eq!(tokio::fs::read(&sentinel_path).await.expect("B remains unchanged"), sentinel_bytes);
+        assert_body(&disk_b, USER_VOLUME, "sentinel", &sentinel).await;
+        assert!(!root_b.path().join(USER_VOLUME).join("reconnected/xl.meta").exists());
+        connection.assert_original_connection();
+        reconnected.assert_original_connection();
+        drop(reconnected);
+        drop(connection);
+        drop(disk_a);
+        drop(disk_b);
+        timeout(WAIT, server_a.shutdown()).await.expect("bounded A shutdown");
+        timeout(WAIT, server_b.shutdown()).await.expect("bounded B shutdown");
+    }
+}
