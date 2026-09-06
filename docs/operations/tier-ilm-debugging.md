@@ -173,7 +173,7 @@ Historical transition transactions in `upload_outcome_unknown` state can use an 
 
 ## Inspect and disposition retained recovery records
 
-This section describes an **approved target that is not implemented yet**. Current servers do not expose the routes below and continue to quarantine tier-delete journal v1/v2 records. Do not remove internal metadata objects by hand: that loses ETag, all-pool, decommission, export, and audit guarantees.
+Current servers expose the routes below for retained recovery controls. Do not remove internal metadata objects by hand: that loses ETag, all-pool, decommission, export, and audit guarantees.
 
 The approved read-only inventory is bounded and paginated:
 
@@ -222,6 +222,39 @@ Canonical replay of an identical export/disposition consumes no new quota. New o
 Malformed/unsupported records and journal v3-v6 cannot use abandon. Known-version and v6 manifest ownership must converge through their normal exact recovery protocol. Operators may inspect, export, and request a bounded retry, but cannot bypass source/free-version proof, manifest membership, topology, or version semantics.
 
 Automatic retry state survives restart. Retryable transport/quorum failures use a 60-second exponential base capped at one hour and a deterministic 80-to-100-percent multiplier, so jitter never increases the capped delay. After 32 consecutive failures or seven days from the first persisted failure, automatic work stops at `operator_required`. Unsupported or ambiguous evidence goes directly to `retained_ambiguous`/`operator_required`; age alone never deletes it. Resolved controls, immutable exports, and completed disposition receipts have minimum 30-day, 90-day, and 365-day retention respectively, and are collected only after exact source absence, decommission, successor, and audit checks.
+
+### Retry a retained transition transaction
+
+For a `transition_transaction` control, inspect returns an additional `transition_retry` object when the exact transaction source and recovery-control generation are still consistent. It contains `retry_ready`, `control_revision`, `source_generation_sha256`, the current classification and counters, and a bounded refusal reason. A missing `transition_retry` with `transition_retry_not_ready_reason=source_or_control_not_ready` means the server could not reconstruct exact live evidence; do not retry from an older response.
+
+First perform a dry-run with the exact revision and source-generation digest returned by the latest inspect:
+
+```json
+POST /rustfs/admin/v3/ilm/recovery/records/<control-id>
+{
+  "action": "retry_transition_recovery",
+  "mode": "dry_run",
+  "expected_control_revision": 7,
+  "expected_source_generation_sha256": "<sha256>"
+}
+```
+
+After repairing the reported storage, tier, or capability problem, repeat inspect and dry-run, then execute with the newly observed values:
+
+```json
+POST /rustfs/admin/v3/ilm/recovery/records/<control-id>
+{
+  "action": "retry_transition_recovery",
+  "mode": "execute",
+  "expected_control_revision": 7,
+  "expected_source_generation_sha256": "<sha256>",
+  "confirm": true
+}
+```
+
+Execution performs one ETag-CAS update of the exact ownerless `retained_ambiguous` or `operator_required` control to `retrying`. It preserves the lifetime attempt count and failure history, clears only the consecutive-failure backoff, and does not mutate the transaction source or issue a tier PUT, GET, probe, or DELETE. The normal recovery worker then acquires a fresh bounded owner lease and repeats every source and remote proof before any side effect.
+
+A historical v1 `UploadStarted` record can return to `retained_ambiguous` because its bytes do not prove whether PUT reached the provider. `LocalCommitStarted` becomes terminal only when the local object still matches the recorded version ID, data directory, modification time, size, ETag, and exact transitioned remote tuple; otherwise it returns to `operator_required`. Retrying is therefore a bounded re-evaluation after an underlying repair, not an override of missing evidence.
 
 The full schema, lease, mixed-version, retry, privacy, and metric requirements are in [../architecture/ilm-tiering-persistence-contracts.md](../architecture/ilm-tiering-persistence-contracts.md#bounded-recovery-control-and-operator-disposition).
 

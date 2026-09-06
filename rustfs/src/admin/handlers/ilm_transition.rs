@@ -22,15 +22,17 @@ use crate::admin::storage_api::lifecycle::{
     IlmRecoveryDispositionState, IlmRecoveryExportObservation, IlmRecoveryProtocol, ManualTransitionCancelCheck,
     ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionProgressSink, ManualTransitionQueueSnapshot,
     ManualTransitionRunOptions, ManualTransitionRunReport, ManualTransitionScopeAdmission, ManualTransitionScopeAdmissionClaim,
-    TransitionOperatorDeleteResult, TransitionOperatorError, claim_manual_transition_scope_admission, create_recovery_export,
-    delete_manual_transition_scope_admission_if_current, delete_transition_candidate_for_operator, dry_run_recovery_disposition,
-    enqueue_transition_for_existing_objects_scoped, execute_recovery_disposition,
-    finalize_missing_transition_transaction_for_operator, inspect_recovery_control, inspect_recovery_export_observation,
+    TransitionOperatorDeleteResult, TransitionOperatorError, TransitionRecoveryRetryResult, TransitionRecoveryRetryStatus,
+    claim_manual_transition_scope_admission, create_recovery_export, delete_manual_transition_scope_admission_if_current,
+    delete_transition_candidate_for_operator, dry_run_recovery_disposition, enqueue_transition_for_existing_objects_scoped,
+    execute_recovery_disposition, finalize_missing_transition_transaction_for_operator, inspect_recovery_control,
+    inspect_recovery_export_observation, inspect_transition_recovery_retry_for_operator,
     inspect_transition_transaction_for_operator, list_recovery_controls, load_manual_transition_job_record,
     load_manual_transition_scope_admission, load_recovery_export, manual_transition_job_lease_expired,
     manual_transition_queue_snapshot, manual_transition_scope_admission_lease_expired,
     persist_manual_transition_job_progress_if_owned, renew_manual_transition_job_lease_if_owned,
-    request_manual_transition_job_cancel, save_manual_transition_job_record, update_manual_transition_job_record,
+    request_manual_transition_job_cancel, retry_transition_recovery_for_operator, save_manual_transition_job_record,
+    update_manual_transition_job_record,
 };
 use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::storage_api::s3::{S3ErrorCode as AdminS3ErrorCode, error as admin_s3_error};
@@ -615,6 +617,10 @@ struct IlmRecoveryControlInspectResponse {
     disposition_dry_run_receipt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     disposition_dry_run_receipt_expires_at_unix_nanos: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transition_retry: Option<TransitionRecoveryRetryStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transition_retry_not_ready_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -633,6 +639,13 @@ enum IlmRecoveryRecordMutationRequest {
         confirm: Option<bool>,
         #[serde(default)]
         acknowledge_remote_cleanup_abandoned: Option<bool>,
+    },
+    RetryTransitionRecovery {
+        mode: IlmRecoveryReceiptMode,
+        expected_control_revision: u64,
+        expected_source_generation_sha256: String,
+        #[serde(default)]
+        confirm: Option<bool>,
     },
 }
 
@@ -656,6 +669,19 @@ fn parse_recovery_record_mutation_request(body: &[u8]) -> S3Result<IlmRecoveryRe
             "ILM recovery dry-run must not include terminal confirmation fields",
         ));
     }
+    if matches!(
+        &request,
+        IlmRecoveryRecordMutationRequest::RetryTransitionRecovery {
+            mode: IlmRecoveryReceiptMode::DryRun,
+            ..
+        }
+    ) && value.as_object().is_some_and(|object| object.contains_key("confirm"))
+    {
+        return Err(admin_s3_error(
+            AdminS3ErrorCode::InvalidArgument,
+            "ILM recovery retry dry-run must not include confirm",
+        ));
+    }
     Ok(request)
 }
 
@@ -674,6 +700,14 @@ enum ValidatedIlmRecoveryRecordMutation<'a> {
         export_id: &'a str,
         export_sha256: &'a str,
         reason_code: IlmRecoveryDispositionReasonCode,
+    },
+    RetryTransitionDryRun {
+        expected_control_revision: u64,
+        expected_source_generation_sha256: &'a str,
+    },
+    RetryTransitionExecute {
+        expected_control_revision: u64,
+        expected_source_generation_sha256: &'a str,
     },
 }
 
@@ -730,7 +764,60 @@ fn validate_recovery_record_mutation_request(
                 )),
             }
         }
+        IlmRecoveryRecordMutationRequest::RetryTransitionRecovery {
+            mode,
+            expected_control_revision,
+            expected_source_generation_sha256,
+            confirm,
+        } => {
+            if *expected_control_revision == 0 {
+                return Err(admin_s3_error(
+                    AdminS3ErrorCode::InvalidArgument,
+                    "transition recovery retry requires a nonzero expected control revision",
+                ));
+            }
+            validate_recovery_sha256(
+                expected_source_generation_sha256,
+                "invalid transition recovery source generation checksum",
+            )?;
+            match mode {
+                IlmRecoveryReceiptMode::DryRun if confirm.is_none() => {
+                    Ok(ValidatedIlmRecoveryRecordMutation::RetryTransitionDryRun {
+                        expected_control_revision: *expected_control_revision,
+                        expected_source_generation_sha256,
+                    })
+                }
+                IlmRecoveryReceiptMode::DryRun => Err(admin_s3_error(
+                    AdminS3ErrorCode::InvalidArgument,
+                    "ILM recovery retry dry-run must not include confirm",
+                )),
+                IlmRecoveryReceiptMode::Execute if *confirm == Some(true) => {
+                    Ok(ValidatedIlmRecoveryRecordMutation::RetryTransitionExecute {
+                        expected_control_revision: *expected_control_revision,
+                        expected_source_generation_sha256,
+                    })
+                }
+                IlmRecoveryReceiptMode::Execute => Err(admin_s3_error(
+                    AdminS3ErrorCode::InvalidRequest,
+                    "transition recovery retry requires confirm=true",
+                )),
+            }
+        }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct IlmTransitionRecoveryRetryDryRunResponse {
+    action: &'static str,
+    mode: IlmRecoveryReceiptMode,
+    status: TransitionRecoveryRetryStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct IlmTransitionRecoveryRetryExecuteResponse {
+    action: &'static str,
+    mode: IlmRecoveryReceiptMode,
+    result: TransitionRecoveryRetryResult,
 }
 
 #[derive(Debug, Serialize)]
@@ -928,6 +1015,12 @@ fn map_transition_operator_error(err: TransitionOperatorError) -> S3Error {
         }
         TransitionOperatorError::CandidateVersionMismatch { .. } => {
             s3_error!(OperationAborted, "remote candidate version does not match requested exact version")
+        }
+        TransitionOperatorError::StaleRecoveryControl => {
+            s3_error!(OperationAborted, "transition recovery control or source generation changed")
+        }
+        TransitionOperatorError::RetryNotAllowed => {
+            s3_error!(OperationAborted, "transition recovery control is not eligible for operator retry")
         }
         TransitionOperatorError::Store(_) | TransitionOperatorError::Remote(_) => {
             s3_error!(InternalError, "transition reconciliation failed")
@@ -1549,6 +1642,15 @@ impl Operation for IlmRecoveryControlInspectHandler {
         let control = inspect_recovery_control(store.clone(), &control_id)
             .await
             .map_err(map_recovery_control_error)?;
+        let (transition_retry, transition_retry_not_ready_reason) =
+            if control.protocol == IlmRecoveryProtocol::TransitionTransaction {
+                match inspect_transition_recovery_retry_for_operator(store.clone(), &control_id).await {
+                    Ok(status) => (Some(status), None),
+                    Err(_) => (None, Some("source_or_control_not_ready")),
+                }
+            } else {
+                (None, None)
+            };
         let now = OffsetDateTime::now_utc();
         let (
             export_ready,
@@ -1602,6 +1704,8 @@ impl Operation for IlmRecoveryControlInspectHandler {
                 observation_receipt_expires_at_unix_nanos,
                 disposition_dry_run_receipt,
                 disposition_dry_run_receipt_expires_at_unix_nanos,
+                transition_retry,
+                transition_retry_not_ready_reason,
             },
         )
     }
@@ -1625,10 +1729,9 @@ impl Operation for IlmRecoveryRecordMutationHandler {
         let now = OffsetDateTime::now_utc();
         let now_unix_nanos = i64::try_from(now.unix_timestamp_nanos())
             .map_err(|_| admin_s3_error(AdminS3ErrorCode::InternalError, "ILM recovery receipt timestamp is invalid"))?;
-        let receipt_credentials = recovery_receipt_credentials()?;
-
         match mutation {
             ValidatedIlmRecoveryRecordMutation::Export { observation_receipt } => {
+                let receipt_credentials = recovery_receipt_credentials()?;
                 let receipt = decode_recovery_receipt(observation_receipt, &receipt_credentials)?;
                 let observation = validate_recovery_observation_receipt(
                     receipt,
@@ -1655,6 +1758,7 @@ impl Operation for IlmRecoveryRecordMutationHandler {
                 export_sha256,
                 reason_code: IlmRecoveryDispositionReasonCode::LegacyRemoteCleanupAbandoned,
             } => {
+                let receipt_credentials = recovery_receipt_credentials()?;
                 let receipt = decode_recovery_receipt(observation_receipt, &receipt_credentials)?;
                 let observation = validate_recovery_observation_receipt(
                     receipt,
@@ -1699,6 +1803,7 @@ impl Operation for IlmRecoveryRecordMutationHandler {
                 export_sha256,
                 reason_code: IlmRecoveryDispositionReasonCode::LegacyRemoteCleanupAbandoned,
             } => {
+                let receipt_credentials = recovery_receipt_credentials()?;
                 let receipt = decode_recovery_receipt(observation_receipt, &receipt_credentials)?;
                 let observation = validate_recovery_observation_receipt(
                     receipt,
@@ -1723,6 +1828,51 @@ impl Operation for IlmRecoveryRecordMutationHandler {
                         outcome: execution.outcome,
                         confirmed_absent_copy_count: execution.confirmed_absent_copy_count,
                         source_copy_count: execution.source_copy_count,
+                    },
+                )
+            }
+            ValidatedIlmRecoveryRecordMutation::RetryTransitionDryRun {
+                expected_control_revision,
+                expected_source_generation_sha256,
+            } => {
+                let status = inspect_transition_recovery_retry_for_operator(store, &control_id)
+                    .await
+                    .map_err(map_transition_operator_error)?;
+                if !status.retry_ready {
+                    return Err(map_transition_operator_error(TransitionOperatorError::RetryNotAllowed));
+                }
+                if status.control_revision != expected_control_revision
+                    || status.source_generation_sha256 != expected_source_generation_sha256
+                {
+                    return Err(map_transition_operator_error(TransitionOperatorError::StaleRecoveryControl));
+                }
+                json_response(
+                    StatusCode::OK,
+                    &IlmTransitionRecoveryRetryDryRunResponse {
+                        action: "retry_transition_recovery",
+                        mode: IlmRecoveryReceiptMode::DryRun,
+                        status,
+                    },
+                )
+            }
+            ValidatedIlmRecoveryRecordMutation::RetryTransitionExecute {
+                expected_control_revision,
+                expected_source_generation_sha256,
+            } => {
+                let result = retry_transition_recovery_for_operator(
+                    store,
+                    &control_id,
+                    expected_control_revision,
+                    expected_source_generation_sha256,
+                )
+                .await
+                .map_err(map_transition_operator_error)?;
+                json_response(
+                    StatusCode::OK,
+                    &IlmTransitionRecoveryRetryExecuteResponse {
+                        action: "retry_transition_recovery",
+                        mode: IlmRecoveryReceiptMode::Execute,
+                        result,
                     },
                 )
             }
@@ -2144,6 +2294,48 @@ mod tests {
                 reason_code: IlmRecoveryDispositionReasonCode::LegacyRemoteCleanupAbandoned,
             }) if observed_export_id == export_id && observed_export_sha256 == export_sha256
         ));
+
+        let source_generation_sha256 = "ef".repeat(32);
+        let retry_dry_run_json = format!(
+            r#"{{"action":"retry_transition_recovery","mode":"dry_run","expected_control_revision":7,"expected_source_generation_sha256":"{source_generation_sha256}"}}"#
+        );
+        let retry_dry_run = parse_recovery_record_mutation_request(retry_dry_run_json.as_bytes()).unwrap();
+        assert!(matches!(
+            validate_recovery_record_mutation_request(&retry_dry_run),
+            Ok(ValidatedIlmRecoveryRecordMutation::RetryTransitionDryRun {
+                expected_control_revision: 7,
+                expected_source_generation_sha256: observed,
+            }) if observed == source_generation_sha256
+        ));
+        let retry_execute_json = retry_dry_run_json.replace(r#""mode":"dry_run""#, r#""mode":"execute","confirm":true"#);
+        let retry_execute = parse_recovery_record_mutation_request(retry_execute_json.as_bytes()).unwrap();
+        assert!(matches!(
+            validate_recovery_record_mutation_request(&retry_execute),
+            Ok(ValidatedIlmRecoveryRecordMutation::RetryTransitionExecute {
+                expected_control_revision: 7,
+                expected_source_generation_sha256: observed,
+            }) if observed == source_generation_sha256
+        ));
+        assert!(
+            parse_recovery_record_mutation_request(
+                retry_dry_run_json
+                    .replace(r#""mode":"dry_run""#, r#""mode":"dry_run","confirm":false"#)
+                    .as_bytes()
+            )
+            .is_err()
+        );
+        let retry_without_confirmation = retry_execute_json.replace(r#""confirm":true,"#, "");
+        if let Ok(request) = parse_recovery_record_mutation_request(retry_without_confirmation.as_bytes()) {
+            assert!(validate_recovery_record_mutation_request(&request).is_err());
+        }
+        for invalid in [
+            retry_execute_json.replace(r#""expected_control_revision":7"#, r#""expected_control_revision":0"#),
+            retry_execute_json.replace(source_generation_sha256.as_str(), "EF".repeat(32).as_str()),
+            retry_execute_json.replace(source_generation_sha256.as_str(), "too-short"),
+        ] {
+            let request = parse_recovery_record_mutation_request(invalid.as_bytes()).unwrap();
+            assert!(validate_recovery_record_mutation_request(&request).is_err());
+        }
 
         let dry_run_with_confirmation = dry_run_json.replace(r#""mode":"dry_run""#, r#""mode":"dry_run","confirm":false"#);
         assert!(parse_recovery_record_mutation_request(dry_run_with_confirmation.as_bytes()).is_err());
