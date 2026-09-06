@@ -2804,6 +2804,7 @@ mod target_repair_tests {
     use rustfs_iam::store::{Store as _, object::IAM_CONFIG_PREFIX};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
     use tracing::instrument::WithSubscriber as _;
 
     const ACCESS_KEY: &str = "TARGETREPAIRROOT";
@@ -2819,6 +2820,12 @@ mod target_repair_tests {
     struct RemoteTargetServer {
         endpoint: String,
         task: tokio::task::JoinHandle<()>,
+        next_request: Arc<std::sync::Mutex<Option<RequestPause>>>,
+    }
+
+    struct RequestPause {
+        reached: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
     }
 
     impl Drop for RemoteTargetServer {
@@ -2831,6 +2838,8 @@ mod target_repair_tests {
         async fn start() -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind remote target");
             let endpoint = listener.local_addr().expect("remote target address").to_string();
+            let next_request = Arc::new(std::sync::Mutex::new(None::<RequestPause>));
+            let request_pause = Arc::clone(&next_request);
             let task = tokio::spawn(async move {
                 loop {
                     let (mut socket, _) = listener.accept().await.expect("accept remote target request");
@@ -2845,6 +2854,11 @@ mod target_repair_tests {
                     }
                     let head = String::from_utf8_lossy(&request);
                     let first_line = head.lines().next().unwrap_or_default();
+                    let pause = request_pause.lock().expect("request pause lock").take();
+                    if let Some(pause) = pause {
+                        pause.reached.send(()).expect("notify request arrival");
+                        pause.release.await.expect("release remote response");
+                    }
                     let body = if first_line.starts_with("HEAD /") {
                         ""
                     } else if first_line.starts_with("GET /") && first_line.contains("versioning") {
@@ -2862,7 +2876,27 @@ mod target_repair_tests {
                         .expect("reply to remote target request");
                 }
             });
-            Self { endpoint, task }
+            Self {
+                endpoint,
+                task,
+                next_request,
+            }
+        }
+
+        fn pause_next_request(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (reached, observed) = oneshot::channel();
+            let (release, resume) = oneshot::channel();
+            assert!(
+                self.next_request
+                    .lock()
+                    .expect("request pause lock")
+                    .replace(RequestPause {
+                        reached,
+                        release: resume,
+                    })
+                    .is_none()
+            );
+            (observed, release)
         }
 
         fn target(&self) -> BucketTarget {
@@ -2914,10 +2948,10 @@ mod target_repair_tests {
     }
 
     fn request(method: Method, query: &str, body: Vec<u8>) -> S3Request<Body> {
-        let operation = if method == Method::GET {
-            "list-remote-targets"
-        } else {
-            "set-remote-target"
+        let operation = match method {
+            Method::GET => "list-remote-targets",
+            Method::DELETE => "remove-remote-target",
+            _ => "set-remote-target",
         };
         S3Request {
             input: Body::from(body),
@@ -3271,5 +3305,306 @@ mod target_repair_tests {
             );
         })
         .await;
+    }
+
+    async fn remove(arn: &str) -> S3Result<()> {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("arn", arn)
+            .finish();
+        let response = RemoveRemoteTargetHandler {}
+            .call(request(Method::DELETE, &query, Vec::new()), Params::new())
+            .await?;
+        assert_eq!(response.output.0, StatusCode::NO_CONTENT);
+        Ok(())
+    }
+
+    async fn persisted_targets() -> BucketTargets {
+        metadata_sys::get_config_from_disk(BUCKET)
+            .await
+            .expect("read persisted targets")
+            .bucket_target_config
+            .expect("decode persisted targets")
+    }
+
+    async fn assert_published_targets(targets: &BucketTargets) {
+        let cached = BucketTargetSys::get()
+            .list_bucket_targets(BUCKET)
+            .await
+            .expect("read published targets");
+        assert_eq!(
+            serde_json::to_value(cached).expect("encode cache"),
+            serde_json::to_value(targets).expect("encode disk")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_target_writes_preserve_repairs_missing_from_the_cache() {
+        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+            for operation in ["create", "update", "remove"] {
+                let (_temp, _env) = test_env().await;
+                let first = RemoteTargetServer::start().await;
+                let second = RemoteTargetServer::start().await;
+                let third = RemoteTargetServer::start().await;
+                let first_arn = repair(&first.target(), "").await.expect("create initial target");
+                let stale = persisted_targets().await;
+                let second_arn = repair(&second.target(), "replace-unreadable=true")
+                    .await
+                    .expect("commit peer repair");
+                let repaired = persisted_targets()
+                    .await
+                    .targets
+                    .into_iter()
+                    .find(|target| target.arn == second_arn)
+                    .expect("persisted peer repair");
+                // Model a node whose target cache predates the committed repair.
+                BucketTargetSys::get().update_all_targets(BUCKET, Some(&stale)).await;
+                let created = match operation {
+                    "create" => Some(repair(&third.target(), "").await.expect("merge target create")),
+                    "update" => {
+                        let mut changed = stale.targets[0].clone();
+                        changed.replication_sync = true;
+                        assert_eq!(repair(&changed, "update=true&sync=true").await.expect("merge target update"), first_arn);
+                        None
+                    }
+                    "remove" => {
+                        remove(&first_arn).await.expect("merge target removal");
+                        None
+                    }
+                    _ => unreachable!(),
+                };
+                let targets = persisted_targets().await;
+                assert_eq!(
+                    targets.targets.len(),
+                    match operation {
+                        "create" => 3,
+                        "update" => 2,
+                        _ => 1,
+                    },
+                    "{operation}"
+                );
+                let kept = targets
+                    .targets
+                    .iter()
+                    .find(|target| target.arn == second_arn)
+                    .expect("unrelated repair must survive");
+                assert_eq!(
+                    serde_json::to_value(kept).expect("encode kept target"),
+                    serde_json::to_value(repaired).expect("encode repair")
+                );
+                if let Some(created) = created {
+                    assert!(
+                        targets
+                            .targets
+                            .iter()
+                            .any(|target| target.arn == created && target.endpoint == third.endpoint)
+                    );
+                }
+                if operation == "update" {
+                    let updated = targets
+                        .targets
+                        .iter()
+                        .find(|target| target.arn == first_arn)
+                        .expect("updated target");
+                    assert!(updated.replication_sync);
+                    assert_eq!(updated.credentials.as_ref().expect("retained credentials").secret_key, "remote-secret");
+                }
+                assert_published_targets(&targets).await;
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_target_writes_refuse_unreadable_disk_even_with_a_readable_cache() {
+        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+            let (_temp, env) = test_env().await;
+            let server = RemoteTargetServer::start().await;
+            let arn = repair(&server.target(), "").await.expect("create initial target");
+            let stale = persisted_targets().await;
+            seed_unreadable(&env).await;
+            BucketTargetSys::get().update_all_targets(BUCKET, Some(&stale)).await;
+            let file = metadata_sys::get_config_from_disk(BUCKET)
+                .await
+                .expect("read metadata")
+                .save_file_path();
+            let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                .await
+                .expect("read original bytes");
+            for operation in ["create", "update", "remove"] {
+                let error = match operation {
+                    "create" => repair(&server.target(), "")
+                        .await
+                        .expect_err("cached idempotency cannot bypass unreadable disk"),
+                    "update" => repair(&stale.targets[0], "update=true&sync=true")
+                        .await
+                        .expect_err("update cannot replace unreadable targets"),
+                    "remove" => remove(&arn).await.expect_err("remove cannot replace unreadable targets"),
+                    _ => unreachable!(),
+                };
+                assert_eq!(error.code(), &S3ErrorCode::InternalError, "{operation}");
+                assert_eq!(
+                    crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                        .await
+                        .expect("read rejected write"),
+                    before
+                );
+                assert_published_targets(&stale).await;
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_target_create_is_idempotent_from_disk_when_the_remote_is_offline() {
+        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+            let (_temp, env) = test_env().await;
+            let mut server = RemoteTargetServer::start().await;
+            let target = server.target();
+            let arn = repair(&target, "").await.expect("create initial target");
+            let file = metadata_sys::get_config_from_disk(BUCKET)
+                .await
+                .expect("read metadata")
+                .save_file_path();
+            let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                .await
+                .expect("read original bytes");
+            BucketTargetSys::get()
+                .update_all_targets(BUCKET, Some(&BucketTargets::default()))
+                .await;
+            server.task.abort();
+            assert!((&mut server.task).await.expect_err("remote server must stop").is_cancelled());
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(10), repair(&target, ""))
+                    .await
+                    .expect("idempotent create must not wait for the remote")
+                    .expect("recognize persisted target"),
+                arn
+            );
+            assert_eq!(
+                crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                    .await
+                    .expect("read idempotent create bytes"),
+                before
+            );
+            let targets = persisted_targets().await;
+            assert_eq!(targets.targets.len(), 1);
+            assert_eq!(targets.targets[0].arn, arn);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_target_update_rejects_same_target_changes_during_remote_validation() {
+        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+            for deleted in [false, true] {
+                let (_temp, _env) = test_env().await;
+                let server = RemoteTargetServer::start().await;
+                let arn = repair(&server.target(), "").await.expect("create initial target");
+                let mut original = persisted_targets().await;
+                let mut requested = original.targets[0].clone();
+                requested.replication_sync = true;
+                if deleted {
+                    original.targets.clear();
+                } else {
+                    original.targets[0].bandwidth_limit = 1024;
+                }
+                let (observed, release) = server.pause_next_request();
+                let update = repair(&requested, "update=true&sync=true");
+                let peer_write = async {
+                    tokio::time::timeout(Duration::from_secs(10), observed)
+                        .await
+                        .expect("validation must reach HTTP source")
+                        .expect("observe validation");
+                    metadata_sys::update(BUCKET, BUCKET_TARGETS_FILE, serde_json::to_vec(&original).expect("encode peer change"))
+                        .await
+                        .expect("commit peer change during validation");
+                    release.send(()).expect("release validation response");
+                };
+                let (result, ()) = tokio::join!(update, peer_write);
+                assert_eq!(
+                    result.expect_err("stale target update must conflict").code(),
+                    &S3ErrorCode::OperationAborted
+                );
+                let targets = persisted_targets().await;
+                assert_eq!(
+                    serde_json::to_value(&targets).expect("encode current targets"),
+                    serde_json::to_value(&original).expect("encode peer targets")
+                );
+                if !deleted {
+                    assert_eq!(targets.targets[0].arn, arn);
+                    assert!(!targets.targets[0].replication_sync);
+                }
+                assert_published_targets(&targets).await;
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_target_validation_does_not_lock_out_a_concurrent_repair() {
+        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+            let (_temp, _env) = test_env().await;
+            let first = RemoteTargetServer::start().await;
+            let second = RemoteTargetServer::start().await;
+            let target = first.target();
+            let (observed, release) = first.pause_next_request();
+            let create = repair(&target, "");
+            let concurrent_repair = async {
+                tokio::time::timeout(Duration::from_secs(10), observed)
+                    .await
+                    .expect("validation must reach HTTP source")
+                    .expect("observe validation");
+                let repaired =
+                    tokio::time::timeout(Duration::from_secs(10), repair(&second.target(), "replace-unreadable=true")).await;
+                release.send(()).expect("release validation response");
+                repaired
+                    .expect("repair must complete while another remote validation is paused")
+                    .expect("concurrent repair")
+            };
+            let (first_arn, second_arn) = tokio::join!(create, concurrent_repair);
+            let first_arn = first_arn.expect("merge validated create");
+            let targets = persisted_targets().await;
+            assert_eq!(targets.targets.len(), 2);
+            assert!(targets.targets.iter().any(|target| target.arn == first_arn));
+            assert!(targets.targets.iter().any(|target| target.arn == second_arn));
+            assert_published_targets(&targets).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_target_remove_checks_current_persisted_replication_rules() {
+        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+            for malformed in [false, true] {
+                let (_temp, env) = test_env().await;
+                let server = RemoteTargetServer::start().await;
+                let arn = repair(&server.target(), "").await.expect("create initial target");
+                let mut metadata = metadata_sys::get_config_from_disk(BUCKET).await.expect("read initial metadata");
+                let file = metadata.save_file_path();
+                metadata.replication_config_xml = if malformed {
+                    b"<ReplicationConfiguration>".to_vec()
+                } else {
+                    format!("<ReplicationConfiguration><Role>{arn}</Role><Rule><ID>active</ID><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><Priority>1</Priority><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Destination><Bucket>{arn}</Bucket></Destination></Rule></ReplicationConfiguration>").into_bytes()
+                };
+                // Another node has persisted rules before this node reloads them.
+                metadata.save_with_store(Arc::clone(&env.ecstore)).await.expect("persist peer rules without refreshing cache");
+                assert!(metadata_sys::get_replication_config(BUCKET).await.is_err(), "precondition: cached rules are absent");
+                assert_eq!(metadata_sys::get_config_from_disk(BUCKET).await.expect("read peer metadata").replication_config.is_none(), malformed);
+                let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file).await.expect("read peer bytes");
+                let error = remove(&arn).await.expect_err("rules must prevent unsafe target removal");
+                assert_eq!(error.code(), if malformed { &S3ErrorCode::InternalError } else { &S3ErrorCode::InvalidRequest });
+                assert_eq!(crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file).await.expect("read rejected removal bytes"), before);
+                let targets = persisted_targets().await;
+                assert_eq!(targets.targets.len(), 1);
+                assert_eq!(targets.targets[0].arn, arn);
+                assert_published_targets(&targets).await;
+            }
+        }).await;
     }
 }
