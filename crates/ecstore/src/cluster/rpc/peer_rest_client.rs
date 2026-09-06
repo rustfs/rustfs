@@ -68,7 +68,10 @@ use std::{
     },
     time::SystemTime,
 };
-use tokio::{net::TcpStream, time::Duration};
+use tokio::{
+    net::TcpStream,
+    time::{Duration, timeout},
+};
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tracing::{debug, info, warn};
@@ -872,6 +875,16 @@ impl PeerRestClient {
     pub async fn prepare_retry(&self) {
         self.evict_connection().await;
         self.offline.store(false, Ordering::Release);
+    }
+
+    /// Prepare a retry without allowing connection-cache cleanup to extend the
+    /// caller's probe deadline. The offline gate is cleared even when eviction
+    /// times out so a cancelled cleanup cannot strand the peer in fast-fail
+    /// mode; a later request can perform a fresh eviction if needed.
+    pub async fn prepare_retry_with_timeout(&self, timeout_duration: Duration) -> bool {
+        let evicted = timeout(timeout_duration, self.evict_connection()).await.is_ok();
+        self.offline.store(false, Ordering::Release);
+        evicted
     }
 
     /// Whether this failure means the peer is unreachable, so it should be

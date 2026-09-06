@@ -72,6 +72,29 @@ const LOCAL_CROSS_POOL_FENCE_POLICY_SUPPORTED_VERSION: u32 = 4;
 /// service must not advertise this version until the conditional writer from
 /// rustfs/backlog#684 is available.
 const LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION: u32 = 5;
+
+fn resolve_admin_peer_probe_timeout_secs(configured: Option<u64>) -> u64 {
+    configured
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(rustfs_config::DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS)
+        .min(rustfs_config::MAX_ADMIN_PEER_PROBE_TIMEOUT_SECS)
+}
+
+fn admin_peer_probe_timeout() -> Duration {
+    let configured = rustfs_utils::get_env_opt_u64_with_aliases(rustfs_config::ENV_ADMIN_PEER_PROBE_TIMEOUT_SECS, &[]);
+    let seconds = resolve_admin_peer_probe_timeout_secs(configured);
+    Duration::from_secs(seconds)
+}
+
+fn remaining_admin_peer_probe_timeout(deadline: Instant) -> Option<Duration> {
+    remaining_admin_peer_probe_timeout_at(deadline, Instant::now())
+}
+
+fn remaining_admin_peer_probe_timeout_at(deadline: Instant, now: Instant) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
+    (!remaining.is_zero()).then_some(remaining)
+}
+
 type CrossPoolFencePolicyResult = Result<BTreeMap<String, Uuid>>;
 
 fn cross_pool_fence_policy_results(
@@ -1538,7 +1561,7 @@ impl NotificationSys {
     {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         let endpoints = runtime_sources::endpoint_pools().unwrap_or_else(|| Vec::new().into());
-        let peer_timeout = Duration::from_secs(5);
+        let peer_timeout = admin_peer_probe_timeout();
 
         for (idx, client) in self.peer_clients.iter().enumerate() {
             let endpoints = endpoints.clone();
@@ -1546,7 +1569,9 @@ impl NotificationSys {
             futures.push(async move {
                 if let Some(client) = client {
                     let host = client.host.to_string();
-                    match timeout(peer_timeout, client.local_storage_info()).await {
+                    let deadline = Instant::now() + peer_timeout;
+                    let probe_timeout = remaining_admin_peer_probe_timeout(deadline).unwrap_or_default();
+                    match timeout(probe_timeout, client.local_storage_info()).await {
                         Ok(Ok(mut info)) => {
                             normalize_and_cache_peer_storage_info(cache, &host, &mut info);
                             Some(info)
@@ -1557,7 +1582,6 @@ impl NotificationSys {
                         }
                         Err(_) => {
                             warn!("peer {} storage_info timed out after {:?}", host, peer_timeout);
-                            client.evict_connection().await;
                             handle_peer_failure(cache, &host, &endpoints)
                         }
                     }
@@ -1583,7 +1607,7 @@ impl NotificationSys {
     pub async fn server_info(&self) -> Vec<ServerProperties> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         let endpoints = runtime_sources::endpoint_pools().unwrap_or_else(|| Vec::new().into());
-        let peer_timeout = Duration::from_secs(5);
+        let peer_timeout = admin_peer_probe_timeout();
 
         for (idx, client) in self.peer_clients.iter().enumerate() {
             let host = self
@@ -1600,12 +1624,23 @@ impl NotificationSys {
                     };
                 };
 
+                let deadline = Instant::now() + peer_timeout;
+                let Some(first_timeout) = remaining_admin_peer_probe_timeout(deadline) else {
+                    let health = peer_disk_health_with_deadline(&host, deadline).await;
+                    return PeerServerInfoProbe {
+                        host,
+                        result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                    };
+                };
+
                 // First attempt. A single evicted or half-open internode channel
                 // is enough to fail one probe and, before retrying, would drop
-                // the member to unknown/offline for this whole snapshot. So on any
-                // first-attempt failure we evict the channel and re-dial once
-                // before falling back (rustfs/backlog#1049, P1-B).
-                match timeout(peer_timeout, client.server_info()).await {
+                // the member to unknown/offline for this whole snapshot. On a
+                // quick failure we evict the channel and re-dial once before
+                // falling back (rustfs/backlog#1049, P1-B). A slow attempt
+                // consumes the round budget and therefore does not trigger a
+                // second full wait or an asynchronous eviction side effect.
+                match timeout(first_timeout, client.server_info()).await {
                     Ok(Ok(info)) => {
                         return PeerServerInfoProbe { host, result: Ok(info) };
                     }
@@ -1619,14 +1654,37 @@ impl NotificationSys {
                 // `evict_connection` would leave that gate up and the retry would
                 // fast-fail with "temporarily offline" instead of reconnecting
                 // (rustfs/backlog#1049 P1-B).
-                client.prepare_retry().await;
+                let Some(retry_budget) = remaining_admin_peer_probe_timeout(deadline) else {
+                    let health = peer_disk_health_with_deadline(&host, deadline).await;
+                    return PeerServerInfoProbe {
+                        host,
+                        result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                    };
+                };
+                // Bound connection-cache cleanup too. The helper clears the offline gate even
+                // when eviction itself times out, so cancellation cannot strand this peer in
+                // fast-fail mode.
+                if !client.prepare_retry_with_timeout(retry_budget).await {
+                    let health = peer_disk_health_with_deadline(&host, deadline).await;
+                    return PeerServerInfoProbe {
+                        host,
+                        result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                    };
+                }
 
                 // Second and final attempt on the fresh channel.
-                match timeout(peer_timeout, client.server_info()).await {
+                let Some(retry_timeout) = remaining_admin_peer_probe_timeout(deadline) else {
+                    let health = peer_disk_health_with_deadline(&host, deadline).await;
+                    return PeerServerInfoProbe {
+                        host,
+                        result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                    };
+                };
+                match timeout(retry_timeout, client.server_info()).await {
                     Ok(Ok(info)) => PeerServerInfoProbe { host, result: Ok(info) },
                     Ok(Err(err)) => {
                         warn!("peer {host} server_info failed after retry: {err}");
-                        let health = peer_disk_health(&host).await;
+                        let health = peer_disk_health_with_deadline(&host, deadline).await;
                         PeerServerInfoProbe {
                             host,
                             result: Err(PeerServerInfoProbeFailure::Rpc { health }),
@@ -1634,8 +1692,7 @@ impl NotificationSys {
                     }
                     Err(_) => {
                         warn!("peer {host} server_info timed out after retry ({peer_timeout:?})");
-                        client.evict_connection().await;
-                        let health = peer_disk_health(&host).await;
+                        let health = peer_disk_health_with_deadline(&host, deadline).await;
                         PeerServerInfoProbe {
                             host,
                             result: Err(PeerServerInfoProbeFailure::Rpc { health }),
@@ -3023,6 +3080,11 @@ async fn peer_disk_health(host: &str) -> Option<PeerDiskHealth> {
     }
 }
 
+async fn peer_disk_health_with_deadline(host: &str, deadline: Instant) -> Option<PeerDiskHealth> {
+    let remaining = remaining_admin_peer_probe_timeout(deadline)?;
+    timeout(remaining, peer_disk_health(host)).await.ok().flatten()
+}
+
 /// Handle a peer failure for server_info: return cached data if available, or
 /// classify the member as `unknown` / `degraded` / `offline` depending on how
 /// many consecutive probes have failed and whether the peer's drives are still
@@ -4015,6 +4077,37 @@ mod tests {
             endpoint: endpoint.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn admin_peer_probe_timeout_rejects_zero_and_caps_large_values() {
+        assert_eq!(
+            resolve_admin_peer_probe_timeout_secs(None),
+            rustfs_config::DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_admin_peer_probe_timeout_secs(Some(0)),
+            rustfs_config::DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_admin_peer_probe_timeout_secs(Some(rustfs_config::MAX_ADMIN_PEER_PROBE_TIMEOUT_SECS + 1)),
+            rustfs_config::MAX_ADMIN_PEER_PROBE_TIMEOUT_SECS
+        );
+        assert_eq!(resolve_admin_peer_probe_timeout_secs(Some(7)), 7);
+    }
+
+    #[tokio::test]
+    async fn admin_peer_probe_health_fallback_respects_expired_deadline() {
+        let deadline = Instant::now();
+        assert!(peer_disk_health_with_deadline("peer-1", deadline).await.is_none());
+    }
+
+    #[test]
+    fn admin_peer_probe_deadline_is_shared_across_attempts() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        assert!(remaining_admin_peer_probe_timeout_at(deadline, start + Duration::from_secs(6)).is_some());
+        assert!(remaining_admin_peer_probe_timeout_at(deadline, start + Duration::from_secs(10)).is_none());
     }
 
     #[tokio::test]
