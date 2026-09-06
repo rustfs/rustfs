@@ -669,6 +669,126 @@ impl Default for SourceListRateLimiter {
     }
 }
 
+// Frozen framed-only codec from e1608fbd9ca934d157b5de46c80b4393f2dd3dd6.
+// Keep its own DTO and constants: current-reader round trips cannot establish
+// whether a deployed framed-only reader accepts the bytes we issue.
+#[cfg(test)]
+pub(crate) mod e160_framed_reader {
+    use serde::{Deserialize, Serialize};
+
+    /// The continuation-token version used by ordinary progressing pages.
+    pub const LIST_THROUGH_TOKEN_VERSION: u32 = 1;
+    const LIST_THROUGH_PROGRESS_TOKEN_VERSION: u32 = 2;
+
+    /// The sixteenth consecutive merged page without a key or new EOF fails.
+    /// This also bounds legitimate sparse listings; it is not a cycle detector.
+    pub const MAX_LIST_NO_PROGRESS_PAGES: u8 = 16;
+
+    /// Envelope marker. A bucket that is *not* merging hands out the local
+    /// listing's own marker, so the decoder needs a positive signal before it
+    /// treats an opaque token as a merged one.
+    const LIST_THROUGH_TOKEN_TAG: &str = "odm-list";
+    // Object keys cannot contain NUL (bucket::utils::is_valid_object_prefix),
+    // so this framing cannot collide with a local key used as an opaque marker.
+    const LIST_THROUGH_TOKEN_PREFIX: &str = "\0odm-list:";
+
+    /// The continuation-token envelope. Opaque to clients: it is serialized as
+    /// framed JSON and then base64-encoded by the same helper as a local marker.
+    ///
+    /// A `null` cursor with `done = false` means "list that side from the start";
+    /// `done = true` means the side is finished and must not be listed again.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ListThroughToken {
+        /// Envelope marker, always [`LIST_THROUGH_TOKEN_TAG`].
+        pub t: String,
+        pub v: u32,
+        #[serde(default)]
+        pub local: Option<String>,
+        #[serde(default)]
+        pub local_done: bool,
+        #[serde(default)]
+        pub source: Option<String>,
+        #[serde(default)]
+        pub source_done: bool,
+        /// Last entry the previous page consumed. A side whose page was only
+        /// partially consumed is re-listed from the same cursor and everything at
+        /// or below this key is dropped, which is delimiter-safe: a rolled-up
+        /// common prefix compares as itself, never as its members.
+        #[serde(default)]
+        pub last_key: Option<String>,
+        /// Consecutive empty truncated merged pages, present only in v2 tokens.
+        /// Ordinary v1 tokens retain their original serialized shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub no_progress: Option<u8>,
+    }
+
+    impl ListThroughToken {
+        pub fn encode(&self) -> String {
+            // The envelope is built here from owned strings, so serialization
+            // cannot fail; the fallback keeps the signature infallible.
+            format!("{LIST_THROUGH_TOKEN_PREFIX}{}", serde_json::to_string(self).unwrap_or_default())
+        }
+    }
+
+    /// What a decoded (base64-stripped) continuation token turned out to be.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ListThroughCursor {
+        /// A plain local listing marker: the bucket was not merging when the token
+        /// was issued, or the client is paginating a non-merged listing.
+        Local(String),
+        Merged(Box<ListThroughToken>),
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+    pub enum ListThroughTokenError {
+        #[error("continuation token version {0} is not supported")]
+        UnsupportedVersion(u32),
+        /// The message never echoes the token: it is client-controlled input.
+        #[error("continuation token is malformed")]
+        Malformed,
+    }
+
+    /// Classifies an already base64-decoded continuation token.
+    ///
+    /// Only a framed JSON object is read as a merged token;
+    /// anything else is a local marker, so a bucket that turns `list_through` off
+    /// keeps paginating with the tokens it handed out. A token that *is* an
+    /// envelope but was tampered with (unknown version, unknown field, truncated
+    /// JSON) is an error, never a silent fallback.
+    pub fn decode_continuation_token(decoded: &str) -> Result<ListThroughCursor, ListThroughTokenError> {
+        let Some(payload) = decoded.strip_prefix(LIST_THROUGH_TOKEN_PREFIX) else {
+            return Ok(ListThroughCursor::Local(decoded.to_string()));
+        };
+        let value = serde_json::from_str::<serde_json::Value>(payload).map_err(|_| ListThroughTokenError::Malformed)?;
+        if value.get("t").and_then(serde_json::Value::as_str) != Some(LIST_THROUGH_TOKEN_TAG) {
+            return Err(ListThroughTokenError::Malformed);
+        }
+        match value.get("v").and_then(serde_json::Value::as_u64) {
+            Some(version) if version == u64::from(LIST_THROUGH_TOKEN_VERSION) => {
+                // v1 readers reject this field even when it is null or zero.
+                if value.get("no_progress").is_some() {
+                    return Err(ListThroughTokenError::Malformed);
+                }
+            }
+            Some(version) if version == u64::from(LIST_THROUGH_PROGRESS_TOKEN_VERSION) => {
+                if !value
+                    .get("no_progress")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|count| (1..u64::from(MAX_LIST_NO_PROGRESS_PAGES)).contains(&count))
+                {
+                    return Err(ListThroughTokenError::Malformed);
+                }
+            }
+            Some(version) => return Err(ListThroughTokenError::UnsupportedVersion(version.min(u64::from(u32::MAX)) as u32)),
+            None => return Err(ListThroughTokenError::Malformed),
+        }
+        serde_json::from_value::<ListThroughToken>(value)
+            .map(|token| ListThroughCursor::Merged(Box::new(token)))
+            .map_err(|_| ListThroughTokenError::Malformed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1219,6 +1339,46 @@ mod tests {
             let framed = format!("\0odm-list:{wire}");
             assert_eq!(token.encode(), framed, "framing leaves the JSON payload unchanged");
             assert_eq!(decode_continuation_token(&framed), Ok(ListThroughCursor::Merged(token)));
+        }
+    }
+
+    #[test]
+    fn frozen_e160_reader_distinguishes_framing_and_keeps_strict_budget_validation() {
+        use super::e160_framed_reader as old;
+
+        for raw in [
+            r#"{"t":"odm-list","v":1,"local":"local-2","local_done":false,"source":"source-2","source_done":false,"last_key":"k"}"#,
+            r#"{"t":"odm-list","v":2,"local":"local-2","local_done":false,"source":"source-2","source_done":false,"last_key":"k","no_progress":15}"#,
+        ] {
+            assert_eq!(old::decode_continuation_token(raw), Ok(old::ListThroughCursor::Local(raw.to_string())));
+            let framed = format!("\0odm-list:{raw}");
+            let old::ListThroughCursor::Merged(old_token) = old::decode_continuation_token(&framed).expect("old writer bytes")
+            else {
+                panic!("e160 recognizes its own frame");
+            };
+            assert_eq!(old_token.encode(), framed);
+            let ListThroughCursor::Merged(current) = decode_continuation_token(&framed).expect("dual reader") else {
+                panic!("dual readers preserve old framed chains");
+            };
+            assert_eq!(current.encode(), framed);
+            assert_eq!(current.local, old_token.local);
+            assert_eq!(current.local_done, old_token.local_done);
+            assert_eq!(current.source, old_token.source);
+            assert_eq!(current.source_done, old_token.source_done);
+            assert_eq!(current.last_key, old_token.last_key);
+            assert_eq!(current.v, old_token.v);
+            assert_eq!(current.no_progress, old_token.no_progress);
+        }
+        for count in ["null", "0", "16", "-1", "1.5", "\"1\"", "256"] {
+            let raw = format!(
+                "\0odm-list:{{\"t\":\"odm-list\",\"v\":2,\"local\":null,\"local_done\":true,\"source\":\"A\",\"source_done\":false,\"last_key\":null,\"no_progress\":{count}}}"
+            );
+            assert_eq!(
+                old::decode_continuation_token(&raw),
+                Err(old::ListThroughTokenError::Malformed),
+                "{count}"
+            );
+            assert_eq!(decode_continuation_token(&raw), Err(ListThroughTokenError::Malformed), "{count}");
         }
     }
 

@@ -1727,6 +1727,352 @@ mod tests {
         });
     }
 
+    // The e160 active-ODM route decoded before entering this same merge core.
+    // Freeze both its reader and writer; use real local storage and HTTP source
+    // calls here, without claiming that this harness executes an old binary.
+    async fn execute_e160_source_list(input: ListObjectsV2Input) -> S3Result<S3Response<ListObjectsV2Output>> {
+        use crate::app::storage_api::s3_api::bucket::{build_list_objects_v2_output, parse_list_objects_v2_params};
+        use crate::on_demand_migration::list_through::e160_framed_reader as old;
+
+        let params = parse_list_objects_v2_params(
+            input.prefix.clone(),
+            input.delimiter.clone(),
+            input.max_keys,
+            input.continuation_token.clone(),
+            input.start_after.clone(),
+        )?;
+        assert!(params.max_keys > 0, "the frozen route models active, nonzero merged requests");
+        let token = params.decoded_continuation_token.as_deref().and_then(|raw| {
+            match old::decode_continuation_token(raw).expect("valid frozen-reader input") {
+                old::ListThroughCursor::Local(_) => None,
+                old::ListThroughCursor::Merged(token) => Some(ListThroughToken {
+                    framed: true,
+                    t: token.t,
+                    v: token.v,
+                    local: token.local,
+                    local_done: token.local_done,
+                    source: token.source,
+                    source_done: token.source_done,
+                    last_key: token.last_key,
+                    no_progress: token.no_progress,
+                }),
+            }
+        });
+        let store = shared_gating_ecstore().await;
+        let state = OnDemandMigrationSys::get()
+            .state(&input.bucket)
+            .expect("installed real source state");
+        assert!(state.config().policy.list_through);
+        let mut outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            merged_list_objects_v2(
+                &store,
+                &state,
+                &input.bucket,
+                &params,
+                input.fetch_owner.unwrap_or_default(),
+                false,
+                token.as_ref(),
+            ),
+        )
+        .await
+        .expect("frozen-reader listing must remain bounded")?;
+        assert!(!outcome.degraded, "the compatibility matrix exercises successful source pages");
+        if let Some(raw) = outcome.info.next_continuation_token.as_mut() {
+            // The shared core supplies semantic fields. Only the frozen e160
+            // writer decides the old node's outgoing framing and JSON bytes.
+            let old_token: old::ListThroughToken =
+                serde_json::from_str(raw.strip_prefix("\0odm-list:").unwrap_or(raw)).expect("merge output fields");
+            *raw = old_token.encode();
+        }
+        Ok(S3Response::new(build_list_objects_v2_output(
+            outcome.info,
+            input.fetch_owner.unwrap_or_default(),
+            params.max_keys,
+            input.bucket,
+            params.prefix,
+            params.delimiter,
+            input.encoding_type,
+            params.response_continuation_token,
+            params.response_start_after,
+        )))
+    }
+
+    fn e160_wire_cursor(wire: &str) -> crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor {
+        let raw = base64_simd::STANDARD.decode_to_vec(wire).expect("wire base64");
+        crate::on_demand_migration::list_through::e160_framed_reader::decode_continuation_token(
+            std::str::from_utf8(&raw).expect("wire UTF-8"),
+        )
+        .expect("frozen e160 decoder")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_e160_framed_rollout_and_reader_convergence_preserve_sequence() {
+        run_large_stack_test("list-through-e160-framed-rollout", || async {
+            for initial_framing in [None, Some("true")] {
+                temp_env::async_with_vars(
+                    [
+                        (ENV_LIST_PROGRESS_TOKENS, None),
+                        (ENV_LIST_FRAMED_TOKENS, initial_framing),
+                        ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                        ("HTTP_PROXY", None),
+                        ("HTTPS_PROXY", None),
+                        ("ALL_PROXY", None),
+                        ("http_proxy", None),
+                        ("https_proxy", None),
+                        ("all_proxy", None),
+                        ("NO_PROXY", Some("*")),
+                        ("no_proxy", Some("*")),
+                    ],
+                    async {
+                        let one_scan = [
+                            source_xml(Some("S"), true, Some("a")),
+                            source_xml(None, false, Some("c")),
+                            source_xml(None, false, Some("c")),
+                        ];
+                        let (endpoint, server) = scripted_list_source(one_scan.iter().chain(&one_scan).cloned().collect()).await;
+                        let (_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                        let store = shared_gating_ecstore().await;
+                        for key in ["b", "d"] {
+                            store
+                                .put_object(
+                                    &input.bucket,
+                                    key,
+                                    &mut StoragePutObjReader::from_vec(vec![1]),
+                                    &StorageObjectOptions::default(),
+                                )
+                                .await
+                                .expect("seed interleaved local keys");
+                        }
+                        input.max_keys = Some(1);
+                        // First new writer -> e160 reader -> new reader. After all old
+                        // readers leave, disabling issuance must retain this live frame.
+                        for (page, key) in ["a", "b", "c", "d", "z-local"].into_iter().enumerate() {
+                            let response = if page == 1 {
+                                execute_e160_source_list(input.clone()).await
+                            } else if page >= 3 {
+                                temp_env::async_with_vars(
+                                    [(ENV_LIST_FRAMED_TOKENS, Some("false"))],
+                                    execute_source_list(input.clone()),
+                                )
+                                .await
+                            } else {
+                                execute_source_list(input.clone()).await
+                            }
+                            .expect("compatible framed reader must continue the same scan");
+                            assert_eq!(response.output.key_count, Some(1));
+                            assert_eq!(response.output.contents.as_ref().expect("one object")[0].key.as_deref(), Some(key));
+                            assert_eq!(response.output.is_truncated, Some(page != 4));
+                            input.continuation_token = response.output.next_continuation_token;
+                            if page != 4 {
+                                let wire = input.continuation_token.as_deref().expect("framed continuation");
+                                let crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor::Merged(old) =
+                                    e160_wire_cursor(wire)
+                                else {
+                                    panic!("e160 must recognize every active framed v1 token")
+                                };
+                                assert_eq!(old.v, 1);
+                                assert_eq!(old.last_key.as_deref(), Some(key));
+                                assert_eq!(old.no_progress, None);
+                                assert!(decode_wire_token(wire).framed);
+                            } else {
+                                assert!(input.continuation_token.is_none());
+                            }
+                        }
+                        // A fresh bare chain is safe only after every reader is dual.
+                        temp_env::async_with_vars([(ENV_LIST_FRAMED_TOKENS, Some("false"))], async {
+                            for (page, key) in ["a", "b", "c", "d", "z-local"].into_iter().enumerate() {
+                                let response = execute_source_list(input.clone()).await.expect("converged dual readers");
+                                assert_eq!(response.output.key_count, Some(1));
+                                assert_eq!(response.output.contents.as_ref().expect("one object")[0].key.as_deref(), Some(key));
+                                assert_eq!(response.output.is_truncated, Some(page != 4));
+                                input.continuation_token = response.output.next_continuation_token;
+                                if page != 4 {
+                                    let wire = input.continuation_token.as_deref().expect("bare continuation");
+                                    assert!(!decode_wire_token(wire).framed);
+                                    assert!(
+                                        matches!(e160_wire_cursor(wire),
+                                crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor::Local(_)),
+                                        "a remaining e160 reader would make this switch unsafe"
+                                    );
+                                } else {
+                                    assert!(input.continuation_token.is_none());
+                                }
+                            }
+                        })
+                        .await;
+                        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+                            .await
+                            .expect("both finite source scans complete")
+                            .expect("source server");
+                        assert_eq!(requests.len(), 6, "framing changes add no source fetches");
+                        for scan in requests.chunks_exact(3) {
+                            assert!(!scan[0].contains("continuation-token="));
+                            for request in &scan[1..] {
+                                assert!(request.contains("continuation-token=S"), "{request}");
+                            }
+                        }
+                    },
+                )
+                .await;
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_e160_explicit_bare_negative_control_repeats_an_object() {
+        run_large_stack_test("list-through-e160-bare-negative-control", || async {
+            temp_env::async_with_vars(
+                [
+                    (ENV_LIST_PROGRESS_TOKENS, None),
+                    (ENV_LIST_FRAMED_TOKENS, Some("false")),
+                    ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                    ("HTTP_PROXY", None),
+                    ("HTTPS_PROXY", None),
+                    ("ALL_PROXY", None),
+                    ("http_proxy", None),
+                    ("https_proxy", None),
+                    ("all_proxy", None),
+                    ("NO_PROXY", Some("*")),
+                    ("no_proxy", Some("*")),
+                ],
+                async {
+                    let (endpoint, server) = scripted_list_source(vec![
+                        source_xml(Some("S"), true, Some("a")),
+                        source_xml(Some("S"), true, Some("a")),
+                        source_xml(None, false, Some("c")),
+                    ])
+                    .await;
+                    let (_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                    let store = shared_gating_ecstore().await;
+                    for key in ["b", "d"] {
+                        store
+                            .put_object(
+                                &input.bucket,
+                                key,
+                                &mut StoragePutObjReader::from_vec(vec![1]),
+                                &StorageObjectOptions::default(),
+                            )
+                            .await
+                            .expect("seed interleaved local keys");
+                    }
+                    input.max_keys = Some(1);
+                    let first = execute_source_list(input.clone()).await.expect("explicit bare first page");
+                    assert_eq!(first.output.contents.as_ref().expect("first object")[0].key.as_deref(), Some("a"));
+                    input.continuation_token = first.output.next_continuation_token;
+                    let bare = input.continuation_token.as_deref().expect("new bare cursor");
+                    assert!(!decode_wire_token(bare).framed);
+                    assert!(matches!(
+                        e160_wire_cursor(bare),
+                        crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor::Local(_)
+                    ));
+                    let repeated = execute_e160_source_list(input.clone())
+                        .await
+                        .expect("old reader silently restarts");
+                    assert_eq!(repeated.output.key_count, Some(1));
+                    assert_eq!(
+                        repeated.output.contents.as_ref().expect("repeated object")[0].key.as_deref(),
+                        Some("a"),
+                        "negative control: the incompatible bare setting loses last_key and repeats a"
+                    );
+                    input.continuation_token = repeated.output.next_continuation_token;
+                    assert!(decode_wire_token(input.continuation_token.as_deref().expect("old framed cursor")).framed);
+                    let resumed = execute_source_list(input).await.expect("old writer now supplies framing");
+                    assert_eq!(
+                        resumed.output.contents.as_ref().expect("next object")[0].key.as_deref(),
+                        Some("b"),
+                        "this mismatch need not loop forever: e160 subsequently emits a frame"
+                    );
+                    let requests = tokio::time::timeout(Duration::from_secs(5), server)
+                        .await
+                        .expect("finite negative-control source")
+                        .expect("source server");
+                    assert_eq!(requests.len(), 3);
+                    assert!(!requests[0].contains("continuation-token="));
+                    assert!(!requests[1].contains("continuation-token="), "the old reader restarted the source scan");
+                    assert!(requests[2].contains("continuation-token=S"));
+                },
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_e160_framed_budget_survives_readers_but_bare_budget_is_lost() {
+        run_large_stack_test("list-through-e160-budget", || async {
+            temp_env::async_with_vars([
+                (ENV_LIST_PROGRESS_TOKENS, None), (ENV_LIST_FRAMED_TOKENS, Some("false")),
+                ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                ("HTTP_PROXY", None), ("HTTPS_PROXY", None), ("ALL_PROXY", None),
+                ("http_proxy", None), ("https_proxy", None), ("all_proxy", None),
+                ("NO_PROXY", Some("*")), ("no_proxy", Some("*")),
+            ], async {
+                // Fixed writer bytes, independent of the current token encoder.
+                let framed13 = "\0odm-list:{\"t\":\"odm-list\",\"v\":2,\"local\":null,\"local_done\":true,\"source\":\"A\",\"source_done\":false,\"last_key\":null,\"no_progress\":13}";
+                let (endpoint, server) = scripted_list_source(["B", "C", "D", "E", "F", "G"].into_iter()
+                    .map(|cursor| source_xml(Some(cursor), true, None)).collect()).await;
+                let (_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                input.max_keys = Some(1);
+                input.continuation_token = Some(base64_simd::STANDARD.encode_to_string(framed13.as_bytes()));
+                let fourteen = execute_source_list(input.clone()).await.expect("new reader preserves the old framed budget");
+                assert_eq!(fourteen.output.key_count, Some(0));
+                assert_eq!(fourteen.output.is_truncated, Some(true));
+                input.continuation_token = fourteen.output.next_continuation_token;
+                let crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor::Merged(old) =
+                    e160_wire_cursor(input.continuation_token.as_deref().expect("fourteenth empty page")) else {
+                        panic!("the new writer must preserve a framed v2 token for e160");
+                    };
+                assert_eq!(old.v, 2);
+                assert_eq!(old.no_progress, Some(14));
+                assert_eq!(old.source.as_deref(), Some("C"));
+                assert!(old.local_done);
+                assert_eq!(old.last_key, None);
+                let fifteen = execute_e160_source_list(input.clone()).await.expect("e160 preserves an existing v2 budget");
+                assert_eq!(fifteen.output.key_count, Some(0));
+                assert_eq!(fifteen.output.is_truncated, Some(true));
+                input.continuation_token = fifteen.output.next_continuation_token;
+                let next = decode_wire_token(input.continuation_token.as_deref().expect("fifteenth empty page"));
+                assert!(next.framed);
+                assert_eq!(next.v, 2);
+                assert_eq!(next.no_progress, Some(15));
+                assert_eq!(next.source.as_deref(), Some("E"));
+                assert!(next.local_done);
+                assert_eq!(next.last_key, None);
+                assert_source_policy_result(execute_source_list(input).await, SourceErrorPolicy::Propagate);
+                let requests = tokio::time::timeout(Duration::from_secs(5), server).await
+                    .expect("bounded framed budget source").expect("source server");
+                assert_eq!(requests.len(), 6, "each of the three reader hops spends exactly two source fetches");
+                for (request, cursor) in requests.iter().zip(["A", "B", "C", "D", "E", "F"]) {
+                    assert!(request.contains(&format!("continuation-token={cursor}")), "{request}");
+                }
+
+                let (endpoint, server) = scripted_list_source(vec![
+                    source_xml(Some("B"), true, None), source_xml(Some("C"), true, None),
+                ]).await;
+                let (_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                let bare15 = r#"{"t":"odm-list","v":2,"local":null,"local_done":true,"source":"A","source_done":false,"last_key":null,"no_progress":15}"#;
+                input.continuation_token = Some(base64_simd::STANDARD.encode_to_string(bare15.as_bytes()));
+                assert!(matches!(e160_wire_cursor(input.continuation_token.as_deref().expect("bare v2")),
+                    crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor::Local(_)));
+                let restarted = execute_e160_source_list(input).await.expect("negative control: old reader loses the budget");
+                assert_eq!(restarted.output.key_count, Some(0));
+                assert_eq!(restarted.output.is_truncated, Some(true));
+                let reset = decode_wire_token(restarted.output.next_continuation_token.as_deref().expect("restarted cursor"));
+                assert!(reset.framed);
+                assert_eq!(reset.v, 1);
+                assert_eq!(reset.no_progress, None, "bare v2 was never recognized by the e160 reader");
+                let requests = tokio::time::timeout(Duration::from_secs(5), server).await
+                    .expect("bounded bare negative-control source").expect("source server");
+                assert_eq!(requests.len(), 2);
+                assert!(!requests[0].contains("continuation-token="));
+                assert!(requests[1].contains("continuation-token=B"));
+            }).await;
+        });
+    }
+
     fn decode_wire_token(wire: &str) -> ListThroughToken {
         let raw = base64_simd::STANDARD.decode_to_vec(wire).expect("base64 continuation token");
         decode_list_cursor(Some(std::str::from_utf8(&raw).expect("UTF-8 cursor")))
