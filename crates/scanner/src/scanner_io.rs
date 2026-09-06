@@ -218,8 +218,8 @@ fn complete_scanner_cache_snapshot_plan_digest(
 
 fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<'_>) -> Option<DataUsageScanPlanDigest> {
     let authoritative = serde_json::from_slice::<DataUsageInfo>(proof.authoritative_data?).ok()?;
-    if complete_scanner_cache_snapshot_plan_digest(&authoritative, proof, true).is_some() {
-        return Some(proof.scan_plan_digest);
+    if let Some(plan_digest) = complete_scanner_cache_snapshot_plan_digest(&authoritative, proof, true) {
+        return Some(plan_digest);
     }
 
     // A complete but superseded observation may reuse its per-set cache only
