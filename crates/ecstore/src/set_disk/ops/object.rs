@@ -16291,7 +16291,23 @@ mod transition_upload_integrity_tests {
             let bucket = format!("transition-real-bitrot-{}", position.label());
             let object = format!("{}-corrupt.bin", position.label());
             let payload = vec![0x41; 2 * 1024 * 1024];
-            let original = write_source(&set_disks, &disk_stores, &bucket, &object, &payload).await;
+            // Corruption edits physical shards, so every healthy rename must finish first.
+            for disk in &disk_stores {
+                disk.make_volume(&bucket).await.expect("bucket volume should be created");
+            }
+            let mut reader = PutObjReader::from_vec(payload.to_vec());
+            let original = set_disks
+                .put_object(
+                    &bucket,
+                    &object,
+                    &mut reader,
+                    &ObjectOptions {
+                        write_completion: WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("source object should be written");
             let source = set_disks
                 .get_object_fileinfo(
                     &bucket,
