@@ -4656,6 +4656,58 @@ where
     result
 }
 
+#[derive(Debug)]
+struct MultipartReplicationReadPlan {
+    part_number: i32,
+    part_size: i64,
+    range: Option<HTTPRangeSpec>,
+    next_offset: i64,
+}
+
+fn multipart_replication_read_plan(
+    object_info: &ObjectInfo,
+    obj_opts: &ObjectOptions,
+    mut input: ReplicationMultipartPartInput,
+    stored_size: usize,
+    is_last: bool,
+) -> std::io::Result<MultipartReplicationReadPlan> {
+    let empty_last_part = is_last && input.part_size == 0 && stored_size == 0;
+    // Raw reads address stored bytes. Only untransformed legacy parts may
+    // substitute their stored size for a missing logical size.
+    if obj_opts.raw_data_movement_read || (input.part_size == 0 && !object_info.is_compressed() && !object_info.is_encrypted()) {
+        input.part_size = i64::try_from(stored_size).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "multipart replication stored part size exceeds i64")
+        })?;
+    }
+    if empty_last_part {
+        if input.offset < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "empty multipart replication part has a negative offset",
+            ));
+        }
+        let part_number = i32::try_from(input.part_number)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "multipart replication part number exceeds i32"))?;
+        return Ok(MultipartReplicationReadPlan {
+            part_number,
+            part_size: 0,
+            range: None,
+            next_offset: input.offset,
+        });
+    }
+    let plan = replication_multipart_part_plan(input).map_err(std::io::Error::other)?;
+    Ok(MultipartReplicationReadPlan {
+        part_number: plan.part_number,
+        part_size: plan.part_size,
+        range: Some(HTTPRangeSpec {
+            is_suffix_length: false,
+            start: plan.range.start,
+            end: plan.range.end,
+        }),
+        next_offset: plan.next_offset,
+    })
+}
+
 async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
     ctx: MultipartReplicationContext<'_, S>,
     upload_id: &str,
@@ -4676,35 +4728,31 @@ async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
 
     let mut header_size = replication_put_object_header_size(&put_opts);
     let mut offset: i64 = 0;
-    for part_info in object_info.parts.iter() {
-        // Ciphertext passthrough (raw read) ranges over the stored part
-        // bytes; decrypted reads range over the logical plaintext parts.
-        let part_size = if obj_opts.raw_data_movement_read {
-            part_info.size as i64
-        } else {
-            part_info.actual_size
-        };
-        let part_plan = replication_multipart_part_plan(ReplicationMultipartPartInput {
-            offset,
-            part_number: part_info.number,
-            part_size,
-        })
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
-        let range_spec = HTTPRangeSpec {
-            is_suffix_length: false,
-            start: part_plan.range.start,
-            end: part_plan.range.end,
-        };
+    for (index, part_info) in object_info.parts.iter().enumerate() {
+        let part_plan = multipart_replication_read_plan(
+            object_info,
+            obj_opts,
+            ReplicationMultipartPartInput {
+                offset,
+                part_number: part_info.number,
+                part_size: part_info.actual_size,
+            },
+            part_info.size,
+            index + 1 == object_info.parts.len(),
+        )?;
         offset = part_plan.next_offset;
 
-        let part_reader = storage
-            .get_object_reader(src_bucket, object, Some(range_spec), HeaderMap::new(), obj_opts)
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        let part_stream = wrap_with_bandwidth_monitor_with_header(part_reader.stream, src_bucket, arn, header_size);
+        let byte_stream = if let Some(range_spec) = part_plan.range {
+            let part_reader = storage
+                .get_object_reader(src_bucket, object, Some(range_spec), HeaderMap::new(), obj_opts)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let part_stream = wrap_with_bandwidth_monitor_with_header(part_reader.stream, src_bucket, arn, header_size);
+            async_read_to_bytestream(part_stream)
+        } else {
+            ByteStream::from_static(b"")
+        };
         header_size = 0;
-        let byte_stream = async_read_to_bytestream(part_stream);
 
         let object_part = cli
             .put_object_part(
@@ -4760,6 +4808,174 @@ async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
 #[cfg(test)]
 mod tests {
     use super::super::replication_filemeta_boundary::ReplicateTargetDecision;
+
+    #[test]
+    fn multipart_read_plan_preserves_legacy_plain_part_ranges() {
+        const MIB: usize = 1024 * 1024;
+        let object_info = ObjectInfo {
+            etag: Some("0123456789abcdef0123456789abcdef".to_string()),
+            size: 6 * 1024 * 1024,
+            ..Default::default()
+        };
+        let mut offset = 0;
+        for (part_number, stored_size, start, end) in [
+            (1, 5 * MIB, 0, 5 * 1024 * 1024 - 1),
+            (2, MIB, 5 * 1024 * 1024, 6 * 1024 * 1024 - 1),
+        ] {
+            let plan = multipart_replication_read_plan(
+                &object_info,
+                &ObjectOptions::default(),
+                ReplicationMultipartPartInput {
+                    offset,
+                    part_number,
+                    part_size: 0,
+                },
+                stored_size,
+                part_number == 2,
+            )
+            .expect("legacy plain parts must use their stored sizes");
+            assert_eq!(plan.part_number, i32::try_from(part_number).expect("part number fits"));
+            assert_eq!(plan.part_size, i64::try_from(stored_size).expect("stored size fits"));
+            let range = plan.range.expect("a nonempty part must read a range");
+            assert!(!range.is_suffix_length);
+            assert_eq!((range.start, range.end), (start, end));
+            assert_eq!(plan.next_offset, end + 1);
+            offset = plan.next_offset;
+        }
+        assert_eq!(offset, object_info.size);
+    }
+
+    #[test]
+    fn multipart_read_plan_distinguishes_transformed_and_raw_sizes() {
+        for metadata in [
+            HashMap::from([("x-rustfs-internal-compression".to_string(), "klauspost/compress/s2".to_string())]),
+            HashMap::from([("x-amz-server-side-encryption".to_string(), "AES256".to_string())]),
+        ] {
+            let object_info = ObjectInfo {
+                user_defined: Arc::new(metadata),
+                ..Default::default()
+            };
+            assert!(object_info.is_compressed() || object_info.is_encrypted());
+            for raw in [false, true] {
+                for actual_size in [-1, 0, 5] {
+                    let result = multipart_replication_read_plan(
+                        &object_info,
+                        &ObjectOptions {
+                            raw_data_movement_read: raw,
+                            ..Default::default()
+                        },
+                        ReplicationMultipartPartInput {
+                            offset: 7,
+                            part_number: 2,
+                            part_size: actual_size,
+                        },
+                        9,
+                        true,
+                    );
+                    if !raw && actual_size <= 0 {
+                        let err = result.expect_err("transformed reads cannot substitute physical bytes for unknown plaintext");
+                        assert!(matches!(
+                            err.get_ref().and_then(|err| err.downcast_ref::<rustfs_replication::ReplicationMultipartPlanError>()),
+                            Some(rustfs_replication::ReplicationMultipartPlanError::InvalidPartSize { part_size })
+                                if *part_size == actual_size
+                        ));
+                    } else {
+                        let plan = result.expect("the selected representation has a known positive size");
+                        let expected_size = if raw { 9 } else { 5 };
+                        assert_eq!(plan.part_number, 2);
+                        assert_eq!(plan.part_size, expected_size);
+                        let range = plan.range.expect("a nonempty part must read a range");
+                        assert_eq!((range.start, range.end), (7, 7 + expected_size - 1));
+                        assert_eq!(plan.next_offset, 7 + expected_size);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multipart_read_plan_retains_an_empty_last_part_without_advancing() {
+        for offset in [5 * 1024 * 1024, i64::MAX] {
+            for raw in [false, true] {
+                let plan = multipart_replication_read_plan(
+                    &ObjectInfo::default(),
+                    &ObjectOptions {
+                        raw_data_movement_read: raw,
+                        ..Default::default()
+                    },
+                    ReplicationMultipartPartInput {
+                        offset,
+                        part_number: 2,
+                        part_size: 0,
+                    },
+                    0,
+                    true,
+                )
+                .expect("an empty final part needs no range read");
+                assert_eq!(plan.part_number, 2);
+                assert_eq!(plan.part_size, 0);
+                assert!(plan.range.is_none());
+                assert_eq!(plan.next_offset, offset);
+            }
+        }
+    }
+
+    #[test]
+    fn multipart_read_plan_rejects_invalid_empty_parts_and_ranges() {
+        for (offset, part_number, actual_size, stored_size, is_last) in [
+            (0, 1, 0, 0, false),
+            (0, 2, -1, 0, true),
+            (0, 2, -1, 9, true),
+            (-1, 2, 0, 0, true),
+            (0, usize::try_from(i32::MAX).expect("i32 fits usize") + 1, 0, 0, true),
+            (i64::MAX, 2, 1, 1, true),
+            (i64::MAX, 2, 2, 2, true),
+        ] {
+            let err = multipart_replication_read_plan(
+                &ObjectInfo::default(),
+                &ObjectOptions::default(),
+                ReplicationMultipartPartInput {
+                    offset,
+                    part_number,
+                    part_size: actual_size,
+                },
+                stored_size,
+                is_last,
+            )
+            .expect_err("invalid part metadata must not become a successful transport plan");
+            assert!(
+                err.kind() == std::io::ErrorKind::InvalidData
+                    || err
+                        .get_ref()
+                        .is_some_and(|err| err.is::<rustfs_replication::ReplicationMultipartPlanError>()),
+                "the failure must preserve a typed metadata or planner error: {err}"
+            );
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn multipart_read_plan_rejects_physical_size_overflow() {
+        for raw in [false, true] {
+            let err = multipart_replication_read_plan(
+                &ObjectInfo::default(),
+                &ObjectOptions {
+                    raw_data_movement_read: raw,
+                    ..Default::default()
+                },
+                ReplicationMultipartPartInput {
+                    offset: 0,
+                    part_number: 1,
+                    part_size: 0,
+                },
+                usize::MAX,
+                true,
+            )
+            .expect_err("a physical size outside the range API must be rejected before casting");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(err.to_string(), "multipart replication stored part size exceeds i64");
+        }
+    }
 
     #[test]
     fn same_state_terminal_retry_uses_validate_only() {
