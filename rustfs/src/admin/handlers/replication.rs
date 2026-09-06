@@ -196,7 +196,10 @@ async fn persist_remote_target_write(
     })
     .await;
     if conflict {
-        return Err(s3_error!(OperationAborted, "remote target changed during validation; retry the request"));
+        return Err(S3Error::with_message(
+            S3ErrorCode::OperationAborted,
+            "remote target changed during validation; retry the request",
+        ));
     }
     if let Some(error) = target_error {
         return Err(map_bucket_target_error(error));
@@ -828,8 +831,8 @@ impl Operation for SetRemoteTargetHandler {
                 let (arn, exists) =
                     BucketTargetSys::remote_arn_for_targets(targets, &remote_target, &remote_target.deployment_id);
                 if exists && !arn.is_empty() {
-                    let body =
-                        serde_json::to_string(&arn).map_err(|_| s3_error!(InternalError, "Failed to serialize target ARN"))?;
+                    let body = serde_json::to_string(&arn)
+                        .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize target ARN"))?;
                     return Ok(S3Response::new((StatusCode::OK, Body::from(body))));
                 }
             }
@@ -840,7 +843,7 @@ impl Operation for SetRemoteTargetHandler {
         };
         if update {
             if remote_target.arn.is_empty() {
-                return Err(s3_error!(InvalidRequest, "ARN is empty"));
+                return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "ARN is empty"));
             }
             let Some(mut target) = metadata
                 .bucket_target_config
@@ -849,10 +852,11 @@ impl Operation for SetRemoteTargetHandler {
                 .into_iter()
                 .find(|target| target.arn == remote_target.arn)
             else {
-                return Err(s3_error!(InvalidRequest, "Target not found"));
+                return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Target not found"));
             };
             mode = RemoteTargetWrite::Update {
-                expected: serde_json::to_vec(&target).map_err(|_| s3_error!(InternalError, "Failed to serialize target"))?,
+                expected: serde_json::to_vec(&target)
+                    .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize target"))?,
             };
 
             // Overlay only the requested field groups onto the stored target
@@ -922,7 +926,8 @@ impl Operation for SetRemoteTargetHandler {
             .map_err(map_bucket_target_error)?;
         let _targets_guard = lock_bucket_targets_metadata(bucket).await;
         let arn = persist_remote_target_write(bucket, remote_target, incarnation, mode).await?;
-        let arn_str = serde_json::to_string(&arn).map_err(|_| s3_error!(InternalError, "Failed to serialize target ARN"))?;
+        let arn_str = serde_json::to_string(&arn)
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize target ARN"))?;
 
         // MinIO-compatible clients encrypt the request payload for this endpoint,
         // but they parse the success response directly as plain JSON string ARN.
@@ -1050,7 +1055,10 @@ impl Operation for RemoveRemoteTargetHandler {
         }
         if arn.arn_type == BucketTargetType::ReplicationService {
             if !metadata.replication_config_xml.is_empty() && metadata.replication_config.is_none() {
-                return Err(s3_error!(InternalError, "persisted replication rules cannot be decoded"));
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "persisted replication rules cannot be decoded",
+                ));
             }
             if metadata.replication_config.as_ref().is_some_and(|config| {
                 config
@@ -1071,7 +1079,8 @@ impl Operation for RemoveRemoteTargetHandler {
                 bucket: bucket.to_string(),
             }));
         }
-        let json_targets = serde_json::to_vec(&targets).map_err(|_| s3_error!(InternalError, "Failed to serialize targets"))?;
+        let json_targets = serde_json::to_vec(&targets)
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets"))?;
         let bucket = bucket.clone();
         let arn = arn_str.clone();
         // The pool cancellation owns a detached task. Both outer guards must
@@ -1088,7 +1097,9 @@ impl Operation for RemoveRemoteTargetHandler {
             Ok::<(), S3Error>(())
         })
         .await
-        .map_err(|error| s3_error!(InternalError, "remote target removal task failed: {error}"))??;
+        .map_err(|error| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("remote target removal task failed: {error}"))
+        })??;
 
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
     }
@@ -3587,7 +3598,7 @@ mod target_repair_tests {
                 .await
                 .expect("read metadata")
                 .save_file_path();
-            let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+            let before = crate::admin::storage_api::config::read_admin_config(Arc::clone(&env.ecstore), &file)
                 .await
                 .expect("read original bytes");
             for operation in ["create", "update", "remove"] {
@@ -3603,7 +3614,7 @@ mod target_repair_tests {
                 };
                 assert_eq!(error.code(), &S3ErrorCode::InternalError, "{operation}");
                 assert_eq!(
-                    crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                    crate::admin::storage_api::config::read_admin_config(Arc::clone(&env.ecstore), &file)
                         .await
                         .expect("read rejected write"),
                     before
@@ -3626,7 +3637,7 @@ mod target_repair_tests {
                 .await
                 .expect("read metadata")
                 .save_file_path();
-            let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+            let before = crate::admin::storage_api::config::read_admin_config(Arc::clone(&env.ecstore), &file)
                 .await
                 .expect("read original bytes");
             BucketTargetSys::get()
@@ -3642,7 +3653,7 @@ mod target_repair_tests {
                 arn
             );
             assert_eq!(
-                crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                crate::admin::storage_api::config::read_admin_config(Arc::clone(&env.ecstore), &file)
                     .await
                     .expect("read idempotent create bytes"),
                 before
@@ -3873,10 +3884,10 @@ mod target_repair_tests {
             metadata.save_with_store(Arc::clone(&env.ecstore)).await.expect("persist peer rules without refreshing cache");
             assert!(metadata_sys::get_replication_config(BUCKET).await.is_err(), "precondition: cached rules are absent");
             assert_eq!(metadata_sys::get_config_from_disk(BUCKET).await.expect("read peer metadata").replication_config.is_none(), malformed);
-            let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file).await.expect("read peer bytes");
+            let before = crate::admin::storage_api::config::read_admin_config(Arc::clone(&env.ecstore), &file).await.expect("read peer bytes");
             let error = remove(&arn).await.expect_err("rules must prevent unsafe target removal");
             assert_eq!(error.code(), if malformed { &S3ErrorCode::InternalError } else { &S3ErrorCode::InvalidRequest });
-            assert_eq!(crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file).await.expect("read rejected removal bytes"), before);
+            assert_eq!(crate::admin::storage_api::config::read_admin_config(Arc::clone(&env.ecstore), &file).await.expect("read rejected removal bytes"), before);
             let targets = persisted_targets().await;
             assert_eq!(targets.targets.len(), 1);
             assert_eq!(targets.targets[0].arn, arn);
