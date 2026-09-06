@@ -256,10 +256,10 @@ clap = { version = "4.6.6" }
 const-str = { version = "1.1.0" }
 convert_case = "0.12.0"
 criterion = { version = "0.8" }
-crossbeam-queue = "0.3.13"
-crossbeam-channel = "0.5.16"
-crossbeam-deque = "0.8.7"
-crossbeam-utils = "0.8.22"
+crossbeam-queue = "0.3.14"
+crossbeam-channel = "0.5.17"
+crossbeam-deque = "0.8.8"
+crossbeam-utils = "0.8.23"
 datafusion = { default-features = false, version = "55.0.0" }
 derive_builder = "0.20.2"
 enumset = "1.1.14"
@@ -306,7 +306,7 @@ rustfs-erasure-codec = { version = "8.0.2" }
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.13.1" }
 rumqttc = { package = "rumqttc-next", version = "0.34.0" }
-redis = { version = "1.6.0" }
+redis = { version = "1.7.0" }
 rustify = { version = "0.7", default-features = false }
 rustix = { version = "1.1.4" }
 rust-embed = { version = "8.12.0" }
