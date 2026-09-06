@@ -5108,7 +5108,49 @@ async fn read_pool_meta_replicas<S>(pools: Vec<Arc<S>>, no_lock: bool) -> Vec<Po
 where
     S: EcstoreObjectIO,
 {
-    join_all(pools.into_iter().map(|pool| read_pool_meta_replica(pool, no_lock))).await
+    let reads = join_all(pools.into_iter().map(|pool| read_pool_meta_replica(pool, no_lock))).await;
+    #[cfg(feature = "e2e-test-hooks")]
+    if STARTUP_CAS_OBSERVATION.try_with(|_| ()).is_ok() {
+        let batch = uuid::Uuid::new_v4();
+        for (pool, read) in reads.iter().enumerate() {
+            let mut observation = serde_json::json!({
+                "kind": "replica-read", "object": POOL_META_NAME, "batch": batch, "pool": pool,
+                "cas": match &read.cas {
+                    PoolMetaCasToken::Missing => "missing",
+                    PoolMetaCasToken::Existing(_) => "existing",
+                    PoolMetaCasToken::Unsafe => "unsafe",
+                },
+                "etag": match &read.cas { PoolMetaCasToken::Existing(etag) => Some(etag), _ => None },
+            });
+            match &read.replica {
+                PoolMetaReplica::Valid {
+                    raw,
+                    canonical,
+                    meta,
+                    revision,
+                    committed,
+                    ..
+                } => {
+                    observation["state"] = serde_json::json!("valid");
+                    observation["committed"] = serde_json::json!(committed);
+                    observation["version"] = serde_json::json!(revision.version);
+                    observation["cluster_id"] = serde_json::json!(revision.cluster_id);
+                    observation["epoch"] = serde_json::json!(revision.epoch);
+                    observation["generation"] = serde_json::json!(revision.generation);
+                    observation["transaction_id"] = serde_json::json!(revision.transaction_id);
+                    observation["pool_count"] = serde_json::json!(meta.pools.len());
+                    observation["payload_sha256"] = serde_json::json!(rustfs_utils::crypto::hex(Sha256::digest(canonical)));
+                    observation["raw_sha256"] = serde_json::json!(rustfs_utils::crypto::hex(Sha256::digest(raw)));
+                }
+                PoolMetaReplica::Missing => observation["state"] = serde_json::json!("missing"),
+                PoolMetaReplica::Corrupt(_) => observation["state"] = serde_json::json!("corrupt"),
+                PoolMetaReplica::Incompatible(_) => observation["state"] = serde_json::json!("incompatible"),
+                PoolMetaReplica::Unreadable(_) => observation["state"] = serde_json::json!("unreadable"),
+            }
+            startup_cas_test_observe(observation);
+        }
+    }
+    reads
 }
 
 fn select_pool_meta_replicas_observing<R>(write_state: &mut PoolMetaWriteState, replicas: Vec<R>) -> Result<PoolMetaSelection>
@@ -5480,6 +5522,60 @@ fn pool_meta_cas_preconditions(token: &PoolMetaCasToken, object: &str) -> Result
     }
 }
 
+#[cfg(feature = "e2e-test-hooks")]
+struct StartupCasObservation {
+    attempt: uuid::Uuid,
+    phase: &'static str,
+    pools: Vec<usize>,
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+tokio::task_local! {
+    static STARTUP_CAS_OBSERVATION: StartupCasObservation;
+}
+
+// This scope follows only the directly polled startup future. Spawned work
+// does not inherit it; receiver evidence retains its existing RPC tuple.
+#[cfg(feature = "e2e-test-hooks")]
+pub(crate) async fn startup_cas_test_scope<S, F: std::future::Future>(
+    attempt: uuid::Uuid,
+    phase: &'static str,
+    pools: &[Arc<S>],
+    future: F,
+) -> F::Output {
+    STARTUP_CAS_OBSERVATION
+        .scope(
+            StartupCasObservation {
+                attempt,
+                phase,
+                // These identities are never dereferenced or logged. The
+                // caller and operation keep the same pool Arcs alive.
+                pools: pools.iter().map(|pool| Arc::as_ptr(pool) as usize).collect(),
+            },
+            future,
+        )
+        .await
+}
+
+// Direct JSON diagnostics are independent of the startup tracing subscriber.
+#[cfg(feature = "e2e-test-hooks")]
+pub(crate) fn startup_cas_test_observe(mut observation: serde_json::Value) {
+    let Some(nonce) = std::env::var("RUSTFS_E2E_STARTUP_CAS_NONCE")
+        .ok()
+        .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+    else {
+        return;
+    };
+    observation["nonce"] = serde_json::json!(nonce);
+    observation["pid"] = serde_json::json!(std::process::id());
+    let _ = STARTUP_CAS_OBSERVATION.try_with(|scope| {
+        observation["attempt"] = serde_json::json!(scope.attempt);
+        observation["startup_phase"] = serde_json::json!(scope.phase);
+    });
+    let line = format!("RUSTFS_E2E_STARTUP_CAS {observation}\n");
+    let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
+}
+
 async fn save_pool_meta_object_cas<S>(
     pool: Arc<S>,
     object: &str,
@@ -5500,13 +5596,43 @@ where
         ..Default::default()
     };
     fence.add_to_options(&mut opts);
+    #[cfg(feature = "e2e-test-hooks")]
+    let observation = std::env::var_os("RUSTFS_E2E_STARTUP_CAS_NONCE").map(|_| {
+        serde_json::json!({
+            "kind": "cas", "object": object, "phase": phase,
+            "pool": STARTUP_CAS_OBSERVATION.try_with(|scope| {
+                scope.pools.iter().position(|identity| *identity == Arc::as_ptr(&pool) as usize)
+            }).ok().flatten(),
+            "payload_sha256": rustfs_utils::crypto::hex(Sha256::digest(&data)),
+            "if_match": opts.http_preconditions.as_ref().and_then(|p| p.if_match.as_deref()),
+            "if_none_match": opts.http_preconditions.as_ref().and_then(|p| p.if_none_match.as_deref()),
+            "tail_drained": opts.write_completion == crate::object_api::WriteCompletion::TailDrained,
+            "no_lock": opts.no_lock,
+        })
+    });
     let result = save_config_with_opts_and_metadata(pool, object, data, &opts).await;
     if matches!(&result, Err(Error::PreconditionFailed)) {
         record_pool_meta_stale_write_rejection(phase);
     }
-    let object_info = result?;
-    fence.ensure_held()?;
-    Ok(object_info)
+    let result = result.and_then(|object_info| {
+        fence.ensure_held()?;
+        Ok(object_info)
+    });
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(mut observation) = observation {
+        observation["ok"] = serde_json::json!(result.is_ok());
+        observation["etag"] = serde_json::json!(result.as_ref().ok().and_then(|info| info.etag.as_deref()));
+        observation["mod_time"] = serde_json::json!(
+            result
+                .as_ref()
+                .ok()
+                .and_then(|info| info.mod_time)
+                .map(|time| time.unix_timestamp_nanos().to_string())
+        );
+        observation["error"] = serde_json::json!(result.as_ref().err().map(ToString::to_string));
+        startup_cas_test_observe(observation);
+    }
+    result
 }
 
 async fn persist_pool_meta_identity<S>(
@@ -6805,6 +6931,13 @@ impl PoolMeta {
         };
         if confirmed.revision == revision && confirmed.canonical.as_ref() == Some(&durable) {
             persist_pool_meta_identity(pools, write_state, true, fence).await?;
+            #[cfg(feature = "e2e-test-hooks")]
+            startup_cas_test_observe(serde_json::json!({
+                "kind": "confirmed", "object": POOL_META_NAME,
+                "payload_sha256": rustfs_utils::crypto::hex(Sha256::digest(&durable)),
+                "generation": confirmed.revision.generation,
+                "transaction_id": confirmed.revision.transaction_id,
+            }));
             return Ok(confirmed.meta);
         }
         if !commit_succeeded {

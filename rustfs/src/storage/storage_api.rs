@@ -378,9 +378,11 @@ pub(crate) mod timeout_wrapper_consumer {
 
 pub(crate) mod tonic_service_consumer {
     #[cfg(test)]
+    pub(crate) use super::super::tonic_service::make_server;
+    #[cfg(test)]
     pub(crate) use super::super::tonic_service::{heal_topology_fingerprint, make_heal_control_server_for_source};
     pub(crate) use super::super::tonic_service::{
-        make_heal_control_server_with_cache, make_scanner_control_server, make_server, make_tier_mutation_control_server,
+        make_heal_control_server_with_cache, make_scanner_control_server, make_server_for_slot, make_tier_mutation_control_server,
     };
 }
 
@@ -600,8 +602,8 @@ pub(crate) mod ecstore_storage {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
     pub(crate) use rustfs_ecstore::api::storage::{
-        ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk, all_local_disk_path,
-        find_local_disk_by_ref, init_local_disks_with_instance_ctx, init_lock_clients,
+        BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
+        all_local_disk_path, find_local_disk_by_ref, init_local_disks_with_instance_ctx, init_lock_clients,
         prewarm_local_disk_id_map_with_instance_ctx,
     };
 }
@@ -677,6 +679,9 @@ type EcstoreReplicationStats = ecstore_bucket::replication::ReplicationStats;
 pub(crate) type DynReplicationPool = StorageReplicationPoolHandle;
 pub(crate) type DynReader = ecstore_rio::DynReader;
 pub(crate) type ECStore = ecstore_storage::ECStore;
+pub(crate) type BootstrapLocalTarget = ecstore_storage::BootstrapLocalTarget;
+#[cfg(all(test, not(windows)))]
+pub(crate) use rustfs_ecstore::api::disk::{LocalPublicationPause, LocalPublicationStage};
 pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
 #[cfg(test)]
 pub(crate) type Endpoints = ecstore_layout::Endpoints;

@@ -582,13 +582,59 @@ jobs:
           install-build-packaging-tools: 'false'
 
       - name: Build debug binary
-        run: cargo build -p rustfs --bins --features e2e-test-hooks
+        run: |
+          python3 - <<'PYBUILD'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with pathlib.Path(path).open("rb") as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          argv = ["cargo", "build", "-p", "rustfs", "--bins", "--features", "e2e-test-hooks"]
+          commit, tree = git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")
+          clean_before = not git("status", "--porcelain", "--untracked-files=normal")
+          if not clean_before:
+              raise SystemExit("hooks binary requires a clean build checkout")
+          lock_sha256 = sha256("Cargo.lock")
+          lock_git_blob = git("hash-object", "Cargo.lock")
+          rustc = subprocess.check_output(["rustc", "-vV"], text=True)
+          host = next(line.removeprefix("host: ") for line in rustc.splitlines() if line.startswith("host: "))
+          if os.environ.get("CARGO_BUILD_TARGET") or pathlib.Path(os.environ.get("CARGO_TARGET_DIR", "target")).resolve() != pathlib.Path("target").resolve():
+              raise SystemExit("this artifact requires the native target/debug output")
+          subprocess.run(argv, check=True)
+          clean_after = not git("status", "--porcelain", "--untracked-files=normal")
+          if not clean_after or commit != git("rev-parse", "HEAD") or tree != git("rev-parse", "HEAD^{tree}") or lock_sha256 != sha256("Cargo.lock"):
+              raise SystemExit("hooks binary source changed while building")
+          manifest = {
+              "schema": 1, "commit": commit, "tree": tree,
+              "clean_before": clean_before, "clean_after": clean_after,
+              "lock_sha256": lock_sha256, "lock_git_blob": lock_git_blob,
+              "argv": argv, "profile": "debug", "target": host,
+              "features": ["e2e-test-hooks"],
+              "rustc_verbose": rustc,
+              "build_flags": {key: os.environ[key] for key in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_TARGET", "CARGO_TARGET_DIR", "RUSTUP_TOOLCHAIN") if key in os.environ},
+              "binary_sha256": sha256("target/debug/rustfs"),
+          }
+          pathlib.Path("target/debug/rustfs.e2e-startup-cas-build.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PYBUILD
 
       - name: Upload debug binary
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rustfs-debug-binary
-          path: target/debug/rustfs
+          path: |
+            target/debug/rustfs
+            target/debug/rustfs.e2e-startup-cas-build.json
           if-no-files-found: error
           retention-days: 1
 
@@ -906,6 +952,36 @@ jobs:
       - name: Make binary executable
         run: chmod +x ./target/debug/rustfs
 
+      - name: Preserve startup CAS binary input
+        env:
+          STARTUP_CAS_INPUT: ${{ runner.temp }}/rustfs-startup-cas-input
+        run: |
+          python3 - <<'PYINPUT'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+
+          source = pathlib.Path("target/debug/rustfs")
+          manifest_path = source.with_name("rustfs.e2e-startup-cas-build.json")
+          manifest = json.loads(manifest_path.read_text())
+          target = pathlib.Path(os.environ["STARTUP_CAS_INPUT"])
+          target.mkdir(parents=True, exist_ok=True)
+          binary = target / "rustfs"
+          shutil.copy2(source, binary)
+          digest = hashlib.sha256()
+          with binary.open("rb") as stream:
+              for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                  digest.update(chunk)
+          commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          if manifest["binary_sha256"] != digest.hexdigest() or manifest["commit"] != commit:
+              raise SystemExit("downloaded hooks binary identity mismatch")
+          shutil.copy2(manifest_path, target / manifest_path.name)
+          binary.chmod(0o755)
+          PYINPUT
+
       - name: Verify e2e full membership
         env:
           NEXTEST_LISTING: ${{ runner.temp }}/rustfs-e2e-full-list.json
@@ -918,6 +994,10 @@ jobs:
       # extend that filter, never add ad-hoc e2e jobs here. Reuses the downloaded
       # debug binary; each test spawns its own rustfs server on a random port.
       - name: Run e2e full suite
+        env:
+          RUSTFS_E2E_STARTUP_CAS_BINARY: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs
+          RUSTFS_E2E_STARTUP_CAS_BUILD_MANIFEST: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs.e2e-startup-cas-build.json
+          RUSTFS_E2E_STARTUP_CAS_ARTIFACT_DIR: ${{ runner.temp }}/rustfs-startup-cas-evidence
         run: cargo nextest run --profile e2e-full -p e2e_test
 
       - name: Upload junit
@@ -928,6 +1008,17 @@ jobs:
           path: |
             target/nextest/e2e-full/junit.xml
             ${{ runner.temp }}/rustfs-e2e-full-list.json
+          retention-days: 7
+
+      - name: Upload startup CAS evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: fresh-startup-cas-evidence-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/rustfs-startup-cas-evidence
+            ${{ runner.temp }}/rustfs-startup-cas-input/rustfs.e2e-startup-cas-build.json
+          if-no-files-found: warn
           retention-days: 7
 
   e2e-tests-rio-v2:
