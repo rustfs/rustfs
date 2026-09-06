@@ -49,10 +49,11 @@ use rustfs_protos::proto_gen::node_service::{
     LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
     LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest,
     ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageSnapshotRequest, ScannerDirtyUsageSnapshotResponse,
-    ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse, ServerInfoRequest,
-    SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest,
-    TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse,
-    TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
+    ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
+    ScannerScopedDirtyUsageAckRequest, ScannerScopedDirtyUsageEntry, ServerInfoRequest, SignalServiceRequest,
+    SignalServiceResponse, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest, TierDailyStatsRequest,
+    TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse, TierMutationFailureClass,
+    TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
     tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
 pub use rustfs_protos::{PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS};
@@ -92,6 +93,7 @@ const HEAL_CONTROL_PAYLOAD_MAX_SIZE: usize = 64 * 1024;
 const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
 const PEER_REST_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SCANNER_ACTIVITY_MAX_MESSAGE_SIZE: usize = 1024;
+const SCANNER_SCOPED_DIRTY_USAGE_STAGE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Reserve time for the acquire response's network/clock uncertainty.  The
 /// server owns the real expiry; this local deadline is intentionally earlier
 /// so a coordinator never starts a bounded persistence operation at the edge
@@ -192,12 +194,102 @@ pub struct ScannerPeerActivity {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScannerPeerDirtyUsageSnapshot {
+    pub owner_id: String,
     pub instance_id: String,
     pub generation: u64,
     pub pending_bucket_count: u64,
     pub protocol_version: u32,
     pub complete: bool,
-    pub buckets: BTreeMap<String, u64>,
+    pub buckets: BTreeMap<String, ScannerPeerDirtyUsageBucket>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScannerPeerDirtyUsageBucket {
+    pub bucket_incarnation: Uuid,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScannerScopedDirtyUsageAckEntry {
+    pub bucket: String,
+    pub bucket_incarnation: Uuid,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScannerDirtyUsageAcknowledgement {
+    Generation {
+        host: String,
+        instance_id: String,
+        generation: u64,
+    },
+    Scoped {
+        host: String,
+        owner_id: String,
+        instance_id: String,
+        entries: Vec<ScannerScopedDirtyUsageAckEntry>,
+    },
+}
+
+fn scanner_scoped_dirty_usage_ack_payloads(
+    owner_id: String,
+    instance_id: String,
+    probe_only: bool,
+    entries: Vec<ScannerScopedDirtyUsageAckEntry>,
+) -> Result<Vec<ScannerScopedDirtyUsageAckRequest>> {
+    use rustfs_protos::scoped_dirty_usage::*;
+
+    if entries.is_empty() {
+        return Err(Error::other("scoped dirty usage acknowledgement entries must be nonempty"));
+    }
+
+    let mut payloads = Vec::with_capacity(entries.len().div_ceil(SCOPED_DIRTY_USAGE_MAX_ENTRIES as usize));
+    let mut batch = Vec::with_capacity(SCOPED_DIRTY_USAGE_MAX_ENTRIES as usize);
+    for entry in entries {
+        batch.push(ScannerScopedDirtyUsageEntry {
+            bucket: entry.bucket,
+            bucket_incarnation: entry.bucket_incarnation.as_bytes().to_vec().into(),
+            generation: entry.generation,
+        });
+        if batch.len() == SCOPED_DIRTY_USAGE_MAX_ENTRIES as usize {
+            payloads.push(scanner_scoped_dirty_usage_ack_payload(
+                &owner_id,
+                &instance_id,
+                probe_only,
+                std::mem::take(&mut batch),
+            )?);
+        }
+    }
+    if !batch.is_empty() {
+        payloads.push(scanner_scoped_dirty_usage_ack_payload(&owner_id, &instance_id, probe_only, batch)?);
+    }
+
+    Ok(payloads)
+}
+
+fn scanner_scoped_dirty_usage_ack_payload(
+    owner_id: &str,
+    instance_id: &str,
+    probe_only: bool,
+    entries: Vec<ScannerScopedDirtyUsageEntry>,
+) -> Result<ScannerScopedDirtyUsageAckRequest> {
+    use rustfs_protos::scoped_dirty_usage::*;
+
+    let payload = ScannerScopedDirtyUsageAckRequest {
+        challenge: Uuid::new_v4().as_bytes().to_vec().into(),
+        protocol_version: SCOPED_DIRTY_USAGE_PROTOCOL_VERSION,
+        owner_id: owner_id.to_string(),
+        instance_id: instance_id.to_string(),
+        scope: SCOPED_DIRTY_USAGE_BUCKET_SCOPE,
+        probe_only,
+        entries,
+    };
+    canonical_scoped_dirty_usage_request(&payload).map_err(|err| Error::other(err.to_string()))?;
+    Ok(payload)
+}
+
+fn scanner_scoped_dirty_usage_ack_reconciled(activity: &ScannerPeerActivity, expected_instance_id: &str) -> bool {
+    activity.instance_id == expected_instance_id && activity.dirty_usage_pending == Some(false)
 }
 
 fn scanner_instance_id_is_valid(instance_id: &str) -> bool {
@@ -351,6 +443,11 @@ fn decode_scanner_dirty_usage_snapshot_with_verifier(
     if !scanner_instance_id_is_valid(&response.instance_id) {
         return Err(Error::other("peer returned an invalid scanner dirty usage snapshot instance ID"));
     }
+    let owner_id = Uuid::parse_str(&response.owner_id)
+        .ok()
+        .filter(|owner_id| !owner_id.is_nil())
+        .map(|owner_id| owner_id.to_string())
+        .ok_or_else(|| Error::other("peer returned an invalid scanner dirty usage snapshot owner"))?;
     if response.generation == u64::MAX {
         return Err(Error::other("peer scanner dirty usage snapshot exhausted its generation"));
     }
@@ -386,9 +483,14 @@ fn decode_scanner_dirty_usage_snapshot_with_verifier(
         if bucket.generation == 0 || bucket.generation > response.generation {
             return Err(Error::other("peer scanner dirty usage snapshot contains an invalid bucket generation"));
         }
+        Uuid::from_slice(bucket.bucket_incarnation.as_ref())
+            .ok()
+            .filter(|bucket_incarnation| !bucket_incarnation.is_nil())
+            .ok_or_else(|| Error::other("peer scanner dirty usage snapshot contains an invalid bucket incarnation"))?;
     }
 
     Ok(ScannerPeerDirtyUsageSnapshot {
+        owner_id,
         instance_id: response.instance_id,
         generation: response.generation,
         pending_bucket_count: response.pending_bucket_count,
@@ -397,7 +499,16 @@ fn decode_scanner_dirty_usage_snapshot_with_verifier(
         buckets: response
             .buckets
             .into_iter()
-            .map(|bucket| (bucket.bucket, bucket.generation))
+            .map(|bucket| {
+                (
+                    bucket.bucket,
+                    ScannerPeerDirtyUsageBucket {
+                        bucket_incarnation: Uuid::from_slice(bucket.bucket_incarnation.as_ref())
+                            .expect("bucket incarnation was validated"),
+                        generation: bucket.generation,
+                    },
+                )
+            })
             .collect(),
     })
 }
@@ -2077,19 +2188,10 @@ impl PeerRestClient {
         &self,
         owner_id: String,
         instance_id: String,
-        entries: Vec<rustfs_protos::proto_gen::node_service::ScannerScopedDirtyUsageEntry>,
+        entries: Vec<ScannerScopedDirtyUsageAckEntry>,
     ) -> Result<bool> {
         use rustfs_protos::scoped_dirty_usage::*;
-        let payload = rustfs_protos::proto_gen::node_service::ScannerScopedDirtyUsageAckRequest {
-            challenge: Uuid::new_v4().as_bytes().to_vec().into(),
-            protocol_version: SCOPED_DIRTY_USAGE_PROTOCOL_VERSION,
-            owner_id,
-            instance_id,
-            scope: SCOPED_DIRTY_USAGE_BUCKET_SCOPE,
-            probe_only: true,
-            entries,
-        };
-        let canonical = canonical_scoped_dirty_usage_request(&payload).map_err(|err| Error::other(err.to_string()))?;
+        let payloads = scanner_scoped_dirty_usage_ack_payloads(owner_id, instance_id, true, entries)?;
         self.finalize_result(
             async {
                 let mut client = super::client::scanner_control_time_out_client(
@@ -2097,26 +2199,106 @@ impl PeerRestClient {
                     TonicInterceptor::Signature(gen_tonic_signature_interceptor()),
                 )
                 .await?;
+                for payload in payloads {
+                    let canonical =
+                        canonical_scoped_dirty_usage_request(&payload).map_err(|err| Error::other(err.to_string()))?;
+                    let mut request = Request::new(payload.clone());
+                    set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                    let response = client.scanner_scoped_dirty_usage_ack(request).await?.into_inner();
+                    let body = canonical_scoped_dirty_usage_response(&canonical, &response)
+                        .map_err(|_| Error::other("scoped dirty usage capability response is too large"))?;
+                    verify_tonic_rpc_response_proof(&body, response.response_proof.as_ref())?;
+                    if response.protocol_version != SCOPED_DIRTY_USAGE_PROTOCOL_VERSION
+                        || response.owner_id != payload.owner_id
+                        || response.instance_id != payload.instance_id
+                        || response.max_entries != SCOPED_DIRTY_USAGE_MAX_ENTRIES
+                        || response.max_request_bytes != SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES
+                        || response.cleared != 0
+                    {
+                        return Err(Error::other("scoped dirty usage capability response does not match request"));
+                    }
+                    if !response.supported {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            .await,
+        )
+        .await
+    }
+
+    pub async fn acknowledge_scanner_scoped_dirty_usage(
+        &self,
+        owner_id: String,
+        instance_id: String,
+        entries: Vec<ScannerScopedDirtyUsageAckEntry>,
+    ) -> Result<ScannerPeerActivity> {
+        use rustfs_protos::scoped_dirty_usage::*;
+        let payloads = scanner_scoped_dirty_usage_ack_payloads(owner_id, instance_id.clone(), false, entries)?;
+        let ack_attempt = async {
+            let mut client = super::client::scanner_control_time_out_client(
+                &self.grid_host,
+                TonicInterceptor::Signature(gen_tonic_signature_interceptor()),
+            )
+            .await?;
+            for payload in payloads {
+                let canonical = canonical_scoped_dirty_usage_request(&payload).map_err(|err| Error::other(err.to_string()))?;
                 let mut request = Request::new(payload.clone());
                 set_tonic_canonical_body_digest(&mut request, &canonical)?;
                 let response = client.scanner_scoped_dirty_usage_ack(request).await?.into_inner();
                 let body = canonical_scoped_dirty_usage_response(&canonical, &response)
-                    .map_err(|_| Error::other("scoped dirty usage capability response is too large"))?;
+                    .map_err(|_| Error::other("scoped dirty usage acknowledgement response is too large"))?;
                 verify_tonic_rpc_response_proof(&body, response.response_proof.as_ref())?;
                 if response.protocol_version != SCOPED_DIRTY_USAGE_PROTOCOL_VERSION
                     || response.owner_id != payload.owner_id
                     || response.instance_id != payload.instance_id
                     || response.max_entries != SCOPED_DIRTY_USAGE_MAX_ENTRIES
                     || response.max_request_bytes != SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES
-                    || response.cleared != 0
+                    || !response.supported
                 {
-                    return Err(Error::other("scoped dirty usage capability response does not match request"));
+                    return Err(Error::other("scoped dirty usage acknowledgement response does not match request"));
                 }
-                Ok(response.supported)
             }
-            .await,
-        )
-        .await
+            Ok(())
+        };
+        let result = match timeout(SCANNER_SCOPED_DIRTY_USAGE_STAGE_TIMEOUT, ack_attempt).await {
+            Ok(result) => self.finalize_result(result).await,
+            Err(_) => {
+                self.prepare_retry_with_timeout(SCANNER_SCOPED_DIRTY_USAGE_STAGE_TIMEOUT)
+                    .await;
+                Err(Error::other("scoped dirty usage acknowledgement deadline elapsed"))
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                let activity = self.scanner_scoped_dirty_usage_activity_confirmation().await?;
+                if activity.instance_id == instance_id {
+                    Ok(activity)
+                } else {
+                    Err(Error::other(
+                        "scoped dirty usage acknowledgement peer restarted before activity confirmation",
+                    ))
+                }
+            }
+            Err(err) => {
+                if Self::is_network_like_error(&err) {
+                    self.prepare_retry_with_timeout(SCANNER_SCOPED_DIRTY_USAGE_STAGE_TIMEOUT)
+                        .await;
+                }
+                match self.scanner_scoped_dirty_usage_activity_confirmation().await {
+                    Ok(activity) if scanner_scoped_dirty_usage_ack_reconciled(&activity, &instance_id) => Ok(activity),
+                    _ => Err(err),
+                }
+            }
+        }
+    }
+
+    async fn scanner_scoped_dirty_usage_activity_confirmation(&self) -> Result<ScannerPeerActivity> {
+        timeout(SCANNER_SCOPED_DIRTY_USAGE_STAGE_TIMEOUT, self.scanner_activity())
+            .await
+            .map_err(|_| Error::other("scoped dirty usage activity confirmation timed out"))?
     }
 
     pub async fn acknowledge_scanner_dirty_usage(&self, instance_id: String, generation: u64) -> Result<ScannerPeerActivity> {
@@ -2845,14 +3027,77 @@ mod tests {
                 rustfs_protos::proto_gen::node_service::ScannerDirtyUsageBucket {
                     bucket: "archive".to_string(),
                     generation: 3,
+                    bucket_incarnation: Uuid::from_u128(0x11111111111111111111111111111111).as_bytes().to_vec().into(),
                 },
                 rustfs_protos::proto_gen::node_service::ScannerDirtyUsageBucket {
                     bucket: "photos".to_string(),
                     generation: 7,
+                    bucket_incarnation: Uuid::from_u128(0x22222222222222222222222222222222).as_bytes().to_vec().into(),
                 },
             ],
             response_proof: b"proof".to_vec().into(),
+            owner_id: "33333333-3333-3333-3333-333333333333".to_string(),
         }
+    }
+
+    #[test]
+    fn scanner_scoped_dirty_usage_ack_payloads_split_at_protocol_limit() {
+        use rustfs_protos::scoped_dirty_usage::{SCOPED_DIRTY_USAGE_MAX_ENTRIES, canonical_scoped_dirty_usage_request};
+
+        let entries = (0..=SCOPED_DIRTY_USAGE_MAX_ENTRIES)
+            .map(|index| ScannerScopedDirtyUsageAckEntry {
+                bucket: format!("bucket-{index:02}"),
+                bucket_incarnation: Uuid::from_u128(0x11111111111111111111111111111111),
+                generation: 9,
+            })
+            .collect::<Vec<_>>();
+
+        let payloads = scanner_scoped_dirty_usage_ack_payloads(
+            "33333333-3333-3333-3333-333333333333".to_string(),
+            "0123456789abcdef0123456789abcdef".to_string(),
+            false,
+            entries,
+        )
+        .expect("33 entries should split into valid scoped dirty usage requests");
+
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0].entries.len(), SCOPED_DIRTY_USAGE_MAX_ENTRIES as usize);
+        assert_eq!(payloads[1].entries.len(), 1);
+        assert_eq!(payloads[0].entries.first().map(|entry| entry.bucket.as_str()), Some("bucket-00"));
+        assert_eq!(payloads[0].entries.last().map(|entry| entry.bucket.as_str()), Some("bucket-31"));
+        assert_eq!(payloads[1].entries.first().map(|entry| entry.bucket.as_str()), Some("bucket-32"));
+        for payload in payloads {
+            canonical_scoped_dirty_usage_request(&payload).expect("each split scoped ACK payload should be canonical");
+        }
+    }
+
+    #[test]
+    fn scanner_scoped_dirty_usage_ack_reconciliation_requires_same_clean_instance() {
+        let activity = |instance_id: &str, pending| ScannerPeerActivity {
+            instance_id: instance_id.to_string(),
+            namespace_generation: 1,
+            maintenance_generation: 1,
+            protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            topology_digest: Some([1; 32]),
+            data_movement_active: Some(false),
+            dirty_usage_generation: Some(9),
+            dirty_usage_pending: pending,
+            movement_generation: Some(1),
+            publication_blocked: Some(false),
+        };
+
+        assert!(scanner_scoped_dirty_usage_ack_reconciled(
+            &activity("0123456789abcdef0123456789abcdef", Some(false)),
+            "0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!scanner_scoped_dirty_usage_ack_reconciled(
+            &activity("0123456789abcdef0123456789abcdef", Some(true)),
+            "0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!scanner_scoped_dirty_usage_ack_reconciled(
+            &activity("fedcba9876543210fedcba9876543210", Some(false)),
+            "0123456789abcdef0123456789abcdef"
+        ));
     }
 
     #[test]
@@ -2863,9 +3108,18 @@ mod tests {
         assert_eq!(decoded.generation, 7);
         assert_eq!(decoded.pending_bucket_count, 2);
         assert_eq!(decoded.protocol_version, SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION);
+        assert_eq!(decoded.owner_id, "33333333-3333-3333-3333-333333333333");
         assert!(decoded.complete);
-        assert_eq!(decoded.buckets.get("archive"), Some(&3));
-        assert_eq!(decoded.buckets.get("photos"), Some(&7));
+        assert_eq!(
+            decoded.buckets.get("archive").map(|bucket| bucket.bucket_incarnation),
+            Some(Uuid::from_u128(0x11111111111111111111111111111111))
+        );
+        assert_eq!(decoded.buckets.get("archive").map(|bucket| bucket.generation), Some(3));
+        assert_eq!(
+            decoded.buckets.get("photos").map(|bucket| bucket.bucket_incarnation),
+            Some(Uuid::from_u128(0x22222222222222222222222222222222))
+        );
+        assert_eq!(decoded.buckets.get("photos").map(|bucket| bucket.generation), Some(7));
 
         let overflow_count =
             u64::try_from(SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES + 1).expect("the test snapshot entry limit should fit in u64");
@@ -2916,6 +3170,14 @@ mod tests {
         empty_bucket.buckets[0].bucket.clear();
         cases.push((empty_bucket, "empty bucket name"));
 
+        let mut invalid_owner = test_scanner_dirty_usage_snapshot_response();
+        invalid_owner.owner_id.clear();
+        cases.push((invalid_owner, "snapshot owner"));
+
+        let mut invalid_incarnation = test_scanner_dirty_usage_snapshot_response();
+        invalid_incarnation.buckets[0].bucket_incarnation = Uuid::nil().as_bytes().to_vec().into();
+        cases.push((invalid_incarnation, "bucket incarnation"));
+
         let mut partial = test_scanner_dirty_usage_snapshot_response();
         partial.complete = false;
         cases.push((partial, "entry-limit overflow"));
@@ -2928,6 +3190,7 @@ mod tests {
                 .map(|index| rustfs_protos::proto_gen::node_service::ScannerDirtyUsageBucket {
                     bucket: format!("bucket-{index:04}"),
                     generation: 1,
+                    bucket_incarnation: Uuid::from_u128(0x11111111111111111111111111111111).as_bytes().to_vec().into(),
                 })
                 .collect(),
             ..test_scanner_dirty_usage_snapshot_response()

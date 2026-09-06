@@ -15,8 +15,6 @@
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
 
 use crate::error::is_err_bucket_not_found;
 #[cfg(feature = "gcs")]
@@ -719,17 +717,7 @@ async fn check_warm_backend_with_deadlines(
     if !matches!(cleanup_result, Ok(Ok(()))) {
         return Err(probe_cleanup_incomplete_error());
     }
-    if let Err(err) = read_result {
-        //if is_err_bucket_not_found(&err) {
-        //    return Err(ERR_TIER_BUCKET_NOT_FOUND);
-        //}
-        /*else if is_err_signature_does_not_match(err) {
-            return Err(ERR_TIER_MISSING_CREDENTIALS);
-        }*/
-        //else {
-        return Err(err);
-        //}
-    }
+    read_result?;
     Ok(())
 }
 
@@ -759,7 +747,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -800,7 +788,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -820,7 +808,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -840,7 +828,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -860,7 +848,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -880,7 +868,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -900,7 +888,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -929,7 +917,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -949,7 +937,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }

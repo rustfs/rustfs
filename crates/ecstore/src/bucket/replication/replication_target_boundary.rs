@@ -48,6 +48,7 @@ pub use rustfs_replication::{ObjectLockIntegrity, object_lock_put_integrity};
 pub(crate) use rustfs_replication::{
     SsecPassthroughGate, is_replication_target_offline_error, ssec_passthrough_gate, version_identity_drifted,
 };
+pub use rustfs_replication::{VersionIdentityCapability, version_identity_capability_from_put};
 
 use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Error, Result};
@@ -190,6 +191,14 @@ impl ReplicationTargetStore {
         BucketTargetSys::get()
             .record_ssec_passthrough_capability(arn, capability)
             .await
+    }
+
+    pub(crate) fn version_identity_capability(arn: &str) -> VersionIdentityCapability {
+        BucketTargetSys::get().version_identity_capability(arn)
+    }
+
+    pub(crate) fn record_version_identity_capability(arn: &str, capability: VersionIdentityCapability) {
+        BucketTargetSys::get().record_version_identity_capability(arn, capability)
     }
 
     #[cfg(test)]

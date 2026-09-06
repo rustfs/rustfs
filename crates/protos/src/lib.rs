@@ -575,11 +575,13 @@ pub fn canonical_scanner_dirty_usage_snapshot_response_body(
     body.push_u64(response.generation);
     body.push_u64(response.pending_bucket_count);
     body.push_u32(response.protocol_version);
+    body.push_str(&response.owner_id)?;
     body.push_bool(response.complete);
     body.push_count(response.buckets.len())?;
     for bucket in &response.buckets {
         body.push_str(&bucket.bucket)?;
         body.push_u64(bucket.generation);
+        body.push_bytes(bucket.bucket_incarnation.as_ref())?;
     }
     Ok(body.finish())
 }
@@ -1842,13 +1844,16 @@ mod scanner_activity_tests {
                 ScannerDirtyUsageBucket {
                     bucket: "archive".to_string(),
                     generation: 3,
+                    bucket_incarnation: vec![1; 16].into(),
                 },
                 ScannerDirtyUsageBucket {
                     bucket: "photos".to_string(),
                     generation: 7,
+                    bucket_incarnation: vec![2; 16].into(),
                 },
             ],
             response_proof: vec![9; 32].into(),
+            owner_id: "11111111-1111-1111-1111-111111111111".to_string(),
         };
         let baseline = canonical_scanner_dirty_usage_snapshot_response_body(&[1; 16], &response)
             .expect("scanner dirty usage snapshot response should encode");
@@ -1865,6 +1870,9 @@ mod scanner_activity_tests {
         let mut protocol = response.clone();
         protocol.protocol_version = 2;
         variants.push(protocol);
+        let mut owner = response.clone();
+        owner.owner_id = "22222222-2222-2222-2222-222222222222".to_string();
+        variants.push(owner);
         let mut complete = response.clone();
         complete.complete = false;
         variants.push(complete);
@@ -1874,6 +1882,9 @@ mod scanner_activity_tests {
         let mut bucket_generation = response.clone();
         bucket_generation.buckets[0].generation = 4;
         variants.push(bucket_generation);
+        let mut bucket_incarnation = response.clone();
+        bucket_incarnation.buckets[0].bucket_incarnation = vec![3; 16].into();
+        variants.push(bucket_incarnation);
         let mut bucket_order = response.clone();
         bucket_order.buckets.reverse();
         variants.push(bucket_order);

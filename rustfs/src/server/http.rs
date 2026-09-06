@@ -2418,6 +2418,7 @@ fn get_default_tcp_keepalive() -> TcpKeepalive {
 mod tests {
     use super::*;
     use crate::server::compress::RequestPathCategory;
+    use crate::storage_api::server::http::ScannerScopedDirtyUsageAckEntry;
     use bytes::Bytes;
     use http::Request as HttpRequest;
     use http::{HeaderMap, StatusCode};
@@ -3454,9 +3455,9 @@ mod tests {
             .scanner_scoped_dirty_usage_capability(
                 "11111111-1111-1111-1111-111111111111".to_string(),
                 "a".repeat(32),
-                vec![rustfs_protos::proto_gen::node_service::ScannerScopedDirtyUsageEntry {
-                    bucket: "photos".into(),
-                    bucket_incarnation: vec![1; 16].into(),
+                vec![ScannerScopedDirtyUsageAckEntry {
+                    bucket: "photos".to_string(),
+                    bucket_incarnation: uuid::Uuid::from_u128(0x11111111111111111111111111111111),
                     generation: 8,
                 }],
             )

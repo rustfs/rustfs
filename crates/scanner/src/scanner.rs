@@ -2216,10 +2216,7 @@ where
         false
     } else if let Some(notification_system) = storeapi.scanner_notification_system() {
         let acknowledgement_count = remote_dirty_usage_acknowledgements.len();
-        let acknowledgements = remote_dirty_usage_acknowledgements
-            .into_iter()
-            .map(|acknowledgement| (acknowledgement.host, acknowledgement.instance_id, acknowledgement.generation))
-            .collect();
+        let acknowledgements = remote_dirty_usage_acknowledgements.into_iter().map(Into::into).collect();
         remote_dirty_usage_acknowledgement_pending(
             cycle_info.current,
             acknowledgement_count,
@@ -3578,9 +3575,10 @@ use usage_store::*;
 
 pub use activity::scanner_topology_digest;
 pub(crate) use activity::{
-    ScannerActivitySnapshot, ScannerDirtyUsageAcknowledgement, probe_scanner_activity, scanner_activity_allows_usage_publication,
-    scanner_activity_dirty_usage_state_for_host, scanner_activity_publication_lease_targets, scanner_activity_snapshot_digest,
-    scanner_activity_structural_digest, scanner_dirty_usage_acknowledgements,
+    ScannerActivitySnapshot, ScannerDirtyUsageAcknowledgement, ScannerDirtyUsageAcknowledgementKind, probe_scanner_activity,
+    scanner_activity_allows_usage_publication, scanner_activity_dirty_usage_state_for_host,
+    scanner_activity_publication_lease_targets, scanner_activity_snapshot_digest, scanner_activity_structural_digest,
+    scanner_dirty_usage_acknowledgements,
 };
 pub(crate) use activity::{ScannerCycleOutcome, scanner_cycle_outcome_with_pending_maintenance};
 pub use backlog::{

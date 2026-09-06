@@ -123,6 +123,13 @@ pub struct CommittedSnapshot {
     payload: Vec<u8>,
 }
 
+#[derive(Default)]
+struct SnapshotReadStats {
+    file_reads: usize,
+    bytes_read: usize,
+    peak_file_bytes: usize,
+}
+
 impl CommittedSnapshot {
     /// Persistent single-writer sequence, not a process UUID ordering.
     pub fn sequence(&self) -> u64 {
@@ -162,6 +169,15 @@ pub enum RecoverySnapshot {
 }
 
 async fn read_bounded(disk: &EcstoreDiskStore, path: &str, limit: usize) -> Result<Option<Vec<u8>>, SnapshotError> {
+    read_bounded_with_stats(disk, path, limit, None).await
+}
+
+async fn read_bounded_with_stats(
+    disk: &EcstoreDiskStore,
+    path: &str,
+    limit: usize,
+    mut stats: Option<&mut SnapshotReadStats>,
+) -> Result<Option<Vec<u8>>, SnapshotError> {
     let reader = match EcstoreDiskAPI::read_file(disk.as_ref(), RUSTFS_META_BUCKET, path).await {
         Ok(reader) => reader,
         Err(EcstoreDiskError::FileNotFound | EcstoreDiskError::VolumeNotFound) => return Ok(None),
@@ -177,6 +193,11 @@ async fn read_bounded(disk: &EcstoreDiskStore, path: &str, limit: usize) -> Resu
         .map_err(SnapshotError::Read)?;
     if bytes.len() > limit {
         return Err(SnapshotError::TooLarge);
+    }
+    if let Some(stats) = stats.as_mut() {
+        stats.file_reads += 1;
+        stats.bytes_read = stats.bytes_read.checked_add(bytes.len()).ok_or(SnapshotError::TooLarge)?;
+        stats.peak_file_bytes = stats.peak_file_bytes.max(bytes.len());
     }
     Ok(Some(bytes))
 }
@@ -197,17 +218,26 @@ fn select_snapshot(selected: &mut Option<CommittedSnapshot>, candidate: Committe
 }
 
 async fn read_committed(disks: &[EcstoreDiskStore], limit: usize) -> Result<Option<CommittedSnapshot>, SnapshotError> {
+    read_committed_with_stats(disks, limit, None).await
+}
+
+async fn read_committed_with_stats(
+    disks: &[EcstoreDiskStore],
+    limit: usize,
+    mut stats: Option<&mut SnapshotReadStats>,
+) -> Result<Option<CommittedSnapshot>, SnapshotError> {
     let mut selected = None;
     let mut damaged = None;
     let mut identities = HashMap::new();
     for disk in disks {
         for (manifest_path, payload_path) in MANIFEST_PATHS.into_iter().zip(PAYLOAD_PATHS) {
             let candidate = async {
-                let Some(manifest) = read_bounded(disk, manifest_path, MANIFEST_LEN).await? else {
+                let Some(manifest) = read_bounded_with_stats(disk, manifest_path, MANIFEST_LEN, stats.as_deref_mut()).await?
+                else {
                     return Ok(None);
                 };
                 let header = Manifest::decode(&manifest, limit)?;
-                let payload = read_bounded(disk, payload_path, header.payload_len)
+                let payload = read_bounded_with_stats(disk, payload_path, header.payload_len, stats.as_deref_mut())
                     .await?
                     .ok_or(SnapshotError::Corrupt)?;
                 CommittedSnapshot::decode(&manifest, payload, limit).map(Some)
@@ -493,6 +523,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_reader_reopens_previous_anchor_across_publication_boundaries() {
+        let owner = Uuid::new_v4();
+        let old = payload("old");
+        let next = payload("next");
+        let boundaries = [
+            ("payload-only", next.clone(), None),
+            ("torn-manifest", next.clone(), Some(manifest(owner, 2, &next)[..20].to_vec())),
+            ("stale-payload", old.clone(), Some(manifest(owner, 2, &next))),
+        ];
+        for (case, successor_payload, successor_manifest) in boundaries {
+            let root = TempDir::new().expect("test directory");
+            let store = disk(&root, "disk").await;
+            commit(&store, 0, owner, 1, &old).await;
+            install(&store, PAYLOAD_PATHS[1], &successor_payload).await;
+            if let Some(manifest) = &successor_manifest {
+                install(&store, MANIFEST_PATHS[1], manifest).await;
+            }
+
+            let reopened = disk(&root, "disk").await;
+            let recovered = read_committed(std::slice::from_ref(&reopened), 4096)
+                .await
+                .unwrap_or_else(|error| panic!("{case}: old anchor must remain readable after reopen: {error:?}"))
+                .unwrap_or_else(|| panic!("{case}: previous committed anchor missing after reopen"));
+            assert_eq!(recovered.manifest.sequence, 1, "{case}: successor must not become authoritative");
+            assert_eq!(recovered.payload, old, "{case}: previous payload must survive");
+            assert_eq!(
+                EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, PAYLOAD_PATHS[0])
+                    .await
+                    .expect("old payload retained")
+                    .as_ref(),
+                old.as_slice(),
+                "{case}: previous payload bytes changed"
+            );
+            assert_eq!(
+                EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[0])
+                    .await
+                    .expect("old manifest retained")
+                    .as_ref(),
+                manifest(owner, 1, &old).as_slice(),
+                "{case}: previous manifest bytes changed"
+            );
+            assert_eq!(
+                EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, PAYLOAD_PATHS[1])
+                    .await
+                    .expect("successor payload retained")
+                    .as_ref(),
+                successor_payload.as_slice(),
+                "{case}: successor evidence changed"
+            );
+            if let Some(manifest) = &successor_manifest {
+                assert_eq!(
+                    EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[1])
+                        .await
+                        .expect("successor manifest retained")
+                        .as_ref(),
+                    manifest.as_slice(),
+                    "{case}: successor manifest evidence changed"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn stale_manifest_cas_cannot_replace_committed_anchor() {
         let root = TempDir::new().expect("test directory");
         let disk = disk(&root, "disk").await;
@@ -568,6 +661,35 @@ mod tests {
                 .expect("payload retained")
                 .as_ref(),
             bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_reader_resource_bounds_are_measured() {
+        let root = TempDir::new().expect("test directory");
+        let first = disk(&root, "first").await;
+        let second = disk(&root, "second").await;
+        let owner = Uuid::new_v4();
+        let old = [payload("old-0"), payload("old-1")].concat();
+        let new = [payload("new-0"), payload("new-1"), payload("new-2")].concat();
+        commit(&first, 0, owner, 1, &old).await;
+        commit(&second, 1, owner, 2, &new).await;
+
+        let mut stats = SnapshotReadStats::default();
+        let recovered = read_committed_with_stats(&[first, second], 4096, Some(&mut stats))
+            .await
+            .expect("read committed replicas")
+            .expect("committed snapshot");
+
+        assert_eq!(recovered.sequence(), 2);
+        assert_eq!(recovered.payload(), new.as_slice());
+        assert_eq!(recovered.manifest.payload_len, new.len());
+        assert_eq!(stats.file_reads, 4, "only committed manifests and their payloads are materialized");
+        assert_eq!(stats.bytes_read, (MANIFEST_LEN * 2) + old.len() + new.len());
+        assert_eq!(
+            stats.peak_file_bytes,
+            new.len().max(MANIFEST_LEN),
+            "reader peak allocation remains bounded by one manifest or payload file"
         );
     }
 

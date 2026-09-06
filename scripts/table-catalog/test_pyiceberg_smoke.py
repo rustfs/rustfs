@@ -669,7 +669,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             with mock.patch.object(pyiceberg_smoke, "ensure_aws_env"):
                 with mock.patch.object(pyiceberg_smoke, "ensure_bucket"):
                     with mock.patch.object(pyiceberg_smoke, "enable_table_bucket"):
-                        with mock.patch.object(pyiceberg_smoke, "install_rustfs_rest_sigv4_adapter"):
+                        with mock.patch.object(pyiceberg_smoke, "load_rest_catalog", side_effect=lambda *_args, **_kwargs: FakeCatalog()):
                             with mock.patch.object(pyiceberg_smoke, "ensure_namespace"):
                                 with mock.patch.object(
                                     pyiceberg_smoke,

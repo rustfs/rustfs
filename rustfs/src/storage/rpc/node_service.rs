@@ -303,25 +303,38 @@ fn scanner_activity_response(
     }
 }
 
-fn scanner_dirty_usage_snapshot_response(
+async fn scanner_dirty_usage_snapshot_response(
+    store: &ECStore,
     snapshot: rustfs_scanner::ScannerDirtyUsageSnapshot,
-) -> ScannerDirtyUsageSnapshotResponse {
-    ScannerDirtyUsageSnapshotResponse {
+) -> Result<ScannerDirtyUsageSnapshotResponse, Status> {
+    if store.id.is_nil() {
+        return Err(Status::failed_precondition("scanner dirty usage snapshot owner is unavailable"));
+    }
+    let mut buckets = Vec::with_capacity(snapshot.buckets.len());
+    for bucket in snapshot.buckets {
+        let bucket_incarnation = store
+            .bucket_incarnation_id_from_disk(&bucket.bucket)
+            .await
+            .map_err(|_| Status::failed_precondition("scanner dirty usage bucket incarnation is unavailable"))?;
+        if bucket_incarnation.is_nil() {
+            return Err(Status::failed_precondition("scanner dirty usage bucket incarnation is unavailable"));
+        }
+        buckets.push(ScannerDirtyUsageBucket {
+            bucket: bucket.bucket,
+            generation: bucket.generation,
+            bucket_incarnation: bucket_incarnation.as_bytes().to_vec().into(),
+        });
+    }
+    Ok(ScannerDirtyUsageSnapshotResponse {
         instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
         generation: snapshot.generation,
         pending_bucket_count: snapshot.pending_bucket_count,
         protocol_version: rustfs_scanner::SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION,
         complete: snapshot.complete,
-        buckets: snapshot
-            .buckets
-            .into_iter()
-            .map(|bucket| ScannerDirtyUsageBucket {
-                bucket: bucket.bucket,
-                generation: bucket.generation,
-            })
-            .collect(),
+        buckets,
         response_proof: Bytes::new(),
-    }
+        owner_id: store.id.to_string(),
+    })
 }
 
 fn scanner_activity_response_v7(
@@ -2219,11 +2232,14 @@ impl Node for NodeService {
             .as_ref()
             .try_into()
             .map_err(|_| Status::invalid_argument("scanner dirty usage snapshot challenge must be 16 bytes"))?;
-        let snapshot = rustfs_scanner::scanner_dirty_usage_snapshot(rustfs_scanner::SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES);
+        let store = self
+            .resolve_object_store()
+            .ok_or_else(|| Status::unavailable("storage layer is not initialized"))?;
+        let snapshot = rustfs_scanner::scanner_dirty_usage_snapshot(rustfs_scanner::SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES);
         if snapshot.generation == u64::MAX {
             return Err(Status::resource_exhausted("scanner dirty usage generation is exhausted"));
         }
-        let mut response = scanner_dirty_usage_snapshot_response(snapshot);
+        let mut response = scanner_dirty_usage_snapshot_response(&store, snapshot).await?;
         let canonical = rustfs_protos::canonical_scanner_dirty_usage_snapshot_response_body(&challenge, &response)
             .map_err(|_| Status::internal("scanner dirty usage snapshot response is too large to authenticate"))?;
         response.response_proof = sign_tonic_rpc_response_proof(&canonical)
@@ -6510,7 +6526,28 @@ mod tests {
     #[tokio::test]
     async fn test_scanner_dirty_usage_snapshot_requires_body_bound_auth_and_signs_a_consistent_view() {
         let _ = rustfs_credentials::set_global_rpc_secret("scanner-dirty-usage-snapshot-test-secret".to_string());
-        let service = create_test_node_service();
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("TESTROOTACCESSKEY".to_string()),
+            Some("TESTROOTSECRET123".to_string()),
+        );
+        let temp_dir = tempfile::tempdir().expect("scanner dirty usage snapshot RPC test directory");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp_dir.path())
+            .build()
+            .await;
+        ObjectStore::new(Arc::clone(&env.ecstore))
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+            .await
+            .expect("build isolated IAM");
+        let context = Arc::new(crate::runtime_sources::AppContext::with_default_interfaces(
+            Arc::clone(&env.ecstore),
+            iam,
+            Arc::new(KmsServiceManager::new()),
+        ));
+        let service = make_server_for_context(Some(context));
         let unsigned = service
             .scanner_dirty_usage_snapshot(Request::new(ScannerDirtyUsageSnapshotRequest {
                 challenge: vec![7; 16].into(),
@@ -6564,6 +6601,7 @@ mod tests {
             .into_inner();
         assert_eq!(response.instance_id, rustfs_scanner::scanner_activity_epoch());
         assert_eq!(response.protocol_version, rustfs_scanner::SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION);
+        assert!(Uuid::parse_str(&response.owner_id).is_ok_and(|owner_id| !owner_id.is_nil()));
         let bucket_count = u64::try_from(response.buckets.len()).expect("snapshot bucket count should fit in u64");
         assert_eq!(response.complete, response.pending_bucket_count == bucket_count);
         let canonical = rustfs_protos::canonical_scanner_dirty_usage_snapshot_response_body(&challenge, &response)

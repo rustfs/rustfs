@@ -33,11 +33,11 @@
 
 use crate::common::{init_logging, replication_fast_env};
 use crate::fake_s3_target::{BucketMode, FAKE_ACCESS_KEY, FAKE_SECRET_KEY};
-use crate::fake_s3_target::{FakeS3Target, Operation as FakeTargetOperation, RequestRecord};
+use crate::fake_s3_target::{FakeS3Target, FaultAction as FakeTargetFault, Operation as FakeTargetOperation, RequestRecord};
 use crate::on_demand_migration::common::{OdmEnvOptions, OdmTestEnv, fake_source_client};
 use crate::replication_extension_test::{
-    LOOPBACK_REPLICATION_TARGET_ENV, ReplicationTargetOptions, enable_bucket_versioning, put_bucket_replication,
-    set_replication_target_with_options,
+    LOOPBACK_REPLICATION_TARGET_ENV, ReplicationTargetOptions, enable_bucket_versioning, get_replication_reset_status,
+    put_bucket_replication, set_replication_target_with_options, start_bucket_replication_reset,
 };
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::{ByteStream, DateTime};
@@ -225,6 +225,170 @@ fn expectation(mode: TargetMode, shape: ObjectShape) -> Expectation {
         .find(|(known_mode, known_shape, _)| *known_mode == mode && *known_shape == shape)
         .map(|(_, _, issue)| Expectation::KnownFailing(issue))
         .unwrap_or(Expectation::Completed)
+}
+
+/// rustfs/backlog#2340: a target that mints its own version ids (Wasabi,
+/// AWS S3) answers 404 to a HEAD by the source uuid, which the worker used to
+/// read as "replica missing" and re-drive the PUT — one more target version
+/// per heal, MRF retry or resync. Two re-drive shapes, both must converge on
+/// the single version the first PUT created:
+/// - the first PUT lands but its response is lost, so the object is FAILED
+///   and the scanner heal pass re-drives it;
+/// - an existing-object resync re-drives a COMPLETED object unconditionally.
+#[tokio::test]
+async fn matrix_mint_own_version_ids_redrive_does_not_duplicate() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "matrix-mint-own-redrive-dst".to_string();
+    target.create_bucket_with_object_lock(target_bucket.clone());
+    target.assign_own_version_ids(true);
+
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("HTTP_PROXY", ""),
+        ("HTTPS_PROXY", ""),
+        // The scanner heal pass is what re-drives a FAILED object.
+        ("RUSTFS_SCANNER_CYCLE", "1"),
+        ("RUSTFS_SCANNER_START_DELAY_SECS", "1"),
+    ]);
+    let env = OdmTestEnv::start_with(OdmEnvOptions {
+        env: env_vars,
+        ..OdmEnvOptions::default()
+    })
+    .await?;
+    let source_env = &env.rustfs;
+
+    let source_bucket = "matrix-mint-own-redrive-src";
+    let source_client = source_env.create_s3_client();
+    source_client
+        .create_bucket()
+        .bucket(source_bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await?;
+    enable_bucket_versioning(source_env, source_bucket).await?;
+    let target_arn = set_replication_target_with_options(
+        source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket: &target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(source_env, source_bucket, &target_arn).await?;
+
+    // Teach the worker the target's identity contract with one ordinary
+    // write, exactly as production learns it (the PUT response carries the
+    // minted id).
+    let probe_key = "redrive/identity-probe.bin";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(probe_key)
+        .body(ByteStream::from(payload(4 * 1024, 0x01)))
+        .send()
+        .await?;
+    assert_eq!(
+        wait_for_terminal_replication_status(&source_client, source_bucket, probe_key).await?,
+        "COMPLETED"
+    );
+
+    // Shape 1: the PUT is stored, its response never arrives, heal re-drives.
+    let heal_key = "redrive/heal.bin";
+    target.inject_for_key(FakeTargetOperation::PutObject, heal_key, FakeTargetFault::DisconnectAfterResponse, 1);
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(heal_key)
+        .body(ByteStream::from(payload(8 * 1024, 0x02)))
+        .send()
+        .await?;
+    wait_for_replication_status_and_single_version(&source_client, source_bucket, &target, &target_bucket, heal_key).await?;
+
+    // Shape 2: an existing-object resync re-drives a COMPLETED object.
+    let resync_key = "redrive/resync.bin";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(resync_key)
+        .body(ByteStream::from(payload(8 * 1024, 0x03)))
+        .send()
+        .await?;
+    assert_eq!(
+        wait_for_terminal_replication_status(&source_client, source_bucket, resync_key).await?,
+        "COMPLETED"
+    );
+    let (reset_arn, _reset_id) = start_bucket_replication_reset(source_env, source_bucket).await?;
+    assert_eq!(reset_arn, target_arn);
+    let resync = async {
+        loop {
+            let status = get_replication_reset_status(source_env, source_bucket, &target_arn).await?;
+            if let Some(entry) = status.targets.iter().find(|entry| entry.arn == target_arn)
+                && entry.status == "Completed"
+            {
+                return Ok::<_, Box<dyn Error + Send + Sync>>(entry.replicated_count);
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+    };
+    let replicated = timeout(Duration::from_secs(90), resync)
+        .await
+        .map_err(|_| "existing-object resync did not complete within 90 seconds")??;
+    assert!(replicated >= 3, "resync must count the located replicas as replicated, got {replicated}");
+    for key in [probe_key, heal_key, resync_key] {
+        let versions = target.stored_versions(&target_bucket, key);
+        assert_eq!(
+            versions.len(),
+            1,
+            "{key}: a re-drive against a target that mints its own version ids must not mint another one: {versions:?}"
+        );
+    }
+
+    target.shutdown().await;
+    Ok(())
+}
+
+/// Wait until `key` is COMPLETED on the source and, for the observation
+/// window after that, the target still holds exactly one live version of it.
+async fn wait_for_replication_status_and_single_version(
+    source_client: &Client,
+    source_bucket: &str,
+    target: &FakeS3Target,
+    target_bucket: &str,
+    key: &str,
+) -> TestResult {
+    // The lost PUT response first settles the object FAILED; only the next
+    // scanner heal pass can turn that into COMPLETED, so FAILED is transient
+    // here and the wait is for COMPLETED alone.
+    let converged = async {
+        loop {
+            let head = source_client.head_object().bucket(source_bucket).key(key).send().await?;
+            if head.replication_status().is_some_and(|status| status.as_str() == "COMPLETED") {
+                return Ok::<_, Box<dyn Error + Send + Sync>>(());
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+    };
+    timeout(Duration::from_secs(90), converged)
+        .await
+        .map_err(|_| format!("{key}: heal re-drive did not converge to COMPLETED within 90 seconds"))??;
+    // The heal pass keeps visiting the key for a few scanner cycles; a
+    // duplicate would show up here as a second stored version.
+    for _ in 0..12 {
+        let versions = target.stored_versions(target_bucket, key);
+        assert_eq!(versions.len(), 1, "{key}: target minted another version on re-drive: {versions:?}");
+        sleep(Duration::from_millis(500)).await;
+    }
+    Ok(())
 }
 
 #[tokio::test]

@@ -14,6 +14,7 @@
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
+#[allow(clippy::module_inception, reason = "preserve the public services::tier::tier path")]
 pub mod tier;
 pub mod tier_admin;
 pub mod tier_config;

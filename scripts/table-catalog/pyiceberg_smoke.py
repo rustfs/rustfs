@@ -41,6 +41,8 @@ TABLE_MAINTENANCE_CONFIG_VERSION = 1
 IDENTIFIER_SEGMENT_MAX_LEN = 64
 MAX_PAGINATION_PROBE_PAGES = 16
 
+RUSTFS_PROFILES = {"rustfs", "rustfs-compat", CATALOG_VENDED_PROFILE}
+
 PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
     "rustfs": {
         "catalog_uri": "{endpoint}/iceberg",
@@ -264,6 +266,7 @@ class RuntimeDeps:
     botocore_config: Any
     botocore_credentials: Any
     botocore_auth: Any
+    botocore_s3_auth: Any
     botocore_awsrequest: Any
     pyarrow: Any
     load_catalog: Any
@@ -469,13 +472,13 @@ def load_runtime_deps() -> RuntimeDeps:
         pyarrow = None
         missing.append("pyarrow")
     try:
-        from botocore.auth import SigV4Auth
+        from botocore.auth import S3SigV4Auth, SigV4Auth
         from botocore.awsrequest import AWSRequest
         from botocore.exceptions import ClientError
         from botocore.config import Config
         from botocore.credentials import Credentials
     except ModuleNotFoundError:
-        ClientError = Config = Credentials = SigV4Auth = AWSRequest = None
+        ClientError = Config = Credentials = S3SigV4Auth = SigV4Auth = AWSRequest = None
         missing.append("botocore")
     try:
         from pyiceberg.catalog import load_catalog
@@ -496,6 +499,7 @@ def load_runtime_deps() -> RuntimeDeps:
         botocore_config=Config,
         botocore_credentials=Credentials,
         botocore_auth=SigV4Auth,
+        botocore_s3_auth=S3SigV4Auth,
         botocore_awsrequest=AWSRequest,
         pyarrow=pyarrow,
         load_catalog=load_catalog,
@@ -529,6 +533,12 @@ def unsigned_ssl_context(insecure: bool) -> ssl.SSLContext | None:
     return ssl._create_unverified_context()
 
 
+def sign_rest_request(args: argparse.Namespace, deps: RuntimeDeps, request: Any) -> None:
+    credentials = deps.botocore_credentials(args.access_key, args.secret_key)
+    signer = deps.botocore_s3_auth if args.profile in RUSTFS_PROFILES else deps.botocore_auth
+    signer(credentials, args.rest_signing_name, args.region).add_auth(request)
+
+
 def signed_rest_request(args: argparse.Namespace, deps: RuntimeDeps, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
     endpoint = normalized_endpoint(args.endpoint)
     url = f"{endpoint}{path}"
@@ -541,8 +551,7 @@ def signed_rest_request(args: argparse.Namespace, deps: RuntimeDeps, method: str
         headers["content-type"] = "application/json"
 
     aws_request = deps.botocore_awsrequest(method=method, url=url, data=payload, headers=headers)
-    credentials = deps.botocore_credentials(args.access_key, args.secret_key)
-    deps.botocore_auth(credentials, args.rest_signing_name, args.region).add_auth(aws_request)
+    sign_rest_request(args, deps, aws_request)
     prepared = aws_request.prepare()
 
     request = urllib.request.Request(
@@ -1053,9 +1062,7 @@ def write_live_evidence(args: argparse.Namespace, result: SmokeResult) -> None:
     output_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def install_rustfs_rest_sigv4_adapter(catalog: Any, args: argparse.Namespace, deps: RuntimeDeps) -> None:
-    from urllib import parse
-
+def install_rustfs_rest_sigv4_adapter(catalog: Any, args: argparse.Namespace, deps: RuntimeDeps, session: Any = None) -> None:
     from requests.adapters import HTTPAdapter
 
     class RustfsSigV4Adapter(HTTPAdapter):
@@ -1068,21 +1075,37 @@ def install_rustfs_rest_sigv4_adapter(catalog: Any, args: argparse.Namespace, de
             if "connection" in request.headers:
                 del request.headers["connection"]
 
-            url = str(request.url).split("?")[0]
-            query = str(parse.urlsplit(request.url).query)
-            params = dict(parse.parse_qsl(query))
-            credentials = deps.botocore_credentials(args.access_key, args.secret_key)
             aws_request = deps.botocore_awsrequest(
                 method=request.method,
-                url=url,
-                params=params,
+                url=request.url,
                 data=body,
                 headers=dict(request.headers),
             )
-            deps.botocore_auth(credentials, args.rest_signing_name, args.region).add_auth(aws_request)
+            sign_rest_request(args, deps, aws_request)
             request.headers.update(aws_request.headers)
 
-    catalog._session.mount(catalog.uri, RustfsSigV4Adapter())
+    (session if session is not None else catalog._session).mount(catalog.uri, RustfsSigV4Adapter())
+
+
+def load_rest_catalog(args: argparse.Namespace, deps: RuntimeDeps, storage_credential: StorageCredential | None = None) -> Any:
+    properties = catalog_properties(args, storage_credential)
+    if args.profile not in RUSTFS_PROFILES:
+        catalog = deps.load_catalog(args.catalog_name, **properties)
+        install_rustfs_rest_sigv4_adapter(catalog, args, deps)
+        return catalog
+
+    from pyiceberg.catalog import _ENV_CONFIG
+    from pyiceberg.catalog.rest import RestCatalog
+    from pyiceberg.utils.config import merge_config
+
+    properties = merge_config(_ENV_CONFIG.get_catalog_config(args.catalog_name) or {}, properties)
+
+    class RustfsRestCatalog(RestCatalog):
+        def _init_sigv4(self, session: Any) -> None:
+            # RestCatalog fetches /config before constructing its persistent session.
+            install_rustfs_rest_sigv4_adapter(self, args, deps, session=session)
+
+    return RustfsRestCatalog(args.catalog_name, **properties)
 
 
 def table_identifier(args: argparse.Namespace) -> tuple[str, str]:
@@ -1399,8 +1422,7 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> SmokeResult:
     enable_table_bucket(args, deps)
 
     print(f"[3/10] loading PyIceberg REST catalog at {endpoint}{args.rest_path}")
-    catalog = deps.load_catalog(args.catalog_name, **catalog_properties(args))
-    install_rustfs_rest_sigv4_adapter(catalog, args, deps)
+    catalog = load_rest_catalog(args, deps)
     identifier = table_identifier(args)
 
     if args.replace:
@@ -1430,8 +1452,7 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> SmokeResult:
         except RuntimeError:
             expected_table_location = table_warehouse_location(catalog.load_table(identifier))
         verify_vended_credential_data_plane_scope(args, deps, storage_credential, expected_table_location)
-        catalog = deps.load_catalog(args.catalog_name, **catalog_properties(args, storage_credential=storage_credential))
-        install_rustfs_rest_sigv4_adapter(catalog, args, deps)
+        catalog = load_rest_catalog(args, deps, storage_credential=storage_credential)
     else:
         print(f"[6/10] using configured S3 credentials for data-plane operations")
         print(f"[7/10] skipping vended credential data-plane scope probe")

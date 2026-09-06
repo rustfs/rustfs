@@ -14,7 +14,8 @@
 
 use crate::bucket::lifecycle::tier_last_day_stats::DailyAllTierStats;
 use crate::cluster::rpc::{
-    PeerRestClient, ScannerPeerActivity, ScannerPeerDirtyUsageSnapshot, ScannerPublicationLease, TierConfigReloadOutcome,
+    PeerRestClient, ScannerDirtyUsageAcknowledgement, ScannerPeerActivity, ScannerPeerDirtyUsageSnapshot,
+    ScannerPublicationLease, TierConfigReloadOutcome,
 };
 use crate::diagnostics::admin_server_info::get_commit_id;
 use crate::disk::DiskAPI;
@@ -2552,11 +2553,70 @@ impl NotificationSys {
         Ok(snapshots)
     }
 
-    pub async fn acknowledge_scanner_dirty_usage(&self, acknowledgements: Vec<(String, String, u64)>) -> Result<bool> {
+    pub async fn scanner_scoped_dirty_usage_capabilities(
+        &self,
+        acknowledgements: Vec<ScannerDirtyUsageAcknowledgement>,
+    ) -> Result<bool> {
         let mut by_host = HashMap::with_capacity(acknowledgements.len());
-        for (host, instance_id, generation) in acknowledgements {
-            if by_host.insert(host.clone(), (instance_id, generation)).is_some() {
-                return Err(Error::other(format!("duplicate scanner dirty usage acknowledgement target: {host}")));
+        for acknowledgement in acknowledgements {
+            let host = match &acknowledgement {
+                ScannerDirtyUsageAcknowledgement::Scoped { host, .. } => host.clone(),
+                ScannerDirtyUsageAcknowledgement::Generation { .. } => {
+                    return Err(Error::other("scanner scoped dirty usage capability requires scoped acknowledgements"));
+                }
+            };
+            if by_host.insert(host.clone(), acknowledgement).is_some() {
+                return Err(Error::other("duplicate scanner dirty usage acknowledgement target"));
+            }
+        }
+
+        let clients = self
+            .peer_clients
+            .iter()
+            .flatten()
+            .map(|client| (client.grid_host.clone(), client.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut futures = Vec::with_capacity(by_host.len());
+        for (host, acknowledgement) in by_host {
+            let Some(client) = clients.get(&host).cloned() else {
+                return Err(Error::other("scanner scoped dirty usage capability failed: peer is not reachable"));
+            };
+            futures.push(async move {
+                let ScannerDirtyUsageAcknowledgement::Scoped {
+                    owner_id,
+                    instance_id,
+                    entries,
+                    ..
+                } = acknowledgement
+                else {
+                    unreachable!("scoped acknowledgement was validated before probing");
+                };
+                timeout(
+                    SCANNER_ACTIVITY_PROBE_TIMEOUT,
+                    client.scanner_scoped_dirty_usage_capability(owner_id, instance_id, entries),
+                )
+                .await
+                .map_err(|_| Error::other("scanner scoped dirty usage capability timed out"))?
+            });
+        }
+
+        for result in join_all(futures).await {
+            if !result? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub async fn acknowledge_scanner_dirty_usage(&self, acknowledgements: Vec<ScannerDirtyUsageAcknowledgement>) -> Result<bool> {
+        let mut by_host = HashMap::with_capacity(acknowledgements.len());
+        for acknowledgement in acknowledgements {
+            let host = match &acknowledgement {
+                ScannerDirtyUsageAcknowledgement::Generation { host, .. }
+                | ScannerDirtyUsageAcknowledgement::Scoped { host, .. } => host.clone(),
+            };
+            if by_host.insert(host.clone(), acknowledgement).is_some() {
+                return Err(Error::other("duplicate scanner dirty usage acknowledgement target"));
             }
         }
 
@@ -2568,18 +2628,34 @@ impl NotificationSys {
             .collect::<HashMap<_, _>>();
         let mut failures = Vec::new();
         let mut futures = Vec::with_capacity(by_host.len());
-        for (host, (instance_id, generation)) in by_host {
+        for (host, acknowledgement) in by_host {
             let Some(client) = clients.get(&host).cloned() else {
                 failures.push(format!("peer {host} scanner dirty usage acknowledgement failed: peer is not reachable"));
                 continue;
             };
             futures.push(async move {
-                let result = scanner_activity_with_timeout(
-                    SCANNER_ACTIVITY_PROBE_TIMEOUT,
-                    &host,
-                    client.acknowledge_scanner_dirty_usage(instance_id, generation),
-                )
-                .await;
+                let result = match acknowledgement {
+                    ScannerDirtyUsageAcknowledgement::Generation {
+                        instance_id, generation, ..
+                    } => {
+                        scanner_activity_with_timeout(
+                            SCANNER_ACTIVITY_PROBE_TIMEOUT,
+                            &host,
+                            client.acknowledge_scanner_dirty_usage(instance_id, generation),
+                        )
+                        .await
+                    }
+                    ScannerDirtyUsageAcknowledgement::Scoped {
+                        owner_id,
+                        instance_id,
+                        entries,
+                        ..
+                    } => {
+                        client
+                            .acknowledge_scanner_scoped_dirty_usage(owner_id, instance_id, entries)
+                            .await
+                    }
+                };
                 (host, result)
             });
         }
@@ -4744,15 +4820,28 @@ mod tests {
             peer_topology_hosts: Vec::new(),
         };
         let missing = sys
-            .acknowledge_scanner_dirty_usage(vec![("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7)])
+            .acknowledge_scanner_dirty_usage(vec![ScannerDirtyUsageAcknowledgement::Generation {
+                host: "peer-1".to_string(),
+                instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+                generation: 7,
+            }])
             .await
             .expect_err("a missing acknowledgement target must remain pending");
         assert!(missing.to_string().contains("peer is not reachable"));
 
         let duplicate = sys
             .acknowledge_scanner_dirty_usage(vec![
-                ("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7),
-                ("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7),
+                ScannerDirtyUsageAcknowledgement::Generation {
+                    host: "peer-1".to_string(),
+                    instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+                    generation: 7,
+                },
+                ScannerDirtyUsageAcknowledgement::Scoped {
+                    host: "peer-1".to_string(),
+                    owner_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                    instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+                    entries: Vec::new(),
+                },
             ])
             .await
             .expect_err("duplicate acknowledgement targets must be rejected");

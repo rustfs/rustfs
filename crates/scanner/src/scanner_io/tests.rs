@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::dirty_usage::{clear_dirty_usage_buckets_for_tests, dirty_usage_buckets_for_tests};
+use super::dirty_usage::{
+    DirtyUsageBucketScope, clear_dirty_usage_buckets_for_tests, dirty_usage_bucket_scopes_for_tests,
+    dirty_usage_buckets_for_tests,
+};
 use super::io_disk::tier_stats_template;
 use super::*;
 use crate::scanner_budget::ScannerCycleBudgetConfig;
@@ -374,6 +377,7 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
         let requested_scope = if explicit_scope {
             ScannerBucketScanScope::from_dirty_buckets(
                 HashSet::from(["hot-bucket".to_string()]),
+                HashMap::new(),
                 DataUsageScanPlanDigest([7; 32]),
             )
         } else {
@@ -916,6 +920,47 @@ fn dirty_usage_snapshot_is_sorted_and_reports_its_cutoff() {
         vec!["photos", "videos"]
     );
     assert!(snapshot.buckets.iter().all(|bucket| bucket.generation <= snapshot.generation));
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[test]
+#[serial]
+fn dirty_usage_object_marks_only_its_top_level_entry_until_the_scope_becomes_ambiguous() {
+    clear_dirty_usage_buckets_for_tests();
+
+    record_dirty_usage_object("photos", "2026/january/object-a");
+    record_dirty_usage_object("photos", "archive/object-b");
+    let scopes = dirty_usage_bucket_scopes_for_tests();
+    assert_eq!(
+        scopes.get("photos"),
+        Some(&DirtyUsageBucketScope::TopLevelEntries(HashSet::from([
+            "2026".to_string(),
+            "archive".to_string(),
+        ])))
+    );
+    drop(scopes);
+
+    record_dirty_usage_object("photos", "../ambiguous");
+    assert_eq!(
+        dirty_usage_bucket_scopes_for_tests().get("photos"),
+        Some(&DirtyUsageBucketScope::WholeBucket)
+    );
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[test]
+#[serial]
+fn dirty_usage_object_expands_an_overfull_prefix_journal_to_the_whole_bucket() {
+    clear_dirty_usage_buckets_for_tests();
+
+    for index in 0..129 {
+        record_dirty_usage_object("photos", &format!("prefix-{index}/object"));
+    }
+
+    assert_eq!(
+        dirty_usage_bucket_scopes_for_tests().get("photos"),
+        Some(&DirtyUsageBucketScope::WholeBucket)
+    );
     clear_dirty_usage_buckets_for_tests();
 }
 
@@ -1500,6 +1545,7 @@ fn scoped_scan_selects_only_current_dirty_buckets_after_baseline_validation() {
     let scope = scoped_scan_scope_from_dirty_buckets(
         ScannerBucketScanScope::default(),
         HashSet::from(["photos".to_string(), "deleted".to_string()]),
+        None,
         true,
         &[bucket_info("photos")],
         ScannerCacheBaselineProof {
@@ -1554,6 +1600,56 @@ fn scoped_scan_baseline_work_proof_requires_uniform_known_set_identity() {
     }
 }
 
+#[test]
+fn scoped_scan_uses_only_locally_verified_prefix_hints() {
+    let source = DataUsageCacheSource::new(1, 2);
+    let expected_sources = HashSet::from([source]);
+    let scan_plan_digest = DataUsageScanPlanDigest([6; 32]);
+    let baseline = complete_usage_baseline(source, scan_plan_digest, 7, 11);
+    let dirty_scopes = HashMap::from([
+        (
+            "photos".to_string(),
+            DirtyUsageBucketScope::TopLevelEntries(HashSet::from(["2026".to_string()])),
+        ),
+        ("videos".to_string(), DirtyUsageBucketScope::WholeBucket),
+    ]);
+
+    let locally_scoped = scoped_scan_scope_from_dirty_buckets(
+        ScannerBucketScanScope::default(),
+        HashSet::from(["photos".to_string(), "videos".to_string()]),
+        Some(&dirty_scopes),
+        true,
+        &[bucket_info("photos"), bucket_info("videos")],
+        ScannerCacheBaselineProof {
+            authoritative_data: Some(&baseline),
+            observed_candidate_data: None,
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest,
+        },
+    );
+    assert!(locally_scoped.prefix_scope_for("photos").is_some());
+    assert!(locally_scoped.prefix_scope_for("videos").is_none());
+
+    let distributed_scope = scoped_scan_scope_from_dirty_buckets(
+        ScannerBucketScanScope::default(),
+        HashSet::from(["photos".to_string(), "videos".to_string()]),
+        None,
+        true,
+        &[bucket_info("photos"), bucket_info("videos")],
+        ScannerCacheBaselineProof {
+            authoritative_data: Some(&baseline),
+            observed_candidate_data: None,
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest,
+        },
+    );
+    assert!(distributed_scope.prefix_scope_for("photos").is_none());
+}
+
 fn peer_dirty_usage_snapshot(
     instance_id: &str,
     generation: u64,
@@ -1561,6 +1657,7 @@ fn peer_dirty_usage_snapshot(
     buckets: &[(&str, u64)],
 ) -> EcstoreScannerPeerDirtyUsageSnapshot {
     EcstoreScannerPeerDirtyUsageSnapshot {
+        owner_id: uuid::Uuid::from_u128(0x11111111111111111111111111111111).to_string(),
         instance_id: instance_id.to_string(),
         generation,
         pending_bucket_count: u64::try_from(buckets.len()).expect("test bucket count should fit"),
@@ -1568,7 +1665,15 @@ fn peer_dirty_usage_snapshot(
         complete,
         buckets: buckets
             .iter()
-            .map(|(bucket, generation)| ((*bucket).to_string(), *generation))
+            .map(|(bucket, generation)| {
+                (
+                    (*bucket).to_string(),
+                    crate::storage_api::EcstoreScannerPeerDirtyUsageBucket {
+                        bucket_incarnation: uuid::Uuid::from_u128(0x22222222222222222222222222222222),
+                        generation: *generation,
+                    },
+                )
+            })
             .collect(),
     }
 }
@@ -1595,7 +1700,7 @@ fn verified_remote_dirty_usage_buckets_merges_only_complete_current_snapshots() 
     ]);
 
     assert_eq!(
-        verified_remote_dirty_usage_buckets(
+        verified_remote_dirty_usage(
             &expected_peers,
             vec![
                 (
@@ -1608,8 +1713,61 @@ fn verified_remote_dirty_usage_buckets_merges_only_complete_current_snapshots() 
                 ),
             ],
         ),
-        Some(HashSet::from(["photos".to_string(), "archive".to_string()]))
+        Some(VerifiedRemoteDirtyUsage {
+            dirty_buckets: HashSet::from(["photos".to_string(), "archive".to_string()]),
+            acknowledgements: vec![
+                crate::scanner::ScannerDirtyUsageAcknowledgement {
+                    host: "node-a:9000".to_string(),
+                    instance_id: "instance-a".to_string(),
+                    kind: crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped {
+                        owner_id: uuid::Uuid::from_u128(0x11111111111111111111111111111111).to_string(),
+                        entries: vec![crate::storage_api::EcstoreScannerScopedDirtyUsageAckEntry {
+                            bucket: "photos".to_string(),
+                            bucket_incarnation: uuid::Uuid::from_u128(0x22222222222222222222222222222222),
+                            generation: 7,
+                        }],
+                    },
+                },
+                crate::scanner::ScannerDirtyUsageAcknowledgement {
+                    host: "node-b:9000".to_string(),
+                    instance_id: "instance-b".to_string(),
+                    kind: crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped {
+                        owner_id: uuid::Uuid::from_u128(0x11111111111111111111111111111111).to_string(),
+                        entries: vec![crate::storage_api::EcstoreScannerScopedDirtyUsageAckEntry {
+                            bucket: "archive".to_string(),
+                            bucket_incarnation: uuid::Uuid::from_u128(0x22222222222222222222222222222222),
+                            generation: 3,
+                        }],
+                    },
+                },
+            ],
+        })
     );
+}
+
+#[test]
+fn scanner_scoped_dirty_usage_ack_cost_threshold_is_single_protocol_batch() {
+    let acknowledgement = |entry_count: usize| crate::scanner::ScannerDirtyUsageAcknowledgement {
+        host: "node-a:9000".to_string(),
+        instance_id: "instance-a".to_string(),
+        kind: crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped {
+            owner_id: uuid::Uuid::from_u128(0x11111111111111111111111111111111).to_string(),
+            entries: (0..entry_count)
+                .map(|index| crate::storage_api::EcstoreScannerScopedDirtyUsageAckEntry {
+                    bucket: format!("bucket-{index:02}"),
+                    bucket_incarnation: uuid::Uuid::from_u128(0x22222222222222222222222222222222),
+                    generation: 7,
+                })
+                .collect(),
+        },
+    };
+
+    assert!(!scanner_scoped_dirty_usage_ack_exceeds_cost_threshold(&[acknowledgement(
+        crate::SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES
+    )]));
+    assert!(scanner_scoped_dirty_usage_ack_exceeds_cost_threshold(&[acknowledgement(
+        crate::SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES + 1
+    )]));
 }
 
 #[test]
@@ -1630,7 +1788,7 @@ fn verified_remote_dirty_usage_buckets_rejects_incomplete_or_stale_peer_state() 
         peer_dirty_usage_snapshot("instance-a", 7, true, &[]),
     ] {
         assert!(
-            verified_remote_dirty_usage_buckets(&expected_peers, vec![("node-a:9000".to_string(), snapshot)]).is_none(),
+            verified_remote_dirty_usage(&expected_peers, vec![("node-a:9000".to_string(), snapshot)]).is_none(),
             "incomplete, stale, mismatched, or empty pending peer state must fall back to a full scan"
         );
     }
@@ -1669,6 +1827,7 @@ fn scoped_set_scan_rebuilds_selected_buckets_and_drops_deleted_buckets() {
         &all_buckets,
         &ScannerBucketScanScope {
             selected_buckets: Some(selected_buckets),
+            selected_bucket_prefixes: None,
             baseline_scan_plan_digest: Some(baseline_digest),
         },
         ScannerSetCacheGeneration {
@@ -1707,6 +1866,7 @@ fn scoped_set_scan_rejects_unbound_bucket_incarnations() {
     let old_cache = complete_set_usage_cache(&[("stable", 10), ("dirty", 20)], baseline_digest);
     let scope = ScannerBucketScanScope {
         selected_buckets: Some(Arc::new(HashSet::from(["dirty".to_string()]))),
+        selected_bucket_prefixes: None,
         baseline_scan_plan_digest: Some(baseline_digest),
     };
     let generation = ScannerSetCacheGeneration {
@@ -1744,6 +1904,7 @@ fn scoped_set_scan_falls_back_when_an_unselected_bucket_has_no_baseline() {
             &all_buckets,
             &ScannerBucketScanScope {
                 selected_buckets: Some(Arc::new(HashSet::from(["dirty".to_string()]))),
+                selected_bucket_prefixes: None,
                 baseline_scan_plan_digest: Some(baseline_digest),
             },
             ScannerSetCacheGeneration {
@@ -1764,6 +1925,7 @@ fn scoped_set_scan_requires_an_exact_complete_baseline() {
     let all_buckets = vec![bucket_info_with_created_time("dirty")];
     let scope = ScannerBucketScanScope {
         selected_buckets: Some(Arc::new(HashSet::from(["dirty".to_string()]))),
+        selected_bucket_prefixes: None,
         baseline_scan_plan_digest: Some(baseline_digest),
     };
     let generation = ScannerSetCacheGeneration {
@@ -1792,6 +1954,7 @@ fn scoped_set_scan_requires_an_exact_complete_baseline() {
 
     let empty_scope = ScannerBucketScanScope {
         selected_buckets: Some(Arc::new(HashSet::new())),
+        selected_bucket_prefixes: None,
         baseline_scan_plan_digest: Some(baseline_digest),
     };
     let complete = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);

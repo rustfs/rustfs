@@ -117,6 +117,92 @@ async fn assert_reset_fences(store: &Arc<ECStore>) {
     ));
 }
 
+async fn assert_rebuilt_reset_fences(store: &Arc<ECStore>, expected_epoch: u64) {
+    let data = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("rebuilt cycle remains durable");
+    let (cycle, epoch) = decode_scanner_cycle_state(&data).expect("valid rebuilt cycle");
+    assert_eq!((cycle.current, cycle.next, epoch), (0, 42, expected_epoch));
+    let usage: DataUsageInfo = serde_json::from_slice(
+        &read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .expect("durable rebuilt usage fence"),
+    )
+    .expect("valid usage");
+    assert_eq!(usage.scanner_epoch, Some(expected_epoch));
+    assert_eq!(usage.scanner_cycle, Some(41));
+    assert!(matches!(
+        read_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+}
+
+#[test]
+fn scanner_reset_crash_child_process_fixture() {
+    let Ok(root) = std::env::var("RUSTFS_SCANNER_RESET_CRASH_ROOT") else {
+        return;
+    };
+    let stage = match std::env::var("RUSTFS_SCANNER_RESET_CRASH_STAGE").as_deref() {
+        Ok("primary-read") => cleanup_io_fault::Stage::PrimaryRead,
+        Ok("primary-write") => cleanup_io_fault::Stage::PrimaryWrite,
+        Ok("usage-fence") => cleanup_io_fault::Stage::UsageFence,
+        other => panic!("unexpected reset crash stage: {other:?}"),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("child runtime should build");
+    runtime.block_on(async {
+        let store = setup_scanner_cycle_store_at_path(std::path::Path::new(&root), false, 1).await;
+        if stage == cleanup_io_fault::Stage::UsageFence {
+            save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), b"corrupt-cycle".to_vec())
+                .await
+                .expect("force child through reconstruction branch");
+        }
+        let injection = cleanup_io_fault::install(&store, stage, false);
+        let error = resume_scanner_cycle_cleanup(CancellationToken::new(), store)
+            .await
+            .expect_err("child should stop at the injected owned I/O boundary");
+        assert!(injection.fired_while_owned());
+        let expected = match stage {
+            cleanup_io_fault::Stage::PrimaryRead => "injected primary read failure",
+            cleanup_io_fault::Stage::PrimaryWrite => "injected primary write failure",
+            cleanup_io_fault::Stage::UsageFence => "injected usage fence failure",
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+    });
+    std::process::exit(77);
+}
+
+#[tokio::test]
+#[serial]
+async fn disabled_cleanup_recovers_after_child_process_crash_boundaries() {
+    for (name, expected_rebuilt_epoch) in [("primary-read", None), ("primary-write", None), ("usage-fence", Some(9))] {
+        let temp_dir = tempfile::tempdir().expect("crash fixture directory");
+        let store = setup_scanner_cycle_store_at_path(temp_dir.path(), false, 1).await;
+        seed_cleanup(&store, "cleanup-pending").await;
+        drop(store);
+
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .arg("scanner::tests::recovery_control::scanner_reset_crash_child_process_fixture")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("RUSTFS_SCANNER_RESET_CRASH_ROOT", temp_dir.path())
+            .env("RUSTFS_SCANNER_RESET_CRASH_STAGE", name)
+            .status()
+            .expect("child crash fixture should start");
+        assert_eq!(status.code(), Some(77), "{name} child did not reach the owned crash boundary");
+
+        let restarted = setup_scanner_cycle_store_at_path(temp_dir.path(), false, 1).await;
+        run_disabled_startup(CancellationToken::new(), restarted.clone()).await;
+        if let Some(epoch) = expected_rebuilt_epoch {
+            assert_rebuilt_reset_fences(&restarted, epoch).await;
+        } else {
+            assert_reset_fences(&restarted).await;
+        }
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn disabled_cleanup_reopens_persisted_intent_without_starting_scanner() {

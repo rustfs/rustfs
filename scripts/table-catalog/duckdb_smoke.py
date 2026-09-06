@@ -438,8 +438,7 @@ def run_smoke(args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps) -> Du
     stage_table = table_name(args.table, "stage")
     v3_table = table_name(args.table, "v3")
     smoke_tables = [seed_table, write_table, purge_table, drop_table, stage_table, v3_table]
-    catalog = deps.load_catalog(iceberg_args.catalog_name, **pyiceberg_smoke.catalog_properties(iceberg_args))
-    pyiceberg_smoke.install_rustfs_rest_sigv4_adapter(catalog, iceberg_args, deps)
+    catalog = pyiceberg_smoke.load_rest_catalog(iceberg_args, deps)
     namespace_preexisting = bool(catalog.namespace_exists(args.namespace))
     prepare_smoke_tables(catalog, args.namespace, smoke_tables, args.replace)
     pyiceberg_smoke.ensure_namespace(catalog, args.namespace)

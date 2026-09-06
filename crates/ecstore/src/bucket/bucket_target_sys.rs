@@ -18,7 +18,7 @@ use crate::bucket::metadata_sys::get_replication_config;
 use crate::bucket::remote_s3_client::{
     PathStyle, REPLICATION_TARGET_RETRY_POLICY, RemoteCredentials, RemoteS3EndpointSpec, build_remote_s3_client,
 };
-use crate::bucket::replication::{ObjectLockIntegrity, object_lock_put_integrity};
+use crate::bucket::replication::{ObjectLockIntegrity, object_lock_put_integrity, replication_etags_match};
 use crate::bucket::replication::{ReplicationStatusType, ReplicationTargetConfigBridge};
 use crate::bucket::target::ARN;
 use crate::bucket::target::BucketTargetType;
@@ -126,6 +126,22 @@ impl From<&BucketTarget> for RemoteS3EndpointSpec {
 }
 
 pub type HeadObjectSdkError = Box<SdkError<HeadObjectError>>;
+
+/// Whether an edited bucket target still addresses the same remote service
+/// (endpoint, bucket, path style, TLS and identity), so a verdict learned
+/// about that service stays valid across the edit.
+fn same_replication_service(edited: &BucketTarget, previous: &BucketTarget) -> bool {
+    let access_key = |target: &BucketTarget| target.credentials.as_ref().map(|credentials| credentials.access_key.clone());
+    edited.endpoint == previous.endpoint
+        && edited.target_bucket == previous.target_bucket
+        && edited.secure == previous.secure
+        && edited.path == previous.path
+        && access_key(edited) == access_key(previous)
+}
+
+/// Page size and page budget for [`TargetClient::find_version_by_etag`].
+const FIND_VERSION_BY_ETAG_PAGE_SIZE: i32 = 1000;
+const FIND_VERSION_BY_ETAG_MAX_PAGES: usize = 8;
 pub type GetObjectSdkError = Box<SdkError<GetObjectError>>;
 pub type GetObjectTaggingSdkError = Box<SdkError<GetObjectTaggingError>>;
 pub type PutObjectTaggingSdkError = Box<SdkError<PutObjectTaggingError>>;
@@ -349,6 +365,13 @@ struct TargetClientBuildProbe {
 /// their import path while the verdict vocabulary lives with the
 /// replication decision logic.
 pub use crate::bucket::replication::SsecPassthroughCapability;
+/// Version-identity verdicts (see the enum's own docs in
+/// `rustfs-replication`) are cached here per target ARN and follow the same
+/// `arn_remotes_map` lifecycle. They carry no TTL: the verdict is refreshed
+/// by every replication write's response, so it can only go stale on a
+/// target that receives no writes — and a stale `MintsOwn` costs one extra
+/// content-identity lookup before a PUT, never a lost replica.
+pub use crate::bucket::replication::VersionIdentityCapability;
 
 /// How long an audited SSE-C passthrough verdict stays authoritative.
 ///
@@ -375,6 +398,11 @@ pub struct BucketTargetSys {
     /// SSE-C passthrough capability verdicts keyed by target ARN. See
     /// [`SsecPassthroughCapability`]; reset alongside `arn_remotes_map`.
     ssec_passthrough_map: Arc<RwLock<HashMap<String, SsecPassthroughRecord>>>,
+    /// Version-identity verdicts keyed by target ARN. See
+    /// [`VersionIdentityCapability`]; reset alongside `arn_remotes_map`. A std
+    /// lock (never held across an await) so the replication worker can record
+    /// a verdict from inside its synchronous PUT-response audit.
+    version_identity_map: Arc<std::sync::RwLock<HashMap<String, VersionIdentityCapability>>>,
     pub targets_map: Arc<RwLock<HashMap<String, Vec<BucketTarget>>>>,
     /// Buckets whose persisted `bucket-targets.json` exists but cannot be
     /// decoded (rustfs/backlog#2282). Written under the bucket's update mutex
@@ -423,6 +451,7 @@ impl BucketTargetSys {
         Self {
             arn_remotes_map: Arc::new(RwLock::new(HashMap::new())),
             ssec_passthrough_map: Arc::new(RwLock::new(HashMap::new())),
+            version_identity_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
             targets_map: Arc::new(RwLock::new(HashMap::new())),
             unreadable_targets: Arc::new(RwLock::new(HashSet::new())),
             h_mutex: Arc::new(RwLock::new(HashMap::new())),
@@ -746,8 +775,38 @@ impl BucketTargetSys {
                 arn_remotes_map.remove(&target.arn);
                 health_map.remove(&target.arn);
                 ssec_map.remove(&target.arn);
+                self.forget_version_identity_capability(&target.arn);
             }
         }
+    }
+
+    /// Cached version-identity verdict for a target ARN; `Unknown` until a
+    /// replication write or a replication-check VersionFidelity probe judged
+    /// it since the target was built.
+    pub fn version_identity_capability(&self, arn: &str) -> VersionIdentityCapability {
+        self.version_identity_map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(arn)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Record a version-identity verdict for a target ARN. Written by the
+    /// replication worker after every PutObject / CompleteMultipartUpload
+    /// response and by the replication-check VersionFidelity phase.
+    pub fn record_version_identity_capability(&self, arn: &str, capability: VersionIdentityCapability) {
+        self.version_identity_map
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(arn.to_string(), capability);
+    }
+
+    fn forget_version_identity_capability(&self, arn: &str) {
+        self.version_identity_map
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(arn);
     }
 
     /// Cached SSE-C passthrough capability for a target ARN, plus whether the
@@ -1162,12 +1221,32 @@ impl BucketTargetSys {
         // Remove existing targets
         if let Some(existing_targets) = targets_map.remove(bucket) {
             let mut ssec_map = self.ssec_passthrough_map.write().await;
+            let unchanged_service: HashMap<&str, &BucketTarget> = targets
+                .map(|new_targets| {
+                    new_targets
+                        .targets
+                        .iter()
+                        .map(|target| (target.arn.as_str(), target))
+                        .collect()
+                })
+                .unwrap_or_default();
             for target in existing_targets {
                 arn_remotes_map.remove(&target.arn);
                 health_map.remove(&target.arn);
                 // A rebuilt/edited target may point at a different service:
                 // the SSE-C passthrough verdict must be re-audited from Unknown.
                 ssec_map.remove(&target.arn);
+                // The version-identity verdict survives an edit that keeps the
+                // same remote service (a resync start or a bandwidth change
+                // rewrites the entry in place): forgetting it there would make
+                // the very resync that follows re-drive every object as a
+                // duplicate on a target that mints its own version ids.
+                if unchanged_service
+                    .get(target.arn.as_str())
+                    .is_none_or(|edited| !same_replication_service(edited, &target))
+                {
+                    self.forget_version_identity_capability(&target.arn);
+                }
                 self.update_bandwidth_limit(bucket, &target.arn, 0);
             }
         }
@@ -1890,6 +1969,62 @@ impl TargetClient {
             .send()
             .await
             .map_err(Box::new)
+    }
+
+    /// Locate a replica by content identity on a target that mints its own
+    /// version ids: page `ListObjectVersions` under the exact key and return
+    /// the newest live version whose ETag matches `source_etag`. Delete
+    /// markers and prefix siblings never match. Bounded to
+    /// [`FIND_VERSION_BY_ETAG_MAX_PAGES`] pages so a key with a very deep
+    /// history cannot turn one convergence check into an unbounded scan; a
+    /// replica beyond that window reads as missing, which only costs a
+    /// re-PUT (today's behaviour), never a lost object.
+    pub async fn find_version_by_etag(
+        &self,
+        bucket: &str,
+        object: &str,
+        source_etag: &str,
+    ) -> Result<Option<String>, Box<SdkError<aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError>>> {
+        let mut key_marker: Option<String> = None;
+        let mut version_id_marker: Option<String> = None;
+        for _ in 0..FIND_VERSION_BY_ETAG_MAX_PAGES {
+            let page = self
+                .client
+                .list_object_versions()
+                .bucket(bucket)
+                .prefix(object)
+                .max_keys(FIND_VERSION_BY_ETAG_PAGE_SIZE)
+                .set_key_marker(key_marker.take())
+                .set_version_id_marker(version_id_marker.take())
+                .send()
+                .await
+                .map_err(Box::new)?;
+            if let Some(version) = page.versions().iter().find(|version| {
+                version.key() == Some(object)
+                    && version.version_id().is_some_and(|id| !id.is_empty())
+                    && replication_etags_match(Some(source_etag), version.e_tag())
+            }) {
+                return Ok(version.version_id().map(str::to_string));
+            }
+            // Every listed key is >= the prefix; once the listing moved past
+            // the exact key there is nothing left to find.
+            if page
+                .versions()
+                .iter()
+                .any(|version| version.key().is_some_and(|key| key > object))
+            {
+                return Ok(None);
+            }
+            if !page.is_truncated().unwrap_or(false) {
+                return Ok(None);
+            }
+            key_marker = page.next_key_marker().map(str::to_string);
+            version_id_marker = page.next_version_id_marker().map(str::to_string);
+            if key_marker.is_none() {
+                return Ok(None);
+            }
+        }
+        Ok(None)
     }
 
     /// HEAD used by the read-proxy path (GET/HEAD of an object not yet
@@ -3219,6 +3354,64 @@ mod tests {
         assert!(message.contains(REDACTED_CREDENTIAL));
         assert!(!message.contains("sensitive-access-key"));
         assert!(message.contains("connection refused"));
+    }
+
+    #[test]
+    fn same_replication_service_ignores_resync_and_bandwidth_edits() {
+        let base = BucketTarget {
+            endpoint: "target.example:9000".to_string(),
+            target_bucket: "replica".to_string(),
+            secure: true,
+            path: "on".to_string(),
+            arn: "arn:rustfs:replication:us-east-1:bucket:same".to_string(),
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resync_edit = BucketTarget {
+            reset_id: "reset-1".to_string(),
+            bandwidth_limit: 1024,
+            ..base.clone()
+        };
+        assert!(same_replication_service(&resync_edit, &base));
+        for moved in [
+            BucketTarget {
+                endpoint: "other.example:9000".to_string(),
+                ..base.clone()
+            },
+            BucketTarget {
+                target_bucket: "other".to_string(),
+                ..base.clone()
+            },
+            BucketTarget {
+                secure: false,
+                ..base.clone()
+            },
+            BucketTarget {
+                credentials: Some(Credentials {
+                    access_key: "rotated".to_string(),
+                    ..Default::default()
+                }),
+                ..base.clone()
+            },
+        ] {
+            assert!(!same_replication_service(&moved, &base));
+        }
+    }
+
+    #[test]
+    fn version_identity_verdict_is_per_arn_and_forgotten_with_the_target() {
+        let sys = BucketTargetSys::default();
+        let arn = "arn:rustfs:replication:us-east-1:bucket:identity";
+        assert_eq!(sys.version_identity_capability(arn), VersionIdentityCapability::Unknown);
+        sys.record_version_identity_capability(arn, VersionIdentityCapability::MintsOwn);
+        assert_eq!(sys.version_identity_capability(arn), VersionIdentityCapability::MintsOwn);
+        assert_eq!(sys.version_identity_capability("other"), VersionIdentityCapability::Unknown);
+        // A rebuilt target may point at a different service.
+        sys.forget_version_identity_capability(arn);
+        assert_eq!(sys.version_identity_capability(arn), VersionIdentityCapability::Unknown);
     }
 
     #[test]

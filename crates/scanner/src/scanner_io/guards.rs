@@ -865,6 +865,41 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn service_cohort_overflow_eventually_services_every_stable_member() {
+        let source = DataUsageCacheSource::new(0, 0);
+        let inventory = cohort_inventory(&["aa", "bb", "cc", "dd", "ee", "ff"]);
+        let mut cohort = ScannerServiceCohort {
+            max_members: 2,
+            max_name_bytes: 4,
+            ..Default::default()
+        };
+        let mut admitted = HashSet::new();
+        for _ in 0..3 {
+            cohort.refresh(&inventory);
+            let mut buckets = inventory[&source].clone();
+            cohort.order_buckets(source, &mut buckets);
+            for bucket in buckets.iter().take(2) {
+                admitted.insert(bucket.name.clone());
+                cohort.record_admitted(source, &bucket.name);
+            }
+        }
+        assert_eq!(
+            admitted,
+            HashSet::from([
+                "aa".to_string(),
+                "bb".to_string(),
+                "cc".to_string(),
+                "dd".to_string(),
+                "ee".to_string(),
+                "ff".to_string(),
+            ]),
+            "stable overflow inventory must rotate every member through the tracked window"
+        );
+        assert!(cohort.overflowed);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn service_cohort_bounds_names_and_does_not_reset_duplicate_dirty_age() {
         let source = DataUsageCacheSource::new(0, 0);
         let mut cohort = ScannerServiceCohort {
