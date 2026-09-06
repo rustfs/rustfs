@@ -99,11 +99,17 @@ pub(crate) const GET_STAGE_READER_OPEN_MMAP_COPY_FALLBACK: &str = "reader_open_m
 pub(crate) const GET_STAGE_READER_OPEN_MMAP_COPY_SUCCESS: &str = "reader_open_mmap_copy_success";
 pub(crate) const GET_STAGE_READER_OPEN_STREAM: &str = "reader_open_stream";
 pub(crate) const GET_STAGE_READER_MMAP_ACCESS_CHECK: &str = "reader_mmap_access_check";
+#[cfg(unix)]
 pub(crate) const GET_STAGE_READER_MMAP_BLOCKING_TASK: &str = "reader_mmap_blocking_task";
+#[cfg(unix)]
 pub(crate) const GET_STAGE_READER_MMAP_BLOCKING_WAIT: &str = "reader_mmap_blocking_wait";
+#[cfg(unix)]
 pub(crate) const GET_STAGE_READER_MMAP_COPY_BUFFER: &str = "reader_mmap_copy_buffer";
+#[cfg(unix)]
 pub(crate) const GET_STAGE_READER_MMAP_DIRECT_READ_COPY: &str = "reader_mmap_direct_read_copy";
+#[cfg(unix)]
 pub(crate) const GET_STAGE_READER_MMAP_FILE_OPEN: &str = "reader_mmap_file_open";
+#[cfg(unix)]
 pub(crate) const GET_STAGE_READER_MMAP_MAP: &str = "reader_mmap_map";
 pub(crate) const GET_STAGE_READER_MMAP_METADATA_LOOKUP: &str = "reader_mmap_metadata_lookup";
 pub(crate) const GET_STAGE_READER_MMAP_METADATA_VALIDATE: &str = "reader_mmap_metadata_validate";

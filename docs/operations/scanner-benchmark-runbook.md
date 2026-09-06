@@ -85,6 +85,13 @@ at most 1 MiB. Logs are kept separately and require an operator-managed disk
 quota. Missing output, timeout, nonzero exit, unknown/missing metrics, zero
 samples, and request errors fail the run. Adapters must terminate their own
 children on failure and `stop` must be idempotent even after partial preparation.
+The runner keeps its session leader unreaped while stopping a failed command
+or collector: it sends TERM, allows the existing ten-second grace period, then
+kills the remaining process group before reaping. This prevents a parent exit
+from hiding live descendants or allowing the group ID to be reused before its
+last signal. A successful `prepare` preserves adapter-owned services until
+`stop`; services that leave the command's process group remain the adapter's
+cleanup responsibility.
 
 The request contains the fixed manifest fields, selected build, scenario, round,
 leg, comparison (`build` or `background`), background mode (`on` or `off`),

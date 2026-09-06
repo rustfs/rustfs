@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import select
 import shutil
 import signal
 import subprocess
@@ -126,28 +127,110 @@ def validate_manifest(manifest):
             require(manifest["expected_healed_objects"][scenario] > 0, f"{scenario} requires repairs")
 
 
+class OwnedCommand:
+    """Keep the session leader unreaped until its group's last signal is sent."""
+
+    def __init__(self, args, log):
+        require(sys.platform == "darwin" or hasattr(os, "waitid"), "non-reaping child observation is unavailable")
+        self.args, self.status = args, None
+        self.queue = select.kqueue() if sys.platform == "darwin" else None
+        self.process = None
+        read_gate, write_gate = os.pipe()
+        try:
+            # The shell has already exec'd when Popen returns. Gate the target
+            # until kqueue is registered; preexec_fn would deadlock Popen here.
+            gate = f'read -r _scanner_gate <&{read_gate} || exit 125; exec {read_gate}<&-; exec "$@"'
+            self.process = subprocess.Popen(["bash", "-c", gate, "scanner-abba", *args], pass_fds=(read_gate,),
+                                            stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            if self.queue is not None:
+                # Darwin NOTE_EXITSTATUS is not exposed by Python's select constants.
+                event = select.kevent(self.process.pid, filter=select.KQ_FILTER_PROC,
+                                      flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                      fflags=select.KQ_NOTE_EXIT | 0x04000000)
+                self.queue.control([event], 0, 0)
+            os.write(write_gate, b"\n")
+        except BaseException:
+            try:
+                if self.process is not None:
+                    try:
+                        self._signal_group(signal.SIGKILL)
+                    finally:
+                        self.process.wait(timeout=10)
+            finally:
+                if self.queue is not None:
+                    self.queue.close()
+            raise
+        finally:
+            os.close(read_gate)
+            os.close(write_gate)
+
+    def wait(self, timeout):
+        if self.status is not None:
+            return self.status
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            if self.queue is not None:
+                events = self.queue.control(None, 1, remaining)
+                if events:
+                    self.status = os.waitstatus_to_exitcode(events[0].data)
+                    return self.status
+            else:
+                result = os.waitid(os.P_PID, self.process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+                if result is not None:
+                    self.status = result.si_status if result.si_code == os.CLD_EXITED else -result.si_status
+                    return self.status
+                time.sleep(min(0.05, remaining))
+
+    def _signal_group(self, sig):
+        try:
+            os.killpg(self.process.pid, sig)
+            return True
+        except ProcessLookupError:
+            return False
+
+    def finish(self, terminate=False):
+        if self.process.returncode is not None:
+            return self.process.returncode
+        try:
+            if terminate:
+                try:
+                    self._signal_group(signal.SIGTERM)
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline and self._signal_group(0):
+                        time.sleep(0.05)
+                finally:
+                    # Keep the PID reserved through the last group signal, even
+                    # when the cleanup grace period itself is interrupted.
+                    self._signal_group(signal.SIGKILL)
+        finally:
+            try:
+                returncode = self.process.wait(timeout=10)
+            finally:
+                if self.queue is not None:
+                    self.queue.close()
+        return returncode
+
+
 def invoke(adapter, action, request, timeout):
     """The adapter writes bounded JSON separately; stderr/stdout remain raw evidence."""
     output = request.parent / f"{action}.json"
     with (request.parent / f"{action}.log").open("wb") as log:
-        process = subprocess.Popen([str(adapter), action, str(request), str(output)],
-                                   stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        process = OwnedCommand([str(adapter), action, str(request), str(output)], log)
         try:
-            returncode = process.wait(timeout=timeout)
+            returncode = process.wait(timeout)
             if returncode:
                 raise subprocess.CalledProcessError(returncode, [str(adapter), action])
-        finally:
-            if process.poll() != 0:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
-    return read_json(output)
+            result = read_json(output)
+        except BaseException:
+            process.finish(terminate=True)
+            raise
+        else:
+            # Successful prepare may intentionally leave adapter-owned services.
+            process.finish()
+            return result
 
 
 def validate_result(result, request, expected):
@@ -188,7 +271,7 @@ def convergence(result):
     require(window["full_walk_objects"] > 0, "zero full walk reference")
     require(0 < window["budget_available_seconds"] <= window["window_end"] - window["window_start"],
             "invalid convergence budget window")
-    return window["walk_objects"] / window["full_walk_objects"]
+    return ratio(window["walk_objects"], window["full_walk_objects"], "convergence work")
 
 
 def evaluate(cells):
@@ -229,6 +312,7 @@ def evaluate(cells):
         candidate_p2 = [value for cell, value in zip(group, p2) if cell["leg"].startswith("B")]
         p2_pending = any(value is None for value in candidate_p2)
         passed &= all(ratio(value, 1, "p2 work multiple") <= P2_WORK_MULTIPLE_LIMIT for value in candidate_p2 if value is not None)
+        p2_report = [None if value is None else float(value) for value in p2]
         inconclusive |= noise or p2_pending
         if not noise and not passed:
             failed = True
@@ -238,7 +322,7 @@ def evaluate(cells):
                             "p99_regression": float(p99), "throughput_change": float(throughput),
                             "thresholds": {key: float(value) for key, value in thresholds.items()},
                             "p1": p1, "p2_max_work_multiple": float(P2_WORK_MULTIPLE_LIMIT),
-                            "p2_post_stop_work_multiples": p2})
+                            "p2_post_stop_work_multiples": p2_report})
     return ("fail" if failed else "inconclusive" if inconclusive else "pass"), comparisons
 
 
@@ -254,12 +338,12 @@ def collect_live(prepared, request, request_path, adapter):
             "--samples", str(request["duration_seconds"] // 60 + 1), "--interval-secs", "60",
             "--out-dir", str(output)]
     with (request_path.parent / "collector.log").open("wb") as log:
-        process = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        process = OwnedCommand(args, log)
         try:
             started = time.monotonic()
             result = invoke(adapter, "measure", request_path, request["duration_seconds"] + 300)
             require(time.monotonic() - started >= request["duration_seconds"], "measurement ended before required window")
-            require(process.wait(timeout=120) == 0, "scanner collector failed")
+            require(process.wait(120) == 0, "scanner collector failed")
             require(output.joinpath("scanner-summary.csv").stat().st_size > 0, "missing collector samples")
             samples = list((output / "status").glob("scanner-status.*.json"))
             require(len(samples) == request["duration_seconds"] // 60 + 1, "missing scanner samples")
@@ -286,16 +370,7 @@ def collect_live(prepared, request, request_path, adapter):
                             "missing per-host scanner metrics")
             return result
         finally:
-            # Stop telemetry children as well when measurement fails or times out.
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            process.finish(terminate=True)
 
 
 def run(manifest, adapter, output, data_root):

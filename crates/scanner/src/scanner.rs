@@ -1888,9 +1888,9 @@ where
                                 // A remote restart or movement flip invalidates
                                 // the token proof; usage_store interprets this
                                 // as a publication barrier and performs no PUT.
-                                return true;
+                                return Some(ScannerCycleDeferReason::DataMovement);
                             }
-                            storeapi.scanner_data_usage_publication_blocked().await
+                            scanner_local_publication_defer_reason(storeapi.as_ref()).await
                         }
                     },
                 )
@@ -3239,8 +3239,8 @@ where
 {
     match status {
         ScannerCycleStatus::Complete | ScannerCycleStatus::Superseded => {
-            if storeapi.scanner_data_usage_publication_blocked().await {
-                return Some(ScannerCycleDeferReason::DataMovement);
+            if let Some(reason) = scanner_local_publication_defer_reason(storeapi).await {
+                return Some(reason);
             }
             if status == ScannerCycleStatus::Complete {
                 let distributed = storeapi.setup_is_dist_erasure().await;
@@ -3260,6 +3260,22 @@ where
         // Incomplete cycles may publish a non-authoritative observational
         // snapshot when at least one set has a usable current/LKG view.
         ScannerCycleStatus::Incomplete => None,
+    }
+}
+
+async fn scanner_local_publication_defer_reason<S>(storeapi: &S) -> Option<ScannerCycleDeferReason>
+where
+    S: ScannerStorage,
+{
+    if !storeapi.scanner_data_usage_publication_blocked().await {
+        return None;
+    }
+    // Pending namespace commits invalidate this publication attempt, but only
+    // storage movement creates durable, rate-limited catch-up debt.
+    if storeapi.scanner_data_movement_pause_status().await.paused {
+        Some(ScannerCycleDeferReason::DataMovement)
+    } else {
+        Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
     }
 }
 

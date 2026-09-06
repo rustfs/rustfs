@@ -561,4 +561,41 @@ mod tests {
             }
         }
     }
+
+    /// GCS states its error code in the response body, which this backend never
+    /// reads, so every class must follow from the status alone. The classes are
+    /// what the runtime acts on: only `NotFound` is negative-cached, and only a
+    /// retryable class may be re-sent rather than counted against the breaker.
+    /// The 404 row scripts the readable-bucket probe as well, because a GCS
+    /// object 404 is only a key miss once the bucket has answered
+    /// (`object_404_requires_a_readable_source_bucket` pins that rule).
+    #[tokio::test]
+    async fn gcs_statuses_map_onto_the_shared_error_classes() {
+        for method in [Method::HEAD, Method::GET] {
+            for (status, expected, retryable) in [
+                (404_u16, "not_found", false),
+                (403, "access_denied", false),
+                (401, "access_denied", false),
+                (429, "throttled", true),
+                (503, "throttled", true),
+                (500, "server_error", true),
+                (502, "server_error", true),
+            ] {
+                let mut script = vec![ScriptedResponse::new(status, Vec::new(), String::new())];
+                if status == 404 {
+                    script.push(ScriptedResponse::new(200, Vec::new(), "{}".to_string()));
+                }
+                let (endpoint, _) = scripted_server(script).await;
+                let backend = backend(&endpoint);
+                let result = if method == Method::HEAD {
+                    backend.head("a.txt").await.map(|_| ())
+                } else {
+                    backend.get("a.txt", None).await.map(|_| ())
+                };
+                let err = result.expect_err("a non-2xx status must fail");
+                assert_eq!(err.class_label(), expected, "{method} HTTP {status}: {err:?}");
+                assert_eq!(err.is_retryable(), retryable, "{method} HTTP {status}: {err:?}");
+            }
+        }
+    }
 }

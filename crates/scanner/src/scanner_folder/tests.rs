@@ -25,6 +25,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::Mutex;
 
 mod checkpoint_fixture;
+pub(super) mod enumeration_restart;
 
 /// Reset the process-global alert cooldown map; test-only.
 fn reset_alert_cooldowns() {

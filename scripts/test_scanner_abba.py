@@ -3,13 +3,17 @@
 
 import contextlib
 import copy
+import fcntl
 import io
 import json
 import os
 from pathlib import Path
+import shlex
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -20,9 +24,18 @@ def fake_adapter():
     action, request_path, output_path = sys.argv[1:]
     request = harness.read_json(Path(request_path))
     fault = os.environ.get("SCANNER_ABBA_TEST_FAULT", "")
+    if fault == "stubborn-child" and action in ("prepare", "measure"):
+        marker = Path(request_path).parent / "stubborn.pid"
+        if os.fork() == 0:
+            os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), "--stubborn-worker", str(marker)])
+        wait_for_marker(marker)
+        if action == "measure":
+            time.sleep(60)
     if action == "prepare":
         result = {"ready": True}
     elif action == "stop":
+        if fault == "stubborn-child":
+            reap_fixture(Path(request_path).parent / "stubborn.pid")
         result = {"stopped": True}
     elif action == "oracle":
         if fault == "oracle-exit":
@@ -87,6 +100,36 @@ def fake_adapter():
     return 0
 
 
+def wait_for_marker(marker):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if marker.exists() and marker.stat().st_size:
+            return
+        time.sleep(0.01)
+    raise AssertionError("fixture child did not become ready")
+
+
+def child_released(marker, timeout=1):
+    deadline = time.monotonic() + timeout
+    with marker.open("r+") as stream:
+        while True:
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.01)
+
+
+def reap_fixture(marker):
+    if marker.exists() and marker.stat().st_size and not child_released(marker, timeout=0):
+        # The unique file lock proves the original fixture process still owns this PID.
+        os.kill(int(marker.read_text()), signal.SIGKILL)
+        if not child_released(marker, timeout=5):
+            raise AssertionError("fixture child did not release its process-owned lock")
+
+
 class ScannerAbbaTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -109,6 +152,112 @@ class ScannerAbbaTest(unittest.TestCase):
     def run_harness(self, fault=""):
         with patch.dict(os.environ, {"SCANNER_ABBA_TEST_FAULT": fault}), contextlib.redirect_stdout(io.StringIO()):
             return harness.run(copy.deepcopy(self.manifest), self.adapter, self.root / "out", self.root / "data")
+
+    def test_adapter_timeout_reaps_group_after_parent_exits_on_term(self):
+        request = self.root / "request.json"
+        harness.write_json(request, {})
+        marker = self.root / "stubborn.pid"
+        try:
+            with patch.dict(os.environ, {"SCANNER_ABBA_TEST_FAULT": "stubborn-child"}):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    harness.invoke(self.adapter, "measure", request, 3)
+            wait_for_marker(marker)
+            self.assertTrue(child_released(marker), "TERM-exited parent left its TERM-ignoring child alive")
+        finally:
+            reap_fixture(marker)
+
+    def test_collector_failure_reaps_group_after_parent_exits_on_term(self):
+        request = self.root / "request.json"
+        harness.write_json(request, {})
+        marker = self.root / "stubborn.pid"
+        collector = self.root / "run_scanner_validation_harness.sh"
+        command = [sys.executable, str(self.adapter), "measure", str(request), str(self.root / "unused.json")]
+        collector.write_text("#!/usr/bin/env bash\nexec " + shlex.join(command) + "\n")
+
+        def failed_measure(*_):
+            wait_for_marker(marker)
+            raise ValueError("injected measurement failure")
+
+        try:
+            with patch.dict(os.environ, {"SCANNER_ABBA_TEST_FAULT": "stubborn-child"}), \
+                 patch.object(harness, "__file__", str(self.root / "scanner_abba.py")), \
+                 patch.object(harness, "invoke", side_effect=failed_measure):
+                with self.assertRaisesRegex(ValueError, "injected measurement failure"):
+                    harness.collect_live({"collector": {"alias": "fixture", "endpoint": "fixture", "metrics_endpoints": "fixture"}},
+                                         {"duration_seconds": 900}, request, self.adapter)
+            self.assertTrue(child_released(marker), "collector parent exit did not end its telemetry child")
+        finally:
+            reap_fixture(marker)
+
+    def test_successful_prepare_keeps_service_alive(self):
+        request = self.root / "request.json"
+        harness.write_json(request, {})
+        marker = self.root / "stubborn.pid"
+        try:
+            with patch.dict(os.environ, {"SCANNER_ABBA_TEST_FAULT": "stubborn-child"}):
+                self.assertEqual(harness.invoke(self.adapter, "prepare", request, 5), {"ready": True})
+                self.assertFalse(child_released(marker, timeout=0), "successful prepare must preserve its service")
+                self.assertEqual(harness.invoke(self.adapter, "stop", request, 5), {"stopped": True})
+            self.assertTrue(child_released(marker), "adapter stop must release its service")
+        finally:
+            reap_fixture(marker)
+
+    def test_reaped_owner_never_signals_a_reused_process_group(self):
+        with (self.root / "owner.log").open("wb") as log:
+            owner = harness.OwnedCommand([sys.executable, "-c", "pass"], log)
+            self.assertEqual(owner.wait(5), 0)
+            self.assertEqual(owner.finish(), 0)
+            with patch.object(harness.os, "killpg", side_effect=AssertionError("released PGID must not be signalled")):
+                self.assertEqual(owner.finish(terminate=True), 0)
+
+    def test_cleanup_interruption_still_kills_group_and_reaps_leader(self):
+        request = self.root / "request.json"
+        harness.write_json(request, {})
+        marker = self.root / "stubborn.pid"
+        original_sleep = time.sleep
+        interrupted = False
+
+        def interrupt_once(delay):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            original_sleep(delay)
+
+        with (self.root / "interrupted.log").open("wb") as log:
+            with patch.dict(os.environ, {"SCANNER_ABBA_TEST_FAULT": "stubborn-child"}):
+                owner = harness.OwnedCommand([str(self.adapter), "measure", str(request), str(self.root / "unused.json")], log)
+            try:
+                wait_for_marker(marker)
+                with patch.object(harness.time, "sleep", side_effect=interrupt_once):
+                    with self.assertRaises(KeyboardInterrupt):
+                        owner.finish(terminate=True)
+                self.assertTrue(child_released(marker), "cleanup cancellation left its child alive")
+                self.assertIsNotNone(owner.process.returncode, "cleanup cancellation must reap its leader")
+            finally:
+                reap_fixture(marker)
+                owner.process.wait(timeout=5)
+
+    def test_constructor_failure_after_gate_release_kills_group(self):
+        request = self.root / "request.json"
+        harness.write_json(request, {})
+        marker = self.root / "stubborn.pid"
+        original_write = os.write
+
+        def release_then_fail(fd, data):
+            original_write(fd, data)
+            wait_for_marker(marker)
+            raise OSError("injected failure after gate release")
+
+        try:
+            with (self.root / "construction.log").open("wb") as log, \
+                 patch.dict(os.environ, {"SCANNER_ABBA_TEST_FAULT": "stubborn-child"}), \
+                 patch.object(harness.os, "write", side_effect=release_then_fail):
+                with self.assertRaisesRegex(OSError, "injected failure after gate release"):
+                    harness.OwnedCommand([str(self.adapter), "measure", str(request), str(self.root / "unused.json")], log)
+            self.assertTrue(child_released(marker), "initialization failure left its child alive")
+        finally:
+            reap_fixture(marker)
 
     def test_complete_synthetic_matrix_is_not_performance_evidence(self):
         self.assertEqual(self.run_harness(), 0)
@@ -201,16 +350,17 @@ class ScannerAbbaTest(unittest.TestCase):
                 else:
                     harness.write_json(sample, payload)
                 process = Mock(pid=123, wait=Mock(return_value=1 if name == "collector-exit" else 0))
-                with patch.object(harness.subprocess, "Popen", return_value=process), \
+                with patch.object(harness, "OwnedCommand", return_value=process), \
                         patch.object(harness, "invoke", return_value={"sample_count": 10}), \
-                        patch.object(harness.time, "monotonic", side_effect=(0, 900)), \
-                        patch.object(harness.os, "killpg"):
+                        patch.object(harness.time, "monotonic", side_effect=(0, 900)):
                     if error:
                         with self.assertRaisesRegex(ValueError, error):
                             harness.collect_live(prepared, {"duration_seconds": 900}, self.root / "request.json", self.adapter)
                     else:
                         self.assertEqual(harness.collect_live(prepared, {"duration_seconds": 900},
                                                              self.root / "request.json", self.adapter), {"sample_count": 10})
+
+                process.finish.assert_called_once_with(terminate=True)
 
     def test_unstable_p1_work_control_is_inconclusive(self):
         with patch.object(harness, "SCENARIOS", ("cold-hot",)):
@@ -259,6 +409,14 @@ class ScannerAbbaTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--stubborn-worker":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        with Path(sys.argv[2]).open("w+") as marker:
+            fcntl.flock(marker, fcntl.LOCK_EX)
+            marker.write(str(os.getpid()))
+            marker.flush()
+            while True:
+                time.sleep(1)
     if len(sys.argv) == 4 and sys.argv[1] in ("prepare", "measure", "oracle", "stop"):
         sys.exit(fake_adapter())
     unittest.main()

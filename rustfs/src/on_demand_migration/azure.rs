@@ -44,8 +44,9 @@ use super::storage_api::HTTPRangeSpec;
 use super::storage_api::remote_s3_client::RemoteS3ClientError;
 use hmac::{Hmac, Mac, digest::KeyInit};
 use http::{HeaderMap, HeaderValue, Method};
+use percent_encoding::percent_decode_str;
 use quick_xml::Reader;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesStart, Event};
 use sha2::Sha256;
 use std::collections::{BTreeMap, HashMap};
 use url::Url;
@@ -379,13 +380,23 @@ fn parse_list_blobs(xml: &str) -> Result<AzureListing, SourceError> {
                     _ => {
                         let end = start.to_end().into_owned();
                         let text = leaf_text(&mut reader, end.name())?;
+                        let text = if name == "name" {
+                            decode_list_name(&start, text)?
+                        } else {
+                            text
+                        };
                         apply_list_field(&name, text, &mut blob, &mut prefixes, &mut next_marker, in_blob_prefix);
                     }
                 }
             }
             Ok(Event::Empty(empty)) => {
                 let name = local_name(empty.name().as_ref());
-                apply_list_field(&name, String::new(), &mut blob, &mut prefixes, &mut next_marker, in_blob_prefix);
+                let text = if name == "name" {
+                    decode_list_name(&empty, String::new())?
+                } else {
+                    String::new()
+                };
+                apply_list_field(&name, text, &mut blob, &mut prefixes, &mut next_marker, in_blob_prefix);
             }
             Ok(Event::End(end)) => match local_name(end.name().as_ref()).as_str() {
                 "blob" => {
@@ -424,6 +435,43 @@ fn parse_list_blobs(xml: &str) -> Result<AzureListing, SourceError> {
         prefixes,
         next_marker: next_marker.filter(|marker| !marker.is_empty()),
     })
+}
+
+/// Azure marks XML-inexpressible blob/prefix names with `Encoded="true"`.
+/// Only those names are URI-decoded, once; ordinary percent signs and `+`
+/// are part of the key, and NextMarker remains an opaque cursor.
+fn decode_list_name(start: &BytesStart<'_>, text: String) -> Result<String, SourceError> {
+    let mut encoded = false;
+    for attribute in start.attributes() {
+        let attribute = attribute.map_err(|_| SourceError::Other("source listing name has invalid attributes".to_string()))?;
+        if attribute.key.as_ref() == "Encoded" {
+            let value = quick_xml::escape::unescape(&attribute.value)
+                .map_err(|_| SourceError::Other("source listing name has an invalid Encoded attribute".to_string()))?;
+            encoded = match value.as_ref() {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                _ => return Err(SourceError::Other("source listing name has an invalid Encoded attribute".to_string())),
+            };
+        }
+    }
+    if !encoded {
+        return Ok(text);
+    }
+
+    // percent_decode_str leaves malformed escapes untouched. Refuse them
+    // rather than return a different key or replace invalid UTF-8 with U+FFFD.
+    let mut bytes = text.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%'
+            && !(bytes.next().is_some_and(|b| b.is_ascii_hexdigit()) && bytes.next().is_some_and(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(SourceError::Other("source listing name has invalid percent encoding".to_string()));
+        }
+    }
+    percent_decode_str(&text)
+        .decode_utf8()
+        .map(|name| name.into_owned())
+        .map_err(|_| SourceError::Other("source listing name is not valid UTF-8".to_string()))
 }
 
 fn apply_list_field(
@@ -586,6 +634,13 @@ mod tests {
     const LAST_PAGE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <EnumerationResults><Blobs><Blob><Name>only.txt</Name><Properties><Content-Length>1</Content-Length></Properties></Blob></Blobs><NextMarker /></EnumerationResults>"#;
 
+    const ENCODED_NAME_PAGE: &str = r#"<EnumerationResults><Blobs>
+<Blob><Name Encoded="true">%EF%BF%BE/part%252F+%20%26.txt</Name><Properties><Content-Length>5</Content-Length></Properties></Blob>
+<Blob><Name>%EF%BF%BE/part%252F+%20%26.txt</Name><Properties><Content-Length>5</Content-Length></Properties></Blob>
+<BlobPrefix><Name Encoded="true">%EF%BF%BF%2F</Name></BlobPrefix>
+<BlobPrefix><Name Encoded="false">literal%FF+/</Name></BlobPrefix>
+</Blobs><NextMarker Encoded="true">opaque%2F+cursor</NextMarker></EnumerationResults>"#;
+
     const TAGS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <Tags><TagSet>
   <Tag><Key>env</Key><Value>prod</Value></Tag>
@@ -618,6 +673,87 @@ mod tests {
         let listing = parse_list_blobs(LAST_PAGE).expect("page should parse");
         assert_eq!(listing.objects.len(), 1);
         assert!(listing.next_marker.is_none(), "an empty NextMarker is not a cursor");
+        let empty = parse_list_blobs("<EnumerationResults><Blobs/><NextMarker/></EnumerationResults>")
+            .expect("an empty final page is valid");
+        assert!(empty.objects.is_empty());
+        assert!(empty.prefixes.is_empty());
+        assert!(empty.next_marker.is_none());
+    }
+
+    #[test]
+    fn list_blobs_decodes_only_marked_names_once() {
+        let listing = parse_list_blobs(ENCODED_NAME_PAGE).expect("encoded names should parse");
+        assert_eq!(listing.objects[0].key, "\u{fffe}/part%2F+ &.txt");
+        assert_eq!(listing.objects[1].key, "%EF%BF%BE/part%252F+%20%26.txt");
+        assert_eq!(listing.prefixes, ["\u{ffff}/", "literal%FF+/"]);
+        assert_eq!(listing.next_marker.as_deref(), Some("opaque%2F+cursor"));
+
+        for (attribute, text, expected) in [
+            ("", "a%2Fb+ &amp;.txt", "a%2Fb+ &.txt"),
+            ("Encoded=\"false\"", "a%2Fb+ &amp;.txt", "a%2Fb+ &.txt"),
+            ("Encoded=\"0\"", "a%2Fb+ &amp;.txt", "a%2Fb+ &.txt"),
+            ("Encoded=\"true\"", "a%2Fb+ &amp;.txt", "a/b+ &.txt"),
+            ("Encoded=\"1\"", "a%2Fb+ &amp;.txt", "a/b+ &.txt"),
+            ("Encoded=\"tr&#117;e\"", "a%2Fb+ &amp;.txt", "a/b+ &.txt"),
+            ("", "%", "%"),
+            ("Encoded=\"false\"", "%", "%"),
+            ("", "中文/plain%2F+name%", "中文/plain%2F+name%"),
+            ("Encoded=\"false\"", "中文/plain%2F+name%", "中文/plain%2F+name%"),
+            (
+                "Encoded=\"true\"",
+                "%EF%BF%BE%EF%BF%BF/%E4%B8%AD%E6%96%87-%25-%2B-%252F+&amp;-%26amp%3B",
+                "\u{fffe}\u{ffff}/中文-%-+-%2F+&-&amp;",
+            ),
+        ] {
+            for container in ["Blob", "BlobPrefix"] {
+                let properties = if container == "Blob" {
+                    "<Properties><Content-Length>0</Content-Length></Properties>"
+                } else {
+                    ""
+                };
+                let xml = format!(
+                    "<EnumerationResults><Blobs><{container}><Name {attribute}>{text}</Name>{properties}</{container}></Blobs></EnumerationResults>"
+                );
+                let listing = parse_list_blobs(&xml).expect("valid name");
+                if container == "Blob" {
+                    assert_eq!(listing.objects.len(), 1);
+                    assert_eq!(listing.objects[0].key, expected, "{container}: {attribute}, {text}");
+                    assert_eq!(listing.objects[0].size, 0, "a named zero-byte blob remains valid");
+                } else {
+                    assert!(listing.objects.is_empty(), "a prefix-only page remains valid");
+                    assert_eq!(listing.prefixes, [expected], "{container}: {attribute}, {text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn list_blobs_rejects_invalid_encoded_names_without_returning_partial_entries() {
+        for name in [
+            "<Name Encoded=\"true\">%</Name>",
+            "<Name Encoded=\"true\">%2</Name>",
+            "<Name Encoded=\"true\">%GG</Name>",
+            "<Name Encoded=\"true\">%FF</Name>",
+            "<Name Encoded=\"true\">%E2%82</Name>",
+            "<Name Encoded=\"true\">%C0%AF</Name>",
+            "<Name Encoded=\"true\">%ED%A0%80</Name>",
+            "<Name Encoded=\"maybe\">a</Name>",
+            "<Name Encoded=\"true\" Encoded=\"false\">a</Name>",
+            "<Name Encoded=\"true\" Encoded=\"false\"/>",
+            "<Name Encoded=\"&unknown;\">a</Name>",
+        ] {
+            for container in ["Blob", "BlobPrefix"] {
+                let properties = if container == "Blob" {
+                    "<Properties><Content-Length>1</Content-Length></Properties>"
+                } else {
+                    ""
+                };
+                let xml = format!(
+                    "<EnumerationResults><Blobs><Blob><Name>before</Name><Properties><Content-Length>1</Content-Length></Properties></Blob><{container}>{name}{properties}</{container}><Blob><Name>after</Name><Properties><Content-Length>1</Content-Length></Properties></Blob></Blobs><NextMarker>opaque%2B+marker</NextMarker></EnumerationResults>"
+                );
+                assert!(matches!(parse_list_blobs(&xml), Err(SourceError::Other(_))), "{container}: {name}");
+            }
+        }
     }
 
     #[test]
@@ -904,6 +1040,118 @@ mod tests {
             recorded.lock().expect("recorder lock").is_empty(),
             "an unsupported request must never reach the source"
         );
+    }
+
+    #[tokio::test]
+    async fn listed_encoded_and_literal_names_get_distinct_source_objects() {
+        let mut head_headers = blob_headers();
+        head_headers.push(("Content-Length", "5".to_string()));
+        let (endpoint, recorded) = scripted_server(vec![
+            ScriptedResponse::new(200, Vec::new(), ENCODED_NAME_PAGE.to_string()),
+            ScriptedResponse::new(200, head_headers.clone(), String::new()),
+            ScriptedResponse::new(200, blob_headers(), "first".to_string()),
+            ScriptedResponse::new(200, head_headers, String::new()),
+            ScriptedResponse::new(200, blob_headers(), "other".to_string()),
+        ])
+        .await;
+        let backend = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]));
+        let page = backend
+            .list(&SourceListRequest {
+                max_keys: 4,
+                ..Default::default()
+            })
+            .await
+            .expect("list names");
+        assert_eq!(page.objects.len(), 2);
+        assert_eq!(page.objects[0].key, "\u{fffe}/part%2F+ &.txt");
+        assert_eq!(page.objects[1].key, "%EF%BF%BE/part%252F+%20%26.txt");
+        assert_eq!(page.common_prefixes, ["\u{ffff}/", "literal%FF+/"]);
+        for (object, body) in page.objects.iter().zip([b"first", b"other"]) {
+            let head = backend.head(&object.key).await.expect("head listed object");
+            assert_eq!(head.size, object.size);
+            let got = backend.get(&object.key, None).await.expect("get listed object");
+            assert_eq!(got.body.collect().await.expect("source body").into_bytes().as_ref(), body);
+        }
+        let recorded = recorded.lock().expect("recorder lock");
+        assert_eq!(recorded.len(), 5);
+        for (requests, expected) in recorded[1..].as_chunks::<2>().0.iter().zip([
+            "/legacy/%EF%BF%BE/part%252F+%20&.txt",
+            "/legacy/%25EF%25BF%25BE/part%25252F+%2520%2526.txt",
+        ]) {
+            assert_eq!(requests[0].method, "HEAD");
+            assert_eq!(requests[1].method, "GET");
+            assert_eq!(requests[0].target, expected);
+            assert_eq!(requests[1].target, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn listed_encoded_prefix_and_opaque_marker_round_trip_through_query_encoding() {
+        const PAGE: &str = r#"<EnumerationResults><Blobs><BlobPrefix><Name Encoded="true">%EF%BF%BE%EF%BF%BF/%E4%B8%AD%E6%96%87/%252F%2B%25+%26/</Name></BlobPrefix></Blobs><NextMarker>opaque%2B+marker</NextMarker></EnumerationResults>"#;
+        let (endpoint, recorded) = scripted_server(vec![
+            ScriptedResponse::new(200, Vec::new(), PAGE.to_string()),
+            ScriptedResponse::new(200, Vec::new(), LAST_PAGE.to_string()),
+            ScriptedResponse::new(200, Vec::new(), LAST_PAGE.to_string()),
+        ])
+        .await;
+        let backend = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]));
+        let first = backend
+            .list(&SourceListRequest {
+                delimiter: Some("/"),
+                max_keys: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("list encoded prefix");
+        assert!(first.objects.is_empty());
+        assert_eq!(first.common_prefixes, ["\u{fffe}\u{ffff}/中文/%2F+%+&/"]);
+        assert_eq!(first.next_continuation_token.as_deref(), Some("opaque%2B+marker"));
+        assert!(first.is_truncated);
+
+        let second = backend
+            .list(&SourceListRequest {
+                delimiter: Some("/"),
+                continuation_token: first.next_continuation_token.as_deref(),
+                max_keys: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("continue with the original listing conditions");
+        assert!(!second.is_truncated);
+        assert!(second.next_continuation_token.is_none());
+
+        let nested = backend
+            .list(&SourceListRequest {
+                prefix: Some(&first.common_prefixes[0]),
+                delimiter: Some("/"),
+                max_keys: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("start a separate listing under the returned logical prefix");
+        assert!(!nested.is_truncated);
+
+        let recorded = recorded.lock().expect("recorder lock");
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded[0].method, "GET");
+        assert!(!recorded[0].target.contains("marker="));
+        assert_eq!(recorded[1].method, "GET");
+        assert_eq!(
+            recorded[1].target,
+            "/legacy?restype=container&comp=list&delimiter=%2F&marker=opaque%252B%2Bmarker&maxresults=1"
+        );
+        let request_url = endpoint.join(&recorded[1].target).expect("recorded request URL");
+        let query: HashMap<_, _> = request_url.query_pairs().into_owned().collect();
+        assert_eq!(query.get("marker").map(String::as_str), Some("opaque%2B+marker"));
+        assert_eq!(recorded[2].method, "GET");
+        assert_eq!(
+            recorded[2].target,
+            "/legacy?restype=container&comp=list&prefix=%EF%BF%BE%EF%BF%BF%2F%E4%B8%AD%E6%96%87%2F%252F%2B%25%2B%26%2F&delimiter=%2F&maxresults=1"
+        );
+        let request_url = endpoint.join(&recorded[2].target).expect("recorded prefix request URL");
+        let query: HashMap<_, _> = request_url.query_pairs().into_owned().collect();
+        assert_eq!(query.get("prefix"), Some(&first.common_prefixes[0]));
+        assert!(!query.contains_key("marker"));
     }
 
     #[tokio::test]

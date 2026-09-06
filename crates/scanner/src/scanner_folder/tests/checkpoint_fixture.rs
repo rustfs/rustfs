@@ -20,6 +20,8 @@ use crate::{DataUsageCacheSource, DataUsageScanPlanDigest};
 use std::io::Cursor;
 use tokio::io::AsyncReadExt;
 
+mod segment_observation;
+
 const CACHE_NAME: &str = "bucket/checkpoint-fixture.bin";
 const STATIC_OBJECTS: u64 = 24;
 const MAX_CACHE_BYTES: u64 = 1024 * 1024;

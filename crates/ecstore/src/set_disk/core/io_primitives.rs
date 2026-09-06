@@ -111,10 +111,11 @@ use crate::disk::{
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::ShardReader;
 use crate::io_support::bitrot::{
-    BitrotReaderStageMetrics, DeferredReaderStripeHandle, adjust_shard_read_params,
-    create_bitrot_reader_from_bytes_with_stage_metrics, create_deferred_bitrot_reader_with_stripe_handle,
-    object_mmap_read_max_length,
+    BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_from_bytes_with_stage_metrics,
+    create_deferred_bitrot_reader_with_stripe_handle,
 };
+#[cfg(unix)]
+use crate::io_support::bitrot::{adjust_shard_read_params, object_mmap_read_max_length};
 use crate::set_disk::runtime_sources;
 use crate::set_disk::shard_source::ShardReadCost;
 use crate::storage_api_contracts::object::ObjectOperations;

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::heal::{
+    outcome::HealTaskOutcome,
     progress::{HealProgress, HealStatistics},
     resume::{ReplacementPhase, ResumeGc, ResumeManager, ResumeState, ResumeUtils},
     storage::HealStorageAPI,
@@ -185,6 +186,7 @@ fn record_displaced_terminal(
     request: &HealRequest,
 ) -> Arc<CompletedHealStatus> {
     let terminal = Arc::new(CompletedHealStatus {
+        outcome: None,
         progress: None,
         retained_bytes: std::sync::OnceLock::new(),
         heal_type: request.heal_type.clone(),
@@ -268,6 +270,7 @@ async fn publish_completed_heal(
 
 #[derive(Debug, Clone)]
 pub struct HealTaskReport {
+    pub outcome: Option<Arc<HealTaskOutcome>>,
     pub status: HealTaskStatus,
     pub result_items: Vec<HealResultItem>,
     pub result_items_truncated: bool,
@@ -285,6 +288,7 @@ async fn active_task_report(task: &HealTask, since: Option<u64>) -> HealTaskRepo
     let window = task.get_result_items_since(since).await;
     HealTaskReport {
         status: task.get_status().await,
+        outcome: Some(Arc::new(task.get_outcome().await)),
         result_items: window.items,
         // The legacy flag stays set once anything was evicted; a lagging
         // incremental cursor additionally marks this response truncated so
@@ -298,6 +302,7 @@ async fn active_task_report(task: &HealTask, since: Option<u64>) -> HealTaskRepo
 
 fn empty_task_report(status: HealTaskStatus) -> HealTaskReport {
     HealTaskReport {
+        outcome: None,
         status,
         result_items: Vec::new(),
         result_items_truncated: false,
@@ -325,6 +330,7 @@ fn completed_task_report(completed: &CompletedHealStatus, since: Option<u64>) ->
     };
     HealTaskReport {
         status: completed.status.clone(),
+        outcome: completed.outcome.clone(),
         result_items,
         result_items_truncated: completed.result_items_truncated || lagged,
         progress: completed.progress.clone(),

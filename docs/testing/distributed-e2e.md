@@ -17,7 +17,7 @@ A multi-pool layout in which any pool spans several localhost ports is not expre
 
 Data-movement cases fail closed. A decommission or rebalance test must observe a successful start response, an active state, a clean terminal state, non-zero movement counters, and post-operation object integrity. An unsupported response, HTTP 5xx, missing status fields, cleanup warning, or zero-progress terminal response fails the case; pre/post S3 availability alone is not evidence that movement ran.
 
-The four expansion pools must report independent capacity. Four directories on one runner filesystem all return the same `statfs` totals, so RustFS correctly concludes that no pool is less free than the cluster average and performs no rebalance. The Actions job mounts four isolated ext4 loopback filesystems and exports their absolute paths through `RUSTFS_E2E_POOL_ROOTS`. The harness rejects missing, duplicate, relative, nonexistent, or same-device roots instead of allowing a vacuous movement pass. Planned pool additions stop every process with SIGTERM; hard process termination remains a chaos-only fault. After the fourth pool joins, the harness performs one full graceful persistent restart: this proves the expanded pool map survives restart and ensures movement begins only after every replica can load the converged metadata.
+The four expansion pools must report independent capacity. Four directories on one runner filesystem all return the same `statfs` totals, so RustFS correctly concludes that no pool is less free than the cluster average and performs no rebalance. The Actions job mounts four isolated 1 GiB tmpfs filesystems and exports their absolute paths through `RUSTFS_E2E_POOL_ROOTS`. It does not use ext4 loop devices: the `sm-standard-4` ARC pods have no `/dev/loop-control`, so `mount -o loop` fails with `No such file or directory`. Sized tmpfs still reports a distinct `st_dev` and independent 1 GiB `statfs` capacity. The harness rejects missing, duplicate, relative, nonexistent, or same-device roots instead of allowing a vacuous movement pass. Planned pool additions stop every process with SIGTERM; hard process termination remains a chaos-only fault. After the fourth pool joins, the harness performs one full graceful persistent restart: this proves the expanded pool map survives restart and ensures movement begins only after every replica can load the converged metadata.
 
 The expansion fixture is an all-current-binary fleet, so it initializes pool metadata with the documented V3 write and fleet-confirmation gates. Decommission cases write their baseline objects, version history, and multipart data into pool 0 before adding pools 1–3, then retire pool 0. This makes a passing result evidence of user-data movement rather than merely an internal-metadata counter changing.
 
@@ -58,6 +58,11 @@ Hardware power-loss, physical NIC pull, authenticated inter-node partition, firm
 ```bash
 cargo build -p rustfs --bins
 # Expansion/decommission/rebalance cases require four paths on distinct filesystems.
+# If you do not already have four disks, sized tmpfs is enough:
+#   for p in 0 1 2 3; do
+#     sudo mkdir -p /mnt/rustfs-pool-$p
+#     sudo mount -t tmpfs -o size=1G,nosuid,nodev,mode=1777 tmpfs /mnt/rustfs-pool-$p
+#   done
 export RUSTFS_E2E_POOL_ROOTS=/mnt/rustfs-pool-0:/mnt/rustfs-pool-1:/mnt/rustfs-pool-2:/mnt/rustfs-pool-3
 # Upgrade cases require the pinned previous binary (CI downloads it).
 export RUSTFS_UPGRADE_SOURCE_BINARY=/path/to/rustfs-1.0.0-rc.2

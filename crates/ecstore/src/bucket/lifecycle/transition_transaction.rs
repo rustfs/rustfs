@@ -747,7 +747,7 @@ pub enum TransitionTransactionRecoveryOutcome {
     OperatorRequired(IlmRecoveryErrorCode),
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 #[derive(Default)]
 struct TransitionRecoveryClaimBarrierState {
     transaction_id: Uuid,
@@ -755,17 +755,17 @@ struct TransitionRecoveryClaimBarrierState {
     release: tokio::sync::Notify,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) struct TransitionRecoveryClaimBarrier {
     state: Arc<TransitionRecoveryClaimBarrierState>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 static TRANSITION_RECOVERY_CLAIM_BARRIER: std::sync::OnceLock<
     std::sync::Mutex<Option<Arc<TransitionRecoveryClaimBarrierState>>>,
 > = std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl TransitionRecoveryClaimBarrier {
     pub(crate) fn install(transaction_id: Uuid) -> Self {
         let state = Arc::new(TransitionRecoveryClaimBarrierState {
@@ -796,7 +796,7 @@ impl TransitionRecoveryClaimBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl Drop for TransitionRecoveryClaimBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -810,7 +810,7 @@ impl Drop for TransitionRecoveryClaimBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 async fn pause_before_transition_recovery_claim(transaction_id: Uuid) {
     let barrier = TRANSITION_RECOVERY_CLAIM_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -825,7 +825,7 @@ async fn pause_before_transition_recovery_claim(transaction_id: Uuid) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 #[derive(Default)]
 struct TransitionRecoveryTerminalBarrierState {
     transaction_id: Uuid,
@@ -833,17 +833,17 @@ struct TransitionRecoveryTerminalBarrierState {
     release: tokio::sync::Notify,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) struct TransitionRecoveryTerminalBarrier {
     state: Arc<TransitionRecoveryTerminalBarrierState>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 static TRANSITION_RECOVERY_TERMINAL_BARRIER: std::sync::OnceLock<
     std::sync::Mutex<Option<Arc<TransitionRecoveryTerminalBarrierState>>>,
 > = std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl TransitionRecoveryTerminalBarrier {
     pub(crate) fn install(transaction_id: Uuid) -> Self {
         let state = Arc::new(TransitionRecoveryTerminalBarrierState {
@@ -870,7 +870,7 @@ impl TransitionRecoveryTerminalBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl Drop for TransitionRecoveryTerminalBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -884,7 +884,7 @@ impl Drop for TransitionRecoveryTerminalBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 async fn pause_after_transition_recovery_terminal(transaction_id: Uuid) {
     let barrier = TRANSITION_RECOVERY_TERMINAL_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -1242,7 +1242,7 @@ async fn process_transition_transaction_record_at(
                         },
                     )
                     .map_err(transition_transaction_store_error)?;
-                #[cfg(test)]
+                #[cfg(all(test, feature = "test-util"))]
                 pause_before_transition_recovery_claim(current.transaction_id).await;
                 match save_transition_transaction_record_if_current(api.clone(), &current, &cleanup).await {
                     Ok(()) => recover_cleanup_pending(api.clone(), &cleanup).await,
@@ -1300,7 +1300,7 @@ async fn process_transition_transaction_record_at(
         };
         persist_transition_recovery_result(api.clone(), control, &recovery, now_unix_nanos).await?;
         if let Some(source) = source_to_delete {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "test-util"))]
             pause_after_transition_recovery_terminal(source.transaction_id).await;
             delete_transition_transaction_record(api, &source).await?;
         }
@@ -1322,7 +1322,7 @@ fn transition_recovery_control_identity(transaction: &TransitionTransaction, rec
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) fn transition_recovery_control_id(transaction: &TransitionTransaction) -> Result<String> {
     let record_name = transition_transaction_record_object_name(transaction.transaction_id)?;
     transition_recovery_control_identity(transaction, &record_name)
@@ -1753,7 +1753,7 @@ pub async fn recover_transition_transaction_records(
     recover_transition_transaction_records_with_now(api, limit, marker, None).await
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 pub async fn recover_transition_transaction_records_at(
     api: Arc<ECStore>,
     limit: usize,
