@@ -26,7 +26,7 @@ use super::common::{
     OdmEnvOptions, OdmSourceSpec, OdmTestEnv, SeedObject, start_configured_env, start_configured_env_with,
 };
 use crate::common::{RustFSTestEnvironment, replication_fast_env, signed_request};
-use crate::fake_s3_target::{BucketMode, FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction, Operation};
+use crate::fake_s3_target::{BucketMode, FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, Operation};
 use crate::object_lock::common::put_object_lock_configuration;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::{
