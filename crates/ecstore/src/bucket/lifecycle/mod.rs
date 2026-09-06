@@ -26,6 +26,7 @@ mod object_lock_boundary;
 pub use self::core as lifecycle;
 pub mod recovery_control;
 pub mod recovery_disposition;
+pub(crate) mod recovery_disposition_runtime;
 pub mod recovery_export;
 mod replication_sink;
 pub mod rule;

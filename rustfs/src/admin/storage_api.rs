@@ -235,6 +235,10 @@ pub(crate) mod lifecycle {
     pub(crate) use super::ecstore_bucket::lifecycle::recovery_control::{
         IlmRecoveryClassification, IlmRecoveryControlView, IlmRecoveryProtocol, inspect_recovery_control, list_recovery_controls,
     };
+    pub(crate) use super::ecstore_bucket::lifecycle::recovery_disposition::{
+        IlmRecoveryDispositionExecutionOutcome, IlmRecoveryDispositionReasonCode, IlmRecoveryDispositionState,
+        dry_run_recovery_disposition, execute_recovery_disposition,
+    };
     pub(crate) use super::ecstore_bucket::lifecycle::recovery_export::{
         IlmRecoveryExportObservation, create_recovery_export, inspect_recovery_export_observation, load_recovery_export,
     };

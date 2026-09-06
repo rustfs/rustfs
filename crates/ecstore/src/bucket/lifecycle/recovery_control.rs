@@ -485,6 +485,20 @@ impl IlmRecoveryControl {
         self.validate()
     }
 
+    pub fn abandon_for_operator(&mut self, expected_source_generation: &IlmRecoverySourceGeneration) -> Result<()> {
+        if self.owner.is_some()
+            || self.classification != IlmRecoveryClassification::RetainedAmbiguous
+            || &self.observed_source_generation != expected_source_generation
+        {
+            return Err(IlmRecoveryControlError::InvalidSuccessor(
+                "operator abandonment requires the exact ownerless retained source generation",
+            ));
+        }
+        self.bump_revision()?;
+        self.classification = IlmRecoveryClassification::Abandoned;
+        self.validate()
+    }
+
     pub fn validate_successor(&self, next: &Self) -> Result<()> {
         self.validate()?;
         next.validate()?;
@@ -508,10 +522,32 @@ impl IlmRecoveryControl {
                 self.validate_failure_successor(next)
             }
             (Some(_), None) => self.validate_finish_successor(next),
+            (None, None)
+                if self.classification == IlmRecoveryClassification::RetainedAmbiguous
+                    && next.classification == IlmRecoveryClassification::Abandoned =>
+            {
+                self.validate_operator_abandon_successor(next)
+            }
             (None, None) => Err(IlmRecoveryControlError::InvalidSuccessor(
                 "ownerless control cannot advance without a claim",
             )),
         }
+    }
+
+    fn validate_operator_abandon_successor(&self, next: &Self) -> Result<()> {
+        if next.observed_source_generation != self.observed_source_generation
+            || next.attempt_count != self.attempt_count
+            || next.consecutive_failure_count != self.consecutive_failure_count
+            || next.first_failure_at_unix_nanos != self.first_failure_at_unix_nanos
+            || next.last_failure_at_unix_nanos != self.last_failure_at_unix_nanos
+            || next.next_attempt_at_unix_nanos != self.next_attempt_at_unix_nanos
+            || next.last_error_code != self.last_error_code
+        {
+            return Err(IlmRecoveryControlError::InvalidSuccessor(
+                "operator abandonment changed recovery history or source generation",
+            ));
+        }
+        Ok(())
     }
 
     fn validate_claim_successor(&self, next: &Self) -> Result<()> {
@@ -828,6 +864,23 @@ pub async fn observe_recovery_source(
     canonical_path: &str,
     source_schema: &str,
 ) -> EcstoreResult<ObservedIlmRecoverySource> {
+    observe_recovery_source_with_options(api, canonical_path, source_schema, false).await
+}
+
+pub(crate) async fn observe_recovery_source_no_lock(
+    api: Arc<ECStore>,
+    canonical_path: &str,
+    source_schema: &str,
+) -> EcstoreResult<ObservedIlmRecoverySource> {
+    observe_recovery_source_with_options(api, canonical_path, source_schema, true).await
+}
+
+async fn observe_recovery_source_with_options(
+    api: Arc<ECStore>,
+    canonical_path: &str,
+    source_schema: &str,
+    no_lock: bool,
+) -> EcstoreResult<ObservedIlmRecoverySource> {
     validate_canonical_source_path(canonical_path).map_err(recovery_control_store_error)?;
     if source_schema.trim().is_empty() {
         return Err(Error::other("ILM recovery source schema is empty"));
@@ -837,7 +890,16 @@ pub async fn observe_recovery_source(
     let mut observations = Vec::new();
     for set in api.all_set_disks() {
         let authority = format!("pool-{}/set-{}", set.pool_index, set.set_index);
-        match config_boundary::read_config_with_metadata(set, canonical_path, &ObjectOptions::default()).await {
+        match config_boundary::read_config_with_metadata(
+            set,
+            canonical_path,
+            &ObjectOptions {
+                no_lock,
+                ..Default::default()
+            },
+        )
+        .await
+        {
             Ok((data, metadata)) => {
                 let etag = metadata
                     .etag
@@ -1253,6 +1315,36 @@ mod tests {
             changed.validate_successor(&invalid),
             Err(IlmRecoveryControlError::InvalidSuccessor(_))
         ));
+    }
+
+    #[test]
+    fn operator_abandonment_is_an_exact_ownerless_retained_successor() {
+        let mut retained = IlmRecoveryControl::new(
+            control().identity,
+            generation(),
+            IlmRecoveryClassification::RetainedAmbiguous,
+            1_000_000_000,
+            IlmRecoveryErrorCode::OperatorDispositionRequired,
+        )
+        .expect("retained control should build");
+        let previous = retained.clone();
+        retained
+            .abandon_for_operator(&previous.observed_source_generation)
+            .expect("exact retained generation should be abandonable");
+        previous
+            .validate_successor(&retained)
+            .expect("operator abandonment should be a valid successor");
+        assert_eq!(retained.classification, IlmRecoveryClassification::Abandoned);
+        assert_eq!(retained.revision, previous.revision + 1);
+
+        let mut wrong_generation = previous.clone();
+        let mut generation = previous.observed_source_generation.clone();
+        generation.source_etag = "different".to_string();
+        assert!(wrong_generation.abandon_for_operator(&generation).is_err());
+
+        let mut mutated_history = retained.clone();
+        mutated_history.attempt_count += 1;
+        assert!(previous.validate_successor(&mutated_history).is_err());
     }
 
     #[test]

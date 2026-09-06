@@ -32,6 +32,7 @@ use crate::bucket::lifecycle::manual_transition_job::{
     record_manual_transition_worker_result_with_reason, renew_manual_transition_job_lease_if_owned,
     save_manual_transition_job_record_if_current, save_manual_transition_task_if_absent, update_manual_transition_job_record,
 };
+use crate::bucket::lifecycle::recovery_disposition_runtime::run_recovery_disposition_maintenance_loop;
 use crate::bucket::lifecycle::replication_sink;
 use crate::bucket::lifecycle::replication_sink::{
     DeleteReplicationConfigSnapshot, ReplicationObjectBridge, ReplicationStatusType, replication_state_to_filemeta,
@@ -149,6 +150,7 @@ pub type ExpiryOpType = Box<dyn ExpiryOp + Send + Sync + 'static>;
 static XXHASH_SEED: u64 = 0;
 static TIER_FREE_VERSION_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 static MANUAL_TRANSITION_JOB_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
+static RECOVERY_DISPOSITION_MAINTENANCE_STARTED: OnceLock<()> = OnceLock::new();
 
 #[cfg(test)]
 #[derive(Default)]
@@ -2398,7 +2400,18 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
     let _ = spawn_tier_free_version_recovery_once(api.clone(), &TIER_FREE_VERSION_RECOVERY_STARTED);
     spawn_tier_delete_journal_recovery_once(api.clone());
     spawn_transition_transaction_recovery_once(api.clone());
+    spawn_recovery_disposition_maintenance_once(api.clone());
     spawn_manual_transition_job_recovery_once(api);
+}
+
+fn spawn_recovery_disposition_maintenance_once(api: Arc<ECStore>) -> Option<JoinHandle<()>> {
+    let cancel_token = api.ctx.background_cancel_token()?;
+    if RECOVERY_DISPOSITION_MAINTENANCE_STARTED.set(()).is_err() {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        run_recovery_disposition_maintenance_loop(api, cancel_token).await;
+    }))
 }
 
 fn spawn_manual_transition_job_recovery_once(api: Arc<ECStore>) -> Option<JoinHandle<()>> {

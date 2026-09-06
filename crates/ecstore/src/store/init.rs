@@ -828,8 +828,14 @@ mod tests {
             recovery_control::{
                 IlmRecoveryClassification, IlmRecoveryControl, IlmRecoveryControlIdentity, IlmRecoveryErrorCode,
                 IlmRecoveryProtocol, MAX_RECOVERY_ATTEMPTS, list_recovery_controls, load_recovery_control,
-                observe_recovery_source, save_recovery_control_if_absent,
+                observe_recovery_source, recovery_control_record_object_name, save_recovery_control_if_absent,
             },
+            recovery_disposition::{
+                IlmRecoveryDispositionExecutionOutcome, IlmRecoveryDispositionState, RecoveryDispositionCrashStage,
+                dry_run_recovery_disposition, execute_recovery_disposition, inject_recovery_disposition_crash_once,
+                load_recovery_disposition,
+            },
+            recovery_disposition_runtime::garbage_collect_completed_recovery_disposition,
             recovery_export::{
                 create_recovery_export, inspect_recovery_export_observation, load_recovery_export,
                 recovery_export_record_object_name,
@@ -16934,6 +16940,301 @@ mod tests {
             backend.op_log().await.is_empty(),
             "repeated recovery must not invoke any backend operation"
         );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn legacy_recovery_disposition_removes_only_local_journals_and_replays() {
+        Box::pin(legacy_recovery_disposition_removes_only_local_journals_and_replays_case()).await;
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn legacy_recovery_disposition_removes_only_local_journals_and_replays_case() {
+        let temp_dir = tempfile::tempdir().expect("create legacy disposition store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "legacy-recovery-disposition", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "LEGACY-DISPOSITION";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("legacy disposition tier lease should resolve")
+            .backend_identity();
+        let fixtures = [
+            serde_json::json!({
+                "version": 1,
+                "obj_name": "legacy/disposition-v1",
+                "version_id": "opaque-disposition-v1",
+                "tier_name": tier_name,
+            }),
+            serde_json::json!({
+                "version": 2,
+                "obj_name": "legacy/disposition-v2",
+                "version_id": "opaque-disposition-v2",
+                "tier_name": tier_name,
+                "backend_identity": backend_identity,
+            }),
+        ];
+        let mut journal_paths = Vec::new();
+        for fixture in &fixtures {
+            let data = serde_json::to_vec(fixture).expect("legacy disposition fixture should encode");
+            let entry = crate::bucket::lifecycle::tier_delete_journal::decode_tier_delete_journal_entry(&data)
+                .expect("legacy disposition fixture should decode");
+            let path = tier_delete_journal_object_name(&entry);
+            com::save_config(store.clone(), &path, data)
+                .await
+                .expect("legacy disposition fixture should persist");
+            journal_paths.push(path);
+        }
+
+        let recovered = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("legacy disposition recovery scan should finish");
+        assert_eq!((recovered.scanned, recovered.deleted, recovered.failed), (2, 0, 0));
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 2);
+
+        let mut controls = list_recovery_controls(
+            store.clone(),
+            IlmRecoveryProtocol::TierDeleteJournal,
+            Some(IlmRecoveryClassification::RetainedAmbiguous),
+            100,
+            None,
+        )
+        .await
+        .expect("legacy disposition controls should be listable")
+        .records;
+        controls.sort_by(|left, right| left.control_id.cmp(&right.control_id));
+        assert_eq!(controls.len(), 2, "both legacy schemas must support disposition");
+
+        let actor_sha256 = rustfs_utils::crypto::hex_sha256(b"legacy-disposition-actor", ToOwned::to_owned);
+        let wrong_actor_sha256 = rustfs_utils::crypto::hex_sha256(b"different-disposition-actor", ToOwned::to_owned);
+        let wrong_export_sha256 = "ff".repeat(32);
+        for (index, control) in controls.iter().enumerate() {
+            let observation = inspect_recovery_export_observation(store.clone(), &control.control_id)
+                .await
+                .expect("legacy disposition source should be observable");
+            let export = create_recovery_export(store.clone(), &observation, &actor_sha256)
+                .await
+                .expect("legacy disposition export should persist");
+            let confirmed_at_unix_nanos = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos())
+                .expect("legacy disposition timestamp should fit i64");
+
+            if index == 0 {
+                let wrong_hash = Box::pin(execute_recovery_disposition(
+                    store.clone(),
+                    &observation,
+                    &export.export_id,
+                    &wrong_export_sha256,
+                    &actor_sha256,
+                    confirmed_at_unix_nanos,
+                ))
+                .await
+                .expect_err("a mismatched export checksum must fail before local deletion");
+                assert_eq!(wrong_hash, Error::PreconditionFailed);
+                assert_eq!(tier_delete_journal_count(store.clone()).await, 2);
+            }
+
+            let dry_run = dry_run_recovery_disposition(
+                store.clone(),
+                &observation,
+                &export.export_id,
+                &export.content_sha256,
+                &actor_sha256,
+                confirmed_at_unix_nanos,
+            )
+            .await
+            .expect("legacy disposition dry-run should validate exact local state");
+            assert_eq!(dry_run.source_copy_count, observation.source_generation.copies.len());
+            assert_eq!(
+                tier_delete_journal_count(store.clone()).await,
+                fixtures.len() - index,
+                "dry-run must not delete a legacy journal"
+            );
+            assert!(
+                matches!(
+                    load_recovery_disposition(store.clone(), IlmRecoveryProtocol::TierDeleteJournal, &dry_run.disposition_id,)
+                        .await,
+                    Err(Error::ConfigNotFound)
+                ),
+                "dry-run must not persist a disposition record"
+            );
+
+            if index == 0 {
+                inject_recovery_disposition_crash_once(RecoveryDispositionCrashStage::AfterLocalDelete);
+                Box::pin(execute_recovery_disposition(
+                    store.clone(),
+                    &observation,
+                    &export.export_id,
+                    &export.content_sha256,
+                    &actor_sha256,
+                    confirmed_at_unix_nanos,
+                ))
+                .await
+                .expect_err("the injected crash must stop after local delete commits");
+                assert_eq!(tier_delete_journal_count(store.clone()).await, 1);
+                let interrupted =
+                    load_recovery_disposition(store.clone(), IlmRecoveryProtocol::TierDeleteJournal, &dry_run.disposition_id)
+                        .await
+                        .expect("the applying disposition must survive the post-delete crash");
+                assert_eq!(interrupted.disposition.state, IlmRecoveryDispositionState::Applying);
+                assert!(
+                    interrupted.disposition.confirmed_absent.is_empty(),
+                    "the crash must occur before absence progress is persisted"
+                );
+            } else {
+                inject_recovery_disposition_crash_once(RecoveryDispositionCrashStage::AfterControlAbandon);
+                Box::pin(execute_recovery_disposition(
+                    store.clone(),
+                    &observation,
+                    &export.export_id,
+                    &export.content_sha256,
+                    &actor_sha256,
+                    confirmed_at_unix_nanos,
+                ))
+                .await
+                .expect_err("the injected crash must stop after control abandonment commits");
+                let interrupted =
+                    load_recovery_disposition(store.clone(), IlmRecoveryProtocol::TierDeleteJournal, &dry_run.disposition_id)
+                        .await
+                        .expect("the applying disposition must survive the post-control crash");
+                assert_eq!(interrupted.disposition.state, IlmRecoveryDispositionState::Applying);
+                assert_eq!(
+                    interrupted.disposition.confirmed_absent.len(),
+                    interrupted.disposition.identity.source_generation.copies.len()
+                );
+
+                let abandoned =
+                    load_recovery_control(store.clone(), IlmRecoveryProtocol::TierDeleteJournal, &observation.control_id)
+                        .await
+                        .expect("the abandoned control must survive the injected crash");
+                let exact_abandoned = abandoned.control.encode().expect("the exact abandoned control should encode");
+                let mut wrong_history = abandoned.control;
+                wrong_history.last_error_code = IlmRecoveryErrorCode::CleanupFailed;
+                let control_path = recovery_control_record_object_name(observation.protocol, &observation.control_id)
+                    .expect("control path should remain canonical");
+                com::save_config(
+                    store.clone(),
+                    &control_path,
+                    wrong_history
+                        .encode()
+                        .expect("the alternate valid control history should encode"),
+                )
+                .await
+                .expect("the alternate control history fixture should persist");
+                let wrong_history_err = Box::pin(execute_recovery_disposition(
+                    store.clone(),
+                    &observation,
+                    &export.export_id,
+                    &export.content_sha256,
+                    &actor_sha256,
+                    confirmed_at_unix_nanos + 1,
+                ))
+                .await
+                .expect_err("a different abandoned control history must not bridge to completion");
+                assert_eq!(wrong_history_err, Error::PreconditionFailed);
+                com::save_config(store.clone(), &control_path, exact_abandoned)
+                    .await
+                    .expect("the exact abandoned control fixture should be restored");
+            }
+
+            let replay_confirmed_at_unix_nanos = confirmed_at_unix_nanos + 2;
+            let executed = Box::pin(execute_recovery_disposition(
+                store.clone(),
+                &observation,
+                &export.export_id,
+                &export.content_sha256,
+                &actor_sha256,
+                replay_confirmed_at_unix_nanos,
+            ))
+            .await
+            .expect("a later request must resume and complete the interrupted disposition");
+            assert_eq!(executed.state, IlmRecoveryDispositionState::Completed);
+            assert_eq!(executed.outcome, IlmRecoveryDispositionExecutionOutcome::Completed);
+            assert_eq!(executed.confirmed_absent_copy_count, executed.source_copy_count);
+            assert_eq!(tier_delete_journal_count(store.clone()).await, fixtures.len() - index - 1);
+            assert!(matches!(
+                com::read_config(store.clone(), &observation.canonical_source_path).await,
+                Err(Error::ConfigNotFound)
+            ));
+            if index == 0 {
+                let untouched = journal_paths
+                    .iter()
+                    .find(|path| *path != &observation.canonical_source_path)
+                    .expect("the other legacy journal should remain");
+                com::read_config(store.clone(), untouched)
+                    .await
+                    .expect("disposition must not remove a different legacy journal");
+            }
+
+            let abandoned = load_recovery_control(store.clone(), IlmRecoveryProtocol::TierDeleteJournal, &observation.control_id)
+                .await
+                .expect("abandoned recovery control should remain inspectable");
+            assert_eq!(abandoned.control.classification, IlmRecoveryClassification::Abandoned);
+            assert_eq!(abandoned.control.revision, observation.control_revision + 1);
+            assert_eq!(abandoned.control.observed_source_generation, observation.source_generation);
+
+            let persisted =
+                load_recovery_disposition(store.clone(), IlmRecoveryProtocol::TierDeleteJournal, &executed.disposition_id)
+                    .await
+                    .expect("completed disposition should remain durable");
+            assert_eq!(persisted.disposition.state, IlmRecoveryDispositionState::Completed);
+
+            let replayed = Box::pin(execute_recovery_disposition(
+                store.clone(),
+                &observation,
+                &export.export_id,
+                &export.content_sha256,
+                &actor_sha256,
+                replay_confirmed_at_unix_nanos + 1,
+            ))
+            .await
+            .expect("same actor should replay the completed disposition");
+            assert_eq!(replayed.state, IlmRecoveryDispositionState::Completed);
+            assert_eq!(replayed.outcome, IlmRecoveryDispositionExecutionOutcome::Replayed);
+
+            let wrong_actor = Box::pin(execute_recovery_disposition(
+                store.clone(),
+                &observation,
+                &export.export_id,
+                &export.content_sha256,
+                &wrong_actor_sha256,
+                replay_confirmed_at_unix_nanos + 2,
+            ))
+            .await
+            .expect_err("a different actor must not replay a completed disposition");
+            assert_eq!(wrong_actor, Error::PreconditionFailed);
+
+            assert!(
+                !Box::pin(garbage_collect_completed_recovery_disposition(
+                    store.clone(),
+                    &persisted,
+                    persisted.disposition.retain_until_unix_nanos - 1,
+                ))
+                .await
+                .expect("completed disposition should remain before retention expires")
+            );
+            assert!(
+                Box::pin(garbage_collect_completed_recovery_disposition(
+                    store.clone(),
+                    &persisted,
+                    persisted.disposition.retain_until_unix_nanos,
+                ))
+                .await
+                .expect("expired completed disposition should be garbage collected")
+            );
+            assert!(matches!(
+                load_recovery_disposition(store.clone(), IlmRecoveryProtocol::TierDeleteJournal, &executed.disposition_id).await,
+                Err(Error::ConfigNotFound)
+            ));
+            assert_eq!(backend.remove_count().await, 0, "legacy disposition must not call the remote tier");
+            assert_eq!(backend.exact_remove_count(), 0, "legacy disposition must not issue exact remote DELETE");
+            assert!(
+                backend.op_log().await.is_empty(),
+                "legacy disposition must not invoke any backend operation"
+            );
+        }
     }
 
     #[cfg(feature = "test-util")]

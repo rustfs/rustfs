@@ -161,20 +161,30 @@ where
             DeletedObject = DeletedObject,
         >,
 {
-    match api
-        .delete_object(
-            RUSTFS_META_BUCKET,
-            file,
-            ObjectOptions {
-                http_preconditions: Some(HTTPPreconditions {
-                    if_match: Some(etag.to_string()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-    {
+    delete_config_if_match_with_opts(api, file, etag, ObjectOptions::default()).await
+}
+
+pub(crate) async fn delete_config_if_match_with_opts<S>(
+    api: Arc<S>,
+    file: &str,
+    etag: &str,
+    mut options: ObjectOptions,
+) -> Result<()>
+where
+    S: ObjectOperations<
+            Error = Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
+{
+    options.http_preconditions = Some(HTTPPreconditions {
+        if_match: Some(etag.to_string()),
+        ..Default::default()
+    });
+    match api.delete_object(RUSTFS_META_BUCKET, file, options).await {
         Ok(_) => Ok(()),
         Err(err) => {
             if err == Error::FileNotFound || matches!(err, Error::ObjectNotFound(_, _)) {

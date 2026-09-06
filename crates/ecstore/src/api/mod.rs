@@ -78,10 +78,8 @@ pub mod bucket {
 
         pub mod recovery_disposition {
             pub use crate::bucket::lifecycle::recovery_disposition::{
-                CreatedIlmRecoveryDisposition, IlmRecoveryDisposition, IlmRecoveryDispositionAction, IlmRecoveryDispositionError,
-                IlmRecoveryDispositionIdentity, IlmRecoveryDispositionOwnerLease, IlmRecoveryDispositionReasonCode,
-                IlmRecoveryDispositionState, ObservedIlmRecoveryDisposition, create_recovery_disposition_if_absent,
-                load_recovery_disposition, recovery_disposition_id, save_recovery_disposition_if_current,
+                IlmRecoveryDispositionExecutionOutcome, IlmRecoveryDispositionReasonCode, IlmRecoveryDispositionState,
+                dry_run_recovery_disposition, execute_recovery_disposition,
             };
         }
 
