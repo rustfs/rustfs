@@ -728,6 +728,15 @@ async fn scan_and_persist_local_bucket(
         DataUsageCacheReuseOptions {
             require_source: true,
             tier_registry_generation: Some(tier_registry_generation),
+            checkpoint_identity: crate::scanner_io::scanner_bucket_checkpoint_identity(
+                &set,
+                &bucket,
+                expected_publication_epoch,
+                tier_registry_generation,
+                scan_mode,
+            )
+            .await
+            .ok(),
         },
     );
     match scan_state {
@@ -821,6 +830,22 @@ async fn scan_and_persist_local_bucket(
         ScannerDiskScanOutcome::Partial(cache) => (cache, Some(RemoteScannerFrameResult::Partial)),
         ScannerDiskScanOutcome::NamespaceNotFound(cache) => (cache, Some(RemoteScannerFrameResult::NamespaceNotFound)),
     };
+    if let Some(expected) = cache.info.scan_identity
+        && crate::scanner_io::scanner_bucket_checkpoint_identity(
+            &set,
+            &bucket,
+            expected_publication_epoch,
+            tier_registry_generation,
+            scan_mode,
+        )
+        .await
+        .ok()
+            != Some(expected)
+    {
+        return Err(RemoteScannerServerError::retry_bucket(
+            "remote scanner checkpoint identity changed during scanning",
+        ));
+    }
 
     if guard.is_lock_lost() {
         return Err(RemoteScannerServerError::worker(

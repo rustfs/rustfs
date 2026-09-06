@@ -33,8 +33,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# Single source of truth for the migration-gate filter. ci.yml must invoke
-# this script instead of inlining the expression.
+# Single source of truth for the migration-gate target and filter. The
+# test-util feature activates migration-critical tests that otherwise leave
+# their shared fixtures compiled but unused. ci.yml must invoke this script
+# instead of inlining either selection.
+MIGRATION_GATE_TARGET_ARGS=(-p rustfs-ecstore --lib --features test-util)
 MIGRATION_GATE_FILTER='test(data_movement) or test(rebalance) or test(decommission) or test(source_cleanup) or test(delete_marker)'
 FLOOR_FILE=".config/migration-gate-floor.txt"
 
@@ -60,7 +63,7 @@ if [[ "$mode" == "all" || "$mode" == "check" ]]; then
     # count to 0 and failing every PR). A nextest failure aborts via set -e
     # with its stderr visible; a JSON schema change makes jq fail loudly
     # rather than silently passing.
-    count="$(cargo nextest list -p rustfs-ecstore --lib -E "$MIGRATION_GATE_FILTER" --message-format json \
+    count="$(cargo nextest list "${MIGRATION_GATE_TARGET_ARGS[@]}" -E "$MIGRATION_GATE_FILTER" --message-format json \
         | jq '[."rust-suites"[].testcases[] | select(."filter-match".status == "matches")] | length')"
     if ! [[ "$count" =~ ^[0-9]+$ ]]; then
         echo "error: could not parse nextest JSON listing (got count: '$count')" >&2
@@ -81,5 +84,5 @@ if [[ "$mode" == "all" || "$mode" == "check" ]]; then
 fi
 
 if [[ "$mode" == "all" || "$mode" == "run" ]]; then
-    cargo nextest run -p rustfs-ecstore --lib -E "$MIGRATION_GATE_FILTER"
+    cargo nextest run "${MIGRATION_GATE_TARGET_ARGS[@]}" -E "$MIGRATION_GATE_FILTER"
 fi
