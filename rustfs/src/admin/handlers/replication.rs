@@ -3153,7 +3153,7 @@ mod target_repair_tests {
                 .await
                 .expect("read recreated bucket bytes");
 
-            let error = persist_remote_target_repair(BUCKET, target, incarnation)
+            let error = Box::pin(persist_remote_target_repair(BUCKET, target, incarnation))
                 .await
                 .expect_err("validation of a deleted bucket must not authorize repair of its replacement");
             assert_eq!(error.code(), &S3ErrorCode::NoSuchBucket);
@@ -3200,7 +3200,7 @@ mod target_repair_tests {
                 .await
                 .expect("read suspended bucket bytes");
 
-            let error = persist_remote_target_repair(BUCKET, target, incarnation)
+            let error = Box::pin(persist_remote_target_repair(BUCKET, target, incarnation))
                 .await
                 .expect_err("a target validated before suspension must not be committed");
             assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
