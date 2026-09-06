@@ -82,12 +82,17 @@ fn parse_remote_target_write_modes(uri: &http::Uri) -> S3Result<(bool, bool)> {
             _ => continue,
         };
         if mode.is_some() {
-            return Err(s3_error!(InvalidRequest, "duplicate remote target write mode"));
+            return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "duplicate remote target write mode"));
         }
         *mode = Some(match value.as_ref() {
             "true" => true,
             "false" => false,
-            _ => return Err(s3_error!(InvalidRequest, "remote target write modes must be true or false")),
+            _ => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    "remote target write modes must be true or false",
+                ));
+            }
         });
     }
     let update = update.unwrap_or(false);
@@ -3045,7 +3050,7 @@ mod target_repair_tests {
                 .await
                 .expect("read source metadata")
                 .save_file_path();
-            let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+            let before = crate::admin::storage_api::config::read_admin_config(Arc::clone(&env.ecstore), &file)
                 .await
                 .expect("read original bytes");
             for query in [
@@ -3063,7 +3068,7 @@ mod target_repair_tests {
                     repair(&target, query).await.expect_err("invalid repair must fail").code(),
                     &S3ErrorCode::InvalidRequest
                 );
-                let after = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                let after = crate::admin::storage_api::config::read_admin_config(Arc::clone(&env.ecstore), &file)
                     .await
                     .expect("read unchanged bytes");
                 assert_eq!(after, before, "rejected opt-in must not rewrite metadata");
@@ -3151,7 +3156,7 @@ mod target_repair_tests {
                     .expect("load recreated bucket");
                 assert_ne!(recreated.bucket_incarnation_id, incarnation);
                 let file = recreated.save_file_path();
-                let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                let before = crate::admin::storage_api::config::read_admin_config(Arc::clone(&env.ecstore), &file)
                     .await
                     .expect("read recreated bucket bytes");
 
@@ -3160,7 +3165,7 @@ mod target_repair_tests {
                     .expect_err("validation of a deleted bucket must not authorize repair of its replacement");
                 assert_eq!(error.code(), &S3ErrorCode::NoSuchBucket);
                 assert_eq!(
-                    crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                    crate::admin::storage_api::config::read_admin_config(Arc::clone(&env.ecstore), &file)
                         .await
                         .expect("read rejected incarnation repair bytes"),
                     before
@@ -3201,7 +3206,7 @@ mod target_repair_tests {
                 assert_eq!(suspended.bucket_incarnation_id, incarnation);
                 assert!(!suspended.versioning_config.as_ref().expect("persisted versioning").enabled());
                 let file = suspended.save_file_path();
-                let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                let before = crate::admin::storage_api::config::read_admin_config(Arc::clone(&env.ecstore), &file)
                     .await
                     .expect("read suspended bucket bytes");
 
@@ -3210,7 +3215,7 @@ mod target_repair_tests {
                     .expect_err("a target validated before suspension must not be committed");
                 assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
                 assert_eq!(
-                    crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                    crate::admin::storage_api::config::read_admin_config(Arc::clone(&env.ecstore), &file)
                         .await
                         .expect("read rejected versioning repair bytes"),
                     before
@@ -3259,7 +3264,7 @@ mod target_repair_tests {
                 "a failed transaction must not claim success: {lines}"
             );
             assert_eq!(
-                crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                crate::admin::storage_api::config::read_admin_config(Arc::clone(&env.ecstore), &file)
                     .await
                     .expect("read failed repair bytes"),
                 corrupt
