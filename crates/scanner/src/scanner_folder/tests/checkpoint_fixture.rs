@@ -29,6 +29,13 @@ const MAX_CACHE_BYTES: u64 = 1024 * 1024;
 const SOURCE: DataUsageCacheSource = DataUsageCacheSource::new(0, 0);
 const PLAN: DataUsageScanPlanDigest = DataUsageScanPlanDigest([17; 32]);
 
+fn scan_options(scan_mode: HealScanMode) -> ScannerDiskScanOptions {
+    ScannerDiskScanOptions {
+        scan_mode,
+        prefix_scan_scope: None,
+    }
+}
+
 /// Real cache persistence codec and CAS calls, backed by two bounded local files.
 #[derive(Debug)]
 struct FixtureStore {
@@ -538,7 +545,7 @@ async fn checkpoint_fixture_existing_uncovered_cursor_cannot_skip_to_complete() 
                 vec![scanner.local_disk.clone()],
                 loaded,
                 None,
-                HealScanMode::Normal,
+                scan_options(HealScanMode::Normal),
             )
             .await
             .expect("scan must revisit the prefix");
@@ -594,7 +601,7 @@ async fn checkpoint_fixture_failed_child_prevents_receipt_advancing_past_gap() {
             vec![scanner.local_disk.clone()],
             cache,
             None,
-            HealScanMode::Normal,
+            scan_options(HealScanMode::Normal),
         )
         .await
         .expect("scan with a known failed child");
@@ -645,7 +652,7 @@ async fn check_complete_sampling_resumption(resume_mode: HealScanMode) {
             vec![scanner.local_disk.clone()],
             cache,
             None,
-            HealScanMode::Normal,
+            scan_options(HealScanMode::Normal),
         )
         .await
         .expect("initial complete baseline");
@@ -690,7 +697,7 @@ async fn check_complete_sampling_resumption(resume_mode: HealScanMode) {
             vec![scanner.local_disk.clone()],
             cache,
             None,
-            HealScanMode::Normal,
+            scan_options(HealScanMode::Normal),
         )
         .await
         .expect("sampling interruption");
@@ -737,7 +744,14 @@ async fn check_complete_sampling_resumption(resume_mode: HealScanMode) {
         let result = scanner
             .local_disk
             .clone()
-            .nsscanner_disk(budget.token(), budget, vec![scanner.local_disk.clone()], loaded, None, resume_mode)
+            .nsscanner_disk(
+                budget.token(),
+                budget,
+                vec![scanner.local_disk.clone()],
+                loaded,
+                None,
+                scan_options(resume_mode),
+            )
             .await
             .expect("bounded recovery scan");
         let (cache, complete) = match result {
@@ -988,7 +1002,7 @@ async fn run_checkpoint_fixture(change_digest: bool) {
                 vec![scanner.local_disk.clone()],
                 cache,
                 None,
-                HealScanMode::Normal,
+                scan_options(HealScanMode::Normal),
             )
             .await
             .expect("bounded sweep outcome");

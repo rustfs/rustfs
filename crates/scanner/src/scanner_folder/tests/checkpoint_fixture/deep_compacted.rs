@@ -30,7 +30,7 @@ async fn scan(
     );
     let outcome = disk
         .clone()
-        .nsscanner_disk(budget.token(), budget.clone(), vec![disk.clone()], cache, None, mode)
+        .nsscanner_disk(budget.token(), budget.clone(), vec![disk.clone()], cache, None, super::scan_options(mode))
         .await
         .expect("bounded real disk scan");
     (outcome, budget)

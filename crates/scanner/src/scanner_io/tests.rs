@@ -377,6 +377,7 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
         let requested_scope = if explicit_scope {
             ScannerBucketScanScope::from_dirty_buckets(
                 HashSet::from(["hot-bucket".to_string()]),
+                HashMap::new(),
                 DataUsageScanPlanDigest([7; 32]),
             )
         } else {
@@ -1620,7 +1621,8 @@ fn scoped_scan_uses_only_locally_verified_prefix_hints() {
         true,
         &[bucket_info("photos"), bucket_info("videos")],
         ScannerCacheBaselineProof {
-            data: Some(&baseline),
+            authoritative_data: Some(&baseline),
+            observed_candidate_data: None,
             expected_sources: &expected_sources,
             leader_epoch: 11,
             want_cycle: 8,
@@ -1637,7 +1639,8 @@ fn scoped_scan_uses_only_locally_verified_prefix_hints() {
         true,
         &[bucket_info("photos"), bucket_info("videos")],
         ScannerCacheBaselineProof {
-            data: Some(&baseline),
+            authoritative_data: Some(&baseline),
+            observed_candidate_data: None,
             expected_sources: &expected_sources,
             leader_epoch: 11,
             want_cycle: 8,
@@ -1801,6 +1804,7 @@ fn scoped_set_scan_rejects_unbound_bucket_incarnations() {
     let old_cache = complete_set_usage_cache(&[("stable", 10), ("dirty", 20)], baseline_digest);
     let scope = ScannerBucketScanScope {
         selected_buckets: Some(Arc::new(HashSet::from(["dirty".to_string()]))),
+        selected_bucket_prefixes: None,
         baseline_scan_plan_digest: Some(baseline_digest),
     };
     let generation = ScannerSetCacheGeneration {
