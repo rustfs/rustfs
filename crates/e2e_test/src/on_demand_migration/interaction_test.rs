@@ -877,13 +877,22 @@ async fn test_odm_global_disable_preserves_data_config_and_backfill_across_resta
                     .set_marker(cursor)
                     .send()
                     .await?;
+                // V1 may omit NextMarker without a delimiter; clients then
+                // continue from the last returned key.
+                let next = page.next_marker().or_else(|| {
+                    if page.is_truncated() == Some(true) {
+                        page.contents().last().and_then(|object| object.key())
+                    } else {
+                        None
+                    }
+                });
                 (
                     page.contents()
                         .iter()
                         .map(|object| object.key().expect("listed key").to_string())
                         .collect::<Vec<_>>(),
                     page.is_truncated(),
-                    page.next_marker().map(str::to_string),
+                    next.map(str::to_string),
                 )
             };
             assert_eq!(keys.len(), 1, "one local key per page, V2={use_v2}");
