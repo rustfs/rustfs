@@ -1031,7 +1031,7 @@ mod tests {
             assert!(invalid.validate().is_err(), "noncanonical source path must fail closed");
         }
 
-        let mut rebound = disposition.clone();
+        let mut rebound = disposition;
         rebound.identity.control_id = digest(b"different-control");
         assert!(rebound.validate().is_err(), "export ID must bind the exact control and source generation");
     }

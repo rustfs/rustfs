@@ -1900,7 +1900,7 @@ mod tests {
         );
         assert!(
             applying
-                .validate_successor(&recovery_disposition_checkpoint(4, Applying, None, vec![first_copy.clone()]))
+                .validate_successor(&recovery_disposition_checkpoint(4, Applying, None, vec![first_copy]))
                 .is_err(),
             "Applying must retain a fenced owner"
         );
@@ -1910,7 +1910,7 @@ mod tests {
             *identity_sha256 = "A".repeat(64);
         }
         assert!(prepared.validate_successor(&noncanonical_identity).is_err());
-        let mut changed_created_at = claimed.clone();
+        let mut changed_created_at = claimed;
         if let DurableIlmRecordCheckpoint::RecoveryDisposition {
             created_at_unix_nanos, ..
         } = &mut changed_created_at
@@ -1919,7 +1919,7 @@ mod tests {
         }
         assert!(prepared.validate_successor(&changed_created_at).is_err());
 
-        let mut early_takeover = taken_over.clone();
+        let mut early_takeover = taken_over;
         if let DurableIlmRecordCheckpoint::RecoveryDisposition {
             owner_lease_acquired_at_unix_nanos,
             ..
@@ -1976,7 +1976,7 @@ mod tests {
             "an incomplete Applying checkpoint cannot complete without a progress generation"
         );
 
-        let mut other_identity = completed.clone();
+        let mut other_identity = completed;
         if let DurableIlmRecordCheckpoint::RecoveryDisposition { identity_sha256, .. } = &mut other_identity {
             *identity_sha256 = "e".repeat(64);
         }

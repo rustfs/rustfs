@@ -818,7 +818,7 @@ mod tests {
             &base64_simd::STANDARD.encode_to_string(legacy_source()),
         )
         .unwrap();
-        let mut rotated = observed.clone();
+        let mut rotated = observed;
         rotated.control_etag = "new-control-etag".to_string();
         rotated.control_revision += 1;
         rotated.topology_generation = hex_sha256(b"new-topology", ToOwned::to_owned);
