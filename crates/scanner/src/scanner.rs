@@ -1910,10 +1910,10 @@ where
         .as_ref()
         .map(|(notification_system, grants)| (Arc::clone(notification_system), grants.clone()));
     let remote_lease_release_safe = Arc::new(AtomicBool::new(true));
-    let mut usage_persist_outcome = match publication_defer_reason {
+    let mut usage_publication_result = match publication_defer_reason {
         Some(reason) => {
             drop(receiver);
-            DataUsagePersistOutcome::Deferred(reason)
+            DataUsagePublicationResult::from(DataUsagePersistOutcome::Deferred(reason))
         }
         None => {
             // ScannerIO emits its complete or observational update only after
@@ -1928,6 +1928,11 @@ where
                 .as_ref()
                 .map(|(_, grants)| grants.iter().map(|grant| grant.lease.token).collect())
                 .unwrap_or_default();
+            let ack_expectation = scan_result
+                .as_ref()
+                .ok()
+                .filter(|result| result.has_dirty_usage_to_acknowledge())
+                .and_then(ScannerCycleResult::publication_expectation);
             let mut usage_persist_task = AbortOnDropHandle::new(tokio::spawn(async move {
                 store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch_and_lease_fence(
                     ctx_clone,
@@ -1940,6 +1945,7 @@ where
                         remote_lease_deadline,
                         remote_lease_fence,
                     )
+                    .with_ack_expectation(ack_expectation)
                     .with_remote_lease_tokens(remote_lease_tokens)
                     .with_lease_release_flag(remote_lease_release_safe_for_task),
                     move || {
@@ -1973,7 +1979,7 @@ where
                         error = %err,
                         "Scanner data usage persistence task failed"
                     );
-                    DataUsagePersistOutcome::Failed
+                    DataUsagePublicationResult::from(DataUsagePersistOutcome::Failed)
                 }
                 DataUsagePersistTaskResult::Cancelled => {
                     debug!(
@@ -1985,7 +1991,7 @@ where
                         state = "usage_persist_task_cancelled",
                         "Scanner data usage persistence task cancelled"
                     );
-                    DataUsagePersistOutcome::Failed
+                    DataUsagePublicationResult::from(DataUsagePersistOutcome::Failed)
                 }
                 DataUsagePersistTaskResult::TimedOut => {
                     error!(
@@ -1998,11 +2004,12 @@ where
                         state = "usage_persist_task_timed_out",
                         "Scanner data usage persistence task timed out"
                     );
-                    DataUsagePersistOutcome::Failed
+                    DataUsagePublicationResult::from(DataUsagePersistOutcome::Failed)
                 }
             }
         }
     };
+    let mut usage_persist_outcome = usage_publication_result.outcome();
     let lease_expired = remote_publication_leases
         .as_ref()
         .is_some_and(|(_, grants)| grants.iter().any(|grant| !grant.lease.is_valid()));
@@ -2202,8 +2209,9 @@ where
         };
     }
 
+    usage_publication_result.restrict_outcome(usage_persist_outcome);
     let (completion_outcome, scanner_pending_maintenance_work, remote_dirty_usage_acknowledgements) =
-        finalize_scanner_cycle_result(scan_cycle_result, usage_persist_outcome);
+        finalize_scanner_cycle_result(scan_cycle_result, usage_publication_result);
     let remote_dirty_usage_pending = if remote_dirty_usage_acknowledgements.is_empty() {
         false
     } else if let Some(notification_system) = storeapi.scanner_notification_system() {
@@ -3437,21 +3445,35 @@ fn scanner_cycle_completion_outcome(
 
 fn finalize_scanner_cycle_result(
     scan_cycle_result: crate::scanner_io::ScannerCycleResult,
-    usage_persist_outcome: DataUsagePersistOutcome,
+    publication: DataUsagePublicationResult,
 ) -> (ScannerCycleOutcome, bool, Vec<ScannerDirtyUsageAcknowledgement>) {
+    let (usage_persist_outcome, proof) = publication.into_parts();
     let completion_outcome = scanner_cycle_completion_outcome_for_result(&scan_cycle_result, usage_persist_outcome);
-    let pending_maintenance_work = scan_cycle_result.has_pending_maintenance_work();
     let durable_complete_snapshot = scan_cycle_result.status == ScannerCycleStatus::Complete
         && matches!(
             usage_persist_outcome,
             DataUsagePersistOutcome::Saved | DataUsagePersistOutcome::AlreadyDurable
-        );
+        )
+        && scan_cycle_result.publication_expectation().as_ref().is_some_and(|expected| {
+            proof
+                .as_ref()
+                .is_some_and(|proof| proof.verified_version_for(expected).is_some())
+        });
+    let pending_maintenance_work = scan_cycle_result.has_pending_maintenance_work()
+        || (scan_cycle_result.has_dirty_usage_to_acknowledge() && !durable_complete_snapshot);
     let remote_dirty_usage_acknowledgements = if durable_complete_snapshot {
-        scan_cycle_result.acknowledge_durable_usage()
+        match proof {
+            Some(proof) => scan_cycle_result.acknowledge_durable_usage(&proof),
+            None => Vec::new(),
+        }
     } else {
         Vec::new()
     };
-    (completion_outcome, pending_maintenance_work, remote_dirty_usage_acknowledgements)
+    (
+        completion_outcome,
+        pending_maintenance_work || crate::scanner_io::dirty_usage_buckets_pending(),
+        remote_dirty_usage_acknowledgements,
+    )
 }
 
 fn scanner_cycle_completion_outcome_for_result(
@@ -3551,6 +3573,7 @@ use activity::*;
 use backlog::*;
 use cycle_state::*;
 use leadership::*;
+pub(crate) use usage_store::RootPublicationProof;
 use usage_store::*;
 
 pub use activity::scanner_topology_digest;

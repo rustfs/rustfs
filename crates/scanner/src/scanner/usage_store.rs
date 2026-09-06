@@ -34,6 +34,139 @@ pub(super) enum DataUsagePersistOutcome {
     Failed,
 }
 
+#[derive(Debug)]
+pub(crate) struct RootPublicationProof {
+    candidate: crate::scanner_io::ScannerPublicationExpectation,
+    root_version: (String, [u8; 32]),
+}
+
+impl RootPublicationProof {
+    pub(crate) fn verified_version_for(
+        &self,
+        expected: &crate::scanner_io::ScannerPublicationExpectation,
+    ) -> Option<&(String, [u8; 32])> {
+        self.candidate.same_candidate(expected).then_some(&self.root_version)
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct DataUsagePublicationResult {
+    outcome: DataUsagePersistOutcome,
+    proof: Option<RootPublicationProof>,
+}
+
+impl From<DataUsagePersistOutcome> for DataUsagePublicationResult {
+    fn from(outcome: DataUsagePersistOutcome) -> Self {
+        Self { outcome, proof: None }
+    }
+}
+
+impl DataUsagePublicationResult {
+    pub(super) fn outcome(&self) -> DataUsagePersistOutcome {
+        self.outcome
+    }
+    pub(super) fn restrict_outcome(&mut self, outcome: DataUsagePersistOutcome) {
+        if outcome != self.outcome {
+            self.proof = None;
+        }
+        self.outcome = outcome;
+    }
+    pub(super) fn into_parts(self) -> (DataUsagePersistOutcome, Option<RootPublicationProof>) {
+        (self.outcome, self.proof)
+    }
+}
+
+fn root_ack_write_is_confirmed<T, E>(
+    result: &std::result::Result<T, E>,
+    state: Option<ScannerPublicationCommitState>,
+    written_etag: Option<&str>,
+) -> bool {
+    result.is_ok() && state == Some(ScannerPublicationCommitState::Committed) && written_etag.is_some_and(|etag| !etag.is_empty())
+}
+
+#[cfg(test)]
+mod root_publication_confirmation_tests {
+    use super::*;
+
+    #[test]
+    fn root_publication_confirmation_requires_committed_state_and_write_revision() {
+        let saved = Ok::<(), ()>(());
+        for state in [
+            None,
+            Some(ScannerPublicationCommitState::Admitted),
+            Some(ScannerPublicationCommitState::InFlight),
+            Some(ScannerPublicationCommitState::AbortedBeforeCommit),
+            Some(ScannerPublicationCommitState::Indeterminate),
+        ] {
+            assert!(!root_ack_write_is_confirmed(&saved, state, Some("revision")));
+        }
+        for etag in [None, Some("")] {
+            assert!(!root_ack_write_is_confirmed(&saved, Some(ScannerPublicationCommitState::Committed), etag));
+        }
+        assert!(root_ack_write_is_confirmed(
+            &saved,
+            Some(ScannerPublicationCommitState::Committed),
+            Some("revision")
+        ));
+    }
+
+    #[test]
+    fn root_publication_confirmation_does_not_carry_state_across_cas_attempts() {
+        let attempts = [
+            (Err(()), Some(ScannerPublicationCommitState::Committed), Some("first")),
+            (Ok(()), Some(ScannerPublicationCommitState::AbortedBeforeCommit), Some("second")),
+            (Ok(()), None, Some("legacy")),
+            (Ok(()), Some(ScannerPublicationCommitState::Committed), Some("confirmed")),
+        ];
+        let confirmations = attempts
+            .iter()
+            .map(|(result, state, etag)| root_ack_write_is_confirmed(result, *state, *etag))
+            .collect::<Vec<_>>();
+        assert_eq!(confirmations, [false, false, false, true]);
+    }
+}
+
+async fn read_root_publication_proof<S: ScannerObjectIO + ScannerConfigObjectDelete>(
+    store: Arc<S>,
+    ctx: &CancellationToken,
+    deadline: tokio::time::Instant,
+    epoch: u64,
+    expected: &crate::scanner_io::ScannerPublicationExpectation,
+    candidate: &DataUsageInfo,
+    written_etag: Option<&str>,
+) -> Option<RootPublicationProof> {
+    let read = async {
+        let _admission = scanner_publication_admission_for_epoch(store.clone(), epoch).await?;
+        let (bytes, revision) = read_config_with_revision(store, DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .ok()?;
+        let bytes = bytes?;
+        let DataUsageCacheRevision::Etag(etag) = revision else {
+            return None;
+        };
+        if etag.is_empty() || written_etag.is_some_and(|written| written != etag) {
+            return None;
+        }
+        let persisted: DataUsageInfo = serde_json::from_slice(&bytes).ok()?;
+        if &persisted != candidate {
+            return None;
+        }
+        let root_digest = Sha256::digest(&bytes).into();
+        if ctx.is_cancelled() || tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        Some(RootPublicationProof {
+            candidate: expected.clone(),
+            root_version: (etag, root_digest),
+        })
+    };
+    tokio::select! {
+        biased;
+        _ = ctx.cancelled() => None,
+        result = tokio::time::timeout_at(deadline, read) => result.ok().flatten(),
+    }
+}
+
 fn remote_lease_expired(deadline: Option<std::time::Instant>) -> bool {
     deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
 }
@@ -166,6 +299,7 @@ pub(super) struct ScannerPublicationFence {
     pub(super) scanner_publication_lease_fence: Option<String>,
     pub(super) remote_lease_tokens: Vec<Uuid>,
     pub(super) lease_release_safe: Arc<AtomicBool>,
+    pub(super) ack_expectation: Option<crate::scanner_io::ScannerPublicationExpectation>,
 }
 
 impl ScannerPublicationFence {
@@ -180,6 +314,7 @@ impl ScannerPublicationFence {
             scanner_publication_lease_fence,
             remote_lease_tokens: Vec::new(),
             lease_release_safe: Arc::new(AtomicBool::new(true)),
+            ack_expectation: None,
         }
     }
 
@@ -192,21 +327,26 @@ impl ScannerPublicationFence {
         self.lease_release_safe = lease_release_safe;
         self
     }
+
+    pub(super) fn with_ack_expectation(mut self, expected: Option<crate::scanner_io::ScannerPublicationExpectation>) -> Self {
+        self.ack_expectation = expected;
+        self
+    }
 }
 
 #[derive(Debug)]
-pub(super) enum DataUsagePersistTaskResult {
-    Completed(DataUsagePersistOutcome),
+pub(super) enum DataUsagePersistTaskResult<T = DataUsagePersistOutcome> {
+    Completed(T),
     Cancelled,
     TimedOut,
     JoinFailed(tokio::task::JoinError),
 }
 
-pub(super) async fn wait_for_data_usage_persist_task(
+pub(super) async fn wait_for_data_usage_persist_task<T>(
     ctx: &CancellationToken,
-    task: &mut AbortOnDropHandle<DataUsagePersistOutcome>,
+    task: &mut AbortOnDropHandle<T>,
     timeout: Duration,
-) -> DataUsagePersistTaskResult {
+) -> DataUsagePersistTaskResult<T> {
     tokio::select! {
         biased;
         result = &mut *task => match result {
@@ -320,6 +460,7 @@ where
         route_probe,
     )
     .await
+    .outcome()
 }
 
 pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch_and_lease_fence<
@@ -333,7 +474,7 @@ pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_basel
     initial_baseline: Option<DataUsagePersistBaseline>,
     publication_fence: ScannerPublicationFence,
     route_probe: F,
-) -> DataUsagePersistOutcome
+) -> DataUsagePublicationResult
 where
     F: Fn() -> Fut + Send + Sync,
     Fut: Future<Output = Option<ScannerCycleDeferReason>> + Send,
@@ -344,11 +485,15 @@ where
         scanner_publication_lease_fence,
         remote_lease_tokens,
         lease_release_safe,
+        ack_expectation,
     } = publication_fence;
+    let ack_deadline = scanner_publication_scope_deadline(data_usage_persist_timeout(), remote_lease_deadline);
     let mut outcome = DataUsagePersistOutcome::NoUpdate;
+    let mut proof = None;
     let mut next_baseline = initial_baseline;
 
     'updates: while let Some(mut data_usage_info) = receiver.recv().await {
+        proof = None;
         let _activity_guard = ScannerActivityGuard::new();
         if ctx.is_cancelled() {
             break;
@@ -523,10 +668,14 @@ where
                 continue;
             }
         };
-        let sha256hex = (!data.is_empty()).then(|| hex_simd::encode_to_string(Sha256::digest(&data), hex_simd::AsciiCase::Lower));
+        let data_digest: [u8; 32] = Sha256::digest(&data).into();
+        let sha256hex = (!data.is_empty()).then(|| hex_simd::encode_to_string(data_digest, hex_simd::AsciiCase::Lower));
         let data = Bytes::from(data);
         let backup_due = !observational && data_usage_backup_due(&data_usage_info);
         let mut cas_retry = 0usize;
+        let mut ack_epoch = None;
+        let mut write_confirmed = false;
+        let mut written_etag = None;
         let save_outcome = loop {
             if ctx.is_cancelled() {
                 break 'updates;
@@ -557,6 +706,7 @@ where
             } else {
                 None
             };
+            ack_epoch = Some(publication_epoch_for_save);
             let (existing_data, revision) = match baseline {
                 Some(baseline) => (baseline.data, baseline.revision),
                 None => match read_config_with_revision(storeapi.clone(), target_path).await {
@@ -645,7 +795,7 @@ where
             }
 
             let done_save = Metrics::time(Metric::SaveUsage);
-            let save_result = {
+            let (save_result, commit_state) = {
                 let publication_scope = storeapi
                     .scanner_data_usage_publication_commit_scope_with_release_flag(
                         publication_epoch_for_save,
@@ -681,24 +831,33 @@ where
                 .await;
                 drop(legacy_publication_admission);
                 if let Some(scope) = publication_scope {
-                    match scope.wait_for_completion().await {
-                        ScannerPublicationCommitState::Committed | ScannerPublicationCommitState::AbortedBeforeCommit => {
-                            save_result
-                        }
+                    let state = scope.wait_for_completion().await;
+                    let result = match state {
+                        ScannerPublicationCommitState::Committed => save_result,
+                        ScannerPublicationCommitState::AbortedBeforeCommit => save_result,
                         ScannerPublicationCommitState::Indeterminate
                         | ScannerPublicationCommitState::Admitted
                         | ScannerPublicationCommitState::InFlight => Err(EcstoreError::other(
                             "scanner publication commit scope did not reach a safe terminal state",
                         )),
-                    }
+                    };
+                    (result, Some(state))
                 } else {
-                    save_result
+                    (save_result, None)
                 }
             };
             done_save();
 
+            let attempt_confirmed = root_ack_write_is_confirmed(
+                &save_result,
+                commit_state,
+                save_result.as_ref().ok().and_then(|info| info.etag.as_deref()),
+            );
+
             match save_result {
                 Ok(object_info) => {
+                    write_confirmed = attempt_confirmed;
+                    written_etag = object_info.etag.as_ref().filter(|etag| !etag.is_empty()).cloned();
                     if !observational {
                         next_baseline = object_info
                             .etag
@@ -909,9 +1068,27 @@ where
                 break 'updates;
             }
         }
+        if !observational
+            && data_usage_info.usage_snapshot_converged == Some(true)
+            && matches!(outcome, DataUsagePersistOutcome::Saved | DataUsagePersistOutcome::AlreadyDurable)
+            && (outcome == DataUsagePersistOutcome::AlreadyDurable || write_confirmed)
+            && let (Some(expected), Some(epoch)) = (ack_expectation.as_ref(), ack_epoch)
+            && expected.matches_encoded_candidate(&data_digest)
+        {
+            proof = read_root_publication_proof(
+                storeapi.clone(),
+                &ctx,
+                ack_deadline,
+                epoch,
+                expected,
+                &data_usage_info,
+                written_etag.as_deref(),
+            )
+            .await;
+        }
     }
 
-    outcome
+    DataUsagePublicationResult { outcome, proof }
 }
 
 async fn cleanup_observed_data_usage_snapshot_for_epoch_and_lease(
