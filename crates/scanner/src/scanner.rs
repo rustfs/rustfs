@@ -948,6 +948,33 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     init_data_scanner_with_storage(ctx, storeapi).await;
 }
 
+/// Start normal scanning when enabled, or one resume-only cleanup attempt.
+/// The disabled branch returns a finite task for the startup owner to join;
+/// it never enables ordinary namespace scanning or accepts a new reset intent.
+pub async fn init_scanner_with_recovery(
+    ctx: CancellationToken,
+    storeapi: Arc<ECStore>,
+    enabled: bool,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if enabled {
+        init_data_scanner(ctx, storeapi).await;
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        if let Err(error) = resume_scanner_cycle_cleanup(ctx, storeapi).await {
+            warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "disabled_cleanup_deferred",
+                error = %error,
+                "Disabled scanner cleanup remains pending for an operator retry"
+            );
+        }
+    }))
+}
+
 async fn init_data_scanner_with_storage<S>(ctx: CancellationToken, storeapi: Arc<S>)
 where
     S: ScannerStorage,

@@ -18,6 +18,7 @@ use crate::data_usage_define::{
     DATA_USAGE_BLOOM_RECOVERY_PATH, DATA_USAGE_RECOVERY_PATH, usage_floor_primary_read_error_allows_backup,
 };
 use crate::storage_api::owner::ObjectIO as _;
+use std::sync::atomic::AtomicU64;
 use tokio::io::AsyncReadExt as _;
 
 const SCANNER_CYCLE_RECOVERY_SCHEMA_VERSION: u16 = 1;
@@ -33,6 +34,86 @@ const LEGACY_INCOMPLETE_USAGE_FLOOR_RECOVERY: &str = "legacy_empty_usage_floor";
 const CACHE_CYCLE_AHEAD: &str = "cache_cycle_ahead";
 
 const SCANNER_USAGE_STATE_RESET_MODE_FULL_REBUILD: &str = "full-rebuild";
+
+#[cfg(test)]
+pub(super) mod cleanup_io_fault {
+    use super::*;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(in crate::scanner) enum Stage {
+        PrimaryRead,
+        PrimaryWrite,
+        UsageFence,
+    }
+
+    struct Injection {
+        store: std::sync::Weak<ECStore>,
+        stage: Stage,
+        fired: AtomicBool,
+        owned: AtomicBool,
+        newer_completion: bool,
+    }
+
+    static INJECTION: StdMutex<Option<Arc<Injection>>> = StdMutex::new(None);
+    pub(in crate::scanner) struct Guard(Arc<Injection>);
+
+    impl Guard {
+        pub(in crate::scanner) fn fired_while_owned(&self) -> bool {
+            self.0.fired.load(Ordering::Relaxed) && self.0.owned.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let mut slot = INJECTION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot.as_ref().is_some_and(|current| Arc::ptr_eq(current, &self.0)) {
+                *slot = None;
+            }
+        }
+    }
+
+    pub(in crate::scanner) fn install(store: &Arc<ECStore>, stage: Stage, newer_completion: bool) -> Guard {
+        let injection = Arc::new(Injection {
+            store: Arc::downgrade(store),
+            stage,
+            fired: AtomicBool::new(false),
+            owned: AtomicBool::new(false),
+            newer_completion,
+        });
+        let mut slot = INJECTION.lock().expect("cleanup injection slot");
+        assert!(slot.is_none(), "only one cleanup I/O injection may be installed");
+        *slot = Some(injection.clone());
+        Guard(injection)
+    }
+
+    pub(super) fn check(store: &Arc<ECStore>, stage: Stage, owned: bool) -> Result<(), ScannerError> {
+        let injection = {
+            let mut slot = INJECTION.lock().expect("cleanup injection slot");
+            if slot
+                .as_ref()
+                .is_some_and(|injection| injection.stage == stage && injection.store.ptr_eq(&Arc::downgrade(store)))
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        let Some(injection) = injection else {
+            return Ok(());
+        };
+        injection.fired.store(true, Ordering::Relaxed);
+        injection.owned.store(owned, Ordering::Relaxed);
+        if injection.newer_completion {
+            set_scanner_cycle_recovery_status(recovery_status("healthy", None, false));
+        }
+        let reason = match stage {
+            Stage::PrimaryRead => "injected primary read failure",
+            Stage::PrimaryWrite => "injected primary write failure",
+            Stage::UsageFence => "injected usage fence failure",
+        };
+        Err(ScannerError::Io(std::io::Error::other(reason)))
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ScannerCycleRecoveryStatus {
@@ -81,6 +162,8 @@ static SCANNER_CYCLE_RECOVERY_STATUS: LazyLock<RwLock<ScannerCycleRecoveryStatus
         ..Default::default()
     })
 });
+// An old startup observation must not overwrite a newer explicit reset status.
+static SCANNER_CYCLE_RECOVERY_STATUS_VERSION: AtomicU64 = AtomicU64::new(0);
 
 pub fn scanner_cycle_recovery_status() -> ScannerCycleRecoveryStatus {
     SCANNER_CYCLE_RECOVERY_STATUS
@@ -90,6 +173,24 @@ pub fn scanner_cycle_recovery_status() -> ScannerCycleRecoveryStatus {
 }
 
 fn set_scanner_cycle_recovery_status(status: ScannerCycleRecoveryStatus) {
+    let _ = publish_scanner_cleanup_status(status, None);
+}
+
+pub(super) fn scanner_cleanup_status_version() -> u64 {
+    let _status = SCANNER_CYCLE_RECOVERY_STATUS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    SCANNER_CYCLE_RECOVERY_STATUS_VERSION.load(Ordering::Relaxed)
+}
+
+pub(super) fn publish_scanner_cleanup_status(status: ScannerCycleRecoveryStatus, expected: Option<u64>) -> Option<u64> {
+    let mut current = SCANNER_CYCLE_RECOVERY_STATUS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let version = SCANNER_CYCLE_RECOVERY_STATUS_VERSION.load(Ordering::Relaxed);
+    if expected.is_some_and(|expected| expected == u64::MAX || expected != version) {
+        return None;
+    }
     let recovery_required = if matches!(
         status.state.as_str(),
         "blocked"
@@ -106,9 +207,27 @@ fn set_scanner_cycle_recovery_status(status: ScannerCycleRecoveryStatus) {
     };
     metrics::gauge!(METRIC_SCANNER_CYCLE_RECOVERY_REQUIRED).set(recovery_required);
     metrics::gauge!(METRIC_SCANNER_CYCLE_RECOVERY_RETRY_COUNT).set(status.retry_count as f64);
-    *SCANNER_CYCLE_RECOVERY_STATUS
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = status;
+    *current = status;
+    let next = version.saturating_add(1);
+    SCANNER_CYCLE_RECOVERY_STATUS_VERSION.store(next, Ordering::Relaxed);
+    Some(next)
+}
+
+fn publish_scanner_cleanup_failure(reason: String, expected: u64) {
+    let mut status = {
+        let current = SCANNER_CYCLE_RECOVERY_STATUS
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if SCANNER_CYCLE_RECOVERY_STATUS_VERSION.load(Ordering::Relaxed) != expected {
+            return;
+        }
+        current.clone()
+    };
+    // Preserve the latest core progress, including a newly written primary's
+    // revision and epoch. The original marker may predate that durable write.
+    status.reason = Some(reason);
+    status.last_attempt_at_unix_secs = Some(unix_now_secs());
+    let _ = publish_scanner_cleanup_status(status, Some(expected));
 }
 
 pub(super) fn record_scanner_usage_floor_failure(reason: String) {
@@ -932,10 +1051,81 @@ pub(crate) async fn load_scanner_cycle_state_for_startup(
     }
 }
 
-/// Reset a blocked cycle state after an operator has explicitly requested a full
-/// usage rebuild. The primary object is changed first with its observed ETag;
-/// the recovery marker is removed only when its own ETag still matches.
+/// Reset a blocked cycle state after an explicit full-rescan request. Durable
+/// cleanup state fences primary rewrites; marker removal retains its ETag and
+/// usage-epoch checks.
 pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
+    reset_scanner_cycle_recovery_for_intent(ctx, storeapi, None, None).await
+}
+
+/// Resume only an operator reset whose cleanup phase is already durable.
+/// Missing or merely blocked markers never authorize an automatic reset.
+pub(super) async fn resume_scanner_cycle_cleanup(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
+    let status_version = scanner_cleanup_status_version();
+    let (marker, revision) = match read_scanner_cleanup_marker(storeapi.clone(), &ctx).await {
+        Ok(Some(marker)) => marker,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            let _ =
+                publish_scanner_cleanup_status(recovery_status("blocked", Some(&error.to_string()), false), Some(status_version));
+            return Err(error);
+        }
+    };
+    let mut observation =
+        publish_scanner_cleanup_status(recovery_status_from_marker(&marker, &marker.state), Some(status_version));
+    if marker.state != "cleanup-pending" {
+        return Ok(());
+    }
+    let result = reset_scanner_cycle_recovery_for_intent(ctx, storeapi, Some(revision), Some(&mut observation)).await;
+    if let Err(error) = &result
+        && let Some(observation) = observation
+    {
+        publish_scanner_cleanup_failure(error.to_string(), observation);
+    }
+    result
+}
+
+pub(super) async fn read_scanner_cleanup_marker(
+    storeapi: Arc<impl ScannerObjectIO>,
+    ctx: &CancellationToken,
+) -> Result<Option<(ScannerCycleRecoveryMarker, DataUsageCacheRevision)>, ScannerError> {
+    let (data, revision) = tokio::select! {
+        biased;
+        _ = ctx.cancelled() => return Err(ScannerError::Other("scanner cleanup recovery was cancelled".to_string())),
+        result = tokio::time::timeout(data_usage_persist_timeout(), read_cycle_recovery_marker_bytes(storeapi)) => {
+            result.map_err(|_| ScannerError::Other("scanner cleanup marker inspection timed out".to_string()))?
+                .map_err(|err| ScannerError::Other(format!("failed to inspect pending scanner cleanup: {err}")))?
+        }
+    };
+    let Some(data) = data else {
+        return Ok(None);
+    };
+    let marker: ScannerCycleRecoveryMarker = serde_json::from_slice(&data)
+        .map_err(|err| ScannerError::Other(format!("pending scanner cleanup marker is invalid: {err}")))?;
+    validate_recovery_marker(&marker)
+        .map_err(|err| ScannerError::Other(format!("pending scanner cleanup marker is invalid: {err}")))?;
+    Ok(Some((marker, revision)))
+}
+
+pub(super) async fn reset_scanner_cycle_recovery_for_intent(
+    ctx: CancellationToken,
+    storeapi: Arc<ECStore>,
+    expected_cleanup_revision: Option<DataUsageCacheRevision>,
+    mut observation: Option<&mut Option<u64>>,
+) -> Result<(), ScannerError> {
+    #[cfg(test)]
+    let resume_only = expected_cleanup_revision.is_some();
+    // The outer Some distinguishes a tracked resume whose version may be
+    // invalidated from an explicit v3 reset with no observation owner.
+    let mut publish_status = |status| {
+        if let Some(version) = observation.as_deref_mut() {
+            if let Some(expected) = *version {
+                *version = publish_scanner_cleanup_status(status, Some(expected));
+            }
+        } else {
+            set_scanner_cycle_recovery_status(status);
+        }
+    };
     let lock = storeapi
         .new_ns_lock(RUSTFS_META_BUCKET, "leader.lock")
         .await
@@ -964,6 +1154,21 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
         }
         Err(err) => return Err(ScannerError::Other(format!("failed to read cycle recovery marker: {err}"))),
     };
+    if let Some(expected) = expected_cleanup_revision {
+        if marker_revision != expected || !owns_reset() {
+            return Err(ScannerError::Other(
+                "pending scanner cleanup changed before recovery acquired ownership".to_string(),
+            ));
+        }
+        let marker: ScannerCycleRecoveryMarker = marker_data
+            .as_deref()
+            .and_then(|data| serde_json::from_slice(data).ok())
+            .filter(|marker| validate_recovery_marker(marker).is_ok() && marker.state == "cleanup-pending")
+            .ok_or_else(|| {
+                ScannerError::Other("scanner cleanup recovery requires an unchanged cleanup-pending marker".to_string())
+            })?;
+        publish_status(recovery_status_from_marker(&marker, "cleanup-pending"));
+    }
     let Some(marker_data) = marker_data else {
         // A delete may commit before its reply is lost. Confirm both durable
         // fences before treating a retry without its marker as completed.
@@ -981,7 +1186,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
                 "scanner cycle recovery marker is absent without a completed reset fence".to_string(),
             ));
         }
-        set_scanner_cycle_recovery_status(recovery_status("healthy", None, false));
+        publish_status(recovery_status("healthy", None, false));
         super::notify_scanner_cycle_recovery_wake();
         return Ok(());
     };
@@ -997,6 +1202,10 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
         ));
     }
 
+    #[cfg(test)]
+    if resume_only {
+        cleanup_io_fault::check(&storeapi, cleanup_io_fault::Stage::PrimaryRead, owns_reset())?;
+    }
     let (mut primary_reader, primary_revision) = match storeapi
         .get_object_reader(
             RUSTFS_META_BUCKET,
@@ -1062,7 +1271,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
             let (cleanup_marker, cleanup_marker_revision) =
                 mark_cycle_recovery_cleanup_pending(storeapi.clone(), marker.clone(), &marker_revision, reset_epoch, &owns_reset)
                     .await?;
-            set_scanner_cycle_recovery_status(recovery_status_from_marker(&cleanup_marker, "cleanup-pending"));
+            publish_status(recovery_status_from_marker(&cleanup_marker, "cleanup-pending"));
             let usage_floor = persisted_usage_floor(storeapi.clone()).await?;
             let fence_epoch = primary_epoch
                 .max(usage_floor.leader_epoch)
@@ -1082,6 +1291,10 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
                 ));
             }
             verify_cycle_reset_intent(storeapi.clone(), &cleanup_marker_revision, &owns_reset).await?;
+            #[cfg(test)]
+            if resume_only {
+                cleanup_io_fault::check(&storeapi, cleanup_io_fault::Stage::PrimaryWrite, owns_reset())?;
+            }
             let preserved_info = save_reset_config(
                 storeapi.clone(),
                 DATA_USAGE_BLOOM_NAME_PATH.as_str(),
@@ -1155,7 +1368,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
                     ScannerError::Other(format!("failed to clear stale cycle recovery marker: {err}"))
                 }
             })?;
-            set_scanner_cycle_recovery_status(recovery_status("healthy", None, false));
+            publish_status(recovery_status("healthy", None, false));
             super::notify_scanner_cycle_recovery_wake();
             return Ok(());
         } else if !force_full_rescan && !marker_cleanup_pending {
@@ -1228,11 +1441,23 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
         ));
     }
     verify_cycle_reset_intent(storeapi.clone(), &marker_revision, &owns_reset).await?;
-    if let Err(err) =
-        fence_scanner_usage_epoch_with_expected_epoch(&ctx, storeapi.clone(), leader_epoch, Some(reset_epoch), false, &owns_reset)
-            .await
-    {
-        set_scanner_cycle_recovery_status(ScannerCycleRecoveryStatus {
+    let usage_fence = fence_scanner_usage_epoch_with_expected_epoch(
+        &ctx,
+        storeapi.clone(),
+        leader_epoch,
+        Some(reset_epoch),
+        false,
+        &owns_reset,
+    );
+    #[cfg(test)]
+    let usage_fence = async {
+        if resume_only {
+            cleanup_io_fault::check(&storeapi, cleanup_io_fault::Stage::UsageFence, owns_reset())?;
+        }
+        usage_fence.await
+    };
+    if let Err(err) = usage_fence.await {
+        publish_status(ScannerCycleRecoveryStatus {
             path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
             quarantine_path: Some(DATA_USAGE_BLOOM_RECOVERY_PATH.clone()),
             state: "cleanup-pending".to_string(),
@@ -1260,7 +1485,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
         }
     };
     if current_revision != rebuilt_revision {
-        set_scanner_cycle_recovery_status(ScannerCycleRecoveryStatus {
+        publish_status(ScannerCycleRecoveryStatus {
             path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
             quarantine_path: Some(DATA_USAGE_BLOOM_RECOVERY_PATH.clone()),
             state: "cleanup-pending".to_string(),
@@ -1281,7 +1506,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
     }
 
     if guard.is_lock_lost() {
-        set_scanner_cycle_recovery_status(ScannerCycleRecoveryStatus {
+        publish_status(ScannerCycleRecoveryStatus {
             path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
             quarantine_path: Some(DATA_USAGE_BLOOM_RECOVERY_PATH.clone()),
             state: "cleanup-pending".to_string(),
@@ -1318,7 +1543,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
     .await
     {
         if scanner_publication_epoch_changed(&err) {
-            set_scanner_cycle_recovery_status(ScannerCycleRecoveryStatus {
+            publish_status(ScannerCycleRecoveryStatus {
                 path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
                 quarantine_path: Some(DATA_USAGE_BLOOM_RECOVERY_PATH.clone()),
                 state: "cleanup-pending".to_string(),
@@ -1336,7 +1561,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
                 "scanner recovery reset deferred by a movement epoch change".to_string(),
             ));
         }
-        set_scanner_cycle_recovery_status(ScannerCycleRecoveryStatus {
+        publish_status(ScannerCycleRecoveryStatus {
             path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
             quarantine_path: Some(DATA_USAGE_BLOOM_RECOVERY_PATH.clone()),
             state: "cleanup-pending".to_string(),
@@ -1352,7 +1577,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
         });
         return Err(ScannerError::Other(format!("failed to clear cycle recovery marker: {err}")));
     }
-    set_scanner_cycle_recovery_status(ScannerCycleRecoveryStatus {
+    publish_status(ScannerCycleRecoveryStatus {
         path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
         quarantine_path: Some(DATA_USAGE_BLOOM_RECOVERY_PATH.clone()),
         state: "healthy".to_string(),

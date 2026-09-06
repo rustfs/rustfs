@@ -36,6 +36,8 @@ use tokio::time::{Duration, advance};
 
 const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 
+mod recovery_control;
+
 async fn setup_scanner_cycle_store() -> (tempfile::TempDir, Arc<ECStore>) {
     setup_scanner_cycle_store_with_usage_baseline(true).await
 }
