@@ -254,6 +254,7 @@ pub(crate) mod prepared_publication_test_hooks {
         Remove,
         #[cfg(test)]
         Rollback,
+        #[cfg(test)]
         DirFsync,
     }
 
@@ -823,7 +824,7 @@ async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup, namespace_owners: Ve
     fsync_spawn_blocking(move || {
         // The batch worker may be cancelled while this syscall is still running.
         let _namespace_owners = namespace_owners;
-        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+        #[cfg(all(test, not(windows)))]
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::DirFsync, &dir);
         #[cfg(test)]
         {
