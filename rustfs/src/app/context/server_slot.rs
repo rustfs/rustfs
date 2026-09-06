@@ -26,13 +26,14 @@
 //! server is not ready rather than that another server's global context applies.
 
 use super::global::{AppContext, get_global_app_context};
-use crate::app::storage_api::context::ECStore;
+use crate::app::storage_api::context::{BootstrapLocalTarget, ECStore, InstanceContext};
 use std::sync::{Arc, OnceLock};
 
 /// Late-bound, per-server handle to the application context.
 #[derive(Default)]
 pub struct ServerContextSlot {
     app_context: OnceLock<Arc<AppContext>>,
+    bootstrap_target: Option<BootstrapLocalTarget>,
     heal_topology_fingerprint: Arc<tokio::sync::OnceCell<String>>,
 }
 
@@ -50,7 +51,16 @@ impl ServerContextSlot {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             app_context: OnceLock::new(),
+            bootstrap_target: None,
             heal_topology_fingerprint: Arc::new(tokio::sync::OnceCell::new()),
+        })
+    }
+
+    /// Bind the listener to its foundation before it can accept requests.
+    pub fn with_instance_context(ctx: Arc<InstanceContext>) -> Arc<Self> {
+        Arc::new(Self {
+            bootstrap_target: Some(BootstrapLocalTarget::new(ctx)),
+            ..Self::default()
         })
     }
 
@@ -58,7 +68,30 @@ impl ServerContextSlot {
     /// the slot was already installed; the first installation wins, matching
     /// the process-global singleton's `get_or_init` semantics.
     pub fn install(&self, context: Arc<AppContext>) -> bool {
-        self.app_context.set(context).is_ok()
+        self.try_install(context).is_ok()
+    }
+
+    /// Claim the slot before any process-global application publication.
+    /// Repeated installation, even of the same Arc, is an explicit conflict.
+    pub fn try_install(&self, context: Arc<AppContext>) -> std::io::Result<()> {
+        if self
+            .bootstrap_target
+            .as_ref()
+            .is_some_and(|target| !target.is_for_store(&context.object_store()))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "application context does not belong to this server foundation",
+            ));
+        }
+        self.app_context.set(context).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::AlreadyExists, "server application context is already installed")
+        })
+    }
+
+    /// Immutable, restricted startup capability; never resolves an ambient store.
+    pub fn bootstrap_target(&self) -> Option<BootstrapLocalTarget> {
+        self.bootstrap_target.clone()
     }
 
     /// This server's installed application context, if startup has completed.

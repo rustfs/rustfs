@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::NodeService;
+use super::{LocalMutationTarget, NodeService};
 use crate::storage::storage_api::rpc_consumer::node_service::{
     BatchReadVersionReq, BatchReadVersionResp, DeleteOptions, DiskError, DiskInfoOptions, FileInfoVersions, ReadMultipleReq,
     ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts, validate_batch_read_version_item_count,
@@ -38,6 +38,46 @@ use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 use uuid::Uuid;
+
+impl LocalMutationTarget {
+    async fn rename_local_data(
+        &self,
+        disk_ref: &str,
+        source: (&str, &str),
+        fi: &FileInfo,
+        destination: (&str, &str),
+        scanner_token: Option<Uuid>,
+    ) -> Result<RenameDataResp, DiskError> {
+        match self {
+            Self::Ready(store) => {
+                store
+                    .rename_local_data(disk_ref, source, fi, destination, scanner_token)
+                    .await
+            }
+            Self::Bootstrap(target) => {
+                target
+                    .rename_local_data(disk_ref, source, fi, destination, scanner_token)
+                    .await
+            }
+            Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
+        }
+    }
+
+    async fn undo_local_write(
+        &self,
+        disk_ref: &str,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        opts: DeleteOptions,
+    ) -> Result<(), DiskError> {
+        match self {
+            Self::Ready(store) => store.undo_local_write(disk_ref, volume, path, fi, opts).await,
+            Self::Bootstrap(target) => target.undo_local_write(disk_ref, volume, path, fi, opts).await,
+            Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
+        }
+    }
+}
 
 /// Initial capacity hint (bytes) for typical small msgpack requests and responses.
 const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
@@ -670,55 +710,59 @@ impl NodeService {
             "delete_version",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
-            let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
-                Ok(file_info) => file_info,
-                Err(err) => {
-                    return Ok(Response::new(DeleteVersionResponse {
-                        success: false,
-                        raw_file_info: "".to_string(),
-                        error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
-                    }));
-                }
-            };
-            let opts = match decode_msgpack_or_json::<DeleteOptions>(&request.opts_bin, &request.opts, "DeleteOptions") {
-                Ok(opts) => opts,
-                Err(err) => {
-                    return Ok(Response::new(DeleteVersionResponse {
-                        success: false,
-                        raw_file_info: "".to_string(),
-                        error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
-                    }));
-                }
-            };
-            match disk
-                .delete_version(&request.volume, &request.path, file_info, request.force_del_marker, opts)
+        let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
+            Ok(file_info) => file_info,
+            Err(err) => {
+                return Ok(Response::new(DeleteVersionResponse {
+                    success: false,
+                    raw_file_info: "".to_string(),
+                    error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
+                }));
+            }
+        };
+        let opts = match decode_msgpack_or_json::<DeleteOptions>(&request.opts_bin, &request.opts, "DeleteOptions") {
+            Ok(opts) => opts,
+            Err(err) => {
+                return Ok(Response::new(DeleteVersionResponse {
+                    success: false,
+                    raw_file_info: "".to_string(),
+                    error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
+                }));
+            }
+        };
+        let result = if opts.undo_write {
+            if request.force_del_marker {
+                Err(DiskError::other("undo_write cannot force a delete marker"))
+            } else {
+                let target = self.local_mutation_target();
+                target
+                    .undo_local_write(&request.disk, &request.volume, &request.path, file_info, opts)
+                    .await
+            }
+        } else if let Some(disk) = self.find_disk(&request.disk).await {
+            disk.delete_version(&request.volume, &request.path, file_info, request.force_del_marker, opts)
                 .await
-            {
-                Ok(raw_file_info) => match serde_json::to_string(&raw_file_info) {
-                    Ok(raw_file_info) => Ok(Response::new(DeleteVersionResponse {
-                        success: true,
-                        raw_file_info,
-                        error: None,
-                    })),
-                    Err(err) => Ok(Response::new(DeleteVersionResponse {
-                        success: false,
-                        raw_file_info: "".to_string(),
-                        error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
-                    })),
-                },
+        } else {
+            Err(DiskError::other("cannot find disk"))
+        };
+        match result {
+            Ok(raw_file_info) => match serde_json::to_string(&raw_file_info) {
+                Ok(raw_file_info) => Ok(Response::new(DeleteVersionResponse {
+                    success: true,
+                    raw_file_info,
+                    error: None,
+                })),
                 Err(err) => Ok(Response::new(DeleteVersionResponse {
                     success: false,
                     raw_file_info: "".to_string(),
-                    error: Some(err.into()),
+                    error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
                 })),
-            }
-        } else {
-            Ok(Response::new(DeleteVersionResponse {
+            },
+            Err(err) => Ok(Response::new(DeleteVersionResponse {
                 success: false,
                 raw_file_info: "".to_string(),
-                error: Some(DiskError::other("cannot find disk".to_string()).into()),
-            }))
+                error: Some(err.into()),
+            })),
         }
     }
 
@@ -1206,98 +1250,59 @@ impl NodeService {
             "rename_data",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
-            let decoded_file_info = match decode_rename_data_request_file_info(&request.file_info_bin, &request.file_info) {
-                Ok(file_info) => file_info,
-                Err(err) => {
-                    return Ok(Response::new(RenameDataResponse {
-                        success: false,
-                        rename_data_resp: String::new(),
-                        rename_data_resp_bin: Vec::new().into(),
-                        error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
-                    }));
-                }
-            };
-            let scanner_publication_lease_token = if request.scanner_publication_lease_token.is_empty() {
-                None
-            } else {
-                let token = Uuid::from_slice(&request.scanner_publication_lease_token)
-                    .map_err(|_| Status::invalid_argument("scanner publication lease token must be a UUID"))?;
-                if token.is_nil() {
-                    return Err(Status::invalid_argument("scanner publication lease token must not be nil"));
-                }
-                Some(token)
-            };
-            // The target owns this read guard.  It must span the complete
-            // disk rename, not merely the preflight, so a movement transition
-            // cannot restart after validation and before rename linearization.
-            let scanner_publication_lease_guard: Option<Arc<dyn Send + Sync>> =
-                if let Some(token) = scanner_publication_lease_token {
-                    let Some(store) = self.resolve_object_store() else {
-                        return Ok(Response::new(RenameDataResponse {
-                            success: false,
-                            rename_data_resp: String::new(),
-                            rename_data_resp_bin: Vec::new().into(),
-                            error: Some(DiskError::other("scanner publication lease owner is unavailable").into()),
-                        }));
-                    };
-                    match store.acquire_scanner_publication_lease_guard(token).await {
-                        Ok(guard) => Some(Arc::new(guard)),
-                        Err(err) => {
-                            return Ok(Response::new(RenameDataResponse {
-                                success: false,
-                                rename_data_resp: String::new(),
-                                rename_data_resp_bin: Vec::new().into(),
-                                error: Some(DiskError::other(err.to_string()).into()),
-                            }));
-                        }
-                    }
-                } else {
-                    None
-                };
-            let request_decoded_from_msgpack = decoded_file_info.from_msgpack;
-            match disk
-                .rename_data_borrowed_with_fence_and_guard(
-                    &request.src_volume,
-                    &request.src_path,
-                    &decoded_file_info.value,
-                    &request.dst_volume,
-                    &request.dst_path,
-                    scanner_publication_lease_token,
-                    scanner_publication_lease_guard,
-                )
-                .await
-            {
-                Ok(rename_data_resp) => {
-                    match encode_rename_data_response_payloads(&rename_data_resp, request_decoded_from_msgpack) {
-                        Ok((rename_data_resp, rename_data_resp_bin)) => Ok(Response::new(RenameDataResponse {
-                            success: true,
-                            rename_data_resp,
-                            rename_data_resp_bin: rename_data_resp_bin.into(),
-                            error: None,
-                        })),
-                        Err(err) => Ok(Response::new(RenameDataResponse {
-                            success: false,
-                            rename_data_resp: String::new(),
-                            rename_data_resp_bin: Vec::new().into(),
-                            error: Some(err.into()),
-                        })),
-                    }
-                }
+        let target = self.local_mutation_target();
+        let decoded_file_info = match decode_rename_data_request_file_info(&request.file_info_bin, &request.file_info) {
+            Ok(file_info) => file_info,
+            Err(err) => {
+                return Ok(Response::new(RenameDataResponse {
+                    success: false,
+                    rename_data_resp: String::new(),
+                    rename_data_resp_bin: Vec::new().into(),
+                    error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
+                }));
+            }
+        };
+        let scanner_publication_lease_token = if request.scanner_publication_lease_token.is_empty() {
+            None
+        } else {
+            let token = Uuid::from_slice(&request.scanner_publication_lease_token)
+                .map_err(|_| Status::invalid_argument("scanner publication lease token must be a UUID"))?;
+            if token.is_nil() {
+                return Err(Status::invalid_argument("scanner publication lease token must not be nil"));
+            }
+            Some(token)
+        };
+        let request_decoded_from_msgpack = decoded_file_info.from_msgpack;
+        match target
+            .rename_local_data(
+                &request.disk,
+                (&request.src_volume, &request.src_path),
+                &decoded_file_info.value,
+                (&request.dst_volume, &request.dst_path),
+                scanner_publication_lease_token,
+            )
+            .await
+        {
+            Ok(rename_data_resp) => match encode_rename_data_response_payloads(&rename_data_resp, request_decoded_from_msgpack) {
+                Ok((rename_data_resp, rename_data_resp_bin)) => Ok(Response::new(RenameDataResponse {
+                    success: true,
+                    rename_data_resp,
+                    rename_data_resp_bin: rename_data_resp_bin.into(),
+                    error: None,
+                })),
                 Err(err) => Ok(Response::new(RenameDataResponse {
                     success: false,
                     rename_data_resp: String::new(),
                     rename_data_resp_bin: Vec::new().into(),
                     error: Some(err.into()),
                 })),
-            }
-        } else {
-            Ok(Response::new(RenameDataResponse {
+            },
+            Err(err) => Ok(Response::new(RenameDataResponse {
                 success: false,
                 rename_data_resp: String::new(),
                 rename_data_resp_bin: Vec::new().into(),
-                error: Some(DiskError::other("cannot find disk".to_string()).into()),
-            }))
+                error: Some(err.into()),
+            })),
         }
     }
 

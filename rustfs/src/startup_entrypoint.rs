@@ -141,10 +141,6 @@ async fn run(config: Config) -> Result<()> {
     // the storage path explicitly (Phase 5 follow-up, backlog#1052); a future
     // multi-instance server constructs its own context here instead.
     let instance_ctx = bootstrap_instance_ctx();
-    // This server's request-path context slot (backlog#1052 S2): handed to the
-    // HTTP service now, installed once IAM bootstrap completes.
-    let server_ctx = ServerContextSlot::new();
-
     let StartupListenContext {
         readiness,
         server_addr,
@@ -152,6 +148,7 @@ async fn run(config: Config) -> Result<()> {
     } = init_startup_listen_context(&config, &instance_ctx).await?;
 
     let endpoint_pools = init_startup_storage_foundation(&server_address, &config.volumes, &instance_ctx).await?;
+    let server_ctx = ServerContextSlot::with_instance_context(instance_ctx.clone());
     let StartupHttpServers {
         state_manager,
         s3_shutdown_tx,

@@ -243,7 +243,7 @@ pub(crate) mod fsync_dir_recorder {
 }
 
 /// Pause a real namespace mutation inside its physical executor.
-#[cfg(all(test, not(windows)))]
+#[cfg(all(any(test, feature = "test-util"), not(windows)))]
 pub(crate) mod prepared_publication_test_hooks {
     use super::*;
 
@@ -252,6 +252,7 @@ pub(crate) mod prepared_publication_test_hooks {
         PreparedRename,
         Rename,
         Remove,
+        #[cfg(test)]
         Rollback,
         DirFsync,
     }
@@ -268,6 +269,7 @@ pub(crate) mod prepared_publication_test_hooks {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn install(path: &Path, hook: impl FnOnce() + Send + 'static) -> Guard {
         install_at(Stage::PreparedRename, path, hook)
     }
@@ -283,6 +285,51 @@ pub(crate) mod prepared_publication_test_hooks {
         if let Some(hook) = hook {
             hook();
         }
+    }
+}
+
+/// Controlled application-test pause at an existing physical executor boundary.
+#[cfg(all(feature = "test-util", not(windows)))]
+pub struct LocalPublicationPause {
+    _hook: prepared_publication_test_hooks::Guard,
+    entered: oneshot::Receiver<()>,
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(all(feature = "test-util", not(windows)))]
+#[derive(Clone, Copy)]
+pub enum LocalPublicationStage {
+    PreparedRename,
+    Rename,
+    Remove,
+}
+
+#[cfg(all(feature = "test-util", not(windows)))]
+impl LocalPublicationPause {
+    pub fn install(disk: &crate::disk::Disk, volume: &str, path: &str, stage: LocalPublicationStage) -> Result<Self> {
+        let path = disk
+            .get_object_path_for_io_if_local(volume, path)
+            .ok_or(DiskError::DiskNotFound)??;
+        let stage = match stage {
+            LocalPublicationStage::PreparedRename => prepared_publication_test_hooks::Stage::PreparedRename,
+            LocalPublicationStage::Rename => prepared_publication_test_hooks::Stage::Rename,
+            LocalPublicationStage::Remove => prepared_publication_test_hooks::Stage::Remove,
+        };
+        let (entered_tx, entered) = oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let hook = prepared_publication_test_hooks::install_at(stage, &path, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        Ok(Self {
+            _hook: hook,
+            entered,
+            _release: release,
+        })
+    }
+
+    pub async fn entered(&mut self) -> std::result::Result<(), oneshot::error::RecvError> {
+        (&mut self.entered).await
     }
 }
 
@@ -776,7 +823,7 @@ async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup, namespace_owners: Ve
     fsync_spawn_blocking(move || {
         // The batch worker may be cancelled while this syscall is still running.
         let _namespace_owners = namespace_owners;
-        #[cfg(all(test, not(windows)))]
+        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::DirFsync, &dir);
         #[cfg(test)]
         {
@@ -1912,7 +1959,7 @@ pub(crate) async fn remove_file_with_owner(
     let path = path.as_ref().to_path_buf();
     let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
     run_blocking_namespace_operation(lease, move || {
-        #[cfg(all(test, not(windows)))]
+        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Remove, &path);
         std::fs::remove_file(path)
     })
@@ -2136,7 +2183,7 @@ pub(crate) async fn rename_all_with_prepared_source(
         move || {
             validate_prepared_rename_source(&prepared_source, &src_file_path)?;
             let preparation = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::PreparedRename, &dst_file_path);
             rename_prepared(&src_file_path, &dst_file_path, &preparation)
         }
@@ -2267,7 +2314,7 @@ async fn reliable_rename_inner_with_lease(
         let base_dir = base_dir.clone();
         move || {
             let preparation = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
-            #[cfg(all(test, not(windows)))]
+            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
             {
                 prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &src_file_path);
                 prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &dst_file_path);

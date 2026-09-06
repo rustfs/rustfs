@@ -124,9 +124,6 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
     } else {
         bootstrap_instance_ctx()
     };
-    // This server's request-path context slot (backlog#1052 S2).
-    let server_ctx = ServerContextSlot::new();
-
     let EmbeddedStartupConfig {
         config,
         identity,
@@ -151,6 +148,7 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
         .await
         .map_err(init_error)?;
 
+    let server_ctx = ServerContextSlot::with_instance_context(instance_ctx.clone());
     let http_server = start_embedded_http_server(&config, listen_context.readiness.clone(), server_ctx.clone()).await?;
     let shutdown_handle = http_server.shutdown_handle;
     let bound_addr = http_server.bound_addr;
