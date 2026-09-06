@@ -3478,11 +3478,10 @@ mod target_repair_tests {
         ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
     ];
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn ordinary_target_writes_preserve_repairs_missing_from_the_cache() {
-        temp_env::async_with_vars(ORDINARY_TARGET_ENV, async {
-            for operation in ["create", "update", "remove"] {
+    async fn assert_target_write_preserves_uncached_repair(operation: &str) {
+        temp_env::async_with_vars(
+            ORDINARY_TARGET_ENV,
+            Box::pin(async move {
                 let (_temp, _env) = test_env().await;
                 let first = RemoteTargetServer::start().await;
                 let second = RemoteTargetServer::start().await;
@@ -3551,9 +3550,27 @@ mod target_repair_tests {
                     assert_eq!(updated.credentials.as_ref().expect("retained credentials").secret_key, "remote-secret");
                 }
                 assert_published_targets(&targets).await;
-            }
-        })
+            }),
+        )
         .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_target_create_preserves_repairs_missing_from_the_cache() {
+        assert_target_write_preserves_uncached_repair("create").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_target_update_preserves_repairs_missing_from_the_cache() {
+        assert_target_write_preserves_uncached_repair("update").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_target_remove_preserves_repairs_missing_from_the_cache() {
+        assert_target_write_preserves_uncached_repair("remove").await;
     }
 
     #[tokio::test]
@@ -3637,11 +3654,10 @@ mod target_repair_tests {
         .await;
     }
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn ordinary_target_update_rejects_same_target_changes_during_remote_validation() {
-        temp_env::async_with_vars(ORDINARY_TARGET_ENV, async {
-            for deleted in [false, true] {
+    async fn assert_target_update_rejects_concurrent_change(deleted: bool) {
+        temp_env::async_with_vars(
+            ORDINARY_TARGET_ENV,
+            Box::pin(async move {
                 let (_temp, _env) = test_env().await;
                 let server = RemoteTargetServer::start().await;
                 let arn = repair(&server.target(), "").await.expect("create initial target");
@@ -3680,9 +3696,21 @@ mod target_repair_tests {
                     assert!(!targets.targets[0].replication_sync);
                 }
                 assert_published_targets(&targets).await;
-            }
-        })
+            }),
+        )
         .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_target_update_rejects_same_target_changes_during_remote_validation() {
+        assert_target_update_rejects_concurrent_change(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_target_update_rejects_target_deletion_during_remote_validation() {
+        assert_target_update_rejects_concurrent_change(true).await;
     }
 
     #[tokio::test]
@@ -3829,34 +3857,43 @@ mod target_repair_tests {
         }).await;
     }
 
+    async fn assert_target_remove_checks_persisted_rules(malformed: bool) {
+        temp_env::async_with_vars(ORDINARY_TARGET_ENV, Box::pin(async move {
+            let (_temp, env) = test_env().await;
+            let server = RemoteTargetServer::start().await;
+            let arn = repair(&server.target(), "").await.expect("create initial target");
+            let mut metadata = metadata_sys::get_config_from_disk(BUCKET).await.expect("read initial metadata");
+            let file = metadata.save_file_path();
+            metadata.replication_config_xml = if malformed {
+                b"<ReplicationConfiguration>".to_vec()
+            } else {
+                format!("<ReplicationConfiguration><Role>{arn}</Role><Rule><ID>active</ID><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><Priority>1</Priority><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Destination><Bucket>{arn}</Bucket></Destination></Rule></ReplicationConfiguration>").into_bytes()
+            };
+            // Another node has persisted rules before this node reloads them.
+            metadata.save_with_store(Arc::clone(&env.ecstore)).await.expect("persist peer rules without refreshing cache");
+            assert!(metadata_sys::get_replication_config(BUCKET).await.is_err(), "precondition: cached rules are absent");
+            assert_eq!(metadata_sys::get_config_from_disk(BUCKET).await.expect("read peer metadata").replication_config.is_none(), malformed);
+            let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file).await.expect("read peer bytes");
+            let error = remove(&arn).await.expect_err("rules must prevent unsafe target removal");
+            assert_eq!(error.code(), if malformed { &S3ErrorCode::InternalError } else { &S3ErrorCode::InvalidRequest });
+            assert_eq!(crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file).await.expect("read rejected removal bytes"), before);
+            let targets = persisted_targets().await;
+            assert_eq!(targets.targets.len(), 1);
+            assert_eq!(targets.targets[0].arn, arn);
+            assert_published_targets(&targets).await;
+        }))
+        .await;
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn ordinary_target_remove_checks_current_persisted_replication_rules() {
-        temp_env::async_with_vars(ORDINARY_TARGET_ENV, async {
-            for malformed in [false, true] {
-                let (_temp, env) = test_env().await;
-                let server = RemoteTargetServer::start().await;
-                let arn = repair(&server.target(), "").await.expect("create initial target");
-                let mut metadata = metadata_sys::get_config_from_disk(BUCKET).await.expect("read initial metadata");
-                let file = metadata.save_file_path();
-                metadata.replication_config_xml = if malformed {
-                    b"<ReplicationConfiguration>".to_vec()
-                } else {
-                    format!("<ReplicationConfiguration><Role>{arn}</Role><Rule><ID>active</ID><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><Priority>1</Priority><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Destination><Bucket>{arn}</Bucket></Destination></Rule></ReplicationConfiguration>").into_bytes()
-                };
-                // Another node has persisted rules before this node reloads them.
-                metadata.save_with_store(Arc::clone(&env.ecstore)).await.expect("persist peer rules without refreshing cache");
-                assert!(metadata_sys::get_replication_config(BUCKET).await.is_err(), "precondition: cached rules are absent");
-                assert_eq!(metadata_sys::get_config_from_disk(BUCKET).await.expect("read peer metadata").replication_config.is_none(), malformed);
-                let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file).await.expect("read peer bytes");
-                let error = remove(&arn).await.expect_err("rules must prevent unsafe target removal");
-                assert_eq!(error.code(), if malformed { &S3ErrorCode::InternalError } else { &S3ErrorCode::InvalidRequest });
-                assert_eq!(crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file).await.expect("read rejected removal bytes"), before);
-                let targets = persisted_targets().await;
-                assert_eq!(targets.targets.len(), 1);
-                assert_eq!(targets.targets[0].arn, arn);
-                assert_published_targets(&targets).await;
-            }
-        }).await;
+        assert_target_remove_checks_persisted_rules(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_target_remove_rejects_malformed_persisted_replication_rules() {
+        assert_target_remove_checks_persisted_rules(true).await;
     }
 }
