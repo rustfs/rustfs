@@ -1091,6 +1091,7 @@ mod tests {
         let (endpoint, recorded) = scripted_server(vec![
             ScriptedResponse::new(200, Vec::new(), PAGE.to_string()),
             ScriptedResponse::new(200, Vec::new(), LAST_PAGE.to_string()),
+            ScriptedResponse::new(200, Vec::new(), LAST_PAGE.to_string()),
         ])
         .await;
         let backend = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]));
@@ -1109,29 +1110,48 @@ mod tests {
 
         let second = backend
             .list(&SourceListRequest {
-                prefix: Some(&first.common_prefixes[0]),
+                delimiter: Some("/"),
                 continuation_token: first.next_continuation_token.as_deref(),
                 max_keys: 1,
                 ..Default::default()
             })
             .await
-            .expect("use the returned logical prefix and cursor");
+            .expect("continue with the original listing conditions");
         assert!(!second.is_truncated);
         assert!(second.next_continuation_token.is_none());
 
+        let nested = backend
+            .list(&SourceListRequest {
+                prefix: Some(&first.common_prefixes[0]),
+                delimiter: Some("/"),
+                max_keys: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("start a separate listing under the returned logical prefix");
+        assert!(!nested.is_truncated);
+
         let recorded = recorded.lock().expect("recorder lock");
-        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded.len(), 3);
         assert_eq!(recorded[0].method, "GET");
         assert!(!recorded[0].target.contains("marker="));
         assert_eq!(recorded[1].method, "GET");
         assert_eq!(
             recorded[1].target,
-            "/legacy?restype=container&comp=list&prefix=%EF%BF%BE%EF%BF%BF%2F%E4%B8%AD%E6%96%87%2F%252F%2B%25%2B%26%2F&marker=opaque%252B%2Bmarker&maxresults=1"
+            "/legacy?restype=container&comp=list&delimiter=%2F&marker=opaque%252B%2Bmarker&maxresults=1"
         );
         let request_url = endpoint.join(&recorded[1].target).expect("recorded request URL");
         let query: HashMap<_, _> = request_url.query_pairs().into_owned().collect();
-        assert_eq!(query.get("prefix"), Some(&first.common_prefixes[0]));
         assert_eq!(query.get("marker").map(String::as_str), Some("opaque%2B+marker"));
+        assert_eq!(recorded[2].method, "GET");
+        assert_eq!(
+            recorded[2].target,
+            "/legacy?restype=container&comp=list&prefix=%EF%BF%BE%EF%BF%BF%2F%E4%B8%AD%E6%96%87%2F%252F%2B%25%2B%26%2F&delimiter=%2F&maxresults=1"
+        );
+        let request_url = endpoint.join(&recorded[2].target).expect("recorded prefix request URL");
+        let query: HashMap<_, _> = request_url.query_pairs().into_owned().collect();
+        assert_eq!(query.get("prefix"), Some(&first.common_prefixes[0]));
+        assert!(!query.contains_key("marker"));
     }
 
     #[tokio::test]
