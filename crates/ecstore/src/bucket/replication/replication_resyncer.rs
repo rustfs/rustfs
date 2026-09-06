@@ -6567,6 +6567,36 @@ mod tests {
             body: Bytes,
             info: ObjectInfo,
             ranges: StdMutex<Vec<(i64, i64)>>,
+            full_read: Option<FullReadOutcome>,
+            full_reads: std::sync::atomic::AtomicUsize,
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum FullReadOutcome {
+            EmptyTail,
+            DecodeError,
+            ExtraByte,
+        }
+
+        struct DecodeErrorAfterBody(std::io::Cursor<Bytes>);
+
+        impl tokio::io::AsyncRead for DecodeErrorAfterBody {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let filled = buf.filled().len();
+                match std::pin::Pin::new(&mut self.get_mut().0).poll_read(cx, buf) {
+                    std::task::Poll::Ready(Ok(())) if buf.remaining() > 0 && buf.filled().len() == filled => {
+                        std::task::Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "tail decode failed after all plaintext",
+                        )))
+                    }
+                    result => result,
+                }
+            }
         }
 
         #[async_trait::async_trait]
@@ -6585,8 +6615,30 @@ mod tests {
                 _object: &str,
                 range: Option<HTTPRangeSpec>,
                 _headers: HeaderMap,
-                _opts: &ObjectOptions,
+                opts: &ObjectOptions,
             ) -> Result<GetObjectReader> {
+                assert_eq!(
+                    opts.version_id,
+                    self.info.version_id.map(|id| id.to_string()),
+                    "every read retains the selected source version"
+                );
+                if range.is_none() {
+                    let outcome = self.full_read.expect("only a transformed empty tail needs a full decode");
+                    self.full_reads.fetch_add(1, Ordering::Relaxed);
+                    let stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync> = match outcome {
+                        FullReadOutcome::EmptyTail => Box::new(std::io::Cursor::new(self.body.clone())),
+                        FullReadOutcome::DecodeError => Box::new(DecodeErrorAfterBody(std::io::Cursor::new(self.body.clone()))),
+                        FullReadOutcome::ExtraByte => {
+                            Box::new(std::io::Cursor::new(Bytes::from([self.body.as_ref(), &[0xff]].concat())))
+                        }
+                    };
+                    return Ok(GetObjectReader {
+                        stream,
+                        object_info: self.info.clone(),
+                        buffered_body: None,
+                        body_source: Default::default(),
+                    });
+                }
                 let range = range.expect("multipart transport must request an explicit nonempty range");
                 assert!(!range.is_suffix_length);
                 assert!(range.start <= range.end, "empty parts must not issue an inverted range");
@@ -6623,15 +6675,30 @@ mod tests {
 
         #[tokio::test]
         async fn multipart_transport_preserves_legacy_zero_actual_sizes() {
-            run_transport(4096).await;
+            run_transport(4096, None).await;
         }
 
         #[tokio::test]
         async fn multipart_transport_uploads_an_empty_last_part_without_reading_a_range() {
-            run_transport(0).await;
+            run_transport(0, None).await;
         }
 
-        async fn run_transport(tail_size: usize) {
+        #[tokio::test]
+        async fn multipart_transport_validates_transformed_empty_tail_before_upload() {
+            run_transport(0, Some(FullReadOutcome::EmptyTail)).await;
+        }
+
+        #[tokio::test]
+        async fn multipart_transport_aborts_on_transformed_tail_decode_error() {
+            run_transport(0, Some(FullReadOutcome::DecodeError)).await;
+        }
+
+        #[tokio::test]
+        async fn multipart_transport_aborts_when_transformed_tail_is_not_empty() {
+            run_transport(0, Some(FullReadOutcome::ExtraByte)).await;
+        }
+
+        async fn run_transport(tail_size: usize, full_read: Option<FullReadOutcome>) {
             const FIRST_SIZE: usize = 5 * 1024 * 1024;
             let body = Bytes::from([vec![0x35; FIRST_SIZE], vec![0xa7; tail_size]].concat());
             let etag = faster_hex::hex_string(rustfs_utils::hash::HashAlgorithm::Md5.hash_encode(&body).as_ref());
@@ -6640,6 +6707,12 @@ mod tests {
                     size: i64::try_from(body.len()).expect("body size"),
                     actual_size: i64::try_from(body.len()).expect("body size"),
                     etag: Some(etag.clone()),
+                    version_id: Some(Uuid::new_v4()),
+                    user_defined: Arc::new(if full_read.is_some() {
+                        HashMap::from([("x-amz-server-side-encryption".to_string(), "AES256".to_string())])
+                    } else {
+                        HashMap::new()
+                    }),
                     parts: Arc::new(vec![
                         ObjectPartInfo {
                             number: 1,
@@ -6653,7 +6726,7 @@ mod tests {
                         },
                         ObjectPartInfo {
                             number: 2,
-                            size: tail_size,
+                            size: if full_read.is_some() { 8 } else { tail_size },
                             actual_size: 0,
                             ..Default::default()
                         },
@@ -6662,6 +6735,8 @@ mod tests {
                 },
                 body: body.clone(),
                 ranges: StdMutex::new(Vec::new()),
+                full_read,
+                full_reads: std::sync::atomic::AtomicUsize::new(0),
             });
             let journal = Arc::new(StdMutex::new(Vec::<RequestRecord>::new()));
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -6721,7 +6796,10 @@ mod tests {
             Arc::get_mut(&mut target).expect("unshared test target").client = Arc::new(aws_sdk_s3::Client::from_conf(config));
             let (put_opts, is_multipart) = replication_put_object_options("STANDARD", &source.info).expect("replication options");
             assert!(is_multipart, "persisted parts select the multipart transport");
-            let opts = ObjectOptions::default();
+            let opts = ObjectOptions {
+                version_id: source.info.version_id.map(|id| id.to_string()),
+                ..Default::default()
+            };
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 replicate_object_with_multipart(MultipartReplicationContext {
@@ -6739,9 +6817,33 @@ mod tests {
             .await;
             server.abort();
             assert!(server.await.expect_err("fixture server is stopped").is_cancelled());
-            result
-                .expect("multipart replication must finish")
-                .expect("legacy parts must replicate successfully");
+            let result = result.expect("multipart replication must finish");
+
+            if matches!(full_read, Some(FullReadOutcome::DecodeError | FullReadOutcome::ExtraByte)) {
+                assert_eq!(source.full_reads.load(Ordering::Relaxed), 1, "decode failures follow a full read");
+                let error = result.expect_err("invalid transformed tails must abort replication");
+                if full_read == Some(FullReadOutcome::DecodeError) {
+                    assert!(
+                        error.to_string().contains("tail decode failed after all plaintext"),
+                        "decoder error must remain visible: {error}"
+                    );
+                }
+                let requests = journal.lock().expect("request journal lock");
+                assert_eq!(requests.len(), 3, "initiate, first part and abort; no empty upload or complete");
+                assert!(requests[0].query.contains_key("uploads"));
+                assert_eq!(requests[1].method, http::Method::PUT);
+                assert_eq!(requests[1].query.get("partNumber").map(String::as_str), Some("1"));
+                assert_eq!(requests[1].body, body);
+                assert_eq!(requests[2].method, http::Method::DELETE);
+                assert!(requests[2].query.contains_key("uploadId"));
+                assert_eq!(
+                    *source.ranges.lock().expect("range journal lock"),
+                    vec![(0, i64::try_from(FIRST_SIZE - 1).expect("first end"))]
+                );
+                return;
+            }
+            result.expect("legacy parts must replicate successfully");
+            assert_eq!(source.full_reads.load(Ordering::Relaxed), usize::from(full_read.is_some()));
 
             let requests = journal.lock().expect("request journal lock");
             assert_eq!(requests.len(), 4, "initiate, two upload parts, and complete without retries");
