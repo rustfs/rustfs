@@ -322,8 +322,8 @@ async fn run_row(mode: TargetMode) -> TestResult {
         if shape == ObjectShape::OdmPreservedMd5Multipart {
             assert_eq!(
                 env.source.count_requests(FakeTargetOperation::GetObject, shape.key()),
-                1,
-                "replication must read the persisted local parts"
+                2,
+                "one passthrough GET plus one background pull; replication must read the persisted local parts"
             );
         }
         let journal = target.requests();
@@ -509,6 +509,9 @@ async fn odm_preserved_md5_multipart(env: &OdmTestEnv, bucket: &str, key: &str) 
     let origin_bucket = format!("{bucket}-origin");
     env.source.create_bucket_with_mode(&origin_bucket, BucketMode::Unversioned);
     let mut spec = env.fake_source_spec(&origin_bucket);
+    // Below the 16 MiB inline default the pull is one tee'd PUT with a single
+    // part; force the passthrough + background multipart write-back instead.
+    spec.policy.inline_max_bytes = 4096;
     spec.policy.multipart_part_size_bytes = PART_SIZE as u64;
     spec.policy.preserve_etag = true;
     env.configure_and_wait(bucket, &spec).await?;

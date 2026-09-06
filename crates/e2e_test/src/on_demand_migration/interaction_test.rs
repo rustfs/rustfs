@@ -610,6 +610,9 @@ async fn assert_odm_multipart_replicates_to_rustfs(env: &OdmTestEnv, bucket: &st
     .await?;
     put_bucket_replication(&env.rustfs, bucket, &arn).await?;
     let mut spec = env.fake_source_spec(SOURCE_BUCKET);
+    // Below the 16 MiB inline default the pull is one tee'd PUT with a single
+    // part; force the passthrough + background multipart write-back instead.
+    spec.policy.inline_max_bytes = 4096;
     spec.policy.multipart_part_size_bytes = PART_SIZE as u64;
     spec.policy.preserve_etag = true;
     env.configure_and_wait(bucket, &spec).await?;
@@ -673,6 +676,15 @@ async fn assert_odm_multipart_replicates_to_rustfs(env: &OdmTestEnv, bucket: &st
             [(Some(1), Some(PART_SIZE as i64)), (Some(2), Some(4096))]
         );
     }
+    // REPLICA status surfaces on HEAD, like the other inbound-replica checks.
+    let replica_head = replica_client
+        .head_object()
+        .bucket(replica_bucket)
+        .key(key)
+        .version_id(version)
+        .send()
+        .await?;
+    assert_eq!(replica_head.replication_status().map(|status| status.as_str()), Some("REPLICA"));
     let replica_get = replica_client
         .get_object()
         .bucket(replica_bucket)
@@ -680,7 +692,6 @@ async fn assert_odm_multipart_replicates_to_rustfs(env: &OdmTestEnv, bucket: &st
         .version_id(version)
         .send()
         .await?;
-    assert_eq!(replica_get.replication_status().map(|status| status.as_str()), Some("REPLICA"));
     assert_eq!(replica_get.version_id(), Some(version));
     assert_eq!(replica_get.body.collect().await?.into_bytes(), body);
     let boundary = replica_client
@@ -694,8 +705,8 @@ async fn assert_odm_multipart_replicates_to_rustfs(env: &OdmTestEnv, bucket: &st
     assert_eq!(boundary.body.collect().await?.into_bytes(), body.slice(PART_SIZE - 32..PART_SIZE + 32));
     assert_eq!(
         env.source.count_requests(Operation::GetObject, key),
-        1,
-        "replication and local reads must not fetch the migration source again"
+        2,
+        "one passthrough GET plus one background pull; replication and local reads must not fetch the migration source again"
     );
     Ok(())
 }
