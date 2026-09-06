@@ -1160,7 +1160,7 @@ mod tests {
             let attempt = &classified["attempt"];
             uuid::Uuid::parse_str(attempt.as_str().expect("real init attempt UUID")).expect("valid init attempt UUID");
             assert_eq!(classified["elected_writer"], true);
-            assert_eq!(classified["needs_repair"], true);
+            assert_eq!(classified["needs_repair"], previous.is_some());
             assert_eq!(classified["repair_write_safe"], true);
             assert_eq!(classified["topology_update"], topology_update);
             assert!(
