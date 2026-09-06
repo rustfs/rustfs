@@ -338,12 +338,21 @@ where
             dirty_usage_status,
             activity_status,
         );
-        let empty_usage = DataUsageInfo {
-            last_update: Some(SystemTime::now()),
-            scanner_cycle: Some(want_cycle),
-            usage_snapshot_complete: true,
-            ..Default::default()
+        let Some(candidate) = empty_namespace_usage_candidate(
+            &all_buckets,
+            &expected_sources,
+            &buckets_by_source,
+            ScannerSnapshotIdentity {
+                cycle: want_cycle,
+                leader_epoch,
+                plan_digest: scan_plan_digest,
+                coverage_digest: bucket_coverage_digest,
+                tier_registry_generation: Some(tier_registry_generation),
+            },
+        ) else {
+            return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_publication_epoch(publication_epoch));
         };
+        let (empty_usage, publication_expectation) = candidate.prepare(status);
         let observational_snapshot_published = if should_publish_observational_snapshot(status) {
             publish_observational_snapshot(&updates, empty_usage).await?
         } else {
@@ -366,7 +375,8 @@ where
             .with_activity_digest(activity_digest)
             .with_observational_snapshot_published(observational_snapshot_published)
             .with_remote_publication_lease_targets(remote_publication_lease_targets)
-            .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements));
+            .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
+            .with_publication_expectation(publication_expectation));
     }
 
     let total_results = expected_sources.len();
@@ -595,7 +605,7 @@ where
     let (activity_status, remote_publication_lease_targets) =
         scanner_cycle_activity_status(store, distributed, &activity_before).await;
     let all_bucket_names = all_buckets.iter().map(|bucket| bucket.name.clone()).collect::<Vec<_>>();
-    let completed_usage = completed_data_usage_info(
+    let completed_usage = completed_usage_candidate(
         &results,
         &ScannerSnapshotScope {
             sources: &expected_sources,
@@ -636,7 +646,10 @@ where
         dirty_usage_status,
         activity_status,
     );
-    let observational_snapshot_published = if let Some((data_usage_info, _)) = completed_usage {
+    let mut publication_expectation = None;
+    let observational_snapshot_published = if let Some(candidate) = completed_usage {
+        let (data_usage_info, expectation) = candidate.prepare(cycle_status);
+        publication_expectation = expectation;
         if should_publish_observational_snapshot(cycle_status) {
             publish_observational_snapshot(&updates, data_usage_info).await?
         } else {
@@ -674,5 +687,6 @@ where
         .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
         .with_failed_dirty_usage(!failed_buckets.is_empty())
         .with_pending_maintenance_work(pending_maintenance_work)
-        .with_required_cycle_floor(required_cycle_floor))
+        .with_required_cycle_floor(required_cycle_floor)
+        .with_publication_expectation(publication_expectation))
 }

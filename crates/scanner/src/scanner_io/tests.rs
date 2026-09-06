@@ -462,6 +462,7 @@ async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure(
                 .await
                 .expect("fixture rename tail should finish before the usage scan");
         }
+        wait_for_namespace_commit_tails(&store).await;
         let ctx = CancellationToken::new();
         let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
         let (updates, receiver) = mpsc::channel(1);
@@ -511,15 +512,7 @@ async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure(
             .put_object("cold-bucket", "new", &mut reader, &ScannerObjectOptions::default())
             .await
             .expect("new cold object should persist");
-        let lock = store.pools[0].disk_set[0]
-            .new_ns_lock("cold-bucket", "new")
-            .await
-            .expect("fixture namespace lock should be created");
-        let _settled = lock
-            .get_write_lock(Duration::from_secs(30))
-            .await
-            .expect("fixture rename tail should finish before the usage scan");
-        drop(_settled);
+        wait_for_namespace_commit_tails(&store).await;
         record_dirty_usage_bucket("hot-bucket");
         if scan_mode == HealScanMode::Normal && !requires_full_scan {
             record_dirty_usage_bucket("cold-bucket");
@@ -1011,8 +1004,8 @@ fn dirty_usage_snapshot_clears_a_stably_absent_bucket_after_durable_save() {
     assert!(dirty_usage_buckets().contains_key("temporarily-omitted"));
     assert_eq!(dirty_usage_snapshot_status(&snapshot), DirtyUsageSnapshotStatus::Current);
 
-    let acknowledgements = ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(snapshot.buckets.as_ref().clone()))
-        .acknowledge_durable_usage();
+    let acknowledgements =
+        ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(snapshot.buckets.as_ref().clone())).clear_verified_usage();
     assert!(acknowledgements.is_empty());
     assert!(!dirty_usage_buckets().contains_key("temporarily-omitted"));
     clear_dirty_usage_buckets_for_tests();
@@ -1118,7 +1111,7 @@ fn dirty_usage_is_acknowledged_only_after_durable_usage_confirmation() {
     assert!(dirty_usage_buckets().contains_key("photos"));
 
     let confirmed = ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(snapshot.buckets.as_ref().clone()));
-    let acknowledgements = confirmed.acknowledge_durable_usage();
+    let acknowledgements = confirmed.clear_verified_usage();
     assert!(acknowledgements.is_empty());
     assert!(!dirty_usage_buckets().contains_key("photos"));
     clear_dirty_usage_buckets_for_tests();
