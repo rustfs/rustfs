@@ -19,7 +19,6 @@ use crate::admin::runtime_sources::{
     AppContext, app_context_from_req, current_notification_system_for_context, current_replication_pool_handle,
     current_replication_stats_handle_for_context, current_runtime_port, object_store_from_req,
 };
-use crate::admin::storage_api::AdminVersioningConfigExt as _;
 use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
@@ -28,13 +27,14 @@ use crate::admin::storage_api::bucket::replication::{BucketStats, ReplicationSta
 #[cfg(test)]
 use crate::admin::storage_api::bucket::replication::{REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS};
 use crate::admin::storage_api::bucket::target::{
-    BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat, duration_from_secs_or_nanos,
+    ARN, BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat, duration_from_secs_or_nanos,
 };
 use crate::admin::storage_api::bucket::target_sys::{BucketTargetError, BucketTargetSys};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::contract::list::ListOperations as _;
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::runtime::PeerRestClient;
+use crate::admin::storage_api::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
 use crate::admin::utils::{extract_query_params, read_compatible_admin_body};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
@@ -50,6 +50,7 @@ use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -103,11 +104,34 @@ fn parse_remote_target_write_modes(uri: &http::Uri) -> S3Result<(bool, bool)> {
     Ok((update, replace_unreadable))
 }
 
-/// Repair decisions use the disk snapshot protected by the metadata transaction,
-/// never the stale target cache retained after an unreadable configuration load.
-async fn persist_remote_target_repair(bucket: &str, mut target: BucketTarget, incarnation: uuid::Uuid) -> S3Result<String> {
+enum RemoteTargetWrite {
+    Create { replace_unreadable: bool },
+    Update { expected: Vec<u8> },
+}
+
+async fn persist_remote_target_repair(bucket: &str, target: BucketTarget, incarnation: uuid::Uuid) -> S3Result<String> {
+    persist_remote_target_write(
+        bucket,
+        target,
+        incarnation,
+        RemoteTargetWrite::Create {
+            replace_unreadable: true,
+        },
+    )
+    .await
+}
+
+/// Merge only into the disk snapshot protected by the metadata transaction.
+/// An update may reuse remote validation only while that target is unchanged.
+async fn persist_remote_target_write(
+    bucket: &str,
+    mut target: BucketTarget,
+    incarnation: uuid::Uuid,
+    mode: RemoteTargetWrite,
+) -> S3Result<String> {
     let mut discarded_unreadable = false;
     let mut target_error = None;
+    let mut conflict = false;
     let updated = metadata_sys::update_config_with(bucket, BUCKET_TARGETS_FILE, |metadata| {
         if metadata.bucket_incarnation_id != incarnation {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
@@ -118,12 +142,44 @@ async fn persist_remote_target_repair(bucket: &str, mut target: BucketTarget, in
             target_error = Some(BucketTargetError::BucketReplicationSourceNotVersioned {
                 bucket: bucket.to_string(),
             });
-            return Err(StorageError::other("source bucket versioning changed before target repair"));
+            return Err(StorageError::other("source bucket versioning changed before target write"));
         }
         discarded_unreadable = metadata.bucket_targets_unreadable();
+        if discarded_unreadable
+            && !matches!(
+                &mode,
+                RemoteTargetWrite::Create {
+                    replace_unreadable: true
+                }
+            )
+        {
+            target_error = Some(BucketTargetError::BucketRemoteTargetsUnreadable {
+                bucket: bucket.to_string(),
+            });
+            return Err(StorageError::other("persisted remote targets cannot be decoded"));
+        }
         let mut targets = metadata.bucket_target_config.clone().unwrap_or_default();
-        let (arn, exists) = BucketTargetSys::remote_arn_for_targets(&targets.targets, &target, &target.deployment_id);
-        target.arn = arn;
+        let (update, exists) = match &mode {
+            RemoteTargetWrite::Create { .. } => {
+                let (arn, exists) = BucketTargetSys::remote_arn_for_targets(&targets.targets, &target, &target.deployment_id);
+                target.arn = arn;
+                (false, exists)
+            }
+            RemoteTargetWrite::Update { expected } => {
+                let current = targets.targets.iter().find(|current| current.arn == target.arn);
+                if current
+                    .map(serde_json::to_vec)
+                    .transpose()
+                    .map_err(StorageError::other)?
+                    .as_ref()
+                    != Some(expected)
+                {
+                    conflict = true;
+                    return Err(StorageError::other("remote target changed during validation"));
+                }
+                (true, false)
+            }
+        };
         if target.arn.is_empty() {
             target_error = Some(BucketTargetError::BucketRemoteArnInvalid {
                 bucket: bucket.to_string(),
@@ -131,7 +187,7 @@ async fn persist_remote_target_repair(bucket: &str, mut target: BucketTarget, in
             return Err(StorageError::other("remote target ARN is empty"));
         }
         if !exists {
-            BucketTargetSys::upsert_target_entry(&mut targets.targets, &target, false).map_err(|error| {
+            BucketTargetSys::upsert_target_entry(&mut targets.targets, &target, update).map_err(|error| {
                 target_error = Some(error);
                 StorageError::other("remote target merge failed")
             })?;
@@ -139,6 +195,9 @@ async fn persist_remote_target_repair(bucket: &str, mut target: BucketTarget, in
         serde_json::to_vec(&targets).map_err(StorageError::other)
     })
     .await;
+    if conflict {
+        return Err(s3_error!(OperationAborted, "remote target changed during validation; retry the request"));
+    }
     if let Some(error) = target_error {
         return Err(map_bucket_target_error(error));
     }
@@ -741,32 +800,59 @@ impl Operation for SetRemoteTargetHandler {
             return Ok(S3Response::new((StatusCode::OK, Body::from(arn_str))));
         }
 
-        if !update {
-            let (arn, exist) = bucket_target_sys
-                .get_remote_arn(bucket, Some(&remote_target), remote_target.deployment_id.as_str())
-                .await;
-            remote_target.arn = arn.clone();
-            if exist && !arn.is_empty() {
-                let arn_str = serde_json::to_string(&arn).unwrap_or_default();
-
-                warn!("return exists, arn: {}", arn_str);
-                // MinIO-compatible clients encrypt the request payload for this endpoint,
-                // but they parse the success response directly as plain JSON string ARN.
-                return Ok(S3Response::new((StatusCode::OK, Body::from(arn_str))));
-            }
-        }
-
-        if remote_target.arn.is_empty() {
-            return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "ARN is empty".to_string()));
-        }
-        let _targets_guard = lock_bucket_targets_metadata(bucket).await;
-
-        if update {
-            let Some(mut target) = bucket_target_sys
-                .get_remote_bucket_target_by_arn(bucket, &remote_target.arn)
+        let incarnation = metadata_sys::capture_bucket_metadata_incarnation(bucket)
+            .await
+            .map_err(ApiError::from)?;
+        // Preserve create idempotency even when an existing destination is
+        // offline, but decide it from disk under the same transaction as writers.
+        let metadata = {
+            let transaction_guard = metadata_sys::acquire_bucket_metadata_transaction_lock_for_incarnation(bucket, incarnation)
                 .await
+                .map_err(ApiError::from)?;
+            let metadata = metadata_sys::get_config_from_disk(bucket).await.map_err(ApiError::from)?;
+            transaction_guard.checked_bucket_incarnation().map_err(ApiError::from)?;
+            if metadata.bucket_incarnation_id != incarnation {
+                return Err(ApiError::from(StorageError::BucketNotFound(bucket.to_string())).into());
+            }
+            if metadata.bucket_targets_unreadable() {
+                return Err(map_bucket_target_error(BucketTargetError::BucketRemoteTargetsUnreadable {
+                    bucket: bucket.to_string(),
+                }));
+            }
+            if !update {
+                let targets = metadata
+                    .bucket_target_config
+                    .as_ref()
+                    .map(|targets| targets.targets.as_slice())
+                    .unwrap_or_default();
+                let (arn, exists) =
+                    BucketTargetSys::remote_arn_for_targets(targets, &remote_target, &remote_target.deployment_id);
+                if exists && !arn.is_empty() {
+                    let body =
+                        serde_json::to_string(&arn).map_err(|_| s3_error!(InternalError, "Failed to serialize target ARN"))?;
+                    return Ok(S3Response::new((StatusCode::OK, Body::from(body))));
+                }
+            }
+            metadata
+        };
+        let mut mode = RemoteTargetWrite::Create {
+            replace_unreadable: false,
+        };
+        if update {
+            if remote_target.arn.is_empty() {
+                return Err(s3_error!(InvalidRequest, "ARN is empty"));
+            }
+            let Some(mut target) = metadata
+                .bucket_target_config
+                .unwrap_or_default()
+                .targets
+                .into_iter()
+                .find(|target| target.arn == remote_target.arn)
             else {
-                return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Target not found".to_string()));
+                return Err(s3_error!(InvalidRequest, "Target not found"));
+            };
+            mode = RemoteTargetWrite::Update {
+                expected: serde_json::to_vec(&target).map_err(|_| s3_error!(InternalError, "Failed to serialize target"))?,
             };
 
             // Overlay only the requested field groups onto the stored target
@@ -828,26 +914,15 @@ impl Operation for SetRemoteTargetHandler {
             remote_target = target;
         }
 
-        let arn = remote_target.arn.clone();
-
-        let targets = bucket_target_sys
-            .set_target(bucket, &remote_target, update)
+        // Neither the process-local target lock nor the cluster metadata
+        // transaction may be held while the remote endpoint is responding.
+        bucket_target_sys
+            .validate_target(bucket, &remote_target)
             .await
             .map_err(map_bucket_target_error)?;
-        let json_targets = serde_json::to_vec(&targets).map_err(|e| {
-            error!("Serialization error: {}", e);
-            S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
-        })?;
-
-        metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
-            .await
-            .map_err(|e| {
-                error!("Failed to update bucket targets: {}", e);
-                S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update bucket targets: {e}"))
-            })?;
-        bucket_target_sys.update_all_targets(bucket, Some(&targets)).await;
-
-        let arn_str = serde_json::to_string(&arn).unwrap_or_default();
+        let _targets_guard = lock_bucket_targets_metadata(bucket).await;
+        let arn = persist_remote_target_write(bucket, remote_target, incarnation, mode).await?;
+        let arn_str = serde_json::to_string(&arn).map_err(|_| s3_error!(InternalError, "Failed to serialize target ARN"))?;
 
         // MinIO-compatible clients encrypt the request payload for this endpoint,
         // but they parse the success response directly as plain JSON string ARN.
@@ -952,25 +1027,56 @@ impl Operation for RemoveRemoteTargetHandler {
             .await
             .map_err(ApiError::from)?;
 
-        let sys = BucketTargetSys::get();
-        let _targets_guard = lock_bucket_targets_metadata(bucket).await;
-
-        let targets = sys.remove_target(bucket, arn_str).await.map_err(map_bucket_target_error)?;
-
-        cancel_active_resync_intent(bucket, arn_str).await?;
-
-        let json_targets = serde_json::to_vec(&targets).map_err(|e| {
-            error!("Serialization error: {}", e);
-            S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
+        let arn = ARN::from_str(arn_str).map_err(|_| {
+            map_bucket_target_error(BucketTargetError::BucketRemoteArnInvalid {
+                bucket: bucket.to_string(),
+            })
         })?;
-
-        metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
+        let incarnation = metadata_sys::capture_bucket_metadata_incarnation(bucket)
             .await
-            .map_err(|e| {
-                error!("Failed to update bucket targets: {}", e);
-                S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update bucket targets: {e}"))
-            })?;
-        sys.update_all_targets(bucket, Some(&targets)).await;
+            .map_err(ApiError::from)?;
+        let _targets_guard = lock_bucket_targets_metadata(bucket).await;
+        // Match resync start: local targets -> lifecycle -> metadata transaction
+        // -> resync admission -> resync status CAS. Keep the transaction through
+        // cancellation and target persistence so another start cannot interleave.
+        let transaction_guard = metadata_sys::acquire_bucket_metadata_transaction_lock_for_incarnation(bucket, incarnation)
+            .await
+            .map_err(ApiError::from)?;
+        let metadata = metadata_sys::get_config_from_disk(bucket).await.map_err(ApiError::from)?;
+        if metadata.bucket_targets_unreadable() {
+            return Err(map_bucket_target_error(BucketTargetError::BucketRemoteTargetsUnreadable {
+                bucket: bucket.to_string(),
+            }));
+        }
+        if arn.arn_type == BucketTargetType::ReplicationService {
+            if !metadata.replication_config_xml.is_empty() && metadata.replication_config.is_none() {
+                return Err(s3_error!(InternalError, "persisted replication rules cannot be decoded"));
+            }
+            if metadata.replication_config.as_ref().is_some_and(|config| {
+                config
+                    .filter_all_replication_target_arns()
+                    .iter()
+                    .any(|target| target == arn_str)
+            }) {
+                return Err(map_bucket_target_error(BucketTargetError::BucketRemoteRemoveDisallowed {
+                    bucket: bucket.to_string(),
+                }));
+            }
+        }
+        let mut targets = metadata.bucket_target_config.unwrap_or_default();
+        let previous_len = targets.targets.len();
+        targets.targets.retain(|target| target.arn != *arn_str);
+        if targets.targets.len() == previous_len {
+            return Err(map_bucket_target_error(BucketTargetError::BucketRemoteTargetNotFound {
+                bucket: bucket.to_string(),
+            }));
+        }
+        let json_targets = serde_json::to_vec(&targets).map_err(|_| s3_error!(InternalError, "Failed to serialize targets"))?;
+        transaction_guard.checked_bucket_incarnation().map_err(ApiError::from)?;
+        cancel_active_resync_intent(bucket, arn_str).await?;
+        metadata_sys::update_bucket_targets_under_transaction_lock(&transaction_guard, bucket, json_targets)
+            .await
+            .map_err(ApiError::from)?;
 
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
     }

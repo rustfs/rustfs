@@ -667,7 +667,7 @@ pub(crate) mod replication {
 }
 
 pub(crate) mod target {
-    pub(crate) use super::ecstore_bucket::target::duration_from_secs_or_nanos;
+    pub(crate) use super::ecstore_bucket::target::{ARN, duration_from_secs_or_nanos};
     pub(crate) type BucketTarget = super::ecstore_bucket::target::BucketTarget;
     pub(crate) type BucketTargetType = super::ecstore_bucket::target::BucketTargetType;
     pub(crate) type BucketTargets = super::ecstore_bucket::target::BucketTargets;
