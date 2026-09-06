@@ -110,6 +110,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
         self.env = {
             **os.environ, "GITHUB_STEP_SUMMARY": str(self.directory / "summary.md"),
             "GITHUB_ENV": str(self.directory / "github-env"), "RUNNER_TEMP": self.temp.name, "TMPDIR": self.temp.name,
+            "LOG_FILE": str(self.directory / "suite.log"),
         }
         for key in ("server_url", "repository", "run_id", "run_attempt", "sha", "event_name"):
             self.env[f"GITHUB_{key.upper()}"] = self.context[f"github.{key}"]
