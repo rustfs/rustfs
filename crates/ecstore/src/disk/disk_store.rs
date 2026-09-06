@@ -324,6 +324,46 @@ impl DiskStoreRenameDataExt for LocalDiskWrapper {
 }
 
 impl LocalDiskWrapper {
+    pub(in crate::disk) async fn delete_version_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        self.track_disk_health_mutation(
+            "delete_version",
+            DiskMetricMutation::Delete,
+            || async {
+                Box::pin(
+                    self.disk
+                        .delete_version_with_namespace_owner(volume, path, fi, force_del_marker, opts, namespace_owner),
+                )
+                .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    pub(in crate::disk) async fn delete_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        self.track_disk_health_mutation(
+            "delete",
+            DiskMetricMutation::Delete,
+            || async { Box::pin(self.disk.delete_with_namespace_owner(volume, path, opts, namespace_owner)).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     pub(in crate::disk) async fn undo_write_with_namespace_owner(
         &self,
         volume: &str,

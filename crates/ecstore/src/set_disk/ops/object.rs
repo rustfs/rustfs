@@ -7497,6 +7497,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let transported = delete_file_info_with_replication_transport_metadata(fi);
         let fi = &transported;
         let disks = self.disk_inventory().await;
+        let namespace_owner = (!is_meta_bucketname(bucket)).then(|| self.ctx.begin_namespace_commit());
         let write_quorum = disks.len() / 2 + 1;
         let rollback_dir = Uuid::new_v4();
 
@@ -7504,10 +7505,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut errs = Vec::with_capacity(disks.len());
 
         for disk in disks.iter() {
+            let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
             futures.push(async move {
                 if let Some(disk) = disk {
                     match disk
-                        .delete_version(
+                        .delete_version_with_namespace_owner(
                             bucket,
                             object,
                             fi.clone(),
@@ -7516,6 +7518,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 old_data_dir: Some(rollback_dir),
                                 ..Default::default()
                             },
+                            disk_namespace_owner,
                         )
                         .await
                     {
@@ -7563,10 +7566,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let bucket = bucket.to_string();
             let object = object.to_string();
             let fi = fi.clone();
+            let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
             rollback_futures.push(async move {
                 if should_rollback {
                     if let Err(err) = disk
-                        .delete_version(
+                        .delete_version_with_namespace_owner(
                             &bucket,
                             &object,
                             fi,
@@ -7577,6 +7581,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 old_data_dir: Some(rollback_dir),
                                 ..Default::default()
                             },
+                            disk_namespace_owner,
                         )
                         .await
                     {
@@ -7591,7 +7596,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 } else {
                     let rollback_path = format!("{object}/{rollback_dir}");
                     if let Err(err) = disk
-                        .delete(
+                        .delete_with_namespace_owner(
                             &bucket,
                             &rollback_path,
                             DeleteOptions {
@@ -7599,6 +7604,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 immediate: true,
                                 ..Default::default()
                             },
+                            disk_namespace_owner,
                         )
                         .await
                         && err != DiskError::FileNotFound
@@ -7617,6 +7623,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         join_all(rollback_futures).await;
+        drop(namespace_owner);
         quorum_result
     }
 

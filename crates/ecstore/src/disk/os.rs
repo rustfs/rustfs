@@ -1401,7 +1401,7 @@ async fn acquire_namespace_mutation_lease(path: &Path) -> Arc<NamespaceMutationL
     acquire_namespace_mutation_lease_with_owner(path, None).await
 }
 
-async fn acquire_namespace_mutation_lease_with_owner(
+pub(in crate::disk) async fn acquire_namespace_mutation_lease_with_owner(
     path: &Path,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Arc<NamespaceMutationLease> {
@@ -1974,6 +1974,42 @@ pub(crate) async fn remove_dir_with_owner(
     let path = path.as_ref().to_path_buf();
     let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
     run_blocking_namespace_operation(lease, move || std::fs::remove_dir(path)).await
+}
+
+/// Preserve raw rename semantics while retaining a counted owner in the syscall.
+/// Unlike reliable rename, this never creates parents or retries a missing source.
+pub(in crate::disk) async fn rename_with_namespace_owner(
+    src: &Path,
+    dst: &Path,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> io::Result<()> {
+    if namespace_owner.is_none() {
+        return tokio::fs::rename(src, dst).await;
+    }
+    let src = src.to_path_buf();
+    let dst = dst.to_path_buf();
+    let lease = acquire_namespace_mutation_lease_with_owner(&dst, namespace_owner).await;
+    run_blocking_namespace_operation(lease, move || {
+        #[cfg(all(test, not(windows)))]
+        {
+            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &src);
+            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &dst);
+        }
+        std::fs::rename(src, dst)
+    })
+    .await
+}
+
+pub(in crate::disk) async fn create_dir_all_with_namespace_owner(
+    path: &Path,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> io::Result<()> {
+    if namespace_owner.is_none() {
+        return tokio::fs::create_dir_all(path).await;
+    }
+    let path = path.to_path_buf();
+    let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
+    run_blocking_namespace_operation(lease, move || std::fs::create_dir_all(path)).await
 }
 
 #[tracing::instrument(name = "rename_all", level = "debug", skip_all)]
