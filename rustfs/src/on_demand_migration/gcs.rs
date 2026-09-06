@@ -372,6 +372,17 @@ mod tests {
         ]
     }
 
+    #[tokio::test]
+    async fn dot_segment_keys_fail_before_any_source_request() {
+        let (endpoint, recorded) = scripted_server(Vec::new()).await;
+        let backend = backend(&endpoint);
+        for key in [".", "..", "dir/./key", "dir/../key", "\u{fffe}/../key"] {
+            assert!(matches!(backend.head(key).await, Err(SourceError::Unsupported(_))), "HEAD {key:?}");
+            assert!(matches!(backend.get(key, None).await, Err(SourceError::Unsupported(_))), "GET {key:?}");
+        }
+        assert!(recorded.lock().expect("recorder lock").is_empty());
+    }
+
     #[test]
     fn objects_list_maps_items_prefixes_and_the_page_token() {
         let page = parse_objects_list(LIST_PAGE_ONE).expect("page should parse");
