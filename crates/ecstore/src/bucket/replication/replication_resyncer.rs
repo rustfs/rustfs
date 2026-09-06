@@ -6809,7 +6809,11 @@ mod tests {
                 assert_eq!(requests.len(), 1, "unknown transformed boundaries retain one streaming PUT");
                 let request = &requests[0];
                 assert_eq!(request.method, http::Method::PUT);
-                assert!(request.query.is_empty(), "single PUT has no multipart operations");
+                assert_eq!(
+                    request.query,
+                    HashMap::from([("x-id".to_string(), "PutObject".to_string())]),
+                    "single PUT has only the SDK operation query"
+                );
                 assert_eq!(request.body, body, "single PUT includes every byte of both source parts");
                 assert_eq!(
                     request.headers.get("content-length").expect("body length"),
