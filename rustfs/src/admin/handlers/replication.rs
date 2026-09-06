@@ -19,6 +19,7 @@ use crate::admin::runtime_sources::{
     AppContext, app_context_from_req, current_notification_system_for_context, current_replication_pool_handle,
     current_replication_stats_handle_for_context, current_runtime_port, object_store_from_req,
 };
+use crate::admin::storage_api::AdminVersioningConfigExt as _;
 use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
@@ -29,7 +30,7 @@ use crate::admin::storage_api::bucket::replication::{REMOTE_TARGET_READ_ONLY_HIS
 use crate::admin::storage_api::bucket::target::{
     BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat, duration_from_secs_or_nanos,
 };
-use crate::admin::storage_api::bucket::target_sys::{BucketTargetError, BucketTargetSys, UnreadableTargetsPolicy};
+use crate::admin::storage_api::bucket::target_sys::{BucketTargetError, BucketTargetSys};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::contract::list::ListOperations as _;
 use crate::admin::storage_api::error::StorageError;
@@ -70,6 +71,90 @@ const EVENT_ADMIN_REMOTE_TARGET_STATE: &str = "admin_remote_target_state";
 /// flag is deliberately absent from `PutBucketReplication`: targets are
 /// repaired first, then the rule is set.
 const REPLACE_UNREADABLE_TARGETS_PARAM: &str = "replace-unreadable";
+
+fn parse_remote_target_write_modes(uri: &http::Uri) -> S3Result<(bool, bool)> {
+    let mut update = None;
+    let mut replace_unreadable = None;
+    for (key, value) in url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()) {
+        let mode = match key.as_ref() {
+            "update" => &mut update,
+            REPLACE_UNREADABLE_TARGETS_PARAM => &mut replace_unreadable,
+            _ => continue,
+        };
+        if mode.is_some() {
+            return Err(s3_error!(InvalidRequest, "duplicate remote target write mode"));
+        }
+        *mode = Some(match value.as_ref() {
+            "true" => true,
+            "false" => false,
+            _ => return Err(s3_error!(InvalidRequest, "remote target write modes must be true or false")),
+        });
+    }
+    let update = update.unwrap_or(false);
+    let replace_unreadable = replace_unreadable.unwrap_or(false);
+    if update && replace_unreadable {
+        return Err(s3_error!(InvalidRequest, "replace-unreadable requires a complete target create request"));
+    }
+    Ok((update, replace_unreadable))
+}
+
+/// Repair decisions use the disk snapshot protected by the metadata transaction,
+/// never the stale target cache retained after an unreadable configuration load.
+async fn persist_remote_target_repair(bucket: &str, mut target: BucketTarget, incarnation: uuid::Uuid) -> S3Result<String> {
+    let mut discarded_unreadable = false;
+    let mut target_error = None;
+    let updated = metadata_sys::update_config_with(bucket, BUCKET_TARGETS_FILE, |metadata| {
+        if metadata.bucket_incarnation_id != incarnation {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        if target.target_type == BucketTargetType::ReplicationService
+            && !metadata.versioning_config.as_ref().is_some_and(|config| config.enabled())
+        {
+            target_error = Some(BucketTargetError::BucketReplicationSourceNotVersioned {
+                bucket: bucket.to_string(),
+            });
+            return Err(StorageError::other("source bucket versioning changed before target repair"));
+        }
+        discarded_unreadable = metadata.bucket_targets_unreadable();
+        let mut targets = metadata.bucket_target_config.clone().unwrap_or_default();
+        let (arn, exists) = BucketTargetSys::remote_arn_for_targets(&targets.targets, &target, &target.deployment_id);
+        target.arn = arn;
+        if target.arn.is_empty() {
+            target_error = Some(BucketTargetError::BucketRemoteArnInvalid {
+                bucket: bucket.to_string(),
+            });
+            return Err(StorageError::other("remote target ARN is empty"));
+        }
+        if !exists {
+            BucketTargetSys::upsert_target_entry(&mut targets.targets, &target, false).map_err(|error| {
+                target_error = Some(error);
+                StorageError::other("remote target merge failed")
+            })?;
+        }
+        serde_json::to_vec(&targets).map_err(StorageError::other)
+    })
+    .await;
+    if let Some(error) = target_error {
+        return Err(map_bucket_target_error(error));
+    }
+    updated.map_err(ApiError::from)?;
+
+    // Persistence also publishes the fresh target set under the transaction
+    // guard. Publishing another snapshot here could undo a concurrent repair.
+    if discarded_unreadable {
+        warn!(
+            event = EVENT_ADMIN_REMOTE_TARGET_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_REPLICATION,
+            action = "set_remote_target",
+            result = "unreadable_targets_replaced",
+            bucket = %bucket,
+            arn = %target.arn,
+            "admin remote target state"
+        );
+    }
+    Ok(target.arn)
+}
 
 /// Field groups a `set-remote-target?update=true` request may modify, mirroring
 /// MinIO's `TargetUpdateType` / `GetTargetUpdateOps` query contract: the update
@@ -554,8 +639,7 @@ impl Operation for SetRemoteTargetHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         };
 
-        let update = queries.get("update").is_some_and(|v| v == "true");
-        let replace_unreadable = queries.get(REPLACE_UNREADABLE_TARGETS_PARAM).is_some_and(|v| v == "true");
+        let (update, replace_unreadable) = parse_remote_target_write_modes(&req.uri)?;
 
         warn!("set remote target, bucket: {}, update: {}", bucket, update);
 
@@ -633,6 +717,24 @@ impl Operation for SetRemoteTargetHandler {
         remote_target.source_bucket = bucket.clone();
 
         let bucket_target_sys = BucketTargetSys::get();
+
+        if replace_unreadable {
+            // Validate the complete replacement before acquiring the metadata
+            // transaction; remote I/O must not extend the cluster-wide lock.
+            let incarnation = metadata_sys::capture_bucket_metadata_incarnation(bucket)
+                .await
+                .map_err(ApiError::from)?;
+            bucket_target_sys
+                .validate_target(bucket, &remote_target)
+                .await
+                .map_err(map_bucket_target_error)?;
+            // Match ordinary writers: local targets lock, then lifecycle and
+            // cluster metadata transaction guards acquired by the repair.
+            let _targets_guard = lock_bucket_targets_metadata(bucket).await;
+            let arn = persist_remote_target_repair(bucket, remote_target, incarnation).await?;
+            let arn_str = serde_json::to_string(&arn).map_err(|_| s3_error!(InternalError, "Failed to serialize target ARN"))?;
+            return Ok(S3Response::new((StatusCode::OK, Body::from(arn_str))));
+        }
 
         if !update {
             let (arn, exist) = bucket_target_sys
@@ -723,37 +825,10 @@ impl Operation for SetRemoteTargetHandler {
 
         let arn = remote_target.arn.clone();
 
-        let unreadable_policy = if replace_unreadable {
-            UnreadableTargetsPolicy::Replace
-        } else {
-            UnreadableTargetsPolicy::FailClosed
-        };
-        let discarding_unreadable_targets = replace_unreadable
-            && matches!(
-                bucket_target_sys.list_bucket_targets(bucket).await,
-                Err(BucketTargetError::BucketRemoteTargetsUnreadable { .. })
-            );
-
         let targets = bucket_target_sys
-            .set_target(bucket, &remote_target, update, unreadable_policy)
+            .set_target(bucket, &remote_target, update)
             .await
             .map_err(map_bucket_target_error)?;
-
-        // Audited only where the discard actually happened: the flag alone is
-        // not an event, on a readable set it changes nothing, and a refused
-        // write must not leave a record claiming the set was replaced.
-        if discarding_unreadable_targets {
-            warn!(
-                event = EVENT_ADMIN_REMOTE_TARGET_STATE,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_REPLICATION,
-                action = "set_remote_target",
-                result = "unreadable_targets_replaced",
-                bucket = %bucket,
-                arn = %remote_target.arn,
-                "admin remote target state"
-            );
-        }
         let json_targets = serde_json::to_vec(&targets).map_err(|e| {
             error!("Serialization error: {}", e);
             S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
@@ -2710,5 +2785,486 @@ mod tests {
         assert_eq!(payload["Entries"][0]["object"], "a.txt");
         assert_eq!(payload["IsTruncated"], true);
         assert_eq!(payload["ScannedVersions"], 7);
+    }
+}
+
+#[cfg(test)]
+mod target_repair_tests {
+    use super::*;
+    use crate::admin::runtime_sources::publish_test_app_context;
+    use crate::admin::storage_api::bucket::metadata::BUCKET_VERSIONING_CONFIG;
+    use crate::admin::storage_api::bucket::target::BucketTargets;
+    use http::Extensions;
+    use http_body_util::BodyExt as _;
+    use rustfs_iam::store::{Store as _, object::IAM_CONFIG_PREFIX};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tracing::instrument::WithSubscriber as _;
+
+    const ACCESS_KEY: &str = "TARGETREPAIRROOT";
+    const SECRET_KEY: &str = "targetRepairRootSecret123";
+    const BUCKET: &str = "target-repair";
+    const BAD_TARGETS: &[u8] = b"unreadable-targets";
+    const TARGET_REPAIR_ENV: [(&str, Option<&str>); 3] = [
+        ("NO_PROXY", Some("*")),
+        ("no_proxy", Some("*")),
+        ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+    ];
+
+    struct RemoteTargetServer {
+        endpoint: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for RemoteTargetServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl RemoteTargetServer {
+        async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind remote target");
+            let endpoint = listener.local_addr().expect("remote target address").to_string();
+            let task = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.expect("accept remote target request");
+                    let mut request = Vec::new();
+                    let mut chunk = [0; 4096];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let read = socket.read(&mut chunk).await.expect("read remote target request");
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    let head = String::from_utf8_lossy(&request);
+                    let first_line = head.lines().next().unwrap_or_default();
+                    let body = if first_line.starts_with("HEAD /") {
+                        ""
+                    } else if first_line.starts_with("GET /") && first_line.contains("versioning") {
+                        "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status></VersioningConfiguration>"
+                    } else {
+                        panic!("unexpected remote target request: {first_line}");
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("reply to remote target request");
+                }
+            });
+            Self { endpoint, task }
+        }
+
+        fn target(&self) -> BucketTarget {
+            BucketTarget {
+                source_bucket: BUCKET.to_string(),
+                endpoint: self.endpoint.clone(),
+                target_bucket: "remote".to_string(),
+                target_type: BucketTargetType::ReplicationService,
+                region: "us-east-1".to_string(),
+                credentials: Some(TargetCredentials {
+                    access_key: "remote-access".to_string(),
+                    secret_key: "remote-secret".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+    }
+
+    async fn test_env() -> (tempfile::TempDir, rustfs_test_utils::TestECStoreEnv) {
+        let _ = rustfs_credentials::init_global_action_credentials(Some(ACCESS_KEY.to_string()), Some(SECRET_KEY.to_string()));
+        let temp = tempfile::tempdir().expect("create repair test root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp.path())
+            .disk_count(1)
+            .build()
+            .await;
+        env.make_bucket(BUCKET, true).await;
+        rustfs_iam::store::object::ObjectStore::new(Arc::clone(&env.ecstore))
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+            .await
+            .expect("build test IAM");
+        publish_test_app_context(Arc::new(AppContext::with_default_interfaces(
+            Arc::clone(&env.ecstore),
+            iam,
+            Arc::new(rustfs_kms::KmsServiceManager::new()),
+        )));
+        metadata_sys::update(
+            BUCKET,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("persist source versioning");
+        (temp, env)
+    }
+
+    fn request(method: Method, query: &str, body: Vec<u8>) -> S3Request<Body> {
+        let operation = if method == Method::GET {
+            "list-remote-targets"
+        } else {
+            "set-remote-target"
+        };
+        S3Request {
+            input: Body::from(body),
+            method,
+            uri: format!("/rustfs/admin/v3/{operation}?bucket={BUCKET}&{query}")
+                .parse()
+                .expect("admin URI"),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: Some(s3s::auth::Credentials {
+                access_key: ACCESS_KEY.to_string(),
+                secret_key: s3s::auth::SecretKey::from(SECRET_KEY.to_string()),
+            }),
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn seed_unreadable(env: &rustfs_test_utils::TestECStoreEnv) {
+        let mut metadata = metadata_sys::get_config_from_disk(BUCKET)
+            .await
+            .expect("read source metadata");
+        metadata.bucket_targets_config_json = BAD_TARGETS.to_vec();
+        metadata
+            .save_with_store(Arc::clone(&env.ecstore))
+            .await
+            .expect("persist unreadable targets");
+        crate::storage::storage_api::set_bucket_metadata(BUCKET.to_string(), metadata)
+            .await
+            .expect("publish unreadable targets");
+        assert!(BucketTargetSys::get().list_bucket_targets(BUCKET).await.is_err());
+    }
+
+    async fn repair(target: &BucketTarget, query: &str) -> S3Result<String> {
+        let body = serde_json::to_vec(&remote_target_admin_json(target).expect("serialize target request"))
+            .expect("encode target request");
+        let response = SetRemoteTargetHandler {}
+            .call(request(Method::PUT, query, body), Params::new())
+            .await?;
+        assert_eq!(response.output.0, StatusCode::OK);
+        let body = response.output.1.collect().await.expect("collect target ARN").to_bytes();
+        Ok(serde_json::from_slice(&body).expect("plain JSON ARN"))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn repair_existing_cached_target_persists_readable_targets_and_lists() {
+        temp_env::async_with_vars(TARGET_REPAIR_ENV, async {
+            let (_temp, env) = test_env().await;
+            let server = RemoteTargetServer::start().await;
+            let mut target = server.target();
+            target.arn = "arn:rustfs:replication:us-east-1:cached:remote".to_string();
+            let targets = BucketTargets {
+                targets: vec![target.clone()],
+            };
+            metadata_sys::update(BUCKET, BUCKET_TARGETS_FILE, serde_json::to_vec(&targets).expect("encode cached target"))
+                .await
+                .expect("seed cached target");
+            seed_unreadable(&env).await;
+            assert_eq!(
+                BucketTargetSys::get().get_remote_arn(BUCKET, Some(&target), "").await,
+                (target.arn.clone(), true)
+            );
+            assert!(
+                BucketTargetSys::get()
+                    .get_remote_target_client(BUCKET, &target.arn)
+                    .await
+                    .is_some()
+            );
+
+            let arn = repair(&target, "replace-unreadable=true").await.expect("repair must commit");
+            assert_ne!(arn, target.arn);
+            assert!(
+                BucketTargetSys::get()
+                    .get_remote_target_client(BUCKET, &target.arn)
+                    .await
+                    .is_none()
+            );
+            assert!(BucketTargetSys::get().get_remote_target_client(BUCKET, &arn).await.is_some());
+            let persisted = metadata_sys::get_config_from_disk(BUCKET)
+                .await
+                .expect("read repaired metadata");
+            assert!(!persisted.bucket_targets_unreadable());
+            let targets = persisted.bucket_target_config.expect("decode persisted repair");
+            assert_eq!(targets.targets.len(), 1);
+            assert_eq!(targets.targets[0].arn, arn);
+            assert_eq!(
+                targets.targets[0]
+                    .credentials
+                    .as_ref()
+                    .expect("persist credentials")
+                    .secret_key,
+                "remote-secret"
+            );
+            let list = ListRemoteTargetHandler {}
+                .call(request(Method::GET, "", Vec::new()), Params::new())
+                .await
+                .expect("list repaired targets");
+            assert_eq!(list.output.0, StatusCode::OK);
+            let listed: serde_json::Value =
+                serde_json::from_slice(&list.output.1.collect().await.expect("collect target list").to_bytes())
+                    .expect("decode list");
+            assert_eq!(listed.as_array().expect("targets list").len(), 1);
+            assert_eq!(listed[0]["arn"], arn);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn repair_partial_update_and_invalid_flags_preserve_persisted_bytes() {
+        temp_env::async_with_vars(TARGET_REPAIR_ENV, async {
+            let (_temp, env) = test_env().await;
+            let server = RemoteTargetServer::start().await;
+            let mut target = server.target();
+            target.arn = "arn:rustfs:replication:us-east-1:cached:remote".to_string();
+            metadata_sys::update(
+                BUCKET,
+                BUCKET_TARGETS_FILE,
+                serde_json::to_vec(&BucketTargets {
+                    targets: vec![target.clone()],
+                })
+                .expect("encode cached target"),
+            )
+            .await
+            .expect("seed cached target");
+            seed_unreadable(&env).await;
+            let file = metadata_sys::get_config_from_disk(BUCKET)
+                .await
+                .expect("read source metadata")
+                .save_file_path();
+            let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                .await
+                .expect("read original bytes");
+            for query in [
+                "update=true&replace-unreadable=true",
+                "replace-unreadable=false&replace-unreadable=true",
+                "replace-unreadable=true&replace-unreadable=false",
+                "replace-unreadable=true&replace%2dunreadable=true",
+                "replace-unreadable=TRUE",
+                "replace-unreadable=1",
+                "replace-unreadable=",
+                "update=true&update=false",
+                "update=invalid",
+            ] {
+                assert_eq!(
+                    repair(&target, query).await.expect_err("invalid repair must fail").code(),
+                    &S3ErrorCode::InvalidRequest
+                );
+                let after = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                    .await
+                    .expect("read unchanged bytes");
+                assert_eq!(after, before, "rejected opt-in must not rewrite metadata");
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn repair_with_stale_unreadable_cache_preserves_another_committed_repair() {
+        temp_env::async_with_vars(TARGET_REPAIR_ENV, async {
+            let (_temp, env) = test_env().await;
+            let first = RemoteTargetServer::start().await;
+            let second = RemoteTargetServer::start().await;
+            seed_unreadable(&env).await;
+            let first_arn = repair(&first.target(), "replace-unreadable=true")
+                .await
+                .expect("commit first repair");
+            // Model another node which still retains the original unreadable
+            // verdict when it begins its repair after this commit.
+            BucketTargetSys::get().mark_targets_unreadable(BUCKET).await;
+            let second_arn = repair(&second.target(), "replace-unreadable=true")
+                .await
+                .expect("merge second repair");
+            let persisted = metadata_sys::get_config_from_disk(BUCKET).await.expect("read both repairs");
+            let targets = persisted.bucket_target_config.expect("decode both repairs");
+            assert_eq!(targets.targets.len(), 2);
+            assert!(targets.targets.iter().any(|target| target.arn == first_arn));
+            assert!(targets.targets.iter().any(|target| target.arn == second_arn));
+            assert_eq!(
+                BucketTargetSys::get()
+                    .list_bucket_targets(BUCKET)
+                    .await
+                    .expect("published repair")
+                    .targets
+                    .len(),
+                2
+            );
+            assert_eq!(
+                repair(&first.target(), "replace-unreadable=true")
+                    .await
+                    .expect("idempotent repair"),
+                first_arn
+            );
+            assert_eq!(
+                metadata_sys::get_config_from_disk(BUCKET)
+                    .await
+                    .expect("read repeated repair")
+                    .bucket_target_config
+                    .expect("decode repeated repair")
+                    .targets
+                    .len(),
+                2
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn repair_transaction_rejects_a_bucket_recreated_after_target_validation() {
+        temp_env::async_with_vars(
+            TARGET_REPAIR_ENV,
+            Box::pin(async {
+                let (_temp, env) = test_env().await;
+                let server = RemoteTargetServer::start().await;
+                let target = server.target();
+                let incarnation = metadata_sys::capture_bucket_metadata_incarnation(BUCKET)
+                    .await
+                    .expect("capture original bucket");
+                BucketTargetSys::get()
+                    .validate_target(BUCKET, &target)
+                    .await
+                    .expect("validate original source and remote target");
+
+                env.ecstore
+                    .delete_bucket(BUCKET, &Default::default())
+                    .await
+                    .expect("delete original bucket");
+                env.make_bucket(BUCKET, true).await;
+                seed_unreadable(&env).await;
+                let recreated = metadata_sys::get_config_from_disk(BUCKET)
+                    .await
+                    .expect("load recreated bucket");
+                assert_ne!(recreated.bucket_incarnation_id, incarnation);
+                let file = recreated.save_file_path();
+                let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                    .await
+                    .expect("read recreated bucket bytes");
+
+                let error = persist_remote_target_repair(BUCKET, target, incarnation)
+                    .await
+                    .expect_err("validation of a deleted bucket must not authorize repair of its replacement");
+                assert_eq!(error.code(), &S3ErrorCode::NoSuchBucket);
+                assert_eq!(
+                    crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                        .await
+                        .expect("read rejected incarnation repair bytes"),
+                    before
+                );
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn repair_transaction_rejects_versioning_suspended_after_target_validation() {
+        temp_env::async_with_vars(
+            TARGET_REPAIR_ENV,
+            Box::pin(async {
+                let (_temp, env) = test_env().await;
+                let server = RemoteTargetServer::start().await;
+                let target = server.target();
+                seed_unreadable(&env).await;
+                let incarnation = metadata_sys::capture_bucket_metadata_incarnation(BUCKET)
+                    .await
+                    .expect("capture source bucket");
+                BucketTargetSys::get()
+                    .validate_target(BUCKET, &target)
+                    .await
+                    .expect("validate versioned source and remote target");
+
+                metadata_sys::update(
+                    BUCKET,
+                    BUCKET_VERSIONING_CONFIG,
+                    b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+                )
+                .await
+                .expect("suspend source versioning after validation");
+                let suspended = metadata_sys::get_config_from_disk(BUCKET)
+                    .await
+                    .expect("load suspended source bucket");
+                assert_eq!(suspended.bucket_incarnation_id, incarnation);
+                assert!(!suspended.versioning_config.as_ref().expect("persisted versioning").enabled());
+                let file = suspended.save_file_path();
+                let before = crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                    .await
+                    .expect("read suspended bucket bytes");
+
+                let error = persist_remote_target_repair(BUCKET, target, incarnation)
+                    .await
+                    .expect_err("a target validated before suspension must not be committed");
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                assert_eq!(
+                    crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                        .await
+                        .expect("read rejected versioning repair bytes"),
+                    before
+                );
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_repair_transaction_never_reports_a_successful_replacement() {
+        temp_env::async_with_vars(TARGET_REPAIR_ENV, async {
+            let (_temp, env) = test_env().await;
+            let server = RemoteTargetServer::start().await;
+            seed_unreadable(&env).await;
+            let target = server.target();
+            BucketTargetSys::get()
+                .validate_target(BUCKET, &target)
+                .await
+                .expect("remote validation must succeed before injecting the metadata failure");
+            let file = metadata_sys::get_config_from_disk(BUCKET)
+                .await
+                .expect("read source metadata")
+                .save_file_path();
+            // Keep the source versioning and unreadable-target caches intact,
+            // but make the transaction's fresh disk load fail.
+            let corrupt = b"invalid metadata envelope".to_vec();
+            env.put_object_bytes(".rustfs.sys", &file, corrupt.clone()).await;
+            assert!(metadata_sys::get_config_from_disk(BUCKET).await.is_err());
+            let log = tempfile::NamedTempFile::new().expect("create captured log");
+            let writer = log.reopen().expect("open captured log writer");
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(writer)
+                .finish();
+            let error = repair(&target, "replace-unreadable=true")
+                .with_subscriber(subscriber)
+                .await
+                .expect_err("repair must fail on the unreadable metadata envelope");
+            assert_eq!(error.code(), &S3ErrorCode::InternalError);
+            let lines = std::fs::read_to_string(log.path()).expect("read captured log");
+            assert!(
+                !lines.contains("unreadable_targets_replaced"),
+                "a failed transaction must not claim success: {lines}"
+            );
+            assert_eq!(
+                crate::admin::storage_api::read_admin_config(Arc::clone(&env.ecstore), &file)
+                    .await
+                    .expect("read failed repair bytes"),
+                corrupt
+            );
+        })
+        .await;
     }
 }
