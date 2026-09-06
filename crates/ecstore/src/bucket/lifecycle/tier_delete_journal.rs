@@ -5565,7 +5565,7 @@ fn legacy_tier_delete_recovery_descriptor(entry: &Jentry) -> Option<(&'static st
 pub(crate) fn validate_legacy_tier_delete_recovery_source(object_name: &str, source_schema: &str, data: &[u8]) -> Result<()> {
     validate_legacy_tier_delete_recovery_path(object_name)?;
     let persisted: PersistedTierDeleteJournalEntry =
-        serde_json::from_slice(data).map_err(|err| Error::other(format!("decode tier delete journal failed: {err}")))?;
+        serde_json::from_slice(data).map_err(|err| Error::other_with_context("decode tier delete journal failed", err))?;
     persisted.validate_legacy_recovery_shape()?;
     let entry = persisted.into_jentry()?;
     let Some((decoded_schema, _)) = legacy_tier_delete_recovery_descriptor(&entry) else {
