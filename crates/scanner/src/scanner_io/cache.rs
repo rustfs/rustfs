@@ -308,6 +308,86 @@ impl<'a> ValidatedScannerSnapshot<'a> {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ScannerPublicationExpectation {
+    candidate: Arc<([u8; 32], DataUsageScanPlanDigest)>,
+}
+
+impl ScannerPublicationExpectation {
+    pub(crate) fn matches_encoded_candidate(&self, digest: &[u8; 32]) -> bool {
+        &self.candidate.0 == digest
+    }
+
+    pub(crate) fn same_candidate(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.candidate, &other.candidate) && self.candidate.1 == other.candidate.1
+    }
+}
+
+pub(super) struct ValidatedUsageCandidate {
+    data: DataUsageInfo,
+    #[cfg(test)]
+    last_update: SystemTime,
+    coverage_digest: DataUsageScanPlanDigest,
+}
+
+pub(super) fn empty_namespace_usage_candidate(
+    all_buckets: &[BucketInfo],
+    sources: &HashSet<DataUsageCacheSource>,
+    buckets_by_source: &HashMap<DataUsageCacheSource, Vec<BucketInfo>>,
+    identity: ScannerSnapshotIdentity,
+) -> Option<ValidatedUsageCandidate> {
+    if !all_buckets.is_empty()
+        || sources.is_empty()
+        || sources.len() != buckets_by_source.len()
+        || sources
+            .iter()
+            .any(|source| buckets_by_source.get(source).is_none_or(|buckets| !buckets.is_empty()))
+    {
+        return None;
+    }
+    let last_update = SystemTime::now();
+    Some(ValidatedUsageCandidate {
+        data: DataUsageInfo {
+            last_update: Some(last_update),
+            scanner_cycle: Some(identity.cycle),
+            scanner_epoch: Some(identity.leader_epoch),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        },
+        #[cfg(test)]
+        last_update,
+        coverage_digest: identity.coverage_digest,
+    })
+}
+
+impl ValidatedUsageCandidate {
+    pub(super) fn prepare(mut self, status: ScannerCycleStatus) -> (DataUsageInfo, Option<ScannerPublicationExpectation>) {
+        self.data.usage_snapshot_converged = Some(status == ScannerCycleStatus::Complete);
+        let expectation = if status == ScannerCycleStatus::Complete {
+            struct DigestWriter(Sha256);
+            impl std::io::Write for DigestWriter {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0.update(bytes);
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut writer = DigestWriter(Sha256::new());
+            serde_json::to_writer(&mut writer, &self.data)
+                .ok()
+                .map(|()| ScannerPublicationExpectation {
+                    candidate: Arc::new((writer.0.finalize().into(), self.coverage_digest)),
+                })
+        } else {
+            None
+        };
+        (self.data, expectation)
+    }
+}
+
+#[cfg(test)]
 pub(super) fn completed_data_usage_info(
     results: &[DataUsageCache],
     scope: &ScannerSnapshotScope<'_>,
@@ -316,6 +396,18 @@ pub(super) fn completed_data_usage_info(
     budget_elapsed: bool,
     cancelled: bool,
 ) -> Option<(DataUsageInfo, SystemTime)> {
+    completed_usage_candidate(results, scope, tier_registry_names, bucket_plan_complete, budget_elapsed, cancelled)
+        .map(|candidate| (candidate.data, candidate.last_update))
+}
+
+pub(super) fn completed_usage_candidate(
+    results: &[DataUsageCache],
+    scope: &ScannerSnapshotScope<'_>,
+    tier_registry_names: &[String],
+    bucket_plan_complete: bool,
+    budget_elapsed: bool,
+    cancelled: bool,
+) -> Option<ValidatedUsageCandidate> {
     if !bucket_plan_complete {
         return None;
     }
@@ -393,7 +485,12 @@ pub(super) fn completed_data_usage_info(
         usage_snapshot_set_states,
         ..Default::default()
     };
-    Some((data_usage_info, merged_last_update))
+    Some(ValidatedUsageCandidate {
+        data: data_usage_info,
+        #[cfg(test)]
+        last_update: merged_last_update,
+        coverage_digest: scope.identity.coverage_digest,
+    })
 }
 
 fn tier_accounting_proof_is_publishable(

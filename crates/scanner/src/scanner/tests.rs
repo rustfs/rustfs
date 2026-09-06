@@ -37,6 +37,7 @@ use tokio::time::{Duration, advance};
 const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 
 mod recovery_control;
+mod scoped_ack_publication;
 
 async fn setup_scanner_cycle_store() -> (tempfile::TempDir, Arc<ECStore>) {
     setup_scanner_cycle_store_with_usage_baseline(true).await
@@ -6184,7 +6185,7 @@ async fn coordinator_classifies_an_expired_publication_lease() {
         .await;
 
     assert_eq!(
-        outcome,
+        outcome.outcome(),
         DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded)
     );
     assert!(store.put_counts.lock().await.is_empty(), "expired lease must prevent a PUT");
@@ -7325,7 +7326,7 @@ fn scanner_cycle_cache_floor_stays_pending_during_deferred_usage_publication() {
 
 #[test]
 #[serial]
-fn finalizing_a_saved_cycle_acknowledges_its_exact_dirty_snapshot() {
+fn finalizing_a_saved_enum_without_proof_keeps_dirty_pending() {
     crate::scanner_io::clear_dirty_usage_bucket("photos");
     crate::scanner_io::record_dirty_usage_bucket("photos");
     let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
@@ -7337,17 +7338,19 @@ fn finalizing_a_saved_cycle_acknowledges_its_exact_dirty_snapshot() {
     };
     let unsaved = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot.clone()))
         .with_remote_dirty_usage_acknowledgements(vec![remote_acknowledgement.clone()]);
-    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(unsaved, DataUsagePersistOutcome::NoUpdate);
+    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(unsaved, DataUsagePersistOutcome::NoUpdate.into());
     assert_eq!(outcome, ScannerCycleOutcome::Failed);
     assert!(acknowledgements.is_empty());
     assert!(crate::scanner_io::dirty_usage_buckets_pending());
 
     let saved = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot))
-        .with_remote_dirty_usage_acknowledgements(vec![remote_acknowledgement.clone()]);
-    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(saved, DataUsagePersistOutcome::Saved);
+        .with_remote_dirty_usage_acknowledgements(vec![remote_acknowledgement]);
+    let (outcome, pending, acknowledgements) = finalize_scanner_cycle_result(saved, DataUsagePersistOutcome::Saved.into());
     assert_eq!(outcome, ScannerCycleOutcome::Completed);
-    assert_eq!(acknowledgements, vec![remote_acknowledgement]);
-    assert!(!crate::scanner_io::dirty_usage_buckets_pending());
+    assert!(acknowledgements.is_empty());
+    assert!(pending);
+    assert!(crate::scanner_io::dirty_usage_buckets_pending());
+    crate::scanner_io::clear_dirty_usage_bucket("photos");
 }
 
 #[test]
@@ -7359,7 +7362,7 @@ fn finalizing_a_deferred_usage_save_keeps_dirty_work_pending() {
     let deferred = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot));
 
     let (outcome, _, acknowledgements) =
-        finalize_scanner_cycle_result(deferred, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
+        finalize_scanner_cycle_result(deferred, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement).into());
 
     assert_eq!(outcome, ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
     assert!(acknowledgements.is_empty());
@@ -7379,7 +7382,7 @@ fn finalizing_post_scan_observation_advances_partially_without_dirty_ack() {
     )
     .with_observational_snapshot_published(true);
 
-    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(observed, DataUsagePersistOutcome::Saved);
+    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(observed, DataUsagePersistOutcome::Saved.into());
 
     assert_eq!(outcome, ScannerCycleOutcome::Partial);
     assert!(acknowledgements.is_empty());
@@ -7415,17 +7418,20 @@ async fn scanner_cycle_keeps_remote_pending_acknowledgement() {
 
 #[test]
 #[serial]
-fn finalizing_an_already_durable_cycle_acknowledges_its_exact_dirty_snapshot() {
+fn finalizing_an_already_durable_enum_without_proof_keeps_dirty_pending() {
     crate::scanner_io::clear_dirty_usage_bucket("photos");
     crate::scanner_io::record_dirty_usage_bucket("photos");
     let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
 
     let durable = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot));
-    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(durable, DataUsagePersistOutcome::AlreadyDurable);
+    let (outcome, pending, acknowledgements) =
+        finalize_scanner_cycle_result(durable, DataUsagePersistOutcome::AlreadyDurable.into());
 
     assert_eq!(outcome, ScannerCycleOutcome::Completed);
     assert!(acknowledgements.is_empty());
-    assert!(!crate::scanner_io::dirty_usage_buckets_pending());
+    assert!(pending);
+    assert!(crate::scanner_io::dirty_usage_buckets_pending());
+    crate::scanner_io::clear_dirty_usage_bucket("photos");
 }
 
 #[test]
@@ -7436,7 +7442,8 @@ fn finalizing_a_prior_same_cycle_snapshot_keeps_new_dirty_work_pending() {
     let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
 
     let durable = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot));
-    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(durable, DataUsagePersistOutcome::PriorCycleDurable);
+    let (outcome, _, acknowledgements) =
+        finalize_scanner_cycle_result(durable, DataUsagePersistOutcome::PriorCycleDurable.into());
 
     assert_eq!(outcome, ScannerCycleOutcome::Completed);
     assert!(acknowledgements.is_empty());
@@ -7452,7 +7459,7 @@ fn finalizing_a_durable_superseded_snapshot_keeps_dirty_work_pending() {
     let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
 
     let superseded = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Superseded, Some(dirty_snapshot));
-    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(superseded, DataUsagePersistOutcome::Saved);
+    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(superseded, DataUsagePersistOutcome::Saved.into());
 
     assert_eq!(outcome, ScannerCycleOutcome::Superseded);
     assert!(acknowledgements.is_empty());
@@ -8881,7 +8888,7 @@ fn post_lease_activity_proof_rejects_a_put_tail_that_finished_before_lease_acqui
     ]);
     let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(
         result,
-        DataUsagePersistOutcome::Deferred(reason.expect("changed namespace should defer publication")),
+        DataUsagePersistOutcome::Deferred(reason.expect("changed namespace should defer publication")).into(),
     );
     assert_eq!(
         outcome,
