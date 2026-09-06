@@ -55,6 +55,14 @@ Standard S3 areas that must not be described as complete:
 
 `excluded_tests.txt` holds tests that must not block the compatibility gate: vendor-specific or non-portable behavior, and intentionally unsupported product behavior such as ACL authorization.
 
+## Intentional Deviations From AWS S3
+
+Object keys are stored as file-system paths under each drive (`{drive}/{bucket}/{object}/xl.meta`), the same layout MinIO uses. The rules below exist to keep that layout unambiguous and are not compatibility gaps to close; clients that need the AWS behavior must adapt on their side.
+
+| Behavior | RustFS | AWS S3 | Why |
+|---|---|---|---|
+| Object key with a `.` or `..` path segment, or an empty segment (`//`), such as `a//b/./c/../d` | `400 InvalidArgument` (`check_object_args` in `crates/ecstore/src/bucket/utils.rs`, mirroring MinIO `IsValidObjectPrefix`) | Accepted as an opaque key | A `..` segment would resolve to a parent directory and `.`/`//` segments would alias other keys on disk; encoding them would change the MinIO-compatible on-disk format. |
+
 ## Update Rule
 
 When a feature starts passing, move its test entries from `unimplemented_tests.txt` to `implemented_tests.txt` and update the row here in the same PR. Do not change README wording beyond the supported coverage. Handler-level status (missing, stubbed, or diverging endpoints) is tracked in [minio-rustfs-router-compatibility.md](minio-rustfs-router-compatibility.md).
