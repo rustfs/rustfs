@@ -3013,7 +3013,7 @@ fn parse_decommission_durable_ilm_receipt_path(path: &str) -> Result<Decommissio
         .ok_or_else(|| Error::other(format!("durable ILM receipt path `{path}` is missing its record id")))?;
     let id_kind = parts
         .next()
-        .filter(|id_kind| matches!(*id_kind, "operation_id" | "transaction_id" | "job_id"))
+        .filter(|id_kind| matches!(*id_kind, "operation_id" | "transaction_id" | "job_id" | "control_id"))
         .ok_or_else(|| Error::other(format!("durable ILM receipt path `{path}` has an invalid id kind")))?;
     let source_path = parts
         .next()
@@ -3023,8 +3023,9 @@ fn parse_decommission_durable_ilm_receipt_path(path: &str) -> Result<Decommissio
         return Err(Error::other(format!("durable ILM receipt path `{path}` has an invalid run token")));
     }
     match id_kind {
-        "operation_id" if !is_sha256_checksum(id) => {
-            return Err(Error::other(format!("durable ILM receipt path `{path}` has an invalid operation id")));
+        "operation_id" | "control_id" if !is_sha256_checksum(id) => {
+            let id_label = id_kind.trim_end_matches("_id");
+            return Err(Error::other(format!("durable ILM receipt path `{path}` has an invalid {id_label} id")));
         }
         "transaction_id" | "job_id" if uuid::Uuid::parse_str(id).is_err() => {
             return Err(Error::other(format!("durable ILM receipt path `{path}` has an invalid UUID")));
@@ -19300,8 +19301,8 @@ mod pools_tests {
         load_decommission_entry_versions, local_decommission_queue_prefix, mark_decommission_bucket_done,
         merge_decommission_durable_ilm_receipts, merge_pool_meta_updates_for_save, merge_pool_status_refresh,
         missing_decommission_worker_prefix, next_decommission_capacity_generation, observe_decommission_terminal_reload_result,
-        pool_meta_has_active_decommission, publish_pool_meta_updates, read_pool_meta_replica,
-        reconcile_decommission_meta_buckets, reconcile_decommission_unresolved_entries_for_completion,
+        parse_decommission_durable_ilm_receipt_path, pool_meta_has_active_decommission, publish_pool_meta_updates,
+        read_pool_meta_replica, reconcile_decommission_meta_buckets, reconcile_decommission_unresolved_entries_for_completion,
         record_decommission_unresolved_entry, recover_decommission_capacity_reservations,
         renew_decommission_capacity_reservation, require_decommission_store, reserve_decommission_start_cancelers,
         reserve_decommission_start_target_capacity, resolve_decommission_bucket_state,
@@ -20167,6 +20168,26 @@ mod pools_tests {
             &operation_id,
         );
         assert!(!old_receipt.starts_with(&decommission_durable_ilm_receipt_run_prefix(&second_token)));
+    }
+
+    #[test]
+    fn decommission_recovery_control_receipt_path_round_trips() {
+        let run_token = "b".repeat(64);
+        let control_id = "a".repeat(64);
+        let source_path = format!(
+            "ilm/recovery-controls/transition_transaction/{}/{}/{}.json",
+            &control_id[..2],
+            &control_id[2..4],
+            control_id
+        );
+        let path = decommission_durable_ilm_receipt_path(&run_token, &source_path, "control_id", &control_id);
+
+        let locator = parse_decommission_durable_ilm_receipt_path(&path).expect("recovery control receipt path should parse");
+
+        assert_eq!(locator.run_token, run_token);
+        assert_eq!(locator.source_path, source_path);
+        assert_eq!(locator.id_kind, "control_id");
+        assert_eq!(locator.id, control_id);
     }
 
     #[test]

@@ -20769,7 +20769,7 @@ mod tests {
             .await;
         let unsupported_stats = recover_transition_transaction_records(store.clone(), 100, None)
             .await
-            .expect("unsupported provider recovery should fail closed");
+            .expect("active unknown ownership should remain fenced before provider recovery");
         assert_eq!(
             (
                 unsupported_stats.scanned,
@@ -20778,20 +20778,28 @@ mod tests {
                 unsupported_stats.failed
             ),
             (1, 0, 1, 0),
-            "an unsupported provider probe must retain the unknown upload"
+            "active unknown ownership must retain the upload before the recovery deadline"
         );
         assert_eq!(transition_transaction_record_count(store.clone()).await, 1);
         let recovery_control_id =
             transition_recovery_control_id(&transaction).expect("transition recovery control id should derive");
-        let control = load_recovery_control(store.clone(), IlmRecoveryProtocol::TransitionTransaction, &recovery_control_id)
-            .await
-            .expect("unsupported probe control should persist");
-        assert_eq!(control.control.classification, IlmRecoveryClassification::RetainedAmbiguous);
+        assert!(matches!(
+            load_recovery_control(store.clone(), IlmRecoveryProtocol::TransitionTransaction, &recovery_control_id).await,
+            Err(Error::ConfigNotFound)
+        ));
         assert!(
             backend.contains(&transaction.remote_object).await,
-            "unsupported recovery must not delete the candidate"
+            "active ownership must not delete the candidate"
         );
-        assert_eq!(backend.remove_count().await, 0, "unsupported recovery must not attempt cleanup");
+        assert_eq!(backend.remove_count().await, 0, "active ownership must not attempt cleanup");
+        assert!(
+            !backend
+                .op_log()
+                .await
+                .iter()
+                .any(|operation| matches!(operation, MockWarmOp::Probe { .. })),
+            "active ownership must not probe the provider"
+        );
 
         backend.set_transition_candidate_probe_override(None).await;
         let stats =
