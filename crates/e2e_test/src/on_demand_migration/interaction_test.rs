@@ -22,8 +22,8 @@
 //! local object and what the source was asked for.
 
 use super::common::{
-    AdminResponse, BoxError, OdmEnvOptions, OdmSourceSpec, OdmTestEnv, SeedObject, start_configured_env,
-    start_configured_env_with,
+    ALLOW_LOOPBACK_SOURCE_ENV, AdminResponse, BackfillOp, BackfillRequest, BoxError, ODM_MODULE_SWITCH_ENV, ODM_SERVER_ENV,
+    OdmEnvOptions, OdmSourceSpec, OdmTestEnv, SeedObject, start_configured_env, start_configured_env_with,
 };
 use crate::common::{RustFSTestEnvironment, replication_fast_env, signed_request};
 use crate::fake_s3_target::{BucketMode, FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, Operation};
@@ -32,7 +32,7 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, Event, FilterRule, FilterRuleName, NotificationConfiguration, NotificationConfigurationFilter,
     ObjectLockRetentionMode, QueueConfiguration, S3KeyFilter, ServerSideEncryption, ServerSideEncryptionByDefault,
-    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, VersioningConfiguration,
+    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging, VersioningConfiguration,
 };
 use bytes::Bytes;
 use local_ip_address::local_ip;
@@ -730,6 +730,242 @@ async fn test_odm_disable_keeps_pulled_objects_and_stops_source_traffic() -> Tes
     assert_eq!(resumed.header(ODM_RESPONSE_HEADER), Some("source"));
     assert_eq!(resumed.body, body);
     assert_eq!(env.source.count_requests(Operation::GetObject, untouched_key), 1);
+    Ok(())
+}
+
+/// The process switch preserves configured buckets and unfinished jobs while
+/// restoring local-only S3 behavior, including after an ordinary metadata write.
+#[tokio::test]
+async fn test_odm_global_disable_preserves_data_config_and_backfill_across_restarts() -> TestResult {
+    let bucket = "odm-global-disable";
+    let mut env = start_configured_env(bucket, SOURCE_BUCKET, |spec| spec.policy.list_through = true).await?;
+    let pulled_key = "migrated/pulled.bin";
+    let remote_key = "remote/untouched.bin";
+    let pending_key = "backfill/pending.bin";
+    let local_key = "local/kept.bin";
+    let source_body = Bytes::from_static(b"source payload");
+    let local_body = Bytes::from_static(b"client payload");
+    env.seed_source(
+        SOURCE_BUCKET,
+        &[
+            SeedObject::new(pulled_key, source_body.clone()),
+            SeedObject::new(remote_key, source_body.clone()),
+            SeedObject::new(pending_key, source_body.clone()),
+        ],
+    );
+    env.client
+        .put_object()
+        .bucket(bucket)
+        .key(local_key)
+        .body(local_body.clone().into())
+        .send()
+        .await?;
+    let pulled = env.raw_get(bucket, pulled_key).await?;
+    assert_eq!(pulled.status, 200);
+    assert_eq!(pulled.header(ODM_RESPONSE_HEADER), Some("source"));
+    assert_eq!(pulled.body, source_body);
+    let stored = env.raw_get(bucket, pulled_key).await?;
+    assert_eq!(stored.status, 200);
+    assert_eq!(stored.header(ODM_RESPONSE_HEADER), None, "the inline pull has committed locally");
+    assert_eq!(stored.body, source_body);
+    let config = env.get_config(bucket).await?;
+    assert_eq!(config.status, 200, "{}", config.body);
+    let config = config.json()?;
+
+    // Hold every attempt until the process has exited, so retries cannot commit
+    // the only backfill object before the crash. The start checkpoint exists.
+    let mut pending_get = env.source.hold_get_object(SOURCE_BUCKET, pending_key);
+    let started = env
+        .start_backfill(
+            bucket,
+            BackfillRequest {
+                prefix: Some("backfill/".to_string()),
+                ..BackfillRequest::default()
+            },
+        )
+        .await?;
+    assert_eq!(started.status, 200, "{}", started.body);
+    let job_id = started.json()?["job"]["job_id"].as_str().ok_or("missing job ID")?.to_string();
+    tokio::time::timeout(Duration::from_secs(10), pending_get.wait_until_entered())
+        .await
+        .expect("backfill never reached the held source GET")?;
+    let process = env.rustfs.process.as_mut().ok_or("missing RustFS process before crash")?;
+    assert!(process.try_wait()?.is_none(), "RustFS exited before the controlled crash");
+    process.kill()?;
+    let stopped = process.wait()?;
+    assert!(!stopped.success(), "the interrupted process must exit after being killed");
+    drop(env.rustfs.process.take());
+    drop(pending_get);
+    env.source.take_requests();
+    env.rustfs
+        .restart_server_preserving_data(vec![], &[(ODM_MODULE_SWITCH_ENV, "false"), (ALLOW_LOOPBACK_SOURCE_ENV, "true")])
+        .await?;
+
+    let off_config = env.get_config(bucket).await?;
+    assert_eq!(off_config.status, 200, "{}", off_config.body);
+    assert_eq!(off_config.json()?, config, "the saved configuration and timestamp survive disabling");
+    let status = env.status_json(bucket).await?;
+    assert_eq!(status["configured"], true, "{status}");
+    assert_eq!(status["enabled"], true, "the bucket remains configured as enabled: {status}");
+    assert_eq!(status["module_enabled"], false, "{status}");
+    assert_eq!(status["counters"], Value::Null, "no bucket runtime is installed: {status}");
+    let checkpoint = env.backfill_job(bucket).await?.ok_or("disabled module lost the checkpoint")?;
+    assert_eq!(checkpoint["job_id"], job_id);
+    assert_eq!(checkpoint["state"], "running", "the interrupted job is retained: {checkpoint}");
+
+    for (key, body) in [(local_key, &local_body), (pulled_key, &source_body)] {
+        let get = env.raw_get(bucket, key).await?;
+        assert_eq!(get.status, 200);
+        assert_eq!(&get.body, body);
+        assert_eq!(get.header(ODM_RESPONSE_HEADER), None);
+        let head = env.client.head_object().bucket(bucket).key(key).send().await?;
+        assert_eq!(head.content_length(), Some(i64::try_from(body.len())?));
+    }
+    for key in [remote_key, pending_key] {
+        let get = env.raw_get(bucket, key).await?;
+        assert_eq!(get.status, 404, "disabled source GET {key}: {}", String::from_utf8_lossy(&get.body));
+        let head = env.client.head_object().bucket(bucket).key(key).send().await;
+        let err = head.expect_err("a source-only object must remain absent locally");
+        assert_eq!(err.raw_response().map(|response| response.status().as_u16()), Some(404));
+    }
+
+    let replacement = Bytes::from_static(b"written while the module is off");
+    for key in [local_key, "local/deleted.bin"] {
+        env.client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(replacement.clone().into())
+            .send()
+            .await?;
+    }
+    env.client
+        .delete_object()
+        .bucket(bucket)
+        .key("local/deleted.bin")
+        .send()
+        .await?;
+    assert_eq!(env.raw_get(bucket, "local/deleted.bin").await?.status, 404);
+    assert_eq!(env.raw_get(bucket, local_key).await?.body, replacement);
+
+    // Both wire protocols must finish their local pages even though the saved
+    // configuration still requests list-through.
+    for use_v2 in [false, true] {
+        let mut cursor = None;
+        let mut listed = Vec::new();
+        for page_number in 0..2 {
+            let (keys, truncated, next) = if use_v2 {
+                let page = env
+                    .client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .max_keys(1)
+                    .set_continuation_token(cursor)
+                    .send()
+                    .await?;
+                (
+                    page.contents()
+                        .iter()
+                        .map(|object| object.key().expect("listed key").to_string())
+                        .collect::<Vec<_>>(),
+                    page.is_truncated(),
+                    page.next_continuation_token().map(str::to_string),
+                )
+            } else {
+                let page = env
+                    .client
+                    .list_objects()
+                    .bucket(bucket)
+                    .max_keys(1)
+                    .set_marker(cursor)
+                    .send()
+                    .await?;
+                // V1 may omit NextMarker without a delimiter; clients then
+                // continue from the last returned key.
+                let next = page.next_marker().or_else(|| {
+                    if page.is_truncated() == Some(true) {
+                        page.contents().last().and_then(|object| object.key())
+                    } else {
+                        None
+                    }
+                });
+                (
+                    page.contents()
+                        .iter()
+                        .map(|object| object.key().expect("listed key").to_string())
+                        .collect::<Vec<_>>(),
+                    page.is_truncated(),
+                    next.map(str::to_string),
+                )
+            };
+            assert_eq!(keys.len(), 1, "one local key per page, V2={use_v2}");
+            assert_eq!(truncated, Some(page_number == 0), "local pagination must terminate, V2={use_v2}");
+            if page_number == 0 {
+                assert!(next.as_ref().is_some_and(|value| !value.is_empty()), "missing local cursor, V2={use_v2}");
+            }
+            cursor = next;
+            listed.extend(keys);
+        }
+        assert_eq!(listed, [local_key, pulled_key], "source-only keys must stay absent, V2={use_v2}");
+    }
+
+    let spec = env.fake_source_spec(SOURCE_BUCKET);
+    for response in [
+        env.configure_source(bucket, &spec).await?,
+        env.validate_source(bucket, &spec).await?,
+        env.backfill(bucket, BackfillOp::Start(BackfillRequest::default())).await?,
+    ] {
+        assert_eq!(response.status, 400, "{}", response.body);
+        assert!(response.body.contains("OnDemandMigrationDisabled"), "{}", response.body);
+    }
+    let tagging = Tagging::builder()
+        .tag_set(Tag::builder().key("module").value("disabled").build()?)
+        .build()?;
+    env.client
+        .put_bucket_tagging()
+        .bucket(bucket)
+        .tagging(tagging.clone())
+        .send()
+        .await?;
+    assert_eq!(env.get_config(bucket).await?.json()?, config, "an unrelated metadata write preserves ODM");
+    assert_eq!(
+        env.backfill_job(bucket).await?,
+        Some(checkpoint),
+        "no recovery or checkpoint update while disabled"
+    );
+    assert!(
+        env.source.requests().is_empty(),
+        "disabled startup and all requests must leave the source untouched"
+    );
+
+    env.rustfs.restart_server_preserving_data(vec![], ODM_SERVER_ENV).await?;
+    env.wait_until_source_consulted(bucket).await?;
+    assert_eq!(
+        env.get_config(bucket).await?.json()?,
+        config,
+        "reenabling uses the persisted configuration"
+    );
+    let tags = env.client.get_bucket_tagging().bucket(bucket).send().await?;
+    assert_eq!(tags.tag_set(), tagging.tag_set(), "the ordinary metadata write also persists");
+    let resumed = env.raw_get(bucket, remote_key).await?;
+    assert_eq!(resumed.status, 200);
+    assert_eq!(resumed.header(ODM_RESPONSE_HEADER), Some("source"));
+    assert_eq!(resumed.body, source_body, "stored credentials still authenticate without reconfiguration");
+    let completed = env
+        .wait_for_backfill(bucket, SETTLE, |job| job["state"] == "completed")
+        .await?;
+    assert_eq!(completed["job_id"], job_id, "the interrupted job resumes without a new start");
+    assert_eq!(completed["failed"], 0, "{completed}");
+    for (key, body) in [
+        (local_key, &replacement),
+        (pulled_key, &source_body),
+        (pending_key, &source_body),
+    ] {
+        let get = env.raw_get(bucket, key).await?;
+        assert_eq!(get.status, 200);
+        assert_eq!(&get.body, body);
+        assert_eq!(get.header(ODM_RESPONSE_HEADER), None, "{key} remains stored locally");
+    }
     Ok(())
 }
 

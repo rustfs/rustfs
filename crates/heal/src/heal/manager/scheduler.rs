@@ -175,11 +175,23 @@ impl HealManager {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .get(&request.id)
                     .cloned();
-                let task = Arc::new(HealTask::from_replacement_recovery_request(
-                    request,
-                    storage.clone(),
-                    replacement_resume_endpoint,
-                ));
+                let mainline_pacer = if request.source == HealRequestSource::Admin && config.mainline_throttle_enable {
+                    workload_provider.as_ref().and_then(|provider| {
+                        crate::heal::pacing::MainlinePacer::new(
+                            provider.clone(),
+                            config.mainline_read_utilization_high_percent,
+                            config.mainline_write_utilization_high_percent,
+                            config.mainline_max_sleep,
+                        )
+                        .map(Arc::new)
+                    })
+                } else {
+                    None
+                };
+                let task = Arc::new(
+                    HealTask::from_replacement_recovery_request(request, storage.clone(), replacement_resume_endpoint)
+                        .with_mainline_pacer(mainline_pacer),
+                );
                 let task_id = task.id.clone();
                 active_heals_guard.insert(task_id.clone(), task.clone());
                 publish_active_heal_count(&active_heals_guard);

@@ -39,6 +39,7 @@ use temp_env::with_var;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+mod scoped_entry_fallback;
 mod service_cohort;
 
 #[derive(Clone)]

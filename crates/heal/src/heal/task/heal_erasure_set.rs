@@ -422,7 +422,8 @@ impl HealTask {
             self.source,
         )
         .with_replacement_targets(self.heal_endpoints.clone(), is_auto_replacement.then(|| self.id.clone()))
-        .with_replacement_identity_fence(replacement_target_identities.clone());
+        .with_replacement_identity_fence(replacement_target_identities.clone())
+        .with_mainline_pacer(self.mainline_pacer.clone());
 
         {
             let mut progress = self.progress.write().await;

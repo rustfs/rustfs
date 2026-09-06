@@ -337,7 +337,7 @@ const THROTTLE_CODES: &[&str] = &[
     "RequestThrottled",
     "ServerBusy",
 ];
-const NOT_FOUND_CODES: &[&str] = &["NoSuchKey", "BlobNotFound"];
+const NOT_FOUND_CODES: &[&str] = &["NoSuchKey"];
 const ACCESS_DENIED_CODES: &[&str] = &[
     "AccessDenied",
     "InvalidAccessKeyId",
@@ -1813,10 +1813,11 @@ mod tests {
 
     /// The S3 backend behind the scripted connector, without the prefix-mapping
     /// client on top: the contract is a property of the backend itself.
-    async fn scripted_s3_backend(responses: Vec<Scripted>) -> S3SourceBackend {
+    async fn scripted_s3_backend(responses: Vec<Scripted>) -> (S3SourceBackend, Recorded) {
         let spec = spec(None);
+        let requests: Recorded = Arc::new(Mutex::new(Vec::new()));
         let connector = SharedHttpConnector::new(ScriptedConnector {
-            requests: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::clone(&requests),
             responses: Arc::new(Mutex::new(responses.into_iter().collect())),
         });
         let http_client = http_client_fn(move |_settings, _components| connector.clone());
@@ -1826,17 +1827,20 @@ mod tests {
             .expect("test spec should build")
             .http_client(http_client)
             .interceptor(SourceProxyMarkerInterceptor::new());
-        S3SourceBackend {
-            client: S3Client::from_conf(config.build()),
-            bucket: spec.bucket.clone(),
-        }
+        (
+            S3SourceBackend {
+                client: S3Client::from_conf(config.build()),
+                bucket: spec.bucket.clone(),
+            },
+            requests,
+        )
     }
 
     #[tokio::test]
     async fn s3_backend_satisfies_the_shared_backend_contract() {
         let mut ranged = contract_object_headers(3);
         ranged.push(("content-range", "bytes 1-3/5".to_string()));
-        let backend = scripted_s3_backend(vec![
+        let (backend, requests) = scripted_s3_backend(vec![
             ok(contract_object_headers(5), ""),
             ok(contract_object_headers(5), "hello"),
             ok(ranged, "ell"),
@@ -1845,6 +1849,7 @@ mod tests {
             ok(Vec::new(), CONTRACT_TAGGING),
             ok(Vec::new(), ""),
             status(404, ""),
+            // An object HEAD 404 requires the existing S3 bucket HEAD probe.
             ok(Vec::new(), ""),
             status(403, ACCESS_DENIED_BODY),
         ])
@@ -1859,6 +1864,32 @@ mod tests {
             },
         )
         .await;
+        let requests = recorded(&requests);
+        let actual: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                (
+                    request.method.as_str(),
+                    url::Url::parse(&request.uri).expect("recorded S3 URL").path().to_string(),
+                )
+            })
+            .collect();
+        let expected = [
+            ("HEAD", "/source-bucket/dir/a.txt"),
+            ("GET", "/source-bucket/dir/a.txt"),
+            ("GET", "/source-bucket/dir/a.txt"),
+            ("GET", "/source-bucket/"),
+            ("GET", "/source-bucket/"),
+            ("GET", "/source-bucket/dir/a.txt"),
+            ("HEAD", "/source-bucket/"),
+            ("HEAD", "/source-bucket/missing"),
+            ("HEAD", "/source-bucket/"),
+            ("HEAD", "/source-bucket/secret"),
+        ];
+        assert_eq!(actual, expected.map(|(method, path)| (method, path.to_string())));
+        for request in &requests {
+            assert_outbound_markers(request);
+        }
     }
 
     fn prefix_client(prefix: Option<String>) -> SourceClient {

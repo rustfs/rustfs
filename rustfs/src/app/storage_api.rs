@@ -718,6 +718,8 @@ pub(crate) mod bucket {
                     delete_marker_version_id: None,
                     delete_marker: false,
                     delete_marker_mtime: None,
+                    target_delete_marker_version_ids: Default::default(),
+                    target_delete_marker_version_ids_corrupt: false,
                     target_arns,
                     force_delete_id: Some(operation_id),
                     force_delete_generation: Some(i64::try_from(generation.unix_timestamp_nanos()).unwrap_or(i64::MAX)),
