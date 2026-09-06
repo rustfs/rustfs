@@ -696,7 +696,7 @@ mod tests {
     #[serial_test::serial]
     fn write_back_multipart_completion_preserves_a_client_put_after_staging() {
         crate::app::gating_test_env::run_large_stack_test(
-            "odm-mpu-completion-client-put",
+            "odm-write-back-multipart-client-put-race",
             write_back_multipart_completion_preserves_a_client_put_after_staging_inner,
         );
     }

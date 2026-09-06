@@ -112,6 +112,10 @@ pub(crate) fn current_cache_root_entry_with_generation(
     let metadata_is_current = cache.info.name == name
         && cache.info.source == Some(source)
         && cache.info.snapshot_complete
+        && cache.info.scan_progress.is_none()
+        && cache.info.scan_checkpoint.is_none()
+        && cache.info.scan_resume_after.is_none()
+        && cache.info.scan_coverage_receipt.is_none()
         && cache.info.scan_plan_digest == Some(scan_plan_digest)
         && cache.info.last_update.is_some()
         && cache.info.next_cycle == next_cycle
@@ -137,6 +141,7 @@ pub(crate) enum DataUsageCacheScanState {
 pub(crate) struct DataUsageCacheReuseOptions {
     pub(crate) require_source: bool,
     pub(crate) tier_registry_generation: Option<u64>,
+    pub(crate) checkpoint_identity: Option<crate::DataUsageScanIdentity>,
 }
 
 #[cfg(test)]
@@ -159,6 +164,7 @@ pub(crate) fn current_cache_root_or_prepare(
         DataUsageCacheReuseOptions {
             require_source,
             tier_registry_generation: None,
+            checkpoint_identity: None,
         },
     )
 }
@@ -172,6 +178,12 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
     scan_plan_digest: DataUsageScanPlanDigest,
     options: DataUsageCacheReuseOptions,
 ) -> DataUsageCacheScanState {
+    if cache.info.next_cycle <= next_cycle
+        && cache.info.leader_epoch <= leader_epoch
+        && cache.info.scan_identity != options.checkpoint_identity
+    {
+        cache.info.scan_plan_digest = None;
+    }
     if options.tier_registry_generation.is_some_and(|generation| {
         cache.info.next_cycle <= next_cycle
             && cache.info.leader_epoch <= leader_epoch
@@ -193,7 +205,12 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
         Ok(Some(root)) => DataUsageCacheScanState::Current(Box::new(root)),
         current => DataUsageCacheScanState::Prepared {
             invalid_current: current.err(),
-            outcome: cache.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, options.require_source),
+            outcome: match options.checkpoint_identity.filter(crate::DataUsageScanIdentity::is_valid) {
+                Some(identity) => {
+                    cache.prepare_bucket_checkpoint(name, next_cycle, leader_epoch, source, scan_plan_digest, identity)
+                }
+                None => cache.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, options.require_source),
+            },
         },
     }
 }
@@ -218,6 +235,7 @@ pub(super) struct ScannerSnapshotIdentity {
     pub(super) cycle: u64,
     pub(super) leader_epoch: u64,
     pub(super) plan_digest: DataUsageScanPlanDigest,
+    pub(super) coverage_digest: DataUsageScanPlanDigest,
     pub(super) tier_registry_generation: Option<u64>,
 }
 
@@ -269,6 +287,7 @@ impl<'a> ValidatedScannerSnapshot<'a> {
             if result.info.next_cycle != scope.identity.cycle
                 || result.info.leader_epoch != scope.identity.leader_epoch
                 || result.info.scan_plan_digest != Some(scope.identity.plan_digest)
+                || result.info.scan_coverage_digest != Some(scope.identity.coverage_digest)
                 || result.info.tier_registry_generation != scope.identity.tier_registry_generation
             {
                 return Err(ScannerSnapshotValidationError::GenerationMismatch);
@@ -668,6 +687,7 @@ pub(super) async fn persist_and_publish_cache_snapshot(
     expected_publication_epoch: u64,
 ) -> Option<SystemTime> {
     let source = cache_snapshot.info.source?;
+    let coverage_digest = cache_snapshot.info.scan_coverage_digest?;
     let execution_digest = cache_snapshot.info.scan_execution_digest?;
     let guard = match acquire_scanner_cache_locks(store.as_ref(), DATA_USAGE_CACHE_NAME, source).await {
         Ok(guard) => guard,
@@ -733,7 +753,8 @@ pub(super) async fn persist_and_publish_cache_snapshot(
         );
         return None;
     }
-    if persisted.info.scan_execution_digest == Some(execution_digest)
+    if persisted.info.scan_coverage_digest == Some(coverage_digest)
+        && persisted.info.scan_execution_digest == Some(execution_digest)
         && matches!(
             current_cache_root_entry_with_generation(
                 &persisted,

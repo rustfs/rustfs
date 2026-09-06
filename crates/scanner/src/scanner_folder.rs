@@ -707,6 +707,9 @@ pub struct FolderScanner {
     /// next scan and cannot mix generations in one aggregate.
     tier_registry: TierRegistrySnapshot,
     pending_heals_changed: bool,
+    coverage_frontier: Option<String>,
+    resume_frontier: Option<String>,
+    coverage_gap: bool,
     pending_size_reconciliation_keys: HashSet<String>,
     pending_size_reconciliation_scopes: HashSet<String>,
     pending_size_reconciliation_truncated: bool,
@@ -904,6 +907,16 @@ impl FolderScanner {
         );
         self.new_cache.info.scan_checkpoint = Some(checkpoint.clone());
         self.update_cache.info.scan_checkpoint = Some(checkpoint);
+    }
+
+    fn record_completed_child(&mut self, folder: &str, healthy: bool) {
+        if self.old_cache.info.scan_progress.is_some() {
+            self.coverage_gap |= !healthy;
+            if !self.coverage_gap {
+                self.coverage_frontier = Some(folder.to_owned());
+            }
+        }
+        self.record_scan_resume_hint(folder);
     }
 
     fn record_scan_resume_hint_if_not_ancestor(&mut self, folder: &str) {
@@ -1471,6 +1484,7 @@ impl FolderScanner {
                 // (e.g. in the get_size error branch below). This branch only accounts
                 // for subsequent skips of already-failed paths.
                 if self.should_skip_failed(&item.path) {
+                    self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
                     continue;
                 }
 
@@ -1484,6 +1498,7 @@ impl FolderScanner {
                         let failure_action = classify_get_size_failure(&item, &e);
 
                         if failure_action != GetSizeFailureAction::Skip {
+                            self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
                             // Track failed objects to prevent infinite retry loops
                             into.failed_objects += 1;
                             self.record_failed(&item.path);
@@ -1576,6 +1591,9 @@ impl FolderScanner {
                 abandoned_children.remove(&path_join_buf(&[&item.bucket, &item.object_path()]));
 
                 apply_scanner_size_summary(into, &sz);
+                if !sz.size_reconciliation.is_empty() {
+                    self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
+                }
                 self.apply_size_reconciliation(&sz);
                 into.objects += 1;
                 object_count += 1;
@@ -1620,6 +1638,7 @@ impl FolderScanner {
             }
 
             if self.is_erasure_mode && found_erasure_data_directory && !found_object_metadata {
+                self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
                 found_object_metadata = true;
                 let metadata_path = path_join_buf(&[&dir_path, STORAGE_FORMAT_FILE]);
 
@@ -1741,7 +1760,13 @@ impl FolderScanner {
                 source: FolderScanSource::Existing,
             }));
             let has_queued_folders = !queued_folders.is_empty();
-            let resume_order = order_queued_folders_for_resume(&mut queued_folders, scan_resume_after);
+            let forward_sweep = self.old_cache.info.scan_progress.is_some();
+            let forward_resume_after = self.resume_frontier.clone();
+            let resume_order = if forward_sweep {
+                order_queued_folders_for_resume(&mut queued_folders, None)
+            } else {
+                order_queued_folders_for_resume(&mut queued_folders, scan_resume_after)
+            };
             if checkpoint_tracks_child_order && has_queued_folders {
                 match resume_order {
                     FolderResumeOrder::Used => global_metrics().record_scanner_checkpoint_used(),
@@ -1758,6 +1783,18 @@ impl FolderScanner {
 
                 let mut folder_item = queued_folder.folder;
                 let h = hash_path(&folder_item.name);
+                if forward_sweep
+                    && !into.compacted
+                    && forward_resume_after.as_deref().is_some_and(|resume| {
+                        folder_item.name.as_str() <= resume
+                            && !matches!(folder_resume_match(&folder_item.name, resume), Some(FolderResumeMatch::Descendant))
+                    })
+                    && self.old_cache.find(&folder_item.name).is_some()
+                {
+                    self.new_cache.copy_with_children(&self.old_cache, &h, &folder_item.parent);
+                    into.add_child(&h);
+                    continue;
+                }
 
                 match queued_folder.source {
                     FolderScanSource::New => {
@@ -1789,7 +1826,7 @@ impl FolderScanner {
                         }
                     }
                     FolderScanSource::Existing => {
-                        if !into.compacted && self.old_cache.is_compacted(&h) {
+                        if !forward_sweep && !into.compacted && self.old_cache.is_compacted(&h) {
                             let next_cycle = self.old_cache.info.next_cycle as u32;
                             if !h.mod_(next_cycle, data_usage_update_dir_cycles()) {
                                 // Transfer and add as child...
@@ -1810,7 +1847,7 @@ impl FolderScanner {
                     // In compacted mode child totals are accumulated directly into the parent entry.
                     let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
                     fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
-                    self.record_scan_resume_hint(&folder_item.name);
+                    self.record_completed_child(&folder_item.name, into.failed_objects == 0);
                     self.send_update_for_entry(&this_hash, &folder.parent, into).await;
                     tokio::task::yield_now().await;
                 } else {
@@ -1835,12 +1872,13 @@ impl FolderScanner {
                             error = %e,
                             "Scanner child folder scan failed"
                         );
+                        self.coverage_gap |= forward_sweep;
                         continue;
                     }
                     tokio::task::yield_now().await;
 
                     into.add_child(&h);
-                    self.record_scan_resume_hint(&folder_item.name);
+                    self.record_completed_child(&folder_item.name, dst.failed_objects == 0);
                     // We scanned a folder, optionally send update.
                     self.update_cache.delete_recursive(&h);
                     self.update_cache.copy_with_children(&self.new_cache, &h, &folder_item.parent);
@@ -2250,7 +2288,10 @@ impl FolderScanner {
             self.new_cache.replace_hashed(&this_hash, &folder.parent, into);
         }
 
+        // Keep independently accounted children while the sweep cursor may
+        // reference them; the hard cardinality compaction below still applies.
         if !into.compacted
+            && self.old_cache.info.scan_progress.is_none()
             && self.new_cache.info.name != folder.name
             && let Some(mut flat) = self.new_cache.size_recursive(&this_hash.key())
         {
@@ -2359,6 +2400,7 @@ pub async fn scan_data_folder(
     cache.fold_retired_tiers(&tier_registry.names);
     cache.info.tier_registry_generation = Some(tier_registry.generation);
 
+    let resume_frontier = cache.validated_scan_frontier().map(str::to_owned);
     // Create folder scanner
     let mut scanner = FolderScanner {
         root: base_path,
@@ -2388,6 +2430,9 @@ pub async fn scan_data_folder(
         local_disk,
         tier_registry,
         pending_heals_changed: false,
+        coverage_frontier: resume_frontier.clone(),
+        resume_frontier,
+        coverage_gap: false,
         pending_size_reconciliation_keys: HashSet::new(),
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,
@@ -2418,23 +2463,41 @@ pub async fn scan_data_folder(
     match scanner.scan_folder(ctx.clone(), folder, &mut root).await {
         Ok(()) => {
             // Get the new cache and finalize it
+            let coverage_gap = scanner.coverage_gap;
             let new_cache = scanner.as_mut_new_cache();
             new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
             new_cache.info.last_update = Some(SystemTime::now());
             new_cache.info.next_cycle = cache.info.next_cycle;
-            let unresolved_objects = root.failed_objects > 0
+            let unresolved_objects = coverage_gap
+                || root.failed_objects > 0
                 || !new_cache.info.failed_objects.is_empty()
                 || !new_cache.info.size_reconciliation.is_empty();
-            new_cache.info.snapshot_complete = !unresolved_objects;
+            let mixed_coverage = new_cache
+                .info
+                .scan_progress
+                .is_some_and(|progress| progress.started_plan != progress.requested_plan);
+            new_cache.info.snapshot_complete = !unresolved_objects && !mixed_coverage;
+            if let Some(progress) = &mut new_cache.info.scan_progress {
+                if new_cache.info.snapshot_complete {
+                    new_cache.info.scan_plan_digest = Some(progress.requested_plan);
+                    new_cache.info.scan_progress = None;
+                } else {
+                    // Retain observations, then verify from the beginning under
+                    // the latest plan. A clean tail cannot certify an old prefix.
+                    progress.started_plan = progress.requested_plan;
+                    new_cache.info.scan_plan_digest = None;
+                }
+            }
             let had_scan_checkpoint = cache.info.scan_checkpoint.is_some() || new_cache.info.scan_checkpoint.is_some();
             new_cache.info.scan_resume_after = None;
             new_cache.info.scan_checkpoint = None;
+            new_cache.info.scan_coverage_receipt = None;
             if had_scan_checkpoint {
                 global_metrics().record_scanner_checkpoint_cleared();
             }
 
             close_disk_guard.close().await;
-            if unresolved_objects {
+            if unresolved_objects || mixed_coverage {
                 Err(ScannerError::PartialCache(Box::new(new_cache.clone())))
             } else {
                 Ok(new_cache.clone())
@@ -2448,6 +2511,7 @@ pub async fn scan_data_folder(
                 if root_has_progress {
                     scanner.carry_forward_old_children(&root_hash, &mut root);
                 }
+                let coverage_frontier = scanner.coverage_frontier.clone();
                 let new_cache = scanner.as_mut_new_cache();
                 if root_has_progress {
                     new_cache.replace_hashed(&root_hash, &None, &root);
@@ -2461,6 +2525,18 @@ pub async fn scan_data_folder(
                     new_cache.info.snapshot_complete = false;
                     if root_has_progress {
                         set_scan_checkpoint(new_cache, checkpoint_reason_from_budget(budget.reason()));
+                    }
+                    new_cache.seal_scan_frontier(coverage_frontier.as_deref())?;
+                    if new_cache.info.scan_progress.is_some() {
+                        if let Some(checkpoint) = &new_cache.info.scan_checkpoint {
+                            global_metrics().record_scanner_checkpoint_set(
+                                checkpoint.version,
+                                checkpoint.resume_after.clone(),
+                                checkpoint.reason.as_str(),
+                            );
+                        } else {
+                            global_metrics().record_scanner_checkpoint_cleared();
+                        }
                     }
                     close_disk_guard.close().await;
                     return Err(ScannerError::PartialCache(Box::new(new_cache.clone())));

@@ -1204,7 +1204,7 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
     let mut revision = DataUsageCacheRevision::Missing;
     let outcome = tokio::time::timeout(
         Duration::from_secs(30),
-        run_data_scanner_cycle_with_budget(&ctx, &store, &mut cycle_info, &mut revision, 1, Arc::clone(&budget)),
+        run_data_scanner_cycle_with_budget(&ctx, &store, &mut cycle_info, &mut revision, 1, Arc::clone(&budget), true),
     )
     .await
     .expect("the coordinator must finish its namespace walk while a PUT is pending");
@@ -1240,7 +1240,7 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
     let retry_budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default());
     let outcome = tokio::time::timeout(
         Duration::from_secs(30),
-        run_data_scanner_cycle_with_budget(&ctx, &store, &mut cycle_info, &mut revision, 1, Arc::clone(&retry_budget)),
+        run_data_scanner_cycle_with_budget(&ctx, &store, &mut cycle_info, &mut revision, 1, Arc::clone(&retry_budget), true),
     )
     .await
     .expect("the same cycle must converge after the pending PUT drains");
@@ -8238,6 +8238,76 @@ fn clean_idle_backoff_policy_preserves_explicit_and_maintenance_cycles() {
     }
 }
 
+#[tokio::test]
+#[serial]
+async fn scoped_scan_explicit_bitrot_keeps_dirty_planning_without_idle_backoff() {
+    temp_env::async_with_vars([(ENV_SCANNER_CYCLE, None), (ENV_SCANNER_BITROT_CYCLE_SECS, Some("3600"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+        let (_temp_dir, store) = setup_scanner_cycle_store_with_pool_count(true, 2).await;
+        let ctx = CancellationToken::new();
+        let (features, generation) = configure_scanner_defaults(&ctx, &store).await;
+        let config = resolve_scanner_runtime_config();
+        assert_eq!(config.cycle_interval_source, ScannerRuntimeConfigSource::Default);
+        assert_eq!(config.bitrot_cycle_source, ScannerRuntimeConfigSource::Env);
+        assert!(!scanner_clean_idle_backoff_configured(&config));
+        assert!(!features.needs_regular_cycle());
+        assert_eq!(
+            generation,
+            Some(scanner_maintenance_generation()),
+            "multi-disk startup must inspect maintenance independently"
+        );
+        let observed = ScannerCycleObservedGenerations::for_wait(&config, None, 7, 0, scanner_maintenance_generation());
+        assert_eq!(observed.dirty_usage, Some(7), "explicit bitrot still permits ordinary dirty wakeups");
+        for (wake, full) in [
+            (ScannerCycleWakeReason::DirtyUsage, false),
+            (ScannerCycleWakeReason::ClusterActivity, false),
+            (ScannerCycleWakeReason::Timer, true),
+            (ScannerCycleWakeReason::ClusterMaintenance, true),
+        ] {
+            assert_eq!(
+                features.requires_full_scan(generation, scanner_maintenance_generation(), wake),
+                full,
+                "{wake:?}"
+            );
+        }
+        assert!(features.requires_full_scan(None, scanner_maintenance_generation(), ScannerCycleWakeReason::DirtyUsage));
+        for unsafe_features in [
+            ScannerMaintenanceFeatures {
+                lifecycle: true,
+                ..Default::default()
+            },
+            ScannerMaintenanceFeatures {
+                replication: true,
+                ..Default::default()
+            },
+            ScannerMaintenanceFeatures {
+                inspection_failed: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(unsafe_features.requires_full_scan(
+                generation,
+                scanner_maintenance_generation(),
+                ScannerCycleWakeReason::DirtyUsage
+            ));
+        }
+        crate::scanner_io::record_scanner_maintenance_change("maintenance-proof-change");
+        assert!(features.requires_full_scan(generation, scanner_maintenance_generation(), ScannerCycleWakeReason::DirtyUsage));
+        let (refreshed, refreshed_generation) = detect_stable_scanner_maintenance_features(&ctx, &store)
+            .await
+            .expect("changed maintenance generation should be inspected");
+        assert!(!refreshed.requires_full_scan(
+            Some(refreshed_generation),
+            scanner_maintenance_generation(),
+            ScannerCycleWakeReason::DirtyUsage
+        ));
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
 #[test]
 fn clean_idle_backoff_requires_activity_probes() {
     let default_config = ScannerRuntimeConfig::default();
@@ -8624,6 +8694,63 @@ fn scanner_node_activity(epoch: &str, namespace_generation: u64, maintenance_gen
         movement_generation: 9,
         publication_blocked: false,
     }
+}
+
+#[test]
+fn scoped_scan_remote_dirty_coverage_invalidates_local_bucket_current() {
+    let before = BTreeMap::from([("remote".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+    let mut after = before.clone();
+    let remote = after.get_mut("remote").expect("remote activity should exist");
+    remote.dirty_usage_generation += 1;
+    remote.dirty_usage_pending = true;
+    assert_eq!(scanner_activity_structural_digest(&before), scanner_activity_structural_digest(&after));
+    let old_plan = crate::scanner_io::checkpoint_fixture_bucket_digest(
+        DataUsageScanPlanDigest(scanner_activity_snapshot_digest(&before)),
+        None,
+    );
+    let new_plan = crate::scanner_io::checkpoint_fixture_bucket_digest(
+        DataUsageScanPlanDigest(scanner_activity_snapshot_digest(&after)),
+        None,
+    );
+    assert_ne!(
+        old_plan, new_plan,
+        "remote dirty changes must fence Current even without a local bucket hint"
+    );
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut cache = DataUsageCache {
+        info: crate::DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            leader_epoch: 11,
+            source: Some(source),
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH),
+            snapshot_complete: true,
+            scan_plan_digest: Some(old_plan),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace("bucket", "", DataUsageEntry::default());
+    assert!(matches!(
+        crate::scanner_io::current_cache_root_or_prepare_with_generation(
+            &mut cache,
+            "bucket",
+            source,
+            7,
+            11,
+            new_plan,
+            crate::scanner_io::DataUsageCacheReuseOptions {
+                require_source: true,
+                tier_registry_generation: None,
+                checkpoint_identity: None,
+            },
+        ),
+        crate::scanner_io::DataUsageCacheScanState::Prepared {
+            outcome: DataUsageCachePrepareOutcome::Reset,
+            ..
+        }
+    ));
 }
 
 #[test]

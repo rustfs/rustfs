@@ -228,10 +228,25 @@
             "sanUsed": false,
             "extensionsUsed": false,
             "attributesUsed": false,
+            "authorizationCompatibility": {
+                "decision": "constrained CSR profile for the pinned stock step-ca JWK authorization path",
+                "reason": "The JWK token carries SANs as strings and step-ca classifies each string by content before comparing it with the typed PKCS#10 GeneralName.",
+                "noSubjectAlternativeNameAccepted": true,
+                "matchingTypes": {
+                    "iPAddress": "a parsed IPv4 or IPv6 address",
+                    "uniformResourceIdentifier": "an absolute URI with a conventional scheme, valid percent escapes, and no control octets",
+                    "rfc822Name": "a non-IP, non-URI value containing @",
+                    "dNSName": "every remaining non-empty string"
+                },
+                "unsupportedGeneralNamesRejected": true,
+                "mismatchedTypeReason": "CERTIFICATE_REQUEST_PROFILE_UNSUPPORTED",
+                "retryable": false,
+                "identityBoundary": "The names are mirrored only so the authority can validate proof of possession. The issued CN and sole URI SAN are rendered from Connect's signed deviceUid claim and checked after issuance."
+            },
             "claimedDeviceUidInFixtures": "0198f4b0-8b00-7d80-9491-9fa0b1c2d3e7",
             "claimedSubjectAlternativeNameInFixtures": "urn:rustfs:connect:device:0198f4b0-8b00-7d80-9491-9fa0b1c2d3e7",
             "claimedIdentityNote": "Every certificate request in this set carries the subject CN=0198f4b0-8b00-7d80-9491-9fa0b1c2d3e7 and the matching device URN as its only subject alternative name. Connect assigned no such device, and no vector references that uid anywhere else. A verifier that reads an identity out of a certificate request will visibly agree with a value nothing else in the exchange corroborates, which is easier to notice than an omission.",
-            "ignoredFieldsNote": "Connect consumes a certificate request for its SubjectPublicKeyInfo and its self-signature and for nothing else. The subject, the subject alternative names, any requested extensions, and any attributes are ignored and are never copied into the issued certificate. A device cannot name itself: ADR 0008 fixes the issued subject as CN=<clusterDeviceUid> and the SAN as urn:rustfs:connect:device:<clusterDeviceUid>, and Connect assigns that uid during this exchange. A device has no uid to put in a certificate request, which is the structural reason the request cannot be the source of its own identity.",
+            "ignoredFieldsNote": "subjectUsed and sanUsed mean used as identity or copied into the certificate; both are false. Connect mirrors compatible names into a minute-scale CA authorization token only so stock step-ca can compare them with this CSR. Requested extensions and attributes remain unused. A device cannot name itself: ADR 0008 fixes the issued subject as CN=<clusterDeviceUid> and the SAN as urn:rustfs:connect:device:<clusterDeviceUid>, and Connect assigns that uid during this exchange. A device has no uid to put in a certificate request, which is the structural reason the request cannot be the source of its own identity.",
             "selfSignatureAloneIsInsufficient": "A valid self-signature proves only that somebody holds the key in the request. It binds no token, no tenant, no cluster, and no attempt, so a verifier that stopped there would issue a device certificate to any key presented with any stolen token. reject-vectors.json publishes exactly that vector under \"accepted proof presented with a substituted certificate request\"."
         }
     },
@@ -245,6 +260,7 @@
             "decode the certificate request, refuse anything that is not one well-formed PKCS#10 DER with no trailing octets with CERTIFICATE_REQUEST_MALFORMED",
             "refuse a SubjectPublicKeyInfo that is not an ECDSA key on P-256 with DEVICE_KEY_UNSUPPORTED",
             "refuse a certificate request whose ES256 self-signature does not verify under its own key with CERTIFICATE_REQUEST_MALFORMED",
+            "refuse a certificate request whose subject or typed SANs cannot round-trip through the pinned stock step-ca authorization strings with CERTIFICATE_REQUEST_PROFILE_UNSUPPORTED",
             "resolve the registration token by uid and secret digest and refuse anything not usable now with REGISTRATION_TOKEN_UNUSABLE",
             "rebuild the transcript from the resolved row plus requestId and the recomputed certificate request digest",
             "verify the proof over those octets under the certificate request key and refuse with REGISTRATION_PROOF_INVALID"
@@ -255,6 +271,7 @@
             "SIGNATURE_NOT_CANONICAL",
             "CERTIFICATE_REQUEST_MALFORMED",
             "DEVICE_KEY_UNSUPPORTED",
+            "CERTIFICATE_REQUEST_PROFILE_UNSUPPORTED",
             "REGISTRATION_PROOF_INVALID"
         ],
         "ownedElsewhere": [

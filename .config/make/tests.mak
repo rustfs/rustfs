@@ -31,6 +31,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_object_batch_bench_enhanced.sh
 	./scripts/test_hotpath_warp_ab_gate.sh
 	./scripts/test_hotpath_warp_abba.sh
+	./scripts/test_scanner_validation_harness.sh
 	./scripts/test_exact_1mib_handoff_abba.sh
 	./scripts/test_pinned_paired_abba_bench.sh
 	./scripts/test_manual_transition_runbooks.sh
