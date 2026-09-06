@@ -324,7 +324,7 @@ pub(crate) async fn merged_list_objects_v2(
     }
 
     let issue_progress_tokens = rustfs_utils::get_env_bool(ENV_LIST_PROGRESS_TOKENS, false);
-    let framed = token.is_some_and(|token| token.framed) || rustfs_utils::get_env_bool(ENV_LIST_FRAMED_TOKENS, false);
+    let framed = token.is_some_and(|token| token.framed) || rustfs_utils::get_env_bool(ENV_LIST_FRAMED_TOKENS, true);
     let outcome = match merger.finish(issue_progress_tokens) {
         Ok(outcome) => outcome,
         Err(ListPageError::NoProgress(MergeSide::Source)) => {
@@ -1486,7 +1486,7 @@ mod tests {
             temp_env::async_with_vars(
                 [
                     (ENV_LIST_PROGRESS_TOKENS, Some("true")),
-                    (ENV_LIST_FRAMED_TOKENS, None),
+                    (ENV_LIST_FRAMED_TOKENS, Some("false")),
                     ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
                     ("HTTP_PROXY", None),
                     ("HTTPS_PROXY", None),
@@ -1567,7 +1567,7 @@ mod tests {
             temp_env::async_with_vars(
                 [
                     (ENV_LIST_PROGRESS_TOKENS, None),
-                    (ENV_LIST_FRAMED_TOKENS, None),
+                    (ENV_LIST_FRAMED_TOKENS, Some("false")),
                     ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
                     ("HTTP_PROXY", None),
                     ("HTTPS_PROXY", None),
@@ -1596,7 +1596,7 @@ mod tests {
                             let raw = base64_simd::STANDARD.decode_to_vec(&next).expect("base64 continuation token");
                             let decoded = std::str::from_utf8(&raw).expect("JSON token");
                             let token = decode_list_cursor(Some(decoded)).expect("v1 reader").expect("merged token");
-                            assert!(!token.framed, "the default cannot begin issuing framed tokens");
+                            assert!(!token.framed, "explicit false must keep issuing bare tokens for older readers");
                             assert_eq!(token.v, 1, "the default rollout cannot begin issuing v2");
                             assert_eq!(token.no_progress, None);
                             assert!(!decoded.contains("no_progress"), "ordinary v1 wire shape stays unchanged");
@@ -2249,7 +2249,10 @@ mod tests {
                     input.continuation_token = Some(next);
 
                     temp_env::async_with_vars(
-                        [(ENV_LIST_PROGRESS_TOKENS, None::<&str>), (ENV_LIST_FRAMED_TOKENS, None)],
+                        [
+                            (ENV_LIST_PROGRESS_TOKENS, None::<&str>),
+                            (ENV_LIST_FRAMED_TOKENS, Some("false")),
+                        ],
                         async {
                             let second = execute_source_list(input.clone())
                                 .await
