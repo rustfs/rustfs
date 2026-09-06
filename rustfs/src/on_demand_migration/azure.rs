@@ -918,6 +918,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dot_segment_keys_fail_before_any_source_request() {
+        let (endpoint, recorded) = scripted_server(Vec::new()).await;
+        let backend = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]));
+        for key in [".", "..", "dir/./key", "dir/../key", "\u{fffe}/../key"] {
+            assert!(matches!(backend.head(key).await, Err(SourceError::Unsupported(_))), "HEAD {key:?}");
+            assert!(matches!(backend.get(key, None).await, Err(SourceError::Unsupported(_))), "GET {key:?}");
+            assert!(matches!(backend.tagging(key).await, Err(SourceError::Unsupported(_))), "tags {key:?}");
+        }
+        assert!(recorded.lock().expect("recorder lock").is_empty());
+    }
+
+    #[tokio::test]
     async fn sas_credentials_travel_in_the_query_and_never_sign() {
         let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(200, blob_headers(), String::new())]).await;
         let backend = backend(
