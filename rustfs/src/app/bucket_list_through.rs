@@ -1010,10 +1010,11 @@ mod tests {
     #[serial_test::serial]
     fn native_list_through_malformed_fields_follow_both_source_policies() {
         run_large_stack_test("native-list-through-fields", || async {
+            // The proxy matcher treats IP literals separately from the `*` domain wildcard.
             temp_env::async_with_vars(
                 [("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")), ("HTTP_PROXY", None), ("HTTPS_PROXY", None),
                  ("ALL_PROXY", None), ("http_proxy", None), ("https_proxy", None), ("all_proxy", None),
-                 ("NO_PROXY", Some("*")), ("no_proxy", Some("*"))],
+                 ("NO_PROXY", Some("127.0.0.1,localhost,::1")), ("no_proxy", Some("127.0.0.1,localhost,::1"))],
                 async {
                     #[cfg(feature = "gcs")]
                     let service_account = native_test_service_account();
@@ -1068,6 +1069,7 @@ mod tests {
     #[serial_test::serial]
     fn native_list_through_preserves_valid_empty_pages_and_zero_size_objects() {
         run_large_stack_test("native-list-through-valid", || async {
+            // The proxy matcher treats IP literals separately from the `*` domain wildcard.
             temp_env::async_with_vars(
                 [
                     ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
@@ -1077,8 +1079,8 @@ mod tests {
                     ("http_proxy", None),
                     ("https_proxy", None),
                     ("all_proxy", None),
-                    ("NO_PROXY", Some("*")),
-                    ("no_proxy", Some("*")),
+                    ("NO_PROXY", Some("127.0.0.1,localhost,::1")),
+                    ("no_proxy", Some("127.0.0.1,localhost,::1")),
                 ],
                 async {
                     #[cfg(feature = "gcs")]
