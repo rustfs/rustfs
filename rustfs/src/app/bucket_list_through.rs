@@ -1941,7 +1941,7 @@ mod tests {
                             .expect("both finite source scans complete")
                             .expect("source server");
                         assert_eq!(requests.len(), 6, "framing changes add no source fetches");
-                        for scan in requests.chunks_exact(3) {
+                        for scan in requests.as_chunks::<3>().0.iter() {
                             assert!(!scan[0].contains("continuation-token="));
                             for request in &scan[1..] {
                                 assert!(request.contains("continuation-token=S"), "{request}");
