@@ -302,7 +302,164 @@ pub(crate) fn site_replication_state_replicates_ilm_expiry(state: &SiteReplicati
     state.peers.values().any(|peer| peer.replicate_ilm_expiry)
 }
 
-pub(crate) fn site_replication_bootstrap_plan(info: &SRInfo) -> S3Result<SiteReplicationBootstrapPlan> {
+/// Secret-bearing half of the IAM snapshot. `SRInfo` is served to admin
+/// callers (`site-replication/info`, status, add preflight) and must stay
+/// secret-free, so the bootstrap plan receives credentials through this
+/// separate value, built only on the paths that deliver to peers (site add
+/// bootstrap, repair, retry snapshot resend). Never persisted, never served.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SiteReplicationIamCredentials {
+    /// Built-in users (access key -> credential); temp and service accounts
+    /// are excluded, external/IdP users never appear here.
+    pub(crate) users: BTreeMap<String, SiteReplicationUserCredential>,
+    /// Every service account except the site replicator's own, already
+    /// shaped as the `service-account` create item the live hook emits.
+    pub(crate) service_accounts: Vec<SiteReplicationServiceAccountSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SiteReplicationUserCredential {
+    pub(crate) secret_key: String,
+    pub(crate) status: AccountStatus,
+    /// The user record's own update time (the axis the receiver's staleness
+    /// check compares against), unlike `UserInfo::updated_at` which
+    /// `list_users` overwrites with the policy mapping's time.
+    pub(crate) updated_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SiteReplicationServiceAccountSnapshot {
+    pub(crate) create: SRSvcAccCreate,
+    pub(crate) envelope: Option<SRSvcAccReplicationEnvelope>,
+    pub(crate) updated_at: Option<OffsetDateTime>,
+}
+
+pub(crate) const SERVICE_ACCOUNT_ENVELOPE_VERSION: u64 = 2;
+
+pub(crate) fn encode_service_account_replication_policy(
+    claims: &HashMap<String, Value>,
+    session_policy: Option<&str>,
+) -> S3Result<(SRSessionPolicy, Option<SRSvcAccReplicationEnvelope>)> {
+    if !claims.contains_key(OIDC_VIRTUAL_PARENT_CLAIM) {
+        return session_policy
+            .map(SRSessionPolicy::from_json)
+            .transpose()
+            .map(|policy| policy.unwrap_or_default())
+            .map(|policy| (policy, None))
+            .map_err(|err| s3_error!(InvalidArgument, "marshal policy failed: {:?}", err));
+    }
+
+    let policy = match session_policy {
+        Some(policy) => serde_json::from_str::<Policy>(policy)
+            .map_err(|err| s3_error!(InvalidArgument, "invalid service account replication policy: {:?}", err))?,
+        None => Policy::default(),
+    };
+    if policy.statements.is_empty() && (!policy.id.is_empty() || !policy.version.is_empty())
+        || policy.version.is_empty() && !policy.statements.is_empty()
+    {
+        return Err(s3_error!(InvalidArgument, "service account replication policy is not normalized"));
+    }
+    let policy = serde_json::to_string(&policy)
+        .map_err(|err| s3_error!(InternalError, "marshal service account replication policy failed: {:?}", err))?;
+    let policy = SRSessionPolicy::from_json(&policy)
+        .map_err(|err| s3_error!(InternalError, "marshal service account replication policy failed: {:?}", err))?;
+    Ok((
+        policy,
+        Some(SRSvcAccReplicationEnvelope {
+            version: SERVICE_ACCOUNT_ENVELOPE_VERSION,
+        }),
+    ))
+}
+
+/// Read the credentials the IAM snapshot needs straight from the IAM store:
+/// `list_users` deliberately strips secret keys and skips service accounts,
+/// which is right for an admin listing and wrong for a peer snapshot (the
+/// plan builder used to drop every user for lack of a secret, so a status
+/// change or secret rotation committed while a peer was unreachable never
+/// reached it — backlog#2289).
+pub(crate) async fn build_sr_iam_credentials() -> S3Result<SiteReplicationIamCredentials> {
+    let mut credentials = SiteReplicationIamCredentials::default();
+    let Some(iam_sys) = current_iam_handle() else {
+        return Ok(credentials);
+    };
+
+    let mut users = HashMap::new();
+    iam_sys.load_users(UserType::Reg, &mut users).await.map_err(ApiError::from)?;
+    for (access_key, identity) in users {
+        if identity.credentials.is_temp() || identity.credentials.is_service_account() {
+            continue;
+        }
+        credentials.users.insert(
+            access_key,
+            SiteReplicationUserCredential {
+                secret_key: identity.credentials.secret_key,
+                status: if identity.credentials.status == "off" {
+                    AccountStatus::Disabled
+                } else {
+                    AccountStatus::Enabled
+                },
+                updated_at: identity.update_at,
+            },
+        );
+    }
+
+    let mut service_accounts = HashMap::new();
+    iam_sys
+        .load_users(UserType::Svc, &mut service_accounts)
+        .await
+        .map_err(ApiError::from)?;
+    let mut service_accounts: Vec<_> = service_accounts.into_iter().collect();
+    service_accounts.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (access_key, identity) in service_accounts {
+        // The replicator account is installed by join / rotate, never by a snapshot.
+        if access_key == SITE_REPLICATOR_SERVICE_ACCOUNT || !identity.credentials.is_service_account() {
+            continue;
+        }
+        let claims = iam_sys.get_claims_for_svc_acc(&access_key).await.map_err(ApiError::from)?;
+        let (account, session_policy) = iam_sys.get_service_account(&access_key).await.map_err(ApiError::from)?;
+        let session_policy = session_policy
+            .map(|policy| serde_json::to_string(&policy))
+            .transpose()
+            .map_err(|err| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("marshal service account session policy failed: {err:?}"),
+                )
+            })?;
+        let (session_policy, envelope) = encode_service_account_replication_policy(&claims, session_policy.as_deref())?;
+        credentials.service_accounts.push(SiteReplicationServiceAccountSnapshot {
+            create: SRSvcAccCreate {
+                parent: identity.credentials.parent_user,
+                access_key,
+                secret_key: identity.credentials.secret_key,
+                groups: identity.credentials.groups.unwrap_or_default(),
+                claims,
+                session_policy,
+                status: identity.credentials.status,
+                name: account.name.unwrap_or_default(),
+                description: account.description.unwrap_or_default(),
+                expiration: account.expiration,
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            },
+            envelope,
+            updated_at: identity.update_at,
+        });
+    }
+
+    Ok(credentials)
+}
+
+/// The bootstrap plan for peer delivery: `info` (secret-free) plus the IAM
+/// credentials read at this moment.
+pub(crate) async fn build_site_replication_bootstrap_plan(info: &SRInfo) -> S3Result<SiteReplicationBootstrapPlan> {
+    let credentials = build_sr_iam_credentials().await?;
+    site_replication_bootstrap_plan(info, &credentials)
+}
+
+pub(crate) fn site_replication_bootstrap_plan(
+    info: &SRInfo,
+    credentials: &SiteReplicationIamCredentials,
+) -> S3Result<SiteReplicationBootstrapPlan> {
     let mut plan = SiteReplicationBootstrapPlan::default();
     let replicate_ilm_expiry = site_replication_info_replicates_ilm_expiry(info);
 
@@ -318,24 +475,57 @@ pub(crate) fn site_replication_bootstrap_plan(info: &SRInfo) -> S3Result<SiteRep
     }
 
     for (access_key, user) in &info.user_info_map {
-        if let Some(secret_key) = &user.secret_key {
-            plan.iam_items.push(SRIAMItem {
-                r#type: "iam-user".to_string(),
-                iam_user: Some(rustfs_madmin::SRIAMUser {
-                    access_key: access_key.clone(),
-                    is_delete_req: false,
-                    user_req: Some(AddOrUpdateUserReq {
-                        secret_key: secret_key.clone(),
-                        policy: user.policy_name.clone(),
-                        status: user.status.clone(),
-                    }),
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        // Credentials come from the store snapshot; an inline `secret_key` on
+        // the SRInfo entry (older callers, tests) is accepted as a fallback.
+        // Users with neither (external / IdP identities) have nothing a peer
+        // could install and are skipped.
+        let credential = credentials.users.get(access_key);
+        let Some(secret_key) = credential
+            .map(|credential| credential.secret_key.clone())
+            .or_else(|| user.secret_key.clone())
+            .filter(|secret_key| !secret_key.is_empty())
+        else {
+            continue;
+        };
+        let status = credential
+            .map(|credential| credential.status.clone())
+            .unwrap_or_else(|| user.status.clone());
+        let updated_at = credential.and_then(|credential| credential.updated_at).or(user.updated_at);
+        plan.iam_items.push(SRIAMItem {
+            r#type: "iam-user".to_string(),
+            iam_user: Some(rustfs_madmin::SRIAMUser {
+                access_key: access_key.clone(),
+                is_delete_req: false,
+                user_req: Some(AddOrUpdateUserReq {
+                    secret_key,
+                    policy: user.policy_name.clone(),
+                    status,
                 }),
-                updated_at: user.updated_at,
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        });
+    }
+
+    // Service accounts follow their parents: the receiver creates a missing
+    // account under `parent` and updates an existing one (secret, status,
+    // session policy), so a rotation or disable committed during an outage
+    // converges through the same snapshot as users do.
+    for account in &credentials.service_accounts {
+        plan.iam_items.push(SRIAMItem {
+            r#type: "service-account".to_string(),
+            svc_acc_change: Some(SRSvcAccChange {
+                create: Some(account.create.clone()),
+                oidc_service_account_envelope: account.envelope.clone(),
                 api_version: Some(SITE_REPL_API_VERSION.to_string()),
                 ..Default::default()
-            });
-        }
+            }),
+            updated_at: account.updated_at,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        });
     }
 
     for (name, desc) in &info.group_desc_map {
@@ -518,7 +708,12 @@ pub(crate) async fn broadcast_site_replication_make_bucket(
     } else {
         path
     };
-    broadcast_site_replication_json_using_runtime(runtime, &path, &serde_json::json!({})).await?;
+    // Both steps run to completion on their own: the broadcast attempts every
+    // peer and reports the first failure (backlog#2293), so stopping here on
+    // that error would skip `configure-replication` for the peers whose
+    // `make` just succeeded — and nothing records a retry for that gap. The
+    // failed peer's retry events cover both steps independently.
+    let make_result = broadcast_site_replication_json_using_runtime(runtime, &path, &serde_json::json!({})).await;
 
     let configure_path = bootstrap_bucket_op_path(bucket, "configure-replication");
     let configure_path = if let Some(token) = bootstrap_token {
@@ -526,7 +721,8 @@ pub(crate) async fn broadcast_site_replication_make_bucket(
     } else {
         configure_path
     };
-    broadcast_site_replication_json_using_runtime(runtime, &configure_path, &serde_json::json!({})).await
+    let configure_result = broadcast_site_replication_json_using_runtime(runtime, &configure_path, &serde_json::json!({})).await;
+    make_result.and(configure_result)
 }
 
 const SITE_REPLICATION_DELETE_INTENT_PENDING: &str =
@@ -832,6 +1028,21 @@ pub async fn site_replication_iam_change_hook(item: SRIAMItem) -> S3Result<()> {
     let Some(runtime) = runtime_site_replication_targets().await? else {
         return Ok(());
     };
+    // A local revoke must out-rank a stale grant a peer delivers later, so its
+    // mark is committed before the broadcast (backlog#2291). The broadcast
+    // still goes out when the mark cannot be persisted: the peers' own records
+    // remain the primary gate, the mark only covers the deleted case.
+    if let Err(err) = record_iam_deletion_marks_for_item(&item).await {
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            item_type = %item.r#type,
+            result = "iam_deletion_mark_not_recorded",
+            error = ?err,
+            "failed to record local IAM deletion mark before broadcast"
+        );
+    }
     let mut first_error: Option<S3Error> = None;
     for peer in runtime.state.peers.values() {
         if peer.deployment_id == runtime.local_peer.deployment_id

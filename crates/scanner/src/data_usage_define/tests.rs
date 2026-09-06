@@ -29,6 +29,8 @@ use tokio::sync::Mutex;
 
 const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([3; 32]);
 
+mod cache_cost;
+
 #[test]
 fn scoped_scan_coverage_metadata_preserves_map_compatibility() {
     #[derive(serde::Deserialize)]

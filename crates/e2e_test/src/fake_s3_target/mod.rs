@@ -451,8 +451,38 @@ impl JournaledHeaders {
 struct ControlState {
     scripts: HashMap<Operation, VecDeque<FaultAction>>,
     keyed_scripts: HashMap<(Operation, String), VecDeque<FaultAction>>,
+    held_get: Option<HeldGetObject>,
     requests: VecDeque<RequestRecord>,
     next_sequence: u64,
+}
+
+#[derive(Clone)]
+struct HeldGetObject {
+    bucket: String,
+    key: String,
+    entered: watch::Sender<usize>,
+    released: watch::Receiver<bool>,
+}
+
+/// Holds every GET of one object, including retries, until this guard is dropped.
+#[must_use = "dropping the guard releases the held GET requests"]
+pub struct GetObjectGate {
+    control: Arc<Mutex<ControlState>>,
+    entered: watch::Receiver<usize>,
+    released: watch::Sender<bool>,
+}
+
+impl GetObjectGate {
+    pub async fn wait_until_entered(&mut self) -> Result<(), watch::error::RecvError> {
+        self.entered.wait_for(|count| *count > 0).await.map(|_| ())
+    }
+}
+
+impl Drop for GetObjectGate {
+    fn drop(&mut self) {
+        lock(&self.control).held_get = None;
+        self.released.send_replace(true);
+    }
 }
 
 #[derive(Default)]
@@ -934,6 +964,30 @@ impl FakeS3Target {
             .entry((operation, key.into()))
             .or_default()
             .extend(std::iter::repeat_n(action, times));
+    }
+
+    /// Hold one exact bucket/key before any GET response can reach the client.
+    /// The fixture supports one live gate; request and connection deadlines still apply.
+    pub fn hold_get_object(&self, bucket: &str, key: &str) -> GetObjectGate {
+        assert!(
+            bucket.len() <= MAX_RETAINED_IDENTIFIER_BYTES && key.len() <= MAX_RETAINED_IDENTIFIER_BYTES,
+            "held GET identifiers exceed the fixture limit"
+        );
+        let mut state = lock(&self.control);
+        assert!(state.held_get.is_none(), "fake target already holds a GET gate");
+        let (entered, entered_rx) = watch::channel(0);
+        let (released, released_rx) = watch::channel(false);
+        state.held_get = Some(HeldGetObject {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            entered,
+            released: released_rx,
+        });
+        GetObjectGate {
+            control: Arc::clone(&self.control),
+            entered: entered_rx,
+            released,
+        }
     }
 
     pub fn clear_faults(&self) {
@@ -2243,6 +2297,17 @@ impl S3 for FakeBackend {
         let fault = request_fault(&req);
         apply_non_body_fault(fault.as_ref(), &self.control).await?;
         let input = req.input;
+        let held_get = lock(&self.control)
+            .held_get
+            .as_ref()
+            .filter(|held| held.bucket == input.bucket && held.key == input.key)
+            .cloned();
+        if let Some(mut held) = held_get {
+            held.entered.send_modify(|count| *count += 1);
+            // Keep the gate installed when a request is cancelled or times out:
+            // a retry must cross the same boundary before returning any bytes.
+            let _ = held.released.wait_for(|released| *released).await;
+        }
         let (version, versioned) = {
             let state = lock(&self.store);
             (
@@ -2892,6 +2957,81 @@ mod tests {
 
     fn retain_until() -> aws_sdk_s3::primitives::DateTime {
         aws_sdk_s3::primitives::DateTime::from_secs(4_102_444_800)
+    }
+
+    #[tokio::test]
+    async fn get_object_gate_holds_retries_and_releases_on_drop() -> Result<(), BoxError> {
+        let target = FakeS3Target::start().await?;
+        let bucket = "gated-target";
+        target.create_bucket(bucket);
+        for key in ["held", "unrelated"] {
+            target.put_seed_object(bucket, key, Bytes::from_static(b"payload"), &SeedMetadata::default());
+        }
+        {
+            let gate = target.hold_get_object(bucket, "held");
+            let request = || S3Request {
+                input: GetObjectInput {
+                    bucket: bucket.to_string(),
+                    key: "held".to_string(),
+                    ..Default::default()
+                },
+                method: Method::GET,
+                uri: Uri::from_static("/gated-target/held"),
+                headers: HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            // Without a fault, only the gate can suspend this backend method.
+            let mut first = target.backend.get_object(request());
+            assert!(futures::poll!(first.as_mut()).is_pending(), "the first GET must wait at the gate");
+            drop(first);
+            let mut retry = target.backend.get_object(request());
+            assert!(futures::poll!(retry.as_mut()).is_pending(), "a cancelled GET must not consume the gate");
+            drop(gate);
+            let std::task::Poll::Ready(response) = futures::poll!(retry.as_mut()) else {
+                panic!("dropping the gate must release the waiting GET");
+            };
+            let mut body = response?.output.body.expect("released GET body");
+            assert_eq!(body.next().await.transpose()?, Some(Bytes::from_static(b"payload")));
+            assert!(body.next().await.is_none(), "released GET body must be complete");
+        }
+        let client = client(&target);
+        let mut gate = target.hold_get_object(bucket, "held");
+        let mut requests = tokio::task::JoinSet::new();
+        let first = client.clone();
+        requests.spawn(async move { get_bytes(&first, bucket, "held", None).await });
+        timeout(Duration::from_secs(2), gate.wait_until_entered()).await??;
+        requests.abort_all();
+        assert!(
+            requests
+                .join_next()
+                .await
+                .expect("first GET task")
+                .expect_err("cancel the first GET attempt")
+                .is_cancelled()
+        );
+
+        let retry = client.clone();
+        requests.spawn(async move { get_bytes(&retry, bucket, "held", None).await });
+        timeout(Duration::from_secs(2), gate.entered.wait_for(|count| *count == 2)).await??;
+        assert_eq!(
+            timeout(Duration::from_secs(2), get_bytes(&client, bucket, "unrelated", None)).await??,
+            Bytes::from_static(b"payload")
+        );
+        assert!(requests.try_join_next().is_none(), "the retry must remain behind the gate");
+        drop(gate);
+        assert_eq!(
+            timeout(Duration::from_secs(2), requests.join_next())
+                .await?
+                .expect("retried GET task")??,
+            Bytes::from_static(b"payload")
+        );
+        assert_eq!(get_bytes(&client, bucket, "held", None).await?, Bytes::from_static(b"payload"));
+        assert_eq!(target.count_requests(Operation::GetObject, "held"), 3);
+        Ok(())
     }
 
     #[tokio::test]

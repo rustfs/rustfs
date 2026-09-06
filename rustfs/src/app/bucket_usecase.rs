@@ -2783,41 +2783,48 @@ impl DefaultBucketUsecase {
         } else {
             (None, None)
         };
-        let (object_infos, degraded) = match source_state {
-            Some(state) => {
+        let (object_infos, degraded) = match (source_state, merged_token.as_ref()) {
+            (None, Some(token)) if params.max_keys == 0 => {
+                // No source was consulted, so retain every unconsumed side and
+                // the original wire format without spending its progress budget.
+                let is_truncated = !token.local_done || !token.source_done;
+                (
+                    StorageListObjectsV2Info {
+                        is_truncated,
+                        next_continuation_token: params.decoded_continuation_token.clone().filter(|_| is_truncated),
+                        ..Default::default()
+                    },
+                    false,
+                )
+            }
+            (None, None) => {
+                let infos = store
+                    .list_objects_v2(
+                        &bucket,
+                        &params.prefix,
+                        params.decoded_continuation_token.clone(),
+                        params.delimiter.clone(),
+                        params.max_keys,
+                        fetch_owner.unwrap_or_default(),
+                        params.start_after_for_query.clone(),
+                        incl_deleted,
+                    )
+                    .await
+                    .map_err(ApiError::from)?;
+                (infos, false)
+            }
+            (state, token) => {
                 let outcome = list_through::merged_list_objects_v2(
                     &store,
-                    &state,
+                    state.as_ref(),
                     &bucket,
                     &params,
                     fetch_owner.unwrap_or_default(),
                     incl_deleted,
-                    merged_token.as_ref(),
+                    token,
                 )
                 .await?;
                 (outcome.info, outcome.degraded)
-            }
-            None => {
-                let cursor = list_through::local_cursor(params.decoded_continuation_token.as_deref(), merged_token.as_ref());
-                match cursor {
-                    list_through::LocalListCursor::Exhausted => (StorageListObjectsV2Info::default(), false),
-                    list_through::LocalListCursor::Token(token) => {
-                        let infos = store
-                            .list_objects_v2(
-                                &bucket,
-                                &params.prefix,
-                                token,
-                                params.delimiter.clone(),
-                                params.max_keys,
-                                fetch_owner.unwrap_or_default(),
-                                params.start_after_for_query.clone(),
-                                incl_deleted,
-                            )
-                            .await
-                            .map_err(ApiError::from)?;
-                        (infos, false)
-                    }
-                }
             }
         };
 

@@ -35,6 +35,10 @@ use crate::bucket::lifecycle::config_boundary;
 use crate::bucket::lifecycle::durable_namespace::{
     TIER_DELETE_JOURNAL_NAMESPACE, TIER_DELETE_JOURNAL_V6_NAMESPACE, validate_durable_ilm_record,
 };
+use crate::bucket::lifecycle::recovery_control::{
+    IlmRecoveryClassification, IlmRecoveryControl, IlmRecoveryControlIdentity, IlmRecoveryErrorCode, IlmRecoveryProtocol,
+    load_recovery_control, observe_recovery_source, save_recovery_control_if_absent,
+};
 use crate::bucket::lifecycle::runtime_boundary;
 use crate::bucket::lifecycle::tier_sweeper::{
     Jentry, TierDeleteDispatchBinding, TierDeleteJournalState, TierDeleteSourceIdentity,
@@ -78,6 +82,13 @@ const TIER_DELETE_DISPATCH_MEMBER_DELETE_CONCURRENCY: usize = 32;
 const TIER_DELETE_DISPATCH_PREPARE_CONCURRENCY: usize = 16;
 const TIER_DELETE_DISPATCH_CAS_CONCURRENCY: usize = 32;
 const TIER_DELETE_JOURNAL_VERSION: u8 = 2;
+const TIER_DELETE_JOURNAL_V1_RECOVERY_SCHEMA: &str = "rustfs-tier-delete-journal-v1";
+const TIER_DELETE_JOURNAL_V2_RECOVERY_SCHEMA: &str = "rustfs-tier-delete-journal-v2";
+const TIER_DELETE_JOURNAL_UNKNOWN_RECOVERY_SCHEMA: &str = "rustfs-tier-delete-journal-unknown";
+const TIER_DELETE_JOURNAL_V1_RECOVERY_CLASS: &str = "tier_delete_journal_v1";
+const TIER_DELETE_JOURNAL_V2_RECOVERY_CLASS: &str = "tier_delete_journal_v2";
+const TIER_DELETE_JOURNAL_CORRUPT_RECOVERY_CLASS: &str = "tier_delete_journal_corrupt";
+const CORRUPT_TIER_DELETE_JOURNAL_IDENTITY: &str = "corrupt";
 const TIER_DELETE_JOURNAL_EXACT_VERSION: u8 = 3;
 const TIER_DELETE_JOURNAL_STATE_VERSION: u8 = 4;
 const TIER_DELETE_JOURNAL_TRANSACTION_VERSION: u8 = 5;
@@ -5509,6 +5520,125 @@ enum TierDeleteJournalEntryRecoveryOutcome {
     Failed,
 }
 
+fn canonical_legacy_tier_delete_journal_identity(object_name: &str) -> Option<&str> {
+    let identity = object_name
+        .strip_prefix(TIER_DELETE_JOURNAL_LEGACY_PREFIX)?
+        .strip_suffix(".json")?;
+    (rustfs_utils::crypto::is_sha256_checksum(identity)
+        && !identity
+            .bytes()
+            .any(|byte| byte.is_ascii_hexdigit() && byte.is_ascii_uppercase()))
+    .then_some(identity)
+}
+
+fn legacy_tier_delete_recovery_descriptor(entry: &Jentry) -> Option<(&'static str, &'static str)> {
+    match entry.persisted_version {
+        1 => Some((TIER_DELETE_JOURNAL_V1_RECOVERY_SCHEMA, TIER_DELETE_JOURNAL_V1_RECOVERY_CLASS)),
+        TIER_DELETE_JOURNAL_VERSION => Some((TIER_DELETE_JOURNAL_V2_RECOVERY_SCHEMA, TIER_DELETE_JOURNAL_V2_RECOVERY_CLASS)),
+        _ => None,
+    }
+}
+
+fn legacy_tier_delete_control_matches(
+    control: &IlmRecoveryControl,
+    identity: &IlmRecoveryControlIdentity,
+    generation: &crate::bucket::lifecycle::recovery_control::IlmRecoverySourceGeneration,
+    classification: IlmRecoveryClassification,
+    error_code: IlmRecoveryErrorCode,
+) -> bool {
+    control.identity == *identity
+        && control.observed_source_generation == *generation
+        && control.classification == classification
+        && control.last_error_code == error_code
+        && control.owner.is_none()
+        && control.attempt_count == 0
+        && control.consecutive_failure_count == 0
+}
+
+fn legacy_tier_delete_control_is_scheduler_fence(control: &IlmRecoveryControl, identity: &IlmRecoveryControlIdentity) -> bool {
+    control.identity == *identity && control.owner.is_none() && !control.classification.permits_automatic_attempt()
+}
+
+async fn persist_legacy_tier_delete_recovery_control(
+    api: Arc<ECStore>,
+    object_name: &str,
+    observed_data: &[u8],
+    stable_operation_identity: String,
+    (source_schema, record_class): (&'static str, &'static str),
+    intended_classification: IlmRecoveryClassification,
+    intended_error_code: IlmRecoveryErrorCode,
+) -> Result<()> {
+    let identity = IlmRecoveryControlIdentity {
+        protocol: IlmRecoveryProtocol::TierDeleteJournal,
+        canonical_source_path: object_name.to_string(),
+        stable_operation_identity,
+        record_class: record_class.to_string(),
+    };
+    let control_id = identity.source_operation_digest().map_err(Error::other)?;
+    match load_recovery_control(api.clone(), IlmRecoveryProtocol::TierDeleteJournal, &control_id).await {
+        Ok(observed) if legacy_tier_delete_control_is_scheduler_fence(&observed.control, &identity) => return Ok(()),
+        Ok(_) => return Err(Error::PreconditionFailed),
+        Err(Error::ConfigNotFound) => {}
+        Err(err) => return Err(err),
+    }
+
+    let source = observe_recovery_source(api.clone(), object_name, source_schema).await?;
+    let exact_source = source.is_consistent() && source.canonical_data.as_deref() == Some(observed_data);
+    let (classification, error_code) = if exact_source {
+        (intended_classification, intended_error_code)
+    } else {
+        (IlmRecoveryClassification::Corrupt, IlmRecoveryErrorCode::SourceDivergent)
+    };
+    let candidate = IlmRecoveryControl::new(
+        identity.clone(),
+        source.generation.clone(),
+        classification,
+        i64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos())
+            .map_err(|_| Error::other("tier delete journal recovery timestamp does not fit i64"))?,
+        error_code,
+    )
+    .map_err(Error::other)?;
+
+    match save_recovery_control_if_absent(api.clone(), &candidate).await {
+        Ok(()) | Err(Error::PreconditionFailed) => {}
+        Err(save_error) => match load_recovery_control(api.clone(), IlmRecoveryProtocol::TierDeleteJournal, &control_id).await {
+            Ok(observed)
+                if legacy_tier_delete_control_matches(
+                    &observed.control,
+                    &identity,
+                    &source.generation,
+                    classification,
+                    error_code,
+                ) =>
+            {
+                return Ok(());
+            }
+            Ok(_) | Err(_) => return Err(save_error),
+        },
+    }
+
+    let observed = load_recovery_control(api, IlmRecoveryProtocol::TierDeleteJournal, &control_id).await?;
+    if !legacy_tier_delete_control_matches(&observed.control, &identity, &source.generation, classification, error_code) {
+        return Err(Error::PreconditionFailed);
+    }
+    Ok(())
+}
+
+async fn retain_corrupt_legacy_tier_delete_journal(api: Arc<ECStore>, object_name: &str, data: &[u8]) -> Result<()> {
+    canonical_legacy_tier_delete_journal_identity(object_name)
+        .ok_or_else(|| Error::other("tier delete journal path is not canonical"))?;
+    persist_legacy_tier_delete_recovery_control(
+        api,
+        object_name,
+        data,
+        CORRUPT_TIER_DELETE_JOURNAL_IDENTITY.to_string(),
+        (TIER_DELETE_JOURNAL_UNKNOWN_RECOVERY_SCHEMA, TIER_DELETE_JOURNAL_CORRUPT_RECOVERY_CLASS),
+        IlmRecoveryClassification::Corrupt,
+        IlmRecoveryErrorCode::SourceCorrupt,
+    )
+    .await
+}
+
 async fn recover_tier_delete_journal_entry(api: Arc<ECStore>, object_name: String) -> TierDeleteJournalEntryRecoveryOutcome {
     let data = match config_boundary::read_config(api.clone(), &object_name).await {
         Ok(data) => data,
@@ -5529,6 +5659,22 @@ async fn recover_tier_delete_journal_entry(api: Arc<ECStore>, object_name: Strin
     let je = match decode_tier_delete_journal_entry(&data) {
         Ok(je) => je,
         Err(err) => {
+            if canonical_legacy_tier_delete_journal_identity(&object_name).is_some() {
+                return match retain_corrupt_legacy_tier_delete_journal(api, &object_name, &data).await {
+                    Ok(()) => TierDeleteJournalEntryRecoveryOutcome::Retained,
+                    Err(control_error) => {
+                        warn!(
+                            event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            journal_object = %object_name,
+                            error = ?control_error,
+                            "Failed to retain corrupt tier delete journal recovery control"
+                        );
+                        TierDeleteJournalEntryRecoveryOutcome::Failed
+                    }
+                };
+            }
             warn!(
                 event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
                 component = LOG_COMPONENT_ECSTORE,
@@ -5542,6 +5688,22 @@ async fn recover_tier_delete_journal_entry(api: Arc<ECStore>, object_name: Strin
     };
 
     if tier_delete_journal_object_name(&je) != object_name {
+        if canonical_legacy_tier_delete_journal_identity(&object_name).is_some() {
+            return match retain_corrupt_legacy_tier_delete_journal(api, &object_name, &data).await {
+                Ok(()) => TierDeleteJournalEntryRecoveryOutcome::Retained,
+                Err(err) => {
+                    warn!(
+                        event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        journal_object = %object_name,
+                        error = ?err,
+                        "Failed to retain mismatched tier delete journal recovery control"
+                    );
+                    TierDeleteJournalEntryRecoveryOutcome::Failed
+                }
+            };
+        }
         warn!(
             event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
             component = LOG_COMPONENT_ECSTORE,
@@ -5550,6 +5712,36 @@ async fn recover_tier_delete_journal_entry(api: Arc<ECStore>, object_name: Strin
             "Tier delete journal content does not match its object name and will be retained"
         );
         return TierDeleteJournalEntryRecoveryOutcome::Failed;
+    }
+
+    if let Some((source_schema, record_class)) = legacy_tier_delete_recovery_descriptor(&je) {
+        let stable_operation_identity = canonical_legacy_tier_delete_journal_identity(&object_name)
+            .expect("decoded legacy journal path was validated against its canonical object name")
+            .to_string();
+        return match persist_legacy_tier_delete_recovery_control(
+            api,
+            &object_name,
+            &data,
+            stable_operation_identity,
+            (source_schema, record_class),
+            IlmRecoveryClassification::RetainedAmbiguous,
+            IlmRecoveryErrorCode::RemoteVersionUnknown,
+        )
+        .await
+        {
+            Ok(()) => TierDeleteJournalEntryRecoveryOutcome::Retained,
+            Err(err) => {
+                warn!(
+                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    journal_object = %object_name,
+                    error = ?err,
+                    "Failed to retain legacy tier delete journal recovery control"
+                );
+                TierDeleteJournalEntryRecoveryOutcome::Failed
+            }
+        };
     }
 
     match api

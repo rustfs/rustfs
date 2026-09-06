@@ -108,6 +108,144 @@ pub struct ErasureSetHealer {
     target_endpoints: Arc<[String]>,
     replacement_task_id: Option<String>,
     replacement_target_identities: Option<Arc<[ReplacementTargetIdentity]>>,
+    mainline_pacer: Option<Arc<super::pacing::MainlinePacer>>,
+}
+
+async fn acquire_page_permit(
+    semaphore: Arc<Semaphore>,
+    pacer: Option<&super::pacing::MainlinePacer>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    let acquire = || async {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Error::TaskCancelled),
+            permit = semaphore.clone().acquire_owned() => permit.map_err(|err| Error::other(format!("Failed to acquire page concurrency permit: {err}"))),
+        }
+    };
+    let mut paid_pause = false;
+    loop {
+        let permit = acquire().await?;
+        if let Some(pacer) = pacer {
+            // Keep the real permit on the low-pressure path. Every acquisition
+            // gets a fresh decision, including a waiter that queued a second
+            // time. One completed pause is a bounded minimum-progress grant.
+            match pacer.admission_decision() {
+                super::pacing::PacingDecision::Wait(pressure) if !paid_pause => {
+                    drop(permit);
+                    paid_pause = pacer.wait_after_admission(cancel, pressure).await?;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        return Ok(permit);
+    }
+}
+
+#[cfg(test)]
+mod mainline_pacing_tests {
+    use super::*;
+    use crate::heal::pacing::{MainlinePacer, TestPressure};
+    use rustfs_concurrency::WorkloadClass;
+    use std::sync::atomic::Ordering;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test(start_paused = true)]
+    async fn running_mainline_page_waiters_resample_after_capacity_and_release_permits() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let occupied = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("existing object owns capacity");
+        let provider = Arc::new(TestPressure::new(WorkloadClass::ForegroundRead, 0));
+        let pacer = Arc::new(MainlinePacer::new(provider.clone(), 80, 80, Duration::from_millis(250)).expect("pacer"));
+        let cancel = CancellationToken::new();
+        let waiting = tokio::spawn({
+            let semaphore = semaphore.clone();
+            let pacer = pacer.clone();
+            let cancel = cancel.clone();
+            async move { acquire_page_permit(semaphore, Some(&pacer), &cancel).await }
+        });
+        tokio::task::yield_now().await;
+        provider.active.store(100, Ordering::SeqCst);
+        drop(occupied);
+        provider.sampled.notified().await;
+        assert_eq!(semaphore.available_permits(), 1, "running pressure wait cannot retain the page permit");
+        cancel.cancel();
+        assert!(matches!(waiting.await.expect("page waiter"), Err(Error::TaskCancelled)));
+        assert_eq!(semaphore.available_permits(), 1);
+        let deadline = tokio::time::timeout(
+            Duration::from_millis(10),
+            acquire_page_permit(semaphore.clone(), Some(&pacer), &CancellationToken::new()),
+        )
+        .await;
+        assert!(deadline.is_err());
+        assert_eq!(semaphore.available_permits(), 1, "deadline must release all permits");
+        let permit = acquire_page_permit(semaphore.clone(), None, &CancellationToken::new())
+            .await
+            .expect("unpaced admission");
+        assert_eq!(semaphore.available_permits(), 0, "disabling pacing cannot disable the hard cap");
+        drop(permit);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn running_mainline_two_page_waiters_check_pressure_at_final_admission() {
+        use std::task::Poll;
+        for raise_pressure in [false, true] {
+            let semaphore = Arc::new(Semaphore::new(1));
+            let occupied = semaphore.clone().acquire_owned().await.expect("queue both waiters");
+            let provider = Arc::new(TestPressure::new(WorkloadClass::ForegroundRead, 0));
+            let pause = Duration::from_millis(250);
+            let pacer = MainlinePacer::new(provider.clone(), 80, 80, pause).expect("pacer");
+            let cancel = CancellationToken::new();
+            let mut first = Box::pin(acquire_page_permit(semaphore.clone(), Some(&pacer), &cancel));
+            let mut second = Box::pin(acquire_page_permit(semaphore.clone(), Some(&pacer), &cancel));
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            drop(occupied);
+            let first_ready = match futures::poll!(first.as_mut()) {
+                Poll::Ready(result) => Some(result.expect("first admission")),
+                Poll::Pending => None,
+            };
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            let first_permit = match first_ready {
+                Some(permit) => permit,
+                None => tokio::time::timeout(Duration::from_millis(1), first)
+                    .await
+                    .expect("low-pressure waiters must not bounce capacity forever")
+                    .expect("first permit"),
+            };
+            // The first object owns real page capacity while its commit runs.
+            tokio::time::advance(Duration::from_millis(100)).await;
+            if raise_pressure {
+                provider.active.store(100, Ordering::SeqCst);
+            }
+            drop(first_permit);
+            let admitted = if raise_pressure {
+                assert!(
+                    futures::poll!(second.as_mut()).is_pending(),
+                    "a second acquisition cannot reuse the earlier low-pressure sample"
+                );
+                assert_eq!(semaphore.available_permits(), 1, "pressure wait must release page capacity");
+                tokio::time::advance(pause).await;
+                tokio::time::timeout(Duration::from_millis(1), second)
+                    .await
+                    .expect("sustained pressure must allow one unit after its bounded pause")
+                    .expect("second permit")
+            } else {
+                tokio::time::timeout(Duration::from_millis(1), second)
+                    .await
+                    .expect("low pressure must make progress")
+                    .expect("second permit")
+            };
+            assert_eq!(semaphore.available_permits(), 0);
+            drop(admitted);
+            assert_eq!(semaphore.available_permits(), 1);
+        }
+    }
 }
 
 pub(crate) fn target_outcomes_complete(result: &HealResultItem, target_endpoints: &[String]) -> bool {
@@ -219,7 +357,13 @@ impl ErasureSetHealer {
             target_endpoints: Vec::new().into(),
             replacement_task_id: None,
             replacement_target_identities: None,
+            mainline_pacer: None,
         }
+    }
+
+    pub(crate) fn with_mainline_pacer(mut self, pacer: Option<Arc<super::pacing::MainlinePacer>>) -> Self {
+        self.mainline_pacer = pacer;
+        self
     }
 
     pub(crate) fn with_replacement_targets(
@@ -856,6 +1000,9 @@ impl ErasureSetHealer {
         let include_lifecycle_object_info = lifecycle_expiry_context.is_some();
 
         loop {
+            if let Some(pacer) = &self.mainline_pacer {
+                pacer.wait(&self.cancel_token).await?;
+            }
             self.verify_replacement_identity_fence("page scan").await?;
             // Get one page of object versions
             let (objects, next_token, is_truncated) = if use_disk_walk {
@@ -1034,13 +1181,10 @@ impl ErasureSetHealer {
                 let semaphore = semaphore.clone();
                 let target_endpoints = self.target_endpoints.clone();
                 let replacement_commit_evidence_required = self.replacement_task_id.is_some();
+                let mainline_pacer = self.mainline_pacer.clone();
 
                 page_tasks.push(async move {
-                    let permit = semaphore
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .map_err(|e| Error::other(format!("Failed to acquire page concurrency permit: {e}")));
+                    let permit = acquire_page_permit(semaphore, mainline_pacer.as_deref(), &cancel_token).await;
 
                     let _permit = match permit {
                         Ok(permit) => permit,

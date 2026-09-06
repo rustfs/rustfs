@@ -295,6 +295,8 @@ pub(crate) mod remote_s3_client {
 }
 
 pub(crate) mod metadata_sys {
+    #[cfg(test)]
+    pub(crate) use super::ecstore_bucket::metadata_sys::ConfigWriteLockProbe;
     use std::sync::Arc;
 
     use rustfs_policy::policy::BucketPolicy;
@@ -312,6 +314,7 @@ pub(crate) mod metadata_sys {
         super::ecstore_bucket::metadata_sys::get(bucket).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn update(bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
         crate::storage::storage_api::update_bucket_metadata_config(bucket, config_file, data).await
     }
@@ -332,6 +335,25 @@ pub(crate) mod metadata_sys {
         super::ecstore_bucket::metadata_sys::update_if_incarnation(bucket, config_file, data, expected_incarnation_id).await
     }
 
+    /// [`update_if_incarnation`] stamping the config with a replicated edit's
+    /// source `updated_at` instead of the local clock (backlog#2292).
+    pub(crate) async fn update_if_incarnation_at(
+        bucket: &str,
+        config_file: &str,
+        data: Vec<u8>,
+        expected_incarnation_id: uuid::Uuid,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::update_if_incarnation_at(
+            bucket,
+            config_file,
+            data,
+            expected_incarnation_id,
+            updated_at,
+        )
+        .await
+    }
+
     pub(crate) async fn update_quota_if_incarnation(
         bucket: &str,
         data: Vec<u8>,
@@ -339,6 +361,25 @@ pub(crate) mod metadata_sys {
         proof: &super::ecstore_notification::CrossPoolFenceFleetProofToken,
     ) -> Result<OffsetDateTime> {
         super::ecstore_bucket::metadata_sys::update_quota_if_incarnation(bucket, data, expected_incarnation_id, proof).await
+    }
+
+    /// [`update_quota_if_incarnation`] stamping the quota with a replicated
+    /// edit's source `updated_at` instead of the local clock (backlog#2292).
+    pub(crate) async fn update_quota_if_incarnation_at(
+        bucket: &str,
+        data: Vec<u8>,
+        expected_incarnation_id: uuid::Uuid,
+        proof: &super::ecstore_notification::CrossPoolFenceFleetProofToken,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::update_quota_if_incarnation_at(
+            bucket,
+            data,
+            expected_incarnation_id,
+            proof,
+            updated_at,
+        )
+        .await
     }
 
     pub(crate) async fn capture_bucket_metadata_incarnation(bucket: &str) -> Result<uuid::Uuid> {
@@ -393,6 +434,18 @@ pub(crate) mod metadata_sys {
         expected_incarnation_id: uuid::Uuid,
     ) -> Result<OffsetDateTime> {
         super::ecstore_bucket::metadata_sys::delete_if_incarnation(bucket, config_file, expected_incarnation_id).await
+    }
+
+    /// [`delete_if_incarnation`] stamping the cleared config with a replicated
+    /// deletion's source `updated_at` instead of the local clock (backlog#2292).
+    pub(crate) async fn delete_if_incarnation_at(
+        bucket: &str,
+        config_file: &str,
+        expected_incarnation_id: uuid::Uuid,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::delete_if_incarnation_at(bucket, config_file, expected_incarnation_id, updated_at)
+            .await
     }
 
     pub(crate) async fn get_bucket_policy(bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
@@ -667,7 +720,7 @@ pub(crate) mod replication {
 }
 
 pub(crate) mod target {
-    pub(crate) use super::ecstore_bucket::target::duration_from_secs_or_nanos;
+    pub(crate) use super::ecstore_bucket::target::{ARN, duration_from_secs_or_nanos};
     pub(crate) type BucketTarget = super::ecstore_bucket::target::BucketTarget;
     pub(crate) type BucketTargetType = super::ecstore_bucket::target::BucketTargetType;
     pub(crate) type BucketTargets = super::ecstore_bucket::target::BucketTargets;

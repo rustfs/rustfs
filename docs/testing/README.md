@@ -23,6 +23,8 @@ Every script named above is indexed with status and wiring in [`scripts/README.m
 
 The [scanner checkpoint fixture](scanner-checkpoint-fixture.md) diagnoses retained subtree coverage across budget interruption, persistence, reload, and plan invalidation.
 
+The [scanner cache cost profile](scanner-cache-cost.md) separates clone, subtree copy, encoding, and counted save costs without changing production cache behavior.
+
 ## Naming conventions
 
 ### Reserved test-name substrings (migration gate)

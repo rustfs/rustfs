@@ -34,6 +34,7 @@ fn unavailable_recreate_error(result: &HealResultItem, opts: &HealOpts) -> Optio
 
 impl HealTask {
     pub(super) async fn heal_bucket(&self, bucket: &str) -> Result<()> {
+        self.pace_mainline().await?;
         debug!(
             target: "rustfs::heal::task",
             event = EVENT_HEAL_BUCKET_STAGE,
@@ -308,6 +309,7 @@ impl HealTask {
                 self.check_control_flags().await?;
                 let mut listing_attempt = 0;
                 let (objects, next_token, is_truncated) = loop {
+                    self.pace_mainline().await?;
                     let page = if let Some(set_disk_id) = set_disk_id.as_deref() {
                         self.await_with_control(self.storage.list_versions_for_heal_page_disk_walk(
                             set_disk_id,
@@ -362,6 +364,7 @@ impl HealTask {
                     let mut retry = Vec::with_capacity(pending.len());
                     for item in pending {
                         self.check_control_flags().await?;
+                        self.pace_mainline().await?;
                         let mut telemetry_unknown = false;
                         let object = item.name.as_str();
                         let identity =
