@@ -26,7 +26,7 @@
 //! the log line and the admin response.
 
 use super::source_client::{SourceError, SourceHead, SourceTimeouts, USER_AGENT_SUFFIX, classify_status, is_multipart_etag};
-use crate::bucket::remote_s3_client::{RemoteS3ClientError, validate_remote_endpoint, validate_target_ca_pem};
+use super::storage_api::remote_s3_client::{RemoteS3ClientError, validate_remote_endpoint, validate_target_ca_pem};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_types::body::SdkBody;
 use futures::StreamExt;
@@ -130,6 +130,24 @@ impl NativeHttp {
         request: reqwest::Request,
         error_code_header: &str,
     ) -> Result<reqwest::Response, SourceError> {
+        self.send_classified(request, error_code_header, false).await
+    }
+
+    #[cfg(feature = "gcs")]
+    pub(super) async fn send_object(
+        &self,
+        request: reqwest::Request,
+        error_code_header: &str,
+    ) -> Result<reqwest::Response, SourceError> {
+        self.send_classified(request, error_code_header, true).await
+    }
+
+    async fn send_classified(
+        &self,
+        request: reqwest::Request,
+        error_code_header: &str,
+        not_found_on_404_without_code: bool,
+    ) -> Result<reqwest::Response, SourceError> {
         let response = self.client.execute(request).await.map_err(classify_transport_error)?;
         let status = response.status();
         if status.is_success() {
@@ -140,14 +158,14 @@ impl NativeHttp {
             .get(error_code_header)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        Err(classify_status(
-            status.as_u16(),
-            None,
-            match &code {
-                Some(code) => format!("source returned HTTP {status} ({code})"),
-                None => format!("source returned HTTP {status}"),
-            },
-        ))
+        let message = match &code {
+            Some(code) => format!("source returned HTTP {status} ({code})"),
+            None => format!("source returned HTTP {status}"),
+        };
+        match classify_status(status.as_u16(), code.as_deref(), message) {
+            SourceError::Other(_) if not_found_on_404_without_code && status.as_u16() == 404 => Err(SourceError::NotFound),
+            err => Err(err),
+        }
     }
 }
 
@@ -193,6 +211,7 @@ pub(super) async fn read_text(response: reqwest::Response, max_bytes: usize) -> 
 /// Base64 digest (`Content-MD5`, `md5Hash`, `x-goog-hash`) as lowercase hex.
 /// `None` when the value is not a 16-byte digest, so a CRC32C never passes as
 /// an MD5.
+#[cfg(any(test, feature = "gcs"))]
 pub(super) fn base64_md5_to_hex(value: &str) -> Option<String> {
     let raw = base64_simd::STANDARD.decode_to_vec(value.trim().as_bytes()).ok()?;
     (raw.len() == 16).then(|| faster_hex::hex_string(&raw))

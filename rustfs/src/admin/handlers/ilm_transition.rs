@@ -18,18 +18,20 @@ use crate::admin::runtime_sources::object_store_from_extensions;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::lifecycle::{
-    ManualTransitionCancelCheck, ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionProgressSink,
-    ManualTransitionQueueSnapshot, ManualTransitionRunOptions, ManualTransitionRunReport, ManualTransitionScopeAdmission,
-    ManualTransitionScopeAdmissionClaim, TransitionOperatorDeleteResult, TransitionOperatorError,
-    claim_manual_transition_scope_admission, delete_manual_transition_scope_admission_if_current,
-    delete_transition_candidate_for_operator, enqueue_transition_for_existing_objects_scoped,
-    finalize_missing_transition_transaction_for_operator, inspect_transition_transaction_for_operator,
+    IlmRecoveryClassification, IlmRecoveryProtocol, ManualTransitionCancelCheck, ManualTransitionJobRecord,
+    ManualTransitionJobState, ManualTransitionProgressSink, ManualTransitionQueueSnapshot, ManualTransitionRunOptions,
+    ManualTransitionRunReport, ManualTransitionScopeAdmission, ManualTransitionScopeAdmissionClaim,
+    TransitionOperatorDeleteResult, TransitionOperatorError, claim_manual_transition_scope_admission,
+    delete_manual_transition_scope_admission_if_current, delete_transition_candidate_for_operator,
+    enqueue_transition_for_existing_objects_scoped, finalize_missing_transition_transaction_for_operator,
+    inspect_recovery_control, inspect_transition_transaction_for_operator, list_recovery_controls,
     load_manual_transition_job_record, load_manual_transition_scope_admission, manual_transition_job_lease_expired,
     manual_transition_queue_snapshot, manual_transition_scope_admission_lease_expired,
     persist_manual_transition_job_progress_if_owned, renew_manual_transition_job_lease_if_owned,
     request_manual_transition_job_cancel, save_manual_transition_job_record, update_manual_transition_job_record,
 };
 use crate::admin::storage_api::runtime::ECStore;
+use crate::admin::storage_api::s3::{S3ErrorCode as AdminS3ErrorCode, error as admin_s3_error};
 use crate::admin::utils::json_response;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::HeaderMap;
@@ -230,7 +232,46 @@ pub fn register_ilm_transition_route(r: &mut S3Router<AdminOperation>) -> std::i
         format!("{ADMIN_PREFIX}/v3/ilm/transition/reconcile/{{transaction_id}}").as_str(),
         AdminOperation(&TransitionReconcileApplyHandler {}),
     )?;
+    r.insert(
+        Method::GET,
+        format!("{ADMIN_PREFIX}/v3/ilm/recovery/records").as_str(),
+        AdminOperation(&IlmRecoveryControlListHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{ADMIN_PREFIX}/v3/ilm/recovery/records/{{control_id}}").as_str(),
+        AdminOperation(&IlmRecoveryControlInspectHandler {}),
+    )?;
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IlmRecoveryControlListQuery {
+    protocol: IlmRecoveryProtocol,
+    #[serde(default)]
+    classification: Option<IlmRecoveryClassification>,
+    #[serde(default = "default_recovery_control_list_limit")]
+    limit: usize,
+    #[serde(default)]
+    marker: Option<String>,
+}
+
+const fn default_recovery_control_list_limit() -> usize {
+    100
+}
+
+fn parse_recovery_control_list_query(query: Option<&str>) -> S3Result<IlmRecoveryControlListQuery> {
+    let query = query.ok_or_else(|| admin_s3_error(AdminS3ErrorCode::InvalidRequest, "protocol is required"))?;
+    let parsed: IlmRecoveryControlListQuery = serde_urlencoded::from_bytes(query.as_bytes())
+        .map_err(|_| admin_s3_error(AdminS3ErrorCode::InvalidArgument, "invalid ILM recovery control query"))?;
+    if !(1..=1_000).contains(&parsed.limit) {
+        return Err(admin_s3_error(AdminS3ErrorCode::InvalidArgument, "limit must be between 1 and 1000"));
+    }
+    if parsed.marker.as_ref().is_some_and(|marker| marker.is_empty()) {
+        return Err(admin_s3_error(AdminS3ErrorCode::InvalidArgument, "marker must not be empty"));
+    }
+    Ok(parsed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,6 +462,26 @@ async fn authorize_transition_admin_request(req: &S3Request<Body>, action: Admin
 fn transition_transaction_id_from_params(params: &Params<'_, '_>) -> S3Result<Uuid> {
     Uuid::parse_str(params.get("transaction_id").unwrap_or(""))
         .map_err(|_| s3_error!(InvalidArgument, "invalid transition transaction id"))
+}
+
+fn recovery_control_id_from_params(params: &Params<'_, '_>) -> S3Result<String> {
+    let control_id = params.get("control_id").unwrap_or("");
+    if control_id.len() != 64
+        || !control_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(admin_s3_error(AdminS3ErrorCode::InvalidArgument, "invalid ILM recovery control id"));
+    }
+    Ok(control_id.to_string())
+}
+
+fn map_recovery_control_error(err: StorageError) -> S3Error {
+    if err == StorageError::ConfigNotFound {
+        admin_s3_error(AdminS3ErrorCode::NoSuchKey, "ILM recovery control not found")
+    } else {
+        admin_s3_error(AdminS3ErrorCode::InternalError, "ILM recovery control request failed")
+    }
 }
 
 fn map_transition_operator_error(err: TransitionOperatorError) -> S3Error {
@@ -1031,6 +1092,40 @@ impl Operation for TransitionReconcileInspectHandler {
     }
 }
 
+pub struct IlmRecoveryControlListHandler {}
+
+#[async_trait::async_trait]
+impl Operation for IlmRecoveryControlListHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_transition_admin_request(&req, AdminAction::ListTierAction).await?;
+        let query = parse_recovery_control_list_query(req.uri.query())?;
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
+            return Err(admin_s3_error(AdminS3ErrorCode::InternalError, "object store is not initialized"));
+        };
+        let page = list_recovery_controls(store, query.protocol, query.classification, query.limit, query.marker)
+            .await
+            .map_err(map_recovery_control_error)?;
+        json_response(StatusCode::OK, &page)
+    }
+}
+
+pub struct IlmRecoveryControlInspectHandler {}
+
+#[async_trait::async_trait]
+impl Operation for IlmRecoveryControlInspectHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_transition_admin_request(&req, AdminAction::ListTierAction).await?;
+        let control_id = recovery_control_id_from_params(&params)?;
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
+            return Err(admin_s3_error(AdminS3ErrorCode::InternalError, "object store is not initialized"));
+        };
+        let control = inspect_recovery_control(store, &control_id)
+            .await
+            .map_err(map_recovery_control_error)?;
+        json_response(StatusCode::OK, &control)
+    }
+}
+
 pub struct TransitionReconcileApplyHandler {}
 
 #[async_trait::async_trait]
@@ -1102,6 +1197,49 @@ mod tests {
 
         let matched = router.at(path).expect("route should match");
         f(&matched.params)
+    }
+
+    fn with_recovery_control_params<T>(path: &str, f: impl FnOnce(&Params<'_, '_>) -> T) -> T {
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/ilm/recovery/records/{control_id}", ())
+            .expect("route should insert");
+        let matched = router.at(path).expect("route should match");
+        f(&matched.params)
+    }
+
+    #[test]
+    fn recovery_control_query_is_bounded_and_strict() {
+        let query = parse_recovery_control_list_query(Some("protocol=transition_transaction"))
+            .expect("minimal recovery query should parse");
+        assert_eq!(query.protocol, IlmRecoveryProtocol::TransitionTransaction);
+        assert_eq!(query.classification, None);
+        assert_eq!(query.limit, 100);
+
+        let filtered = parse_recovery_control_list_query(Some(
+            "protocol=tier_delete_journal&classification=retained_ambiguous&limit=1000&marker=opaque",
+        ))
+        .expect("bounded filtered query should parse");
+        assert_eq!(filtered.protocol, IlmRecoveryProtocol::TierDeleteJournal);
+        assert_eq!(filtered.classification, Some(IlmRecoveryClassification::RetainedAmbiguous));
+        assert_eq!(filtered.limit, 1000);
+        assert!(parse_recovery_control_list_query(None).is_err());
+        assert!(parse_recovery_control_list_query(Some("protocol=transition_transaction&limit=0")).is_err());
+        assert!(parse_recovery_control_list_query(Some("protocol=transition_transaction&limit=1001")).is_err());
+        assert!(parse_recovery_control_list_query(Some("protocol=unknown")).is_err());
+        assert!(parse_recovery_control_list_query(Some("protocol=transition_transaction&extra=true")).is_err());
+    }
+
+    #[test]
+    fn recovery_control_id_is_canonical_lowercase_sha256() {
+        let id = "ab".repeat(32);
+        with_recovery_control_params(&format!("/rustfs/admin/v3/ilm/recovery/records/{id}"), |params| {
+            assert_eq!(recovery_control_id_from_params(params).expect("control id should parse"), id);
+        });
+        let uppercase = "AB".repeat(32);
+        with_recovery_control_params(&format!("/rustfs/admin/v3/ilm/recovery/records/{uppercase}"), |params| {
+            assert!(recovery_control_id_from_params(params).is_err())
+        });
     }
 
     fn manual_transition_job_request(method: Method, path: &'static str) -> S3Request<Body> {

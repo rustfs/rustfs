@@ -62,20 +62,14 @@ exit 1
 STUB
 chmod +x "$TMP_ROOT/bin/python3"
 
-SANDBOX_PATH="$TMP_ROOT/bin:/usr/bin:/bin"
-if PATH="$SANDBOX_PATH" command -v uv >/dev/null 2>&1; then
-    # uv is reachable even from the sandbox PATH, so the resolver would
-    # legitimately fall back to it instead of failing. Skip this case.
-    echo "ℹ️  uv is on the sandbox PATH; skipping the no-interpreter case"
-else
-    if PATH="$SANDBOX_PATH" "$RESOLVER" -c 'pass' \
-        >"$TMP_ROOT/none.out" 2>"$TMP_ROOT/none.err"; then
-        fail "resolver succeeded with no usable interpreter on PATH"
-    fi
-    grep -q 'No Python 3.11+ interpreter found' "$TMP_ROOT/none.err" \
-        || fail "missing-interpreter failure did not name the requirement"
-    grep -q 'RUSTFS_PYTHON=' "$TMP_ROOT/none.err" \
-        || fail "missing-interpreter failure did not point at the override"
+ln -s "$(command -v bash)" "$TMP_ROOT/bin/bash"
+if PATH="$TMP_ROOT/bin" RUSTFS_PYTHON="" "$RESOLVER" -c 'pass' \
+    >"$TMP_ROOT/none.out" 2>"$TMP_ROOT/none.err"; then
+    fail "resolver succeeded with no usable interpreter on PATH"
 fi
+grep -q 'No Python 3.11+ interpreter found' "$TMP_ROOT/none.err" \
+    || fail "missing-interpreter failure did not name the requirement"
+grep -q 'RUSTFS_PYTHON=' "$TMP_ROOT/none.err" \
+    || fail "missing-interpreter failure did not point at the override"
 
 echo "✅ scripts/python_bin.sh resolver checks passed"

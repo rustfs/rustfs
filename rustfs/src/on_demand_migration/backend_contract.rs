@@ -27,7 +27,7 @@
 //! and whether the provider can resume a listing from a key.
 
 use super::source_client::{SourceBackend, SourceError, SourceListRequest};
-use crate::storage_api_contracts::range::HTTPRangeSpec;
+use super::storage_api::HTTPRangeSpec;
 use std::collections::HashMap;
 
 /// The single object every fixture serves.

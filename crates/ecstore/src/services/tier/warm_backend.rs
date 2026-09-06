@@ -19,13 +19,14 @@
 #![allow(clippy::all)]
 
 use crate::error::is_err_bucket_not_found;
+#[cfg(feature = "gcs")]
+use crate::services::tier::warm_backend_gcs::WarmBackendGCS;
 use crate::services::tier::{
     tier::{ERR_TIER_BACKEND_IN_USE, ERR_TIER_INVALID_CONFIG, ERR_TIER_TYPE_UNSUPPORTED},
     tier_config::{TierConfig, TierType},
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_NOT_FOUND, ERR_TIER_PERM_ERR},
     warm_backend_aliyun::WarmBackendAliyun,
     warm_backend_azure::WarmBackendAzure,
-    warm_backend_gcs::WarmBackendGCS,
     warm_backend_huaweicloud::WarmBackendHuaweicloud,
     warm_backend_minio::WarmBackendMinIO,
     warm_backend_r2::WarmBackendR2,
@@ -912,6 +913,15 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                 });
             }
         }
+        #[cfg(not(feature = "gcs"))]
+        TierType::GCS => {
+            return Err(AdminError {
+                code: ERR_TIER_TYPE_UNSUPPORTED.code.clone(),
+                message: "This build does not include the GCS backend; rebuild with the gcs feature".to_string(),
+                status_code: StatusCode::NOT_IMPLEMENTED,
+            });
+        }
+        #[cfg(feature = "gcs")]
         TierType::GCS => {
             if let Some(gcs_config) = tier.gcs.as_ref() {
                 let dd = WarmBackendGCS::new(gcs_config, &tier.name).await;
@@ -1027,6 +1037,27 @@ mod tests {
     };
 
     const PROBE_VERSION: &str = "remote-v2";
+
+    #[cfg(not(feature = "gcs"))]
+    #[tokio::test]
+    async fn gcs_backend_not_compiled_preserves_config() {
+        let json = r#"{"name":"ARCHIVE","type":"gcs","gcs":{"bucket":"archive","creds":"secret"}}"#;
+        let tier: TierConfig = serde_json::from_str(json).expect("GCS config remains readable without the backend");
+        assert_eq!(tier.tier_type, TierType::GCS);
+        let encoded = serde_json::to_vec(&tier).expect("GCS config remains writable");
+        let restored: TierConfig = serde_json::from_slice(&encoded).expect("GCS config round trips");
+        assert_eq!(restored.tier_type, TierType::GCS);
+        let restored_gcs = restored.gcs.as_ref().expect("GCS settings preserved");
+        assert_eq!(restored_gcs.bucket, "archive");
+        assert_eq!(restored_gcs.creds, "secret");
+        assert_eq!(tier.redacted().gcs.expect("redacted GCS settings").creds, "REDACTED");
+        let error = match new_warm_backend(&tier, false).await {
+            Ok(_) => panic!("an excluded GCS backend cannot be constructed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ERR_TIER_TYPE_UNSUPPORTED.code);
+        assert_eq!(error.status_code, StatusCode::NOT_IMPLEMENTED);
+    }
 
     struct CountingBackend {
         put_result: fn() -> Result<String, std::io::Error>,

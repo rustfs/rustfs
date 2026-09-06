@@ -38,16 +38,6 @@ use crate::admin::runtime_sources::{
 };
 use crate::admin::storage_api::bucket::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG;
 use crate::admin::storage_api::bucket::metadata_sys;
-use crate::admin::storage_api::bucket::on_demand_migration::backfill::{
-    BackfillCheckpoint, BackfillError, BackfillRequest, BackfillState, SkipExisting, global_backfill_runner,
-};
-use crate::admin::storage_api::bucket::on_demand_migration::source_client::{
-    SourceClient, SourceClientSpec, SourceError, SourceProbe, SourceProvider, SourceTimeouts,
-};
-use crate::admin::storage_api::bucket::on_demand_migration::{
-    OdmBucketSnapshot, OnDemandMigrationConfig, OnDemandMigrationConfigError, OnDemandMigrationSys, PathStyle, ValidationContext,
-    source_backend_spec,
-};
 use crate::admin::storage_api::bucket::remote_s3_client::{
     PathStyle as RemotePathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3RetryPolicy,
 };
@@ -58,6 +48,16 @@ use crate::admin::utils::{extract_query_params, read_compatible_admin_body};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::module_switches::{ENV_ON_DEMAND_MIGRATION_ENABLED, on_demand_migration_enabled_from_env};
+use crate::on_demand_migration::backfill::{
+    BackfillCheckpoint, BackfillError, BackfillRequest, BackfillState, SkipExisting, global_backfill_runner,
+};
+use crate::on_demand_migration::source_client::{
+    SourceClient, SourceClientSpec, SourceError, SourceProbe, SourceProvider, SourceTimeouts,
+};
+use crate::on_demand_migration::{
+    OdmBucketSnapshot, OnDemandMigrationConfig, OnDemandMigrationConfigError, OnDemandMigrationSys, PathStyle, ValidationContext,
+    source_backend_spec,
+};
 use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -90,6 +90,8 @@ const BACKFILL_OP_CANCEL: &str = "cancel";
 pub(crate) const ERR_CODE_MODULE_DISABLED: &str = "OnDemandMigrationDisabled";
 /// Error code returned when the source bucket did not answer the probe.
 pub(crate) const ERR_CODE_SOURCE_UNREACHABLE: &str = "OnDemandMigrationSourceUnreachable";
+/// Error code returned when the configured provider was excluded at build time.
+pub(crate) const ERR_CODE_BACKEND_NOT_COMPILED: &str = "OnDemandMigrationBackendNotCompiled";
 /// Error code returned by `GET` when the bucket has no configuration.
 pub(crate) const ERR_CODE_NO_SUCH_CONFIGURATION: &str = "NoSuchConfiguration";
 /// Error code (409) returned by `start` while a backfill job holds the lease.
@@ -578,7 +580,7 @@ async fn validate_config(bucket: &str, config: &OnDemandMigrationConfig) -> S3Re
 }
 
 fn source_provider(config: &OnDemandMigrationConfig) -> SourceProvider {
-    use crate::admin::storage_api::bucket::on_demand_migration::Provider;
+    use crate::on_demand_migration::Provider;
     match config.source.provider {
         Provider::S3 => SourceProvider::S3,
         Provider::Aws => SourceProvider::Aws,
@@ -630,12 +632,17 @@ pub(crate) fn source_client_spec(config: &OnDemandMigrationConfig) -> SourceClie
     }
 }
 
-/// Builder failures are input errors: the endpoint policy, the CA PEM or the
-/// credentials the operator supplied. Anonymous sources are not wired yet
+/// Distinguishes excluded backends from invalid endpoint, CA or credentials.
+/// Anonymous S3 sources are not wired yet
 /// (ODM-05 adds the credential-less path), so `MissingCredentials` is a 400
 /// naming the field instead of an opaque internal error.
 fn client_build_error(err: RemoteS3ClientError) -> S3Error {
     match err {
+        RemoteS3ClientError::BackendNotCompiled(provider) => custom_error(
+            ERR_CODE_BACKEND_NOT_COMPILED,
+            StatusCode::NOT_IMPLEMENTED,
+            format!("the {provider} backend is not included in this build; rebuild with the gcs feature"),
+        ),
         RemoteS3ClientError::MissingCredentials => admin_s3_error(
             S3ErrorCode::InvalidArgument,
             "source.credentials is required: anonymous sources are not supported yet",
@@ -780,7 +787,7 @@ impl Operation for GetBucketOnDemandMigrationHandler {
         let bucket = bucket_from_params(&params)?;
         let cred = authorize_for_bucket(&req, AdminAction::GetBucketOnDemandMigrationAction, &bucket).await?;
 
-        let Some((config, updated_at)) = metadata_sys::get_on_demand_migration_config(&bucket).await.map_err(|err| {
+        let Some((config, updated_at)) = crate::on_demand_migration::config::get_config(&bucket).await.map_err(|err| {
             admin_s3_error(S3ErrorCode::InternalError, format!("failed to read on-demand migration config: {err}"))
         })?
         else {
@@ -839,7 +846,7 @@ impl Operation for GetBucketOnDemandMigrationStatusHandler {
         let bucket = bucket_from_params(&params)?;
         let cred = authorize_for_bucket(&req, AdminAction::GetBucketOnDemandMigrationAction, &bucket).await?;
 
-        let config = metadata_sys::get_on_demand_migration_config(&bucket).await.map_err(|err| {
+        let config = crate::on_demand_migration::config::get_config(&bucket).await.map_err(|err| {
             admin_s3_error(S3ErrorCode::InternalError, format!("failed to read on-demand migration config: {err}"))
         })?;
         let runtime = OnDemandMigrationSys::get().bucket_snapshot(&bucket);
@@ -1286,6 +1293,14 @@ mod tests {
         let err = client_build_error(RemoteS3ClientError::MissingCredentials);
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
         assert!(err.message().unwrap_or_default().contains("source.credentials"));
+    }
+
+    #[test]
+    fn backend_not_compiled_is_distinct_from_invalid_credentials() {
+        let err = client_build_error(RemoteS3ClientError::BackendNotCompiled("gcs_native"));
+        assert_eq!(err.code(), &S3ErrorCode::Custom(ERR_CODE_BACKEND_NOT_COMPILED.into()));
+        assert_eq!(err.status_code(), Some(StatusCode::NOT_IMPLEMENTED));
+        assert!(err.message().unwrap_or_default().contains("gcs feature"));
     }
 
     #[test]
@@ -1747,6 +1762,19 @@ mod store_tests {
                 assert_eq!(body["served_by_source_ratio"], Value::Null, "no per-bucket GET total exists");
                 assert_eq!(body["inflight_pulls"], Value::from(0));
                 assert_eq!(body["queue_depth"], Value::from(0));
+
+                // A malformed replacement cannot overwrite the saved source.
+                let before = metadata_sys::get(BUCKET).await.expect("saved metadata");
+                for invalid in [b"not-json".to_vec(), br#"{"source":{"provider":"s3"},"bogus":1}"#.to_vec()] {
+                    let err = SetBucketOnDemandMigrationHandler {}
+                        .call(root_request(Method::PUT, config_uri(""), invalid), bucket_params(&router))
+                        .await
+                        .expect_err("malformed replacement must be rejected");
+                    assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+                    let after = metadata_sys::get(BUCKET).await.expect("saved metadata remains readable");
+                    assert_eq!(after.on_demand_migration_config_json, before.on_demand_migration_config_json);
+                    assert_eq!(after.on_demand_migration_config_updated_at, before.on_demand_migration_config_updated_at);
+                }
 
                 // The peer fan-out ran: the single unreachable peer is reported.
                 let context = crate::admin::runtime_sources::current_app_context();
