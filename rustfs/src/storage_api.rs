@@ -18,6 +18,8 @@
 use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod capacity {
+    pub(crate) use crate::storage::storage_api::ecstore_capacity::is_pool_activation_fleet_proof_error;
+
     pub(crate) mod service {
         pub(crate) use crate::storage::storage_api::{all_local_disk, disk_drive_path, disk_endpoint};
     }
