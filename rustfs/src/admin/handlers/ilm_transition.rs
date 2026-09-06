@@ -481,6 +481,14 @@ async fn authorize_transition_admin_request(req: &S3Request<Body>, action: Admin
     Ok(actor)
 }
 
+async fn authorize_recovery_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<String> {
+    if req.credentials.is_none() {
+        return Err(s3_error!(InvalidRequest, "authentication required"));
+    }
+    let credentials = authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    Ok(recovery_actor_sha256(&credentials))
+}
+
 fn transition_transaction_id_from_params(params: &Params<'_, '_>) -> S3Result<Uuid> {
     Uuid::parse_str(params.get("transaction_id").unwrap_or(""))
         .map_err(|_| s3_error!(InvalidArgument, "invalid transition transaction id"))
@@ -488,14 +496,19 @@ fn transition_transaction_id_from_params(params: &Params<'_, '_>) -> S3Result<Uu
 
 fn recovery_control_id_from_params(params: &Params<'_, '_>) -> S3Result<String> {
     let control_id = params.get("control_id").unwrap_or("");
-    if control_id.len() != 64
-        || !control_id
+    validate_recovery_sha256(control_id, "invalid ILM recovery control id")?;
+    Ok(control_id.to_string())
+}
+
+fn validate_recovery_sha256(value: &str, message: &'static str) -> S3Result<()> {
+    if value.len() != 64
+        || !value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     {
-        return Err(admin_s3_error(AdminS3ErrorCode::InvalidArgument, "invalid ILM recovery control id"));
+        return Err(admin_s3_error(AdminS3ErrorCode::InvalidArgument, message));
     }
-    Ok(control_id.to_string())
+    Ok(())
 }
 
 fn map_recovery_control_error(err: StorageError) -> S3Error {
@@ -508,13 +521,7 @@ fn map_recovery_control_error(err: StorageError) -> S3Error {
 
 fn recovery_export_id_from_params(params: &Params<'_, '_>) -> S3Result<String> {
     let export_id = params.get("export_id").unwrap_or("");
-    if export_id.len() != 64
-        || !export_id
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(admin_s3_error(AdminS3ErrorCode::InvalidArgument, "invalid ILM recovery export id"));
-    }
+    validate_recovery_sha256(export_id, "invalid ILM recovery export id")?;
     Ok(export_id.to_string())
 }
 
@@ -547,11 +554,34 @@ fn recovery_export_download_headers(export_id: &str, encoded_len: usize) -> S3Re
     Ok(headers)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IlmRecoveryReceiptAction {
+    Export,
+    AbandonRemoteCleanup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IlmRecoveryReceiptMode {
+    DryRun,
+    Execute,
+}
+
+const fn default_recovery_receipt_mode() -> IlmRecoveryReceiptMode {
+    IlmRecoveryReceiptMode::Execute
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IlmRecoveryObservationReceipt {
     schema: String,
-    action: String,
+    action: IlmRecoveryReceiptAction,
+    // Receipts issued before action modes were introduced represented the
+    // existing export execution path, so decode them as Execute until their
+    // fixed 15-minute lifetime elapses.
+    #[serde(default = "default_recovery_receipt_mode")]
+    mode: IlmRecoveryReceiptMode,
     actor_sha256: String,
     issued_at_unix_nanos: i64,
     expires_at_unix_nanos: i64,
@@ -572,11 +602,127 @@ struct IlmRecoveryControlInspectResponse {
     observation_receipt_expires_at_unix_nanos: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IlmRecoveryDispositionReasonCode {
+    LegacyRemoteCleanupAbandoned,
+}
+
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IlmRecoveryExportCreateRequest {
-    action: String,
-    observation_receipt: String,
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum IlmRecoveryRecordMutationRequest {
+    Export {
+        observation_receipt: String,
+    },
+    AbandonRemoteCleanup {
+        mode: IlmRecoveryReceiptMode,
+        observation_receipt: String,
+        export_id: String,
+        export_sha256: String,
+        reason_code: IlmRecoveryDispositionReasonCode,
+        #[serde(default)]
+        confirm: Option<bool>,
+        #[serde(default)]
+        acknowledge_remote_cleanup_abandoned: Option<bool>,
+    },
+}
+
+fn parse_recovery_record_mutation_request(body: &[u8]) -> S3Result<IlmRecoveryRecordMutationRequest> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| admin_s3_error(AdminS3ErrorCode::InvalidArgument, "invalid ILM recovery request"))?;
+    let request: IlmRecoveryRecordMutationRequest = serde_json::from_value(value.clone())
+        .map_err(|_| admin_s3_error(AdminS3ErrorCode::InvalidArgument, "invalid ILM recovery request"))?;
+    if matches!(
+        &request,
+        IlmRecoveryRecordMutationRequest::AbandonRemoteCleanup {
+            mode: IlmRecoveryReceiptMode::DryRun,
+            ..
+        }
+    ) && value
+        .as_object()
+        .is_some_and(|object| object.contains_key("confirm") || object.contains_key("acknowledge_remote_cleanup_abandoned"))
+    {
+        return Err(admin_s3_error(
+            AdminS3ErrorCode::InvalidArgument,
+            "ILM recovery dry-run must not include terminal confirmation fields",
+        ));
+    }
+    Ok(request)
+}
+
+#[allow(dead_code)]
+enum ValidatedIlmRecoveryRecordMutation<'a> {
+    Export {
+        observation_receipt: &'a str,
+    },
+    AbandonDryRun {
+        observation_receipt: &'a str,
+        export_id: &'a str,
+        export_sha256: &'a str,
+        reason_code: IlmRecoveryDispositionReasonCode,
+    },
+    AbandonExecute {
+        observation_receipt: &'a str,
+        export_id: &'a str,
+        export_sha256: &'a str,
+        reason_code: IlmRecoveryDispositionReasonCode,
+    },
+}
+
+fn validate_recovery_record_mutation_request(
+    request: &IlmRecoveryRecordMutationRequest,
+) -> S3Result<ValidatedIlmRecoveryRecordMutation<'_>> {
+    match request {
+        IlmRecoveryRecordMutationRequest::Export { observation_receipt } => {
+            Ok(ValidatedIlmRecoveryRecordMutation::Export { observation_receipt })
+        }
+        IlmRecoveryRecordMutationRequest::AbandonRemoteCleanup {
+            mode,
+            observation_receipt,
+            export_id,
+            export_sha256,
+            reason_code,
+            confirm,
+            acknowledge_remote_cleanup_abandoned,
+        } => {
+            validate_recovery_sha256(export_id, "invalid ILM recovery export id")?;
+            validate_recovery_sha256(export_sha256, "invalid ILM recovery export checksum")?;
+            if observation_receipt.is_empty() {
+                return Err(admin_s3_error(
+                    AdminS3ErrorCode::InvalidArgument,
+                    "ILM recovery observation receipt must not be empty",
+                ));
+            }
+            match mode {
+                IlmRecoveryReceiptMode::DryRun if confirm.is_none() && acknowledge_remote_cleanup_abandoned.is_none() => {
+                    Ok(ValidatedIlmRecoveryRecordMutation::AbandonDryRun {
+                        observation_receipt,
+                        export_id,
+                        export_sha256,
+                        reason_code: *reason_code,
+                    })
+                }
+                IlmRecoveryReceiptMode::DryRun => Err(admin_s3_error(
+                    AdminS3ErrorCode::InvalidArgument,
+                    "ILM recovery dry-run must not include terminal confirmation fields",
+                )),
+                IlmRecoveryReceiptMode::Execute
+                    if *confirm == Some(true) && *acknowledge_remote_cleanup_abandoned == Some(true) =>
+                {
+                    Ok(ValidatedIlmRecoveryRecordMutation::AbandonExecute {
+                        observation_receipt,
+                        export_id,
+                        export_sha256,
+                        reason_code: *reason_code,
+                    })
+                }
+                IlmRecoveryReceiptMode::Execute => Err(admin_s3_error(
+                    AdminS3ErrorCode::InvalidRequest,
+                    "ILM recovery disposition requires confirm=true and acknowledge_remote_cleanup_abandoned=true",
+                )),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -587,16 +733,68 @@ struct IlmRecoveryExportCreateResponse {
     outcome: &'static str,
 }
 
-fn recovery_actor_sha256(req: &S3Request<Body>) -> S3Result<String> {
-    let access_key = &req
-        .credentials
-        .as_ref()
-        .ok_or_else(|| admin_s3_error(AdminS3ErrorCode::InvalidRequest, "authentication required"))?
-        .access_key;
+// These response envelopes pin the future disposition wire contract before
+// its storage state machine is connected to this handler.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IlmRecoveryDispositionDryRunStatus {
+    Ready,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IlmRecoveryDispositionState {
+    Applying,
+    Completed,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IlmRecoveryDispositionOutcome {
+    AcceptedForRecovery,
+    Completed,
+    Replayed,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IlmRecoveryDispositionDryRunResponse {
+    action: IlmRecoveryReceiptAction,
+    mode: IlmRecoveryReceiptMode,
+    status: IlmRecoveryDispositionDryRunStatus,
+    disposition_id: String,
+    export_id: String,
+    export_sha256: String,
+    source_generation_sha256: String,
+    copy_set_sha256: String,
+    source_copy_count: usize,
+    observation_receipt: String,
+    observation_receipt_expires_at_unix_nanos: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IlmRecoveryDispositionExecuteResponse {
+    action: IlmRecoveryReceiptAction,
+    mode: IlmRecoveryReceiptMode,
+    disposition_id: String,
+    state: IlmRecoveryDispositionState,
+    outcome: IlmRecoveryDispositionOutcome,
+    confirmed_absent_copy_count: usize,
+    source_copy_count: usize,
+}
+
+fn recovery_actor_sha256(credentials: &Credentials) -> String {
+    let access_key = &credentials.access_key;
     let mut bound = Vec::with_capacity(access_key.len() + 40);
     bound.extend_from_slice(b"rustfs-ilm-recovery-actor-v1\0");
     bound.extend_from_slice(access_key.as_bytes());
-    Ok(hex_sha256(&bound, ToOwned::to_owned))
+    hex_sha256(&bound, ToOwned::to_owned)
 }
 
 fn recovery_receipt_credentials() -> S3Result<Credentials> {
@@ -662,12 +860,15 @@ fn decode_recovery_receipt(token: &str, credentials: &Credentials) -> S3Result<I
 fn issue_recovery_observation_receipt(
     observation: IlmRecoveryExportObservation,
     actor_sha256: String,
+    action: IlmRecoveryReceiptAction,
+    mode: IlmRecoveryReceiptMode,
     now: OffsetDateTime,
 ) -> S3Result<(String, i64)> {
     let expires_at = now + ILM_RECOVERY_OBSERVATION_RECEIPT_TTL;
     let receipt = IlmRecoveryObservationReceipt {
         schema: "rustfs-ilm-recovery-observation-receipt-v1".to_string(),
-        action: "export".to_string(),
+        action,
+        mode,
         actor_sha256,
         issued_at_unix_nanos: i64::try_from(now.unix_timestamp_nanos())
             .map_err(|_| admin_s3_error(AdminS3ErrorCode::InternalError, "ILM recovery receipt timestamp is invalid"))?,
@@ -684,12 +885,15 @@ fn validate_recovery_observation_receipt(
     receipt: IlmRecoveryObservationReceipt,
     actor_sha256: &str,
     control_id: &str,
+    expected_action: IlmRecoveryReceiptAction,
+    expected_mode: IlmRecoveryReceiptMode,
     now_unix_nanos: i64,
 ) -> S3Result<IlmRecoveryExportObservation> {
     let ttl_nanos = i64::try_from(ILM_RECOVERY_OBSERVATION_RECEIPT_TTL.whole_nanoseconds())
         .map_err(|_| admin_s3_error(AdminS3ErrorCode::InternalError, "ILM recovery receipt TTL is invalid"))?;
     if receipt.schema != "rustfs-ilm-recovery-observation-receipt-v1"
-        || receipt.action != "export"
+        || receipt.action != expected_action
+        || receipt.mode != expected_mode
         || receipt.actor_sha256 != actor_sha256
         || receipt.observation.control_id != control_id
         || receipt.nonce.is_nil()
@@ -1333,8 +1537,7 @@ pub struct IlmRecoveryControlInspectHandler {}
 #[async_trait::async_trait]
 impl Operation for IlmRecoveryControlInspectHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_transition_admin_request(&req, AdminAction::ListTierAction).await?;
-        let actor_sha256 = recovery_actor_sha256(&req)?;
+        let actor_sha256 = authorize_recovery_admin_request(&req, AdminAction::ListTierAction).await?;
         let control_id = recovery_control_id_from_params(&params)?;
         let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(admin_s3_error(AdminS3ErrorCode::InternalError, "object store is not initialized"));
@@ -1345,7 +1548,13 @@ impl Operation for IlmRecoveryControlInspectHandler {
         let now = OffsetDateTime::now_utc();
         let (export_ready, export_not_ready_reason, observation_receipt, expires_at) =
             match inspect_recovery_export_observation(store, &control_id).await {
-                Ok(observation) => match issue_recovery_observation_receipt(observation, actor_sha256, now) {
+                Ok(observation) => match issue_recovery_observation_receipt(
+                    observation,
+                    actor_sha256,
+                    IlmRecoveryReceiptAction::Export,
+                    IlmRecoveryReceiptMode::Execute,
+                    now,
+                ) {
                     Ok((token, expires_at)) => (true, None, Some(token), Some(expires_at)),
                     Err(_) => (false, Some("receipt_key_unavailable"), None, None),
                 },
@@ -1369,8 +1578,7 @@ pub struct IlmRecoveryExportCreateHandler {}
 #[async_trait::async_trait]
 impl Operation for IlmRecoveryExportCreateHandler {
     async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_transition_admin_request(&req, AdminAction::SetTierAction).await?;
-        let actor_sha256 = recovery_actor_sha256(&req)?;
+        let actor_sha256 = authorize_recovery_admin_request(&req, AdminAction::SetTierAction).await?;
         let control_id = recovery_control_id_from_params(&params)?;
         let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(admin_s3_error(AdminS3ErrorCode::InternalError, "object store is not initialized"));
@@ -1378,15 +1586,23 @@ impl Operation for IlmRecoveryExportCreateHandler {
         let body = req.input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await.map_err(|_| {
             admin_s3_error(AdminS3ErrorCode::InvalidRequest, "ILM recovery export body is too large or unreadable")
         })?;
-        let request: IlmRecoveryExportCreateRequest = serde_json::from_slice(&body)
-            .map_err(|_| admin_s3_error(AdminS3ErrorCode::InvalidArgument, "invalid ILM recovery export request"))?;
-        if request.action != "export" {
+        let request = parse_recovery_record_mutation_request(&body)?;
+        let ValidatedIlmRecoveryRecordMutation::Export { observation_receipt } =
+            validate_recovery_record_mutation_request(&request)?
+        else {
             return Err(admin_s3_error(AdminS3ErrorCode::InvalidArgument, "unsupported ILM recovery action"));
-        }
-        let receipt = decode_recovery_receipt(&request.observation_receipt, &recovery_receipt_credentials()?)?;
+        };
+        let receipt = decode_recovery_receipt(observation_receipt, &recovery_receipt_credentials()?)?;
         let now = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos())
             .map_err(|_| admin_s3_error(AdminS3ErrorCode::InternalError, "ILM recovery receipt timestamp is invalid"))?;
-        let observation = validate_recovery_observation_receipt(receipt, &actor_sha256, &control_id, now)?;
+        let observation = validate_recovery_observation_receipt(
+            receipt,
+            &actor_sha256,
+            &control_id,
+            IlmRecoveryReceiptAction::Export,
+            IlmRecoveryReceiptMode::Execute,
+            now,
+        )?;
         let created = create_recovery_export(store, &observation, &actor_sha256)
             .await
             .map_err(map_recovery_export_error)?;
@@ -1576,7 +1792,8 @@ mod tests {
         .unwrap();
         let payload = IlmRecoveryObservationReceipt {
             schema: "rustfs-ilm-recovery-observation-receipt-v1".to_string(),
-            action: "export".to_string(),
+            action: IlmRecoveryReceiptAction::Export,
+            mode: IlmRecoveryReceiptMode::Execute,
             actor_sha256: hex_sha256(b"actor-a", ToOwned::to_owned),
             issued_at_unix_nanos: 1,
             expires_at_unix_nanos: 1 + ILM_RECOVERY_OBSERVATION_RECEIPT_TTL.whole_nanoseconds() as i64,
@@ -1597,13 +1814,22 @@ mod tests {
                 payload.clone(),
                 &payload.actor_sha256,
                 &payload.observation.control_id,
+                IlmRecoveryReceiptAction::Export,
+                IlmRecoveryReceiptMode::Execute,
                 payload.issued_at_unix_nanos,
             )
             .is_ok()
         );
         let assert_denied = |receipt: IlmRecoveryObservationReceipt, actor: &str, control: &str, now: i64| {
-            let err = validate_recovery_observation_receipt(receipt, actor, control, now)
-                .expect_err("invalid observation receipt must be denied");
+            let err = validate_recovery_observation_receipt(
+                receipt,
+                actor,
+                control,
+                IlmRecoveryReceiptAction::Export,
+                IlmRecoveryReceiptMode::Execute,
+                now,
+            )
+            .expect_err("invalid observation receipt must be denied");
             assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
         };
         assert_denied(
@@ -1629,7 +1855,15 @@ mod tests {
             payload.issued_at_unix_nanos,
         );
         let mut invalid = payload.clone();
-        invalid.action = "abandon".to_string();
+        invalid.action = IlmRecoveryReceiptAction::AbandonRemoteCleanup;
+        assert_denied(
+            invalid,
+            &payload.actor_sha256,
+            &payload.observation.control_id,
+            payload.issued_at_unix_nanos,
+        );
+        let mut invalid = payload.clone();
+        invalid.mode = IlmRecoveryReceiptMode::DryRun;
         assert_denied(
             invalid,
             &payload.actor_sha256,
@@ -1668,6 +1902,184 @@ mod tests {
         let err = decode_recovery_receipt(std::str::from_utf8(&tampered).unwrap(), &credentials)
             .expect_err("tampered receipt must be denied");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+        let mut legacy_payload = serde_json::to_value(&payload).unwrap();
+        legacy_payload.as_object_mut().unwrap().remove("mode");
+        let legacy_payload: IlmRecoveryObservationReceipt = serde_json::from_value(legacy_payload).unwrap();
+        assert_eq!(legacy_payload.mode, IlmRecoveryReceiptMode::Execute);
+    }
+
+    #[test]
+    fn recovery_actor_binding_uses_the_authenticated_presented_access_key() {
+        let first = Credentials {
+            access_key: "operator-a".to_string(),
+            secret_key: "first-secret".to_string(),
+            ..Default::default()
+        };
+        let same_actor_rotated_secret = Credentials {
+            access_key: first.access_key.clone(),
+            secret_key: "rotated-secret".to_string(),
+            ..Default::default()
+        };
+        let other = Credentials {
+            access_key: "operator-b".to_string(),
+            secret_key: first.secret_key.clone(),
+            ..Default::default()
+        };
+
+        let actor = recovery_actor_sha256(&first);
+        assert_eq!(actor, recovery_actor_sha256(&same_actor_rotated_secret));
+        assert_ne!(actor, recovery_actor_sha256(&other));
+        assert!(!actor.contains(&first.access_key));
+
+        let production = include_str!("ilm_transition.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+        let gate = extract_block_between_markers(
+            production,
+            "async fn authorize_recovery_admin_request",
+            "fn transition_transaction_id_from_params",
+        );
+        assert!(gate.contains("let credentials = authorize_admin_request("));
+        assert!(gate.contains("recovery_actor_sha256(&credentials)"));
+        assert!(!gate.contains("MaskedAccessKey"));
+    }
+
+    #[test]
+    fn recovery_record_mutation_wire_contract_is_strict_and_mode_specific() {
+        let export = parse_recovery_record_mutation_request(br#"{"action":"export","observation_receipt":"opaque"}"#).unwrap();
+        assert!(matches!(
+            validate_recovery_record_mutation_request(&export),
+            Ok(ValidatedIlmRecoveryRecordMutation::Export {
+                observation_receipt: "opaque"
+            })
+        ));
+
+        let export_id = "ab".repeat(32);
+        let export_sha256 = "cd".repeat(32);
+        let dry_run_json = format!(
+            r#"{{"action":"abandon_remote_cleanup","mode":"dry_run","observation_receipt":"opaque-dry-run","export_id":"{export_id}","export_sha256":"{export_sha256}","reason_code":"legacy_remote_cleanup_abandoned"}}"#
+        );
+        let dry_run = parse_recovery_record_mutation_request(dry_run_json.as_bytes()).unwrap();
+        assert!(matches!(
+            validate_recovery_record_mutation_request(&dry_run),
+            Ok(ValidatedIlmRecoveryRecordMutation::AbandonDryRun {
+                observation_receipt: "opaque-dry-run",
+                export_id: observed_export_id,
+                export_sha256: observed_export_sha256,
+                reason_code: IlmRecoveryDispositionReasonCode::LegacyRemoteCleanupAbandoned,
+            }) if observed_export_id == export_id && observed_export_sha256 == export_sha256
+        ));
+
+        let execute_json = format!(
+            r#"{{"action":"abandon_remote_cleanup","mode":"execute","confirm":true,"acknowledge_remote_cleanup_abandoned":true,"observation_receipt":"opaque-execute","export_id":"{export_id}","export_sha256":"{export_sha256}","reason_code":"legacy_remote_cleanup_abandoned"}}"#
+        );
+        let execute = parse_recovery_record_mutation_request(execute_json.as_bytes()).unwrap();
+        assert!(matches!(
+            validate_recovery_record_mutation_request(&execute),
+            Ok(ValidatedIlmRecoveryRecordMutation::AbandonExecute {
+                observation_receipt: "opaque-execute",
+                export_id: observed_export_id,
+                export_sha256: observed_export_sha256,
+                reason_code: IlmRecoveryDispositionReasonCode::LegacyRemoteCleanupAbandoned,
+            }) if observed_export_id == export_id && observed_export_sha256 == export_sha256
+        ));
+
+        let dry_run_with_confirmation = dry_run_json.replace(r#""mode":"dry_run""#, r#""mode":"dry_run","confirm":false"#);
+        assert!(parse_recovery_record_mutation_request(dry_run_with_confirmation.as_bytes()).is_err());
+        assert!(parse_recovery_record_mutation_request(dry_run_json.replace('}', r#","confirm":null}"#).as_bytes()).is_err());
+
+        let uppercase_export_id = "AB".repeat(32);
+        for invalid in [
+            execute_json.replace(r#""confirm":true,"#, ""),
+            execute_json.replace(r#""confirm":true"#, r#""confirm":false"#),
+            execute_json.replace(
+                r#""acknowledge_remote_cleanup_abandoned":true"#,
+                r#""acknowledge_remote_cleanup_abandoned":false"#,
+            ),
+            execute_json.replace(export_id.as_str(), uppercase_export_id.as_str()),
+            execute_json.replace(export_sha256.as_str(), "too-short"),
+            execute_json.replace("opaque-execute", ""),
+        ] {
+            match parse_recovery_record_mutation_request(invalid.as_bytes()) {
+                Ok(request) => assert!(
+                    validate_recovery_record_mutation_request(&request).is_err(),
+                    "request should fail closed: {invalid}"
+                ),
+                Err(_) => {}
+            }
+        }
+
+        for invalid in [
+            br#"{"action":"export","observation_receipt":"opaque","extra":true}"#.as_slice(),
+            br#"{"action":"abandon_remote_cleanup","mode":"preview"}"#.as_slice(),
+            br#"{"action":"unknown","observation_receipt":"opaque"}"#.as_slice(),
+        ] {
+            assert!(parse_recovery_record_mutation_request(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn recovery_disposition_response_wire_contract_is_closed() {
+        let export = IlmRecoveryExportCreateResponse {
+            export_id: "ab".repeat(32),
+            export_sha256: "cd".repeat(32),
+            download_url: "/rustfs/admin/v3/ilm/recovery/exports/export-id".to_string(),
+            outcome: "created",
+        };
+        assert_eq!(
+            serde_json::to_value(&export).unwrap(),
+            serde_json::json!({
+                "export_id": "ab".repeat(32),
+                "export_sha256": "cd".repeat(32),
+                "download_url": "/rustfs/admin/v3/ilm/recovery/exports/export-id",
+                "outcome": "created",
+            })
+        );
+
+        let dry_run = IlmRecoveryDispositionDryRunResponse {
+            action: IlmRecoveryReceiptAction::AbandonRemoteCleanup,
+            mode: IlmRecoveryReceiptMode::DryRun,
+            status: IlmRecoveryDispositionDryRunStatus::Ready,
+            disposition_id: "ab".repeat(32),
+            export_id: "cd".repeat(32),
+            export_sha256: "ef".repeat(32),
+            source_generation_sha256: "12".repeat(32),
+            copy_set_sha256: "34".repeat(32),
+            source_copy_count: 2,
+            observation_receipt: "opaque-execute".to_string(),
+            observation_receipt_expires_at_unix_nanos: 900_000_000_001,
+        };
+        let dry_run_json = serde_json::to_value(&dry_run).unwrap();
+        assert_eq!(dry_run_json["action"], "abandon_remote_cleanup");
+        assert_eq!(dry_run_json["mode"], "dry_run");
+        assert_eq!(dry_run_json["status"], "ready");
+        assert_eq!(
+            serde_json::from_value::<IlmRecoveryDispositionDryRunResponse>(dry_run_json).unwrap(),
+            dry_run
+        );
+
+        let execute = IlmRecoveryDispositionExecuteResponse {
+            action: IlmRecoveryReceiptAction::AbandonRemoteCleanup,
+            mode: IlmRecoveryReceiptMode::Execute,
+            disposition_id: "ab".repeat(32),
+            state: IlmRecoveryDispositionState::Applying,
+            outcome: IlmRecoveryDispositionOutcome::AcceptedForRecovery,
+            confirmed_absent_copy_count: 1,
+            source_copy_count: 2,
+        };
+        let execute_json = serde_json::to_value(&execute).unwrap();
+        assert_eq!(execute_json["state"], "applying");
+        assert_eq!(execute_json["outcome"], "accepted_for_recovery");
+        assert_eq!(
+            serde_json::from_value::<IlmRecoveryDispositionExecuteResponse>(execute_json).unwrap(),
+            execute
+        );
+
+        let mut unknown = serde_json::to_value(&dry_run).unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<IlmRecoveryDispositionDryRunResponse>(unknown).is_err());
     }
 
     #[test]
