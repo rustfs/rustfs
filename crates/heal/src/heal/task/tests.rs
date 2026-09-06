@@ -15,6 +15,8 @@
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk};
 use super::*;
 
+mod deferred_retry;
+
 mod canonical_outcome {
     use super::*;
     use crate::heal::outcome::{HealExecutionOutcome, HealTraversalCoverage};
@@ -939,6 +941,10 @@ async fn verified_recovery_keeps_state_when_marker_clear_fails() {
 
 #[derive(Default)]
 struct MockStorage {
+    retry_test_pages: Option<Vec<Vec<HealListItem>>>,
+    retry_test_delays: HashMap<String, Duration>,
+    retry_test_listing_delays: Mutex<VecDeque<Duration>>,
+    retry_test_events: Mutex<Vec<String>>,
     listed: Mutex<bool>,
     list_each_bucket: bool,
     fail_second_listing_page: bool,
@@ -1109,6 +1115,7 @@ fn replacement_identity(
 }
 
 enum MockHealObjectOutcome {
+    RetryableLock,
     OkWithOtherError(&'static str),
     ErrOther(&'static str),
     DanglingGraceDeferred,
@@ -1213,6 +1220,10 @@ impl HealStorageAPI for MockStorage {
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
         self.heal_object_calls.lock().unwrap().push(object.to_string());
+        self.retry_test_events.lock().expect("events").push(format!("heal:{object}"));
+        if let Some(delay) = self.retry_test_delays.get(object) {
+            tokio::time::sleep(*delay).await;
+        }
         self.heal_object_version_ids
             .lock()
             .unwrap()
@@ -1241,6 +1252,13 @@ impl HealStorageAPI for MockStorage {
                     bucket.to_string(),
                     object.to_string(),
                 ))),
+                MockHealObjectOutcome::RetryableLock => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::Lock(rustfs_lock::LockError::AlreadyLocked {
+                        resource: object.to_string(),
+                        owner: "competing-writer".to_string(),
+                    }))),
+                )),
                 MockHealObjectOutcome::RetryableSlowDown => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::SlowDown))))
                 }
@@ -1266,6 +1284,13 @@ impl HealStorageAPI for MockStorage {
                     bucket.to_string(),
                     object.to_string(),
                 ))),
+                MockHealObjectOutcome::RetryableLock => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::Lock(rustfs_lock::LockError::AlreadyLocked {
+                        resource: object.to_string(),
+                        owner: "competing-writer".to_string(),
+                    }))),
+                )),
                 MockHealObjectOutcome::RetryableSlowDown => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::SlowDown))))
                 }
@@ -1361,6 +1386,19 @@ impl HealStorageAPI for MockStorage {
             .lock()
             .expect("listing tokens")
             .push(continuation_token.map(ToOwned::to_owned));
+        self.retry_test_events
+            .lock()
+            .expect("events")
+            .push(format!("list:{}", continuation_token.unwrap_or("first")));
+        let delay = self.retry_test_listing_delays.lock().expect("listing delays").pop_front();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        if let Some(pages) = &self.retry_test_pages {
+            let page = continuation_token.map_or(0, |token| token.parse::<usize>().expect("test page token"));
+            let next = (page + 1 < pages.len()).then(|| (page + 1).to_string());
+            return Ok((pages[page].clone(), next.clone(), next.is_some()));
+        }
         if let Some(remaining) = self
             .recoverable_second_page_failures
             .lock()
