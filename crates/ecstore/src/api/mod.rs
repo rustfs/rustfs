@@ -76,6 +76,22 @@ pub mod bucket {
             };
         }
 
+        pub mod recovery_disposition {
+            pub use crate::bucket::lifecycle::recovery_disposition::{
+                CreatedIlmRecoveryDisposition, IlmRecoveryDisposition, IlmRecoveryDispositionAction, IlmRecoveryDispositionError,
+                IlmRecoveryDispositionIdentity, IlmRecoveryDispositionOwnerLease, IlmRecoveryDispositionReasonCode,
+                IlmRecoveryDispositionState, ObservedIlmRecoveryDisposition, create_recovery_disposition_if_absent,
+                load_recovery_disposition, recovery_disposition_id, save_recovery_disposition_if_current,
+            };
+        }
+
+        pub mod recovery_export {
+            pub use crate::bucket::lifecycle::recovery_export::{
+                IlmRecoveryExportCreated, IlmRecoveryExportObservation, create_recovery_export,
+                inspect_recovery_export_observation, load_recovery_export,
+            };
+        }
+
         pub mod transition_transaction {
             pub use crate::bucket::lifecycle::transition_transaction::{
                 TransitionOperatorDeleteResult, TransitionOperatorError, TransitionOperatorProbe, TransitionOperatorStatus,
@@ -293,7 +309,7 @@ pub mod cache {
 pub mod capacity {
     pub use crate::core::pools::{
         DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
-        path2_bucket_object, path2_bucket_object_with_base_path,
+        is_pool_activation_fleet_proof_error, path2_bucket_object, path2_bucket_object_with_base_path,
     };
     pub use crate::store::utils::is_reserved_or_invalid_bucket;
 }
@@ -446,9 +462,12 @@ pub mod notification {
     #[cfg(any(test, feature = "test-util"))]
     pub use crate::services::notification_sys::rotate_cross_pool_fence_fleet_proof_for_test;
     pub use crate::services::notification_sys::{
-        ClusterTierDailyStats, CrossPoolFenceFleetProofToken, LegacyTransitionStateReconcileFleetProofToken, NotificationPeerErr,
-        NotificationSys, ScannerPublicationLeaseGrant, acquire_cross_pool_fence_fleet_proof,
+        ClusterTierDailyStats, CrossPoolFenceFleetProofToken, IlmRecoveryExportFleetProofToken,
+        LegacyTransitionStateReconcileFleetProofToken, NotificationPeerErr, NotificationSys, ScannerPublicationLeaseGrant,
+        acquire_cross_pool_fence_fleet_proof, acquire_ilm_recovery_export_fleet_proof,
         acquire_legacy_transition_state_reconcile_fleet_proof, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
+        ilm_recovery_export_fleet_proof_matches, ilm_recovery_export_local_process_epoch,
+        ilm_recovery_export_member_epochs_sha256, ilm_recovery_export_topology_generation,
         legacy_transition_state_reconcile_fleet_proof_matches, new_global_notification_sys,
         scanner_peer_transport_error_message_is_retryable, start_remote_version_state_fleet_probe,
     };

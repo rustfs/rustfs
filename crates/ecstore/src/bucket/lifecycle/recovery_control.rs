@@ -168,7 +168,7 @@ impl IlmRecoverySourceGeneration {
         Ok(generation)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.source_schema.trim().is_empty() {
             return Err(IlmRecoveryControlError::Corrupt("source schema is empty"));
         }

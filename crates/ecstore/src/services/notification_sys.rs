@@ -33,11 +33,11 @@ use rustfs_madmin::net::NetInfo;
 use rustfs_madmin::{ItemState, ServerProperties, StorageInfo};
 use rustfs_utils::XHost;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::DefaultHasher};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, LazyLock, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
@@ -311,12 +311,20 @@ pub struct LegacyTransitionStateReconcileFleetProofToken {
     _permit: FleetCapabilityProofPermit,
 }
 
+/// Effect-window authority for one immutable ILM recovery export.
+pub struct IlmRecoveryExportFleetProofToken {
+    token: FleetCapabilityProofToken,
+    _permit: FleetCapabilityProofPermit,
+}
+
 static REMOTE_VERSION_STATE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static CROSS_POOL_FENCE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static TIER_DELETE_JOURNAL_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static DECOMMISSION_TARGET_FENCE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static LEGACY_TRANSITION_STATE_RECONCILE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
+static ILM_RECOVERY_EXPORT_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static REMOTE_VERSION_STATE_PROBE_TOPOLOGY: OnceLock<String> = OnceLock::new();
+static ILM_RECOVERY_EXPORT_LOCAL_PROCESS_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
 
 fn cross_pool_fence_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
     CROSS_POOL_FENCE_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
@@ -336,6 +344,10 @@ fn decommission_target_fence_fleet_proof_slot() -> &'static std::sync::RwLock<Fl
 
 fn legacy_transition_state_reconcile_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
     LEGACY_TRANSITION_STATE_RECONCILE_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
+}
+
+fn ilm_recovery_export_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
+    ILM_RECOVERY_EXPORT_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
 }
 
 fn revoke_fleet_capability_proof_state(state: &mut FleetCapabilityProofState) {
@@ -573,6 +585,117 @@ pub async fn legacy_transition_state_reconcile_fleet_proof_matches(
     .await
 }
 
+pub async fn acquire_ilm_recovery_export_fleet_proof() -> Option<IlmRecoveryExportFleetProofToken> {
+    let expected_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get()?;
+    let proof = {
+        let state = ilm_recovery_export_fleet_proof_slot()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        acquire_ilm_recovery_export_fleet_proof_from(&state, expected_topology, Instant::now())?
+    };
+    let observed = observe_ilm_recovery_export_fleet(expected_topology).await?;
+    let state = ilm_recovery_export_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ilm_recovery_export_fleet_proof_matches_observation_at(&state, &proof, expected_topology, &observed, Instant::now())
+        .then_some(proof)
+}
+
+fn acquire_ilm_recovery_export_fleet_proof_from(
+    state: &FleetCapabilityProofState,
+    expected_topology: &str,
+    now: Instant,
+) -> Option<IlmRecoveryExportFleetProofToken> {
+    let token = acquire_fleet_capability_proof_from(state, expected_topology, now)?;
+    let permit = state.proof.as_ref()?.generation.try_acquire()?;
+    Some(IlmRecoveryExportFleetProofToken { token, _permit: permit })
+}
+
+pub async fn ilm_recovery_export_fleet_proof_matches(proof: &IlmRecoveryExportFleetProofToken) -> bool {
+    let Some(expected_topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else {
+        return false;
+    };
+    {
+        let state = ilm_recovery_export_fleet_proof_slot()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !ilm_recovery_export_fleet_proof_matches_at(&state, proof, expected_topology, Instant::now()) {
+            return false;
+        }
+    }
+    let Some(observed) = observe_ilm_recovery_export_fleet(expected_topology).await else {
+        return false;
+    };
+    let state = ilm_recovery_export_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ilm_recovery_export_fleet_proof_matches_observation_at(&state, proof, expected_topology, &observed, Instant::now())
+}
+
+pub fn ilm_recovery_export_topology_generation(proof: &IlmRecoveryExportFleetProofToken) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rustfs-ilm-recovery-export-topology-v1\0");
+    hasher.update(proof.token.topology_fingerprint.as_bytes());
+    rustfs_utils::crypto::hex(hasher.finalize().as_slice())
+}
+
+pub fn ilm_recovery_export_member_epochs_sha256(proof: &IlmRecoveryExportFleetProofToken) -> String {
+    let encoded = serde_json::to_vec(proof.token.peer_epochs.as_ref()).expect("member epoch map is JSON encodable");
+    let mut hasher = Sha256::new();
+    hasher.update(b"rustfs-ilm-recovery-export-members-v1\0");
+    hasher.update(encoded);
+    rustfs_utils::crypto::hex(hasher.finalize().as_slice())
+}
+
+pub fn ilm_recovery_export_local_process_epoch() -> Uuid {
+    *ILM_RECOVERY_EXPORT_LOCAL_PROCESS_EPOCH
+}
+
+fn ilm_recovery_export_fleet_proof_matches_at(
+    state: &FleetCapabilityProofState,
+    proof: &IlmRecoveryExportFleetProofToken,
+    expected_topology: &str,
+    now: Instant,
+) -> bool {
+    proof._permit.generation.is_accepting()
+        && fleet_capability_proof_matches_at(state, &proof.token, expected_topology, now)
+        && state
+            .proof
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.generation, &proof._permit.generation))
+}
+
+fn ilm_recovery_export_fleet_proof_matches_observation_at(
+    state: &FleetCapabilityProofState,
+    proof: &IlmRecoveryExportFleetProofToken,
+    expected_topology: &str,
+    observed: &BTreeMap<String, Uuid>,
+    now: Instant,
+) -> bool {
+    ilm_recovery_export_fleet_proof_matches_at(state, proof, expected_topology, now)
+        && proof.token.peer_epochs.as_ref() == observed
+}
+
+async fn observe_ilm_recovery_export_fleet(expected_topology: &str) -> Option<BTreeMap<String, Uuid>> {
+    #[cfg(test)]
+    {
+        let state = ilm_recovery_export_fleet_proof_slot()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if fleet_capability_proof_valid_at(state.proof.as_ref(), expected_topology, Instant::now()) {
+            return state.proof.as_ref().map(|proof| proof.peer_epochs.as_ref().clone());
+        }
+    }
+    let notification_sys = get_global_notification_sys()?;
+    timeout(
+        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+        notification_sys.probe_ilm_recovery_export_fleet(expected_topology),
+    )
+    .await
+    .ok()?
+    .ok()
+}
+
 async fn legacy_transition_state_reconcile_fleet_proof_matches_with_observer<F, Fut>(
     slot: &std::sync::RwLock<FleetCapabilityProofState>,
     proof: &LegacyTransitionStateReconcileFleetProofToken,
@@ -661,7 +784,7 @@ pub(crate) fn install_cross_pool_fence_fleet_proof_for_test() {
         state.proof.clone()
     } else {
         Some(FleetCapabilityProof::new(
-            topology,
+            topology.clone(),
             Arc::new(BTreeMap::new()),
             now + Duration::from_secs(60 * 60),
         ))
@@ -694,6 +817,21 @@ pub(crate) fn install_cross_pool_fence_fleet_proof_for_test() {
     decommission_state.topology_conflict = false;
     decommission_state.draining_generation = None;
     decommission_state.proof = proof.as_ref().map(FleetCapabilityProof::with_fresh_generation);
+    drop(decommission_state);
+    let mut export_state = ilm_recovery_export_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !fleet_capability_proof_valid_at(export_state.proof.as_ref(), &topology, now) {
+        debug_assert!(
+            export_state
+                .proof
+                .as_ref()
+                .is_none_or(|current| current.generation.is_drained())
+        );
+        export_state.topology_conflict = false;
+        export_state.draining_generation = None;
+        export_state.proof = proof.as_ref().map(FleetCapabilityProof::with_fresh_generation);
+    }
 }
 
 #[cfg(test)]
@@ -950,6 +1088,7 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 tier_delete_journal_fleet_proof_slot(),
                 decommission_target_fence_fleet_proof_slot(),
                 legacy_transition_state_reconcile_fleet_proof_slot(),
+                ilm_recovery_export_fleet_proof_slot(),
             ] {
                 mark_fleet_capability_topology_conflict(slot);
             }
@@ -959,29 +1098,42 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
 
     tokio::spawn(async move {
         loop {
-            let result = match get_global_notification_sys() {
-                Some(notification_sys) => {
-                    match timeout(
+            let notification_sys = get_global_notification_sys();
+            let remote_version_state_probe = async {
+                match notification_sys.as_ref() {
+                    Some(notification_sys) => timeout(
                         REMOTE_VERSION_STATE_PROBE_TIMEOUT,
                         notification_sys.probe_remote_version_state_fleet(&topology_fingerprint),
                     )
                     .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => Err(Error::other("remote version state fleet capability probe timed out")),
-                    }
+                    .unwrap_or_else(|_| Err(Error::other("remote version state fleet capability probe timed out"))),
+                    None => Err(Error::other("remote version state fleet capability notification system is unavailable")),
                 }
-                None => Err(Error::other("remote version state fleet capability notification system is unavailable")),
             };
-            let fence_probe = match get_global_notification_sys() {
-                Some(notification_sys) => timeout(
-                    REMOTE_VERSION_STATE_PROBE_TIMEOUT,
-                    notification_sys.probe_cross_pool_fence_fleet(&topology_fingerprint),
-                )
-                .await
-                .unwrap_or_else(|_| Err(Error::other("cross-pool fence fleet capability probe timed out"))),
-                None => Err(Error::other("cross-pool fence fleet capability notification system is unavailable")),
+            let cross_pool_fence_probe = async {
+                match notification_sys.as_ref() {
+                    Some(notification_sys) => timeout(
+                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                        notification_sys.probe_cross_pool_fence_fleet(&topology_fingerprint),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(Error::other("cross-pool fence fleet capability probe timed out"))),
+                    None => Err(Error::other("cross-pool fence fleet capability notification system is unavailable")),
+                }
             };
+            let recovery_export_probe = async {
+                match notification_sys.as_ref() {
+                    Some(notification_sys) => timeout(
+                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                        notification_sys.probe_ilm_recovery_export_fleet(&topology_fingerprint),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(Error::other("ILM recovery export fleet capability probe timed out"))),
+                    None => Err(Error::other("ILM recovery export fleet capability notification system is unavailable")),
+                }
+            };
+            let (result, fence_probe, recovery_export_result) =
+                tokio::join!(remote_version_state_probe, cross_pool_fence_probe, recovery_export_probe);
             let (fence_result, journal_result, decommission_target_fence_result, reconcile_result) = match fence_probe {
                 Ok((peer_epochs, minimum_version)) => cross_pool_fence_policy_results(peer_epochs, minimum_version),
                 Err(err) => {
@@ -1004,6 +1156,7 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 revoke_fleet_capability_proof(tier_delete_journal_fleet_proof_slot());
                 revoke_fleet_capability_proof(decommission_target_fence_fleet_proof_slot());
                 revoke_fleet_capability_proof(legacy_transition_state_reconcile_fleet_proof_slot());
+                revoke_fleet_capability_proof(ilm_recovery_export_fleet_proof_slot());
             } else if let Some(err) = publish_fleet_capability_probe_result(
                 remote_version_state_fleet_proof_slot(),
                 &topology_fingerprint,
@@ -1025,6 +1178,24 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_NOTIFICATION,
                     capability = "cross_pool_fence",
+                    state = "failed_closed",
+                    error = %err,
+                    "notification capability probe"
+                );
+            }
+            if !topology_conflict
+                && let Some(err) = publish_fleet_capability_probe_result(
+                    ilm_recovery_export_fleet_proof_slot(),
+                    &topology_fingerprint,
+                    recovery_export_result,
+                    Instant::now(),
+                )
+            {
+                debug!(
+                    event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    capability = "ilm_recovery_export_v1",
                     state = "failed_closed",
                     error = %err,
                     "notification capability probe"
@@ -1174,6 +1345,46 @@ impl NotificationSys {
         }
         Ok((peer_epochs, minimum_version))
     }
+
+    async fn probe_ilm_recovery_export_fleet(&self, topology_fingerprint: &str) -> Result<BTreeMap<String, Uuid>> {
+        if self.peer_clients.len() != self.peer_topology_hosts.len() {
+            return Err(Error::other("ILM recovery export capability fleet membership is incomplete"));
+        }
+        let local_member = runtime_sources::local_node_name().await;
+        if local_member.trim().is_empty() {
+            return Err(Error::other("ILM recovery export local member identity is unavailable"));
+        }
+        let mut peer_epochs = BTreeMap::new();
+        insert_remote_version_state_peer(&mut peer_epochs, local_member.clone(), ilm_recovery_export_local_process_epoch())?;
+        let probes = self.peer_clients.iter().map(|client| async {
+            let client = client
+                .as_ref()
+                .ok_or_else(|| Error::other("ILM recovery export capability peer is unreachable"))?;
+            client.probe_ilm_recovery_export(topology_fingerprint.to_string()).await
+        });
+        for result in join_all(probes).await {
+            let (peer, epoch) = result?;
+            insert_remote_version_state_peer(&mut peer_epochs, peer, epoch)?;
+        }
+        validate_ilm_recovery_export_members(&self.peer_topology_hosts, &local_member, &peer_epochs)?;
+        Ok(peer_epochs)
+    }
+}
+
+fn validate_ilm_recovery_export_members(
+    expected_remote_members: &[String],
+    local_member: &str,
+    observed: &BTreeMap<String, Uuid>,
+) -> Result<()> {
+    let expected = expected_remote_members
+        .iter()
+        .cloned()
+        .chain(std::iter::once(local_member.to_string()))
+        .collect::<BTreeSet<_>>();
+    if expected.len() != expected_remote_members.len().saturating_add(1) || observed.keys().ne(expected.iter()) {
+        return Err(Error::other("ILM recovery export capability fleet membership does not match topology"));
+    }
+    Ok(())
 }
 
 /// Rolling tier activity summed over every cluster member that answered, with
@@ -3505,6 +3716,81 @@ mod tests {
         );
 
         assert!(captured != restarted.token());
+    }
+
+    #[test]
+    fn ilm_recovery_export_member_digest_is_order_independent_and_epoch_bound() {
+        let now = Instant::now();
+        let local_epoch = ilm_recovery_export_local_process_epoch();
+        assert!(!local_epoch.is_nil());
+        assert_eq!(local_epoch, ilm_recovery_export_local_process_epoch());
+        let remote_epoch = Uuid::new_v4();
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let peers = BTreeMap::from([("node-b".to_string(), remote_epoch), ("node-a".to_string(), local_epoch)]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(peers), now).is_none());
+        let proof = {
+            let state = slot.read().expect("export proof slot should not poison");
+            acquire_ilm_recovery_export_fleet_proof_from(&state, "topology-a", now).expect("complete fleet should admit export")
+        };
+        let digest = ilm_recovery_export_member_epochs_sha256(&proof);
+
+        let changed_slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let changed = BTreeMap::from([("node-a".to_string(), local_epoch), ("node-b".to_string(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&changed_slot, "topology-a", Ok(changed), now).is_none());
+        let changed_proof = {
+            let state = changed_slot.read().expect("export proof slot should not poison");
+            acquire_ilm_recovery_export_fleet_proof_from(&state, "topology-a", now).expect("complete fleet should admit export")
+        };
+        assert_ne!(digest, ilm_recovery_export_member_epochs_sha256(&changed_proof));
+    }
+
+    #[test]
+    fn ilm_recovery_export_members_must_match_the_exact_topology() {
+        let expected_remote = vec!["node-b".to_string()];
+        let local = "node-a";
+        let complete = BTreeMap::from([
+            (local.to_string(), Uuid::new_v4()),
+            (expected_remote[0].clone(), Uuid::new_v4()),
+        ]);
+        assert!(validate_ilm_recovery_export_members(&expected_remote, local, &complete).is_ok());
+
+        let unexpected = BTreeMap::from([(local.to_string(), Uuid::new_v4()), ("node-c".to_string(), Uuid::new_v4())]);
+        assert!(validate_ilm_recovery_export_members(&expected_remote, local, &unexpected).is_err());
+        assert!(
+            validate_ilm_recovery_export_members(&[local.to_string()], local, &complete).is_err(),
+            "the configured remote set cannot repeat the local member"
+        );
+    }
+
+    #[test]
+    fn ilm_recovery_export_restart_revokes_authority_until_permit_drains() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let original = BTreeMap::from([("node-a".to_string(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(original), now).is_none());
+        let admitted = {
+            let state = slot.read().expect("export proof slot should not poison");
+            acquire_ilm_recovery_export_fleet_proof_from(&state, "topology-a", now).expect("fresh fleet should admit export")
+        };
+
+        let restarted = BTreeMap::from([("node-a".to_string(), Uuid::new_v4())]);
+        let draining = publish_fleet_capability_probe_result(&slot, "topology-a", Ok(restarted.clone()), now)
+            .expect("restart must wait for the admitted export effect window");
+        assert!(draining.to_string().contains("previous generation to drain"));
+        {
+            let state = slot.read().expect("export proof slot should not poison");
+            assert!(!ilm_recovery_export_fleet_proof_matches_at(&state, &admitted, "topology-a", now));
+            assert!(
+                acquire_ilm_recovery_export_fleet_proof_from(&state, "topology-a", now).is_none(),
+                "successor authority must wait for the old effect window to drain"
+            );
+        }
+        drop(admitted);
+        assert!(
+            publish_fleet_capability_probe_result(&slot, "topology-a", Ok(restarted), now + Duration::from_millis(1)).is_none()
+        );
+        let state = slot.read().expect("export proof slot should not poison");
+        assert!(acquire_ilm_recovery_export_fleet_proof_from(&state, "topology-a", now).is_some());
     }
 
     #[test]

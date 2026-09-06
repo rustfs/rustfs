@@ -453,6 +453,14 @@ async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure(
                 .put_object(bucket, "initial", &mut reader, &ScannerObjectOptions::default())
                 .await
                 .expect("initial object should persist");
+            let lock = store.pools[0].disk_set[0]
+                .new_ns_lock(bucket, "initial")
+                .await
+                .expect("fixture namespace lock should be created");
+            let _settled = lock
+                .get_write_lock(Duration::from_secs(30))
+                .await
+                .expect("fixture rename tail should finish before the usage scan");
         }
         let ctx = CancellationToken::new();
         let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
@@ -503,6 +511,15 @@ async fn scoped_scan_same_cycle_maintenance_rewalks_after_root_delivery_failure(
             .put_object("cold-bucket", "new", &mut reader, &ScannerObjectOptions::default())
             .await
             .expect("new cold object should persist");
+        let lock = store.pools[0].disk_set[0]
+            .new_ns_lock("cold-bucket", "new")
+            .await
+            .expect("fixture namespace lock should be created");
+        let _settled = lock
+            .get_write_lock(Duration::from_secs(30))
+            .await
+            .expect("fixture rename tail should finish before the usage scan");
+        drop(_settled);
         record_dirty_usage_bucket("hot-bucket");
         if scan_mode == HealScanMode::Normal && !requires_full_scan {
             record_dirty_usage_bucket("cold-bucket");

@@ -3385,7 +3385,7 @@ pub(crate) async fn acquire_pool_activation_fleet_proof(
         .ok_or_else(|| Error::other(POOL_ACTIVATION_FLEET_PROOF_REQUIRED))
 }
 
-pub(crate) fn is_pool_activation_fleet_proof_error(err: &Error) -> bool {
+pub fn is_pool_activation_fleet_proof_error(err: &Error) -> bool {
     // Save-stage helpers add context by formatting the original error, so the
     // marker may be nested in the display string. Restrict matching to the
     // `Error::other` I/O shape used by this activation path.

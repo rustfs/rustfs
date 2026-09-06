@@ -2279,6 +2279,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multipart_empty_tail_full_reads_preserve_plaintext() {
+        let key = [0x6Eu8; 32];
+        let part_sizes = [5 * 1024 * 1024, 0];
+        let encrypted = build_legacy_ssec_multipart_fixture(key, &part_sizes).await;
+        for (kind, mut fixture, headers) in [
+            (
+                "encrypted",
+                CompressedMultipartFixture {
+                    object_info: encrypted.object_info,
+                    stored: encrypted.ciphertext,
+                    plaintext: encrypted.plaintext,
+                },
+                ssec_headers_from_key(key),
+            ),
+            ("compressed", compressed_multipart_fixture(&part_sizes).await, HeaderMap::new()),
+            (
+                "compressed and encrypted",
+                compressed_encrypted_multipart_fixture(key, &part_sizes).await,
+                ssec_headers_from_key(key),
+            ),
+        ] {
+            fixture.object_info.etag = Some(faster_hex::hex_string(Md5::digest(&fixture.plaintext).as_ref()));
+            assert_eq!(fixture.object_info.etag.as_ref().expect("source ETag").len(), 32);
+            assert_eq!(fixture.object_info.parts.len(), 2);
+            let tail = &fixture.object_info.parts[1];
+            assert_eq!(tail.actual_size, 0, "{kind}: final part has no plaintext");
+            if kind == "compressed" {
+                assert_eq!(tail.size, 0, "unpadded compression emits no bytes for an empty part");
+            } else {
+                assert!(tail.size > 0, "{kind}: the empty part still has a stored frame");
+            }
+            let stored_size = i64::try_from(fixture.stored.len()).expect("fixture size fits i64");
+            let (mut reader, offset, length) = GetObjectReader::new(
+                Box::new(Cursor::new(fixture.stored)),
+                None,
+                &fixture.object_info,
+                &ObjectOptions::default(),
+                &headers,
+            )
+            .await
+            .expect("full transformed read must include the empty tail");
+            assert_eq!((offset, length), (0, stored_size), "{kind}: full read includes all stored parts");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("read through the complete decoder EOF");
+            assert_eq!(body, fixture.plaintext, "{kind}: no plaintext is added or lost by the empty tail");
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_empty_tail_full_read_authenticates_v2_final_frame() {
+        let key = [0x6Eu8; 32];
+        let plaintext = legacy_fixture_part_plaintext(1, 5 * 1024 * 1024);
+        let mut ciphertext = Vec::new();
+        let mut parts = Vec::new();
+        for (number, body) in [(1, plaintext.as_slice()), (2, b"".as_slice())] {
+            let start = ciphertext.len();
+            rustfs_rio::EncryptReader::new_multipart_v2(Cursor::new(body), key, LEGACY_FIXTURE_BASE_NONCE, number)
+                .read_to_end(&mut ciphertext)
+                .await
+                .expect("encrypt a v2 fixture part with an authenticated final frame");
+            parts.push(ObjectPartInfo {
+                number,
+                size: ciphertext.len() - start,
+                actual_size: i64::try_from(body.len()).expect("fixture plaintext size fits"),
+                ..Default::default()
+            });
+        }
+        let tail_start = parts[0].size;
+        assert_eq!(parts[1].actual_size, 0);
+        assert!(parts[1].size > 8, "the empty final frame carries more than an END marker");
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "v2-empty-tail".to_string(),
+            size: i64::try_from(ciphertext.len()).expect("fixture ciphertext size fits"),
+            etag: Some(faster_hex::hex_string(Md5::digest(&plaintext).as_ref())),
+            parts: Arc::new(parts),
+            user_defined: Arc::new(legacy_ssec_multipart_metadata(key, plaintext.len())),
+            ..Default::default()
+        };
+        for corrupt_tail in [false, true] {
+            let mut stored = ciphertext.clone();
+            if corrupt_tail {
+                // The v2 header is authenticated associated data, including
+                // the header of a final frame containing zero plaintext.
+                stored[tail_start + 5] ^= 1;
+            }
+            let (mut reader, offset, length) = GetObjectReader::new(
+                Box::new(Cursor::new(stored)),
+                None,
+                &object_info,
+                &ObjectOptions::default(),
+                &ssec_headers_from_key(key),
+            )
+            .await
+            .expect("construct the full reader before consuming the final frame");
+            assert_eq!((offset, length), (0, object_info.size));
+            let result = tokio::io::copy(&mut reader.stream, &mut tokio::io::sink()).await;
+            if corrupt_tail {
+                let err = result.expect_err("EOF must authenticate the empty final frame after all plaintext is returned");
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+                assert_eq!(err.to_string(), "v2 encrypted frame failed authentication");
+            } else {
+                assert_eq!(
+                    result.expect("valid empty final frame must reach EOF"),
+                    u64::try_from(plaintext.len()).expect("plaintext length fits")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn compressed_encrypted_multipart_range_crosses_part_boundary() {
         let key_bytes = [0x6Eu8; 32];
         let fixture = compressed_encrypted_multipart_fixture(key_bytes, &[3 * 1024 * 1024, 1024 * 1024]).await;
@@ -3654,6 +3769,61 @@ mod tests {
             assert_eq!(plan.storage_length, object_info.size);
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn multipart_full_read_preserves_legacy_zero_and_negative_part_sizes() {
+        let key = [0x77; 32];
+        let part_sizes = [5 * 1024 * 1024, 1024 * 1024];
+        let encrypted = build_legacy_ssec_multipart_fixture(key, &part_sizes).await;
+        // The encrypted case supplies the fixture key explicitly. This covers
+        // full decrypted reads, not managed-key acquisition.
+        for (kind, fixture, headers) in [
+            ("compressed", compressed_multipart_fixture(&part_sizes).await, HeaderMap::new()),
+            (
+                "encrypted with supplied key",
+                CompressedMultipartFixture {
+                    object_info: encrypted.object_info,
+                    stored: encrypted.ciphertext,
+                    plaintext: encrypted.plaintext,
+                },
+                ssec_headers_from_key(key),
+            ),
+        ] {
+            let source_etag = faster_hex::hex_string(Md5::digest(&fixture.plaintext).as_ref());
+            assert_eq!(source_etag.len(), 32);
+            assert_eq!(fixture.plaintext.len(), 6 * 1024 * 1024);
+            for part_index in 0..part_sizes.len() {
+                assert!(fixture.object_info.parts[part_index].actual_size > 0, "the selected part is nonempty");
+                for actual_size in [0, -1] {
+                    let mut object_info = fixture.object_info.clone();
+                    object_info.etag = Some(source_etag.clone());
+                    Arc::make_mut(&mut object_info.parts)[part_index].actual_size = actual_size;
+                    let (mut reader, offset, length) = GetObjectReader::new(
+                        Box::new(Cursor::new(fixture.stored.clone())),
+                        None,
+                        &object_info,
+                        &ObjectOptions::default(),
+                        &headers,
+                    )
+                    .await
+                    .expect("the authoritative total size must keep full legacy reads available");
+                    assert_eq!(offset, 0);
+                    assert_eq!(length, i64::try_from(fixture.stored.len()).expect("stored size fits"));
+                    let mut body = Vec::new();
+                    reader
+                        .stream
+                        .read_to_end(&mut body)
+                        .await
+                        .expect("full read must reach EOF despite an unspecified per-part logical size");
+                    assert_eq!(
+                        body, fixture.plaintext,
+                        "{kind}: part {part_index} with actual_size={actual_size} must not lose readable data"
+                    );
+                    assert_eq!(reader.object_info.etag.as_deref(), Some(source_etag.as_str()));
+                }
+            }
+        }
     }
 
     /// The physical part sizes must add up to `oi.size` for a seek to be safe;

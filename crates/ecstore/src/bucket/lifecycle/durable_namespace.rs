@@ -22,7 +22,7 @@ use super::{
     bucket_lifecycle_ops::{
         ManualTransitionQueueSnapshot, ManualTransitionRunReport, decode_manual_transition_continuation_token,
     },
-    manual_transition_job, recovery_control, tier_delete_journal, transition_transaction,
+    manual_transition_job, recovery_control, recovery_disposition, recovery_export, tier_delete_journal, transition_transaction,
 };
 use crate::error::{Error, Result};
 use crate::services::tier::tier_probe_intent;
@@ -42,6 +42,8 @@ pub(crate) enum DurableIlmRecordKind {
     ManualTransitionTask,
     ManualTransitionWorkerResult,
     RecoveryControl,
+    RecoveryExport,
+    RecoveryDisposition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,8 +114,20 @@ pub(crate) const RECOVERY_CONTROL_NAMESPACE: DurableIlmNamespace = DurableIlmNam
     max_record_size: recovery_control::MAX_ILM_RECOVERY_CONTROL_SIZE,
     kind: DurableIlmRecordKind::RecoveryControl,
 };
+pub(crate) const RECOVERY_EXPORT_NAMESPACE: DurableIlmNamespace = DurableIlmNamespace {
+    name: "recovery-export",
+    prefix: recovery_export::ILM_RECOVERY_EXPORT_PREFIX,
+    max_record_size: recovery_export::MAX_ILM_RECOVERY_EXPORT_SIZE,
+    kind: DurableIlmRecordKind::RecoveryExport,
+};
+pub(crate) const RECOVERY_DISPOSITION_NAMESPACE: DurableIlmNamespace = DurableIlmNamespace {
+    name: "recovery-disposition",
+    prefix: recovery_disposition::ILM_RECOVERY_DISPOSITION_PREFIX,
+    max_record_size: recovery_disposition::MAX_ILM_RECOVERY_DISPOSITION_SIZE,
+    kind: DurableIlmRecordKind::RecoveryDisposition,
+};
 
-pub(crate) const DURABLE_ILM_NAMESPACES: [DurableIlmNamespace; 10] = [
+pub(crate) const DURABLE_ILM_NAMESPACES: [DurableIlmNamespace; 12] = [
     TIER_DELETE_JOURNAL_NAMESPACE,
     TIER_DELETE_JOURNAL_V6_NAMESPACE,
     TIER_DELETE_DISPATCH_MANIFEST_NAMESPACE,
@@ -124,6 +138,8 @@ pub(crate) const DURABLE_ILM_NAMESPACES: [DurableIlmNamespace; 10] = [
     MANUAL_TRANSITION_TASK_NAMESPACE,
     MANUAL_TRANSITION_WORKER_RESULT_NAMESPACE,
     RECOVERY_CONTROL_NAMESPACE,
+    RECOVERY_EXPORT_NAMESPACE,
+    RECOVERY_DISPOSITION_NAMESPACE,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +277,28 @@ pub(crate) enum DurableIlmRecordCheckpoint {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_fence_sha256: Option<String>,
     },
+    RecoveryExport {
+        content_sha256: String,
+        source_generation_sha256: String,
+        topology_generation: String,
+        member_epochs_sha256: String,
+        creator_sha256: String,
+        retain_until_unix_nanos: i64,
+    },
+    RecoveryDisposition {
+        content_sha256: String,
+        identity_sha256: String,
+        copy_manifest_sha256: String,
+        copy_manifest_count: usize,
+        created_at_unix_nanos: i64,
+        revision: u64,
+        state: recovery_disposition::IlmRecoveryDispositionState,
+        owner_fence_sha256: Option<String>,
+        owner_lease_acquired_at_unix_nanos: Option<i64>,
+        owner_lease_expires_at_unix_nanos: Option<i64>,
+        confirmed_absent_sha256: Vec<String>,
+        retain_until_unix_nanos: i64,
+    },
 }
 
 impl DurableIlmRecordCheckpoint {
@@ -275,7 +313,9 @@ impl DurableIlmRecordCheckpoint {
             | Self::ManualTransitionScope { content_sha256, .. }
             | Self::ManualTransitionTask { content_sha256 }
             | Self::ManualTransitionWorkerResult { content_sha256 }
-            | Self::RecoveryControl { content_sha256, .. } => content_sha256,
+            | Self::RecoveryControl { content_sha256, .. }
+            | Self::RecoveryExport { content_sha256, .. }
+            | Self::RecoveryDisposition { content_sha256, .. } => content_sha256,
         }
     }
 
@@ -315,6 +355,9 @@ impl DurableIlmRecordCheckpoint {
                     || state.is_some_and(|state| *committed != (state == super::tier_sweeper::TierDeleteJournalState::Committed)))
             {
                 return Err(Error::other("durable ILM tier delete journal checkpoint is invalid"));
+            }
+            if !recovery_disposition_checkpoint_is_valid(checkpoint) {
+                return Err(Error::other("durable ILM recovery disposition checkpoint is invalid"));
             }
         }
         if self == next {
@@ -594,6 +637,83 @@ impl DurableIlmRecordCheckpoint {
                     && previous_attempts == next_attempts;
                 adjacent && (claim || source_refresh || completion)
             }
+            (
+                Self::RecoveryDisposition {
+                    identity_sha256: previous_identity,
+                    copy_manifest_sha256: previous_manifest,
+                    copy_manifest_count: previous_manifest_count,
+                    created_at_unix_nanos: previous_created_at,
+                    revision: previous_revision,
+                    state: previous_state,
+                    owner_fence_sha256: previous_owner,
+                    owner_lease_acquired_at_unix_nanos: previous_owner_acquired,
+                    owner_lease_expires_at_unix_nanos: previous_owner_expires,
+                    confirmed_absent_sha256: previous_confirmed,
+                    retain_until_unix_nanos: previous_retain_until,
+                    ..
+                },
+                Self::RecoveryDisposition {
+                    identity_sha256: next_identity,
+                    copy_manifest_sha256: next_manifest,
+                    copy_manifest_count: next_manifest_count,
+                    created_at_unix_nanos: next_created_at,
+                    revision: next_revision,
+                    state: next_state,
+                    owner_fence_sha256: next_owner,
+                    owner_lease_acquired_at_unix_nanos: next_owner_acquired,
+                    owner_lease_expires_at_unix_nanos: next_owner_expires,
+                    confirmed_absent_sha256: next_confirmed,
+                    retain_until_unix_nanos: next_retain_until,
+                    ..
+                },
+            ) => {
+                use recovery_disposition::IlmRecoveryDispositionState::{Applying, Completed, Prepared};
+
+                let immutable_identity_matches = previous_identity == next_identity
+                    && previous_manifest == next_manifest
+                    && previous_manifest_count == next_manifest_count
+                    && previous_created_at == next_created_at
+                    && previous_retain_until == next_retain_until;
+                let adjacent = previous_revision.checked_add(1) == Some(*next_revision);
+                let progress_is_monotonic = sorted_sha256_set_is_subset(previous_confirmed, next_confirmed);
+                let legal_edge = match (previous_state, next_state) {
+                    (Prepared, Prepared) => {
+                        let claim = previous_owner.is_none() && next_owner.is_some();
+                        let takeover = previous_owner.is_some()
+                            && previous_owner != next_owner
+                            && previous_owner_expires
+                                .zip(*next_owner_acquired)
+                                .is_some_and(|(expires, acquired)| acquired >= expires);
+                        previous_confirmed == next_confirmed && (claim || takeover)
+                    }
+                    (Prepared, Applying) => {
+                        previous_confirmed == next_confirmed
+                            && previous_owner.is_some()
+                            && previous_owner == next_owner
+                            && previous_owner_acquired == next_owner_acquired
+                            && previous_owner_expires == next_owner_expires
+                    }
+                    (Applying, Applying) => {
+                        let progress = previous_owner == next_owner
+                            && previous_owner_acquired == next_owner_acquired
+                            && previous_owner_expires == next_owner_expires
+                            && previous_confirmed.len().checked_add(1) == Some(next_confirmed.len());
+                        let takeover = previous_owner.is_some()
+                            && previous_owner != next_owner
+                            && previous_confirmed == next_confirmed
+                            && previous_owner_expires
+                                .zip(*next_owner_acquired)
+                                .is_some_and(|(expires, acquired)| acquired >= expires);
+                        progress || takeover
+                    }
+                    (Applying, Completed) => {
+                        previous_owner.is_some() && next_owner.is_none() && previous_confirmed == next_confirmed
+                    }
+                    _ => false,
+                };
+
+                immutable_identity_matches && adjacent && progress_is_monotonic && legal_edge
+            }
             _ => false,
         };
 
@@ -611,6 +731,11 @@ impl DurableIlmRecordCheckpoint {
     /// after the exact terminal ETag and terminal receipt were committed, to
     /// purge older object versions exposed by that deletion.
     pub(crate) fn is_predecessor_of_terminal(&self, terminal: &Self) -> bool {
+        for checkpoint in [self, terminal] {
+            if !recovery_disposition_checkpoint_is_valid(checkpoint) {
+                return false;
+            }
+        }
         if let Self::TierProbeIntent { state, .. } = terminal
             && !matches!(
                 state,
@@ -624,6 +749,11 @@ impl DurableIlmRecordCheckpoint {
                 classification,
                 recovery_control::IlmRecoveryClassification::Terminal | recovery_control::IlmRecoveryClassification::Abandoned
             )
+        {
+            return false;
+        }
+        if let Self::RecoveryDisposition { state, .. } = terminal
+            && state != &recovery_disposition::IlmRecoveryDispositionState::Completed
         {
             return false;
         }
@@ -752,9 +882,119 @@ impl DurableIlmRecordCheckpoint {
                     && terminal_revision > previous_revision
                     && terminal_attempts >= previous_attempts
             }
+            (
+                Self::RecoveryDisposition {
+                    identity_sha256: previous_identity,
+                    copy_manifest_sha256: previous_manifest,
+                    copy_manifest_count: previous_manifest_count,
+                    created_at_unix_nanos: previous_created_at,
+                    revision: previous_revision,
+                    state: previous_state,
+                    owner_fence_sha256: previous_owner,
+                    confirmed_absent_sha256: previous_confirmed,
+                    retain_until_unix_nanos: previous_retain_until,
+                    ..
+                },
+                Self::RecoveryDisposition {
+                    identity_sha256: terminal_identity,
+                    copy_manifest_sha256: terminal_manifest,
+                    copy_manifest_count: terminal_manifest_count,
+                    created_at_unix_nanos: terminal_created_at,
+                    revision: terminal_revision,
+                    state: recovery_disposition::IlmRecoveryDispositionState::Completed,
+                    confirmed_absent_sha256: terminal_confirmed,
+                    retain_until_unix_nanos: terminal_retain_until,
+                    ..
+                },
+            ) => {
+                matches!(
+                    previous_state,
+                    recovery_disposition::IlmRecoveryDispositionState::Prepared
+                        | recovery_disposition::IlmRecoveryDispositionState::Applying
+                ) && previous_identity == terminal_identity
+                    && previous_manifest == terminal_manifest
+                    && previous_manifest_count == terminal_manifest_count
+                    && previous_created_at == terminal_created_at
+                    && previous_retain_until == terminal_retain_until
+                    && terminal_revision.checked_sub(*previous_revision).is_some_and(|distance| {
+                        let minimum_distance = match previous_state {
+                            recovery_disposition::IlmRecoveryDispositionState::Prepared if previous_owner.is_some() => 3,
+                            recovery_disposition::IlmRecoveryDispositionState::Prepared => 4,
+                            recovery_disposition::IlmRecoveryDispositionState::Applying
+                                if previous_confirmed.len() == *previous_manifest_count =>
+                            {
+                                1
+                            }
+                            recovery_disposition::IlmRecoveryDispositionState::Applying => 2,
+                            recovery_disposition::IlmRecoveryDispositionState::Completed => u64::MAX,
+                        };
+                        distance >= minimum_distance
+                    })
+                    && sorted_sha256_set_is_subset(previous_confirmed, terminal_confirmed)
+            }
             _ => false,
         }
     }
+}
+
+fn recovery_disposition_checkpoint_is_valid(checkpoint: &DurableIlmRecordCheckpoint) -> bool {
+    use recovery_disposition::IlmRecoveryDispositionState::{Applying, Completed, Prepared};
+
+    let DurableIlmRecordCheckpoint::RecoveryDisposition {
+        content_sha256,
+        identity_sha256,
+        copy_manifest_sha256,
+        copy_manifest_count,
+        created_at_unix_nanos,
+        revision,
+        state,
+        owner_fence_sha256,
+        owner_lease_acquired_at_unix_nanos,
+        owner_lease_expires_at_unix_nanos,
+        confirmed_absent_sha256,
+        retain_until_unix_nanos,
+    } = checkpoint
+    else {
+        return true;
+    };
+    let owner_fence_sha256 = owner_fence_sha256.as_deref();
+
+    is_canonical_sha256(content_sha256)
+        && is_canonical_sha256(identity_sha256)
+        && is_canonical_sha256(copy_manifest_sha256)
+        && *copy_manifest_count > 0
+        && *created_at_unix_nanos > 0
+        && *revision > 0
+        && *retain_until_unix_nanos > 0
+        && owner_fence_sha256.is_none_or(is_canonical_sha256)
+        && match (
+            owner_fence_sha256,
+            *owner_lease_acquired_at_unix_nanos,
+            *owner_lease_expires_at_unix_nanos,
+        ) {
+            (None, None, None) => true,
+            (Some(_), Some(acquired), Some(expires)) => acquired > 0 && expires > acquired,
+            _ => false,
+        }
+        && confirmed_absent_sha256.len() <= *copy_manifest_count
+        && confirmed_absent_sha256.iter().all(|digest| is_canonical_sha256(digest))
+        && confirmed_absent_sha256.windows(2).all(|pair| pair[0] < pair[1])
+        && match *state {
+            Prepared => confirmed_absent_sha256.is_empty(),
+            Applying => owner_fence_sha256.is_some(),
+            Completed => owner_fence_sha256.is_none() && confirmed_absent_sha256.len() == *copy_manifest_count,
+        }
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    is_sha256_checksum(value)
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_hexdigit() && byte.is_ascii_uppercase())
+}
+
+fn sorted_sha256_set_is_subset(subset: &[String], superset: &[String]) -> bool {
+    subset.iter().all(|candidate| superset.binary_search(candidate).is_ok())
 }
 
 fn tier_delete_dispatch_parent_progress_delta(
@@ -1348,6 +1588,55 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
                 },
             )
         }
+        DurableIlmRecordKind::RecoveryExport => {
+            let (protocol, export_id) = recovery_export::recovery_export_id_from_record_object_name(path)?;
+            let export = recovery_export::IlmRecoveryExport::decode(&export_id, data)?;
+            let canonical = recovery_export::recovery_export_record_object_name(protocol, &export_id)?;
+            if canonical != path || export.protocol != protocol {
+                return Err(Error::other("ILM recovery export path is not canonical"));
+            }
+            let source_generation_sha256 = checkpoint_hash(&export.source_generation)?;
+            (
+                "export_id",
+                export_id,
+                DurableIlmRecordCheckpoint::RecoveryExport {
+                    content_sha256,
+                    source_generation_sha256,
+                    topology_generation: export.topology_generation,
+                    member_epochs_sha256: export.member_epochs_sha256,
+                    creator_sha256: export.creator_sha256,
+                    retain_until_unix_nanos: export.retain_until_unix_nanos,
+                },
+            )
+        }
+        DurableIlmRecordKind::RecoveryDisposition => {
+            // The disposition module owns strict schema, checksum, canonical
+            // path, immutable-manifest, and state-specific validation. Keep
+            // this boundary limited to decommission identity/checkpoint
+            // projection so the two readers cannot accept different records.
+            let disposition = recovery_disposition::decode_recovery_disposition_checkpoint(path, data)?;
+            if disposition.content_sha256 != content_sha256 {
+                return Err(Error::other("ILM recovery disposition checkpoint content digest is invalid"));
+            }
+            (
+                "disposition_id",
+                disposition.disposition_id,
+                DurableIlmRecordCheckpoint::RecoveryDisposition {
+                    content_sha256: disposition.content_sha256,
+                    identity_sha256: disposition.identity_sha256,
+                    copy_manifest_sha256: disposition.copy_manifest_sha256,
+                    copy_manifest_count: disposition.copy_manifest_count,
+                    created_at_unix_nanos: disposition.created_at_unix_nanos,
+                    revision: disposition.revision,
+                    state: disposition.state,
+                    owner_fence_sha256: disposition.owner_fence_sha256,
+                    owner_lease_acquired_at_unix_nanos: disposition.owner_lease_acquired_at_unix_nanos,
+                    owner_lease_expires_at_unix_nanos: disposition.owner_lease_expires_at_unix_nanos,
+                    confirmed_absent_sha256: disposition.confirmed_absent_sha256,
+                    retain_until_unix_nanos: disposition.retain_until_unix_nanos,
+                },
+            )
+        }
         DurableIlmRecordKind::ManualTransitionJob => {
             let job_id = manual_transition_job::manual_transition_job_id_from_record_object_name(path)
                 .map_err(|err| Error::other(err.to_string()))?;
@@ -1501,6 +1790,203 @@ mod tests {
                 assert!(!path_is_in_namespace(other.prefix, namespace));
             }
         }
+    }
+
+    fn recovery_disposition_checkpoint(
+        revision: u64,
+        state: recovery_disposition::IlmRecoveryDispositionState,
+        owner_fence: Option<&str>,
+        confirmed_absent_sha256: Vec<String>,
+    ) -> DurableIlmRecordCheckpoint {
+        let (owner_lease_acquired_at_unix_nanos, owner_lease_expires_at_unix_nanos) = match owner_fence {
+            Some("f") => (Some(10), Some(20)),
+            Some(_) => (Some(1), Some(10)),
+            None => (None, None),
+        };
+        DurableIlmRecordCheckpoint::RecoveryDisposition {
+            content_sha256: format!("{revision:064x}"),
+            identity_sha256: "a".repeat(64),
+            copy_manifest_sha256: "d".repeat(64),
+            copy_manifest_count: 2,
+            created_at_unix_nanos: 1_700_000_000_000_000_000,
+            revision,
+            state,
+            owner_fence_sha256: owner_fence.map(|digest| digest.repeat(64)),
+            owner_lease_acquired_at_unix_nanos,
+            owner_lease_expires_at_unix_nanos,
+            confirmed_absent_sha256,
+            retain_until_unix_nanos: 1_820_000_000_000_000_000,
+        }
+    }
+
+    #[test]
+    fn recovery_disposition_namespace_is_registered_without_shadowing_its_root() {
+        let disposition_id = "a".repeat(64);
+        let path = format!(
+            "{}/tier_delete_journal/{}/{}/{}.json",
+            recovery_disposition::ILM_RECOVERY_DISPOSITION_PREFIX,
+            &disposition_id[..2],
+            &disposition_id[2..4],
+            disposition_id
+        );
+        let namespace = classify_durable_ilm_record(&path)
+            .expect("recovery disposition path should classify")
+            .expect("recovery disposition should be durable");
+
+        assert_eq!(namespace, &RECOVERY_DISPOSITION_NAMESPACE);
+        assert!(classify_durable_ilm_record(recovery_disposition::ILM_RECOVERY_DISPOSITION_PREFIX).is_err());
+    }
+
+    #[test]
+    fn recovery_disposition_checkpoint_accepts_only_monotonic_progress() {
+        use recovery_disposition::IlmRecoveryDispositionState::{Applying, Completed, Prepared};
+
+        let first_copy = "b".repeat(64);
+        let second_copy = "c".repeat(64);
+        let prepared = recovery_disposition_checkpoint(1, Prepared, None, Vec::new());
+        let claimed = recovery_disposition_checkpoint(2, Prepared, Some("e"), Vec::new());
+        let applying = recovery_disposition_checkpoint(3, Applying, Some("e"), Vec::new());
+        let first_absent = recovery_disposition_checkpoint(4, Applying, Some("e"), vec![first_copy.clone()]);
+        let taken_over = recovery_disposition_checkpoint(5, Applying, Some("f"), vec![first_copy.clone()]);
+        let all_absent = recovery_disposition_checkpoint(6, Applying, Some("f"), vec![first_copy.clone(), second_copy.clone()]);
+        let completed = recovery_disposition_checkpoint(7, Completed, None, vec![first_copy.clone(), second_copy.clone()]);
+
+        prepared
+            .validate_successor(&claimed)
+            .expect("Prepared should record an owner claim without absence progress");
+        claimed
+            .validate_successor(&applying)
+            .expect("Prepared should advance to Applying without folding in deletion progress");
+        applying
+            .validate_successor(&first_absent)
+            .expect("Applying should append newly confirmed absent copies");
+        first_absent
+            .validate_successor(&taken_over)
+            .expect("Applying should record a fenced owner takeover without losing progress");
+        taken_over
+            .validate_successor(&all_absent)
+            .expect("Applying should preserve every earlier confirmation while making progress");
+        all_absent
+            .validate_successor(&completed)
+            .expect("a fully confirmed manifest should advance to Completed");
+
+        assert!(
+            prepared.validate_successor(&completed).is_err(),
+            "adjacent receipt updates must not skip Applying"
+        );
+        assert!(
+            first_absent
+                .validate_successor(&recovery_disposition_checkpoint(5, Applying, Some("e"), Vec::new()))
+                .is_err(),
+            "confirmed-absent progress must not move backwards"
+        );
+        assert!(
+            applying
+                .validate_successor(&recovery_disposition_checkpoint(4, Completed, None, vec![first_copy.clone()]))
+                .is_err(),
+            "Completed must cover the complete immutable copy manifest"
+        );
+        assert!(
+            completed
+                .validate_successor(&recovery_disposition_checkpoint(7, Applying, Some("e"), vec![second_copy]))
+                .is_err(),
+            "Completed is terminal"
+        );
+        assert!(
+            first_absent
+                .validate_successor(&recovery_disposition_checkpoint(5, Applying, Some("e"), vec![first_copy.clone()]))
+                .is_err(),
+            "a same-state revision bump must change the owner fence or absence progress"
+        );
+        assert!(
+            applying
+                .validate_successor(&recovery_disposition_checkpoint(4, Applying, None, vec![first_copy]))
+                .is_err(),
+            "Applying must retain a fenced owner"
+        );
+
+        let mut noncanonical_identity = claimed.clone();
+        if let DurableIlmRecordCheckpoint::RecoveryDisposition { identity_sha256, .. } = &mut noncanonical_identity {
+            *identity_sha256 = "A".repeat(64);
+        }
+        assert!(prepared.validate_successor(&noncanonical_identity).is_err());
+        let mut changed_created_at = claimed;
+        if let DurableIlmRecordCheckpoint::RecoveryDisposition {
+            created_at_unix_nanos, ..
+        } = &mut changed_created_at
+        {
+            *created_at_unix_nanos += 1;
+        }
+        assert!(prepared.validate_successor(&changed_created_at).is_err());
+
+        let mut early_takeover = taken_over;
+        if let DurableIlmRecordCheckpoint::RecoveryDisposition {
+            owner_lease_acquired_at_unix_nanos,
+            ..
+        } = &mut early_takeover
+        {
+            *owner_lease_acquired_at_unix_nanos = Some(9);
+        }
+        assert!(first_absent.validate_successor(&early_takeover).is_err());
+        assert!(
+            applying
+                .validate_successor(&recovery_disposition_checkpoint(
+                    4,
+                    Applying,
+                    Some("e"),
+                    vec!["c".repeat(64), "b".repeat(64)],
+                ))
+                .is_err(),
+            "confirmed-absent entries must be a canonical sorted set"
+        );
+    }
+
+    #[test]
+    fn recovery_disposition_terminal_predecessor_requires_exact_identity_and_full_manifest() {
+        use recovery_disposition::IlmRecoveryDispositionState::{Applying, Completed, Prepared};
+
+        let first_copy = "b".repeat(64);
+        let second_copy = "c".repeat(64);
+        let prepared = recovery_disposition_checkpoint(1, Prepared, None, Vec::new());
+        let applying = recovery_disposition_checkpoint(3, Applying, Some("e"), vec![first_copy.clone()]);
+        let completed = recovery_disposition_checkpoint(5, Completed, None, vec![first_copy.clone(), second_copy]);
+
+        assert!(prepared.is_predecessor_of_terminal(&completed));
+        assert!(applying.is_predecessor_of_terminal(&completed));
+        assert!(
+            !prepared.is_predecessor_of_terminal(&recovery_disposition_checkpoint(2, Applying, Some("e"), Vec::new())),
+            "a nonterminal disposition must not authorize terminal cleanup"
+        );
+        assert!(
+            !prepared.is_predecessor_of_terminal(&recovery_disposition_checkpoint(
+                4,
+                Completed,
+                None,
+                vec![first_copy.clone(), "c".repeat(64)],
+            )),
+            "terminal proof must leave enough revisions for claim, apply, progress, and completion"
+        );
+        assert!(
+            !applying.is_predecessor_of_terminal(&recovery_disposition_checkpoint(
+                4,
+                Completed,
+                None,
+                vec![first_copy.clone(), "c".repeat(64)],
+            )),
+            "an incomplete Applying checkpoint cannot complete without a progress generation"
+        );
+
+        let mut other_identity = completed;
+        if let DurableIlmRecordCheckpoint::RecoveryDisposition { identity_sha256, .. } = &mut other_identity {
+            *identity_sha256 = "e".repeat(64);
+        }
+        assert!(!prepared.is_predecessor_of_terminal(&other_identity));
+
+        let incomplete_terminal = recovery_disposition_checkpoint(4, Completed, None, vec![first_copy]);
+        assert!(
+            !prepared.is_predecessor_of_terminal(&incomplete_terminal),
+            "a partial confirmed-absent set must not become terminal proof"
+        );
     }
 
     fn tier_probe_intent_fixture() -> tier_probe_intent::TierProbeIntent {

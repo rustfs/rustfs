@@ -25,6 +25,8 @@ mod object_handlers_common;
 mod object_lock_boundary;
 pub use self::core as lifecycle;
 pub mod recovery_control;
+pub mod recovery_disposition;
+pub mod recovery_export;
 mod replication_sink;
 pub mod rule;
 mod runtime_boundary;

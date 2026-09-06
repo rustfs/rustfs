@@ -21,7 +21,7 @@
 use super::common::{BoxError, OdmSourceSpec, OdmTestEnv, SeedObject};
 use crate::fake_s3_target::{BucketMode, Operation};
 use aws_sdk_s3::error::ProvideErrorMetadata;
-use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+use aws_sdk_s3::types::{BucketVersioningStatus, ObjectAttributes, VersioningConfiguration};
 use bytes::Bytes;
 use std::time::Duration;
 
@@ -103,11 +103,19 @@ async fn get_miss_pulls_inline_and_serves_locally_afterwards() -> TestResult {
 
 #[tokio::test]
 async fn get_large_object_streams_through_and_backfills_in_background() -> TestResult {
+    const PART_SIZE: usize = 5 * 1024 * 1024;
     let bucket = "odm-get-large";
-    let env = configured_env(bucket, |spec| spec.policy.inline_max_bytes = 4096).await?;
+    let env = configured_env(bucket, |spec| {
+        spec.policy.inline_max_bytes = 4096;
+        spec.policy.multipart_part_size_bytes = u64::try_from(PART_SIZE).expect("part size fits in u64");
+    })
+    .await?;
     let key = "large/archive.bin";
-    let body = payload(512 * 1024);
-    env.seed_source(SOURCE_BUCKET, &[SeedObject::new(key, body.clone())]);
+    let body = payload(PART_SIZE + 4096);
+    let etag = env
+        .seed_source(SOURCE_BUCKET, &[SeedObject::new(key, body.clone())])
+        .remove(0);
+    assert_eq!(etag.len(), 32, "the source fixture has a plain MD5 ETag");
 
     let response = env.raw_get(bucket, key).await?;
     assert_eq!(response.status, 200, "{}", String::from_utf8_lossy(&response.body));
@@ -124,6 +132,68 @@ async fn get_large_object_streams_through_and_backfills_in_background() -> TestR
         source_get_ranges(&env, key),
         vec![None, None],
         "one passthrough GET plus one background pull, both unranged"
+    );
+
+    let source_requests = env.source.requests().len();
+    let second_part = env.client.get_object().bucket(bucket).key(key).part_number(2).send().await?;
+    assert_eq!(second_part.content_length(), Some(4096), "the completed second part is the tail");
+    assert_eq!(
+        second_part.content_range(),
+        Some(format!("bytes {PART_SIZE}-{}/{}", body.len() - 1, body.len()).as_str()),
+        "partNumber reads the stored multipart boundary"
+    );
+    assert_eq!(
+        second_part.body.collect().await?.into_bytes(),
+        body.slice(PART_SIZE..),
+        "the local second part contains the exact source tail"
+    );
+    let third_part = env
+        .client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .part_number(3)
+        .send()
+        .await
+        .expect_err("the completed object has exactly two parts");
+    assert_eq!(third_part.code(), Some("InvalidPart"));
+
+    let mut part_marker = None;
+    for (part_number, part_size) in [(1, PART_SIZE), (2, 4096)] {
+        let attributes = env
+            .client
+            .get_object_attributes()
+            .bucket(bucket)
+            .key(key)
+            .object_attributes(ObjectAttributes::ObjectParts)
+            .object_attributes(ObjectAttributes::Etag)
+            .max_parts(1)
+            .set_part_number_marker(part_marker.clone())
+            .send()
+            .await?;
+        assert_eq!(
+            attributes.e_tag().map(|value| value.trim_matches('"')),
+            Some(etag.as_str()),
+            "multipart write-back preserves the source MD5 ETag"
+        );
+        let parts = attributes
+            .object_parts()
+            .expect("RustFS must expose the stored multipart layout");
+        assert_eq!(parts.total_parts_count(), Some(2));
+        assert_eq!(parts.max_parts(), Some(1));
+        assert_eq!(parts.is_truncated(), Some(part_number == 1));
+        assert_eq!(parts.parts().len(), 1, "RustFS returns one stored part per requested page");
+        assert_eq!(parts.parts()[0].part_number(), Some(part_number));
+        assert_eq!(parts.parts()[0].size(), Some(i64::try_from(part_size).expect("part size fits in i64")));
+        part_marker = parts.next_part_number_marker().map(str::to_owned);
+        if part_number == 1 {
+            assert_eq!(part_marker.as_deref(), Some("1"), "the next request continues after the first part");
+        }
+    }
+    assert_eq!(
+        env.source.requests().len(),
+        source_requests,
+        "local part reads must not consult the source"
     );
     Ok(())
 }

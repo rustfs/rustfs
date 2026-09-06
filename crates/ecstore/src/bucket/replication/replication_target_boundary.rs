@@ -248,7 +248,16 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
         meta.insert(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string());
     }
 
-    let mut is_multipart = object_info.is_multipart();
+    // Older transformed objects can have physical parts without logical part
+    // lengths. Keep their existing whole-object transport: physical sizes are
+    // not plaintext boundaries for a multipart replication read.
+    let legacy_single_put = object_info.etag.as_deref().is_none_or(|etag| etag.len() == 32);
+    let base_is_multipart = object_info.is_multipart()
+        && !(legacy_single_put
+            && object_info.parts.len() > 1
+            && (object_info.is_compressed() || object_info.is_encrypted())
+            && object_info.parts.iter().any(|part| part.actual_size <= 0));
+    let mut is_multipart = base_is_multipart;
 
     if let Some(checksum_data) = &object_info.checksum
         && !checksum_data.is_empty()
@@ -259,8 +268,8 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
         } else if object_info.is_encrypted() {
             // Encrypted checksums cannot be exposed as plaintext headers, and
             // decrypt_checksums reports is_multipart=false for them (a value
-            // the response path relies on). Keep the object's own multipart
-            // flag so encrypted objects stay on the multipart route.
+            // the response path relies on). Keep the transport selected from
+            // the object's layout and readable part boundaries.
         } else {
             let (checksum_meta, checksum_record_is_multipart) = object_info.decrypt_checksums(0, &HeaderMap::new())?;
             // The checksum record describes how the *checksum* is composed,
@@ -268,9 +277,9 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
             // MULTIPART flag even on a multipart upload, so trusting it here
             // routed a 768-part object through a single PutObject and the
             // target rejected the 6 GiB body with EntityTooLarge
-            // (rustfs#6825). The object's own shape is the authority: the
+            // (rustfs#6825). The usable part layout is the authority: the
             // record may only add multipart-ness, never take it away.
-            is_multipart = object_info.is_multipart() || checksum_record_is_multipart;
+            is_multipart = base_is_multipart || checksum_record_is_multipart;
 
             for (key, value) in checksum_meta.iter() {
                 if key != AMZ_CHECKSUM_TYPE {
@@ -278,7 +287,7 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
                 }
             }
 
-            if !object_info.is_multipart()
+            if !base_is_multipart
                 && checksum_meta
                     .get(AMZ_CHECKSUM_TYPE)
                     .is_some_and(|value| value == AMZ_CHECKSUM_TYPE_FULL_OBJECT)
@@ -516,6 +525,7 @@ fn is_standard_header(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::replication_filemeta_boundary::ObjectPartInfo;
     use super::*;
     use aws_smithy_types::DateTime;
     use rustfs_replication::content_matches_by_etag;
@@ -548,6 +558,109 @@ mod tests {
         }
 
         checksum.to_bytes(&combined)
+    }
+
+    fn replication_route_metadata() -> [(&'static str, Arc<HashMap<String, String>>); 4] {
+        let mut compressed = HashMap::new();
+        rustfs_utils::http::insert_str(&mut compressed, rustfs_utils::http::SUFFIX_COMPRESSION, "zstd".to_string());
+        [
+            ("plain", Arc::new(HashMap::new())),
+            ("compressed", Arc::new(compressed)),
+            (
+                "encrypted",
+                Arc::new(HashMap::from([(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string())])),
+            ),
+            (
+                "ssec",
+                Arc::new(HashMap::from([(SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string())])),
+            ),
+        ]
+    }
+
+    fn replication_route_object(
+        etag: Option<&str>,
+        actual_sizes: [i64; 3],
+        metadata: Arc<HashMap<String, String>>,
+    ) -> ObjectInfo {
+        ObjectInfo {
+            etag: etag.map(str::to_string),
+            size: 48,
+            actual_size: 12,
+            user_defined: metadata,
+            parts: Arc::new(
+                actual_sizes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, actual_size)| ObjectPartInfo {
+                        number: index + 1,
+                        size: 16,
+                        actual_size,
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn legacy_transformed_single_put_parts_keep_the_previous_replication_route() {
+        let [_, (_, compressed), (_, encrypted), (_, ssec)] = replication_route_metadata();
+        let cases = [
+            (
+                "compressed middle zero",
+                compressed.clone(),
+                Some("0123456789abcdef0123456789abcdef"),
+                [4, 0, 4],
+            ),
+            ("compressed tail unknown", compressed, None, [4, 4, -1]),
+            (
+                "encrypted middle unknown",
+                encrypted,
+                Some("gggggggggggggggggggggggggggggggg"),
+                [4, -1, 4],
+            ),
+            ("ssec tail zero", ssec.clone(), None, [4, 4, 0]),
+            ("ssec middle unknown", ssec, Some("gggggggggggggggggggggggggggggggg"), [4, -1, 4]),
+        ];
+        for (name, metadata, etag, actual_sizes) in cases {
+            for checksum in [None, Some(full_object_multipart_checksum_record())] {
+                let mut object_info = replication_route_object(etag, actual_sizes, metadata.clone());
+                object_info.checksum = checksum;
+                assert!(object_info.is_multipart(), "{name}: physical parts remain visible to metadata APIs");
+                assert!(object_info.is_compressed() || object_info.is_encrypted());
+
+                let (options, is_multipart) =
+                    replication_put_object_options("STANDARD", &object_info).expect("legacy transformed put options");
+                assert!(
+                    !is_multipart,
+                    "{name}: unknown logical part sizes must preserve the old whole-object route"
+                );
+                assert_eq!(options.internal.source_etag, etag.unwrap_or_default());
+                if metadata.contains_key(SSEC_ALGORITHM_HEADER) {
+                    assert_eq!(
+                        get_header_map(&options.user_metadata, SUFFIX_REPLICATION_SSEC_CRC).is_some(),
+                        object_info.checksum.is_some(),
+                        "SSE-C checksums retain their raw passthrough transport"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn positive_part_sizes_and_legacy_multipart_etags_keep_the_replication_route() {
+        for (name, metadata) in replication_route_metadata() {
+            for (etag, actual_sizes) in [
+                ("0123456789abcdef0123456789abcdef", [4, 4, 4]),
+                ("0123456789abcdef0123456789abcdef-3", [4, 0, -1]),
+            ] {
+                let mut object_info = replication_route_object(Some(etag), actual_sizes, metadata.clone());
+                object_info.checksum = Some(full_object_multipart_checksum_record());
+                let (_, is_multipart) = replication_put_object_options("STANDARD", &object_info).expect("multipart put options");
+                assert!(is_multipart, "{name}/{etag}: usable sizes and old multipart ETags must retain MPU");
+            }
+        }
     }
 
     #[test]
@@ -583,6 +696,36 @@ mod tests {
     }
 
     #[test]
+    fn stored_multipart_parts_keep_the_replication_route_without_a_multipart_etag() {
+        for etag in [Some("0123456789abcdef0123456789abcdef"), None] {
+            for checksum in [None, Some(full_object_multipart_checksum_record())] {
+                let object_info = ObjectInfo {
+                    etag: etag.map(str::to_string),
+                    checksum,
+                    parts: Arc::new(
+                        (1..=2)
+                            .map(|number| ObjectPartInfo {
+                                number,
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
+                    ..Default::default()
+                };
+                let (options, is_multipart) =
+                    replication_put_object_options("STANDARD", &object_info).expect("build put options");
+
+                assert!(
+                    is_multipart,
+                    "stored parts must retain multipart routing: etag={etag:?}, checksum={:?}",
+                    object_info.checksum
+                );
+                assert_eq!(options.internal.source_etag, etag.unwrap_or_default());
+            }
+        }
+    }
+
+    #[test]
     fn checksum_record_never_changes_the_transport_a_single_part_object_needs() {
         // The mirror of the rustfs#6825 guard: an object stored as one PUT
         // must keep the single-PUT transport, or its replica's ETag would
@@ -592,6 +735,10 @@ mod tests {
         let object_info = ObjectInfo {
             etag: Some("0123456789abcdef0123456789abcdef".to_string()),
             checksum: Some(checksum.to_bytes(&[])),
+            parts: Arc::new(vec![ObjectPartInfo {
+                number: 1,
+                ..Default::default()
+            }]),
             ..Default::default()
         };
 
@@ -628,6 +775,19 @@ mod tests {
         let (_, is_multipart) = replication_put_object_options("STANDARD", &object_info).expect("build put options");
 
         assert!(is_multipart, "a composite-checksum multipart object must stay on the multipart transport");
+
+        for (name, metadata) in replication_route_metadata() {
+            let mut legacy = replication_route_object(Some("0123456789abcdef0123456789abcdef"), [4, 0, 4], metadata);
+            legacy.checksum = Some(checksum.to_bytes(&combined));
+            let (_, record_is_multipart) = legacy.decrypt_checksums(0, &HeaderMap::new()).expect("decode checksum");
+            let (_, is_multipart) = replication_put_object_options("STANDARD", &legacy).expect("legacy checksum put options");
+            if legacy.is_encrypted() {
+                assert!(!is_multipart, "{name}: encrypted checksum records must not change the old transport");
+            } else {
+                assert!(record_is_multipart, "the composite checksum must carry its own multipart signal");
+                assert!(is_multipart, "{name}: a composite record can still promote the legacy route to MPU");
+            }
+        }
     }
 
     #[test]

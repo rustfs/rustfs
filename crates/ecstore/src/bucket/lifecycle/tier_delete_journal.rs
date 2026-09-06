@@ -82,8 +82,8 @@ const TIER_DELETE_DISPATCH_MEMBER_DELETE_CONCURRENCY: usize = 32;
 const TIER_DELETE_DISPATCH_PREPARE_CONCURRENCY: usize = 16;
 const TIER_DELETE_DISPATCH_CAS_CONCURRENCY: usize = 32;
 const TIER_DELETE_JOURNAL_VERSION: u8 = 2;
-const TIER_DELETE_JOURNAL_V1_RECOVERY_SCHEMA: &str = "rustfs-tier-delete-journal-v1";
-const TIER_DELETE_JOURNAL_V2_RECOVERY_SCHEMA: &str = "rustfs-tier-delete-journal-v2";
+pub(crate) const TIER_DELETE_JOURNAL_V1_RECOVERY_SCHEMA: &str = "rustfs-tier-delete-journal-v1";
+pub(crate) const TIER_DELETE_JOURNAL_V2_RECOVERY_SCHEMA: &str = "rustfs-tier-delete-journal-v2";
 const TIER_DELETE_JOURNAL_UNKNOWN_RECOVERY_SCHEMA: &str = "rustfs-tier-delete-journal-unknown";
 const TIER_DELETE_JOURNAL_V1_RECOVERY_CLASS: &str = "tier_delete_journal_v1";
 const TIER_DELETE_JOURNAL_V2_RECOVERY_CLASS: &str = "tier_delete_journal_v2";
@@ -884,6 +884,23 @@ struct PersistedTierDeleteJournalEntry {
 }
 
 impl PersistedTierDeleteJournalEntry {
+    fn validate_legacy_recovery_shape(&self) -> Result<()> {
+        let has_later_version_fields = self.version_id_exact.is_some()
+            || self.version_state.is_some()
+            || self.state.is_some()
+            || self.source.is_some()
+            || self.dispatch.is_some();
+        match self.version {
+            1 if self.backend_identity.is_none() && !has_later_version_fields => Ok(()),
+            TIER_DELETE_JOURNAL_VERSION if self.backend_identity.is_some() && !has_later_version_fields => Ok(()),
+            1 => Err(Error::other("tier delete journal v1 entry contains fields from a later version")),
+            TIER_DELETE_JOURNAL_VERSION => Err(Error::other(
+                "tier delete journal v2 entry is missing its identity or contains fields from a later version",
+            )),
+            _ => Err(Error::other("tier delete journal is not an exportable legacy version")),
+        }
+    }
+
     fn from_jentry(je: &Jentry) -> Result<Self> {
         validate_version_state(je.version_state, &je.version_id, je.version_id_exact)?;
         let legacy_unknown = je.version_state == rustfs_filemeta::TransitionVersionState::Unknown;
@@ -5531,12 +5548,33 @@ fn canonical_legacy_tier_delete_journal_identity(object_name: &str) -> Option<&s
     .then_some(identity)
 }
 
+pub(crate) fn validate_legacy_tier_delete_recovery_path(object_name: &str) -> Result<()> {
+    canonical_legacy_tier_delete_journal_identity(object_name)
+        .map(|_| ())
+        .ok_or_else(|| Error::other("legacy tier delete journal path is not canonical"))
+}
+
 fn legacy_tier_delete_recovery_descriptor(entry: &Jentry) -> Option<(&'static str, &'static str)> {
     match entry.persisted_version {
         1 => Some((TIER_DELETE_JOURNAL_V1_RECOVERY_SCHEMA, TIER_DELETE_JOURNAL_V1_RECOVERY_CLASS)),
         TIER_DELETE_JOURNAL_VERSION => Some((TIER_DELETE_JOURNAL_V2_RECOVERY_SCHEMA, TIER_DELETE_JOURNAL_V2_RECOVERY_CLASS)),
         _ => None,
     }
+}
+
+pub(crate) fn validate_legacy_tier_delete_recovery_source(object_name: &str, source_schema: &str, data: &[u8]) -> Result<()> {
+    validate_legacy_tier_delete_recovery_path(object_name)?;
+    let persisted: PersistedTierDeleteJournalEntry =
+        serde_json::from_slice(data).map_err(|err| Error::other_with_context("decode tier delete journal failed", err))?;
+    persisted.validate_legacy_recovery_shape()?;
+    let entry = persisted.into_jentry()?;
+    let Some((decoded_schema, _)) = legacy_tier_delete_recovery_descriptor(&entry) else {
+        return Err(Error::other("tier delete journal is not an exportable legacy version"));
+    };
+    if decoded_schema != source_schema || tier_delete_journal_object_name(&entry) != object_name {
+        return Err(Error::other("legacy tier delete journal identity does not match its recovery source"));
+    }
+    Ok(())
 }
 
 fn legacy_tier_delete_control_matches(
@@ -6140,17 +6178,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        TIER_DELETE_DISPATCH_MANIFEST_VERSION, TIER_DELETE_DISPATCH_PARENT_RECORD_TYPE, TIER_DELETE_DISPATCH_PARENT_VERSION,
-        TIER_DELETE_JOURNAL_EXACT_VERSION, TIER_DELETE_JOURNAL_LEGACY_PREFIX, TIER_DELETE_JOURNAL_SOLE_OWNER_VERSION,
-        TIER_DELETE_JOURNAL_STATE_VERSION, TIER_DELETE_JOURNAL_TRANSACTION_VERSION, TIER_DELETE_JOURNAL_V6_PREFIX,
-        TierDeleteDispatchChunkBinding, TierDeleteDispatchManifest, TierDeleteDispatchManifestState, TierDeleteDispatchParent,
-        TierDeleteDispatchParentState, TierDeleteDispatchRecord, await_tier_delete_journal_recovery,
+        PersistedTierDeleteJournalEntry, TIER_DELETE_DISPATCH_MANIFEST_VERSION, TIER_DELETE_DISPATCH_PARENT_RECORD_TYPE,
+        TIER_DELETE_DISPATCH_PARENT_VERSION, TIER_DELETE_JOURNAL_EXACT_VERSION, TIER_DELETE_JOURNAL_LEGACY_PREFIX,
+        TIER_DELETE_JOURNAL_SOLE_OWNER_VERSION, TIER_DELETE_JOURNAL_STATE_VERSION, TIER_DELETE_JOURNAL_TRANSACTION_VERSION,
+        TIER_DELETE_JOURNAL_V1_RECOVERY_SCHEMA, TIER_DELETE_JOURNAL_V2_RECOVERY_SCHEMA, TIER_DELETE_JOURNAL_V6_PREFIX,
+        TIER_DELETE_JOURNAL_VERSION, TierDeleteDispatchChunkBinding, TierDeleteDispatchManifest, TierDeleteDispatchManifestState,
+        TierDeleteDispatchParent, TierDeleteDispatchParentState, TierDeleteDispatchRecord, await_tier_delete_journal_recovery,
         decode_tier_delete_dispatch_record, decode_tier_delete_journal_entry, encode_tier_delete_dispatch_manifest,
         encode_tier_delete_dispatch_parent, encode_tier_delete_journal_entry, object_info_references_tier_delete,
         record_tier_delete_journal_backend_identity, same_tier_delete_authorization_identity, same_tier_delete_journal_identity,
         tier_delete_dispatch_child_matches_parent, tier_delete_dispatch_chunk_manifest_object_name,
         tier_delete_dispatch_journal_set_digest, tier_delete_dispatch_manifest_object_name, tier_delete_journal_object_name,
-        tier_delete_source_matches_dispatch_scope,
+        tier_delete_source_matches_dispatch_scope, validate_legacy_tier_delete_recovery_source,
     };
     use crate::bucket::lifecycle::tier_sweeper::{
         Jentry, TierDeleteDispatchBinding, TierDeleteJournalState, TierDeleteSourceIdentity,
@@ -6606,6 +6645,72 @@ mod tests {
             let decoded = decode_tier_delete_journal_entry(payload).expect("legacy journal should decode");
             assert_eq!(decoded.version_state, rustfs_filemeta::TransitionVersionState::Unknown);
             assert!(!decoded.version_id_exact);
+        }
+    }
+
+    #[test]
+    fn legacy_recovery_export_rejects_fields_from_later_journal_versions() {
+        let later = bound_v6_journal_entry(TierDeleteJournalState::Prepared);
+        let v1 = PersistedTierDeleteJournalEntry {
+            version: 1,
+            obj_name: "remote/object".to_string(),
+            version_id: "opaque".to_string(),
+            tier_name: "WARM".to_string(),
+            backend_identity: None,
+            version_id_exact: None,
+            version_state: None,
+            state: None,
+            source: None,
+            dispatch: None,
+        };
+        let mut v2 = v1.clone();
+        v2.version = TIER_DELETE_JOURNAL_VERSION;
+        v2.backend_identity = Some([7; 32]);
+
+        let assert_rejected = |persisted: PersistedTierDeleteJournalEntry, schema: &str| {
+            let normalized = persisted
+                .clone()
+                .into_jentry()
+                .expect("the generic compatibility decoder should demonstrate the discarded field");
+            let object_name = tier_delete_journal_object_name(&normalized);
+            let encoded = serde_json::to_vec(&persisted).expect("mixed-version journal fixture should encode");
+            let err = validate_legacy_tier_delete_recovery_source(&object_name, schema, &encoded)
+                .expect_err("legacy recovery export must reject fields from later versions");
+            assert!(err.to_string().contains("later version"));
+        };
+
+        let mut invalid_v1 = Vec::new();
+        let mut with_backend = v1.clone();
+        with_backend.backend_identity = Some([7; 32]);
+        invalid_v1.push(with_backend);
+        for persisted in [&v1, &v2] {
+            let schema = if persisted.version == 1 {
+                TIER_DELETE_JOURNAL_V1_RECOVERY_SCHEMA
+            } else {
+                TIER_DELETE_JOURNAL_V2_RECOVERY_SCHEMA
+            };
+            let mut invalid = Vec::new();
+            let mut with_exact = persisted.clone();
+            with_exact.version_id_exact = Some(false);
+            invalid.push(with_exact);
+            let mut with_version_state = persisted.clone();
+            with_version_state.version_state = Some(rustfs_filemeta::TransitionVersionState::Unknown);
+            invalid.push(with_version_state);
+            let mut with_state = persisted.clone();
+            with_state.state = Some(TierDeleteJournalState::Committed);
+            invalid.push(with_state);
+            let mut with_source = persisted.clone();
+            with_source.source = later.source.clone();
+            invalid.push(with_source);
+            let mut with_dispatch = persisted.clone();
+            with_dispatch.dispatch = later.dispatch.clone();
+            invalid.push(with_dispatch);
+            for record in invalid {
+                assert_rejected(record, schema);
+            }
+        }
+        for record in invalid_v1 {
+            assert_rejected(record, TIER_DELETE_JOURNAL_V1_RECOVERY_SCHEMA);
         }
     }
 

@@ -299,6 +299,24 @@ Heal knobs are environment-only and read by `HealConfig::default` (`crates/heal/
 | `RUSTFS_HEAL_MRF_REPLAY_BATCH` | `256` (`DEFAULT_HEAL_MRF_REPLAY_BATCH`) | Intents per replay push round. |
 | `RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS` | `3600` (`DEFAULT_HEAL_DANGLING_DELETE_GRACE_SECS`, `crates/ecstore/src/set_disk/core/io_primitives.rs`) | A recently modified object is never deleted as dangling inside this window; `0` disables the grace window. |
 
+### Admin heal start, retries, and budgets
+
+Admin heal has three separate budgets. Increasing one does not extend the others:
+
+| Budget | Existing behavior |
+|---|---|
+| Control request | A start/query/cancel envelope has a bounded lifetime derived from the internode RPC timeout, with room for the transport response. It bounds control execution, not the admitted repair task. The HTTP caller can also stop waiting independently. |
+| Task execution | `RUSTFS_HEAL_TASK_TIMEOUT_SECS` supplies the default of 300 seconds when the execution has no explicit timeout. Elapsed execution time is deducted before a recoverable scheduler retry, which keeps the request identity and remaining budget. Object/listing backoff and pressure pacing inside an execution consume that budget; time queued or in the scheduler's between-attempt backoff is not a new absolute wall-clock deadline. Zero is not an unlimited execution budget. |
+| Object/listing retry | A recursive bucket/prefix traversal retries recoverable failures at most three times after the initial attempt, with 2/4/8-second delays plus the existing task-derived jitter. Object retries also obey the bounded delayed window and its 30-second age, checked at safe boundaries; listing retries keep their cursor. These limits do not extend the task execution budget or force an in-flight storage operation to finish within the retry age. |
+
+For a large admin heal, select a finite configured execution budget appropriate to the expected work and contention, and inspect progress while it runs. Investigate stalled work and object failures before increasing this budget; a larger timeout must not hide lock or quorum problems. A longer HTTP or internode timeout does not keep a repair task alive past its execution budget. A successful start response returns the canonical token for accepted or merged work; it does not prove that repair has completed. Query that token without `forceStart`; terminal timeout/cancellation reports retain completed progress while the task report remains available.
+
+Capability preflight runs before constructing and admitting a start request. However, the public `cluster heal coordination unavailable` error can also follow a transport failure or an invalid coordinator response after a request was sent. An unknown or lost HTTP response is therefore not proof that no task was admitted.
+
+The coordinator can replay the result of the exact original RPC envelope within its existing replay lifetime and coordinator epoch. Reusing an ID with changed parameters or nonce is rejected. This bounded, process-local receipt cache is not a general HTTP idempotency key or a restart-surviving admission receipt. Each new HTTP start constructs a new request/envelope, and a fresh `forceStart` intentionally requests a distinct start: do not automatically resend it after an ambiguous response. A fresh non-forced request follows the configured overlap policy, rather than recovering the original receipt. The v3 API rejects `forceStart` combined with `clientToken` or `forceStop`.
+
+Implementation references: `rustfs/src/admin/handlers/heal.rs` (`submit_cluster_heal_start`, `new_heal_control_metadata`), `rustfs/src/storage/rpc/node_service.rs` (`execute_heal_control_envelope_with_manager`), `crates/protos/src/lib.rs` (`heal_control_execution_timeout`), and `crates/heal/src/heal/task.rs` (`retry_request_with_remaining_timeout`, `remaining_timeout`, `bucket_object_retry_delay`). These contracts do not replace the separate real response-loss, long-task, or start-latency validation lanes.
+
 ### Running admin heal pacing
 
 The manager passes its existing workload provider and a configuration snapshot into each admin execution. Bucket/prefix listing and object boundaries resample foreground pressure; erasure-set page workers also resample after earlier work releases page capacity. `High`, `Urgent`, and `force_start` do not exempt ordinary admin execution from this runtime pacing. The existing start-time bypass and overlap-control meanings are unchanged.
