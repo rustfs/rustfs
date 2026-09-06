@@ -2305,7 +2305,11 @@ mod tests {
             assert_eq!(fixture.object_info.parts.len(), 2);
             let tail = &fixture.object_info.parts[1];
             assert_eq!(tail.actual_size, 0, "{kind}: final part has no plaintext");
-            assert!(tail.size > 0, "{kind}: the empty part still has a stored frame");
+            if kind == "compressed" && !cfg!(feature = "rio-v2") {
+                assert_eq!(tail.size, 0, "legacy compression emits no bytes for an empty part");
+            } else {
+                assert!(tail.size > 0, "{kind}: the empty part still has a stored frame");
+            }
             let stored_size = i64::try_from(fixture.stored.len()).expect("fixture size fits i64");
             let (mut reader, offset, length) = GetObjectReader::new(
                 Box::new(Cursor::new(fixture.stored)),
