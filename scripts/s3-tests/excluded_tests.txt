@@ -170,11 +170,14 @@ test_head_bucket_usage
 # --- Batch 2 candidates: expiration with tag / size filters + noncurrent counts.
 #     These need the same debug/scanner lane as batch 1 plus tag/size-filter and
 #     NewerNoncurrentVersions coverage (see ilm-9). Queued for ilm-10 batch 2.
+#     tags1 sends Prefix and Tag as sibling Filter predicates instead of And;
+#     AWS also rejects that malformed request, so it is not a compatibility gate.
 test_lifecycle_deletemarker_expiration_with_days_tag
 test_lifecycle_expiration_newer_noncurrent
 test_lifecycle_expiration_noncur_tags1
 test_lifecycle_expiration_size_gt
 test_lifecycle_expiration_size_lt
+test_lifecycle_expiration_tags1
 test_lifecycle_expiration_tags2
 test_lifecycle_expiration_versioned_tags2
 #
