@@ -1074,7 +1074,7 @@ mod tests {
         }
         let recorded = recorded.lock().expect("recorder lock");
         assert_eq!(recorded.len(), 5);
-        for (requests, expected) in recorded[1..].chunks_exact(2).zip([
+        for (requests, expected) in recorded[1..].as_chunks::<2>().0.iter().zip([
             "/legacy/%EF%BF%BE/part%252F+%20&.txt",
             "/legacy/%25EF%25BF%25BE/part%25252F+%2520%2526.txt",
         ]) {
