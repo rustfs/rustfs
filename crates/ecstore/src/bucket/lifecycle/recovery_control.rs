@@ -499,6 +499,26 @@ impl IlmRecoveryControl {
         self.validate()
     }
 
+    pub fn retry_for_operator(&mut self, expected_source_generation: &IlmRecoverySourceGeneration) -> Result<()> {
+        if self.owner.is_some()
+            || !matches!(
+                self.classification,
+                IlmRecoveryClassification::RetainedAmbiguous | IlmRecoveryClassification::OperatorRequired
+            )
+            || self.attempt_count == u64::MAX
+            || &self.observed_source_generation != expected_source_generation
+        {
+            return Err(IlmRecoveryControlError::InvalidSuccessor(
+                "operator retry requires the exact ownerless retained source generation",
+            ));
+        }
+        self.bump_revision()?;
+        self.classification = IlmRecoveryClassification::Retrying;
+        self.consecutive_failure_count = 0;
+        self.next_attempt_at_unix_nanos = None;
+        self.validate()
+    }
+
     pub fn validate_successor(&self, next: &Self) -> Result<()> {
         self.validate()?;
         next.validate()?;
@@ -528,6 +548,14 @@ impl IlmRecoveryControl {
             {
                 self.validate_operator_abandon_successor(next)
             }
+            (None, None)
+                if matches!(
+                    self.classification,
+                    IlmRecoveryClassification::RetainedAmbiguous | IlmRecoveryClassification::OperatorRequired
+                ) && next.classification == IlmRecoveryClassification::Retrying =>
+            {
+                self.validate_operator_retry_successor(next)
+            }
             (None, None) => Err(IlmRecoveryControlError::InvalidSuccessor(
                 "ownerless control cannot advance without a claim",
             )),
@@ -545,6 +573,22 @@ impl IlmRecoveryControl {
         {
             return Err(IlmRecoveryControlError::InvalidSuccessor(
                 "operator abandonment changed recovery history or source generation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_operator_retry_successor(&self, next: &Self) -> Result<()> {
+        if next.observed_source_generation != self.observed_source_generation
+            || next.attempt_count != self.attempt_count
+            || next.consecutive_failure_count != 0
+            || next.first_failure_at_unix_nanos != self.first_failure_at_unix_nanos
+            || next.last_failure_at_unix_nanos != self.last_failure_at_unix_nanos
+            || next.next_attempt_at_unix_nanos.is_some()
+            || next.last_error_code != self.last_error_code
+        {
+            return Err(IlmRecoveryControlError::InvalidSuccessor(
+                "operator retry changed recovery history or source generation",
             ));
         }
         Ok(())
@@ -1345,6 +1389,69 @@ mod tests {
         let mut mutated_history = retained.clone();
         mutated_history.attempt_count += 1;
         assert!(previous.validate_successor(&mutated_history).is_err());
+    }
+
+    #[test]
+    fn operator_retry_rearms_exact_retained_generation_without_resetting_history() {
+        for classification in [
+            IlmRecoveryClassification::RetainedAmbiguous,
+            IlmRecoveryClassification::OperatorRequired,
+        ] {
+            let mut retained = control();
+            retained
+                .claim("node-a", Uuid::new_v4(), 2_000_000_000, 1)
+                .expect("attempt should claim");
+            retained
+                .record_retryable_failure(2_000_000_001, IlmRecoveryErrorCode::BackendTimeout)
+                .expect("failure should persist");
+            retained.classification = classification;
+            retained.next_attempt_at_unix_nanos = None;
+            if classification == IlmRecoveryClassification::OperatorRequired {
+                retained.attempt_count = u64::from(MAX_RECOVERY_ATTEMPTS);
+                retained.consecutive_failure_count = MAX_RECOVERY_ATTEMPTS;
+            }
+            retained.validate().expect("retained control should remain valid");
+
+            let previous = retained.clone();
+            retained
+                .retry_for_operator(&previous.observed_source_generation)
+                .expect("exact retained generation should be retryable");
+            previous
+                .validate_successor(&retained)
+                .expect("operator retry should be a valid successor");
+            assert_eq!(retained.classification, IlmRecoveryClassification::Retrying);
+            assert_eq!(retained.revision, previous.revision + 1);
+            assert_eq!(retained.attempt_count, previous.attempt_count);
+            assert_eq!(retained.first_failure_at_unix_nanos, previous.first_failure_at_unix_nanos);
+            assert_eq!(retained.last_failure_at_unix_nanos, previous.last_failure_at_unix_nanos);
+            assert_eq!(retained.last_error_code, previous.last_error_code);
+            assert_eq!(retained.consecutive_failure_count, 0);
+            assert_eq!(retained.next_attempt_at_unix_nanos, None);
+            assert!(retained.should_attempt_at(2_000_000_002));
+
+            if classification == IlmRecoveryClassification::OperatorRequired {
+                retained
+                    .claim("node-b", Uuid::new_v4(), 2_000_000_002, 1)
+                    .expect("operator retry should authorize one new bounded attempt");
+                retained
+                    .record_retryable_failure(2_000_000_003, IlmRecoveryErrorCode::BackendTimeout)
+                    .expect("the bounded attempt failure should persist");
+                assert_eq!(retained.classification, IlmRecoveryClassification::OperatorRequired);
+                assert_eq!(retained.attempt_count, u64::from(MAX_RECOVERY_ATTEMPTS) + 1);
+                assert_eq!(retained.consecutive_failure_count, 1);
+            }
+
+            let mut wrong_generation = previous;
+            let mut changed_generation = wrong_generation.observed_source_generation.clone();
+            changed_generation.source_etag = "changed".to_string();
+            assert!(wrong_generation.retry_for_operator(&changed_generation).is_err());
+        }
+
+        let mut exhausted = control();
+        exhausted.classification = IlmRecoveryClassification::OperatorRequired;
+        exhausted.attempt_count = u64::MAX;
+        let generation = exhausted.observed_source_generation.clone();
+        assert!(exhausted.retry_for_operator(&generation).is_err());
     }
 
     #[test]

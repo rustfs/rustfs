@@ -34,7 +34,7 @@ use crate::bucket::lifecycle::tier_sweeper::{
 };
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result as EcstoreResult};
-use crate::object_api::ObjectOptions;
+use crate::object_api::{ObjectInfo, ObjectOptions};
 use crate::services::tier::{tier::TierConfigMgr, warm_backend::TransitionCandidateProbe};
 use crate::storage_api_contracts::{
     list::ListOperations as _,
@@ -954,6 +954,10 @@ pub enum TransitionOperatorError {
         expected: String,
         actual: TransitionOperatorProbe,
     },
+    #[error("transition recovery control is stale")]
+    StaleRecoveryControl,
+    #[error("transition recovery control is not eligible for operator retry")]
+    RetryNotAllowed,
     #[error("transition transaction store failed: {0}")]
     Store(#[source] Error),
     #[error("remote tier reconciliation failed: {0}")]
@@ -961,6 +965,179 @@ pub enum TransitionOperatorError {
 }
 
 type TransitionOperatorResult<T> = std::result::Result<T, TransitionOperatorError>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TransitionRecoveryRetryStatus {
+    pub control_id: String,
+    pub transaction_id: Uuid,
+    pub state: TransitionTransactionState,
+    pub classification: IlmRecoveryClassification,
+    pub control_revision: u64,
+    pub attempt_count: u64,
+    pub consecutive_failure_count: u32,
+    pub last_error_code: IlmRecoveryErrorCode,
+    pub source_generation_sha256: String,
+    pub copy_set_sha256: String,
+    pub retry_ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_not_ready_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TransitionRecoveryRetryResult {
+    pub control_id: String,
+    pub transaction_id: Uuid,
+    pub previous_revision: u64,
+    pub revision: u64,
+    pub classification: IlmRecoveryClassification,
+    pub attempt_count: u64,
+    pub source_generation_sha256: String,
+}
+
+struct TransitionRecoveryRetryContext {
+    observed: ObservedIlmRecoveryControl,
+    transaction: TransitionTransaction,
+    source_generation_sha256: String,
+}
+
+fn transition_recovery_retry_readiness(control: &IlmRecoveryControl) -> (bool, Option<&'static str>) {
+    if control.owner.is_some() {
+        return (false, Some("attempt_owned"));
+    }
+    match control.classification {
+        IlmRecoveryClassification::RetainedAmbiguous | IlmRecoveryClassification::OperatorRequired => (true, None),
+        IlmRecoveryClassification::Retrying => (false, Some("already_retrying")),
+        IlmRecoveryClassification::Corrupt => (false, Some("source_corrupt")),
+        IlmRecoveryClassification::Abandoned => (false, Some("source_abandoned")),
+        IlmRecoveryClassification::Terminal => (false, Some("source_terminal")),
+    }
+}
+
+async fn load_transition_recovery_retry_context(
+    api: Arc<ECStore>,
+    control_id: &str,
+) -> TransitionOperatorResult<TransitionRecoveryRetryContext> {
+    let observed = match load_recovery_control(api.clone(), IlmRecoveryProtocol::TransitionTransaction, control_id).await {
+        Ok(observed) => observed,
+        Err(Error::ConfigNotFound) => return Err(TransitionOperatorError::NotFound),
+        Err(err) => return Err(TransitionOperatorError::Store(err)),
+    };
+    let transaction_id = Uuid::parse_str(&observed.control.identity.stable_operation_identity)
+        .ok()
+        .filter(|transaction_id| !transaction_id.is_nil())
+        .ok_or(TransitionOperatorError::StaleRecoveryControl)?;
+    let canonical_path = transition_transaction_record_object_name(transaction_id)
+        .map_err(|err| TransitionOperatorError::Store(Error::other(err)))?;
+    if observed.control.identity.canonical_source_path != canonical_path
+        || observed.control.identity.record_class != "transition_transaction_v1"
+    {
+        return Err(TransitionOperatorError::StaleRecoveryControl);
+    }
+    let transaction = match load_transition_transaction_record(api.clone(), transaction_id).await {
+        Ok(transaction) => transaction,
+        Err(Error::ConfigNotFound) => return Err(TransitionOperatorError::NotFound),
+        Err(err) => return Err(TransitionOperatorError::Store(err)),
+    };
+    let source = observe_recovery_source(api, &canonical_path, TRANSITION_TRANSACTION_SCHEMA)
+        .await
+        .map_err(TransitionOperatorError::Store)?;
+    let exact_source = source.is_consistent()
+        && source.generation == observed.control.observed_source_generation
+        && source
+            .canonical_data
+            .as_deref()
+            .is_some_and(|data| TransitionTransaction::decode(transaction_id, data).is_ok_and(|decoded| decoded == transaction));
+    if !exact_source {
+        return Err(TransitionOperatorError::StaleRecoveryControl);
+    }
+    let generation = serde_json::to_vec(&observed.control.observed_source_generation)
+        .map_err(|err| TransitionOperatorError::Store(Error::other(err)))?;
+    Ok(TransitionRecoveryRetryContext {
+        observed,
+        transaction,
+        source_generation_sha256: hex_sha256(&generation, ToOwned::to_owned),
+    })
+}
+
+pub async fn inspect_transition_recovery_retry_for_operator(
+    api: Arc<ECStore>,
+    control_id: &str,
+) -> TransitionOperatorResult<TransitionRecoveryRetryStatus> {
+    let context = load_transition_recovery_retry_context(api, control_id).await?;
+    let (retry_ready, retry_not_ready_reason) = transition_recovery_retry_readiness(&context.observed.control);
+    Ok(TransitionRecoveryRetryStatus {
+        control_id: control_id.to_string(),
+        transaction_id: context.transaction.transaction_id,
+        state: context.transaction.state,
+        classification: context.observed.control.classification,
+        control_revision: context.observed.control.revision,
+        attempt_count: context.observed.control.attempt_count,
+        consecutive_failure_count: context.observed.control.consecutive_failure_count,
+        last_error_code: context.observed.control.last_error_code,
+        source_generation_sha256: context.source_generation_sha256,
+        copy_set_sha256: context.observed.control.observed_source_generation.copy_set_sha256.clone(),
+        retry_ready,
+        retry_not_ready_reason,
+    })
+}
+
+pub async fn retry_transition_recovery_for_operator(
+    api: Arc<ECStore>,
+    control_id: &str,
+    expected_control_revision: u64,
+    expected_source_generation_sha256: &str,
+) -> TransitionOperatorResult<TransitionRecoveryRetryResult> {
+    let control_object = recovery_control_record_object_name(IlmRecoveryProtocol::TransitionTransaction, control_id)
+        .map_err(|err| TransitionOperatorError::Store(Error::other(err)))?;
+    let retry_lock = api
+        .new_ns_lock(RUSTFS_META_BUCKET, &format!("{control_object}.recovery-lock"))
+        .await
+        .map_err(TransitionOperatorError::Store)?;
+    let retry_guard = retry_lock
+        .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+        .await
+        .map_err(|err| TransitionOperatorError::Store(Error::other(err)))?;
+    let context = load_transition_recovery_retry_context(api.clone(), control_id).await?;
+    let (retry_ready, _) = transition_recovery_retry_readiness(&context.observed.control);
+    if !retry_ready {
+        return Err(TransitionOperatorError::RetryNotAllowed);
+    }
+    if retry_guard.is_lock_lost()
+        || expected_control_revision == 0
+        || context.observed.control.revision != expected_control_revision
+        || context.source_generation_sha256 != expected_source_generation_sha256
+    {
+        return Err(TransitionOperatorError::StaleRecoveryControl);
+    }
+    let previous_revision = context.observed.control.revision;
+    let mut next = context.observed.control.clone();
+    next.retry_for_operator(&context.observed.control.observed_source_generation)
+        .map_err(|_| TransitionOperatorError::RetryNotAllowed)?;
+    if retry_guard.is_lock_lost() {
+        return Err(TransitionOperatorError::StaleRecoveryControl);
+    }
+    save_recovery_control_if_current(api.clone(), &context.observed, &next)
+        .await
+        .map_err(|err| match err {
+            Error::PreconditionFailed => TransitionOperatorError::StaleRecoveryControl,
+            err => TransitionOperatorError::Store(err),
+        })?;
+    let persisted = load_recovery_control(api, IlmRecoveryProtocol::TransitionTransaction, control_id)
+        .await
+        .map_err(TransitionOperatorError::Store)?;
+    if retry_guard.is_lock_lost() || persisted.control != next {
+        return Err(TransitionOperatorError::StaleRecoveryControl);
+    }
+    Ok(TransitionRecoveryRetryResult {
+        control_id: control_id.to_string(),
+        transaction_id: context.transaction.transaction_id,
+        previous_revision,
+        revision: persisted.control.revision,
+        classification: persisted.control.classification,
+        attempt_count: persisted.control.attempt_count,
+        source_generation_sha256: context.source_generation_sha256,
+    })
+}
 
 fn validate_operator_reconcile_transaction(
     transaction: &TransitionTransaction,
@@ -1706,10 +1883,25 @@ async fn local_commit_matches_transaction(api: Arc<ECStore>, transaction: &Trans
         .get_object_info(&transaction.source.bucket, &transaction.source.object, &opts)
         .await?;
     let transitioned = &object.transitioned_object;
-    Ok(transitioned.status == TRANSITION_COMPLETE
+    Ok(local_object_matches_transition_source(&object, &transaction.source)
+        && transitioned.status == TRANSITION_COMPLETE
         && transitioned.name == transaction.remote_object
         && transitioned.tier == transaction.tier_name
         && transitioned.version_id == transaction.remote_version.tier_delete_version_id().unwrap_or_default())
+}
+
+fn local_object_matches_transition_source(object: &ObjectInfo, source: &TransitionSourceIdentity) -> bool {
+    let observed_version_id = object.version_id.filter(|version_id| !version_id.is_nil());
+    let observed_mod_time = object
+        .mod_time
+        .and_then(|mod_time| i64::try_from(mod_time.unix_timestamp_nanos()).ok());
+    object.bucket == source.bucket
+        && object.name == source.object
+        && observed_version_id == source.version_id
+        && object.data_dir == Some(source.data_dir)
+        && observed_mod_time == Some(source.mod_time_unix_nanos)
+        && object.size == source.size
+        && object.etag.as_deref() == Some(source.etag.as_str())
 }
 
 fn transition_source_lookup_options(transaction: &TransitionTransaction) -> ObjectOptions {
@@ -2181,6 +2373,41 @@ mod tests {
             assert_eq!(opts.version_suspended, mode == TransitionSourceVersionMode::VersionSuspended);
             assert!(!opts.metadata_cache_safe);
         }
+    }
+
+    #[test]
+    fn local_commit_proof_requires_the_complete_source_identity() {
+        let source = source_identity(TransitionSourceVersionMode::Versioned);
+        let exact = ObjectInfo {
+            bucket: source.bucket.clone(),
+            name: source.object.clone(),
+            version_id: source.version_id,
+            data_dir: Some(source.data_dir),
+            mod_time: Some(
+                time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(source.mod_time_unix_nanos))
+                    .expect("source timestamp should be valid"),
+            ),
+            size: source.size,
+            etag: Some(source.etag.clone()),
+            ..Default::default()
+        };
+        assert!(local_object_matches_transition_source(&exact, &source));
+
+        let mut changed = exact.clone();
+        changed.version_id = Some(Uuid::new_v4());
+        assert!(!local_object_matches_transition_source(&changed, &source));
+        changed = exact.clone();
+        changed.data_dir = Some(Uuid::new_v4());
+        assert!(!local_object_matches_transition_source(&changed, &source));
+        changed = exact.clone();
+        changed.mod_time = changed.mod_time.map(|value| value + Duration::from_nanos(1));
+        assert!(!local_object_matches_transition_source(&changed, &source));
+        changed = exact.clone();
+        changed.size += 1;
+        assert!(!local_object_matches_transition_source(&changed, &source));
+        changed = exact;
+        changed.etag = Some("different-etag".to_string());
+        assert!(!local_object_matches_transition_source(&changed, &source));
     }
 
     fn cleanup_proof(transaction: &TransitionTransaction, decision: TransitionCleanupDecision) -> TransitionCleanupProof {

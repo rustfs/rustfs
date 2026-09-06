@@ -862,9 +862,10 @@ mod tests {
                 TransitionOperatorProbe, TransitionRecoveryClaimBarrier, TransitionRecoveryTerminalBarrier,
                 TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction,
                 TransitionTransactionInit, TransitionTransactionState, delete_transition_candidate_for_operator,
-                finalize_missing_transition_transaction_for_operator, inspect_transition_transaction_for_operator,
-                load_transition_transaction_record, recover_transition_transaction_records,
-                recover_transition_transaction_records_at, save_transition_transaction_record,
+                finalize_missing_transition_transaction_for_operator, inspect_transition_recovery_retry_for_operator,
+                inspect_transition_transaction_for_operator, load_transition_transaction_record,
+                recover_transition_transaction_records, recover_transition_transaction_records_at,
+                retry_transition_recovery_for_operator, save_transition_transaction_record,
                 save_transition_transaction_record_if_current, transition_recovery_control_id,
                 transition_transaction_record_object_name,
             },
@@ -20629,7 +20630,7 @@ mod tests {
             bucket: bucket.to_string(),
             object: object.to_string(),
             version_id: None,
-            data_dir: uuid::Uuid::new_v4(),
+            data_dir: original.data_dir.expect("source object should have data_dir"),
             mod_time_unix_nanos: original
                 .mod_time
                 .expect("source object should have mod_time")
@@ -20763,7 +20764,7 @@ mod tests {
                 bucket: bucket.to_string(),
                 object: object.to_string(),
                 version_id: None,
-                data_dir: uuid::Uuid::new_v4(),
+                data_dir: original.data_dir.expect("source object should have data_dir"),
                 mod_time_unix_nanos: original
                     .mod_time
                     .expect("source object should have mod_time")
@@ -20904,10 +20905,77 @@ mod tests {
             IlmRecoveryClassification::RetainedAmbiguous
         );
         let local_commit_control =
-            load_recovery_control(store, IlmRecoveryProtocol::TransitionTransaction, &local_commit_control_id)
+            load_recovery_control(store.clone(), IlmRecoveryProtocol::TransitionTransaction, &local_commit_control_id)
                 .await
                 .expect("local-commit control should persist");
         assert_eq!(local_commit_control.control.classification, IlmRecoveryClassification::OperatorRequired);
+
+        let upload_status = inspect_transition_recovery_retry_for_operator(store.clone(), &upload_started_control_id)
+            .await
+            .expect("retained upload should be inspectable for a bounded retry");
+        let local_status = inspect_transition_recovery_retry_for_operator(store.clone(), &local_commit_control_id)
+            .await
+            .expect("operator-required local commit should be inspectable for a bounded retry");
+        assert!(upload_status.retry_ready);
+        assert!(local_status.retry_ready);
+        assert!(matches!(
+            retry_transition_recovery_for_operator(
+                store.clone(),
+                &upload_started_control_id,
+                upload_status.control_revision + 1,
+                &upload_status.source_generation_sha256,
+            )
+            .await,
+            Err(TransitionOperatorError::StaleRecoveryControl)
+        ));
+
+        let put_count_before_retry = backend.put_count().await;
+        let get_count_before_retry = backend.get_count().await;
+        let remove_count_before_retry = backend.remove_count().await;
+        let upload_retry = retry_transition_recovery_for_operator(
+            store.clone(),
+            &upload_started_control_id,
+            upload_status.control_revision,
+            &upload_status.source_generation_sha256,
+        )
+        .await
+        .expect("exact retained upload generation should be rearmed");
+        let local_retry = retry_transition_recovery_for_operator(
+            store.clone(),
+            &local_commit_control_id,
+            local_status.control_revision,
+            &local_status.source_generation_sha256,
+        )
+        .await
+        .expect("exact operator-required local commit generation should be rearmed");
+        assert_eq!(upload_retry.classification, IlmRecoveryClassification::Retrying);
+        assert_eq!(local_retry.classification, IlmRecoveryClassification::Retrying);
+        assert_eq!(upload_retry.attempt_count, upload_status.attempt_count);
+        assert_eq!(local_retry.attempt_count, local_status.attempt_count);
+        assert_eq!(backend.put_count().await, put_count_before_retry);
+        assert_eq!(backend.get_count().await, get_count_before_retry);
+        assert_eq!(backend.remove_count().await, remove_count_before_retry);
+        assert_eq!(backend.exact_remove_count(), 0, "operator retry must not directly issue remote DELETE");
+
+        let retried = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("rearmed records should be re-evaluated through normal recovery");
+        assert_eq!((retried.scanned, retried.recovered, retried.retained, retried.failed), (2, 0, 2, 0));
+        let upload_retained =
+            load_recovery_control(store.clone(), IlmRecoveryProtocol::TransitionTransaction, &upload_started_control_id)
+                .await
+                .expect("upload retry result should persist");
+        let local_retained = load_recovery_control(store, IlmRecoveryProtocol::TransitionTransaction, &local_commit_control_id)
+            .await
+            .expect("local commit retry result should persist");
+        assert_eq!(upload_retained.control.classification, IlmRecoveryClassification::RetainedAmbiguous);
+        assert_eq!(local_retained.control.classification, IlmRecoveryClassification::OperatorRequired);
+        assert_eq!(upload_retained.control.attempt_count, upload_status.attempt_count + 1);
+        assert_eq!(local_retained.control.attempt_count, local_status.attempt_count + 1);
+        assert_eq!(backend.put_count().await, put_count_before_retry);
+        assert_eq!(backend.get_count().await, get_count_before_retry);
+        assert_eq!(backend.remove_count().await, remove_count_before_retry);
+        assert_eq!(backend.exact_remove_count(), 0);
     }
 
     #[cfg(feature = "test-util")]
