@@ -5564,8 +5564,7 @@ async fn persist_legacy_tier_delete_recovery_control(
     object_name: &str,
     observed_data: &[u8],
     stable_operation_identity: String,
-    source_schema: &'static str,
-    record_class: &'static str,
+    (source_schema, record_class): (&'static str, &'static str),
     intended_classification: IlmRecoveryClassification,
     intended_error_code: IlmRecoveryErrorCode,
 ) -> Result<()> {
@@ -5633,8 +5632,7 @@ async fn retain_corrupt_legacy_tier_delete_journal(api: Arc<ECStore>, object_nam
         object_name,
         data,
         CORRUPT_TIER_DELETE_JOURNAL_IDENTITY.to_string(),
-        TIER_DELETE_JOURNAL_UNKNOWN_RECOVERY_SCHEMA,
-        TIER_DELETE_JOURNAL_CORRUPT_RECOVERY_CLASS,
+        (TIER_DELETE_JOURNAL_UNKNOWN_RECOVERY_SCHEMA, TIER_DELETE_JOURNAL_CORRUPT_RECOVERY_CLASS),
         IlmRecoveryClassification::Corrupt,
         IlmRecoveryErrorCode::SourceCorrupt,
     )
@@ -5725,8 +5723,7 @@ async fn recover_tier_delete_journal_entry(api: Arc<ECStore>, object_name: Strin
             &object_name,
             &data,
             stable_operation_identity,
-            source_schema,
-            record_class,
+            (source_schema, record_class),
             IlmRecoveryClassification::RetainedAmbiguous,
             IlmRecoveryErrorCode::RemoteVersionUnknown,
         )
