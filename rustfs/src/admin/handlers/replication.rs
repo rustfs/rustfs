@@ -2805,6 +2805,11 @@ mod target_repair_tests {
     const SECRET_KEY: &str = "targetRepairRootSecret123";
     const BUCKET: &str = "target-repair";
     const BAD_TARGETS: &[u8] = b"unreadable-targets";
+    const TARGET_REPAIR_ENV: [(&str, Option<&str>); 3] = [
+        ("NO_PROXY", Some("*")),
+        ("no_proxy", Some("*")),
+        ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+    ];
 
     struct RemoteTargetServer {
         endpoint: String,
@@ -2956,7 +2961,7 @@ mod target_repair_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn repair_existing_cached_target_persists_readable_targets_and_lists() {
-        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+        temp_env::async_with_vars(TARGET_REPAIR_ENV, async {
             let (_temp, env) = test_env().await;
             let server = RemoteTargetServer::start().await;
             let mut target = server.target();
@@ -3020,7 +3025,7 @@ mod target_repair_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn repair_partial_update_and_invalid_flags_preserve_persisted_bytes() {
-        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+        temp_env::async_with_vars(TARGET_REPAIR_ENV, async {
             let (_temp, env) = test_env().await;
             let server = RemoteTargetServer::start().await;
             let mut target = server.target();
@@ -3070,7 +3075,7 @@ mod target_repair_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn repair_with_stale_unreadable_cache_preserves_another_committed_repair() {
-        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+        temp_env::async_with_vars(TARGET_REPAIR_ENV, async {
             let (_temp, env) = test_env().await;
             let first = RemoteTargetServer::start().await;
             let second = RemoteTargetServer::start().await;
@@ -3121,7 +3126,7 @@ mod target_repair_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn repair_transaction_rejects_a_bucket_recreated_after_target_validation() {
-        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+        temp_env::async_with_vars(TARGET_REPAIR_ENV, async {
             let (_temp, env) = test_env().await;
             let server = RemoteTargetServer::start().await;
             let target = server.target();
@@ -3165,7 +3170,7 @@ mod target_repair_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn repair_transaction_rejects_versioning_suspended_after_target_validation() {
-        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+        temp_env::async_with_vars(TARGET_REPAIR_ENV, async {
             let (_temp, env) = test_env().await;
             let server = RemoteTargetServer::start().await;
             let target = server.target();
@@ -3212,10 +3217,15 @@ mod target_repair_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn failed_repair_transaction_never_reports_a_successful_replacement() {
-        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+        temp_env::async_with_vars(TARGET_REPAIR_ENV, async {
             let (_temp, env) = test_env().await;
             let server = RemoteTargetServer::start().await;
             seed_unreadable(&env).await;
+            let target = server.target();
+            BucketTargetSys::get()
+                .validate_target(BUCKET, &target)
+                .await
+                .expect("remote validation must succeed before injecting the metadata failure");
             let file = metadata_sys::get_config_from_disk(BUCKET)
                 .await
                 .expect("read source metadata")
@@ -3224,6 +3234,7 @@ mod target_repair_tests {
             // but make the transaction's fresh disk load fail.
             let corrupt = b"invalid metadata envelope".to_vec();
             env.put_object_bytes(".rustfs.sys", &file, corrupt.clone()).await;
+            assert!(metadata_sys::get_config_from_disk(BUCKET).await.is_err());
             let log = tempfile::NamedTempFile::new().expect("create captured log");
             let writer = log.reopen().expect("open captured log writer");
             let subscriber = tracing_subscriber::fmt()
@@ -3231,12 +3242,11 @@ mod target_repair_tests {
                 .without_time()
                 .with_writer(writer)
                 .finish();
-            assert!(
-                repair(&server.target(), "replace-unreadable=true")
-                    .with_subscriber(subscriber)
-                    .await
-                    .is_err()
-            );
+            let error = repair(&target, "replace-unreadable=true")
+                .with_subscriber(subscriber)
+                .await
+                .expect_err("repair must fail on the unreadable metadata envelope");
+            assert_eq!(error.code(), &S3ErrorCode::InternalError);
             let lines = std::fs::read_to_string(log.path()).expect("read captured log");
             assert!(
                 !lines.contains("unreadable_targets_replaced"),
