@@ -467,9 +467,9 @@ async fn authorize_manual_transition_request(req: &S3Request<Body>) -> S3Result<
     authorize_transition_admin_request(req, AdminAction::SetTierAction).await
 }
 
-/// The credential pre-check keeps this endpoint family's historical
-/// missing-credentials message (the shared gate reports "get cred failed") and
-/// still yields the masked actor every transition audit log records.
+/// Recovery endpoints bind their audit actor to the authenticated access key
+/// (hashed, never the presented key itself); the credential pre-check keeps
+/// this endpoint family's historical missing-credentials message.
 async fn authorize_recovery_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<String> {
     if req.credentials.is_none() {
         return Err(admin_s3_error(AdminS3ErrorCode::InvalidRequest, "authentication required"));
@@ -478,6 +478,9 @@ async fn authorize_recovery_admin_request(req: &S3Request<Body>, action: AdminAc
     Ok(recovery_actor_sha256(&credentials))
 }
 
+/// The credential pre-check keeps this endpoint family's historical
+/// missing-credentials message (the shared gate reports "get cred failed") and
+/// still yields the masked actor every transition audit log records.
 async fn authorize_transition_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<String> {
     let Some(input_cred) = req.credentials.as_ref() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
