@@ -3705,13 +3705,13 @@ mod target_repair_tests {
                     serde_json::to_value(&targets).expect("encode current targets"),
                     serde_json::to_value(&original).expect("encode peer targets")
                 );
+                assert_published_targets(&targets).await;
                 if !deleted {
                     assert_eq!(targets.targets[0].arn, arn);
                     assert!(!targets.targets[0].replication_sync);
                 } else {
                     assert!(BucketTargetSys::get().get_remote_target_client(BUCKET, &arn).await.is_none());
                 }
-                assert_published_targets(&targets).await;
             }),
         )
         .await;
