@@ -312,3 +312,5 @@ if PATH="$BIN_DIR:$PATH" "$SCRIPT" --secret-key rustfsadmin >"$secret_arg_log" 2
 fi
 
 grep -q -- 'unknown arg: --secret-key' "$secret_arg_log"
+
+"$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_abba.py"

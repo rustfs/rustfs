@@ -692,9 +692,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial]
-    async fn write_back_multipart_completion_preserves_a_client_put_after_staging() {
+    fn write_back_multipart_completion_preserves_a_client_put_after_staging() {
+        crate::app::gating_test_env::run_large_stack_test(
+            "odm-write-back-multipart-client-put-race",
+            write_back_multipart_completion_preserves_a_client_put_after_staging_inner,
+        );
+    }
+
+    async fn write_back_multipart_completion_preserves_a_client_put_after_staging_inner() {
         let (store, bucket) = write_back_test_bucket("odm-mpu-race", false).await;
         let write_back = OnDemandMigrationWriteBack::new();
         let req = request(
