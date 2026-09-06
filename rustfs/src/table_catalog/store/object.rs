@@ -1336,7 +1336,11 @@ where
         Ok(())
     }
 
-    async fn reserve_table_warehouse_index(&self, entry: &TableEntry) -> TableCatalogStoreResult<WarehouseIndexReservation> {
+    async fn reserve_table_warehouse_index(
+        &self,
+        entry: &TableEntry,
+        prefix_already_checked: bool,
+    ) -> TableCatalogStoreResult<WarehouseIndexReservation> {
         let index = table_warehouse_index_entry(entry)?;
         let object = self
             .paths
@@ -1350,7 +1354,10 @@ where
                 return Ok(WarehouseIndexReservation::AlreadyReserved);
             }
         }
-        self.ensure_table_warehouse_prefix_available(entry).await?;
+        // Registration already checked the prefix while holding the bucket publication fence.
+        if !prefix_already_checked {
+            self.ensure_table_warehouse_prefix_available(entry).await?;
+        }
         loop {
             match self
                 .write_entry(self.catalog_bucket(), &object, &index, TableCatalogPutPrecondition::IfAbsent)
@@ -1531,7 +1538,7 @@ where
     }
 
     async fn restore_table_warehouse_index_after_failed_drop(&self, entry: &TableEntry, reason: &'static str) {
-        if let Err(err) = self.reserve_table_warehouse_index(entry).await {
+        if let Err(err) = self.reserve_table_warehouse_index(entry, false).await {
             tracing::warn!(
                 table_bucket = %entry.table_bucket,
                 namespace = %entry.namespace,
@@ -1618,7 +1625,7 @@ where
         if current.state != TableCatalogEntryState::Active {
             return Ok(());
         }
-        self.reserve_table_warehouse_index(&current).await.map(|_| ())
+        self.reserve_table_warehouse_index(&current, false).await.map(|_| ())
     }
 
     pub(in crate::table_catalog) async fn backfill_table_warehouse_index(
@@ -1847,7 +1854,7 @@ where
             ));
         }
         self.ensure_table_warehouse_prefix_available(&entry).await?;
-        let reservation = self.reserve_table_warehouse_index(&entry).await?;
+        let reservation = self.reserve_table_warehouse_index(&entry, true).await?;
         if !publication.holds_table_bucket(&entry.table_bucket)
             || !publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.table)
         {
@@ -5470,7 +5477,7 @@ where
         if next.warehouse_location != current.warehouse_location {
             self.ensure_table_warehouse_prefix_available(&next).await?;
         }
-        let reservation = self.reserve_table_warehouse_index(&next).await?;
+        let reservation = self.reserve_table_warehouse_index(&next, false).await?;
 
         let staged_write_result = async {
             if !has_existing_commit {
