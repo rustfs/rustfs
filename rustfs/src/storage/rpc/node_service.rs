@@ -4760,6 +4760,7 @@ mod tests {
             });
             let body = rustfs_protos::canonical_rename_data_request_body(request.get_ref()).expect("canonical rename body");
             set_tonic_canonical_body_digest(&mut request, &body).expect("body-bound handler request");
+            mark_v2_authenticated(&mut request);
             let response = super::timeout(Duration::from_secs(10), service.rename_data(request))
                 .await
                 .expect("real rename handler must finish within ten seconds")
