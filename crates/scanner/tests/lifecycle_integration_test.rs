@@ -1020,6 +1020,7 @@ mod serial_tests {
         }
 
         let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
+        let expired_recovery_time = i128::from(i64::MAX / 2);
 
         for case in [
             CleanupCase::Persisted,
@@ -1117,7 +1118,7 @@ mod serial_tests {
                         .await
                         .expect("active unknown ownership must remain fenced after the transaction store was offline");
                     assert_eq!((retained.scanned, retained.recovered, retained.retained, retained.failed), (1, 0, 1, 0));
-                    let recovered = recover_transition_transaction_records_at(ecstore.clone(), 100, None, i128::MAX)
+                    let recovered = recover_transition_transaction_records_at(ecstore.clone(), 100, None, expired_recovery_time)
                         .await
                         .expect("expired unknown ownership may use the provider's missing proof");
                     assert_eq!(
@@ -1166,7 +1167,7 @@ mod serial_tests {
                     assert_eq!(retained.recovered, 0);
                     assert_eq!(retained.retained + retained.failed, 1);
                     backend.set_remove_failure(false);
-                    let recovered = recover_transition_transaction_records_at(ecstore.clone(), 100, None, i128::MAX)
+                    let recovered = recover_transition_transaction_records_at(ecstore.clone(), 100, None, expired_recovery_time)
                         .await
                         .expect("expired recovery should delete the candidate after the backend becomes available");
                     assert_eq!(

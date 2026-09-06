@@ -329,11 +329,11 @@ impl ECStore {
     /// reuse its result, which is sound because bucket deletion/recreation
     /// requires the lifecycle WRITE lock and therefore cannot have run while
     /// any read guard was continuously held.
-    pub(crate) async fn acquire_bucket_incarnation_fence(
+    pub async fn acquire_bucket_incarnation_fence(
         &self,
         bucket: &str,
         expected: uuid::Uuid,
-    ) -> Result<super::bucket_fence::BucketIncarnationFenceGuard> {
+    ) -> Result<super::BucketIncarnationFenceGuard> {
         let inner = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
         let pieces = super::bucket_fence::FencePieces {
             registry: self.bucket_fence_registry.clone(),

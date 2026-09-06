@@ -26,7 +26,6 @@ mod metadata_test;
 pub mod migration;
 mod msgp_decode;
 pub mod object_lock;
-pub mod on_demand_migration;
 pub mod policy_sys;
 pub mod quota;
 pub mod remote_s3_client;

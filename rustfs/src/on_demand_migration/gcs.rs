@@ -43,8 +43,8 @@ use super::source_client::{
     GcsSourceSpec, SourceBackend, SourceError, SourceGet, SourceHead, SourceListRequest, SourceObject, SourcePage,
     SourceTimeouts, range_header_value,
 };
-use crate::bucket::remote_s3_client::RemoteS3ClientError;
-use crate::storage_api_contracts::range::HTTPRangeSpec;
+use super::storage_api::HTTPRangeSpec;
+use super::storage_api::remote_s3_client::RemoteS3ClientError;
 use google_cloud_auth::credentials::service_account::{AccessSpecifier, Builder as ServiceAccountBuilder};
 use google_cloud_auth::credentials::{CacheableResource, Credentials};
 use http::{HeaderMap, HeaderValue, Method};
@@ -124,6 +124,18 @@ impl GcsNativeSourceBackend {
         Ok(request)
     }
 
+    async fn send_object(&self, request: reqwest::Request) -> Result<reqwest::Response, SourceError> {
+        match self.http.send_object(request, NO_ERROR_CODE_HEADER).await {
+            Err(SourceError::NotFound) => {
+                // An XML object URL also returns 404 when its bucket is gone.
+                // Reuse the read-only listing probe before caching a key miss.
+                self.probe().await?;
+                Err(SourceError::NotFound)
+            }
+            result => result,
+        }
+    }
+
     /// Shared mapping for the XML API's HEAD and GET responses.
     fn head_from_response(headers: &HeaderMap) -> Result<SourceHead, SourceError> {
         if header(headers, "x-goog-encryption-key-sha256").is_some() {
@@ -164,7 +176,7 @@ impl GcsNativeSourceBackend {
 impl SourceBackend for GcsNativeSourceBackend {
     async fn head(&self, key: &str) -> Result<SourceHead, SourceError> {
         let request = self.request(Method::HEAD, self.object_url(key)?, HeaderMap::new()).await?;
-        let response = self.http.send(request, NO_ERROR_CODE_HEADER).await?;
+        let response = self.send_object(request).await?;
         Self::head_from_response(response.headers())
     }
 
@@ -177,7 +189,7 @@ impl SourceBackend for GcsNativeSourceBackend {
             );
         }
         let request = self.request(Method::GET, self.object_url(key)?, headers).await?;
-        let response = self.http.send(request, NO_ERROR_CODE_HEADER).await?;
+        let response = self.send_object(request).await?;
         let head = Self::head_from_response(response.headers())?;
         let content_range = header(response.headers(), "content-range").map(str::to_string);
         Ok(SourceGet {
@@ -306,8 +318,8 @@ fn parse_objects_list(body: &str) -> Result<SourcePage, SourceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bucket::on_demand_migration::backend_contract::{BackendCapabilities, assert_backend_contract};
-    use crate::bucket::on_demand_migration::test_http_fixture::{ScriptedResponse, scripted_server};
+    use crate::on_demand_migration::backend_contract::{BackendCapabilities, assert_backend_contract};
+    use crate::on_demand_migration::test_http_fixture::{ScriptedResponse, scripted_server};
     use google_cloud_auth::credentials::anonymous::Builder as AnonymousBuilder;
 
     const LIST_PAGE_ONE: &str = r#"{
@@ -488,6 +500,7 @@ mod tests {
             // request; the probe is the next one on the wire.
             ScriptedResponse::new(200, Vec::new(), "{}".to_string()),
             ScriptedResponse::new(404, Vec::new(), String::new()),
+            ScriptedResponse::new(200, Vec::new(), "{}".to_string()),
             ScriptedResponse::new(403, Vec::new(), String::new()),
         ])
         .await;
@@ -502,5 +515,50 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn listing_404_is_not_an_object_not_found() {
+        let (endpoint, _) = scripted_server(vec![ScriptedResponse::new(404, Vec::new(), String::new())]).await;
+        let err = backend(&endpoint)
+            .list(&SourceListRequest {
+                max_keys: 1,
+                ..Default::default()
+            })
+            .await
+            .expect_err("a failed bucket listing is not a per-object miss");
+        assert_eq!(err.class_label(), "other", "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn object_404_requires_a_readable_source_bucket() {
+        for method in [Method::HEAD, Method::GET] {
+            for (probe_status, expected_class) in [
+                (200, "not_found"),
+                (404, "other"),
+                (403, "access_denied"),
+                (503, "throttled"),
+                (500, "server_error"),
+            ] {
+                let (endpoint, recorded) = scripted_server(vec![
+                    ScriptedResponse::new(404, Vec::new(), String::new()),
+                    ScriptedResponse::new(probe_status, Vec::new(), "{}".to_string()),
+                ])
+                .await;
+                let backend = backend(&endpoint);
+                let result = if method == Method::HEAD {
+                    backend.head("missing").await.map(|_| ())
+                } else {
+                    backend.get("missing", None).await.map(|_| ())
+                };
+                let error = result.expect_err("the object 404 must remain an error");
+                assert_eq!(error.class_label(), expected_class, "{method} with probe HTTP {probe_status}: {error:?}");
+                let recorded = recorded.lock().expect("recorder lock");
+                assert_eq!(recorded.len(), 2, "one bounded read-only probe per ambiguous object miss");
+                assert_eq!(recorded[0].method, method.as_str());
+                assert_eq!(recorded[1].method, "GET");
+                assert_eq!(recorded[1].target, "/storage/v1/b/legacy/o?maxResults=1");
+            }
+        }
     }
 }

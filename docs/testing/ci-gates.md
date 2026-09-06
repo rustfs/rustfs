@@ -49,7 +49,7 @@ Promotion rule: never promote a report-only lane to required from one green run.
 | PR touching `paths` in `fuzz.yml` | `Build Fuzz Harness`, `Smoke / <target>` | `fuzz.yml` `fuzz-build`, `pr-fuzz-smoke` | Report-only | `MAX_TOTAL_TIME=60 ./scripts/fuzz/run.sh` |
 | PR touching `paths` in `windows-filesystem.yml` | `Rename Safety` | `windows-filesystem.yml` `rename-safety` | Report-only | the `cargo test -p rustfs-ecstore --lib <filter>` commands in the job, on Windows |
 | PR touching `paths` in `coverage.yml` | `Workspace line coverage` | `coverage.yml` `coverage` | Report-only | `make coverage`; `python3 scripts/check_security_coverage.py target/llvm-cov/coverage.json` |
-| PR touching `paths` in `e2e-upgrade.yml` | `Direct upgrade from rc.2` | `e2e-upgrade.yml` `direct-upgrade` | Report-only | the `cargo test --locked -p e2e_test` command in the job with `RUSTFS_UPGRADE_SOURCE_BINARY` pointing at the pinned previous release |
+| PR touching `paths` in `e2e-upgrade.yml` | `Direct upgrade from the previous release`, `Mixed-version rolling upgrade from the previous release`, `Bucket configuration survives the upgrade`, `Rollback reads current bucket metadata` | `e2e-upgrade.yml` `upgrade` matrix | Report-only | the `cargo test --locked -p e2e_test` command in the job with `RUSTFS_UPGRADE_SOURCE_BINARY` pointing at the pinned previous release (`UPGRADE_SOURCE_VERSION`) |
 | PR touching `paths` in `oidc-keycloak.yml` | `OIDC Keycloak live gate` | `oidc-keycloak.yml` `oidc-keycloak-live` | Report-only | `cargo build --locked -p rustfs --bin rustfs`, then `bash scripts/test/oidc_keycloak_live.sh ./target/debug/rustfs` |
 | PR touching `paths` in `targets-integration.yml` | `PostgreSQL, MySQL, AMQP, and NATS` | `targets-integration.yml` `targets-live` | Report-only | start the containers as in the job, export the `RUSTFS_TEST_*` DSNs, then the job's `cargo test --locked -p rustfs-targets --test <name> -- --ignored --test-threads=1` commands |
 | PR limited to main-CI-excluded paths | `Quick Checks`, `Test and Lint` | `ci-docs-only.yml` `quick-checks`, `test-and-lint` | Required | `git diff --check`; `make doc-paths-check`; `scripts/check_no_planning_docs.sh` |
@@ -74,6 +74,7 @@ Scheduled lanes never block a PR. Their workflow-local gate fails the run, sched
 | `ci.yml` (weekly) | full matrix, including the schedule/dispatch-only rio-v2 jobs `build-rustfs-debug-binary-rio-v2` and `e2e-tests-rio-v2` | per-job | yes | dispatch `ci.yml` |
 | `build.yml` (weekly) | `build-rustfs` over the six-target platform matrix in `prepare-platform-matrix` (four Linux, macOS aarch64, Windows x86_64) | build/package integrity | yes | dispatch `build.yml` with an exact platform set |
 | `e2e-replication-nightly.yml` (nightly) | `repl-nightly`, `cluster-nightly`, `protocols-nightly` | three independent gates; JUnit, membership listing, server logs | yes | `cargo nextest run --profile e2e-repl-nightly -p e2e_test`; `--profile e2e-nightly`; `-j 1 --profile e2e-protocols` |
+| `e2e-distributed.yml` (storage-sensitive PRs + nightly) | `distributed` | fail-closed 4-node 4-disk S3, durability, replication, movement, fault, and direct/rolling upgrade gate; JUnit, membership listing, per-node server logs | yes, with `never_ran_grace_until` | download the pinned previous release as in the workflow, export `RUSTFS_UPGRADE_SOURCE_BINARY`, then `cargo nextest run --profile e2e-distributed -p e2e_test` |
 | `e2e-s3tests.yml` (weekly) | `s3tests` (single and distributed, four shards each), `upstream-head-canary` | compatibility gate; report, JUnit, node IDs, server logs | yes | `scripts/s3-tests/run.sh` against an existing single or distributed target |
 | `fuzz.yml` (nightly) | `nightly-fuzz-corpus` per target | gate; corpus and crash artifacts | yes | `MAX_TOTAL_TIME=<seconds> ./scripts/fuzz/run.sh` |
 | `minio-interop.yml` (nightly) | `minio-interop` | EC + SSE read-parity gate | yes, with `never_ran_grace_until` | pinned Docker fixture steps in the workflow |
@@ -84,7 +85,7 @@ Scheduled lanes never block a PR. Their workflow-local gate fails the run, sched
 | `mint.yml` (weekly) | `mint` | report-only by design; per-suite PASS/FAIL/NA and raw `log.json` | yes | pinned Docker sequence in the workflow |
 | `coverage.yml` (weekly) | `coverage` | report-only trend; lcov and JSON artifact | yes | `make coverage` |
 | `runner-hygiene.yml` (monthly) | `check-ephemerality` | runner ephemerality | yes | dispatch |
-| `e2e-upgrade.yml` (weekly) | `direct-upgrade` | upgrade gate; server logs | no | see the PR row |
+| `e2e-upgrade.yml` (weekly) | `upgrade` (4-case matrix) | upgrade and rollback gate; server logs | no | see the PR row |
 | `oidc-keycloak.yml` (weekly) | `oidc-keycloak-live` | live OIDC gate | no | see the PR row |
 | `targets-integration.yml` (nightly) | `targets-live` | live target gate; container logs | no | see the PR row |
 | `scheduled-validation-freshness.yml` (nightly) | `check-freshness` | fails on a never-created or stale schedule | n/a | dispatch |

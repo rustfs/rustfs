@@ -19,7 +19,9 @@ on:
     paths:
       - ".github/workflows/e2e-upgrade.yml"
       - "crates/e2e_test/src/common.rs"
+      - "crates/e2e_test/src/fake_s3_target/**"
       - "crates/e2e_test/src/lib.rs"
+      - "crates/e2e_test/src/replication_extension_test.rs"
       - "crates/e2e_test/src/upgrade_compatibility_test.rs"
       - "crates/ecstore/**"
       - "crates/filemeta/**"
@@ -44,9 +46,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  UPGRADE_SOURCE_VERSION: 1.0.0-rc.2
-  UPGRADE_SOURCE_ASSET: rustfs-linux-x86_64-gnu-v1.0.0-rc.2.zip
-  UPGRADE_SOURCE_SHA256: 7c789386bf85278f865b8e0d359bf4edb84d5aa408cc3fa54a18c25ca74cd6e7
+  UPGRADE_SOURCE_VERSION: 1.0.0-rc.5
+  UPGRADE_SOURCE_ASSET: rustfs-linux-x86_64-gnu-v1.0.0-rc.5.zip
+  UPGRADE_SOURCE_SHA256: 3ee8df71e8edcfada533be452c4135868f697bc515460ae97b027313eade7a3d
 
 jobs:
   upgrade:
@@ -55,14 +57,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Direct upgrade from rc.2
+          # The two `_from_rc2_` tests keep their names: they assert
+          # release-independent object contracts and pass unchanged against the
+          # newer pinned source, so renaming them would only churn history and
+          # the CI required-check names. UPGRADE_SOURCE_VERSION above is the
+          # single source of truth for which release they actually run against.
+          - name: Direct upgrade from the previous release
             cache_key: e2e-direct-upgrade
             test: direct_upgrade_from_rc2_preserves_object_contracts
             artifact: direct-upgrade
-          - name: Mixed-version rolling upgrade from rc.2
+          - name: Mixed-version rolling upgrade from the previous release
             cache_key: e2e-mixed-version-upgrade
             test: rolling_upgrade_from_rc2_preserves_mixed_version_contracts
             artifact: mixed-version-upgrade
+          - name: Bucket configuration survives the upgrade
+            cache_key: e2e-bucket-config-upgrade
+            test: direct_upgrade_from_previous_release_preserves_bucket_configuration
+            artifact: bucket-config-upgrade
+          - name: Rollback reads current bucket metadata
+            cache_key: e2e-bucket-config-rollback
+            test: rollback_to_previous_release_reads_current_bucket_metadata
+            artifact: bucket-config-rollback
+          - name: ODM configuration recovery after rc.5 rollback
+            cache_key: e2e-odm-config-rollback
+            test: rc5_rollback_requires_restoring_odm_configuration
+            artifact: odm-config-rollback
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:

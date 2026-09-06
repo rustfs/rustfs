@@ -17,7 +17,7 @@
 //! Wire types for `PUT`/`GET`/`DELETE /v3/on-demand-migration/{bucket}`,
 //! `GET .../status`, `POST .../backfill?op=start|cancel` and
 //! `GET .../backfill` (ODM-12), mirroring the server's config model
-//! (`crates/ecstore/src/bucket/on_demand_migration/config.rs`) and handler
+//! (`rustfs/src/on_demand_migration/config.rs`) and handler
 //! responses (`rustfs/src/admin/handlers/on_demand_migration.rs`). The SDK
 //! owns its own copies, madmin-go style; the fixtures under
 //! `fixtures/on_demand_migration/` are the contract both sides pin

@@ -355,6 +355,19 @@ def collect_live(prepared, request, request_path, adapter):
             for sample in heals:
                 status = read_json(sample)
                 require(isinstance(status.get("healOperations"), dict) and status["healOperations"], "invalid heal status response")
+            metrics = list((output / "metrics").glob("admin-metrics.*.ndjson"))
+            endpoints = [endpoint for endpoint in connection["metrics_endpoints"].split(",") if endpoint]
+            require(metrics and len(metrics) == len(endpoints) * len(samples), "missing distributed metrics samples")
+            for sample in metrics:
+                # The collector requests n=1, so each file contains one final JSON record.
+                status = read_json(sample)
+                require(status.get("errors") == [], "distributed metrics errors")
+                require(status.get("final") is True, "incomplete distributed metrics")
+                hosts = status.get("by_host")
+                require(isinstance(hosts, dict) and hosts, "missing by-host metrics")
+                for host in hosts.values():
+                    require(isinstance(host, dict) and isinstance(host.get("scanner"), dict) and host["scanner"],
+                            "missing per-host scanner metrics")
             return result
         finally:
             process.finish(terminate=True)

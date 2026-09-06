@@ -110,6 +110,7 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
         self.env = {
             **os.environ, "GITHUB_STEP_SUMMARY": str(self.directory / "summary.md"),
             "GITHUB_ENV": str(self.directory / "github-env"), "RUNNER_TEMP": self.temp.name, "TMPDIR": self.temp.name,
+            "LOG_FILE": str(self.directory / "suite.log"),
         }
         for key in ("server_url", "repository", "run_id", "run_attempt", "sha", "event_name"):
             self.env[f"GITHUB_{key.upper()}"] = self.context[f"github.{key}"]
@@ -355,6 +356,8 @@ fi
                 self.assertFalse(any(line.strip().startswith("continue-on-error:") for line in self.steps[handoff]))
                 self.assertIn("        if: always()", self.steps["Cleanup environment (after)"])
                 self.assertLess(list(self.steps).index("Cleanup environment (after)"), list(self.steps).index(handoff))
+                initialized = self.run_step("Initialize functional evidence")
+                self.assertEqual(initialized.returncode, 0, initialized.stderr)
                 suite = self.directory / "auto-testing/rustfs-replication-test.sh"
                 suite.write_text('#!/bin/sh\nprintf "suite failed\\n" >> "$EXECUTED"\nexit 17\n')
                 failed = self.run_step("Run replication suite")

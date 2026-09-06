@@ -417,6 +417,7 @@ const MAX_UPLOADS_LIST: usize = 10000;
 mod bucket;
 mod bucket_fence;
 pub(crate) use bucket::await_bucket_namespace_operation;
+pub use bucket_fence::BucketIncarnationFenceGuard;
 mod heal;
 mod heal_walk;
 pub use heal_walk::HealWalkVersion;
