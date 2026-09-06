@@ -4662,7 +4662,6 @@ struct MultipartReplicationReadPlan {
     part_size: i64,
     range: Option<HTTPRangeSpec>,
     next_offset: i64,
-    verify_empty_tail: bool,
 }
 
 fn multipart_replication_read_plan(
@@ -4672,12 +4671,10 @@ fn multipart_replication_read_plan(
     stored_size: usize,
     is_last: bool,
 ) -> std::io::Result<MultipartReplicationReadPlan> {
-    let transformed = object_info.is_compressed() || object_info.is_encrypted();
-    let verify_empty_tail = !obj_opts.raw_data_movement_read && transformed && is_last && input.part_size == 0;
-    let empty_last_part = is_last && input.part_size == 0 && (stored_size == 0 || verify_empty_tail);
+    let empty_last_part = is_last && input.part_size == 0 && stored_size == 0;
     // Raw reads address stored bytes. Only untransformed legacy parts may
     // substitute their stored size for a missing logical size.
-    if obj_opts.raw_data_movement_read || (input.part_size == 0 && !transformed) {
+    if obj_opts.raw_data_movement_read || (input.part_size == 0 && !object_info.is_compressed() && !object_info.is_encrypted()) {
         input.part_size = i64::try_from(stored_size).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "multipart replication stored part size exceeds i64")
         })?;
@@ -4696,7 +4693,6 @@ fn multipart_replication_read_plan(
             part_size: 0,
             range: None,
             next_offset: input.offset,
-            verify_empty_tail,
         });
     }
     let plan = replication_multipart_part_plan(input).map_err(std::io::Error::other)?;
@@ -4709,26 +4705,7 @@ fn multipart_replication_read_plan(
             end: plan.range.end,
         }),
         next_offset: plan.next_offset,
-        verify_empty_tail: false,
     })
-}
-
-async fn verify_transformed_empty_tail<R: tokio::io::AsyncRead + Unpin>(
-    reader: &mut R,
-    expected_size: i64,
-) -> std::io::Result<()> {
-    let expected_size = u64::try_from(expected_size)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty multipart tail has a negative offset"))?;
-    // Read through EOF: stopping at the expected byte count would skip an
-    // empty encryption/compression frame and hide its validation error.
-    let actual_size = tokio::io::copy(reader, &mut tokio::io::sink()).await?;
-    if actual_size != expected_size {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("empty multipart tail expected {expected_size} plaintext bytes, read {actual_size}"),
-        ));
-    }
-    Ok(())
 }
 
 async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
@@ -4773,13 +4750,6 @@ async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
             let part_stream = wrap_with_bandwidth_monitor_with_header(part_reader.stream, src_bucket, arn, header_size);
             async_read_to_bytestream(part_stream)
         } else {
-            if part_plan.verify_empty_tail {
-                let mut reader = storage
-                    .get_object_reader(src_bucket, object, None, HeaderMap::new(), obj_opts)
-                    .await
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-                verify_transformed_empty_tail(&mut reader.stream, part_plan.next_offset).await?;
-            }
             ByteStream::from_static(b"")
         };
         header_size = 0;
@@ -4870,7 +4840,6 @@ mod tests {
             assert!(!range.is_suffix_length);
             assert_eq!((range.start, range.end), (start, end));
             assert_eq!(plan.next_offset, end + 1);
-            assert!(!plan.verify_empty_tail);
             offset = plan.next_offset;
         }
         assert_eq!(offset, object_info.size);
@@ -4903,36 +4872,12 @@ mod tests {
                         9,
                         true,
                     );
-                    if !raw && actual_size < 0 {
+                    if !raw && actual_size <= 0 {
                         let err = result.expect_err("transformed reads cannot substitute physical bytes for unknown plaintext");
                         assert!(matches!(
-                            err.get_ref().and_then(|err| err.downcast_ref::<rustfs_replication::ReplicationMultipartPlanError>()),
-                            Some(rustfs_replication::ReplicationMultipartPlanError::InvalidPartSize { part_size })
+                            err.get_ref().and_then(|err| err.downcast_ref::<super::super::replication_object_decision_boundary::ReplicationMultipartPlanError>()),
+                            Some(super::super::replication_object_decision_boundary::ReplicationMultipartPlanError::InvalidPartSize { part_size })
                                 if *part_size == actual_size
-                        ));
-                    } else if !raw && actual_size == 0 {
-                        let plan = result.expect("a transformed empty tail requires a full EOF check");
-                        assert_eq!(plan.part_number, 2);
-                        assert_eq!(plan.part_size, 0);
-                        assert!(plan.range.is_none());
-                        assert_eq!(plan.next_offset, 7);
-                        assert!(plan.verify_empty_tail);
-                        let err = multipart_replication_read_plan(
-                            &object_info,
-                            &ObjectOptions::default(),
-                            ReplicationMultipartPartInput {
-                                offset: 7,
-                                part_number: 2,
-                                part_size: 0,
-                            },
-                            9,
-                            false,
-                        )
-                        .expect_err("only the final transformed part can be verified as empty");
-                        assert!(matches!(
-                            err.get_ref()
-                                .and_then(|err| err.downcast_ref::<rustfs_replication::ReplicationMultipartPlanError>()),
-                            Some(rustfs_replication::ReplicationMultipartPlanError::InvalidPartSize { part_size: 0 })
                         ));
                     } else {
                         let plan = result.expect("the selected representation has a known positive size");
@@ -4942,7 +4887,6 @@ mod tests {
                         let range = plan.range.expect("a nonempty part must read a range");
                         assert_eq!((range.start, range.end), (7, 7 + expected_size - 1));
                         assert_eq!(plan.next_offset, 7 + expected_size);
-                        assert!(!plan.verify_empty_tail);
                     }
                 }
             }
@@ -4972,7 +4916,6 @@ mod tests {
                 assert_eq!(plan.part_size, 0);
                 assert!(plan.range.is_none());
                 assert_eq!(plan.next_offset, offset);
-                assert!(!plan.verify_empty_tail);
             }
         }
     }
@@ -5002,9 +4945,9 @@ mod tests {
             .expect_err("invalid part metadata must not become a successful transport plan");
             assert!(
                 err.kind() == std::io::ErrorKind::InvalidData
-                    || err
-                        .get_ref()
-                        .is_some_and(|err| err.is::<rustfs_replication::ReplicationMultipartPlanError>()),
+                    || err.get_ref().is_some_and(|err| {
+                        err.is::<super::super::replication_object_decision_boundary::ReplicationMultipartPlanError>()
+                    }),
                 "the failure must preserve a typed metadata or planner error: {err}"
             );
         }
@@ -5032,52 +4975,6 @@ mod tests {
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
             assert_eq!(err.to_string(), "multipart replication stored part size exceeds i64");
         }
-    }
-
-    #[tokio::test]
-    async fn transformed_empty_tail_verification_requires_exact_eof_length() {
-        for body in [b"four".as_slice(), b"first".as_slice(), b"longer".as_slice()] {
-            let result = verify_transformed_empty_tail(&mut std::io::Cursor::new(body), 5).await;
-            if body.len() == 5 {
-                result.expect("the complete plaintext stream matches the preceding parts");
-            } else {
-                let err = result.expect_err("a different plaintext length cannot certify an empty tail");
-                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-                assert_eq!(
-                    err.to_string(),
-                    format!("empty multipart tail expected 5 plaintext bytes, read {}", body.len())
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn transformed_empty_tail_verification_propagates_errors_after_the_plaintext_limit() {
-        for (tail, error_kind, message) in [
-            (
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "tail authentication failed")),
-                std::io::ErrorKind::InvalidData,
-                "tail authentication failed",
-            ),
-            (
-                Ok(bytes::Bytes::from_static(b"extra")),
-                std::io::ErrorKind::Other,
-                "input provided more bytes than specified",
-            ),
-        ] {
-            let stream = futures::stream::iter([Ok(bytes::Bytes::from_static(b"first")), tail]);
-            let mut reader = rustfs_rio::HardLimitReader::new(tokio_util::io::StreamReader::new(stream), 5);
-            let err = verify_transformed_empty_tail(&mut reader, 5)
-                .await
-                .expect_err("reading the expected plaintext is insufficient without a successful EOF");
-            assert_eq!(err.kind(), error_kind);
-            assert_eq!(err.to_string(), message);
-        }
-        let mut truncated = rustfs_rio::HardLimitReader::new(std::io::Cursor::new(b"four"), 5);
-        let err = verify_transformed_empty_tail(&mut truncated, 5)
-            .await
-            .expect_err("the complete reader must also reject truncated plaintext");
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
@@ -6659,10 +6556,11 @@ mod tests {
         );
     }
     mod multipart_transport_tests {
+        use super::super::super::replication_filemeta_boundary::ObjectPartInfo;
+        use super::super::super::replication_storage_boundary::ObjectIO as _;
         use super::*;
         use bytes::Bytes;
         use http_body_util::{BodyExt, Full};
-        use rustfs_filemeta::ObjectPartInfo;
         use std::convert::Infallible;
 
         #[derive(Debug)]
@@ -6670,36 +6568,7 @@ mod tests {
             body: Bytes,
             info: ObjectInfo,
             ranges: StdMutex<Vec<(i64, i64)>>,
-            full_read: Option<FullReadOutcome>,
             full_reads: std::sync::atomic::AtomicUsize,
-        }
-
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        enum FullReadOutcome {
-            EmptyTail,
-            DecodeError,
-            ExtraByte,
-        }
-
-        struct DecodeErrorAfterBody(std::io::Cursor<Bytes>);
-
-        impl tokio::io::AsyncRead for DecodeErrorAfterBody {
-            fn poll_read(
-                self: std::pin::Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
-                buf: &mut tokio::io::ReadBuf<'_>,
-            ) -> std::task::Poll<std::io::Result<()>> {
-                let filled = buf.filled().len();
-                match std::pin::Pin::new(&mut self.get_mut().0).poll_read(cx, buf) {
-                    std::task::Poll::Ready(Ok(())) if buf.remaining() > 0 && buf.filled().len() == filled => {
-                        std::task::Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "tail decode failed after all plaintext",
-                        )))
-                    }
-                    result => result,
-                }
-            }
         }
 
         #[async_trait::async_trait]
@@ -6710,7 +6579,7 @@ mod tests {
             type ObjectOptions = ObjectOptions;
             type ObjectInfo = ObjectInfo;
             type GetObjectReader = GetObjectReader;
-            type PutObjectReader = crate::object_api::PutObjReader;
+            type PutObjectReader = super::super::super::replication_storage_boundary::PutObjReader;
 
             async fn get_object_reader(
                 &self,
@@ -6726,17 +6595,9 @@ mod tests {
                     "every read retains the selected source version"
                 );
                 if range.is_none() {
-                    let outcome = self.full_read.expect("only a transformed empty tail needs a full decode");
                     self.full_reads.fetch_add(1, Ordering::Relaxed);
-                    let stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync> = match outcome {
-                        FullReadOutcome::EmptyTail => Box::new(std::io::Cursor::new(self.body.clone())),
-                        FullReadOutcome::DecodeError => Box::new(DecodeErrorAfterBody(std::io::Cursor::new(self.body.clone()))),
-                        FullReadOutcome::ExtraByte => {
-                            Box::new(std::io::Cursor::new(Bytes::from([self.body.as_ref(), &[0xff]].concat())))
-                        }
-                    };
                     return Ok(GetObjectReader {
-                        stream,
+                        stream: Box::new(std::io::Cursor::new(self.body.clone())),
                         object_info: self.info.clone(),
                         buffered_body: None,
                         body_source: Default::default(),
@@ -6787,31 +6648,28 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn multipart_transport_validates_transformed_empty_tail_before_upload() {
-            run_transport(0, Some(FullReadOutcome::EmptyTail)).await;
+        async fn multipart_transport_preserves_transformed_unknown_nonempty_parts() {
+            for unknown_part in [(0, 0), (1, 0), (0, -1), (1, -1)] {
+                run_transport(4096, Some(unknown_part)).await;
+            }
         }
 
         #[tokio::test]
-        async fn multipart_transport_aborts_on_transformed_tail_decode_error() {
-            run_transport(0, Some(FullReadOutcome::DecodeError)).await;
+        async fn multipart_transport_preserves_transformed_empty_tail() {
+            run_transport(0, Some((1, 0))).await;
         }
 
-        #[tokio::test]
-        async fn multipart_transport_aborts_when_transformed_tail_is_not_empty() {
-            run_transport(0, Some(FullReadOutcome::ExtraByte)).await;
-        }
-
-        async fn run_transport(tail_size: usize, full_read: Option<FullReadOutcome>) {
+        async fn run_transport(tail_size: usize, unknown_part: Option<(usize, i64)>) {
             const FIRST_SIZE: usize = 5 * 1024 * 1024;
             let body = Bytes::from([vec![0x35; FIRST_SIZE], vec![0xa7; tail_size]].concat());
             let etag = faster_hex::hex_string(rustfs_utils::hash::HashAlgorithm::Md5.hash_encode(&body).as_ref());
             let source = Arc::new(Source {
                 info: ObjectInfo {
-                    size: i64::try_from(body.len()).expect("body size"),
+                    size: i64::try_from(body.len() + if unknown_part.is_some() { 16 } else { 0 }).expect("stored size"),
                     actual_size: i64::try_from(body.len()).expect("body size"),
                     etag: Some(etag.clone()),
                     version_id: Some(Uuid::new_v4()),
-                    user_defined: Arc::new(if full_read.is_some() {
+                    user_defined: Arc::new(if unknown_part.is_some() {
                         HashMap::from([("x-amz-server-side-encryption".to_string(), "AES256".to_string())])
                     } else {
                         HashMap::new()
@@ -6819,8 +6677,10 @@ mod tests {
                     parts: Arc::new(vec![
                         ObjectPartInfo {
                             number: 1,
-                            size: FIRST_SIZE,
-                            actual_size: if tail_size == 0 {
+                            size: FIRST_SIZE + if unknown_part.is_some() { 8 } else { 0 },
+                            actual_size: if let Some((0, size)) = unknown_part {
+                                size
+                            } else if unknown_part.is_some() || tail_size == 0 {
                                 i64::try_from(FIRST_SIZE).expect("first part size")
                             } else {
                                 0
@@ -6829,8 +6689,14 @@ mod tests {
                         },
                         ObjectPartInfo {
                             number: 2,
-                            size: if full_read.is_some() { 8 } else { tail_size },
-                            actual_size: 0,
+                            size: tail_size + if unknown_part.is_some() { 8 } else { 0 },
+                            actual_size: if let Some((1, size)) = unknown_part {
+                                size
+                            } else if unknown_part.is_some() {
+                                i64::try_from(tail_size).expect("tail logical size")
+                            } else {
+                                0
+                            },
                             ..Default::default()
                         },
                     ]),
@@ -6838,7 +6704,6 @@ mod tests {
                 },
                 body: body.clone(),
                 ranges: StdMutex::new(Vec::new()),
-                full_read,
                 full_reads: std::sync::atomic::AtomicUsize::new(0),
             });
             let journal = Arc::new(StdMutex::new(Vec::<RequestRecord>::new()));
@@ -6863,7 +6728,7 @@ mod tests {
                                     let body = body.collect().await.expect("read complete multipart request body").to_bytes();
                                     let response = if request.method == http::Method::POST && query.contains_key("uploads") {
                                         "<InitiateMultipartUploadResult><Bucket>target-bucket</Bucket><Key>object</Key><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>"
-                                    } else if request.method == http::Method::PUT && query.contains_key("partNumber") {
+                                    } else if request.method == http::Method::PUT {
                                         ""
                                     } else if request.method == http::Method::POST && query.contains_key("uploadId") {
                                         "<CompleteMultipartUploadResult><Location>http://localhost/object</Location><Bucket>target-bucket</Bucket><Key>object</Key><ETag>&quot;target-2&quot;</ETag></CompleteMultipartUploadResult>"
@@ -6872,12 +6737,17 @@ mod tests {
  } else {
                                         panic!("unexpected multipart request: {} {}", request.method, request.uri)
                                     };
+                                    let response_etag = if request.method == http::Method::PUT && !query.contains_key("partNumber") {
+                                        format!("\"{}\"", faster_hex::hex_string(rustfs_utils::hash::HashAlgorithm::Md5.hash_encode(&body).as_ref()))
+                                    } else {
+                                        "\"uploaded-part\"".to_string()
+                                    };
                                     journal.lock().expect("request journal lock").push(RequestRecord {
                                         method: request.method, query, headers: request.headers, body,
                                     });
                                     Ok::<_, Infallible>(hyper::Response::builder()
                                         .header("content-type", "application/xml")
-                                        .header("etag", "\"uploaded-part\"")
+                                        .header("etag", response_etag)
                                         .body(Full::new(Bytes::from_static(response.as_bytes())))
                                         .expect("multipart response"))
                                 }
@@ -6898,55 +6768,70 @@ mod tests {
                 .build();
             Arc::get_mut(&mut target).expect("unshared test target").client = Arc::new(aws_sdk_s3::Client::from_conf(config));
             let (put_opts, is_multipart) = replication_put_object_options("STANDARD", &source.info).expect("replication options");
-            assert!(is_multipart, "persisted parts select the multipart transport");
             let opts = ObjectOptions {
                 version_id: source.info.version_id.map(|id| id.to_string()),
                 ..Default::default()
             };
+            let reader = source
+                .get_object_reader("source", "object", None, HeaderMap::new(), &opts)
+                .await
+                .expect("open the existing full-object stream");
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                replicate_object_with_multipart(MultipartReplicationContext {
-                    storage: source.clone(),
-                    cli: target.clone(),
-                    src_bucket: "source",
-                    dst_bucket: "target-bucket",
-                    object: "object",
-                    object_info: &source.info,
-                    obj_opts: &opts,
-                    arn: &target.arn,
-                    put_opts,
-                }),
+                replicate_all_payload_to_target(
+                    ReplicateAllPayloadContext {
+                        storage: &source,
+                        tgt_client: &target,
+                        bucket: "source",
+                        object: "object",
+                        object_info: &source.info,
+                        obj_opts: &opts,
+                        arn: &target.arn,
+                        transfer_size: i64::try_from(body.len()).expect("plaintext size"),
+                        is_multipart,
+                        put_opts,
+                    },
+                    reader,
+                ),
             )
             .await;
             server.abort();
             assert!(server.await.expect_err("fixture server is stopped").is_cancelled());
-            let result = result.expect("multipart replication must finish");
-
-            if matches!(full_read, Some(FullReadOutcome::DecodeError | FullReadOutcome::ExtraByte)) {
-                assert_eq!(source.full_reads.load(Ordering::Relaxed), 1, "decode failures follow a full read");
-                let error = result.expect_err("invalid transformed tails must abort replication");
-                if full_read == Some(FullReadOutcome::DecodeError) {
-                    assert!(
-                        error.to_string().contains("tail decode failed after all plaintext"),
-                        "decoder error must remain visible: {error}"
-                    );
-                }
+            if let Some(error) = result.expect("replication must finish") {
+                panic!("legacy parts must replicate successfully: {error}");
+            }
+            assert_eq!(
+                source.full_reads.load(Ordering::Relaxed),
+                1,
+                "reuse the initial full stream without an extra read"
+            );
+            if unknown_part.is_some() {
                 let requests = journal.lock().expect("request journal lock");
-                assert_eq!(requests.len(), 3, "initiate, first part and abort; no empty upload or complete");
-                assert!(requests[0].query.contains_key("uploads"));
-                assert_eq!(requests[1].method, http::Method::PUT);
-                assert_eq!(requests[1].query.get("partNumber").map(String::as_str), Some("1"));
-                assert_eq!(requests[1].body, body);
-                assert_eq!(requests[2].method, http::Method::DELETE);
-                assert!(requests[2].query.contains_key("uploadId"));
+                assert_eq!(requests.len(), 1, "unknown transformed boundaries retain one streaming PUT");
+                let request = &requests[0];
+                assert_eq!(request.method, http::Method::PUT);
+                assert!(request.query.is_empty(), "single PUT has no multipart operations");
+                assert_eq!(request.body, body, "single PUT includes every byte of both source parts");
                 assert_eq!(
-                    *source.ranges.lock().expect("range journal lock"),
-                    vec![(0, i64::try_from(FIRST_SIZE - 1).expect("first end"))]
+                    request.headers.get("content-length").expect("body length"),
+                    body.len().to_string().as_str()
+                );
+                assert_eq!(
+                    rustfs_utils::http::get_header(&request.headers, rustfs_utils::http::SUFFIX_SOURCE_ETAG).as_deref(),
+                    Some(etag.as_str())
+                );
+                assert_eq!(
+                    rustfs_utils::http::get_header(&request.headers, rustfs_utils::http::SUFFIX_SOURCE_VERSION_ID)
+                        .map(|value| value.into_owned()),
+                    source.info.version_id.map(|id| id.to_string()),
+                    "single PUT preserves the selected source version"
+                );
+                assert!(
+                    source.ranges.lock().expect("range journal lock").is_empty(),
+                    "unknown logical boundaries must not issue guessed ranges"
                 );
                 return;
             }
-            result.expect("legacy parts must replicate successfully");
-            assert_eq!(source.full_reads.load(Ordering::Relaxed), usize::from(full_read.is_some()));
 
             let requests = journal.lock().expect("request journal lock");
             assert_eq!(requests.len(), 4, "initiate, two upload parts, and complete without retries");

@@ -255,6 +255,8 @@ Source-backed responses report only what the source can vouch for: its ETag, its
 - The source ETag is always recorded in internal metadata regardless of the policy, so an audit or a later comparison can still see it.
 - `Last-Modified` of a pulled object is the local write time, not the source's. The source timestamp is preserved in metadata.
 
+A preserved source ETag does not describe the local part layout. Part reads and object attributes use the stored parts, and replication uses multipart transport when their logical boundaries are available. Legacy compressed or encrypted objects without a multipart ETag can lack those boundaries; they retain their existing streaming PUT path and its 5 GiB limit. Their replication target may therefore store a different part layout.
+
 ## Metadata mapping
 
 Copied to the local object:
