@@ -772,10 +772,9 @@ async fn test_odm_global_disable_preserves_data_config_and_backfill_across_resta
     assert_eq!(config.status, 200, "{}", config.body);
     let config = config.json()?;
 
-    // One held response fixes the crash before the only backfill object can
-    // commit. Its start checkpoint already exists; no large source is needed.
-    env.source
-        .inject_for_key(Operation::GetObject, pending_key, FaultAction::Stall(Duration::from_secs(30)), 1);
+    // Hold every attempt until the process has exited, so retries cannot commit
+    // the only backfill object before the crash. The start checkpoint exists.
+    let mut pending_get = env.source.hold_get_object(SOURCE_BUCKET, pending_key);
     let started = env
         .start_backfill(
             bucket,
@@ -787,12 +786,16 @@ async fn test_odm_global_disable_preserves_data_config_and_backfill_across_resta
         .await?;
     assert_eq!(started.status, 200, "{}", started.body);
     let job_id = started.json()?["job"]["job_id"].as_str().ok_or("missing job ID")?.to_string();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while env.source.count_requests(Operation::GetObject, pending_key) == 0 {
-        assert!(Instant::now() < deadline, "backfill never reached the held source GET");
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    env.rustfs.stop_server();
+    tokio::time::timeout(Duration::from_secs(10), pending_get.wait_until_entered())
+        .await
+        .expect("backfill never reached the held source GET")?;
+    let process = env.rustfs.process.as_mut().ok_or("missing RustFS process before crash")?;
+    assert!(process.try_wait()?.is_none(), "RustFS exited before the controlled crash");
+    process.kill()?;
+    let stopped = process.wait()?;
+    assert!(!stopped.success(), "the interrupted process must exit after being killed");
+    drop(env.rustfs.process.take());
+    drop(pending_get);
     env.source.take_requests();
     env.rustfs
         .restart_server_preserving_data(vec![], &[(ODM_MODULE_SWITCH_ENV, "false"), (ALLOW_LOOPBACK_SOURCE_ENV, "true")])
