@@ -17,6 +17,33 @@ use crate::data_usage_define::{UNKNOWN_TIER, UnknownTierStats, hash_path};
 use rustfs_data_usage::{ReplicationAllStats, ReplicationTargetUsage, TierAccountingProof};
 
 const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([7; 32]);
+const TEST_COVERAGE_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([6; 32]);
+
+#[test]
+fn scanner_bucket_inventory_requires_exact_unique_set_union() {
+    let first = BucketInfo {
+        name: "first".to_string(),
+        ..Default::default()
+    };
+    let second = BucketInfo {
+        name: "second".to_string(),
+        ..Default::default()
+    };
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut sets = HashMap::from([(source, vec![first.clone()])]);
+    assert!(scanner_bucket_inventory_is_complete(std::slice::from_ref(&first), &sets));
+    assert!(!scanner_bucket_inventory_is_complete(&[first.clone(), second.clone()], &sets));
+    assert!(!scanner_bucket_inventory_is_complete(&[], &sets));
+    assert!(!scanner_bucket_inventory_is_complete(&[first.clone(), first.clone()], &sets));
+    sets.insert(source, vec![first.clone(), first.clone()]);
+    assert!(!scanner_bucket_inventory_is_complete(std::slice::from_ref(&first), &sets));
+    sets.insert(source, vec![second]);
+    assert!(!scanner_bucket_inventory_is_complete(std::slice::from_ref(&first), &sets));
+    let mut recreated = first.clone();
+    recreated.created = Some(OffsetDateTime::UNIX_EPOCH);
+    sets.insert(source, vec![recreated]);
+    assert!(!scanner_bucket_inventory_is_complete(&[first], &sets));
+}
 
 #[test]
 fn should_publish_completed_snapshot_requires_full_clean_cycle() {
@@ -79,6 +106,7 @@ fn completed_root_cache(bucket: &str, objects: usize, update_secs: u64, source: 
             source: Some(source),
             snapshot_complete: true,
             scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            scan_coverage_digest: Some(TEST_COVERAGE_DIGEST),
             cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
             ..Default::default()
         },
@@ -108,7 +136,139 @@ fn completed_data_usage_info_for_test(
     cancelled: bool,
 ) -> Option<(DataUsageInfo, SystemTime)> {
     let expected_sources = results.iter().filter_map(|result| result.info.source).collect::<HashSet<_>>();
-    completed_data_usage_info(results, &expected_sources, all_buckets, &[], true, budget_elapsed, cancelled)
+    completed_usage_for_scope(results, &expected_sources, all_buckets, &[], true, budget_elapsed, cancelled)
+}
+
+fn completed_usage_for_scope(
+    results: &[DataUsageCache],
+    expected_sources: &HashSet<DataUsageCacheSource>,
+    all_buckets: &[String],
+    tier_registry_names: &[String],
+    bucket_plan_complete: bool,
+    budget_elapsed: bool,
+    cancelled: bool,
+) -> Option<(DataUsageInfo, SystemTime)> {
+    let first = results.first()?;
+    completed_data_usage_info(
+        results,
+        &ScannerSnapshotScope {
+            sources: expected_sources,
+            buckets: all_buckets,
+            identity: ScannerSnapshotIdentity {
+                cycle: first.info.next_cycle,
+                leader_epoch: first.info.leader_epoch,
+                plan_digest: TEST_PLAN_DIGEST,
+                coverage_digest: TEST_COVERAGE_DIGEST,
+                tier_registry_generation: first.info.tier_registry_generation,
+            },
+        },
+        tier_registry_names,
+        bucket_plan_complete,
+        budget_elapsed,
+        cancelled,
+    )
+}
+
+#[test]
+fn completed_data_usage_info_rejects_duplicate_bucket_inventory() {
+    let set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
+    let buckets = vec!["bucket".to_string(), "bucket".to_string()];
+    assert!(completed_data_usage_info_for_test(&[set], &buckets, false, false).is_none());
+}
+
+#[test]
+fn completed_data_usage_info_rejects_extra_or_detached_bucket_data() {
+    let buckets = vec!["bucket".to_string()];
+    let mut set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
+    set.replace(
+        "unlisted",
+        DATA_USAGE_ROOT,
+        DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    assert!(completed_data_usage_info_for_test(&[set.clone()], &buckets, false, false).is_none());
+    set.cache
+        .get_mut(DATA_USAGE_ROOT)
+        .expect("set root")
+        .children
+        .remove(&hash_path("unlisted").key());
+    assert!(
+        completed_data_usage_info_for_test(&[set], &buckets, false, false).is_none(),
+        "orphaned data must not disappear from authoritative accounting"
+    );
+}
+
+#[test]
+fn completed_data_usage_info_rejects_disconnected_expected_bucket() {
+    let buckets = vec!["bucket".to_string()];
+    let mut set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
+    set.cache.get_mut(DATA_USAGE_ROOT).expect("set root").children.clear();
+    assert!(completed_data_usage_info_for_test(&[set], &buckets, false, false).is_none());
+}
+
+#[test]
+fn completed_data_usage_info_rejects_root_scalar_data_and_unknown_key_format() {
+    let buckets = vec!["bucket".to_string()];
+    let set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
+    let mut scalar_root = set.clone();
+    scalar_root.cache.get_mut(DATA_USAGE_ROOT).expect("set root").size = 10;
+    assert!(completed_data_usage_info_for_test(&[scalar_root], &buckets, false, false).is_none());
+    let mut future_format = set;
+    future_format.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT + 1;
+    assert!(completed_data_usage_info_for_test(&[future_format], &buckets, false, false).is_none());
+}
+
+#[test]
+fn completed_data_usage_info_binds_all_results_to_requested_identity() {
+    let buckets = vec!["bucket".to_string()];
+    let source = DataUsageCacheSource::new(0, 0);
+    let sources = HashSet::from([source]);
+    let set = completed_root_cache("bucket", 2, 10, source);
+    let identity = ScannerSnapshotIdentity {
+        cycle: 0,
+        leader_epoch: 0,
+        plan_digest: TEST_PLAN_DIGEST,
+        coverage_digest: TEST_COVERAGE_DIGEST,
+        tier_registry_generation: None,
+    };
+    let results = [set];
+    for expected in [
+        ScannerSnapshotIdentity { cycle: 1, ..identity },
+        ScannerSnapshotIdentity {
+            leader_epoch: 1,
+            ..identity
+        },
+        ScannerSnapshotIdentity {
+            plan_digest: DataUsageScanPlanDigest([9; 32]),
+            ..identity
+        },
+        ScannerSnapshotIdentity {
+            tier_registry_generation: Some(1),
+            ..identity
+        },
+        ScannerSnapshotIdentity {
+            coverage_digest: DataUsageScanPlanDigest([4; 32]),
+            ..identity
+        },
+    ] {
+        let scope = ScannerSnapshotScope {
+            sources: &sources,
+            buckets: &buckets,
+            identity: expected,
+        };
+        assert!(completed_data_usage_info(&results, &scope, &[], true, false, false).is_none());
+    }
+    let scope = ScannerSnapshotScope {
+        sources: &sources,
+        buckets: &buckets,
+        identity,
+    };
+    let (usage, _) = completed_data_usage_info(&results, &scope, &[], true, false, false)
+        .expect("the requested complete scope remains publishable");
+    assert_eq!(usage.objects_total_count, 2);
+    assert!(usage.is_complete_bucket_usage_snapshot());
 }
 
 fn lkg_root_cache(bucket: &str, objects: usize, source: DataUsageCacheSource) -> DataUsageCache {
@@ -136,7 +296,7 @@ fn partial_usage_is_observational_not_authoritative_for_quota() {
     let expected = HashSet::from([current_source, stalled_source]);
 
     assert!(
-        completed_data_usage_info(&[current.clone(), stalled.clone()], &expected, &all_buckets, &[], true, false, false)
+        completed_usage_for_scope(&[current.clone(), stalled.clone()], &expected, &all_buckets, &[], true, false, false)
             .is_none()
     );
     let (observed, _) = observational_data_usage_info(&[current, stalled], &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3)
@@ -509,7 +669,7 @@ fn completed_data_usage_info_accepts_unknown_only_with_current_registry_generati
 
     let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0)]);
     assert!(
-        completed_data_usage_info(&[set], &expected_sources, &all_buckets, &["WARM".to_string()], true, false, false,).is_some()
+        completed_usage_for_scope(&[set], &expected_sources, &all_buckets, &["WARM".to_string()], true, false, false,).is_some()
     );
 }
 
@@ -547,7 +707,7 @@ fn completed_data_usage_info_rejects_non_registry_tier_in_current_generation() {
 
     let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0)]);
     assert!(
-        completed_data_usage_info(&[set], &expected_sources, &all_buckets, &["WARM".to_string()], true, false, false,).is_none()
+        completed_usage_for_scope(&[set], &expected_sources, &all_buckets, &["WARM".to_string()], true, false, false,).is_none()
     );
 }
 
@@ -619,6 +779,7 @@ fn current_cache_root_with_new_tier_generation_resets_old_cache() {
         DataUsageCacheReuseOptions {
             require_source: false,
             tier_registry_generation: Some(2),
+            checkpoint_identity: None,
         },
     );
 
@@ -698,6 +859,8 @@ fn completed_data_usage_info_publishes_confirmed_empty_namespace() {
             source: Some(DataUsageCacheSource::new(0, 0)),
             snapshot_complete: true,
             scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            scan_coverage_digest: Some(TEST_COVERAGE_DIGEST),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
             ..Default::default()
         },
         ..Default::default()
@@ -855,7 +1018,7 @@ fn completed_data_usage_info_requires_exact_topology_sources() {
     let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0), DataUsageCacheSource::new(1, 0)]);
 
     assert!(
-        completed_data_usage_info(&[first_set, unexpected_set], &expected_sources, &all_buckets, &[], true, false, false)
+        completed_usage_for_scope(&[first_set, unexpected_set], &expected_sources, &all_buckets, &[], true, false, false)
             .is_none()
     );
 }
@@ -866,7 +1029,7 @@ fn completed_data_usage_info_rejects_incomplete_bucket_plan() {
     let set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
     let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0)]);
 
-    assert!(completed_data_usage_info(&[set], &expected_sources, &all_buckets, &[], false, false, false).is_none());
+    assert!(completed_usage_for_scope(&[set], &expected_sources, &all_buckets, &[], false, false, false).is_none());
 }
 
 #[test]
@@ -1174,6 +1337,90 @@ fn dirty_bucket_cache_digest_changes_with_generation() {
     assert_eq!(scanner_bucket_cache_digest(plan, None), plan);
     assert!(cache_snapshot_is_current(&cache, "photos", source, 11, 0, first));
     assert!(!cache_snapshot_is_current(&cache, "photos", source, 11, 0, second));
+}
+
+#[test]
+fn scoped_scan_bucket_work_proof_fences_same_cycle_cache() {
+    let source = DataUsageCacheSource::new(0, 0);
+    let structural_plan = DataUsageScanPlanDigest([9; 32]);
+    let normal_plan = scanner_bucket_work_digest(structural_plan, HealScanMode::Normal, false);
+    assert_eq!(normal_plan, structural_plan, "ordinary work keeps the existing digest contract");
+    for (scan_mode, full) in [(HealScanMode::Deep, false), (HealScanMode::Normal, true)] {
+        let requested_plan = scanner_bucket_work_digest(structural_plan, scan_mode, full);
+        assert_ne!(requested_plan, normal_plan);
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "cold".to_string(),
+                next_cycle: 7,
+                leader_epoch: 11,
+                last_update: Some(SystemTime::UNIX_EPOCH),
+                source: Some(source),
+                snapshot_complete: true,
+                scan_plan_digest: Some(normal_plan),
+                cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace("cold", "", DataUsageEntry::default());
+        assert!(cache_snapshot_is_current(&cache, "cold", source, 7, 11, normal_plan));
+        assert!(matches!(
+            current_cache_root_or_prepare(&mut cache, "cold", source, 7, 11, requested_plan, true),
+            DataUsageCacheScanState::Prepared {
+                outcome: DataUsageCachePrepareOutcome::Reset,
+                ..
+            }
+        ));
+        assert!(cache.cache.is_empty(), "different work requirements must enter a fresh walk");
+        cache.replace("cold", "", DataUsageEntry::default());
+        cache.info.snapshot_complete = true;
+        cache.info.last_update = Some(SystemTime::UNIX_EPOCH);
+        assert!(
+            matches!(
+                current_cache_root_or_prepare(&mut cache, "cold", source, 7, 11, requested_plan, true),
+                DataUsageCacheScanState::Current(_)
+            ),
+            "completed matching work may satisfy the same intent retry"
+        );
+    }
+    assert_eq!(
+        scanner_bucket_work_digest(structural_plan, HealScanMode::Deep, false),
+        scanner_bucket_work_digest(structural_plan, HealScanMode::Deep, true)
+    );
+}
+
+#[test]
+fn scoped_scan_complete_root_requires_current_coverage_from_every_set() {
+    let sources = HashSet::from([DataUsageCacheSource::new(0, 0), DataUsageCacheSource::new(1, 0)]);
+    let buckets = vec!["bucket".to_string()];
+    let coverage = DataUsageScanPlanDigest([4; 32]);
+    let scope = ScannerSnapshotScope {
+        sources: &sources,
+        buckets: &buckets,
+        identity: ScannerSnapshotIdentity {
+            cycle: 0,
+            leader_epoch: 0,
+            plan_digest: TEST_PLAN_DIGEST,
+            coverage_digest: coverage,
+            tier_registry_generation: None,
+        },
+    };
+    for (first_coverage, second_coverage, valid) in [
+        (Some(coverage), Some(coverage), true),
+        (None, Some(coverage), false),
+        (Some(coverage), None, false),
+        (None, None, false),
+        (Some(coverage), Some(DataUsageScanPlanDigest([5; 32])), false),
+    ] {
+        let mut first = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
+        let mut second = completed_root_cache("bucket", 3, 10, DataUsageCacheSource::new(1, 0));
+        first.info.scan_coverage_digest = first_coverage;
+        second.info.scan_coverage_digest = second_coverage;
+        assert_eq!(
+            completed_data_usage_info(&[first, second], &scope, &[], true, false, false).is_some(),
+            valid
+        );
+    }
 }
 
 #[test]
