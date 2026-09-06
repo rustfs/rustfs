@@ -399,7 +399,7 @@ mod tests {
             }
             hash.update(&buf[..len]);
         }
-        Ok(format!("{:x}", hash.finalize()))
+        Ok(rustfs_utils::crypto::hex(hash.finalize()))
     }
 
     fn startup_cas_git(args: &[&str]) -> std::io::Result<String> {

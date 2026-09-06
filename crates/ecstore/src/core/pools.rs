@@ -5519,7 +5519,7 @@ where
     let observation = std::env::var_os("RUSTFS_E2E_STARTUP_CAS_NONCE").map(|_| {
         serde_json::json!({
             "kind": "cas", "object": object, "phase": phase,
-            "payload_sha256": format!("{:x}", Sha256::digest(&data)),
+            "payload_sha256": rustfs_utils::crypto::hex(Sha256::digest(&data)),
             "if_match": opts.http_preconditions.as_ref().and_then(|p| p.if_match.as_deref()),
             "if_none_match": opts.http_preconditions.as_ref().and_then(|p| p.if_none_match.as_deref()),
             "tail_drained": opts.write_completion == crate::object_api::WriteCompletion::TailDrained,
@@ -6843,7 +6843,7 @@ impl PoolMeta {
             #[cfg(feature = "e2e-test-hooks")]
             startup_cas_test_observe(serde_json::json!({
                 "kind": "confirmed", "object": POOL_META_NAME,
-                "payload_sha256": format!("{:x}", Sha256::digest(&durable)),
+                "payload_sha256": rustfs_utils::crypto::hex(Sha256::digest(&durable)),
                 "generation": confirmed.revision.generation,
                 "transaction_id": confirmed.revision.transaction_id,
             }));
