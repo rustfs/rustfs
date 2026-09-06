@@ -53,18 +53,12 @@ const SOURCE_STORAGE_CLASS: &str = "STANDARD";
 /// Enable only after every node serving continuation requests can read v2.
 const ENV_LIST_PROGRESS_TOKENS: &str = "RUSTFS_ON_DEMAND_MIGRATION_LIST_V2_TOKENS";
 
+/// Independent of the budget version: bare-v2 readers cannot read framing.
+const ENV_LIST_FRAMED_TOKENS: &str = "RUSTFS_ON_DEMAND_MIGRATION_LIST_FRAMED_TOKENS";
+
 /// Concurrent local metadata probes when a versioned bucket has to check
 /// source-only keys for a shadowing delete marker.
 const DELETE_MARKER_PROBE_CONCURRENCY: usize = 32;
-
-/// Where the local side of a listing resumes.
-pub(crate) enum LocalListCursor {
-    /// Continuation token for the local store, `None` for the first page.
-    Token(Option<String>),
-    /// The local side of a merged listing was already exhausted, so a listing
-    /// that no longer merges has nothing left to return.
-    Exhausted,
-}
 
 /// Reads the (already base64-decoded) continuation token.
 ///
@@ -76,16 +70,6 @@ pub(crate) fn decode_list_cursor(decoded: Option<&str>) -> S3Result<Option<ListT
         Ok(Some(ListThroughCursor::Merged(token))) => Ok(Some(*token)),
         Ok(_) => Ok(None),
         Err(err) => Err(invalid_continuation_token(&err)),
-    }
-}
-
-/// The local cursor to use when the request is answered locally, given the
-/// decoded token.
-pub(crate) fn local_cursor(decoded: Option<&str>, merged: Option<&ListThroughToken>) -> LocalListCursor {
-    match merged {
-        Some(token) if token.local_done => LocalListCursor::Exhausted,
-        Some(token) => LocalListCursor::Token(token.local.clone()),
-        None => LocalListCursor::Token(decoded.map(str::to_string)),
     }
 }
 
@@ -205,7 +189,10 @@ fn source_page_entries(bucket: &str, page: SourcePage) -> Vec<SideEntry> {
     interleave(objects, page.common_prefixes)
 }
 
-/// Runs one merged `ListObjectsV2` page.
+/// Runs one merged `ListObjectsV2` page. With no source state, continues only
+/// the local side of an existing merged chain. The original local page cursor
+/// is reread and raw names are filtered against the last emitted key here;
+/// sending that key to storage as a marker could interpret literal cache tags.
 ///
 /// Cost: at most two listings per side per request — the first page of each
 /// side, plus one refill when the previous page had already consumed most of
@@ -214,30 +201,34 @@ fn source_page_entries(bucket: &str, page: SourcePage) -> Vec<SideEntry> {
 /// source listings.
 pub(crate) async fn merged_list_objects_v2(
     store: &Arc<ECStore>,
-    state: &Arc<BucketOdmState>,
+    state: Option<&Arc<BucketOdmState>>,
     bucket: &str,
     params: &ListObjectsV2Params,
     fetch_owner: bool,
     incl_deleted: bool,
     token: Option<&ListThroughToken>,
 ) -> S3Result<ListThroughOutcome> {
-    let policy = &state.config().policy;
     let max_keys = usize::try_from(params.max_keys).unwrap_or(0);
     let mut merger = ListThroughMerger::new(max_keys, token);
     let mut buffers: [Vec<Option<SideEntry>>; 2] = [Vec::new(), Vec::new()];
     let mut degraded = false;
 
-    let plan = source_list_plan(&params.prefix, state.config().filter.prefix.as_deref(), params.delimiter.as_deref());
+    let plan = state.map_or(SourceListPlan::Skip, |state| {
+        source_list_plan(&params.prefix, state.config().filter.prefix.as_deref(), params.delimiter.as_deref())
+    });
     let mut client: Option<Arc<SourceClient>> = None;
-    match &plan {
-        // Nothing the source holds can appear under this prefix; that is a
-        // filter decision, not a degradation.
-        SourceListPlan::Skip => merger.disable_source(),
-        _ => match state.client() {
-            Ok(ready) if state.breaker().allow_request() => client = Some(Arc::clone(ready)),
-            Ok(_) => degrade_or_fail(&mut merger, &mut degraded, policy.source_error, "breaker_open")?,
-            Err(error) => degrade_or_fail(&mut merger, &mut degraded, policy.source_error, odm_state_error_class(error))?,
-        },
+    match (state, &plan) {
+        // A disabled or excluded source is not a degradation. The merger
+        // retains its unconsumed source cursor for a later enabled request.
+        (None, _) | (_, SourceListPlan::Skip) => merger.disable_source(),
+        (Some(state), _) => {
+            let policy = &state.config().policy;
+            match state.client() {
+                Ok(ready) if state.breaker().allow_request() => client = Some(Arc::clone(ready)),
+                Ok(_) => degrade_or_fail(&mut merger, &mut degraded, policy.source_error, "breaker_open")?,
+                Err(error) => degrade_or_fail(&mut merger, &mut degraded, policy.source_error, odm_state_error_class(error))?,
+            }
+        }
     }
 
     while let Some(fetch) = merger.next_fetch() {
@@ -260,6 +251,8 @@ pub(crate) async fn merged_list_objects_v2(
                 (interleave(objects, info.prefixes), info.is_truncated, info.next_continuation_token)
             }
             MergeSide::Source => {
+                let state = state.expect("the source side is disabled without bucket state");
+                let policy = &state.config().policy;
                 let client = client.as_ref().expect("the source side is disabled without a client");
                 match fetch_source_page(state, client, bucket, params, &plan, fetch.token.as_deref()).await {
                     Ok(page) => page,
@@ -279,6 +272,7 @@ pub(crate) async fn merged_list_objects_v2(
         if let Err(error) = merger.push_page(fetch.side, keys, is_truncated, next_token) {
             match fetch.side {
                 MergeSide::Source => {
+                    let policy = &state.expect("only an enabled source can return a page").config().policy;
                     degrade_or_fail(&mut merger, &mut degraded, policy.source_error, "invalid_pagination")?;
                     continue;
                 }
@@ -289,9 +283,15 @@ pub(crate) async fn merged_list_objects_v2(
     }
 
     let issue_progress_tokens = rustfs_utils::get_env_bool(ENV_LIST_PROGRESS_TOKENS, false);
+    let framed =
+        token.is_some_and(|token| token.framed) || (state.is_some() && rustfs_utils::get_env_bool(ENV_LIST_FRAMED_TOKENS, true));
     let outcome = match merger.finish(issue_progress_tokens) {
         Ok(outcome) => outcome,
         Err(ListPageError::NoProgress(MergeSide::Source)) => {
+            let policy = &state
+                .expect("a disabled source cannot exhaust the progress budget")
+                .config()
+                .policy;
             degrade_or_fail(&mut merger, &mut degraded, policy.source_error, "invalid_pagination")?;
             merger
                 .finish(issue_progress_tokens)
@@ -317,7 +317,10 @@ pub(crate) async fn merged_list_objects_v2(
         }
     }
 
-    if !source_only_keys.is_empty() && policy.respect_local_delete_marker && bucket_keeps_delete_markers(bucket).await {
+    if !source_only_keys.is_empty()
+        && state.is_some_and(|state| state.config().policy.respect_local_delete_marker)
+        && bucket_keeps_delete_markers(bucket).await
+    {
         let shadowed = local_delete_markers(store, bucket, &source_only_keys).await;
         objects.retain(|object| !shadowed.contains(&object.name));
     }
@@ -326,7 +329,10 @@ pub(crate) async fn merged_list_objects_v2(
         info: ListObjectsV2Info {
             is_truncated: outcome.is_truncated,
             continuation_token: None,
-            next_continuation_token: outcome.next_token.map(|token| token.encode()),
+            next_continuation_token: outcome.next_token.map(|mut token| {
+                token.framed = framed;
+                token.encode()
+            }),
             objects,
             prefixes,
         },
@@ -481,6 +487,7 @@ mod tests {
 
     fn token(local: Option<&str>, local_done: bool) -> ListThroughToken {
         ListThroughToken {
+            framed: false,
             t: "odm-list".to_string(),
             v: 1,
             local: local.map(str::to_string),
@@ -546,48 +553,68 @@ mod tests {
         let encoded = resume.encode();
         let decoded = decode_list_cursor(Some(&encoded)).expect("a valid envelope decodes");
         assert_eq!(decoded.as_ref(), Some(&resume));
-        assert!(matches!(
-            local_cursor(Some(&encoded), decoded.as_ref()),
-            LocalListCursor::Token(Some(local)) if local == "local-2"
-        ));
+        let mut merger = ListThroughMerger::new(2, decoded.as_ref());
+        merger.disable_source();
+        let fetch = merger.next_fetch().expect("unconsumed local page");
+        assert_eq!(fetch.side, MergeSide::Local);
+        assert_eq!(fetch.token.as_deref(), Some("local-2"));
 
         let encoded = token(None, true).encode();
         let decoded = decode_list_cursor(Some(&encoded)).expect("a valid envelope decodes");
-        assert!(matches!(local_cursor(Some(&encoded), decoded.as_ref()), LocalListCursor::Exhausted));
+        let mut merger = ListThroughMerger::new(2, decoded.as_ref());
+        merger.disable_source();
+        assert!(merger.next_fetch().is_none());
+        assert!(!merger.finish(false).expect("local EOF").is_truncated);
     }
 
     #[test]
     fn a_v2_token_keeps_the_local_cursor_when_list_through_is_turned_off() {
-        let mut resume = token(Some("local-2"), false);
-        resume.v = 2;
-        resume.no_progress = Some(MAX_LIST_NO_PROGRESS_PAGES - 1);
-        let encoded = resume.encode();
-        let decoded = decode_list_cursor(Some(&encoded)).expect("a v2 envelope decodes");
-        assert_eq!(decoded.as_ref(), Some(&resume));
-        assert!(matches!(
-            local_cursor(Some(&encoded), decoded.as_ref()),
-            LocalListCursor::Token(Some(local)) if local == "local-2"
-        ));
-        resume.local_done = true;
-        let encoded = resume.encode();
-        let decoded = decode_list_cursor(Some(&encoded)).expect("v2 with local EOF decodes");
-        assert!(matches!(local_cursor(Some(&encoded), decoded.as_ref()), LocalListCursor::Exhausted));
+        for framed in [false, true] {
+            let mut resume = token(Some("local-2"), false);
+            resume.framed = framed;
+            resume.v = 2;
+            resume.no_progress = Some(MAX_LIST_NO_PROGRESS_PAGES - 1);
+            let encoded = resume.encode();
+            let decoded = decode_list_cursor(Some(&encoded)).expect("a v2 envelope decodes");
+            assert_eq!(decoded.as_ref(), Some(&resume));
+            let mut merger = ListThroughMerger::new(2, decoded.as_ref());
+            merger.disable_source();
+            let fetch = merger.next_fetch().expect("unconsumed local page");
+            assert_eq!(fetch.side, MergeSide::Local);
+            assert_eq!(fetch.token.as_deref(), Some("local-2"));
+            resume.local_done = true;
+            let encoded = resume.encode();
+            let decoded = decode_list_cursor(Some(&encoded)).expect("v2 with local EOF decodes");
+            let mut merger = ListThroughMerger::new(2, decoded.as_ref());
+            merger.disable_source();
+            assert!(merger.next_fetch().is_none());
+            assert!(!merger.finish(false).expect("local EOF").is_truncated);
+        }
     }
 
     #[test]
     fn a_plain_local_token_is_passed_through_and_a_tampered_one_is_rejected() {
+        use crate::app::storage_api::bucket_usecase::s3_api::bucket::parse_list_objects_v2_params;
+
         let json_key = r#"{"t":"odm-list","v":1,"local_done":true}"#;
         assert!(decode_list_cursor(Some(json_key)).expect("valid local key").is_none());
-        assert!(matches!(local_cursor(Some(json_key), None), LocalListCursor::Token(Some(local)) if local == json_key));
         assert!(
             decode_list_cursor(Some("photos/a.jpg"))
                 .expect("plain markers decode")
                 .is_none()
         );
-        assert!(matches!(
-            local_cursor(Some("photos/a.jpg"), None),
-            LocalListCursor::Token(Some(local)) if local == "photos/a.jpg"
-        ));
+
+        for marker in [json_key, "photos/a.jpg"] {
+            let params = parse_list_objects_v2_params(
+                None,
+                None,
+                Some(2),
+                Some(base64_simd::STANDARD.encode_to_string(marker.as_bytes())),
+                None,
+            )
+            .expect("plain local listing parameters");
+            assert_eq!(params.decoded_continuation_token.as_deref(), Some(marker));
+        }
 
         let tampered = token(Some("local-2"), false).encode().replace("\"v\":1", "\"v\":9");
         let err = decode_list_cursor(Some(&tampered)).expect_err("a bumped version is rejected");
@@ -619,6 +646,17 @@ mod tests {
 
     async fn list_source(
         pages: impl Iterator<Item = String> + Send + 'static,
+    ) -> (
+        String,
+        tokio_util::task::AbortOnDropHandle<Vec<String>>,
+        tokio_util::sync::CancellationToken,
+    ) {
+        list_source_with_response(pages, |_, body| body).await
+    }
+
+    async fn list_source_with_response(
+        pages: impl Iterator<Item = String> + Send + 'static,
+        mut response_body: impl FnMut(&str, String) -> String + Send + 'static,
     ) -> (
         String,
         tokio_util::task::AbortOnDropHandle<Vec<String>>,
@@ -656,6 +694,7 @@ mod tests {
                     "expected a path-style bucket-root LIST request, got {first_line:?}"
                 );
                 assert!(first_line.contains("list-type=2"), "expected a ListObjectsV2 query, got {first_line:?}");
+                let body = response_body(&first_line, body);
                 requests.push(first_line);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -762,6 +801,7 @@ mod tests {
         );
         let continuation_token = resume_source.map(|source| {
             let token = ListThroughToken {
+                framed: false,
                 t: "odm-list".into(),
                 v: 1,
                 local: None,
@@ -807,6 +847,288 @@ mod tests {
         )
         .await
         .expect("listing must complete within its bounded source budget")
+    }
+
+    async fn native_list_source(
+        provider: Provider,
+        pages: Vec<(String, String)>,
+    ) -> (
+        String,
+        tokio_util::task::AbortOnDropHandle<Vec<String>>,
+        tokio_util::sync::CancellationToken,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind native listing source");
+        let address = listener.local_addr().expect("native source address");
+        let stop = tokio_util::sync::CancellationToken::new();
+        let server_stop = stop.clone();
+        let server = tokio::spawn(async move {
+            let mut pages = pages.into_iter();
+            let mut requests = Vec::new();
+            loop {
+                let (mut stream, _) = tokio::select! {
+                    _ = server_stop.cancelled() => break,
+                    accepted = listener.accept() => accepted.expect("accept native source request"),
+                };
+                let (target, body) = pages.next().expect("native source must not receive an extra request");
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut chunk).await.expect("read native source request");
+                    assert!(count > 0, "native request needs complete headers");
+                    request.extend_from_slice(&chunk[..count]);
+                    assert!(request.len() <= 32 * 1024, "native request headers must be bounded");
+                }
+                let text = String::from_utf8(request).expect("native HTTP request text");
+                let first_line = text.lines().next().expect("native request line");
+                assert_eq!(first_line, format!("GET {target} HTTP/1.1"));
+                let authorization = text
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, value)| value.trim())
+                    .expect("native credential must be used");
+                assert!(authorization.starts_with(if provider == Provider::Azure {
+                    "SharedKey acct:"
+                } else {
+                    "Bearer "
+                }));
+                requests.push(first_line.to_string());
+                let response = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).await.expect("write native source page");
+                stream.shutdown().await.expect("finish native source response");
+            }
+            assert!(pages.next().is_none(), "every scripted native page must have been requested");
+            requests
+        });
+        (format!("http://{address}"), tokio_util::task::AbortOnDropHandle::new(server), stop)
+    }
+
+    fn native_list_target(provider: Provider, cursor: bool, max_keys: i32) -> String {
+        if provider == Provider::Azure {
+            format!(
+                "/source-bucket?restype=container&comp=list{}&maxresults={max_keys}",
+                if cursor { "&marker=opaque%2B%2F%3D" } else { "" }
+            )
+        } else {
+            format!(
+                "/storage/v1/b/source-bucket/o?{}maxResults={max_keys}",
+                if cursor { "pageToken=opaque%2B%2F%3D&" } else { "" }
+            )
+        }
+    }
+
+    fn native_list_body(provider: Provider, entries: &str, prefixes: bool, next: bool) -> String {
+        if provider == Provider::Azure {
+            format!(
+                "<EnumerationResults><Blobs>{entries}{}</Blobs><NextMarker>{}</NextMarker></EnumerationResults>",
+                if prefixes {
+                    "<BlobPrefix><Name>目录/子/</Name></BlobPrefix>"
+                } else {
+                    ""
+                },
+                if next { "opaque+/=" } else { "" }
+            )
+        } else {
+            format!(
+                r#"{{"items":[{entries}],"prefixes":{},"nextPageToken":{}}}"#,
+                if prefixes { r#"["目录/子/"]"# } else { "[]" },
+                if next { r#""opaque+/=""# } else { "null" }
+            )
+        }
+    }
+
+    #[cfg(feature = "gcs")]
+    fn native_test_service_account() -> String {
+        // The real Google credentials implementation signs locally. Generate a
+        // disposable key instead of storing private key material in the fixture.
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).expect("generate fixture service-account key");
+        serde_json::json!({
+            "type": "service_account",
+            "client_email": "fixture@example.invalid",
+            "private_key_id": "fixture-key",
+            "private_key": key.serialize_pem(),
+            "project_id": "fixture-project"
+        })
+        .to_string()
+    }
+
+    async fn native_source_policy_request(
+        provider: Provider,
+        policy: SourceErrorPolicy,
+        pages: Vec<(String, String)>,
+        service_account: &str,
+        max_keys: i32,
+    ) -> (S3Result<S3Response<ListObjectsV2Output>>, Vec<String>) {
+        let (endpoint, server, stop) = native_list_source(provider, pages).await;
+        let (_state_guard, mut input) = source_policy_input(endpoint.clone(), policy, None, None).await;
+        input.max_keys = Some(max_keys);
+        let sys = OnDemandMigrationSys::get();
+        let installed = sys.state(&input.bucket).expect("installed source state");
+        let mut config = installed.config().clone();
+        config.source = serde_json::from_value(serde_json::json!({
+            "provider": provider,
+            "endpoint": endpoint,
+            "region": "us-east-1",
+            "bucket": "source-bucket",
+            "azure": if provider == Provider::Azure { serde_json::json!({ "account": "acct", "account_key": "c2VjcmV0LWtleQ==" }) } else { serde_json::Value::Null },
+            "gcs": if provider == Provider::GcsNative { serde_json::json!({ "service_account_json": service_account }) } else { serde_json::Value::Null }
+        })).expect("native source configuration");
+        sys.apply_for_incarnation(&input.bucket, installed.incarnation_id(), Some(&config))
+            .await;
+        let state = sys.state(&input.bucket).expect("native source state");
+        state
+            .client()
+            .unwrap_or_else(|error| panic!("{provider:?} native client must build: {error:?}"));
+        let result = execute_source_list(input).await;
+        stop.cancel();
+        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("native source server must finish")
+            .expect("native source requests must match the script");
+        (result, requests)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_list_through_malformed_fields_follow_both_source_policies() {
+        run_large_stack_test("native-list-through-fields", || async {
+            // The proxy matcher treats IP literals separately from the `*` domain wildcard.
+            temp_env::async_with_vars(
+                [("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")), ("HTTP_PROXY", None), ("HTTPS_PROXY", None),
+                 ("ALL_PROXY", None), ("http_proxy", None), ("https_proxy", None), ("all_proxy", None),
+                 ("NO_PROXY", Some("127.0.0.1,localhost,::1")), ("no_proxy", Some("127.0.0.1,localhost,::1"))],
+                async {
+                    #[cfg(feature = "gcs")]
+                    let service_account = native_test_service_account();
+                    #[cfg(not(feature = "gcs"))]
+                    let service_account = String::new();
+                    for provider in [Provider::Azure, #[cfg(feature = "gcs")] Provider::GcsNative] {
+                        let invalid = if provider == Provider::Azure {
+                            ["<Blob><Name>bad</Name></Blob>",
+                             "<Blob><Name>bad</Name><Properties><Content-Length>-1</Content-Length></Properties></Blob>",
+                             "<Blob><Name>bad</Name><Properties><Content-Length>18446744073709551616</Content-Length></Properties></Blob>",
+                             "<Blob><Properties><Content-Length>1</Content-Length></Properties></Blob>"]
+                        } else {
+                            [r#"{"name":"bad"}"#, r#"{"name":"bad","size":"-1"}"#,
+                             r#"{"name":"bad","size":"18446744073709551616"}"#, r#"{"size":"1"}"#]
+                        };
+                        let valid = if provider == Provider::Azure {
+                            "<Blob><Name>a-source</Name><Properties><Content-Length>1</Content-Length></Properties></Blob>"
+                        } else { r#"{"name":"a-source","size":"1"}"# };
+                        for policy in [SourceErrorPolicy::Propagate, SourceErrorPolicy::NotFound] {
+                            for entry in invalid {
+                                for refill in [false, true] {
+                                    let mut pages = Vec::new();
+                                    if refill {
+                                        pages.push((native_list_target(provider, false, 2), native_list_body(provider, valid, false, true)));
+                                    }
+                                    let entries = if refill { entry.to_string() } else if provider == Provider::Azure {
+                                        format!("{valid}{entry}")
+                                    } else { format!("{valid},{entry}") };
+                                    pages.push((native_list_target(provider, refill, 2), native_list_body(provider, &entries, false, false)));
+                                    let (result, requests) = native_source_policy_request(provider, policy, pages, &service_account, 2).await;
+                                    assert_eq!(requests.len(), if refill { 2 } else { 1 }, "{provider:?} {policy:?} {entry}");
+                                    if policy == SourceErrorPolicy::Propagate {
+                                        let err = result.expect_err("malformed native page must propagate");
+                                        assert_eq!(err.status_code(), Some(http::StatusCode::FAILED_DEPENDENCY));
+                                        assert_eq!(err.code(), &S3ErrorCode::Custom("SourceUnavailable".into()));
+                                        assert_eq!(err.message(), Some("other"));
+                                    } else {
+                                        // Reuse the complete local-only assertions, including no
+                                        // leaked source objects, no cursor and the degraded header.
+                                        assert_source_policy_result(result, policy);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            ).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_list_through_preserves_valid_empty_pages_and_zero_size_objects() {
+        run_large_stack_test("native-list-through-valid", || async {
+            // The proxy matcher treats IP literals separately from the `*` domain wildcard.
+            temp_env::async_with_vars(
+                [
+                    ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                    ("HTTP_PROXY", None),
+                    ("HTTPS_PROXY", None),
+                    ("ALL_PROXY", None),
+                    ("http_proxy", None),
+                    ("https_proxy", None),
+                    ("all_proxy", None),
+                    ("NO_PROXY", Some("127.0.0.1,localhost,::1")),
+                    ("no_proxy", Some("127.0.0.1,localhost,::1")),
+                ],
+                async {
+                    #[cfg(feature = "gcs")]
+                    let service_account = native_test_service_account();
+                    #[cfg(not(feature = "gcs"))]
+                    let service_account = String::new();
+                    for provider in [
+                        Provider::Azure,
+                        #[cfg(feature = "gcs")]
+                        Provider::GcsNative,
+                    ] {
+                        let valid = if provider == Provider::Azure {
+                            "<Blob><Name>目录/空</Name><Properties><Content-Length>0</Content-Length></Properties></Blob>"
+                        } else {
+                            r#"{"name":"目录/空","size":"0"}"#
+                        };
+                        for policy in [SourceErrorPolicy::Propagate, SourceErrorPolicy::NotFound] {
+                            let (result, requests) = native_source_policy_request(
+                                provider,
+                                policy,
+                                vec![
+                                    (native_list_target(provider, false, 3), native_list_body(provider, "", false, true)),
+                                    (native_list_target(provider, true, 3), native_list_body(provider, valid, true, false)),
+                                ],
+                                &service_account,
+                                3,
+                            )
+                            .await;
+                            assert_eq!(requests.len(), 2);
+                            let response = result.expect("valid native listing must succeed under either policy");
+                            assert_ne!(
+                                response
+                                    .headers
+                                    .get("x-rustfs-on-demand-migration-list")
+                                    .and_then(|value| value.to_str().ok()),
+                                Some("local_only")
+                            );
+                            let output = response.output;
+                            let objects = output.contents.expect("local and source objects");
+                            assert_eq!(
+                                objects
+                                    .iter()
+                                    .map(|object| (object.key.as_deref(), object.size))
+                                    .collect::<Vec<_>>(),
+                                vec![(Some("z-local"), Some(1)), (Some("目录/空"), Some(0))]
+                            );
+                            assert_eq!(
+                                output
+                                    .common_prefixes
+                                    .expect("native prefix")
+                                    .into_iter()
+                                    .map(|prefix| prefix.prefix)
+                                    .collect::<Vec<_>>(),
+                                vec![Some("目录/子/".to_string())]
+                            );
+                            assert_eq!(output.key_count, Some(3));
+                            assert_eq!(output.is_truncated, Some(false));
+                            assert!(output.next_continuation_token.is_none());
+                        }
+                    }
+                },
+            )
+            .await;
+        });
     }
 
     async fn source_policy_request(
@@ -1162,6 +1484,7 @@ mod tests {
             temp_env::async_with_vars(
                 [
                     (ENV_LIST_PROGRESS_TOKENS, Some("true")),
+                    (ENV_LIST_FRAMED_TOKENS, Some("false")),
                     ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
                     ("HTTP_PROXY", None),
                     ("HTTPS_PROXY", None),
@@ -1205,6 +1528,7 @@ mod tests {
                                     seen.insert(next.clone()),
                                     "a cross-request source cursor cycle must not return an identical empty merged token"
                                 );
+                                assert!(!decode_wire_token(&next).framed, "the budget switch cannot enable framing");
                                 empty_pages += 1;
                                 input.continuation_token = Some(next);
                             }
@@ -1241,6 +1565,7 @@ mod tests {
             temp_env::async_with_vars(
                 [
                     (ENV_LIST_PROGRESS_TOKENS, None),
+                    (ENV_LIST_FRAMED_TOKENS, Some("false")),
                     ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
                     ("HTTP_PROXY", None),
                     ("HTTPS_PROXY", None),
@@ -1252,7 +1577,10 @@ mod tests {
                     ("no_proxy", Some("*")),
                 ],
                 async {
-                    for policy in [SourceErrorPolicy::Propagate, SourceErrorPolicy::NotFound] {
+                    for (policy, framed) in [SourceErrorPolicy::Propagate, SourceErrorPolicy::NotFound]
+                        .into_iter()
+                        .flat_map(|policy| [false, true].map(|framed| (policy, framed)))
+                    {
                         let pages = ["B", "C", "A"].map(|next| source_xml(Some(next), true, None));
                         let (endpoint, server, stop) = list_source(pages.into_iter().cycle()).await;
                         let (_state_guard, mut input) = source_policy_input(endpoint, policy, Some("A"), None).await;
@@ -1266,6 +1594,7 @@ mod tests {
                             let raw = base64_simd::STANDARD.decode_to_vec(&next).expect("base64 continuation token");
                             let decoded = std::str::from_utf8(&raw).expect("JSON token");
                             let token = decode_list_cursor(Some(decoded)).expect("v1 reader").expect("merged token");
+                            assert!(!token.framed, "explicit false must keep issuing bare tokens for older readers");
                             assert_eq!(token.v, 1, "the default rollout cannot begin issuing v2");
                             assert_eq!(token.no_progress, None);
                             assert!(!decoded.contains("no_progress"), "ordinary v1 wire shape stays unchanged");
@@ -1279,6 +1608,7 @@ mod tests {
                         let mut token = decode_list_cursor(Some(std::str::from_utf8(&raw).expect("JSON token")))
                             .expect("v1 reader")
                             .expect("merged token");
+                        token.framed = framed;
                         token.v = 2;
                         token.no_progress = Some(MAX_LIST_NO_PROGRESS_PAGES - 2);
                         input.continuation_token = Some(base64_simd::STANDARD.encode_to_string(token.encode().as_bytes()));
@@ -1290,6 +1620,7 @@ mod tests {
                         let token = decode_list_cursor(Some(std::str::from_utf8(&raw).expect("JSON token")))
                             .expect("v2 reader")
                             .expect("merged token");
+                        assert_eq!(token.framed, framed, "reader-only nodes retain the incoming framing");
                         assert_eq!(token.v, 2);
                         assert_eq!(token.no_progress, Some(MAX_LIST_NO_PROGRESS_PAGES - 1));
                         input.continuation_token = Some(next);
@@ -1318,6 +1649,7 @@ mod tests {
             temp_env::async_with_vars(
                 [
                     (ENV_LIST_PROGRESS_TOKENS, Some("true")),
+                    (ENV_LIST_FRAMED_TOKENS, None),
                     ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
                     ("HTTP_PROXY", None),
                     ("HTTPS_PROXY", None),
@@ -1390,6 +1722,949 @@ mod tests {
                 },
             )
             .await;
+        });
+    }
+
+    // The e160 active-ODM route decoded before entering this same merge core.
+    // Freeze both its reader and writer; use real local storage and HTTP source
+    // calls here, without claiming that this harness executes an old binary.
+    async fn execute_e160_source_list(input: ListObjectsV2Input) -> S3Result<S3Response<ListObjectsV2Output>> {
+        use crate::app::storage_api::bucket_usecase::s3_api::bucket::{
+            build_list_objects_v2_output, parse_list_objects_v2_params,
+        };
+        use crate::on_demand_migration::list_through::e160_framed_reader as old;
+
+        let params = parse_list_objects_v2_params(
+            input.prefix.clone(),
+            input.delimiter.clone(),
+            input.max_keys,
+            input.continuation_token.clone(),
+            input.start_after.clone(),
+        )?;
+        assert!(params.max_keys > 0, "the frozen route models active, nonzero merged requests");
+        let token = params.decoded_continuation_token.as_deref().and_then(|raw| {
+            match old::decode_continuation_token(raw).expect("valid frozen-reader input") {
+                old::ListThroughCursor::Local(_) => None,
+                old::ListThroughCursor::Merged(token) => Some(ListThroughToken {
+                    framed: true,
+                    t: token.t,
+                    v: token.v,
+                    local: token.local,
+                    local_done: token.local_done,
+                    source: token.source,
+                    source_done: token.source_done,
+                    last_key: token.last_key,
+                    no_progress: token.no_progress,
+                }),
+            }
+        });
+        let store = shared_gating_ecstore().await;
+        let state = OnDemandMigrationSys::get()
+            .state(&input.bucket)
+            .expect("installed real source state");
+        assert!(state.config().policy.list_through);
+        let mut outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            merged_list_objects_v2(
+                &store,
+                Some(&state),
+                &input.bucket,
+                &params,
+                input.fetch_owner.unwrap_or_default(),
+                false,
+                token.as_ref(),
+            ),
+        )
+        .await
+        .expect("frozen-reader listing must remain bounded")?;
+        assert!(!outcome.degraded, "the compatibility matrix exercises successful source pages");
+        if let Some(raw) = outcome.info.next_continuation_token.as_mut() {
+            // The shared core supplies semantic fields. Only the frozen e160
+            // writer decides the old node's outgoing framing and JSON bytes.
+            let old_token: old::ListThroughToken =
+                serde_json::from_str(raw.strip_prefix("\0odm-list:").unwrap_or(raw)).expect("merge output fields");
+            *raw = old_token.encode();
+        }
+        Ok(S3Response::new(build_list_objects_v2_output(
+            outcome.info,
+            input.fetch_owner.unwrap_or_default(),
+            params.max_keys,
+            input.bucket,
+            params.prefix,
+            params.delimiter,
+            input.encoding_type,
+            params.response_continuation_token,
+            params.response_start_after,
+        )))
+    }
+
+    fn e160_wire_cursor(wire: &str) -> crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor {
+        let raw = base64_simd::STANDARD.decode_to_vec(wire).expect("wire base64");
+        crate::on_demand_migration::list_through::e160_framed_reader::decode_continuation_token(
+            std::str::from_utf8(&raw).expect("wire UTF-8"),
+        )
+        .expect("frozen e160 decoder")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_e160_framed_rollout_and_reader_convergence_preserve_sequence() {
+        run_large_stack_test("list-through-e160-framed-rollout", || async {
+            for initial_framing in [None, Some("true")] {
+                temp_env::async_with_vars(
+                    [
+                        (ENV_LIST_PROGRESS_TOKENS, None),
+                        (ENV_LIST_FRAMED_TOKENS, initial_framing),
+                        ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                        ("HTTP_PROXY", None),
+                        ("HTTPS_PROXY", None),
+                        ("ALL_PROXY", None),
+                        ("http_proxy", None),
+                        ("https_proxy", None),
+                        ("all_proxy", None),
+                        ("NO_PROXY", Some("*")),
+                        ("no_proxy", Some("*")),
+                    ],
+                    async {
+                        // Respond to the actual cursor, including a repeated start
+                        // from an incompatible reader, rather than to request order.
+                        let (endpoint, server, _) =
+                            list_source_with_response(std::iter::repeat_n(String::new(), 6), |request, _| {
+                                let uri: http::Uri = request
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .expect("request target")
+                                    .parse()
+                                    .expect("source LIST URI");
+                                let cursors: Vec<_> = url::form_urlencoded::parse(uri.query().expect("LIST query").as_bytes())
+                                    .filter_map(|(key, cursor)| (key == "continuation-token").then_some(cursor))
+                                    .collect();
+                                match cursors.as_slice() {
+                                    [] => source_xml(Some("S"), true, Some("a")),
+                                    [cursor] if cursor == "S" => source_xml(None, false, Some("c")),
+                                    _ => panic!("unexpected source cursor in {request}"),
+                                }
+                            })
+                            .await;
+                        let (_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                        let store = shared_gating_ecstore().await;
+                        for key in ["b", "d"] {
+                            store
+                                .put_object(
+                                    &input.bucket,
+                                    key,
+                                    &mut StoragePutObjReader::from_vec(vec![1]),
+                                    &StorageObjectOptions::default(),
+                                )
+                                .await
+                                .expect("seed interleaved local keys");
+                        }
+                        input.max_keys = Some(1);
+                        // First new writer -> e160 reader -> new reader. After all old
+                        // readers leave, disabling issuance must retain this live frame.
+                        let mut framed_pages = Vec::new();
+                        for (page, key) in ["a", "b", "c", "d", "z-local"].into_iter().enumerate() {
+                            let response = if page == 1 {
+                                execute_e160_source_list(input.clone()).await
+                            } else if page >= 3 {
+                                temp_env::async_with_vars(
+                                    [(ENV_LIST_FRAMED_TOKENS, Some("false"))],
+                                    execute_source_list(input.clone()),
+                                )
+                                .await
+                            } else {
+                                execute_source_list(input.clone()).await
+                            }
+                            .expect("compatible framed reader must continue the same scan");
+                            assert_eq!(response.output.key_count, Some(1));
+                            assert_eq!(response.output.contents.as_ref().expect("one object")[0].key.as_deref(), Some(key));
+                            assert_eq!(response.output.is_truncated, Some(page != 4));
+                            input.continuation_token = response.output.next_continuation_token;
+                            if page != 4 {
+                                let wire = input.continuation_token.as_deref().expect("framed continuation");
+                                framed_pages.push((wire.to_string(), key));
+                            } else {
+                                assert!(input.continuation_token.is_none());
+                            }
+                        }
+                        for (wire, key) in &framed_pages {
+                            let wire = wire.as_str();
+                            let key = *key;
+                            let crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor::Merged(old) =
+                                e160_wire_cursor(wire)
+                            else {
+                                panic!("e160 must recognize every active framed v1 token")
+                            };
+                            assert_eq!(old.v, 1);
+                            assert_eq!(old.last_key.as_deref(), Some(key));
+                            assert_eq!(old.no_progress, None);
+                            assert!(decode_wire_token(wire).framed);
+                        }
+                        // A fresh bare chain is safe only after every reader is dual.
+                        temp_env::async_with_vars([(ENV_LIST_FRAMED_TOKENS, Some("false"))], async {
+                            for (page, key) in ["a", "b", "c", "d", "z-local"].into_iter().enumerate() {
+                                let response = execute_source_list(input.clone()).await.expect("converged dual readers");
+                                assert_eq!(response.output.key_count, Some(1));
+                                assert_eq!(response.output.contents.as_ref().expect("one object")[0].key.as_deref(), Some(key));
+                                assert_eq!(response.output.is_truncated, Some(page != 4));
+                                input.continuation_token = response.output.next_continuation_token;
+                                if page != 4 {
+                                    let wire = input.continuation_token.as_deref().expect("bare continuation");
+                                    assert!(!decode_wire_token(wire).framed);
+                                    assert!(
+                                        matches!(e160_wire_cursor(wire),
+                                crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor::Local(_)),
+                                        "a remaining e160 reader would make this switch unsafe"
+                                    );
+                                } else {
+                                    assert!(input.continuation_token.is_none());
+                                }
+                            }
+                        })
+                        .await;
+                        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+                            .await
+                            .expect("both finite source scans complete")
+                            .expect("source server");
+                        assert_eq!(requests.len(), 6, "framing changes add no source fetches");
+                        for scan in requests.as_chunks::<3>().0.iter() {
+                            assert!(!scan[0].contains("continuation-token="));
+                            for request in &scan[1..] {
+                                assert!(request.contains("continuation-token=S"), "{request}");
+                            }
+                        }
+                    },
+                )
+                .await;
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_e160_explicit_bare_negative_control_repeats_an_object() {
+        run_large_stack_test("list-through-e160-bare-negative-control", || async {
+            temp_env::async_with_vars(
+                [
+                    (ENV_LIST_PROGRESS_TOKENS, None),
+                    (ENV_LIST_FRAMED_TOKENS, Some("false")),
+                    ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                    ("HTTP_PROXY", None),
+                    ("HTTPS_PROXY", None),
+                    ("ALL_PROXY", None),
+                    ("http_proxy", None),
+                    ("https_proxy", None),
+                    ("all_proxy", None),
+                    ("NO_PROXY", Some("*")),
+                    ("no_proxy", Some("*")),
+                ],
+                async {
+                    let (endpoint, server) = scripted_list_source(vec![
+                        source_xml(Some("S"), true, Some("a")),
+                        source_xml(Some("S"), true, Some("a")),
+                        source_xml(None, false, Some("c")),
+                    ])
+                    .await;
+                    let (_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                    let store = shared_gating_ecstore().await;
+                    for key in ["b", "d"] {
+                        store
+                            .put_object(
+                                &input.bucket,
+                                key,
+                                &mut StoragePutObjReader::from_vec(vec![1]),
+                                &StorageObjectOptions::default(),
+                            )
+                            .await
+                            .expect("seed interleaved local keys");
+                    }
+                    input.max_keys = Some(1);
+                    let first = execute_source_list(input.clone()).await.expect("explicit bare first page");
+                    assert_eq!(first.output.contents.as_ref().expect("first object")[0].key.as_deref(), Some("a"));
+                    input.continuation_token = first.output.next_continuation_token;
+                    let bare = input.continuation_token.as_deref().expect("new bare cursor");
+                    assert!(!decode_wire_token(bare).framed);
+                    assert!(matches!(
+                        e160_wire_cursor(bare),
+                        crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor::Local(_)
+                    ));
+                    let repeated = execute_e160_source_list(input.clone())
+                        .await
+                        .expect("old reader silently restarts");
+                    assert_eq!(repeated.output.key_count, Some(1));
+                    assert_eq!(
+                        repeated.output.contents.as_ref().expect("repeated object")[0].key.as_deref(),
+                        Some("a"),
+                        "negative control: the incompatible bare setting loses last_key and repeats a"
+                    );
+                    input.continuation_token = repeated.output.next_continuation_token;
+                    assert!(decode_wire_token(input.continuation_token.as_deref().expect("old framed cursor")).framed);
+                    let resumed = execute_source_list(input).await.expect("old writer now supplies framing");
+                    assert_eq!(
+                        resumed.output.contents.as_ref().expect("next object")[0].key.as_deref(),
+                        Some("b"),
+                        "this mismatch need not loop forever: e160 subsequently emits a frame"
+                    );
+                    let requests = tokio::time::timeout(Duration::from_secs(5), server)
+                        .await
+                        .expect("finite negative-control source")
+                        .expect("source server");
+                    assert_eq!(requests.len(), 3);
+                    assert!(!requests[0].contains("continuation-token="));
+                    assert!(!requests[1].contains("continuation-token="), "the old reader restarted the source scan");
+                    assert!(requests[2].contains("continuation-token=S"));
+                },
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_e160_framed_budget_survives_readers_but_bare_budget_is_lost() {
+        run_large_stack_test("list-through-e160-budget", || async {
+            temp_env::async_with_vars([
+                (ENV_LIST_PROGRESS_TOKENS, None), (ENV_LIST_FRAMED_TOKENS, Some("false")),
+                ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                ("HTTP_PROXY", None), ("HTTPS_PROXY", None), ("ALL_PROXY", None),
+                ("http_proxy", None), ("https_proxy", None), ("all_proxy", None),
+                ("NO_PROXY", Some("*")), ("no_proxy", Some("*")),
+            ], async {
+                // Fixed writer bytes, independent of the current token encoder.
+                let framed13 = "\0odm-list:{\"t\":\"odm-list\",\"v\":2,\"local\":null,\"local_done\":true,\"source\":\"A\",\"source_done\":false,\"last_key\":null,\"no_progress\":13}";
+                let (endpoint, server) = scripted_list_source(["B", "C", "D", "E", "F", "G"].into_iter()
+                    .map(|cursor| source_xml(Some(cursor), true, None)).collect()).await;
+                let (_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                input.max_keys = Some(1);
+                input.continuation_token = Some(base64_simd::STANDARD.encode_to_string(framed13.as_bytes()));
+                let fourteen = execute_source_list(input.clone()).await.expect("new reader preserves the old framed budget");
+                assert_eq!(fourteen.output.key_count, Some(0));
+                assert_eq!(fourteen.output.is_truncated, Some(true));
+                input.continuation_token = fourteen.output.next_continuation_token;
+                let crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor::Merged(old) =
+                    e160_wire_cursor(input.continuation_token.as_deref().expect("fourteenth empty page")) else {
+                        panic!("the new writer must preserve a framed v2 token for e160");
+                    };
+                assert_eq!(old.v, 2);
+                assert_eq!(old.no_progress, Some(14));
+                assert_eq!(old.source.as_deref(), Some("C"));
+                assert!(old.local_done);
+                assert_eq!(old.last_key, None);
+                let fifteen = execute_e160_source_list(input.clone()).await.expect("e160 preserves an existing v2 budget");
+                assert_eq!(fifteen.output.key_count, Some(0));
+                assert_eq!(fifteen.output.is_truncated, Some(true));
+                input.continuation_token = fifteen.output.next_continuation_token;
+                let next = decode_wire_token(input.continuation_token.as_deref().expect("fifteenth empty page"));
+                assert!(next.framed);
+                assert_eq!(next.v, 2);
+                assert_eq!(next.no_progress, Some(15));
+                assert_eq!(next.source.as_deref(), Some("E"));
+                assert!(next.local_done);
+                assert_eq!(next.last_key, None);
+                assert_source_policy_result(execute_source_list(input).await, SourceErrorPolicy::Propagate);
+                let requests = tokio::time::timeout(Duration::from_secs(5), server).await
+                    .expect("bounded framed budget source").expect("source server");
+                assert_eq!(requests.len(), 6, "each of the three reader hops spends exactly two source fetches");
+                for (request, cursor) in requests.iter().zip(["A", "B", "C", "D", "E", "F"]) {
+                    assert!(request.contains(&format!("continuation-token={cursor}")), "{request}");
+                }
+
+                let (endpoint, server) = scripted_list_source(vec![
+                    source_xml(Some("B"), true, None), source_xml(Some("C"), true, None),
+                ]).await;
+                let (_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                let bare15 = r#"{"t":"odm-list","v":2,"local":null,"local_done":true,"source":"A","source_done":false,"last_key":null,"no_progress":15}"#;
+                input.continuation_token = Some(base64_simd::STANDARD.encode_to_string(bare15.as_bytes()));
+                assert!(matches!(e160_wire_cursor(input.continuation_token.as_deref().expect("bare v2")),
+                    crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor::Local(_)));
+                let restarted = execute_e160_source_list(input).await.expect("negative control: old reader loses the budget");
+                assert_eq!(restarted.output.key_count, Some(0));
+                assert_eq!(restarted.output.is_truncated, Some(true));
+                let reset = decode_wire_token(restarted.output.next_continuation_token.as_deref().expect("restarted cursor"));
+                assert!(reset.framed);
+                assert_eq!(reset.v, 1);
+                assert_eq!(reset.no_progress, None, "bare v2 was never recognized by the e160 reader");
+                let requests = tokio::time::timeout(Duration::from_secs(5), server).await
+                    .expect("bounded bare negative-control source").expect("source server");
+                assert_eq!(requests.len(), 2);
+                assert!(!requests[0].contains("continuation-token="));
+                assert!(requests[1].contains("continuation-token=B"));
+            }).await;
+        });
+    }
+
+    fn decode_wire_token(wire: &str) -> ListThroughToken {
+        let raw = base64_simd::STANDARD.decode_to_vec(wire).expect("base64 continuation token");
+        decode_list_cursor(Some(std::str::from_utf8(&raw).expect("UTF-8 cursor")))
+            .expect("valid continuation token")
+            .expect("merged continuation token")
+    }
+
+    #[derive(Clone, Copy)]
+    enum DisabledListScenario {
+        FirstLocalPage,
+        PartiallyConsumedLocalPage,
+        CacheTag(&'static str),
+        CommonPrefixes,
+        Reenable,
+    }
+
+    async fn assert_disabled_list_progress(scenario: DisabledListScenario, framed: bool, disable_module: bool) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (local_keys, source_names, expected_first, expected_disabled) = match scenario {
+            DisabledListScenario::FirstLocalPage => (vec!["a", "c"], ["b", "d"], ["a", "b"], vec!["c", "z-local"]),
+            DisabledListScenario::PartiallyConsumedLocalPage => {
+                (vec!["a", "b", "c", "e"], ["d", "f"], ["a", "b"], vec!["e", "z-local"])
+            }
+            DisabledListScenario::CacheTag(key) => (vec!["a", "b!", "b0", "c"], [key, "f"], ["a", "b!"], vec!["c", "z-local"]),
+            DisabledListScenario::CommonPrefixes => (vec!["p/a/1", "p/c/1"], ["p/b/", "p/d/"], ["p/a/", "p/b/"], vec!["p/c/"]),
+            DisabledListScenario::Reenable => (vec!["a", "c", "e"], ["b", "f"], ["a", "b"], vec!["c", "e"]),
+        };
+        let prefixes = matches!(scenario, DisabledListScenario::CommonPrefixes);
+        let entries = source_names
+            .iter()
+            .map(|name| {
+                if prefixes {
+                    format!("<CommonPrefixes><Prefix>{name}</Prefix></CommonPrefixes>")
+                } else {
+                    format!("<Contents><Key>{name}</Key><Size>1</Size></Contents>")
+                }
+            })
+            .collect::<String>();
+        let body = format!(
+            "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>false</IsTruncated>{entries}</ListBucketResult>"
+        );
+        let source_disabled = Arc::new(AtomicBool::new(false));
+        let source_requests = Arc::new(AtomicUsize::new(0));
+        let forbidden = Arc::clone(&source_disabled);
+        let count = Arc::clone(&source_requests);
+        let (endpoint, server, stop) = list_source_with_response(std::iter::repeat(body), move |_, body| {
+            assert!(!forbidden.load(Ordering::SeqCst), "disabled listing must not call the source");
+            count.fetch_add(1, Ordering::SeqCst);
+            body
+        })
+        .await;
+        let (_state_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+        let store = shared_gating_ecstore().await;
+        for key in local_keys {
+            store
+                .put_object(
+                    &input.bucket,
+                    key,
+                    &mut StoragePutObjReader::from_vec(vec![1]),
+                    &StorageObjectOptions::default(),
+                )
+                .await
+                .expect("seed disabled-list local keys");
+        }
+        if prefixes {
+            input.prefix = Some("p/".to_string());
+            input.delimiter = Some("/".to_string());
+        }
+        input.start_after = Some(if prefixes { "p/0" } else { "0" }.to_string());
+        let page_names = |page: &ListObjectsV2Output| {
+            let mut names = page
+                .contents
+                .iter()
+                .flatten()
+                .map(|object| object.key.clone().expect("listed object key"))
+                .chain(
+                    page.common_prefixes
+                        .iter()
+                        .flatten()
+                        .map(|prefix| prefix.prefix.clone().expect("listed common prefix")),
+                )
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let first = execute_source_list(input.clone()).await.expect("first merged page").output;
+        assert_eq!(page_names(&first), expected_first);
+        assert_eq!(first.key_count, Some(2));
+        assert_eq!(first.is_truncated, Some(true));
+        let mut cursor = first.next_continuation_token.expect("merged cursor");
+        let mut token = decode_wire_token(&cursor);
+        assert_eq!(token.framed, framed);
+        let second_page = match scenario {
+            DisabledListScenario::PartiallyConsumedLocalPage => Some((["c", "d"], ["c", "e"])),
+            DisabledListScenario::CacheTag(key) => Some((["b0", key], ["b0", "c"])),
+            _ => None,
+        };
+        if let Some((expected_second, expected_replay)) = second_page {
+            let first_local = token.local.clone().expect("first local page was fully consumed");
+            assert!(
+                first_local.starts_with(&format!("{}[rustfs_cache:", expected_first[1])),
+                "expected a real opaque cache cursor: {first_local}"
+            );
+            input.continuation_token = Some(cursor);
+            let second = execute_source_list(input.clone()).await.expect("second merged page").output;
+            assert_eq!(page_names(&second), expected_second);
+            cursor = second.next_continuation_token.expect("partially consumed local page");
+            token = decode_wire_token(&cursor);
+            assert_eq!(
+                token.local.as_deref(),
+                Some(first_local.as_str()),
+                "keep the partially consumed local page"
+            );
+            assert_eq!(token.last_key.as_deref(), Some(expected_second[1]));
+            // ECStore prioritizes its opaque continuation over StartAfter. A
+            // fix that merely passes both would still replay c from this page.
+            let token_wins = Arc::clone(&store)
+                .list_objects_v2(
+                    &input.bucket,
+                    "",
+                    Some(first_local),
+                    None,
+                    2,
+                    false,
+                    Some(expected_second[1].to_string()),
+                    false,
+                )
+                .await
+                .expect("verify the real storage continuation contract");
+            assert_eq!(
+                token_wins
+                    .objects
+                    .iter()
+                    .map(|object| object.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected_replay
+            );
+        } else {
+            assert_eq!(token.local, None, "the first local page remains partially consumed");
+            assert_eq!(token.last_key.as_deref(), Some(expected_first[1]));
+        }
+        assert!(!token.local_done);
+        assert!(!token.source_done);
+        let requests_before_disable = source_requests.load(Ordering::SeqCst);
+        assert_eq!(requests_before_disable, if second_page.is_some() { 2 } else { 1 });
+        let sys = OnDemandMigrationSys::get();
+        let installed = sys.state(&input.bucket).expect("installed source state");
+        let saved_config = installed.config().clone();
+        source_disabled.store(true, Ordering::SeqCst);
+        if disable_module {
+            sys.set_module_enabled(false);
+        } else {
+            let mut disabled_config = saved_config.clone();
+            disabled_config.policy.list_through = false;
+            sys.apply_for_incarnation(&input.bucket, installed.incarnation_id(), Some(&disabled_config))
+                .await;
+        }
+        input.continuation_token = Some(cursor);
+        let disabled = execute_source_list(input.clone()).await.expect("local-only continuation");
+        assert!(!disabled.headers.contains_key("x-rustfs-on-demand-migration-list"));
+        assert_eq!(
+            page_names(&disabled.output),
+            expected_disabled,
+            "framed={framed}, module={disable_module}"
+        );
+        assert_eq!(
+            disabled.output.key_count,
+            Some(i32::try_from(expected_disabled.len()).expect("page size"))
+        );
+        assert_eq!(disabled.output.prefix.as_deref(), Some(if prefixes { "p/" } else { "" }));
+        assert_eq!(disabled.output.delimiter, input.delimiter);
+        assert_eq!(disabled.output.start_after, input.start_after, "echo the client's original StartAfter");
+        assert_eq!(source_requests.load(Ordering::SeqCst), requests_before_disable);
+        if matches!(scenario, DisabledListScenario::Reenable) {
+            assert_eq!(disabled.output.is_truncated, Some(true));
+            let next = disabled.output.next_continuation_token.expect("local side still has z-local");
+            let next_token = decode_wire_token(&next);
+            assert_eq!(next_token.framed, framed, "retain the chain's existing wire format");
+            assert_eq!(next_token.source, token.source, "disabled requests do not consume source pages");
+            assert_eq!(next_token.last_key.as_deref(), Some("e"));
+            source_disabled.store(false, Ordering::SeqCst);
+            if disable_module {
+                sys.set_module_enabled(true);
+            } else {
+                sys.apply_for_incarnation(&input.bucket, installed.incarnation_id(), Some(&saved_config))
+                    .await;
+            }
+            input.continuation_token = Some(next);
+            let resumed = execute_source_list(input).await.expect("reenabled continuation").output;
+            assert_eq!(page_names(&resumed), ["f", "z-local"], "both sides continue beyond the local-only page");
+            assert_eq!(resumed.is_truncated, Some(false));
+            assert!(resumed.next_continuation_token.is_none());
+            assert_eq!(source_requests.load(Ordering::SeqCst), requests_before_disable + 1);
+        } else {
+            assert_eq!(disabled.output.is_truncated, Some(false));
+            assert!(disabled.output.next_continuation_token.is_none());
+        }
+        stop.cancel();
+        let requests = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("source server must finish")
+            .expect("source access must respect the disabled phase");
+        assert_eq!(requests.len(), source_requests.load(Ordering::SeqCst));
+        for request in requests {
+            assert!(
+                !request.contains("continuation-token="),
+                "the partially consumed source page is reread: {request}"
+            );
+            if prefixes {
+                assert!(request.contains("prefix=p%2F") && request.contains("delimiter=%2F"), "{request}");
+            }
+        }
+    }
+
+    async fn disabled_list_progress_matrix(scenario: DisabledListScenario) {
+        for framed in [false, true] {
+            temp_env::async_with_vars(
+                [
+                    (ENV_LIST_PROGRESS_TOKENS, Some("true")),
+                    (ENV_LIST_FRAMED_TOKENS, Some(if framed { "true" } else { "false" })),
+                    ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                    ("HTTP_PROXY", None),
+                    ("HTTPS_PROXY", None),
+                    ("ALL_PROXY", None),
+                    ("http_proxy", None),
+                    ("https_proxy", None),
+                    ("all_proxy", None),
+                    ("NO_PROXY", Some("*")),
+                    ("no_proxy", Some("*")),
+                ],
+                Box::pin(async move {
+                    for disable_module in [false, true] {
+                        assert_disabled_list_progress(scenario, framed, disable_module).await;
+                    }
+                }),
+            )
+            .await;
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_disabled_resumes_partially_consumed_first_local_page() {
+        run_large_stack_test("list-disabled-first", || {
+            disabled_list_progress_matrix(DisabledListScenario::FirstLocalPage)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_disabled_resumes_partially_consumed_opaque_local_page() {
+        run_large_stack_test("list-disabled-opaque", || {
+            disabled_list_progress_matrix(DisabledListScenario::PartiallyConsumedLocalPage)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_disabled_treats_source_cache_tag_names_as_literal_keys() {
+        run_large_stack_test("list-disabled-literal-cache-tag", || async {
+            for key in ["b[rustfs_cache:v1,return:]", "b[rustfs_cache:v2,return:]"] {
+                disabled_list_progress_matrix(DisabledListScenario::CacheTag(key)).await;
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_disabled_resumes_common_prefixes_without_repeating() {
+        run_large_stack_test("list-disabled-prefixes", || {
+            disabled_list_progress_matrix(DisabledListScenario::CommonPrefixes)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_disabled_then_reenabled_retains_progress_on_both_sides() {
+        run_large_stack_test("list-disabled-reenable", || disabled_list_progress_matrix(DisabledListScenario::Reenable));
+    }
+
+    #[test]
+    fn local_merger_preserves_json_markers_and_resets_budget_on_progress() {
+        let json_key = r#"{"t":"odm-list","v":1,"local_done":true}"#;
+        for key in [ListEntryKey::object(json_key), ListEntryKey::prefix("photos/")] {
+            let mut resume = token(Some("local-2"), false);
+            resume.v = 2;
+            resume.no_progress = Some(15);
+            let mut merger = ListThroughMerger::new(1, Some(&resume));
+            merger.disable_source();
+            merger
+                .push_page(MergeSide::Local, vec![key.clone()], true, Some(key.name.clone()))
+                .expect("valid local page");
+            let outcome = merger.finish(false).expect("local progress resets the budget");
+            assert_eq!(outcome.picks.len(), 1);
+            assert_eq!(outcome.picks[0].side, MergeSide::Local);
+            let next = outcome.next_token.expect("local continuation");
+            assert_eq!(next.local.as_deref(), Some(key.name.as_str()), "the local marker is embedded unchanged");
+            assert_eq!(next.source, resume.source);
+            assert_eq!(next.source_done, resume.source_done);
+            assert_eq!(next.last_key.as_deref(), Some(key.name.as_str()));
+            assert_eq!(next.v, 1);
+            assert_eq!(next.no_progress, None);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_historical_v2_budget_exhausts_on_the_next_reader_only_request() {
+        run_large_stack_test("list-through-historical-budget", || async {
+            temp_env::async_with_vars(
+                [
+                    (ENV_LIST_PROGRESS_TOKENS, None),
+                    (ENV_LIST_FRAMED_TOKENS, None),
+                    ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                    ("HTTP_PROXY", None), ("HTTPS_PROXY", None), ("ALL_PROXY", None),
+                    ("http_proxy", None), ("https_proxy", None), ("all_proxy", None),
+                    ("NO_PROXY", Some("*")), ("no_proxy", Some("*")),
+                ],
+                async {
+                    for policy in [SourceErrorPolicy::Propagate, SourceErrorPolicy::NotFound] {
+                        let (endpoint, server) = scripted_list_source(vec![
+                            source_xml(Some("B"), true, None), source_xml(Some("C"), true, None),
+                        ]).await;
+                        let (_state_guard, mut input) = source_policy_input(endpoint, policy, None, None).await;
+                        // Fixed bytes from the pre-framing writer, independent of today's encoder.
+                        input.continuation_token = Some("eyJ0Ijoib2RtLWxpc3QiLCJ2IjoyLCJsb2NhbCI6bnVsbCwibG9jYWxfZG9uZSI6ZmFsc2UsInNvdXJjZSI6IkEiLCJzb3VyY2VfZG9uZSI6ZmFsc2UsImxhc3Rfa2V5IjpudWxsLCJub19wcm9ncmVzcyI6MTV9".to_string());
+                        assert_source_policy_result(execute_source_list(input).await, policy);
+                        let requests = tokio::time::timeout(Duration::from_secs(5), server).await
+                            .expect("finite source server must finish").expect("source server must not panic");
+                        assert_eq!(requests.len(), 2, "the old count=15 must terminate without starting a new budget");
+                        for (request, cursor) in requests.iter().zip(["A", "B"]) {
+                            assert!(request.contains(&format!("continuation-token={cursor}")), "{request}");
+                        }
+                    }
+                },
+            ).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_framing_survives_budget_reset_and_local_only_pagination() {
+        run_large_stack_test("list-through-framing-local-pagination", || async {
+            temp_env::async_with_vars(
+                [
+                    (ENV_LIST_PROGRESS_TOKENS, None),
+                    (ENV_LIST_FRAMED_TOKENS, Some("true")),
+                    ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                    ("HTTP_PROXY", None),
+                    ("HTTPS_PROXY", None),
+                    ("ALL_PROXY", None),
+                    ("http_proxy", None),
+                    ("https_proxy", None),
+                    ("all_proxy", None),
+                    ("NO_PROXY", Some("*")),
+                    ("no_proxy", Some("*")),
+                ],
+                async {
+                    let (endpoint, server) = scripted_list_source(vec![
+                        source_xml(Some("A"), true, None),
+                        source_xml(Some("B"), true, None),
+                        source_xml(Some("C"), true, None),
+                        source_xml(Some("D"), true, None),
+                        source_xml(None, false, Some("0-source")),
+                    ])
+                    .await;
+                    let (_state_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                    let json_key = r#"{"t":"odm-list","v":1,"local_done":true}"#;
+                    let expected_local = ["a-local", "b-local", "z-local", json_key, "~last"];
+                    let store = shared_gating_ecstore().await;
+                    for key in ["a-local", "b-local", json_key, "~last"] {
+                        store
+                            .put_object(
+                                &input.bucket,
+                                key,
+                                &mut StoragePutObjReader::from_vec(vec![1]),
+                                &StorageObjectOptions::default(),
+                            )
+                            .await
+                            .expect("seed paginated local keys");
+                    }
+                    input.max_keys = Some(1);
+                    let first = execute_source_list(input.clone()).await.expect("legitimate empty page");
+                    assert_eq!(first.output.key_count, Some(0));
+                    assert_eq!(first.output.is_truncated, Some(true));
+                    let next = first.output.next_continuation_token.expect("first framed cursor");
+                    let token = decode_wire_token(&next);
+                    assert!(token.framed, "the independent switch permits first framing issuance");
+                    assert_eq!(token.v, 1, "framing issuance cannot enable the no-progress budget");
+                    assert_eq!(token.no_progress, None);
+                    input.continuation_token = Some(next);
+                    let budget_page =
+                        temp_env::async_with_vars([(ENV_LIST_PROGRESS_TOKENS, Some("true"))], execute_source_list(input.clone()))
+                            .await
+                            .expect("another valid empty page starts a budget only when enabled");
+                    assert_eq!(budget_page.output.key_count, Some(0));
+                    assert_eq!(budget_page.output.is_truncated, Some(true));
+                    let next = budget_page.output.next_continuation_token.expect("framed v2 cursor");
+                    let token = decode_wire_token(&next);
+                    assert!(token.framed);
+                    assert_eq!(token.v, 2);
+                    assert_eq!(token.no_progress, Some(1));
+                    input.continuation_token = Some(next);
+
+                    temp_env::async_with_vars(
+                        [
+                            (ENV_LIST_PROGRESS_TOKENS, None::<&str>),
+                            (ENV_LIST_FRAMED_TOKENS, Some("false")),
+                        ],
+                        async {
+                            let second = execute_source_list(input.clone())
+                                .await
+                                .expect("reader-only node reaches source data");
+                            assert_eq!(second.output.key_count, Some(1));
+                            assert_eq!(second.output.is_truncated, Some(true));
+                            assert_eq!(second.output.contents.expect("source object")[0].key.as_deref(), Some("0-source"));
+                            let next = second.output.next_continuation_token.expect("remaining local listing");
+                            let token = decode_wire_token(&next);
+                            assert!(token.framed, "resetting the budget must not downgrade the framing");
+                            assert_eq!(token.v, 1);
+                            assert_eq!(token.no_progress, None);
+                            assert!(token.source_done);
+                            input.continuation_token = Some(next);
+
+                            OnDemandMigrationSys::get().remove(&input.bucket);
+                            for (index, key) in expected_local.iter().enumerate() {
+                                let page = execute_source_list(input.clone()).await.expect("local-only continuation");
+                                assert!(!page.headers.contains_key("x-rustfs-on-demand-migration-list"));
+                                assert_eq!(page.output.key_count, Some(1));
+                                let keys: Vec<_> = page
+                                    .output
+                                    .contents
+                                    .expect("one local object")
+                                    .into_iter()
+                                    .map(|object| object.key.expect("local key"))
+                                    .collect();
+                                assert_eq!(
+                                    keys,
+                                    vec![key.to_string()],
+                                    "no duplicate or omitted key after disabling list-through"
+                                );
+                                let truncated = index + 1 < expected_local.len();
+                                assert_eq!(page.output.is_truncated, Some(truncated));
+                                if truncated {
+                                    let next = page.output.next_continuation_token.expect("local side still has keys");
+                                    let token = decode_wire_token(&next);
+                                    assert!(token.framed);
+                                    assert_eq!(token.v, 1);
+                                    assert_eq!(token.no_progress, None);
+                                    assert!(token.local.as_deref().expect("local marker").starts_with(*key));
+                                    assert_eq!(token.last_key.as_deref(), Some(*key));
+                                    input.continuation_token = Some(next);
+                                } else {
+                                    assert!(page.output.next_continuation_token.is_none());
+                                }
+                            }
+                        },
+                    )
+                    .await;
+                    let requests = tokio::time::timeout(Duration::from_secs(5), server)
+                        .await
+                        .expect("finite source server must finish")
+                        .expect("source server must not panic");
+                    assert_eq!(
+                        requests.len(),
+                        5,
+                        "format changes and local-only continuation perform no additional source I/O"
+                    );
+                    assert!(!requests[0].contains("continuation-token="));
+                    for (request, cursor) in requests[1..].iter().zip(["A", "B", "C", "D"]) {
+                        assert!(request.contains(&format!("continuation-token={cursor}")), "{request}");
+                    }
+                },
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_zero_sized_framed_request_preserves_its_budget() {
+        run_large_stack_test("list-through-framed-zero-size", || async {
+            temp_env::async_with_vars(
+                [
+                    (ENV_LIST_PROGRESS_TOKENS, None), (ENV_LIST_FRAMED_TOKENS, None),
+                    ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                    ("HTTP_PROXY", None), ("HTTPS_PROXY", None), ("ALL_PROXY", None),
+                    ("http_proxy", None), ("https_proxy", None), ("all_proxy", None),
+                    ("NO_PROXY", Some("*")), ("no_proxy", Some("*")),
+                ],
+                async {
+                    let (endpoint, server) = scripted_list_source(vec![
+                        source_xml(Some("B"), true, None), source_xml(Some("C"), true, None),
+                    ]).await;
+                    let (_state_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                    let wire = concat!("\0odm-list:", r#"{"t":"odm-list","v":2,"local":null,"local_done":true,"source":"A","source_done":false,"last_key":null,"no_progress":15}"#);
+                    input.continuation_token = Some(base64_simd::STANDARD.encode_to_string(wire.as_bytes()));
+                    input.max_keys = Some(0);
+                    let zero = execute_source_list(input.clone()).await.expect("zero-sized request does not spend the budget");
+                    assert_eq!(zero.output.key_count, Some(0));
+                    assert_eq!(zero.output.is_truncated, Some(true));
+                    let next = zero.output.next_continuation_token.expect("unconsumed source");
+                    let token = decode_wire_token(&next);
+                    assert!(token.framed);
+                    assert_eq!(token.v, 2);
+                    assert_eq!(token.no_progress, Some(15));
+                    assert_eq!(token.source.as_deref(), Some("A"));
+                    assert_eq!(next, input.continuation_token.as_ref().expect("original cursor").as_str());
+                    let state = OnDemandMigrationSys::get().state(&input.bucket).expect("source state");
+                    assert_eq!(state.stats().snapshot(state.breaker().state()).source_latency.count, 0, "zero-sized request must not fetch the source");
+                    input.continuation_token = Some(next);
+                    input.max_keys = Some(2);
+                    assert_source_policy_result(execute_source_list(input).await, SourceErrorPolicy::Propagate);
+                    let requests = tokio::time::timeout(Duration::from_secs(5), server).await
+                        .expect("finite source server must finish").expect("source server must not panic");
+                    assert_eq!(requests.len(), 2, "only the resumed nonzero request fetches the source");
+                    assert_eq!(state.stats().snapshot(state.breaker().state()).source_latency.count, 2);
+                    for (request, cursor) in requests.iter().zip(["A", "B"]) {
+                        assert!(request.contains(&format!("continuation-token={cursor}")), "{request}");
+                    }
+                },
+            ).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zero_sized_merged_cursors_preserve_each_side_and_wire_format() {
+        run_large_stack_test("list-through-zero-side-matrix", || async {
+            temp_env::async_with_vars(
+                [
+                    (ENV_LIST_PROGRESS_TOKENS, Some("true")),
+                    (ENV_LIST_FRAMED_TOKENS, Some("true")),
+                    ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+                    ("HTTP_PROXY", None), ("HTTPS_PROXY", None), ("ALL_PROXY", None),
+                    ("http_proxy", None), ("https_proxy", None), ("all_proxy", None),
+                    ("NO_PROXY", Some("*")), ("no_proxy", Some("*")),
+                ],
+                async {
+                    for framed in [false, true] {
+                        for (local_done, source_done) in [(false, true), (true, false), (false, false), (true, true)] {
+                            let (endpoint, server, stop) = list_source(std::iter::repeat(source_xml(Some("unexpected"), true, None))).await;
+                            let (_state_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                            let json = format!(r#"{{"t":"odm-list","v":2,"local":"local-marker","local_done":{local_done},"source":"source-marker","source_done":{source_done},"last_key":null,"no_progress":15}}"#);
+                            let wire = if framed { format!("\0odm-list:{json}") } else { json };
+                            let original = base64_simd::STANDARD.encode_to_string(wire.as_bytes());
+                            input.continuation_token = Some(original.clone());
+                            input.max_keys = Some(0);
+                            let output = execute_source_list(input).await.expect("zero page remains local").output;
+                            let has_more = !local_done || !source_done;
+                            assert_eq!(output.key_count, Some(0));
+                            assert_eq!(output.is_truncated, Some(has_more), "framed={framed}, local_done={local_done}, source_done={source_done}");
+                            assert_eq!(output.next_continuation_token.as_deref(), has_more.then_some(original.as_str()));
+                            if let Some(next) = output.next_continuation_token {
+                                let token = decode_wire_token(&next);
+                                assert_eq!(token.framed, framed);
+                                assert_eq!(token.v, 2);
+                                assert_eq!(token.no_progress, Some(15));
+                                assert_eq!(token.local_done, local_done);
+                                assert_eq!(token.source_done, source_done);
+                                assert_eq!(token.local.as_deref(), Some("local-marker"));
+                                assert_eq!(token.source.as_deref(), Some("source-marker"));
+                            }
+                            stop.cancel();
+                            let requests = tokio::time::timeout(Duration::from_secs(5), server).await
+                                .expect("unused source must finish").expect("source server must not panic");
+                            assert!(requests.is_empty(), "zero-sized request must not access the source: {requests:?}");
+                        }
+                    }
+                },
+            ).await;
         });
     }
 

@@ -2930,6 +2930,136 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
+    fn heal_start_retry_fixture() -> (
+        Arc<HealManager>,
+        rustfs_heal_contracts::heal_channel::HealChannelRequest,
+        rustfs_protos::heal_control::RequestMetadata,
+    ) {
+        let manager = Arc::new(HealManager::new(Arc::new(HealControlMockStorage), None));
+        let mut request = rustfs_heal_contracts::heal_channel::create_heal_request(
+            "bucket".to_string(),
+            Some("prefix".to_string()),
+            true,
+            None,
+        );
+        request.source = rustfs_heal_contracts::heal_channel::HealRequestSource::Admin;
+        request.recursive = Some(true);
+        let now = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).expect("fixture clock fits in i64");
+        let metadata = rustfs_protos::heal_control::RequestMetadata::new(*Uuid::new_v4().as_bytes(), now, now + 30_000, 7);
+        (manager, request, metadata)
+    }
+
+    #[tokio::test]
+    async fn heal_start_retry_exact_forced_envelope_returns_cached_admission() {
+        let (manager, request, metadata) = heal_start_retry_fixture();
+        let request_id = request.id.clone();
+        let envelope = rustfs_protos::heal_control::Envelope::start(request, metadata).expect("valid forced start");
+        let lost_response =
+            execute_heal_control_envelope_with_manager(envelope.clone(), metadata.coordinator_epoch, Some(manager.clone()))
+                .await
+                .expect("first request is admitted before its response is lost");
+        assert_eq!(manager.operations_snapshot().await.queue_length, 1);
+
+        // The caller sees no first response, but retries the original envelope.
+        let replayed = execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch, Some(manager.clone()))
+            .await
+            .expect("an exact envelope replay must recover its receipt");
+        assert_eq!(replayed, lost_response);
+        assert_eq!(
+            manager.operations_snapshot().await.queue_length,
+            1,
+            "forceStart must not be executed twice"
+        );
+        let outcome = rustfs_protos::heal_control::decode_result(&replayed)
+            .and_then(|result| result.into_outcome(&request_id, metadata.coordinator_epoch))
+            .expect("matching canonical receipt");
+        assert!(matches!(outcome, rustfs_protos::heal_control::Outcome::Start {
+            task_id, admission: rustfs_protos::heal_control::Admission::Accepted,
+        } if task_id == request_id));
+    }
+
+    #[tokio::test]
+    async fn heal_start_retry_new_forced_request_is_a_distinct_start() {
+        let (manager, request, metadata) = heal_start_retry_fixture();
+        let first_id = request.id.clone();
+        let first = rustfs_protos::heal_control::Envelope::start(request.clone(), metadata).expect("first start");
+        let _lost_response = execute_heal_control_envelope_with_manager(first, metadata.coordinator_epoch, Some(manager.clone()))
+            .await
+            .expect("first admission");
+
+        // A fresh HTTP forceStart request intentionally requests another start.
+        let mut next_request = request;
+        next_request.id = Uuid::new_v4().to_string();
+        let next_id = next_request.id.clone();
+        let next_metadata = rustfs_protos::heal_control::RequestMetadata {
+            nonce: *Uuid::new_v4().as_bytes(),
+            ..metadata
+        };
+        let next = rustfs_protos::heal_control::Envelope::start(next_request, next_metadata).expect("new forced start");
+        let response = execute_heal_control_envelope_with_manager(next, metadata.coordinator_epoch, Some(manager.clone()))
+            .await
+            .expect("forceStart preserves its explicit admission semantics");
+        let outcome = rustfs_protos::heal_control::decode_result(&response)
+            .and_then(|result| result.into_outcome(&next_id, metadata.coordinator_epoch))
+            .expect("new receipt");
+        assert!(matches!(outcome, rustfs_protos::heal_control::Outcome::Start {
+            task_id, admission: rustfs_protos::heal_control::Admission::Accepted,
+        } if task_id == next_id && task_id != first_id));
+        assert_eq!(
+            manager.operations_snapshot().await.queue_length,
+            2,
+            "a caller must not treat a new forced request as an idempotent transport retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_start_retry_same_id_with_changed_envelope_conflicts_before_admission() {
+        let (manager, request, metadata) = heal_start_retry_fixture();
+        let original = rustfs_protos::heal_control::Envelope::start(request.clone(), metadata).expect("original start");
+        let receipt =
+            execute_heal_control_envelope_with_manager(original.clone(), metadata.coordinator_epoch, Some(manager.clone()))
+                .await
+                .expect("original admission");
+        let mut changed_options = request.clone();
+        changed_options.remove_corrupted = Some(true);
+        let changed_metadata = rustfs_protos::heal_control::RequestMetadata {
+            nonce: *Uuid::new_v4().as_bytes(),
+            ..metadata
+        };
+        for changed in [
+            rustfs_protos::heal_control::Envelope::start(changed_options, metadata).expect("changed options"),
+            rustfs_protos::heal_control::Envelope::start(request, changed_metadata).expect("changed nonce"),
+        ] {
+            let error = execute_heal_control_envelope_with_manager(changed, metadata.coordinator_epoch, Some(manager.clone()))
+                .await
+                .expect_err("one request ID cannot identify different envelope bytes");
+            assert_eq!(error.code(), tonic::Code::AlreadyExists);
+            assert_eq!(manager.operations_snapshot().await.queue_length, 1);
+        }
+        assert_eq!(
+            execute_heal_control_envelope_with_manager(original, metadata.coordinator_epoch, Some(manager))
+                .await
+                .expect("conflicts must preserve the original receipt"),
+            receipt
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_start_retry_wrong_coordinator_epoch_cannot_admit_locally() {
+        let (manager, request, metadata) = heal_start_retry_fixture();
+        let request_id = request.id.clone();
+        let envelope = rustfs_protos::heal_control::Envelope::start(request, metadata).expect("start envelope");
+        let error = execute_heal_control_envelope_with_manager(envelope, metadata.coordinator_epoch + 1, Some(manager.clone()))
+            .await
+            .expect_err("a different coordinator epoch cannot accept the request");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(manager.operations_snapshot().await.queue_length, 0);
+        assert!(matches!(
+            manager.get_task_status(&request_id).await,
+            Err(rustfs_heal::Error::TaskNotFound { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn heal_control_executor_preserves_canonical_token_and_drops_query_results() {
         let manager = Arc::new(HealManager::new(Arc::new(HealControlMockStorage), None));

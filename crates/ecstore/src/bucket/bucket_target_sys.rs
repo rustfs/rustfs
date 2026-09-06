@@ -794,15 +794,22 @@ impl BucketTargetSys {
     ) -> Result<BucketTargets, BucketTargetError> {
         self.validate_target(bucket, target).await?;
 
-        let mut bucket_targets = match self.list_bucket_targets(bucket).await {
-            Ok(targets) => targets,
-            Err(BucketTargetError::BucketRemoteTargetNotFound { .. }) => BucketTargets::default(),
-            Err(err) => return Err(err),
-        };
+        let mut bucket_targets = self.targets_base_for_write(bucket).await?;
 
         Self::upsert_target_entry(&mut bucket_targets.targets, target, update)?;
 
         Ok(bucket_targets)
+    }
+
+    /// Ordinary writes must not turn an unreadable cached snapshot into an
+    /// empty configuration. Explicit repair belongs to the metadata transaction
+    /// that can inspect the current persisted state.
+    async fn targets_base_for_write(&self, bucket: &str) -> Result<BucketTargets, BucketTargetError> {
+        match self.list_bucket_targets(bucket).await {
+            Ok(targets) => Ok(targets),
+            Err(BucketTargetError::BucketRemoteTargetNotFound { .. }) => Ok(BucketTargets::default()),
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn validate_target(&self, bucket: &str, target: &BucketTarget) -> Result<(), BucketTargetError> {
@@ -863,7 +870,9 @@ impl BucketTargetSys {
         Ok(())
     }
 
-    fn upsert_target_entry(
+    /// Merge a validated target into a caller-owned snapshot. The caller must
+    /// protect that snapshot through persistence.
+    pub fn upsert_target_entry(
         bucket_targets: &mut Vec<BucketTarget>,
         target: &BucketTarget,
         update: bool,
@@ -1227,25 +1236,27 @@ impl BucketTargetSys {
             return (String::new(), false);
         };
 
-        {
-            let targets_map = self.targets_map.read().await;
-            if let Some(targets) = targets_map.get(bucket) {
-                for tgt in targets {
-                    if tgt.target_type == target.target_type
-                        && tgt.target_bucket == target.target_bucket
-                        && target.endpoint == tgt.endpoint
-                        && tgt
-                            .credentials
-                            .as_ref()
-                            .map(|c| {
-                                let default_creds = Credentials::default();
-                                c.access_key == target.credentials.as_ref().unwrap_or(&default_creds).access_key
-                            })
-                            .unwrap_or(false)
-                    {
-                        return (tgt.arn.clone(), true);
-                    }
-                }
+        let targets_map = self.targets_map.read().await;
+        let targets = targets_map.get(bucket).map(Vec::as_slice).unwrap_or_default();
+        Self::remote_arn_for_targets(targets, target, depl_id)
+    }
+
+    /// Resolve create idempotency against the snapshot the caller will persist.
+    pub fn remote_arn_for_targets(targets: &[BucketTarget], target: &BucketTarget, depl_id: &str) -> (String, bool) {
+        for tgt in targets {
+            if tgt.target_type == target.target_type
+                && tgt.target_bucket == target.target_bucket
+                && target.endpoint == tgt.endpoint
+                && tgt
+                    .credentials
+                    .as_ref()
+                    .map(|c| {
+                        let default_creds = Credentials::default();
+                        c.access_key == target.credentials.as_ref().unwrap_or(&default_creds).access_key
+                    })
+                    .unwrap_or(false)
+            {
+                return (tgt.arn.clone(), true);
             }
         }
 
@@ -4312,5 +4323,42 @@ mod tests {
     fn last_minute_latency_empty_window_is_zero() {
         let window = LastMinuteLatency::new();
         assert_eq!(window.get_total().avg, Duration::from_secs(0));
+    }
+
+    fn repair_target(bucket: &str, id: &str) -> BucketTarget {
+        BucketTarget {
+            source_bucket: bucket.to_string(),
+            endpoint: "remote.example.com".to_string(),
+            target_bucket: "remote".to_string(),
+            arn: format!("arn:rustfs:replication:us-east-1:{bucket}:{id}"),
+            target_type: BucketTargetType::ReplicationService,
+            region: "us-east-1".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_target_set_refuses_cached_writes() {
+        let sys = BucketTargetSys::default();
+        let bucket = "targets-repair-opt-in";
+        sys.mark_targets_unreadable(bucket).await;
+        assert!(matches!(
+            sys.targets_base_for_write(bucket).await,
+            Err(BucketTargetError::BucketRemoteTargetsUnreadable { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_readable_target_set_remains_the_write_base() {
+        let sys = BucketTargetSys::default();
+        let bucket = "targets-repair-readable";
+        let existing = repair_target(bucket, "keep");
+        sys.targets_map
+            .write()
+            .await
+            .insert(bucket.to_string(), vec![existing.clone()]);
+        let base = sys.targets_base_for_write(bucket).await.expect("read targets");
+        assert_eq!(base.targets.len(), 1);
+        assert_eq!(base.targets[0].arn, existing.arn);
     }
 }

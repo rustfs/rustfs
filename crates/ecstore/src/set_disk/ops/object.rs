@@ -5785,7 +5785,7 @@ pub(crate) async fn cleanup_rejected_transition_upload_durably(
 }
 
 async fn transition_cleanup_store(ctx: &Arc<crate::runtime::instance::InstanceContext>) -> Option<Arc<ECStore>> {
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(feature = "test-util")]
     pause_transition_cleanup_store().await;
 
     transition_object_store(ctx).await
@@ -6031,24 +6031,24 @@ async fn delete_transition_transaction_after_remote_cleanup(
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 #[derive(Default)]
 struct TransitionCleanupStoreBarrierState {
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 /// One-shot test barrier placed before transition cleanup resolves its ECStore.
 pub(crate) struct TransitionCleanupStoreBarrier {
     state: Arc<TransitionCleanupStoreBarrierState>,
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 static TRANSITION_CLEANUP_STORE_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<TransitionCleanupStoreBarrierState>>>> =
     std::sync::OnceLock::new();
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 impl TransitionCleanupStoreBarrier {
     /// Install the process-local barrier for the next cleanup-store resolution.
     pub(crate) fn install() -> Self {
@@ -6071,7 +6071,7 @@ impl TransitionCleanupStoreBarrier {
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 impl Drop for TransitionCleanupStoreBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -6085,7 +6085,7 @@ impl Drop for TransitionCleanupStoreBarrier {
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 async fn pause_transition_cleanup_store() {
     let barrier = TRANSITION_CLEANUP_STORE_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -6159,7 +6159,7 @@ async fn pause_after_transition_upload_candidate_recorded() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 struct TransitionUploadedCommitBarrierState {
     bucket: String,
     object: String,
@@ -6167,17 +6167,17 @@ struct TransitionUploadedCommitBarrierState {
     release: tokio::sync::Notify,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) struct TransitionUploadedCommitBarrier {
     state: Arc<TransitionUploadedCommitBarrierState>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 static TRANSITION_UPLOADED_COMMIT_BARRIER: std::sync::OnceLock<
     std::sync::Mutex<Option<Arc<TransitionUploadedCommitBarrierState>>>,
 > = std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl TransitionUploadedCommitBarrier {
     pub(crate) fn install(bucket: &str, object: &str) -> Self {
         let state = Arc::new(TransitionUploadedCommitBarrierState {
@@ -6210,7 +6210,7 @@ impl TransitionUploadedCommitBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl Drop for TransitionUploadedCommitBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -6224,7 +6224,7 @@ impl Drop for TransitionUploadedCommitBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 async fn pause_after_transition_uploaded_persisted(bucket: &str, object: &str) {
     let barrier = TRANSITION_UPLOADED_COMMIT_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -9154,7 +9154,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
         upload_cleanup.update_cleanup_transaction(&transaction);
 
-        #[cfg(test)]
+        #[cfg(all(test, feature = "test-util"))]
         pause_after_transition_uploaded_persisted(bucket, object).await;
 
         let commit_opts = opts.as_commit_opts();
@@ -12670,6 +12670,65 @@ mod metadata_mutation_generation_tests {
             .await
             .expect("checksum sidecar should be persisted");
         set_disks.invalidate_get_object_metadata_cache(bucket, object).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(metadata_cache_invalidation_probe)]
+    async fn segment_observation_equal_size_mutations_retire_metadata_generation() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "segment-observation-bucket";
+        let object = "hot/object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create segment fixture bucket");
+        }
+        let (before, old_key) = put_and_prime(&set_disks, bucket, object, b"before").await;
+        let probe = MetadataCacheInvalidationProbe::install(bucket, object);
+        let mut replacement = PutObjReader::from_vec(b"after!".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut replacement, &ObjectOptions::default())
+            .await
+            .expect("commit same-length replacement with normal owner locking");
+        assert_eq!(probe.count(), 2, "same-length PUT must retire its metadata generation");
+        assert_retired(&set_disks, &old_key).await;
+        drop(probe);
+        let after = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read replacement metadata");
+        assert_eq!(before.size, after.size);
+        assert_ne!(before.etag, after.etag, "equal size is not equal content");
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("read replacement body through the owner");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("drain replacement body");
+        assert_eq!(body, b"after!");
+        drop(reader);
+
+        let (before, old_key) = put_and_prime(&set_disks, bucket, object, b"after!").await;
+        let probe = MetadataCacheInvalidationProbe::install(bucket, object);
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(HashMap::from([("x-amz-meta-segment".to_string(), "changed".to_string())])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("commit metadata-only mutation with normal owner locking");
+        assert_eq!(probe.count(), 4, "metadata-only mutation must retire both owner fences");
+        assert_retired(&set_disks, &old_key).await;
+        let after = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read committed metadata-only mutation");
+        assert_eq!(before.size, after.size);
+        assert_eq!(before.etag, after.etag);
+        assert!(!before.user_defined.contains_key("x-amz-meta-segment"));
+        assert_eq!(after.user_defined.get("x-amz-meta-segment").map(String::as_str), Some("changed"));
     }
 
     #[tokio::test]

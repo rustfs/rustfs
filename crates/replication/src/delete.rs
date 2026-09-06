@@ -76,6 +76,21 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
                 .delete_object
                 .delete_marker_mtime
                 .and_then(|t| i64::try_from(t.unix_timestamp_nanos()).ok()),
+            // Carry the target-assigned marker version ids (and the fail-closed corrupt
+            // flag) into the journal so a purge intent replayed after a restart addresses
+            // the same version the live path did (backlog#2290). Only delete-marker state
+            // ever records these; other deletes serialize an empty map.
+            target_delete_marker_version_ids: self
+                .delete_object
+                .replication_state
+                .as_ref()
+                .map(|state| state.target_delete_marker_version_ids.clone())
+                .unwrap_or_default(),
+            target_delete_marker_version_ids_corrupt: self
+                .delete_object
+                .replication_state
+                .as_ref()
+                .is_some_and(|state| state.target_delete_marker_version_ids_corrupt),
             target_arns: self.admitted_target_arns(),
             force_delete_id: self.delete_object.force_delete_id,
             force_delete_generation: self.delete_object.force_delete_generation,
@@ -238,6 +253,28 @@ pub fn delete_marker_purge_version_id(
     })
 }
 
+/// The version a delete replication addresses on `arn`, or `None` to refuse.
+///
+/// A version purge whose purged version is a delete marker must address the
+/// marker version the TARGET assigned — the recorded mapping, exactly as the
+/// delayed-purge watcher does. The source-side `DELETE ?versionId=<marker>`
+/// replicates as such a purge, and a generic S3 target answers a DELETE of an
+/// unknown versionId with 204 while keeping its marker, so addressing it by
+/// the source id reported success and left the marker behind (backlog#2290,
+/// R6.1 on the VMs). Nothing recorded falls back to the source-derived id
+/// (id-mirroring peers); a corrupt record refuses, as the watcher does.
+pub fn delete_replication_target_version_id(dobj: &DeletedObject, arn: &str) -> Option<Option<String>> {
+    let is_version_purge = is_version_delete_replication(dobj);
+    if is_version_purge
+        && !dobj.delete_marker
+        && let Some(marker) = dobj.delete_marker_version_id
+    {
+        return delete_marker_purge_version_id(dobj.replication_state.as_ref(), arn, marker);
+    }
+    let source_version = dobj.delete_marker_version_id.or(dobj.version_id).unwrap_or_default();
+    Some(target_delete_version_id(source_version, is_version_purge))
+}
+
 /// Shape an exhausted purge intent as a marker-creation delete entry. Replay
 /// reconstructs it with `delete_marker: true`, finds the source marker gone,
 /// and funnels into the stale-marker branch of `replicate_delete_with_outcome`
@@ -258,9 +295,9 @@ mod tests {
 
     use super::{
         DeletedObjectReplicationInfo, delete_marker_purge_mrf_entry, delete_marker_purge_version_id,
-        delete_replication_creates_marker, is_object_lock_denied_delete, is_retryable_delete_replication_head_error,
-        is_version_delete_replication, replicate_delete_outcome, resync_existing_delete_replication_info,
-        should_retry_delete_marker_purge, target_delete_version_id,
+        delete_replication_creates_marker, delete_replication_target_version_id, is_object_lock_denied_delete,
+        is_retryable_delete_replication_head_error, is_version_delete_replication, replicate_delete_outcome,
+        resync_existing_delete_replication_info, should_retry_delete_marker_purge, target_delete_version_id,
     };
     use crate::storage_api::DeletedObject;
     use crate::{
@@ -595,6 +632,76 @@ mod tests {
         assert_eq!(entry.retry_count, 0);
         assert_eq!(entry.bucket, "bucket-a");
         assert_eq!(entry.object, "doc.txt");
+        assert!(
+            entry.target_delete_marker_version_ids.is_empty(),
+            "no recorded target marker ids means the journal carries none"
+        );
+        assert!(!entry.target_delete_marker_version_ids_corrupt);
+    }
+
+    /// backlog#2290: a purge intent journaled to MRF must carry the marker
+    /// version ids the targets assigned, plus the fail-closed corrupt flag,
+    /// so a replay after restart addresses the same version the live path did.
+    #[test]
+    fn delete_marker_purge_mrf_entry_carries_target_assigned_marker_versions() {
+        let delete_marker_version_id = Uuid::new_v4();
+        let mut state = ReplicationState::default();
+        state
+            .target_delete_marker_version_ids
+            .insert("arn:a".to_string(), "remote-marker-a".to_string());
+        state
+            .target_delete_marker_version_ids
+            .insert("arn:b".to_string(), "remote-marker-b".to_string());
+        let mut dobj = DeletedObjectReplicationInfo {
+            delete_object: DeletedObject {
+                object_name: "doc.txt".to_string(),
+                delete_marker: false,
+                version_id: Some(Uuid::new_v4()),
+                delete_marker_version_id: Some(delete_marker_version_id),
+                replication_state: Some(state),
+                ..Default::default()
+            },
+            bucket: "bucket-a".to_string(),
+            ..Default::default()
+        };
+
+        let entry = delete_marker_purge_mrf_entry(&dobj, vec!["arn:a".to_string()]);
+        assert_eq!(
+            entry.target_delete_marker_version_ids,
+            HashMap::from([
+                ("arn:a".to_string(), "remote-marker-a".to_string()),
+                ("arn:b".to_string(), "remote-marker-b".to_string()),
+            ]),
+            "every recorded target marker id survives the journal, regardless of the retried ARN subset"
+        );
+        assert!(!entry.target_delete_marker_version_ids_corrupt);
+        assert_eq!(
+            delete_marker_purge_version_id(
+                Some(&ReplicationState {
+                    target_delete_marker_version_ids: entry.target_delete_marker_version_ids,
+                    ..Default::default()
+                }),
+                "arn:a",
+                delete_marker_version_id
+            ),
+            Some(Some("remote-marker-a".to_string()))
+        );
+
+        // The live path refuses to purge on inconsistent metadata and reports the target
+        // as failed; the journaled intent must keep refusing after a restart.
+        dobj.delete_object
+            .replication_state
+            .as_mut()
+            .expect("state was set above")
+            .target_delete_marker_version_ids_corrupt = true;
+        let entry = delete_marker_purge_mrf_entry(&dobj, vec!["arn:a".to_string()]);
+        assert!(entry.target_delete_marker_version_ids_corrupt);
+
+        // A delete without replication state journals an empty map.
+        dobj.delete_object.replication_state = None;
+        let entry = dobj.to_mrf_entry();
+        assert!(entry.target_delete_marker_version_ids.is_empty());
+        assert!(!entry.target_delete_marker_version_ids_corrupt);
     }
 
     #[test]
@@ -655,5 +762,58 @@ mod tests {
         // Other errors mentioning retention must not match.
         assert!(!is_object_lock_denied_delete(Some("InternalError"), Some("retention lookup failed")));
         assert!(!is_object_lock_denied_delete(None, Some("legal hold")));
+    }
+
+    fn purge_of_marker(marker: Uuid, state: Option<ReplicationState>) -> DeletedObject {
+        DeletedObject {
+            object_name: "obj".to_string(),
+            delete_marker: false,
+            delete_marker_version_id: Some(marker),
+            version_id: None,
+            replication_state: state,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn delete_replication_target_version_id_addresses_recorded_marker_for_purges() {
+        let arn = "arn:minio:replication::generic:photos";
+        let marker = Uuid::new_v4();
+        let mut state = ReplicationState::default();
+        state
+            .target_delete_marker_version_ids
+            .insert(arn.to_string(), "remote-marker".to_string());
+
+        // purge of a replicated marker: the target's own version
+        assert_eq!(
+            delete_replication_target_version_id(&purge_of_marker(marker, Some(state.clone())), arn),
+            Some(Some("remote-marker".to_string()))
+        );
+        // nothing recorded for this arn: the source-derived id (id-mirroring peers)
+        assert_eq!(
+            delete_replication_target_version_id(&purge_of_marker(marker, None), arn),
+            Some(Some(marker.to_string()))
+        );
+        // corrupt record: refuse instead of guessing
+        state.target_delete_marker_version_ids_corrupt = true;
+        assert_eq!(delete_replication_target_version_id(&purge_of_marker(marker, Some(state)), arn), None);
+
+        // marker creation keeps the source id (the target mints its own on a
+        // versionless DELETE; the id only travels in the source header)
+        let creation = DeletedObject {
+            object_name: "obj".to_string(),
+            delete_marker: true,
+            delete_marker_version_id: Some(marker),
+            ..Default::default()
+        };
+        assert_eq!(delete_replication_target_version_id(&creation, arn), Some(Some(marker.to_string())));
+        // plain version purge: the source version id
+        let version = Uuid::new_v4();
+        let purge = DeletedObject {
+            object_name: "obj".to_string(),
+            version_id: Some(version),
+            ..Default::default()
+        };
+        assert_eq!(delete_replication_target_version_id(&purge, arn), Some(Some(version.to_string())));
     }
 }

@@ -18,7 +18,7 @@ use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
     NoncurrentVersionTransition, ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use time::macros::offset;
 use time::{self, Duration, OffsetDateTime};
@@ -65,6 +65,66 @@ const ERR_LIFECYCLE_EXPIRED_OBJECT_DELETE_MARKER_WITH_TAGS: &str =
     "Rule with ExpiredObjectDeleteMarker cannot have tags based filtering";
 const ERR_LIFECYCLE_RULE_MUST_HAVE_ACTION: &str = "Rule must have at least one of Expiration, Transition, NoncurrentVersionExpiration, NoncurrentVersionTransition, or DelMarkerExpiration";
 const ERR_LIFECYCLE_PREFIX_FILTER_CONFLICT: &str = "Legacy Prefix and Filter cannot both be present in a lifecycle rule. Use Filter.Prefix instead of the top-level Prefix element.";
+const ERR_LIFECYCLE_INVALID_NEWER_NONCURRENT_VERSIONS: &str = "'NewerNoncurrentVersions' must be a non-negative integer";
+const ERR_LIFECYCLE_FILTER_TOO_MANY_PREDICATES: &str =
+    "Filter must have at most one of Prefix, Tag, ObjectSizeGreaterThan, ObjectSizeLessThan or And; combine predicates with And";
+const ERR_LIFECYCLE_FILTER_AND_TOO_FEW_PREDICATES: &str = "Filter And must contain at least two predicates";
+const ERR_LIFECYCLE_FILTER_DUPLICATE_TAG_KEY: &str = "Filter must not repeat a tag key";
+const ERR_LIFECYCLE_FILTER_INVALID_TAG: &str = "Tag key must be 1-128 characters and tag value must be at most 256 characters";
+const ERR_LIFECYCLE_FILTER_NEGATIVE_SIZE: &str = "ObjectSizeGreaterThan and ObjectSizeLessThan must not be negative";
+const ERR_LIFECYCLE_FILTER_SIZE_RANGE: &str = "ObjectSizeGreaterThan must be smaller than ObjectSizeLessThan";
+/// Longest tag key S3 accepts.
+const MAX_TAG_KEY_LEN: usize = 128;
+/// Longest tag value S3 accepts.
+const MAX_TAG_VALUE_LEN: usize = 256;
+
+/// A validation failure that the S3 boundary must answer with `MalformedXML`
+/// rather than `InvalidArgument`: the document does not match the published
+/// schema shape (wrong number of `Filter` predicates, a one-member `And`).
+///
+/// Everything else stays [`std::io::ErrorKind::Other`], which the boundary
+/// already maps to `InvalidArgument`.
+pub const LIFECYCLE_MALFORMED_XML_ERROR_KIND: std::io::ErrorKind = std::io::ErrorKind::InvalidData;
+
+/// A persisted rule that could never have passed validation. Callers that can
+/// report an error surface it; evaluation itself stays fail-closed and takes
+/// no action for the rule.
+pub const LIFECYCLE_CORRUPT_RULE_ERROR_KIND: std::io::ErrorKind = std::io::ErrorKind::InvalidData;
+
+fn malformed_xml_error(message: &'static str) -> std::io::Error {
+    std::io::Error::new(LIFECYCLE_MALFORMED_XML_ERROR_KIND, message)
+}
+
+/// The retention count a rule keeps, or `None` when the persisted value is
+/// negative — a shape PUT validation rejects, so reaching it means the rule
+/// came from older persistence or an import.
+///
+/// A negative count must never be read as "retain everything": that is how an
+/// invalid configuration silently stopped deleting versions (backlog#2201).
+pub fn retained_noncurrent_versions(count: i32) -> Option<usize> {
+    usize::try_from(count).ok()
+}
+
+/// Does any rule carry a retention count that validation would have rejected?
+pub fn lifecycle_has_corrupt_retention_count(lc: &BucketLifecycleConfiguration) -> bool {
+    lc.rules.iter().any(rule_has_corrupt_retention_count)
+}
+
+fn rule_has_corrupt_retention_count(rule: &LifecycleRule) -> bool {
+    let expiration_count = rule
+        .noncurrent_version_expiration
+        .as_ref()
+        .and_then(|expiration| expiration.newer_noncurrent_versions);
+    let transition_counts = rule
+        .noncurrent_version_transitions
+        .iter()
+        .flatten()
+        .filter_map(|transition| transition.newer_noncurrent_versions);
+    expiration_count
+        .into_iter()
+        .chain(transition_counts)
+        .any(|count| retained_noncurrent_versions(count).is_none())
+}
 
 pub use rustfs_scanner_metrics::metrics::IlmAction;
 
@@ -141,6 +201,17 @@ impl RuleValidate for LifecycleRule {
             return Err(std::io::Error::other(ERR_LIFECYCLE_PREFIX_FILTER_CONFLICT));
         }
 
+        if let Some(filter) = self.filter.as_ref() {
+            validate_lifecycle_filter(filter)?;
+        }
+
+        // A negative retention count was accepted and then read as "retain
+        // (almost) everything" during evaluation, so an HTTP-accepted rule
+        // silently stopped deleting versions (backlog#2201).
+        if rule_has_corrupt_retention_count(self) {
+            return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_NEWER_NONCURRENT_VERSIONS));
+        }
+
         // Rule with DelMarkerExpiration cannot have tags based filtering
         let has_tag_filter = self
             .filter
@@ -173,11 +244,14 @@ impl RuleValidate for LifecycleRule {
         // Rule must have at least one action
         let has_expiration = self.expiration.is_some();
         let has_transition = self.transitions.as_ref().is_some_and(|t| !t.is_empty());
-        let has_noncurrent_expiration = self
-            .noncurrent_version_expiration
-            .as_ref()
-            .and_then(|e| e.noncurrent_days)
-            .is_some();
+        // `NewerNoncurrentVersions` on its own is a MinIO extension, not an AWS
+        // form: it keeps the newest N noncurrent versions and expires the rest
+        // with no age condition. RustFS accepts it for MinIO compatibility, so
+        // it has to count as an action here — otherwise a count-only rule was
+        // rejected as actionless (backlog#2201).
+        let has_noncurrent_expiration = self.noncurrent_version_expiration.as_ref().is_some_and(|expiration| {
+            expiration.noncurrent_days.is_some() || expiration.newer_noncurrent_versions.is_some_and(|count| count > 0)
+        });
         let has_noncurrent_transition = self
             .noncurrent_version_transitions
             .as_ref()
@@ -201,6 +275,81 @@ impl RuleValidate for LifecycleRule {
         }
         Ok(())
     }
+}
+
+/// Structural validation for `LifecycleRuleFilter`.
+///
+/// The generated DTO is all-`Option`, so the S3 schema constraints have to be
+/// checked here: at most one top-level predicate, an `And` that actually
+/// combines at least two, no repeated tag key, tag key/value limits, and a
+/// coherent non-negative size range (backlog#2201).
+///
+/// A filter with no predicate at all stays valid: AWS documents an empty
+/// `Filter` as "applies to every object in the bucket", and rejecting it would
+/// break the most common way to write an unconditional rule.
+fn validate_lifecycle_filter(filter: &LifecycleRuleFilter) -> Result<(), std::io::Error> {
+    let top_level_predicates = usize::from(filter.prefix.is_some())
+        + usize::from(filter.tag.is_some())
+        + usize::from(filter.object_size_greater_than.is_some())
+        + usize::from(filter.object_size_less_than.is_some())
+        + usize::from(filter.and.is_some());
+    if top_level_predicates > 1 {
+        return Err(malformed_xml_error(ERR_LIFECYCLE_FILTER_TOO_MANY_PREDICATES));
+    }
+
+    if let Some(tag) = filter.tag.as_ref() {
+        validate_lifecycle_tag(tag)?;
+    }
+
+    if let Some(and) = filter.and.as_ref() {
+        let tags = and.tags.as_deref().unwrap_or(&[]);
+        let and_predicates = usize::from(and.prefix.is_some())
+            + tags.len()
+            + usize::from(and.object_size_greater_than.is_some())
+            + usize::from(and.object_size_less_than.is_some());
+        if and_predicates < 2 {
+            return Err(malformed_xml_error(ERR_LIFECYCLE_FILTER_AND_TOO_FEW_PREDICATES));
+        }
+        let mut seen_keys = HashSet::with_capacity(tags.len());
+        for tag in tags {
+            validate_lifecycle_tag(tag)?;
+            let key = tag.key.as_deref().unwrap_or_default();
+            if !seen_keys.insert(key) {
+                return Err(std::io::Error::other(ERR_LIFECYCLE_FILTER_DUPLICATE_TAG_KEY));
+            }
+        }
+        validate_lifecycle_size_bounds(and.object_size_greater_than, and.object_size_less_than)?;
+    }
+
+    validate_lifecycle_size_bounds(filter.object_size_greater_than, filter.object_size_less_than)?;
+
+    Ok(())
+}
+
+/// S3 requires a tag to carry a key and value; both are length-bounded.
+/// The DTO makes both optional, so incomplete tags have to be rejected here
+/// rather than silently matching nothing.
+fn validate_lifecycle_tag(tag: &s3s::dto::Tag) -> Result<(), std::io::Error> {
+    let key = tag.key.as_deref().unwrap_or_default();
+    let Some(value) = tag.value.as_deref() else {
+        return Err(std::io::Error::other(ERR_LIFECYCLE_FILTER_INVALID_TAG));
+    };
+    if key.is_empty() || key.chars().count() > MAX_TAG_KEY_LEN || value.chars().count() > MAX_TAG_VALUE_LEN {
+        return Err(std::io::Error::other(ERR_LIFECYCLE_FILTER_INVALID_TAG));
+    }
+    Ok(())
+}
+
+fn validate_lifecycle_size_bounds(greater_than: Option<i64>, less_than: Option<i64>) -> Result<(), std::io::Error> {
+    if greater_than.is_some_and(|size| size < 0) || less_than.is_some_and(|size| size < 0) {
+        return Err(std::io::Error::other(ERR_LIFECYCLE_FILTER_NEGATIVE_SIZE));
+    }
+    if let (Some(greater_than), Some(less_than)) = (greater_than, less_than)
+        && greater_than >= less_than
+    {
+        return Err(std::io::Error::other(ERR_LIFECYCLE_FILTER_SIZE_RANGE));
+    }
+    Ok(())
 }
 
 fn lifecycle_rule_prefix(rule: &LifecycleRule) -> Option<&str> {
@@ -293,6 +442,10 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 {
                     return true;
                 }
+                // A positive count is an action on its own (the MinIO count-only
+                // form). Zero means "no count constraint" here, exactly as the
+                // batch limit path reads it, and a negative count is corrupt —
+                // neither makes the rule active (backlog#2201).
                 if let Some(newer_noncurrent_versions) = rule_noncurrent_version_expiration.newer_noncurrent_versions
                     && newer_noncurrent_versions > 0
                 {
@@ -563,6 +716,23 @@ impl Lifecycle for BucketLifecycleConfiguration {
 
         if let Some(ref lc_rules) = self.filter_rules(obj).await {
             for rule in lc_rules.iter() {
+                // A retention count that PUT validation would have rejected can
+                // only come from older persistence or an import. Take no action
+                // for the rule instead of allowing another action on the same
+                // corrupt rule to delete or transition an object (backlog#2201).
+                if rule_has_corrupt_retention_count(rule) {
+                    debug!(
+                        event = EVENT_LIFECYCLE_NONCURRENT_EXPIRY_SKIPPED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        object = %obj.name,
+                        rule_id = %rule.id.clone().unwrap_or_default(),
+                        reason = "corrupt_newer_noncurrent_versions",
+                        "Skipped lifecycle evaluation for a rule with an invalid retention count"
+                    );
+                    continue;
+                }
+
                 if obj.is_latest && obj.expired_object_deletemarker() {
                     if let Some(expiration) = rule.expiration.as_ref()
                         && expiration.expired_object_delete_marker.is_some_and(|v| v)
@@ -619,11 +789,18 @@ impl Lifecycle for BucketLifecycleConfiguration {
 
                 if !obj.is_latest
                     && let Some(ref noncurrent_version_expiration) = rule.noncurrent_version_expiration
-                    && let Some(noncurrent_days) = noncurrent_version_expiration.noncurrent_days
+                    && (noncurrent_version_expiration.noncurrent_days.is_some()
+                        || noncurrent_version_expiration
+                            .newer_noncurrent_versions
+                            .is_some_and(|count| count > 0))
                     && noncurrent_version_expiration
                         .newer_noncurrent_versions
                         .is_none_or(|retain| usize::try_from(retain).is_ok_and(|retain| newer_noncurrent_versions >= retain))
                 {
+                    // A count-only rule (MinIO extension) has no age condition:
+                    // every version past the retained count is due as soon as it
+                    // became noncurrent, i.e. zero days after the successor.
+                    let noncurrent_days = noncurrent_version_expiration.noncurrent_days.unwrap_or(0);
                     if let Some(successor_mod_time) = obj.successor_mod_time {
                         let expected_expiry = expected_expiry_time(successor_mod_time, noncurrent_days);
                         if now.unix_timestamp() >= expected_expiry.unix_timestamp() {
@@ -791,15 +968,18 @@ impl Lifecycle for BucketLifecycleConfiguration {
             for rule in filter_rules.iter() {
                 if let Some(ref noncurrent_version_expiration) = rule.noncurrent_version_expiration {
                     return if let Some(newer_noncurrent_versions) = noncurrent_version_expiration.newer_noncurrent_versions {
-                        if newer_noncurrent_versions == 0 {
+                        // Zero means "no count constraint"; a negative count is
+                        // corrupt and must not be read as "retain everything"
+                        // (backlog#2201). Neither yields a limit event.
+                        let Some(retained) = retained_noncurrent_versions(newer_noncurrent_versions).filter(|c| *c > 0) else {
                             continue;
-                        }
+                        };
                         Event {
                             action: IlmAction::DeleteVersionAction,
                             rule_id: rule.id.clone().unwrap_or_default(),
                             noncurrent_days: u32::try_from(noncurrent_version_expiration.noncurrent_days.unwrap_or(0))
                                 .unwrap_or(u32::MAX),
-                            newer_noncurrent_versions: usize::try_from(newer_noncurrent_versions).unwrap_or(usize::MAX),
+                            newer_noncurrent_versions: retained,
                             due: Some(OffsetDateTime::UNIX_EPOCH),
                             storage_class: "".into(),
                         }
@@ -1162,7 +1342,11 @@ mod tests {
     use super::*;
     use metrics_util::MetricKind;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-    use s3s::dto::{LifecycleRuleFilter, TransitionStorageClass};
+    use s3s::dto::{
+        LifecycleRuleAndOperator, LifecycleRuleFilter, NoncurrentVersionExpiration, NoncurrentVersionTransition,
+        TransitionStorageClass,
+    };
+    use s3s::xml::{Deserialize as XmlDeserialize, SerializeContent as XmlSerializeContent};
     use serial_test::serial;
     use std::sync::Arc;
     use time::macros::datetime;
@@ -4181,6 +4365,583 @@ mod tests {
         };
         let event = lc.eval_inner(&current, now, 0).await;
         assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
+    // ---- backlog#2201: retention-count and Filter invariants -----------------
+
+    fn rule_with_noncurrent_expiration(expiration: NoncurrentVersionExpiration) -> LifecycleRule {
+        LifecycleRule {
+            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            expiration: None,
+            abort_incomplete_multipart_upload: None,
+            del_marker_expiration: None,
+            filter: None,
+            id: Some("noncurrent".to_string()),
+            noncurrent_version_expiration: Some(expiration),
+            noncurrent_version_transitions: None,
+            prefix: None,
+            transitions: None,
+        }
+    }
+
+    fn rule_with_filter(filter: LifecycleRuleFilter) -> LifecycleRule {
+        LifecycleRule {
+            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            expiration: Some(LifecycleExpiration {
+                days: Some(1),
+                ..Default::default()
+            }),
+            abort_incomplete_multipart_upload: None,
+            del_marker_expiration: None,
+            filter: Some(filter),
+            id: Some("filtered".to_string()),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            prefix: None,
+            transitions: None,
+        }
+    }
+
+    fn config_with_rules(rules: Vec<LifecycleRule>) -> BucketLifecycleConfiguration {
+        BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules,
+        }
+    }
+
+    fn tag(key: &str, value: &str) -> s3s::dto::Tag {
+        s3s::dto::Tag {
+            key: Some(key.to_string()),
+            value: Some(value.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_negative_newer_noncurrent_versions() {
+        // A negative retention count used to be accepted and then read as
+        // usize::MAX during evaluation, so the rule silently stopped deleting
+        // versions (backlog#2201).
+        let lc = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: Some(30),
+            newer_noncurrent_versions: Some(-1),
+        })]);
+
+        let err = lc
+            .validate(&ObjectLockConfiguration::default())
+            .await
+            .expect_err("a negative retention count must be rejected");
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_NEWER_NONCURRENT_VERSIONS);
+        assert_ne!(err.kind(), LIFECYCLE_MALFORMED_XML_ERROR_KIND, "value errors stay InvalidArgument");
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_negative_newer_noncurrent_versions_on_transition() {
+        let mut rule = rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: Some(30),
+            newer_noncurrent_versions: None,
+        });
+        rule.noncurrent_version_transitions = Some(vec![NoncurrentVersionTransition {
+            newer_noncurrent_versions: Some(-3),
+            noncurrent_days: Some(1),
+            storage_class: Some(TransitionStorageClass::from_static(TransitionStorageClass::GLACIER)),
+        }]);
+
+        // The transition validator already refuses a negative count, and it runs
+        // first, so this pins the rejection rather than the message. The gap
+        // this PR closes is the expiration side, which had no such check.
+        config_with_rules(vec![rule])
+            .validate(&ObjectLockConfiguration::default())
+            .await
+            .expect_err("a negative retention count on a transition must be rejected");
+    }
+
+    #[tokio::test]
+    async fn zero_newer_noncurrent_versions_means_no_count_constraint() {
+        // Zero carries no constraint, matching how the batch limit path has
+        // always read it. Alongside an age condition the rule is valid; on its
+        // own it says nothing, so the rule has no action.
+        config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: Some(30),
+            newer_noncurrent_versions: Some(0),
+        })])
+        .validate(&ObjectLockConfiguration::default())
+        .await
+        .expect("zero count alongside NoncurrentDays is valid");
+
+        let err = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: None,
+            newer_noncurrent_versions: Some(0),
+        })])
+        .validate(&ObjectLockConfiguration::default())
+        .await
+        .expect_err("a zero count on its own is not an action");
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_RULE_MUST_HAVE_ACTION);
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_count_only_noncurrent_expiration() {
+        // MinIO extension: NewerNoncurrentVersions with no NoncurrentDays. It
+        // used to be rejected as an actionless rule (backlog#2201).
+        let lc = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: None,
+            newer_noncurrent_versions: Some(2),
+        })]);
+
+        lc.validate(&ObjectLockConfiguration::default())
+            .await
+            .expect("a count-only noncurrent expiration rule is accepted");
+    }
+
+    #[tokio::test]
+    async fn eval_inner_expires_versions_beyond_count_only_retention() {
+        // Count-only rules have no age condition: everything past the retained
+        // count is due as soon as it became noncurrent.
+        let lc = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: None,
+            newer_noncurrent_versions: Some(2),
+        })]);
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(datetime!(2025-01-15 10:30:45 UTC)),
+            successor_mod_time: Some(datetime!(2025-01-15 10:30:45 UTC)),
+            is_latest: false,
+            num_versions: 5,
+            ..Default::default()
+        };
+
+        // Rank 2 is the third-newest noncurrent version: past a retention of 2.
+        let expired = lc.eval_inner(&opts, datetime!(2025-01-15 10:30:46 UTC), 2).await;
+        assert_eq!(expired.action, IlmAction::DeleteVersionAction);
+        assert_eq!(expired.rule_id, "noncurrent");
+
+        // Rank 1 is still within the retained count.
+        let retained = lc.eval_inner(&opts, datetime!(2025-01-15 10:30:46 UTC), 1).await;
+        assert_eq!(retained.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn eval_inner_keeps_age_condition_when_count_and_days_are_set() {
+        // With both set, the count gates which versions are candidates and the
+        // age condition still decides when they are due.
+        with_default_ilm_process_time(|| {});
+        let lc = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: Some(10),
+            newer_noncurrent_versions: Some(1),
+        })]);
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(datetime!(2025-01-01 00:00:00 UTC)),
+            successor_mod_time: Some(datetime!(2025-01-01 00:00:00 UTC)),
+            is_latest: false,
+            num_versions: 3,
+            ..Default::default()
+        };
+
+        let too_young = lc.eval_inner(&opts, datetime!(2025-01-05 00:00:00 UTC), 2).await;
+        assert_eq!(too_young.action, IlmAction::NoneAction, "the age condition still applies");
+
+        let due = lc.eval_inner(&opts, datetime!(2025-01-20 00:00:00 UTC), 2).await;
+        assert_eq!(due.action, IlmAction::DeleteVersionAction);
+    }
+
+    #[tokio::test]
+    async fn eval_inner_takes_no_action_for_a_corrupt_retention_count() {
+        // Reachable only from older persistence or an import; it must not be
+        // read as "retain everything", and it must not delete either.
+        let lc = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: Some(1),
+            newer_noncurrent_versions: Some(-1),
+        })]);
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(datetime!(2025-01-01 00:00:00 UTC)),
+            successor_mod_time: Some(datetime!(2025-01-01 00:00:00 UTC)),
+            is_latest: false,
+            num_versions: 3,
+            ..Default::default()
+        };
+
+        let event = lc.eval_inner(&opts, datetime!(2025-06-01 00:00:00 UTC), 2).await;
+
+        assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    async fn eval_inner_does_not_expire_latest_object_for_a_corrupt_retention_rule() {
+        let mut rule = rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: Some(1),
+            newer_noncurrent_versions: Some(-1),
+        });
+        rule.expiration = Some(LifecycleExpiration {
+            days: Some(1),
+            ..Default::default()
+        });
+        let lc = config_with_rules(vec![rule]);
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(datetime!(2025-01-01 00:00:00 UTC)),
+            is_latest: true,
+            ..Default::default()
+        };
+
+        let event = lc.eval_inner(&opts, datetime!(2025-06-01 00:00:00 UTC), 0).await;
+
+        assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    async fn eval_inner_does_not_delete_latest_marker_for_a_corrupt_retention_rule() {
+        let mut expired_marker_rule = rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: Some(1),
+            newer_noncurrent_versions: Some(-1),
+        });
+        expired_marker_rule.expiration = Some(LifecycleExpiration {
+            expired_object_delete_marker: Some(true),
+            ..Default::default()
+        });
+
+        let mut aged_marker_rule = rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: Some(1),
+            newer_noncurrent_versions: Some(-1),
+        });
+        aged_marker_rule.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(1) });
+
+        for rule in [expired_marker_rule, aged_marker_rule] {
+            let lc = config_with_rules(vec![rule]);
+            let opts = ObjectOpts {
+                name: "obj".to_string(),
+                mod_time: Some(datetime!(2025-01-01 00:00:00 UTC)),
+                version_id: Some(Uuid::new_v4()),
+                is_latest: true,
+                delete_marker: true,
+                num_versions: 1,
+                ..Default::default()
+            };
+
+            let event = lc.eval_inner(&opts, datetime!(2025-06-01 00:00:00 UTC), 0).await;
+
+            assert_eq!(event.action, IlmAction::NoneAction);
+        }
+    }
+
+    #[test]
+    fn corrupt_retention_count_is_detected_on_either_action() {
+        let mut transition_rule = rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: Some(1),
+            newer_noncurrent_versions: Some(0),
+        });
+        transition_rule.noncurrent_version_transitions = Some(vec![NoncurrentVersionTransition {
+            newer_noncurrent_versions: Some(-1),
+            noncurrent_days: Some(1),
+            storage_class: Some(TransitionStorageClass::from_static(TransitionStorageClass::GLACIER)),
+        }]);
+
+        assert!(lifecycle_has_corrupt_retention_count(&config_with_rules(vec![
+            rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+                noncurrent_days: Some(1),
+                newer_noncurrent_versions: Some(-1),
+            })
+        ])));
+        assert!(lifecycle_has_corrupt_retention_count(&config_with_rules(vec![transition_rule])));
+        assert!(!lifecycle_has_corrupt_retention_count(&config_with_rules(vec![
+            rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+                noncurrent_days: Some(1),
+                newer_noncurrent_versions: Some(3),
+            })
+        ])));
+    }
+
+    #[test]
+    fn count_only_rules_are_active_only_for_a_positive_count() {
+        let positive = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: None,
+            newer_noncurrent_versions: Some(2),
+        })]);
+        assert!(positive.has_active_rules(""));
+
+        let corrupt = config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: None,
+            newer_noncurrent_versions: Some(-1),
+        })]);
+        assert!(!corrupt.has_active_rules(""), "a corrupt retention count must not make a rule active");
+    }
+
+    #[tokio::test]
+    async fn noncurrent_versions_expiration_limit_ignores_a_corrupt_count() {
+        // The batch path must not read a negative count as "retain everything".
+        let lc = Arc::new(config_with_rules(vec![rule_with_noncurrent_expiration(NoncurrentVersionExpiration {
+            noncurrent_days: Some(1),
+            newer_noncurrent_versions: Some(-1),
+        })]));
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(datetime!(2025-01-01 00:00:00 UTC)),
+            is_latest: false,
+            ..Default::default()
+        };
+
+        let event = lc.noncurrent_versions_expiration_limit(&opts).await;
+
+        assert_eq!(event.action, IlmAction::NoneAction);
+        assert_eq!(event.newer_noncurrent_versions, 0);
+    }
+
+    #[tokio::test]
+    async fn validate_covers_filter_invariants() {
+        struct Case {
+            name: &'static str,
+            filter: LifecycleRuleFilter,
+            expected: Option<(&'static str, std::io::ErrorKind)>,
+        }
+
+        let cases = vec![
+            Case {
+                // AWS documents an empty Filter as "every object in the bucket".
+                name: "empty filter applies to all objects",
+                filter: LifecycleRuleFilter::default(),
+                expected: None,
+            },
+            Case {
+                name: "single prefix predicate",
+                filter: LifecycleRuleFilter {
+                    prefix: Some("logs/".to_string()),
+                    ..Default::default()
+                },
+                expected: None,
+            },
+            Case {
+                name: "two top-level predicates",
+                filter: LifecycleRuleFilter {
+                    prefix: Some("logs/".to_string()),
+                    tag: Some(tag("env", "prod")),
+                    ..Default::default()
+                },
+                expected: Some((ERR_LIFECYCLE_FILTER_TOO_MANY_PREDICATES, LIFECYCLE_MALFORMED_XML_ERROR_KIND)),
+            },
+            Case {
+                name: "prefix alongside And",
+                filter: LifecycleRuleFilter {
+                    prefix: Some("logs/".to_string()),
+                    and: Some(LifecycleRuleAndOperator {
+                        prefix: Some("logs/".to_string()),
+                        tags: Some(vec![tag("env", "prod")]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                expected: Some((ERR_LIFECYCLE_FILTER_TOO_MANY_PREDICATES, LIFECYCLE_MALFORMED_XML_ERROR_KIND)),
+            },
+            Case {
+                name: "And with a single member",
+                filter: LifecycleRuleFilter {
+                    and: Some(LifecycleRuleAndOperator {
+                        prefix: Some("logs/".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                expected: Some((ERR_LIFECYCLE_FILTER_AND_TOO_FEW_PREDICATES, LIFECYCLE_MALFORMED_XML_ERROR_KIND)),
+            },
+            Case {
+                name: "And with two members",
+                filter: LifecycleRuleFilter {
+                    and: Some(LifecycleRuleAndOperator {
+                        prefix: Some("logs/".to_string()),
+                        tags: Some(vec![tag("env", "prod")]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                expected: None,
+            },
+            Case {
+                name: "And with two tags",
+                filter: LifecycleRuleFilter {
+                    and: Some(LifecycleRuleAndOperator {
+                        tags: Some(vec![tag("env", "prod"), tag("team", "storage")]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                expected: None,
+            },
+            Case {
+                name: "And repeating a tag key",
+                filter: LifecycleRuleFilter {
+                    and: Some(LifecycleRuleAndOperator {
+                        tags: Some(vec![tag("env", "prod"), tag("env", "dev")]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                expected: Some((ERR_LIFECYCLE_FILTER_DUPLICATE_TAG_KEY, std::io::ErrorKind::Other)),
+            },
+            Case {
+                name: "empty tag key",
+                filter: LifecycleRuleFilter {
+                    tag: Some(tag("", "prod")),
+                    ..Default::default()
+                },
+                expected: Some((ERR_LIFECYCLE_FILTER_INVALID_TAG, std::io::ErrorKind::Other)),
+            },
+            Case {
+                name: "missing tag key",
+                filter: LifecycleRuleFilter {
+                    tag: Some(s3s::dto::Tag {
+                        key: None,
+                        value: Some("prod".to_string()),
+                    }),
+                    ..Default::default()
+                },
+                expected: Some((ERR_LIFECYCLE_FILTER_INVALID_TAG, std::io::ErrorKind::Other)),
+            },
+            Case {
+                name: "missing tag value",
+                filter: LifecycleRuleFilter {
+                    tag: Some(s3s::dto::Tag {
+                        key: Some("env".to_string()),
+                        value: None,
+                    }),
+                    ..Default::default()
+                },
+                expected: Some((ERR_LIFECYCLE_FILTER_INVALID_TAG, std::io::ErrorKind::Other)),
+            },
+            Case {
+                name: "empty tag value",
+                filter: LifecycleRuleFilter {
+                    tag: Some(tag("env", "")),
+                    ..Default::default()
+                },
+                expected: None,
+            },
+            Case {
+                name: "tag key at the limit",
+                filter: LifecycleRuleFilter {
+                    tag: Some(tag(&"k".repeat(MAX_TAG_KEY_LEN), "prod")),
+                    ..Default::default()
+                },
+                expected: None,
+            },
+            Case {
+                name: "tag key past the limit",
+                filter: LifecycleRuleFilter {
+                    tag: Some(tag(&"k".repeat(MAX_TAG_KEY_LEN + 1), "prod")),
+                    ..Default::default()
+                },
+                expected: Some((ERR_LIFECYCLE_FILTER_INVALID_TAG, std::io::ErrorKind::Other)),
+            },
+            Case {
+                name: "tag value past the limit",
+                filter: LifecycleRuleFilter {
+                    tag: Some(tag("env", &"v".repeat(MAX_TAG_VALUE_LEN + 1))),
+                    ..Default::default()
+                },
+                expected: Some((ERR_LIFECYCLE_FILTER_INVALID_TAG, std::io::ErrorKind::Other)),
+            },
+            Case {
+                name: "negative ObjectSizeGreaterThan",
+                filter: LifecycleRuleFilter {
+                    object_size_greater_than: Some(-1),
+                    ..Default::default()
+                },
+                expected: Some((ERR_LIFECYCLE_FILTER_NEGATIVE_SIZE, std::io::ErrorKind::Other)),
+            },
+            Case {
+                name: "negative ObjectSizeLessThan",
+                filter: LifecycleRuleFilter {
+                    object_size_less_than: Some(-5),
+                    ..Default::default()
+                },
+                expected: Some((ERR_LIFECYCLE_FILTER_NEGATIVE_SIZE, std::io::ErrorKind::Other)),
+            },
+            Case {
+                name: "inverted size range inside And",
+                filter: LifecycleRuleFilter {
+                    and: Some(LifecycleRuleAndOperator {
+                        object_size_greater_than: Some(100),
+                        object_size_less_than: Some(100),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                expected: Some((ERR_LIFECYCLE_FILTER_SIZE_RANGE, std::io::ErrorKind::Other)),
+            },
+            Case {
+                name: "valid size range inside And",
+                filter: LifecycleRuleFilter {
+                    and: Some(LifecycleRuleAndOperator {
+                        object_size_greater_than: Some(1),
+                        object_size_less_than: Some(2),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                expected: None,
+            },
+        ];
+
+        for case in cases {
+            let result = config_with_rules(vec![rule_with_filter(case.filter)])
+                .validate(&ObjectLockConfiguration::default())
+                .await;
+            match (case.expected, result) {
+                (None, Ok(())) => {}
+                (None, Err(err)) => panic!("{}: expected acceptance, got {err}", case.name),
+                (Some((message, _)), Ok(())) => panic!("{}: expected rejection with {message}", case.name),
+                (Some((message, kind)), Err(err)) => {
+                    assert_eq!(err.to_string(), message, "{}", case.name);
+                    assert_eq!(err.kind(), kind, "{}: wrong S3 error category", case.name);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_keeps_legacy_prefix_and_filter_mutually_exclusive() {
+        let mut rule = rule_with_filter(LifecycleRuleFilter {
+            prefix: Some("logs/".to_string()),
+            ..Default::default()
+        });
+        rule.prefix = Some("legacy/".to_string());
+
+        let err = config_with_rules(vec![rule])
+            .validate(&ObjectLockConfiguration::default())
+            .await
+            .expect_err("legacy Prefix and Filter cannot both be present");
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_PREFIX_FILTER_CONFLICT);
+    }
+
+    #[test]
+    fn count_only_rule_round_trips_through_xml() {
+        // The MinIO count-only form has to survive the wire codec, or the rule
+        // this PR now accepts could not be persisted and read back.
+        let xml = br#"<LifecycleConfiguration><Rule><ID>count-only</ID><Status>Enabled</Status><Filter></Filter><NoncurrentVersionExpiration><NewerNoncurrentVersions>2</NewerNoncurrentVersions></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>"#;
+        let mut deserializer = s3s::xml::Deserializer::new(xml);
+        let parsed =
+            <BucketLifecycleConfiguration as XmlDeserialize>::deserialize(&mut deserializer).expect("count-only XML parses");
+
+        let expiration = parsed.rules[0]
+            .noncurrent_version_expiration
+            .as_ref()
+            .expect("noncurrent expiration is present");
+        assert_eq!(expiration.newer_noncurrent_versions, Some(2));
+        assert_eq!(expiration.noncurrent_days, None);
+
+        let mut buf = Vec::new();
+        let mut serializer = s3s::xml::Serializer::new(&mut buf);
+        XmlSerializeContent::serialize_content(&parsed, &mut serializer).expect("count-only config serializes");
+        let serialized = String::from_utf8(buf).expect("serialized XML is UTF-8");
+        assert!(
+            serialized.contains("<NewerNoncurrentVersions>2</NewerNoncurrentVersions>"),
+            "retention count survives the round trip: {serialized}"
+        );
+        assert!(
+            !serialized.contains("<NoncurrentDays>"),
+            "a count-only rule must not gain an age condition: {serialized}"
+        );
     }
 
     mod adversarial_regressions {

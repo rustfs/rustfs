@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "cases": {
+    "background-target-restart": {
+      "gate": "G14",
+      "task": "W21",
+      "lane": "e2e-nightly",
+      "suite": "e2e_test",
+      "name": "heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_remote_shards_after_background_target_restart",
+      "oracle": "background-target-restart.json",
+      "min_objects": 9,
+      "max_objects": 65,
+      "topology": {"nodes": 4, "drives_per_node": 1},
+      "scope": "Target process restart, exact unversioned S3 bodies and replacement-disk shards; not power loss or EC8+4."
+    }
+  },
+  "release_pending": {
+    "G01": "W02/W04 complete root and quota authority coverage",
+    "G02": "W03 bounded checkpoint progress and independent version inventory",
+    "G03": "W17/W18 exact scoped ACK with durable publication and mixed peers",
+    "G04": "W03/W15/W16 crash at every cache/root/floor/intent boundary",
+    "G05": "W06/W07 per-object outcomes and bounded terminal retention",
+    "G06": "W06/W08/W23 concurrent status, legacy clients and truncation",
+    "G07": "W12/W13/W14 durable MRF responsibility at every commit boundary",
+    "G08": "W12/W13/W14 MRF capacity, disk-full and replica-loss matrix",
+    "G09": "W13/W18/W23 actual mixed-version reader/writer and rollback payloads",
+    "G10": "W05/W09/W10/W11 bounded scheduling and pressure recovery",
+    "G11": "W04/W19/W24 maintenance and complete producer coverage",
+    "G12": "W02/W15/W16 both quota paths during reset and settlement",
+    "G13": "W07/W14 quorum-minus-one, unknown disks, remount, Object Lock, dry-run, grace and commit tail",
+    "G14": "W20/W21 same-window field evidence; 3x4 EC8+4 and multi-set/pool coverage",
+    "P1": "W20 measured cold-walk share and foreground latency/throughput",
+    "P2": "W20/W24 measured post-stop convergence and cold segment reuse",
+    "P3": "W20 measured two-hour pressure/heal capacity and recovery window",
+    "P4": "W20 measured MRF scale and replay cost with retained responsibility",
+    "R-E": "W03/W05 fixed-budget real process restart through enumeration and classification",
+    "R-D": "W07/W14 manager-to-event-to-ledger exact disposition, including grace",
+    "R-L": "W13/W14 legacy source conflicts, migration gaps and crash-safe source retirement"
+  }
+}

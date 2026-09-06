@@ -398,6 +398,12 @@ pub(crate) mod bucket {
 
                 lc.validate(lock_config).await
             }
+
+            /// The `std::io::ErrorKind` [`validate_lifecycle_config`] uses for a
+            /// lifecycle document that violates the published schema shape, which
+            /// the S3 boundary answers with `MalformedXML` (backlog#2201).
+            pub(crate) const LIFECYCLE_MALFORMED_XML_ERROR_KIND: std::io::ErrorKind =
+                crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::LIFECYCLE_MALFORMED_XML_ERROR_KIND;
         }
 
         pub(crate) mod lifecycle_contract {
@@ -712,6 +718,8 @@ pub(crate) mod bucket {
                     delete_marker_version_id: None,
                     delete_marker: false,
                     delete_marker_mtime: None,
+                    target_delete_marker_version_ids: Default::default(),
+                    target_delete_marker_version_ids_corrupt: false,
                     target_arns,
                     force_delete_id: Some(operation_id),
                     force_delete_generation: Some(i64::try_from(generation.unix_timestamp_nanos()).unwrap_or(i64::MAX)),

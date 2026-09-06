@@ -234,9 +234,9 @@ impl SiteReplicationRepairTask<'_> {
 
     pub(crate) fn id(&self) -> S3Result<String> {
         let payload = match self {
-            Self::Iam(item) => serde_json::to_vec(item),
+            Self::Iam(item) => canonical_json_vec(item),
             Self::BucketMake(_) | Self::Replication(_) => serde_json::to_vec(&serde_json::json!({})),
-            Self::BucketMetadata(item) => serde_json::to_vec(item),
+            Self::BucketMetadata(item) => canonical_json_vec(item),
         }
         .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize repair task failed: {err}")))?;
         let mut digest = Sha256::new();
@@ -726,7 +726,7 @@ pub(crate) async fn execute_site_replication_repair_locked(
         return Err(s3_error!(InvalidRequest, "site replication is not configured"));
     }
     let info = build_sr_info(&state, &request.local_peer).await?;
-    let plan = site_replication_bootstrap_plan(&info)?;
+    let plan = build_site_replication_bootstrap_plan(&info).await?;
     let plan_token = site_replication_repair_plan_token(&state, &plan)?;
     let preflight_token = site_replication_repair_preflight_token(&state, &plan, request.signing_key.as_bytes())?;
     let sites = site_replication_repair_sites(&state, &request.local_peer, &plan, request.signing_key.as_bytes())?;

@@ -167,6 +167,13 @@ pub struct HealTaskStatus {
     /// Live progress snapshot; the exact shape is owned by the heal runtime.
     #[serde(default)]
     pub progress: Option<serde_json::Value>,
+    /// Canonical heal-owner result. Missing or future states are not repair proof.
+    #[serde(default)]
+    pub outcome: Option<serde_json::Value>,
+    #[serde(default, alias = "next_seq")]
+    pub next_seq: Option<u64>,
+    #[serde(default, alias = "min_seq")]
+    pub min_seq: Option<u64>,
 }
 
 /// `POST /v3/background-heal/status` response. Known top-level fields are
@@ -358,8 +365,22 @@ impl AdminClient {
         prefix: Option<&str>,
         client_token: &str,
     ) -> Result<HealTaskStatus, AdminClientError> {
-        self.post_json(&heal_path(bucket, prefix), &[("clientToken", client_token.to_string())], Vec::new())
-            .await
+        self.heal_status_since(bucket, prefix, client_token, None).await
+    }
+
+    /// Query a retained result window. Missing cursors and outcome remain unknown.
+    pub async fn heal_status_since(
+        &self,
+        bucket: Option<&str>,
+        prefix: Option<&str>,
+        client_token: &str,
+        since_seq: Option<u64>,
+    ) -> Result<HealTaskStatus, AdminClientError> {
+        let mut query = vec![("clientToken", client_token.to_string())];
+        if let Some(since_seq) = since_seq {
+            query.push(("sinceSeq", since_seq.to_string()));
+        }
+        self.post_json(&heal_path(bucket, prefix), &query, Vec::new()).await
     }
 
     /// Stop a heal: with a `client_token` only that task is cancelled and its
@@ -378,7 +399,7 @@ impl AdminClient {
         match client_token {
             Some(_) => {
                 let status: HealTaskStatus = self.post_json(&heal_path(bucket, prefix), &query, Vec::new()).await?;
-                Ok(HealStopOutcome::Stopped(status))
+                Ok(HealStopOutcome::Stopped(Box::new(status)))
             }
             None => {
                 let success: HealStartSuccess = self.post_json(&heal_path(bucket, prefix), &query, Vec::new()).await?;
@@ -533,7 +554,7 @@ impl AdminClient {
 /// start-success-shaped receipt.
 #[derive(Debug, Clone)]
 pub enum HealStopOutcome {
-    Stopped(HealTaskStatus),
+    Stopped(Box<HealTaskStatus>),
     PathStopped(HealStartSuccess),
 }
 
@@ -633,6 +654,24 @@ mod tests {
         assert_eq!(status.items.len(), 1);
         assert_eq!(status.settings.scan_mode, HealScanMode::Normal);
         assert!(status.progress.is_none());
+    }
+
+    #[test]
+    fn outcome_v3_decoder_preserves_canonical_unknown_and_future_fields() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/heal-outcome-v3.json")).expect("shared fixtures");
+        for case in cases.as_array().expect("cases") {
+            let status: HealTaskStatus = serde_json::from_value(case["response"].clone()).expect("optional outcome response");
+            assert_eq!(status.outcome.as_ref(), Some(&case["response"]["outcome"]));
+            assert_eq!((status.next_seq, status.min_seq), (Some(9), Some(4)));
+            assert!(status.truncated);
+        }
+        let old: HealTaskStatus = serde_json::from_value(json!({"summary":"finished"})).expect("legacy response");
+        assert!(old.outcome.is_none() && old.next_seq.is_none() && old.min_seq.is_none());
+        let future = json!({"execution":{"state":"future_state"},"newField":7});
+        let status: HealTaskStatus =
+            serde_json::from_value(json!({"summary":"running","outcome":future})).expect("future outcome remains opaque");
+        assert_eq!(status.outcome, Some(future));
     }
 
     #[test]
@@ -751,6 +790,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outcome_v3_since_query_preserves_cursor_and_never_sends_force_start() {
+        let server = TestServer::spawn(
+            r#"{"summary":"running","nextSeq":9,"minSeq":4,"truncated":true,"outcome":{"execution":{"state":"future_state"}}}"#,
+            200,
+        )
+        .await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").expect("test client");
+        let status = client
+            .heal_status_since(Some("bucket"), None, "token-1", Some(3))
+            .await
+            .expect("window response");
+        assert_eq!((status.next_seq, status.min_seq), (Some(9), Some(4)));
+        assert!(status.truncated);
+        assert_eq!(status.outcome.expect("future state is preserved")["execution"]["state"], "future_state");
+        let request = server.recorded();
+        assert!(request.query.contains("sinceSeq=3") && request.query.contains("clientToken=token-1"));
+        assert!(!request.query.contains("forceStart") && !request.query.contains("forceStop"));
+    }
+
+    #[tokio::test]
     async fn stop_without_token_takes_the_path_cancel_branch() {
         let server = TestServer::spawn(r#"{"clientToken":"path","clientAddress":"c","startTime":"t"}"#, 200).await;
         let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
@@ -760,6 +819,25 @@ mod tests {
         let request = server.recorded();
         assert!(request.query.contains("forceStop=true"));
         assert!(!request.query.contains("clientToken"));
+    }
+
+    #[tokio::test]
+    async fn stop_with_token_decodes_boxed_task_status() {
+        let body = r#"{"summary":"stopped","detail":"","settings":{"recursive":false},"items":[],"truncated":false}"#;
+        let server = TestServer::spawn(body, 200).await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+
+        let outcome = client
+            .heal_stop(Some("bucket"), None, Some("token-1"))
+            .await
+            .expect("token stop decodes");
+        let super::HealStopOutcome::Stopped(status) = outcome else {
+            panic!("token stop should return task status");
+        };
+        assert_eq!(status.summary, "stopped");
+        let request = server.recorded();
+        assert!(request.query.contains("forceStop=true"));
+        assert!(request.query.contains("clientToken=token-1"));
     }
 
     #[tokio::test]

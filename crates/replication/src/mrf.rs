@@ -31,8 +31,13 @@ const CAPABILITY_OPERATION_KIND: u64 = 1 << 0;
 const CAPABILITY_TARGET_ARNS: u64 = 1 << 1;
 const CAPABILITY_FORCE_DELETE: u64 = 1 << 2;
 const CAPABILITY_DELETE_MARKER_MTIME: u64 = 1 << 3;
-const MRF_KNOWN_CAPABILITIES: u64 =
-    CAPABILITY_OPERATION_KIND | CAPABILITY_TARGET_ARNS | CAPABILITY_FORCE_DELETE | CAPABILITY_DELETE_MARKER_MTIME;
+// Per-ARN target-assigned delete-marker version ids on purge intents (backlog#2290).
+const CAPABILITY_TARGET_DELETE_MARKER_VERSION_IDS: u64 = 1 << 4;
+const MRF_KNOWN_CAPABILITIES: u64 = CAPABILITY_OPERATION_KIND
+    | CAPABILITY_TARGET_ARNS
+    | CAPABILITY_FORCE_DELETE
+    | CAPABILITY_DELETE_MARKER_MTIME
+    | CAPABILITY_TARGET_DELETE_MARKER_VERSION_IDS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MrfCapability {
@@ -40,6 +45,7 @@ pub enum MrfCapability {
     TargetArns,
     ForceDelete,
     DeleteMarkerMtime,
+    TargetDeleteMarkerVersionIds,
 }
 
 impl MrfCapability {
@@ -49,6 +55,7 @@ impl MrfCapability {
             Self::TargetArns => CAPABILITY_TARGET_ARNS,
             Self::ForceDelete => CAPABILITY_FORCE_DELETE,
             Self::DeleteMarkerMtime => CAPABILITY_DELETE_MARKER_MTIME,
+            Self::TargetDeleteMarkerVersionIds => CAPABILITY_TARGET_DELETE_MARKER_VERSION_IDS,
         }
     }
 }
@@ -601,9 +608,17 @@ pub fn decode_mrf_file(data: &[u8]) -> Result<Vec<MrfReplicateEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use uuid::Uuid;
 
+    // Capability word 31 = OperationKind | TargetArns | ForceDelete | DeleteMarkerMtime |
+    // TargetDeleteMarkerVersionIds (backlog#2290).
     const ENVELOPE_FIXTURE: &[u8] = &[
+        b'M', b'R', b'F', b'E', 1, 0, 1, 0, 1, 0, 0, 0, 31, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 2, 3,
+    ];
+
+    // The envelope a binary from before backlog#2290 writes: same header, capability word 15.
+    const PRE_TARGET_MARKER_IDS_ENVELOPE_FIXTURE: &[u8] = &[
         b'M', b'R', b'F', b'E', 1, 0, 1, 0, 1, 0, 0, 0, 15, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 2, 3,
     ];
 
@@ -626,6 +641,8 @@ mod tests {
                 delete_marker_version_id: None,
                 delete_marker: false,
                 delete_marker_mtime: None,
+                target_delete_marker_version_ids: HashMap::new(),
+                target_delete_marker_version_ids_corrupt: false,
                 target_arns: vec!["arn:target-a".to_string()],
             },
             MrfReplicateEntry {
@@ -642,6 +659,8 @@ mod tests {
                 delete_marker_version_id: None,
                 delete_marker: false,
                 delete_marker_mtime: None,
+                target_delete_marker_version_ids: HashMap::new(),
+                target_delete_marker_version_ids_corrupt: false,
                 target_arns: vec!["arn:target-a".to_string(), "arn:target-b".to_string()],
             },
             MrfReplicateEntry {
@@ -658,6 +677,11 @@ mod tests {
                 delete_marker_version_id: Some(del_vid),
                 delete_marker: true,
                 delete_marker_mtime: Some(1_705_312_200_123_456_789),
+                target_delete_marker_version_ids: HashMap::from([
+                    ("arn:target-a".to_string(), "remote-marker-a".to_string()),
+                    ("arn:target-b".to_string(), "remote-marker-b".to_string()),
+                ]),
+                target_delete_marker_version_ids_corrupt: false,
                 target_arns: vec!["arn:target-a".to_string()],
             },
         ];
@@ -685,6 +709,54 @@ mod tests {
             Some(1_705_312_200_123_456_789),
             "delete-marker mtime must survive the MRF disk round-trip"
         );
+        assert!(decoded[0].target_delete_marker_version_ids.is_empty());
+        assert!(decoded[1].target_delete_marker_version_ids.is_empty());
+        assert_eq!(
+            decoded[2].target_delete_marker_version_ids,
+            HashMap::from([
+                ("arn:target-a".to_string(), "remote-marker-a".to_string()),
+                ("arn:target-b".to_string(), "remote-marker-b".to_string()),
+            ]),
+            "target-assigned marker version ids must survive the MRF disk round-trip (backlog#2290)"
+        );
+        assert!(!decoded[2].target_delete_marker_version_ids_corrupt);
+    }
+
+    /// backlog#2290: the corrupt flag rides the same journal round trip, and an
+    /// entry that carries neither field encodes exactly as it did before the
+    /// field existed (both keys are skipped when empty/false).
+    #[test]
+    fn mrf_file_round_trips_target_marker_ids_corrupt_flag_and_skips_empty_keys() {
+        let corrupt = MrfReplicateEntry {
+            bucket: "bucket-a".to_string(),
+            object: "delete-a".to_string(),
+            op: MrfOpKind::Delete,
+            delete_marker: true,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            target_delete_marker_version_ids_corrupt: true,
+            target_arns: vec!["arn:target-a".to_string()],
+            ..Default::default()
+        };
+        let decoded = decode_mrf_file(&encode_mrf_file(std::slice::from_ref(&corrupt)).expect("mrf file should encode"))
+            .expect("mrf file should decode");
+        assert_eq!(decoded, vec![corrupt]);
+        assert!(decoded[0].target_delete_marker_version_ids_corrupt);
+
+        let plain = MrfReplicateEntry {
+            bucket: "bucket-a".to_string(),
+            object: "delete-a".to_string(),
+            op: MrfOpKind::Delete,
+            delete_marker: true,
+            target_arns: vec!["arn:target-a".to_string()],
+            ..Default::default()
+        };
+        let encoded = encode_mrf_file(std::slice::from_ref(&plain)).expect("mrf file should encode");
+        let payload = String::from_utf8_lossy(&encoded);
+        assert!(
+            !payload.contains("targetDeleteMarkerVersionIDs"),
+            "an entry without recorded ids must not grow the new keys: {payload}"
+        );
+        assert_eq!(decode_mrf_file(&encoded).expect("mrf file should decode"), vec![plain]);
     }
 
     #[test]
@@ -719,6 +791,99 @@ mod tests {
         // Old files lack the deleteMarkerMtime key; it must default to None so replay keeps the
         // pre-#867 fallback to the current time.
         assert_eq!(decoded[0].delete_marker_mtime, None);
+        // Old files also lack the target marker id keys; they must default to an empty map
+        // and a clear corrupt flag so replay keeps the pre-#2290 source-id fallback.
+        assert!(decoded[0].target_delete_marker_version_ids.is_empty());
+        assert!(!decoded[0].target_delete_marker_version_ids_corrupt);
+    }
+
+    /// backlog#2290: a delete-marker entry written by a binary that predates the
+    /// `targetDeleteMarkerVersionIDs` key decodes with an empty map and a clear
+    /// corrupt flag — the exact shape replay handled before the field existed.
+    #[test]
+    fn mrf_pre_target_marker_ids_delete_entry_decodes_with_empty_map() {
+        let marker_version_id = Uuid::new_v4();
+        let mut payload = Vec::new();
+        rmp::encode::write_array_len(&mut payload, 1).expect("array len should encode");
+        rmp::encode::write_map_len(&mut payload, 9).expect("map len should encode");
+        rmp::encode::write_str(&mut payload, "bucket").expect("bucket key should encode");
+        rmp::encode::write_str(&mut payload, "old-bucket").expect("bucket value should encode");
+        rmp::encode::write_str(&mut payload, "object").expect("object key should encode");
+        rmp::encode::write_str(&mut payload, "old-key").expect("object value should encode");
+        rmp::encode::write_str(&mut payload, "retryCount").expect("retry key should encode");
+        rmp::encode::write_i32(&mut payload, 0).expect("retry value should encode");
+        rmp::encode::write_str(&mut payload, "size").expect("size key should encode");
+        rmp::encode::write_i64(&mut payload, 0).expect("size value should encode");
+        rmp::encode::write_str(&mut payload, "op").expect("op key should encode");
+        rmp::encode::write_str(&mut payload, "delete").expect("op value should encode");
+        rmp::encode::write_str(&mut payload, "forceDelete").expect("forceDelete key should encode");
+        rmp::encode::write_bool(&mut payload, false).expect("forceDelete value should encode");
+        rmp::encode::write_str(&mut payload, "deleteMarkerVersionID").expect("marker id key should encode");
+        // Uuid serializes as a 16-byte bin in the MessagePack journal.
+        rmp::encode::write_bin(&mut payload, marker_version_id.as_bytes()).expect("marker id value should encode");
+        rmp::encode::write_str(&mut payload, "deleteMarker").expect("deleteMarker key should encode");
+        rmp::encode::write_bool(&mut payload, true).expect("deleteMarker value should encode");
+        rmp::encode::write_str(&mut payload, "targetARNs").expect("targetARNs key should encode");
+        rmp::encode::write_array_len(&mut payload, 1).expect("targetARNs len should encode");
+        rmp::encode::write_str(&mut payload, "arn:target-a").expect("targetARNs value should encode");
+
+        let mut data = Vec::with_capacity(4 + payload.len());
+        data.extend_from_slice(&MRF_META_FORMAT.to_le_bytes());
+        data.extend_from_slice(&MRF_META_VERSION.to_le_bytes());
+        data.extend_from_slice(&payload);
+
+        let decoded = decode_mrf_file(&data).expect("pre-#2290 delete-marker entry should decode");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].op, MrfOpKind::Delete);
+        assert!(decoded[0].delete_marker);
+        assert_eq!(decoded[0].delete_marker_version_id, Some(marker_version_id));
+        assert_eq!(decoded[0].target_arns, vec!["arn:target-a".to_string()]);
+        assert!(decoded[0].target_delete_marker_version_ids.is_empty());
+        assert!(!decoded[0].target_delete_marker_version_ids_corrupt);
+    }
+
+    /// backlog#2290: the new field is fenced by its own capability bit exactly
+    /// like the earlier optional fields — a reader without the bit refuses an
+    /// envelope that advertises it, while the current reader still accepts the
+    /// pre-#2290 envelope.
+    #[test]
+    fn envelope_target_marker_ids_capability_is_fenced_and_backward_compatible() {
+        assert!(MrfCapabilities::current().contains(MrfCapability::TargetDeleteMarkerVersionIds));
+        assert_eq!(MrfCapabilities::with(MrfCapability::TargetDeleteMarkerVersionIds).bits(), 1 << 4);
+
+        // Old envelope, current reader: accepted, and the negotiated set lacks the new bit.
+        let legacy = MrfEnvelope::decode(PRE_TARGET_MARKER_IDS_ENVELOPE_FIXTURE, MrfProtocolCapabilities::current())
+            .expect("pre-#2290 envelope should decode");
+        assert_eq!(legacy.protocol().capabilities().bits(), 15);
+        assert!(
+            !legacy
+                .protocol()
+                .capabilities()
+                .contains(MrfCapability::TargetDeleteMarkerVersionIds)
+        );
+        assert_eq!(legacy.payload(), &[1, 2, 3]);
+
+        // Current envelope, reader that only knows the pre-#2290 bits: refused.
+        let pre_2290_reader = MrfProtocolCapabilities::new(1, 1, MrfCapabilities::from_bits(15).expect("known bits"));
+        assert_eq!(
+            MrfEnvelope::decode(ENVELOPE_FIXTURE, pre_2290_reader),
+            Err(MrfEnvelopeError::MissingCapabilities {
+                required: 31,
+                available: 15,
+            })
+        );
+
+        // Negotiation with such a peer drops the bit instead of failing.
+        let negotiated = MrfProtocolCapabilities::current()
+            .negotiate(pre_2290_reader)
+            .expect("negotiation with a pre-#2290 peer should succeed");
+        assert!(
+            !negotiated
+                .capabilities()
+                .contains(MrfCapability::TargetDeleteMarkerVersionIds)
+        );
+        assert!(negotiated.capabilities().contains(MrfCapability::DeleteMarkerMtime));
     }
 
     #[test]

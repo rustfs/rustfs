@@ -44,8 +44,9 @@ use super::storage_api::HTTPRangeSpec;
 use super::storage_api::remote_s3_client::RemoteS3ClientError;
 use hmac::{Hmac, Mac, digest::KeyInit};
 use http::{HeaderMap, HeaderValue, Method};
+use percent_encoding::percent_decode_str;
 use quick_xml::Reader;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesStart, Event};
 use sha2::Sha256;
 use std::collections::{BTreeMap, HashMap};
 use url::Url;
@@ -162,6 +163,32 @@ impl AzureSourceBackend {
         Ok(request)
     }
 
+    /// A missing blob is distinct from a missing container or version. Only
+    /// object reads may use BlobNotFound as positive evidence of absence.
+    async fn send_object_request(&self, request: reqwest::Request) -> Result<reqwest::Response, SourceError> {
+        let is_head = request.method() == Method::HEAD;
+        let versioned = request
+            .url()
+            .query_pairs()
+            .any(|(name, _)| name.eq_ignore_ascii_case("versionid") || name.eq_ignore_ascii_case("snapshot"));
+        let response = self.http.execute(request).await?;
+        if response.status() == http::StatusCode::NOT_FOUND && !versioned {
+            match header(response.headers(), HEADER_ERROR_CODE) {
+                Some("BlobNotFound") => return Err(SourceError::NotFound),
+                None | Some("ResourceNotFound") if is_head => {
+                    // HEAD may omit an error code. One successful container
+                    // probe proves key absence; a failed probe keeps its error.
+                    // These are two independently timed requests, not one deadline.
+                    drop(response);
+                    self.probe().await?;
+                    return Err(SourceError::NotFound);
+                }
+                _ => {}
+            }
+        }
+        NativeHttp::check_response(response, Some(HEADER_ERROR_CODE))
+    }
+
     /// Shared mapping for Get Blob and Get Blob Properties.
     fn head_from_response(headers: &HeaderMap) -> Result<SourceHead, SourceError> {
         // A customer-provided key means the service holds ciphertext it cannot
@@ -188,7 +215,7 @@ impl AzureSourceBackend {
 impl SourceBackend for AzureSourceBackend {
     async fn head(&self, key: &str) -> Result<SourceHead, SourceError> {
         let request = self.request(Method::HEAD, self.blob_url(key)?, HeaderMap::new())?;
-        let response = self.http.send(request, HEADER_ERROR_CODE).await?;
+        let response = self.send_object_request(request).await?;
         Self::head_from_response(response.headers())
     }
 
@@ -201,7 +228,7 @@ impl SourceBackend for AzureSourceBackend {
             );
         }
         let request = self.request(Method::GET, self.blob_url(key)?, headers)?;
-        let response = self.http.send(request, HEADER_ERROR_CODE).await?;
+        let response = self.send_object_request(request).await?;
         let head = Self::head_from_response(response.headers())?;
         let content_range = header(response.headers(), "content-range").map(str::to_string);
         Ok(SourceGet {
@@ -239,7 +266,7 @@ impl SourceBackend for AzureSourceBackend {
         }
 
         let request = self.request(Method::GET, url, HeaderMap::new())?;
-        let response = self.http.send(request, HEADER_ERROR_CODE).await?;
+        let response = self.http.send(request, Some(HEADER_ERROR_CODE)).await?;
         let body = read_text(response, MAX_XML_BYTES).await?;
         let listing = parse_list_blobs(&body)?;
 
@@ -255,7 +282,7 @@ impl SourceBackend for AzureSourceBackend {
         let mut url = self.blob_url(key)?;
         url.query_pairs_mut().append_pair("comp", "tags");
         let request = self.request(Method::GET, url, HeaderMap::new())?;
-        let response = self.http.send(request, HEADER_ERROR_CODE).await?;
+        let response = self.http.send(request, Some(HEADER_ERROR_CODE)).await?;
         let body = read_text(response, MAX_XML_BYTES).await?;
         parse_blob_tags(&body)
     }
@@ -264,7 +291,7 @@ impl SourceBackend for AzureSourceBackend {
         let mut url = self.container_url()?;
         url.query_pairs_mut().append_pair("restype", "container");
         let request = self.request(Method::HEAD, url, HeaderMap::new())?;
-        self.http.send(request, HEADER_ERROR_CODE).await?;
+        self.http.send(request, Some(HEADER_ERROR_CODE)).await?;
         Ok(())
     }
 }
@@ -342,9 +369,9 @@ struct AzureListing {
 
 #[derive(Default)]
 struct BlobEntry {
-    name: String,
+    name: Option<String>,
     etag: Option<String>,
-    size: u64,
+    size: Option<u64>,
     last_modified: Option<std::time::SystemTime>,
     access_tier: Option<String>,
 }
@@ -357,6 +384,7 @@ fn parse_list_blobs(xml: &str) -> Result<AzureListing, SourceError> {
     let mut next_marker = None;
     let mut blob: Option<BlobEntry> = None;
     let mut in_blob_prefix = false;
+    let mut blob_prefix: Option<String> = None;
     // Open container elements. quick-xml reports a truncated document as a
     // plain end of input, so a non-zero depth at EOF is the only signal that
     // the page was cut short and must not be read as a complete listing.
@@ -366,6 +394,9 @@ fn parse_list_blobs(xml: &str) -> Result<AzureListing, SourceError> {
         match reader.read_event() {
             Ok(Event::Start(start)) => {
                 let name = local_name(start.name().as_ref());
+                if matches!(name.as_str(), "blob" | "blobprefix") && (blob.is_some() || in_blob_prefix) {
+                    return Err(SourceError::Other("source listing entries must not be nested".to_string()));
+                }
                 match name.as_str() {
                     "blob" => {
                         depth += 1;
@@ -379,22 +410,40 @@ fn parse_list_blobs(xml: &str) -> Result<AzureListing, SourceError> {
                     _ => {
                         let end = start.to_end().into_owned();
                         let text = leaf_text(&mut reader, end.name())?;
-                        apply_list_field(&name, text, &mut blob, &mut prefixes, &mut next_marker, in_blob_prefix);
+                        let text = if name == "name" {
+                            decode_list_name(&start, text)?
+                        } else {
+                            text
+                        };
+                        apply_list_field(&name, text, &mut blob, &mut blob_prefix, &mut next_marker, in_blob_prefix)?;
                     }
                 }
             }
             Ok(Event::Empty(empty)) => {
                 let name = local_name(empty.name().as_ref());
-                apply_list_field(&name, String::new(), &mut blob, &mut prefixes, &mut next_marker, in_blob_prefix);
+                if matches!(name.as_str(), "blob" | "blobprefix") {
+                    return Err(SourceError::Other("source listing entry has no name".to_string()));
+                }
+                let text = if name == "name" {
+                    decode_list_name(&empty, String::new())?
+                } else {
+                    String::new()
+                };
+                apply_list_field(&name, text, &mut blob, &mut blob_prefix, &mut next_marker, in_blob_prefix)?;
             }
             Ok(Event::End(end)) => match local_name(end.name().as_ref()).as_str() {
                 "blob" => {
                     depth = depth.saturating_sub(1);
                     if let Some(entry) = blob.take() {
                         objects.push(SourceObject {
-                            key: entry.name,
+                            key: entry
+                                .name
+                                .filter(|name| !name.is_empty())
+                                .ok_or_else(|| SourceError::Other("source listing object has no name".to_string()))?,
                             etag: entry.etag,
-                            size: entry.size,
+                            size: entry
+                                .size
+                                .ok_or_else(|| SourceError::Other("source listing object has no valid size".to_string()))?,
                             last_modified: entry.last_modified,
                             storage_class: entry.access_tier,
                             // Azure ETags carry no part count; the listing
@@ -406,6 +455,12 @@ fn parse_list_blobs(xml: &str) -> Result<AzureListing, SourceError> {
                 "blobprefix" => {
                     depth = depth.saturating_sub(1);
                     in_blob_prefix = false;
+                    prefixes.push(
+                        blob_prefix
+                            .take()
+                            .filter(|name| !name.is_empty())
+                            .ok_or_else(|| SourceError::Other("source listing prefix has no name".to_string()))?,
+                    );
                 }
                 "properties" | "blobs" | "enumerationresults" => depth = depth.saturating_sub(1),
                 _ => {}
@@ -426,20 +481,63 @@ fn parse_list_blobs(xml: &str) -> Result<AzureListing, SourceError> {
     })
 }
 
+/// Azure marks XML-inexpressible blob/prefix names with `Encoded="true"`.
+/// Only those names are URI-decoded, once; ordinary percent signs and `+`
+/// are part of the key, and NextMarker remains an opaque cursor.
+fn decode_list_name(start: &BytesStart<'_>, text: String) -> Result<String, SourceError> {
+    let mut encoded = false;
+    for attribute in start.attributes() {
+        let attribute = attribute.map_err(|_| SourceError::Other("source listing name has invalid attributes".to_string()))?;
+        if attribute.key.as_ref() == "Encoded" {
+            let value = quick_xml::escape::unescape(&attribute.value)
+                .map_err(|_| SourceError::Other("source listing name has an invalid Encoded attribute".to_string()))?;
+            encoded = match value.as_ref() {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                _ => return Err(SourceError::Other("source listing name has an invalid Encoded attribute".to_string())),
+            };
+        }
+    }
+    if !encoded {
+        return Ok(text);
+    }
+
+    // percent_decode_str leaves malformed escapes untouched. Refuse them
+    // rather than return a different key or replace invalid UTF-8 with U+FFFD.
+    let mut bytes = text.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%'
+            && !(bytes.next().is_some_and(|b| b.is_ascii_hexdigit()) && bytes.next().is_some_and(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(SourceError::Other("source listing name has invalid percent encoding".to_string()));
+        }
+    }
+    percent_decode_str(&text)
+        .decode_utf8()
+        .map(|name| name.into_owned())
+        .map_err(|_| SourceError::Other("source listing name is not valid UTF-8".to_string()))
+}
+
 fn apply_list_field(
     name: &str,
     text: String,
     blob: &mut Option<BlobEntry>,
-    prefixes: &mut Vec<String>,
+    blob_prefix: &mut Option<String>,
     next_marker: &mut Option<String>,
     in_blob_prefix: bool,
-) {
+) -> Result<(), SourceError> {
     match name {
         "name" => {
             if in_blob_prefix {
-                prefixes.push(text);
+                if blob_prefix.is_some() {
+                    return Err(SourceError::Other("source listing prefix has duplicate names".to_string()));
+                }
+                *blob_prefix = Some(text);
             } else if let Some(entry) = blob.as_mut() {
-                entry.name = text;
+                if entry.name.is_some() {
+                    return Err(SourceError::Other("source listing object has duplicate names".to_string()));
+                }
+                entry.name = Some(text);
             }
         }
         "nextmarker" => *next_marker = Some(text),
@@ -450,7 +548,14 @@ fn apply_list_field(
         }
         "content-length" => {
             if let Some(entry) = blob.as_mut() {
-                entry.size = text.trim().parse().unwrap_or(0);
+                if entry.size.is_some() {
+                    return Err(SourceError::Other("source listing object has duplicate sizes".to_string()));
+                }
+                entry.size = Some(
+                    text.trim()
+                        .parse()
+                        .map_err(|_| SourceError::Other("source listing object has no valid size".to_string()))?,
+                );
             }
         }
         "last-modified" => {
@@ -465,6 +570,7 @@ fn apply_list_field(
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Parses a `Get Blob Tags` response.
@@ -551,7 +657,7 @@ mod tests {
     use super::*;
     use crate::on_demand_migration::backend_contract::{BackendCapabilities, assert_backend_contract};
     use crate::on_demand_migration::source_client::SourceError;
-    use crate::on_demand_migration::test_http_fixture::{ScriptedResponse, scripted_server};
+    use crate::on_demand_migration::test_http_fixture::{ScriptedResponse, assert_requests, scripted_server};
 
     const LIST_PAGE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <EnumerationResults ServiceEndpoint="https://acct.blob.core.windows.net/" ContainerName="legacy">
@@ -586,6 +692,13 @@ mod tests {
     const LAST_PAGE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <EnumerationResults><Blobs><Blob><Name>only.txt</Name><Properties><Content-Length>1</Content-Length></Properties></Blob></Blobs><NextMarker /></EnumerationResults>"#;
 
+    const ENCODED_NAME_PAGE: &str = r#"<EnumerationResults><Blobs>
+<Blob><Name Encoded="true">%EF%BF%BE/part%252F+%20%26.txt</Name><Properties><Content-Length>5</Content-Length></Properties></Blob>
+<Blob><Name>%EF%BF%BE/part%252F+%20%26.txt</Name><Properties><Content-Length>5</Content-Length></Properties></Blob>
+<BlobPrefix><Name Encoded="true">%EF%BF%BF%2F</Name></BlobPrefix>
+<BlobPrefix><Name Encoded="false">literal%FF+/</Name></BlobPrefix>
+</Blobs><NextMarker Encoded="true">opaque%2F+cursor</NextMarker></EnumerationResults>"#;
+
     const TAGS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <Tags><TagSet>
   <Tag><Key>env</Key><Value>prod</Value></Tag>
@@ -618,6 +731,87 @@ mod tests {
         let listing = parse_list_blobs(LAST_PAGE).expect("page should parse");
         assert_eq!(listing.objects.len(), 1);
         assert!(listing.next_marker.is_none(), "an empty NextMarker is not a cursor");
+        let empty = parse_list_blobs("<EnumerationResults><Blobs/><NextMarker/></EnumerationResults>")
+            .expect("an empty final page is valid");
+        assert!(empty.objects.is_empty());
+        assert!(empty.prefixes.is_empty());
+        assert!(empty.next_marker.is_none());
+    }
+
+    #[test]
+    fn list_blobs_decodes_only_marked_names_once() {
+        let listing = parse_list_blobs(ENCODED_NAME_PAGE).expect("encoded names should parse");
+        assert_eq!(listing.objects[0].key, "\u{fffe}/part%2F+ &.txt");
+        assert_eq!(listing.objects[1].key, "%EF%BF%BE/part%252F+%20%26.txt");
+        assert_eq!(listing.prefixes, ["\u{ffff}/", "literal%FF+/"]);
+        assert_eq!(listing.next_marker.as_deref(), Some("opaque%2F+cursor"));
+
+        for (attribute, text, expected) in [
+            ("", "a%2Fb+ &amp;.txt", "a%2Fb+ &.txt"),
+            ("Encoded=\"false\"", "a%2Fb+ &amp;.txt", "a%2Fb+ &.txt"),
+            ("Encoded=\"0\"", "a%2Fb+ &amp;.txt", "a%2Fb+ &.txt"),
+            ("Encoded=\"true\"", "a%2Fb+ &amp;.txt", "a/b+ &.txt"),
+            ("Encoded=\"1\"", "a%2Fb+ &amp;.txt", "a/b+ &.txt"),
+            ("Encoded=\"tr&#117;e\"", "a%2Fb+ &amp;.txt", "a/b+ &.txt"),
+            ("", "%", "%"),
+            ("Encoded=\"false\"", "%", "%"),
+            ("", "中文/plain%2F+name%", "中文/plain%2F+name%"),
+            ("Encoded=\"false\"", "中文/plain%2F+name%", "中文/plain%2F+name%"),
+            (
+                "Encoded=\"true\"",
+                "%EF%BF%BE%EF%BF%BF/%E4%B8%AD%E6%96%87-%25-%2B-%252F+&amp;-%26amp%3B",
+                "\u{fffe}\u{ffff}/中文-%-+-%2F+&-&amp;",
+            ),
+        ] {
+            for container in ["Blob", "BlobPrefix"] {
+                let properties = if container == "Blob" {
+                    "<Properties><Content-Length>0</Content-Length></Properties>"
+                } else {
+                    ""
+                };
+                let xml = format!(
+                    "<EnumerationResults><Blobs><{container}><Name {attribute}>{text}</Name>{properties}</{container}></Blobs></EnumerationResults>"
+                );
+                let listing = parse_list_blobs(&xml).expect("valid name");
+                if container == "Blob" {
+                    assert_eq!(listing.objects.len(), 1);
+                    assert_eq!(listing.objects[0].key, expected, "{container}: {attribute}, {text}");
+                    assert_eq!(listing.objects[0].size, 0, "a named zero-byte blob remains valid");
+                } else {
+                    assert!(listing.objects.is_empty(), "a prefix-only page remains valid");
+                    assert_eq!(listing.prefixes, [expected], "{container}: {attribute}, {text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn list_blobs_rejects_invalid_encoded_names_without_returning_partial_entries() {
+        for name in [
+            "<Name Encoded=\"true\">%</Name>",
+            "<Name Encoded=\"true\">%2</Name>",
+            "<Name Encoded=\"true\">%GG</Name>",
+            "<Name Encoded=\"true\">%FF</Name>",
+            "<Name Encoded=\"true\">%E2%82</Name>",
+            "<Name Encoded=\"true\">%C0%AF</Name>",
+            "<Name Encoded=\"true\">%ED%A0%80</Name>",
+            "<Name Encoded=\"maybe\">a</Name>",
+            "<Name Encoded=\"true\" Encoded=\"false\">a</Name>",
+            "<Name Encoded=\"true\" Encoded=\"false\"/>",
+            "<Name Encoded=\"&unknown;\">a</Name>",
+        ] {
+            for container in ["Blob", "BlobPrefix"] {
+                let properties = if container == "Blob" {
+                    "<Properties><Content-Length>1</Content-Length></Properties>"
+                } else {
+                    ""
+                };
+                let xml = format!(
+                    "<EnumerationResults><Blobs><Blob><Name>before</Name><Properties><Content-Length>1</Content-Length></Properties></Blob><{container}>{name}{properties}</{container}><Blob><Name>after</Name><Properties><Content-Length>1</Content-Length></Properties></Blob></Blobs><NextMarker>opaque%2B+marker</NextMarker></EnumerationResults>"
+                );
+                assert!(matches!(parse_list_blobs(&xml), Err(SourceError::Other(_))), "{container}: {name}");
+            }
+        }
     }
 
     #[test]
@@ -631,6 +825,168 @@ mod tests {
             assert!(matches!(err, SourceError::Other(_)), "{bad}: {err:?}");
         }
         assert!(parse_blob_tags("<Tags><TagSet>").is_err(), "a truncated tag set must fail");
+    }
+
+    #[tokio::test]
+    async fn native_listing_rejects_missing_or_invalid_required_object_fields() {
+        for entry in [
+            "<Blob />",
+            "<Blob><Properties><Content-Length>1</Content-Length></Properties></Blob>",
+            "<Blob><Name /><Properties><Content-Length>1</Content-Length></Properties></Blob>",
+            "<Blob><Name>broken</Name></Blob>",
+            "<Blob><Name>broken</Name><Properties><Content-Length /></Properties></Blob>",
+            "<Blob><Name>broken</Name><Properties><Content-Length>-1</Content-Length></Properties></Blob>",
+            "<Blob><Name>broken</Name><Properties><Content-Length>18446744073709551616</Content-Length></Properties></Blob>",
+            "<Blob><Name>broken</Name><Properties><Content-Length>not-a-size</Content-Length></Properties></Blob>",
+            "<BlobPrefix />",
+            "<BlobPrefix><Name /></BlobPrefix>",
+            "<BlobPrefix></BlobPrefix>",
+        ] {
+            // Reject the entire page even if a valid object precedes the bad
+            // entry, so callers cannot expose partial data or advance its cursor.
+            let body = format!(
+                "<EnumerationResults><Blobs><Blob><Name>valid</Name><Properties><Content-Length>1</Content-Length></Properties></Blob>{entry}</Blobs><NextMarker>next</NextMarker></EnumerationResults>"
+            );
+            let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(200, Vec::new(), body)]).await;
+            let err = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]))
+                .list(&SourceListRequest {
+                    prefix: Some("dir/"),
+                    delimiter: Some("/"),
+                    continuation_token: Some("opaque+/="),
+                    max_keys: 2,
+                    ..Default::default()
+                })
+                .await
+                .expect_err("malformed object must reject the complete native page");
+            assert!(matches!(err, SourceError::Other(_)), "{entry}: {err:?}");
+            assert!(!err.is_retryable());
+            assert_requests(
+                &recorded,
+                &[(
+                    "GET",
+                    "/legacy?restype=container&comp=list&prefix=dir%2F&delimiter=%2F&marker=opaque%2B%2F%3D&maxresults=2",
+                )],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_listing_rejects_duplicate_fields_and_nested_entries() {
+        for entry in [
+            "<Blob><Name>a</Name><Name>b</Name><Properties><Content-Length>1</Content-Length></Properties></Blob>",
+            "<Blob><Name /><Name>b</Name><Properties><Content-Length>1</Content-Length></Properties></Blob>",
+            "<Blob><Name>a</Name><Properties><Content-Length>1</Content-Length><Content-Length>2</Content-Length></Properties></Blob>",
+            "<BlobPrefix><Name>a/</Name><Name>b/</Name></BlobPrefix>",
+            "<BlobPrefix><Name /><Name>b/</Name></BlobPrefix>",
+            "<Blob><Name>a</Name><Properties><Content-Length>1</Content-Length></Properties><Blob><Name>b</Name><Properties><Content-Length>2</Content-Length></Properties></Blob></Blob>",
+            "<Blob><Name>a</Name><Properties><Content-Length>1</Content-Length></Properties><BlobPrefix><Name>b/</Name></BlobPrefix></Blob>",
+            "<BlobPrefix><Name>a/</Name><Blob><Name>b</Name><Properties><Content-Length>2</Content-Length></Properties></Blob></BlobPrefix>",
+            "<BlobPrefix><Name>a/</Name><BlobPrefix><Name>b/</Name></BlobPrefix></BlobPrefix>",
+        ] {
+            let body = format!(
+                "<EnumerationResults><Blobs><Blob><Name>valid</Name><Properties><Content-Length>0</Content-Length></Properties></Blob>{entry}</Blobs><NextMarker>next</NextMarker></EnumerationResults>"
+            );
+            let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(200, Vec::new(), body)]).await;
+            let result = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]))
+                .list(&SourceListRequest {
+                    delimiter: Some("/"),
+                    continuation_token: Some("opaque+/="),
+                    max_keys: 2,
+                    ..Default::default()
+                })
+                .await;
+            let err = result.expect_err("ambiguous entries must reject the entire page and its cursor");
+            assert!(matches!(err, SourceError::Other(_)), "{entry}: {err:?}");
+            assert!(!err.is_retryable(), "{entry}: {err:?}");
+            assert_requests(
+                &recorded,
+                &[(
+                    "GET",
+                    "/legacy?restype=container&comp=list&delimiter=%2F&marker=opaque%2B%2F%3D&maxresults=2",
+                )],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_listing_preserves_zero_size_unicode_prefixes_and_opaque_cursors() {
+        let body = "<EnumerationResults><Blobs><Blob><Name>目录/空 &amp; file</Name><Properties><Content-Length>0</Content-Length></Properties></Blob><BlobPrefix><Name>目录/子/</Name></BlobPrefix></Blobs><NextMarker>opaque+/=</NextMarker></EnumerationResults>";
+        let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(200, Vec::new(), body.to_string())]).await;
+        let page = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]))
+            .list(&SourceListRequest {
+                max_keys: 2,
+                ..Default::default()
+            })
+            .await
+            .expect("valid native page");
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.objects[0].key, "目录/空 & file");
+        assert_eq!(page.objects[0].size, 0);
+        assert_eq!(page.common_prefixes, ["目录/子/"]);
+        assert!(page.is_truncated);
+        assert_eq!(page.next_continuation_token.as_deref(), Some("opaque+/="));
+        assert_requests(&recorded, &[("GET", "/legacy?restype=container&comp=list&maxresults=2")]);
+    }
+
+    #[tokio::test]
+    async fn encoded_listing_preserves_required_field_and_entry_validation() {
+        for (entry, expected_error) in [
+            (
+                r#"<Blob><Name Encoded="true">a%2Fb</Name></Blob>"#,
+                "source listing object has no valid size",
+            ),
+            (
+                r#"<Blob><Name Encoded="true">a%2Fb</Name><Properties><Content-Length>-1</Content-Length></Properties></Blob>"#,
+                "source listing object has no valid size",
+            ),
+            (
+                r#"<Blob><Name Encoded="true">a%2Fb</Name><Name>a/b</Name><Properties><Content-Length>1</Content-Length></Properties></Blob>"#,
+                "source listing object has duplicate names",
+            ),
+            (
+                r#"<Blob><Name Encoded="true">a%2Fb</Name><Properties><Content-Length>1</Content-Length><Content-Length>2</Content-Length></Properties></Blob>"#,
+                "source listing object has duplicate sizes",
+            ),
+            (
+                r#"<BlobPrefix><Name Encoded="true">a%2F</Name><Name>a/</Name></BlobPrefix>"#,
+                "source listing prefix has duplicate names",
+            ),
+            (r#"<BlobPrefix><Name Encoded="true" /></BlobPrefix>"#, "source listing prefix has no name"),
+            (
+                r#"<Blob><Name Encoded="true">a%2Fb</Name><Properties><Content-Length>1</Content-Length></Properties><Blob><Name Encoded="true">c%2Fd</Name><Properties><Content-Length>2</Content-Length></Properties></Blob></Blob>"#,
+                "source listing entries must not be nested",
+            ),
+            (
+                r#"<BlobPrefix><Name Encoded="true">a%2F</Name><BlobPrefix><Name Encoded="true">b%2F</Name></BlobPrefix></BlobPrefix>"#,
+                "source listing entries must not be nested",
+            ),
+        ] {
+            let body = format!(
+                r#"<EnumerationResults><Blobs><Blob><Name Encoded="true">valid%252F</Name><Properties><Content-Length>0</Content-Length></Properties></Blob>{entry}</Blobs><NextMarker Encoded="true">opaque%2B+marker</NextMarker></EnumerationResults>"#
+            );
+            let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(200, Vec::new(), body)]).await;
+            let err = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]))
+                .list(&SourceListRequest {
+                    delimiter: Some("/"),
+                    continuation_token: Some("opaque%2B+marker"),
+                    max_keys: 2,
+                    ..Default::default()
+                })
+                .await
+                .expect_err("encoded names cannot bypass whole-page validation");
+            assert!(!err.is_retryable(), "{entry}: {err:?}");
+            let SourceError::Other(message) = err else {
+                panic!("wrong error class for {entry}: {err:?}");
+            };
+            assert_eq!(message, expected_error, "{entry}");
+            assert_requests(
+                &recorded,
+                &[(
+                    "GET",
+                    "/legacy?restype=container&comp=list&delimiter=%2F&marker=opaque%252B%2Bmarker&maxresults=2",
+                )],
+            );
+        }
     }
 
     #[test]
@@ -782,6 +1138,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dot_segment_keys_fail_before_any_source_request() {
+        let (endpoint, recorded) = scripted_server(Vec::new()).await;
+        let backend = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]));
+        for key in [".", "..", "dir/./key", "dir/../key", "\u{fffe}/../key"] {
+            assert!(matches!(backend.head(key).await, Err(SourceError::Unsupported(_))), "HEAD {key:?}");
+            assert!(matches!(backend.get(key, None).await, Err(SourceError::Unsupported(_))), "GET {key:?}");
+            assert!(matches!(backend.tagging(key).await, Err(SourceError::Unsupported(_))), "tags {key:?}");
+        }
+        assert!(recorded.lock().expect("recorder lock").is_empty());
+    }
+
+    #[tokio::test]
     async fn sas_credentials_travel_in_the_query_and_never_sign() {
         let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(200, blob_headers(), String::new())]).await;
         let backend = backend(
@@ -907,6 +1275,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listed_encoded_and_literal_names_get_distinct_source_objects() {
+        let mut head_headers = blob_headers();
+        head_headers.push(("Content-Length", "5".to_string()));
+        let (endpoint, recorded) = scripted_server(vec![
+            ScriptedResponse::new(200, Vec::new(), ENCODED_NAME_PAGE.to_string()),
+            ScriptedResponse::new(200, head_headers.clone(), String::new()),
+            ScriptedResponse::new(200, blob_headers(), "first".to_string()),
+            ScriptedResponse::new(200, head_headers, String::new()),
+            ScriptedResponse::new(200, blob_headers(), "other".to_string()),
+        ])
+        .await;
+        let backend = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]));
+        let page = backend
+            .list(&SourceListRequest {
+                max_keys: 4,
+                ..Default::default()
+            })
+            .await
+            .expect("list names");
+        assert_eq!(page.objects.len(), 2);
+        assert_eq!(page.objects[0].key, "\u{fffe}/part%2F+ &.txt");
+        assert_eq!(page.objects[1].key, "%EF%BF%BE/part%252F+%20%26.txt");
+        assert_eq!(page.common_prefixes, ["\u{ffff}/", "literal%FF+/"]);
+        for (object, body) in page.objects.iter().zip([b"first", b"other"]) {
+            let head = backend.head(&object.key).await.expect("head listed object");
+            assert_eq!(head.size, object.size);
+            let got = backend.get(&object.key, None).await.expect("get listed object");
+            assert_eq!(got.body.collect().await.expect("source body").into_bytes().as_ref(), body);
+        }
+        let recorded = recorded.lock().expect("recorder lock");
+        assert_eq!(recorded.len(), 5);
+        for (requests, expected) in recorded[1..].as_chunks::<2>().0.iter().zip([
+            "/legacy/%EF%BF%BE/part%252F+%20&.txt",
+            "/legacy/%25EF%25BF%25BE/part%25252F+%2520%2526.txt",
+        ]) {
+            assert_eq!(requests[0].method, "HEAD");
+            assert_eq!(requests[1].method, "GET");
+            assert_eq!(requests[0].target, expected);
+            assert_eq!(requests[1].target, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn listed_encoded_prefix_and_opaque_marker_round_trip_through_query_encoding() {
+        const PAGE: &str = r#"<EnumerationResults><Blobs><BlobPrefix><Name Encoded="true">%EF%BF%BE%EF%BF%BF/%E4%B8%AD%E6%96%87/%252F%2B%25+%26/</Name></BlobPrefix></Blobs><NextMarker>opaque%2B+marker</NextMarker></EnumerationResults>"#;
+        let (endpoint, recorded) = scripted_server(vec![
+            ScriptedResponse::new(200, Vec::new(), PAGE.to_string()),
+            ScriptedResponse::new(200, Vec::new(), LAST_PAGE.to_string()),
+            ScriptedResponse::new(200, Vec::new(), LAST_PAGE.to_string()),
+        ])
+        .await;
+        let backend = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]));
+        let first = backend
+            .list(&SourceListRequest {
+                delimiter: Some("/"),
+                max_keys: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("list encoded prefix");
+        assert!(first.objects.is_empty());
+        assert_eq!(first.common_prefixes, ["\u{fffe}\u{ffff}/中文/%2F+%+&/"]);
+        assert_eq!(first.next_continuation_token.as_deref(), Some("opaque%2B+marker"));
+        assert!(first.is_truncated);
+
+        let second = backend
+            .list(&SourceListRequest {
+                delimiter: Some("/"),
+                continuation_token: first.next_continuation_token.as_deref(),
+                max_keys: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("continue with the original listing conditions");
+        assert!(!second.is_truncated);
+        assert!(second.next_continuation_token.is_none());
+
+        let nested = backend
+            .list(&SourceListRequest {
+                prefix: Some(&first.common_prefixes[0]),
+                delimiter: Some("/"),
+                max_keys: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("start a separate listing under the returned logical prefix");
+        assert!(!nested.is_truncated);
+
+        let recorded = recorded.lock().expect("recorder lock");
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded[0].method, "GET");
+        assert!(!recorded[0].target.contains("marker="));
+        assert_eq!(recorded[1].method, "GET");
+        assert_eq!(
+            recorded[1].target,
+            "/legacy?restype=container&comp=list&delimiter=%2F&marker=opaque%252B%2Bmarker&maxresults=1"
+        );
+        let request_url = endpoint.join(&recorded[1].target).expect("recorded request URL");
+        let query: HashMap<_, _> = request_url.query_pairs().into_owned().collect();
+        assert_eq!(query.get("marker").map(String::as_str), Some("opaque%2B+marker"));
+        assert_eq!(recorded[2].method, "GET");
+        assert_eq!(
+            recorded[2].target,
+            "/legacy?restype=container&comp=list&prefix=%EF%BF%BE%EF%BF%BF%2F%E4%B8%AD%E6%96%87%2F%252F%2B%25%2B%26%2F&delimiter=%2F&maxresults=1"
+        );
+        let request_url = endpoint.join(&recorded[2].target).expect("recorded prefix request URL");
+        let query: HashMap<_, _> = request_url.query_pairs().into_owned().collect();
+        assert_eq!(query.get("prefix"), Some(&first.common_prefixes[0]));
+        assert!(!query.contains_key("marker"));
+    }
+
+    #[tokio::test]
     async fn tagging_and_probe_address_the_right_resources() {
         let (endpoint, recorded) = scripted_server(vec![
             ScriptedResponse::new(200, Vec::new(), TAGS.to_string()),
@@ -992,13 +1472,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_not_found_requires_provider_evidence_or_one_successful_head_probe() {
+        for method in [Method::HEAD, Method::GET] {
+            for (status, code, expected) in [
+                (404, Some("BlobNotFound"), "not_found"),
+                (403, Some("BlobNotFound"), "access_denied"),
+                (404, Some("ContainerNotFound"), "other"),
+                (404, Some("BlobVersionNotFound"), "other"),
+                (404, Some("UnrecognizedError"), "other"),
+                (404, None, if method == Method::HEAD { "not_found" } else { "other" }),
+                (404, Some("ResourceNotFound"), if method == Method::HEAD { "not_found" } else { "other" }),
+            ] {
+                let probes = method == Method::HEAD && status == 404 && matches!(code, None | Some("ResourceNotFound"));
+                let headers = code
+                    .map(|value| vec![(HEADER_ERROR_CODE, value.to_string())])
+                    .unwrap_or_default();
+                let mut responses = vec![ScriptedResponse::new(status, headers, "untrusted-error-body".to_string())];
+                if probes {
+                    responses.push(ScriptedResponse::new(200, Vec::new(), String::new()));
+                }
+                let (endpoint, recorded) = scripted_server(responses).await;
+                let backend = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]));
+                let result = if method == Method::HEAD {
+                    backend.head("missing").await.map(|_| ())
+                } else {
+                    backend.get("missing", None).await.map(|_| ())
+                };
+                let err = result.expect_err("object error must remain an error");
+                assert_eq!(err.class_label(), expected, "{method} {status} {code:?}: {err:?}");
+                assert!(!err.is_retryable(), "{err:?}");
+                assert!(!err.to_string().contains("untrusted-error-body"));
+                let mut requests = vec![(method.as_str(), "/legacy/missing")];
+                if probes {
+                    requests.push(("HEAD", "/legacy?restype=container"));
+                }
+                assert_requests(&recorded, &requests);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_not_found_alias_never_proves_native_object_absence() {
+        for selector in [None, Some("versionid"), Some("snapshot")] {
+            for operation in ["head", "get", "list", "tags", "probe"] {
+                if selector.is_some() && !matches!(operation, "head" | "get") {
+                    continue;
+                }
+                for (status, expected, retryable) in [
+                    (403, "access_denied", false),
+                    (404, "other", false),
+                    (416, "other", false),
+                    (500, "server_error", true),
+                ] {
+                    let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(
+                        status,
+                        vec![(HEADER_ERROR_CODE, "NoSuchKey".to_string())],
+                        "untrusted-error-body".to_string(),
+                    )])
+                    .await;
+                    let credential = selector.map_or_else(
+                        || Credential::SharedKey(vec![7_u8; 32]),
+                        |selector| Credential::Sas(vec![(selector.to_string(), "old-version".to_string())]),
+                    );
+                    let backend = backend(&endpoint, credential);
+                    let result = match operation {
+                        "head" => backend.head("missing").await.map(|_| ()),
+                        "get" => backend.get("missing", None).await.map(|_| ()),
+                        "list" => backend.list(&SourceListRequest::default()).await.map(|_| ()),
+                        "tags" => backend.tagging("missing").await.map(|_| ()),
+                        "probe" => backend.probe().await,
+                        _ => unreachable!(),
+                    };
+                    let err = result.expect_err("an S3 error alias is not Azure absence evidence");
+                    assert_eq!(err.class_label(), expected, "{operation} {selector:?} HTTP {status}: {err:?}");
+                    assert_eq!(err.is_retryable(), retryable, "{operation} {selector:?} HTTP {status}: {err:?}");
+                    if status == 500 {
+                        assert!(matches!(err, SourceError::ServerError(500)));
+                    }
+                    assert!(!err.to_string().contains("untrusted-error-body"));
+                    let (method, mut target) = match operation {
+                        "head" => ("HEAD", "/legacy/missing".to_string()),
+                        "get" => ("GET", "/legacy/missing".to_string()),
+                        "list" => ("GET", "/legacy?restype=container&comp=list".to_string()),
+                        "tags" => ("GET", "/legacy/missing?comp=tags".to_string()),
+                        "probe" => ("HEAD", "/legacy?restype=container".to_string()),
+                        _ => unreachable!(),
+                    };
+                    if let Some(selector) = selector {
+                        target.push_str(&format!("?{selector}=old-version"));
+                    }
+                    assert_requests(&recorded, &[(method, target.as_str())]);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_head_preserves_the_container_probe_failure() {
+        for (status, expected, retryable) in [
+            (403, "access_denied", false),
+            (404, "other", false),
+            (429, "throttled", true),
+            (500, "server_error", true),
+            (503, "throttled", true),
+        ] {
+            let (endpoint, recorded) = scripted_server(vec![
+                ScriptedResponse::new(404, Vec::new(), String::new()),
+                // A BlobNotFound header on a container request cannot prove
+                // that the object is missing, regardless of this status.
+                ScriptedResponse::new(status, vec![(HEADER_ERROR_CODE, "BlobNotFound".to_string())], String::new()),
+            ])
+            .await;
+            let err = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]))
+                .head("missing")
+                .await
+                .expect_err("failed probe must not become object absence");
+            assert_eq!(err.class_label(), expected, "probe {status}: {err:?}");
+            assert_eq!(err.is_retryable(), retryable, "probe {status}: {err:?}");
+            if status == 500 {
+                assert!(matches!(err, SourceError::ServerError(500)));
+            }
+            assert_requests(&recorded, &[("HEAD", "/legacy/missing"), ("HEAD", "/legacy?restype=container")]);
+        }
+    }
+
+    #[tokio::test]
+    async fn version_and_snapshot_absence_are_not_missing_current_blobs() {
+        for selector in ["versionid", "snapshot"] {
+            for code in [None, Some("BlobNotFound"), Some("ResourceNotFound")] {
+                for method in [Method::HEAD, Method::GET] {
+                    let headers = code
+                        .map(|value| vec![(HEADER_ERROR_CODE, value.to_string())])
+                        .unwrap_or_default();
+                    let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(404, headers, String::new())]).await;
+                    let backend = backend(&endpoint, Credential::Sas(vec![(selector.to_string(), "old-version".to_string())]));
+                    let result = if method == Method::HEAD {
+                        backend.head("object").await.map(|_| ())
+                    } else {
+                        backend.get("object", None).await.map(|_| ())
+                    };
+                    let err = result.expect_err("missing selected version must remain a source error");
+                    assert!(matches!(err, SourceError::Other(_)), "{method} {selector} {code:?}: {err:?}");
+                    assert_requests(&recorded, &[(method.as_str(), &format!("/legacy/object?{selector}=old-version"))]);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_not_found_header_is_not_object_absence_for_list_or_tags() {
+        for tags in [false, true] {
+            let (endpoint, recorded) = scripted_server(vec![ScriptedResponse::new(
+                404,
+                vec![(HEADER_ERROR_CODE, "BlobNotFound".to_string())],
+                String::new(),
+            )])
+            .await;
+            let backend = backend(&endpoint, Credential::SharedKey(vec![7_u8; 32]));
+            let result = if tags {
+                backend.tagging("missing").await.map(|_| ())
+            } else {
+                backend.list(&SourceListRequest::default()).await.map(|_| ())
+            };
+            assert!(matches!(result, Err(SourceError::Other(_))), "tags={tags}: {result:?}");
+            assert_requests(
+                &recorded,
+                &[(
+                    "GET",
+                    if tags {
+                        "/legacy/missing?comp=tags"
+                    } else {
+                        "/legacy?restype=container&comp=list"
+                    },
+                )],
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn azure_backend_satisfies_the_shared_backend_contract() {
         let mut ranged = contract_blob_headers();
         ranged.push(("Content-Range", "bytes 1-3/5".to_string()));
         // A HEAD reports the object size with no body, exactly as Azure does.
         let mut head_only = contract_blob_headers();
         head_only.push(("Content-Length", "5".to_string()));
-        let (endpoint, _) = scripted_server(vec![
+        let (endpoint, recorded) = scripted_server(vec![
             ScriptedResponse::new(200, head_only, String::new()),
             ScriptedResponse::new(200, contract_blob_headers(), "hello".to_string()),
             ScriptedResponse::new(206, ranged, "ell".to_string()),
@@ -1028,6 +1686,23 @@ mod tests {
             },
         )
         .await;
+        assert_requests(
+            &recorded,
+            &[
+                ("HEAD", "/legacy/dir/a.txt"),
+                ("GET", "/legacy/dir/a.txt"),
+                ("GET", "/legacy/dir/a.txt"),
+                ("GET", "/legacy?restype=container&comp=list&prefix=dir%2F&delimiter=%2F&maxresults=2"),
+                (
+                    "GET",
+                    "/legacy?restype=container&comp=list&prefix=dir%2F&delimiter=%2F&marker=cursor-1&maxresults=2",
+                ),
+                ("GET", "/legacy/dir/a.txt?comp=tags"),
+                ("HEAD", "/legacy?restype=container"),
+                ("HEAD", "/legacy/missing"),
+                ("HEAD", "/legacy/secret"),
+            ],
+        );
     }
 
     #[tokio::test]

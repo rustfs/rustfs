@@ -1700,6 +1700,69 @@ impl RustFSTestClusterEnvironment {
         Ok(())
     }
 
+    /// Append a new single-node erasure pool to a stopped multi-pool cluster.
+    ///
+    /// Used to simulate pool expansion on localhost: every pool already owns
+    /// exactly one node with `drives_per_node >= 2` (the only multi-pool layout
+    /// the single-host `RUSTFS_VOLUMES` syntax can express). The new node is
+    /// allocated a fresh port and empty drive directories; callers must
+    /// [`Self::start`] afterwards so every process picks up the extended
+    /// volumes argument. Existing data directories are left untouched.
+    pub async fn append_single_node_pool(&mut self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        if self.nodes.iter().any(|node| node.process.is_some()) {
+            return Err("stop the cluster before appending a pool".into());
+        }
+        if self.topology.drives_per_node < 2 {
+            return Err(
+                "append_single_node_pool requires drives_per_node >= 2 (the server parser rejects a single-drive ellipses pool)"
+                    .into(),
+            );
+        }
+
+        let mut pools = self.topology.normalized_pools();
+        for (pool_idx, nodes) in pools.iter().enumerate() {
+            if nodes.len() != 1 {
+                return Err(format!(
+                    "pool {pool_idx} spans {} nodes; append_single_node_pool requires one node per pool",
+                    nodes.len()
+                )
+                .into());
+            }
+        }
+
+        let new_idx = self.nodes.len();
+        let port = RustFSTestEnvironment::find_available_port().await?;
+        let address = format!("127.0.0.1:{port}");
+        let data_dirs: Vec<String> = (0..self.topology.drives_per_node)
+            .map(|drive| format!("{}/node{}/drive{}", self.temp_dir, new_idx, drive))
+            .collect();
+        for dir in &data_dirs {
+            fs::create_dir_all(dir).await?;
+        }
+
+        self.nodes.push(ClusterNode {
+            url: format!("http://{address}"),
+            address,
+            data_dir: data_dirs[0].clone(),
+            data_dirs,
+            pool_idx: pools.len(),
+            process: None,
+        });
+        pools.push(vec![new_idx]);
+        self.topology.node_count = self.nodes.len();
+        self.topology.pools = pools;
+        self.node_extra_env.push(Vec::new());
+        self.node_capture_log_paths.push(None);
+        self.volume_proxy_addresses.push(None);
+
+        if !self.extra_env.iter().any(|(key, _)| key == "RUSTFS_UNSAFE_BYPASS_DISK_CHECK") {
+            self.extra_env
+                .push(("RUSTFS_UNSAFE_BYPASS_DISK_CHECK".to_string(), "true".to_string()));
+        }
+
+        Ok(new_idx)
+    }
+
     /// Gracefully stop one cluster node and wait for its process to exit.
     ///
     /// This is intentionally separate from [`Self::stop_node`]: the latter is

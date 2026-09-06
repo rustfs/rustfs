@@ -882,6 +882,20 @@ fn reconstructed_heal_delete_info(
 ) -> DeletedObjectReplicationInfo {
     let mut rstate = oi.replication_state();
     rstate.replicate_decision_str = dsc.to_string();
+    // The caller hands us a blank ObjectInfo (the source marker may already be
+    // gone), so the state above carries no target-assigned marker version ids.
+    // Restore them from the journal: `delete_marker_purge_version_id` must hit
+    // the id the target reported, not fall back to the source marker id, which
+    // a target that mints its own ids answers with an idempotent 204 that would
+    // acknowledge the intent while the real marker stays behind (backlog#2290).
+    // The corrupt flag rides along so a refusal stays a refusal after restart.
+    for (arn, version_id) in &entry.target_delete_marker_version_ids {
+        rstate
+            .target_delete_marker_version_ids
+            .entry(arn.clone())
+            .or_insert_with(|| version_id.clone());
+    }
+    rstate.target_delete_marker_version_ids_corrupt |= entry.target_delete_marker_version_ids_corrupt;
 
     let delete_marker_mtime = entry
         .delete_marker_mtime
@@ -6599,6 +6613,89 @@ mod tests {
                 .await
                 .expect("newer journal data should remain readable"),
             replacement_data
+        );
+    }
+
+    /// backlog#2290: a delete-marker purge intent that survives a restart
+    /// through the MRF journal addresses the marker version the TARGET
+    /// assigned, exactly as the live watcher does (see the
+    /// `requires_delayed_purge` spawn). The journal carries the per-ARN ids
+    /// (`targetDeleteMarkerVersionIDs`) and replay restores them into the
+    /// reconstructed replication state; without that the replay would fall
+    /// back to the source marker id, which a target that mints its own ids
+    /// answers with an idempotent 204 — the entry would be acknowledged while
+    /// the real marker stayed behind.
+    #[test]
+    fn mrf_delete_marker_purge_replay_preserves_target_assigned_marker_version() {
+        use super::super::replication_object_decision_boundary::{delete_marker_purge_mrf_entry, delete_marker_purge_version_id};
+
+        let arn = "arn:minio:replication::generic-target:photos".to_string();
+        let source_marker = uuid::Uuid::new_v4();
+        let remote_marker = "remote-assigned-marker-version".to_string();
+
+        let live_oi = ObjectInfo {
+            bucket: "photos".to_string(),
+            name: "obj".to_string(),
+            version_id: Some(source_marker),
+            delete_marker: true,
+            ..Default::default()
+        };
+        let mut live_state = live_oi.replication_state();
+        live_state.replicate_decision_str = replicate_decision_for_admitted_targets(std::slice::from_ref(&arn)).to_string();
+        live_state
+            .target_delete_marker_version_ids
+            .insert(arn.clone(), remote_marker.clone());
+        let live = DeletedObjectReplicationInfo {
+            delete_object: ReplicationDeletedObject {
+                object_name: "obj".to_string(),
+                delete_marker: true,
+                delete_marker_version_id: Some(source_marker),
+                replication_state: Some(live_state),
+                ..Default::default()
+            },
+            bucket: "photos".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            delete_marker_purge_version_id(live.delete_object.replication_state.as_ref(), &arn, source_marker),
+            Some(Some(remote_marker.clone())),
+            "the live purge addresses the recorded target version"
+        );
+
+        // Watch window exhausted: persist the intent, restart, replay it.
+        let entry = delete_marker_purge_mrf_entry(&live, vec![arn.clone()]);
+        let replay_oi = ObjectInfo {
+            bucket: entry.bucket.clone(),
+            name: entry.object.clone(),
+            version_id: entry.version_id,
+            delete_marker: entry.delete_marker,
+            ..Default::default()
+        };
+        let dsc = replicate_decision_for_admitted_targets(&entry.target_arns);
+        let replayed = reconstructed_heal_delete_info(&entry, &replay_oi, &dsc);
+
+        assert_eq!(
+            delete_marker_purge_version_id(replayed.delete_object.replication_state.as_ref(), &arn, source_marker),
+            Some(Some(remote_marker)),
+            "the MRF replay must address the target-assigned marker version, not source marker {source_marker}"
+        );
+
+        // A refusal (inconsistent recorded ids) must stay a refusal across the
+        // journal round trip instead of degrading into the source-id fallback.
+        let mut refused = live;
+        refused
+            .delete_object
+            .replication_state
+            .as_mut()
+            .expect("state was set above")
+            .target_delete_marker_version_ids_corrupt = true;
+        let entry = delete_marker_purge_mrf_entry(&refused, vec![arn.clone()]);
+        assert!(entry.target_delete_marker_version_ids_corrupt);
+        let replayed = reconstructed_heal_delete_info(&entry, &replay_oi, &dsc);
+        assert_eq!(
+            delete_marker_purge_version_id(replayed.delete_object.replication_state.as_ref(), &arn, source_marker),
+            None,
+            "the MRF replay must keep refusing to guess when the recorded ids were inconsistent"
         );
     }
 }

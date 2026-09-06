@@ -14,6 +14,312 @@
 /// scan concurrency accounting: gauge recorders, RAII guards, and worker limits.
 use super::*;
 
+const SCANNER_SERVICE_COHORT_MAX_MEMBERS: usize = 4096;
+const SCANNER_SERVICE_COHORT_MAX_NAME_BYTES: usize = 128 * 1024;
+
+static SERVICE_COHORT_METRICS_OWNER: StdMutex<std::sync::Weak<()>> = StdMutex::new(std::sync::Weak::new());
+
+struct ScannerCohortMetricsOwner(Arc<()>);
+
+impl Default for ScannerCohortMetricsOwner {
+    fn default() -> Self {
+        let owner = Arc::new(());
+        let mut current = SERVICE_COHORT_METRICS_OWNER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = Arc::downgrade(&owner);
+        write_service_cohort_metrics(0, 0.0, false);
+        Self(owner)
+    }
+}
+
+impl Drop for ScannerCohortMetricsOwner {
+    fn drop(&mut self) {
+        let mut current = SERVICE_COHORT_METRICS_OWNER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.ptr_eq(&Arc::downgrade(&self.0)) {
+            *current = std::sync::Weak::new();
+            write_service_cohort_metrics(0, 0.0, false);
+        }
+    }
+}
+
+fn write_service_cohort_metrics(waiting: usize, oldest: f64, overflowed: bool) {
+    metrics::gauge!("rustfs_scanner_service_cohort_waiting").set(waiting as f64);
+    metrics::gauge!("rustfs_scanner_service_cohort_oldest_wait_seconds").set(oldest);
+    metrics::gauge!("rustfs_scanner_service_cohort_capacity_fallback").set(if overflowed { 1.0 } else { 0.0 });
+}
+
+struct ScannerCohortWait {
+    order: u64,
+    queued_at: Instant,
+    admitted: bool,
+    present: bool,
+}
+
+/// Leader-local admission order, never evidence of completed scan coverage.
+/// Retains at most 4096 members and 128 KiB of name payload, including the
+/// cursor shared with its last member. Candidate selection borrows at most
+/// 4096 inventory entries; the existing full inventory is not bounded here.
+pub(crate) struct ScannerServiceCohort {
+    members: HashMap<DataUsageCacheSource, HashMap<Arc<str>, ScannerCohortWait>>,
+    cursor: Option<(DataUsageCacheSource, Arc<str>)>,
+    next_order: u64,
+    max_members: usize,
+    max_name_bytes: usize,
+    overflowed: bool,
+    metrics_owner: ScannerCohortMetricsOwner,
+    waiting: usize,
+    oldest_wait_at_refresh: f64,
+    #[cfg(test)]
+    metric_members_examined: usize,
+}
+
+impl Default for ScannerServiceCohort {
+    fn default() -> Self {
+        Self {
+            members: HashMap::new(),
+            cursor: None,
+            next_order: 0,
+            max_members: SCANNER_SERVICE_COHORT_MAX_MEMBERS,
+            max_name_bytes: SCANNER_SERVICE_COHORT_MAX_NAME_BYTES,
+            overflowed: false,
+            metrics_owner: ScannerCohortMetricsOwner::default(),
+            waiting: 0,
+            oldest_wait_at_refresh: 0.0,
+            #[cfg(test)]
+            metric_members_examined: 0,
+        }
+    }
+}
+
+impl ScannerServiceCohort {
+    pub(crate) fn refresh(&mut self, inventory: &HashMap<DataUsageCacheSource, Vec<BucketInfo>>) {
+        let count = inventory
+            .values()
+            .fold(0usize, |count, buckets| count.saturating_add(buckets.len()));
+        let name_bytes = inventory
+            .values()
+            .flatten()
+            .fold(0usize, |bytes, bucket| bytes.saturating_add(bucket.name.len()));
+        self.overflowed = count > self.max_members || name_bytes > self.max_name_bytes;
+        for wait in self.members.values_mut().flat_map(HashMap::values_mut) {
+            wait.present = false;
+        }
+        for (source, buckets) in inventory {
+            for bucket in buckets {
+                if let Some(wait) = self
+                    .members
+                    .get_mut(source)
+                    .and_then(|members| members.get_mut(bucket.name.as_str()))
+                {
+                    wait.present = true;
+                }
+            }
+        }
+        self.members.retain(|_, buckets| {
+            buckets.retain(|_, wait| wait.present);
+            !buckets.is_empty()
+        });
+        if self.members.values().flat_map(HashMap::values).all(|wait| wait.admitted) {
+            self.members.clear();
+            self.next_order = 0;
+        }
+        if count == 0 {
+            self.cursor = None;
+        }
+        let mut member_count = self.members.values().map(HashMap::len).sum::<usize>();
+        let mut retained_bytes = self
+            .members
+            .values()
+            .flat_map(HashMap::keys)
+            .map(|name| name.len())
+            .sum::<usize>();
+        let mut incoming = self.admission_candidates(inventory, true);
+        if incoming.is_empty() {
+            incoming = self.admission_candidates(inventory, false);
+        }
+        for (pool, set, bucket) in incoming {
+            if member_count >= self.max_members {
+                break;
+            }
+            if retained_bytes.saturating_add(bucket.len()) > self.max_name_bytes {
+                continue;
+            }
+            let Some(next_order) = self.next_order.checked_add(1) else {
+                self.overflowed = true;
+                break;
+            };
+            let source = DataUsageCacheSource::new(pool, set);
+            let members = self.members.entry(source).or_default();
+            if members.contains_key(bucket) {
+                continue;
+            }
+            let name: Arc<str> = bucket.into();
+            retained_bytes += name.len();
+            member_count += 1;
+            members.insert(
+                name.clone(),
+                ScannerCohortWait {
+                    order: self.next_order,
+                    queued_at: Instant::now(),
+                    admitted: false,
+                    present: true,
+                },
+            );
+            self.cursor = Some((source, name));
+            self.next_order = next_order;
+        }
+        self.refresh_metrics();
+    }
+
+    fn admission_candidates<'a>(
+        &self,
+        inventory: &'a HashMap<DataUsageCacheSource, Vec<BucketInfo>>,
+        after_cursor: bool,
+    ) -> Vec<(usize, usize, &'a str)> {
+        let mut candidates = std::collections::BinaryHeap::new();
+        for (source, buckets) in inventory {
+            for bucket in buckets {
+                let key = (source.pool_index, source.set_index, bucket.name.as_str());
+                let after = self
+                    .cursor
+                    .as_ref()
+                    .is_none_or(|(source, name)| key > (source.pool_index, source.set_index, name.as_ref()));
+                if after != after_cursor
+                    || bucket.name.len() > self.max_name_bytes
+                    || self
+                        .members
+                        .get(source)
+                        .is_some_and(|members| members.contains_key(bucket.name.as_str()))
+                {
+                    continue;
+                }
+                if candidates.len() < self.max_members {
+                    candidates.push(key);
+                } else if candidates.peek().is_some_and(|last| key < *last) {
+                    candidates.pop();
+                    candidates.push(key);
+                }
+            }
+        }
+        candidates.into_sorted_vec()
+    }
+
+    pub(crate) fn order_set_indices(&self, sets: &[Arc<SetDisks>]) -> Vec<usize> {
+        let ranks = self
+            .members
+            .iter()
+            .map(|(source, buckets)| {
+                (
+                    *source,
+                    buckets
+                        .values()
+                        .filter(|wait| !wait.admitted)
+                        .map(|wait| wait.order)
+                        .min()
+                        .unwrap_or(u64::MAX),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut indices = (0..sets.len()).collect::<Vec<_>>();
+        indices.sort_by_key(|index| {
+            (
+                ranks
+                    .get(&DataUsageCacheSource::new(sets[*index].pool_index, sets[*index].set_index))
+                    .copied()
+                    .unwrap_or(u64::MAX),
+                *index,
+            )
+        });
+        indices
+    }
+
+    pub(crate) fn order_buckets(&self, source: DataUsageCacheSource, buckets: &mut [BucketInfo]) {
+        let rank = |bucket: &str| {
+            self.members
+                .get(&source)
+                .and_then(|members| members.get(bucket))
+                .filter(|wait| !wait.admitted)
+                .map_or(u64::MAX, |wait| wait.order)
+        };
+        // Stable sorting preserves the existing dispatch order in the tail.
+        buckets.sort_by_key(|bucket| rank(&bucket.name));
+    }
+
+    pub(crate) fn record_admitted(&mut self, source: DataUsageCacheSource, bucket: &str) {
+        let Some(wait) = self.members.get_mut(&source).and_then(|members| members.get_mut(bucket)) else {
+            return;
+        };
+        if wait.admitted {
+            return;
+        }
+        wait.admitted = true;
+        self.waiting -= 1;
+        if self.waiting == 0 {
+            self.oldest_wait_at_refresh = 0.0;
+        }
+        self.record_metrics();
+    }
+
+    #[cfg(test)]
+    pub(super) fn admitted_members(&self) -> Vec<(DataUsageCacheSource, String)> {
+        self.members
+            .iter()
+            .flat_map(|(source, buckets)| {
+                buckets
+                    .iter()
+                    .filter(|(_, wait)| wait.admitted)
+                    .map(|(bucket, _)| (*source, bucket.to_string()))
+            })
+            .collect()
+    }
+
+    fn refresh_metrics(&mut self) {
+        // Oldest age is an inventory-refresh snapshot, not a per-admission
+        // scan of the cohort. Clear it immediately when no waiters remain.
+        let (mut waiting, mut oldest) = (0usize, 0.0f64);
+        for wait in self.members.values().flat_map(HashMap::values) {
+            #[cfg(test)]
+            {
+                self.metric_members_examined += 1;
+            }
+            if !wait.admitted {
+                waiting += 1;
+                oldest = oldest.max(wait.queued_at.elapsed().as_secs_f64());
+            }
+        }
+        self.waiting = waiting;
+        self.oldest_wait_at_refresh = oldest;
+        self.record_metrics();
+    }
+
+    fn record_metrics(&self) {
+        // Serialize owner replacement, publication and retirement. A retired
+        // scanner must neither publish nor clear a replacement's gauges.
+        let current = SERVICE_COHORT_METRICS_OWNER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.ptr_eq(&Arc::downgrade(&self.metrics_owner.0)) {
+            write_service_cohort_metrics(self.waiting, self.oldest_wait_at_refresh, self.overflowed);
+        }
+    }
+}
+
+pub(super) async fn wait_for_bucket_scan_permit(
+    semaphore: &Arc<Semaphore>,
+    ctx: &CancellationToken,
+    complete: &CancellationToken,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    tokio::select! {
+        biased;
+        _ = complete.cancelled() => None,
+        _ = ctx.cancelled() => None,
+        permit = semaphore.clone().acquire_owned() => permit.ok(),
+    }
+}
+
 pub(super) fn bucket_usage_scan_order(
     buckets: &[BucketInfo],
     old_cache: &DataUsageCache,
@@ -287,6 +593,305 @@ mod tests {
     use super::*;
     use rustfs_scanner_metrics::metrics::{ScannerWorkSource, global_metrics};
     use tokio::sync::oneshot;
+
+    #[derive(Default)]
+    struct RecordedGauge(AtomicU64);
+
+    impl metrics::GaugeFn for RecordedGauge {
+        fn increment(&self, value: f64) {
+            self.set(f64::from_bits(self.0.load(Ordering::Relaxed)) + value);
+        }
+        fn decrement(&self, value: f64) {
+            self.increment(-value);
+        }
+        fn set(&self, value: f64) {
+            self.0.store(value.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Default)]
+    struct CohortGaugeRecorder(StdMutex<HashMap<String, Arc<RecordedGauge>>>);
+
+    impl metrics::Recorder for CohortGaugeRecorder {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::from_arc(
+                self.0
+                    .lock()
+                    .expect("gauge recorder")
+                    .entry(key.name().to_string())
+                    .or_default()
+                    .clone(),
+            )
+        }
+    }
+
+    impl CohortGaugeRecorder {
+        fn value(&self, name: &str) -> f64 {
+            f64::from_bits(self.0.lock().expect("gauge recorder")[name].0.load(Ordering::Relaxed))
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn service_cohort_metrics_retire_only_the_current_owner() {
+        let recorder = CohortGaugeRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let mut old = ScannerServiceCohort::default();
+            old.refresh(&cohort_inventory(&["old"]));
+            let mut current = ScannerServiceCohort {
+                max_members: 1,
+                ..Default::default()
+            };
+            current.refresh(&cohort_inventory(&["a", "b"]));
+            for wait in current.members.values_mut().flat_map(HashMap::values_mut) {
+                wait.queued_at = Instant::now() - Duration::from_secs(60);
+            }
+            current.refresh_metrics();
+            old.refresh(&cohort_inventory(&["old", "more"]));
+            drop(old);
+            assert_eq!(recorder.value("rustfs_scanner_service_cohort_waiting"), 1.0);
+            assert_eq!(recorder.value("rustfs_scanner_service_cohort_capacity_fallback"), 1.0);
+            assert!(recorder.value("rustfs_scanner_service_cohort_oldest_wait_seconds") >= 60.0);
+            drop(current);
+            for metric in [
+                "rustfs_scanner_service_cohort_waiting",
+                "rustfs_scanner_service_cohort_oldest_wait_seconds",
+                "rustfs_scanner_service_cohort_capacity_fallback",
+            ] {
+                assert_eq!(recorder.value(metric), 0.0, "owner retirement must clear {metric}");
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn service_cohort_admission_metrics_do_not_rescan_a_full_window() {
+        let recorder = CohortGaugeRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let source = DataUsageCacheSource::new(0, 0);
+            let names = (0..SCANNER_SERVICE_COHORT_MAX_MEMBERS)
+                .map(|index| format!("bucket-{index:04}"))
+                .collect::<Vec<_>>();
+            let inventory = cohort_inventory(&names.iter().map(String::as_str).collect::<Vec<_>>());
+            let mut cohort = ScannerServiceCohort::default();
+            cohort.refresh(&inventory);
+            assert_eq!(cohort.metric_members_examined, SCANNER_SERVICE_COHORT_MAX_MEMBERS);
+            assert_eq!(cohort.waiting, SCANNER_SERVICE_COHORT_MAX_MEMBERS);
+            for (index, name) in names.iter().enumerate() {
+                cohort.record_admitted(source, name);
+                for _ in 0..10 {
+                    cohort.record_admitted(source, name);
+                    cohort.record_admitted(source, "untracked-overflow-name");
+                    cohort.record_admitted(DataUsageCacheSource::new(99, 0), name);
+                }
+                assert_eq!(cohort.waiting, SCANNER_SERVICE_COHORT_MAX_MEMBERS - index - 1);
+                assert_eq!(
+                    cohort.metric_members_examined, SCANNER_SERVICE_COHORT_MAX_MEMBERS,
+                    "tracked, repeated and overflow admissions must not scan cohort members"
+                );
+            }
+            assert_eq!(recorder.value("rustfs_scanner_service_cohort_waiting"), 0.0);
+            assert_eq!(recorder.value("rustfs_scanner_service_cohort_oldest_wait_seconds"), 0.0);
+            cohort.refresh(&inventory);
+            assert_eq!(
+                cohort.metric_members_examined,
+                2 * SCANNER_SERVICE_COHORT_MAX_MEMBERS,
+                "one inventory refresh performs one metrics traversal"
+            );
+        });
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn service_cohort_queued_permit_cancel_and_drop_return_the_same_capacity() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut cohort = ScannerServiceCohort::default();
+        cohort.refresh(&cohort_inventory(&["waiting"]));
+        let gauge_reset = DiskBucketScanGaugeReset::new("cohort-wait".to_string(), "0".to_string());
+        record_disk_bucket_scans_queued(1, "cohort-wait", "0");
+        record_disk_bucket_scans_active(0, "cohort-wait", "0");
+        for cancel in [true, false] {
+            let held = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("hold the sole permit as a barrier");
+            let ctx = CancellationToken::new();
+            let complete = CancellationToken::new();
+            let mut waiter = Box::pin(wait_for_bucket_scan_permit(&semaphore, &ctx, &complete));
+            assert!(
+                futures::poll!(&mut waiter).is_pending(),
+                "the production wait must actually enqueue behind the barrier"
+            );
+            assert_eq!(semaphore.available_permits(), 0);
+            if cancel {
+                ctx.cancel();
+                assert!(waiter.as_mut().await.is_none());
+            }
+            drop(waiter);
+            assert_eq!(semaphore.available_permits(), 0, "cancelling a waiter must not release the held permit");
+            assert!(cohort.admitted_members().is_empty());
+            drop(held);
+            assert_eq!(semaphore.available_permits(), 1, "no queued waiter may leak or steal released capacity");
+        }
+        let ctx = CancellationToken::new();
+        let complete = CancellationToken::new();
+        let permit = wait_for_bucket_scan_permit(&semaphore, &ctx, &complete)
+            .await
+            .expect("same semaphore remains usable");
+        let active_guard = DiskBucketScanActiveGuard::new(active.clone(), "cohort-wait".to_string(), "0".to_string());
+        assert_eq!(active.load(Ordering::Relaxed), 1);
+        drop(active_guard);
+        drop(permit);
+        drop(gauge_reset);
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+        assert_eq!(semaphore.available_permits(), 1);
+        let state = global_metrics()
+            .scanner_runtime_details_report()
+            .disk_bucket_scan_states
+            .into_iter()
+            .find(|state| state.pool == "cohort-wait" && state.set == "0")
+            .expect("fixture gauges");
+        assert_eq!((state.queued, state.active), (0, 0));
+        assert!(cohort.admitted_members().is_empty(), "permit ownership alone does not admit a bucket");
+    }
+
+    fn cohort_inventory(names: &[&str]) -> HashMap<DataUsageCacheSource, Vec<BucketInfo>> {
+        HashMap::from([(
+            DataUsageCacheSource::new(0, 0),
+            names
+                .iter()
+                .map(|name| BucketInfo {
+                    name: (*name).to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+        )])
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn service_cohort_visits_fixed_members_within_service_round_bound() {
+        let inventory = cohort_inventory(&["a", "b", "c", "d", "e"]);
+        let source = DataUsageCacheSource::new(0, 0);
+        let mut cohort = ScannerServiceCohort::default();
+        let mut admitted = HashSet::new();
+        for _ in 0..3 {
+            cohort.refresh(&inventory);
+            let mut buckets = inventory[&source].clone();
+            cohort.order_buckets(source, &mut buckets);
+            for bucket in buckets.iter().take(2) {
+                admitted.insert(bucket.name.clone());
+                cohort.record_admitted(source, &bucket.name);
+            }
+        }
+        assert_eq!(admitted.len(), 5, "ceil(5/2) service rounds must include every member");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn service_cohort_keeps_waiting_bootstrap_ahead_of_new_work() {
+        let source = DataUsageCacheSource::new(0, 0);
+        let mut cohort = ScannerServiceCohort::default();
+        cohort.refresh(&cohort_inventory(&["a-hot", "z-bootstrap"]));
+        cohort.record_admitted(source, "a-hot");
+        let queued_at = cohort.members[&source]["z-bootstrap"].queued_at;
+        let inventory = cohort_inventory(&["a-hot", "aaa-new-bootstrap", "z-bootstrap"]);
+        for _ in 0..10 {
+            cohort.refresh(&inventory);
+            let mut buckets = inventory[&source].clone();
+            cohort.order_buckets(source, &mut buckets);
+            assert_eq!(buckets[0].name, "z-bootstrap");
+            assert_eq!(buckets[1].name, "aaa-new-bootstrap");
+            assert_eq!(cohort.members[&source]["z-bootstrap"].queued_at, queued_at);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn service_cohort_overflow_preserves_waiters_and_rotates_finished_windows() {
+        let source = DataUsageCacheSource::new(0, 0);
+        let mut cohort = ScannerServiceCohort {
+            max_members: 2,
+            max_name_bytes: 4,
+            ..Default::default()
+        };
+        cohort.refresh(&cohort_inventory(&["aa", "bb"]));
+        cohort.record_admitted(source, "aa");
+        for names in [["aa", "bb", "c"], ["aa", "bb", "d"]] {
+            let inventory = cohort_inventory(&names);
+            cohort.refresh(&inventory);
+            assert!(cohort.overflowed);
+            assert_eq!(cohort.members[&source].len(), 2);
+            assert!(cohort.members[&source].contains_key("aa"));
+            let mut fallback = inventory[&source].clone();
+            fallback.reverse();
+            cohort.order_buckets(source, &mut fallback);
+            assert_eq!(fallback[0].name, "bb", "overflow must not discard a waiting member's priority");
+            assert_eq!(fallback.len(), 3, "unknown tail must remain dispatchable");
+        }
+        cohort.record_admitted(source, "bb");
+        let inventory = cohort_inventory(&["aa", "bb", "c", "d"]);
+        cohort.refresh(&inventory);
+        assert_eq!(
+            cohort.members[&source].keys().map(AsRef::as_ref).collect::<HashSet<&str>>(),
+            HashSet::from(["c", "d"])
+        );
+        cohort.record_admitted(source, "c");
+        cohort.record_admitted(source, "d");
+        cohort.refresh(&inventory);
+        assert!(
+            cohort.members[&source].contains_key("aa"),
+            "finite inventory must wrap after the last window"
+        );
+        cohort.refresh(&cohort_inventory(&["bb"]));
+        assert!(!cohort.overflowed);
+        assert_eq!(cohort.members[&source].len(), 1);
+        cohort.next_order = u64::MAX;
+        cohort.refresh(&cohort_inventory(&["bb", "c"]));
+        assert!(cohort.overflowed);
+        assert_eq!(cohort.members[&source].len(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn service_cohort_bounds_names_and_does_not_reset_duplicate_dirty_age() {
+        let source = DataUsageCacheSource::new(0, 0);
+        let mut cohort = ScannerServiceCohort {
+            max_members: 2,
+            max_name_bytes: 4,
+            ..Default::default()
+        };
+        cohort.refresh(&cohort_inventory(&["aa", "bb", "long-name"]));
+        let queued_at = cohort.members[&source]["bb"].queued_at;
+        for _ in 0..10 {
+            cohort.refresh(&cohort_inventory(&["aa", "aa", "bb", "long-name"]));
+            assert_eq!(cohort.members.values().map(HashMap::len).sum::<usize>(), 2);
+            assert_eq!(
+                cohort
+                    .members
+                    .values()
+                    .flat_map(HashMap::keys)
+                    .map(|name| name.len())
+                    .sum::<usize>(),
+                4
+            );
+            assert_eq!(cohort.members[&source]["bb"].queued_at, queued_at);
+        }
+        cohort.refresh(&cohort_inventory(&[]));
+        assert!(cohort.members.is_empty());
+        assert!(cohort.cursor.is_none());
+    }
 
     fn active_bucket_drive_count(source: ScannerWorkSource, bucket: &str, drive: &str) -> u64 {
         global_metrics()

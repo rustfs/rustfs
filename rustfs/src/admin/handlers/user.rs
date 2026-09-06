@@ -1131,6 +1131,7 @@ impl Operation for ImportIam {
                         expiration: req.expiration,
                         allow_site_replicator_account: false,
                         claims: Some(req.claims),
+                        status: None,
                     };
 
                     let groups = if req.groups.is_empty() { None } else { Some(req.groups) };

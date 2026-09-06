@@ -22,7 +22,7 @@ use super::{
     bucket_lifecycle_ops::{
         ManualTransitionQueueSnapshot, ManualTransitionRunReport, decode_manual_transition_continuation_token,
     },
-    manual_transition_job, tier_delete_journal, transition_transaction,
+    manual_transition_job, recovery_control, tier_delete_journal, transition_transaction,
 };
 use crate::error::{Error, Result};
 use crate::services::tier::tier_probe_intent;
@@ -41,6 +41,7 @@ pub(crate) enum DurableIlmRecordKind {
     ManualTransitionScope,
     ManualTransitionTask,
     ManualTransitionWorkerResult,
+    RecoveryControl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,8 +106,14 @@ pub(crate) const MANUAL_TRANSITION_WORKER_RESULT_NAMESPACE: DurableIlmNamespace 
     max_record_size: manual_transition_job::MAX_MANUAL_TRANSITION_WORKER_RESULT_RECORD_SIZE,
     kind: DurableIlmRecordKind::ManualTransitionWorkerResult,
 };
+pub(crate) const RECOVERY_CONTROL_NAMESPACE: DurableIlmNamespace = DurableIlmNamespace {
+    name: "recovery-control",
+    prefix: recovery_control::ILM_RECOVERY_CONTROL_PREFIX,
+    max_record_size: recovery_control::MAX_ILM_RECOVERY_CONTROL_SIZE,
+    kind: DurableIlmRecordKind::RecoveryControl,
+};
 
-pub(crate) const DURABLE_ILM_NAMESPACES: [DurableIlmNamespace; 9] = [
+pub(crate) const DURABLE_ILM_NAMESPACES: [DurableIlmNamespace; 10] = [
     TIER_DELETE_JOURNAL_NAMESPACE,
     TIER_DELETE_JOURNAL_V6_NAMESPACE,
     TIER_DELETE_DISPATCH_MANIFEST_NAMESPACE,
@@ -116,6 +123,7 @@ pub(crate) const DURABLE_ILM_NAMESPACES: [DurableIlmNamespace; 9] = [
     MANUAL_TRANSITION_SCOPE_NAMESPACE,
     MANUAL_TRANSITION_TASK_NAMESPACE,
     MANUAL_TRANSITION_WORKER_RESULT_NAMESPACE,
+    RECOVERY_CONTROL_NAMESPACE,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +249,18 @@ pub(crate) enum DurableIlmRecordCheckpoint {
     ManualTransitionWorkerResult {
         content_sha256: String,
     },
+    RecoveryControl {
+        content_sha256: String,
+        identity_sha256: String,
+        source_generation_sha256: String,
+        first_seen_at_unix_nanos: i64,
+        revision: u64,
+        classification: recovery_control::IlmRecoveryClassification,
+        attempt_count: u64,
+        consecutive_failure_count: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_fence_sha256: Option<String>,
+    },
 }
 
 impl DurableIlmRecordCheckpoint {
@@ -254,7 +274,8 @@ impl DurableIlmRecordCheckpoint {
             | Self::ManualTransitionJob { content_sha256, .. }
             | Self::ManualTransitionScope { content_sha256, .. }
             | Self::ManualTransitionTask { content_sha256 }
-            | Self::ManualTransitionWorkerResult { content_sha256 } => content_sha256,
+            | Self::ManualTransitionWorkerResult { content_sha256 }
+            | Self::RecoveryControl { content_sha256, .. } => content_sha256,
         }
     }
 
@@ -528,6 +549,51 @@ impl DurableIlmRecordCheckpoint {
                     ..
                 },
             ) => previous_identity == next_identity && next_updated_at > previous_updated_at,
+            (
+                Self::RecoveryControl {
+                    identity_sha256: previous_identity,
+                    source_generation_sha256: previous_generation,
+                    first_seen_at_unix_nanos: previous_first_seen,
+                    revision: previous_revision,
+                    classification: previous_classification,
+                    attempt_count: previous_attempts,
+                    consecutive_failure_count: previous_failures,
+                    owner_fence_sha256: previous_owner,
+                    ..
+                },
+                Self::RecoveryControl {
+                    identity_sha256: next_identity,
+                    source_generation_sha256: next_generation,
+                    first_seen_at_unix_nanos: next_first_seen,
+                    revision: next_revision,
+                    classification: next_classification,
+                    attempt_count: next_attempts,
+                    consecutive_failure_count: next_failures,
+                    owner_fence_sha256: next_owner,
+                    ..
+                },
+            ) => {
+                let adjacent = previous_identity == next_identity
+                    && previous_first_seen == next_first_seen
+                    && previous_revision.checked_add(1) == Some(*next_revision);
+                let claim = next_owner.is_some()
+                    && *previous_classification == recovery_control::IlmRecoveryClassification::Retrying
+                    && *next_classification == recovery_control::IlmRecoveryClassification::Retrying
+                    && previous_attempts.checked_add(1) == Some(*next_attempts)
+                    && previous_failures == next_failures;
+                let source_refresh = previous_owner.is_some()
+                    && previous_owner == next_owner
+                    && *previous_classification == recovery_control::IlmRecoveryClassification::Retrying
+                    && *next_classification == recovery_control::IlmRecoveryClassification::Retrying
+                    && previous_attempts == next_attempts
+                    && previous_failures == next_failures
+                    && previous_generation != next_generation;
+                let completion = previous_owner.is_some()
+                    && next_owner.is_none()
+                    && previous_generation == next_generation
+                    && previous_attempts == next_attempts;
+                adjacent && (claim || source_refresh || completion)
+            }
             _ => false,
         };
 
@@ -549,6 +615,14 @@ impl DurableIlmRecordCheckpoint {
             && !matches!(
                 state,
                 tier_probe_intent::TierProbeIntentState::AbortedNoRemote | tier_probe_intent::TierProbeIntentState::Completed
+            )
+        {
+            return false;
+        }
+        if let Self::RecoveryControl { classification, .. } = terminal
+            && !matches!(
+                classification,
+                recovery_control::IlmRecoveryClassification::Terminal | recovery_control::IlmRecoveryClassification::Abandoned
             )
         {
             return false;
@@ -651,6 +725,32 @@ impl DurableIlmRecordCheckpoint {
                         .checked_sub(*previous_revision)
                         .is_some_and(|distance| tier_probe_state_reaches(*previous_state, *terminal_state, distance))
                     && (!previous_remote_version_known || previous_remote_version == terminal_remote_version)
+            }
+            (
+                Self::RecoveryControl {
+                    identity_sha256: previous_identity,
+                    source_generation_sha256: previous_generation,
+                    first_seen_at_unix_nanos: previous_first_seen,
+                    revision: previous_revision,
+                    attempt_count: previous_attempts,
+                    ..
+                },
+                Self::RecoveryControl {
+                    identity_sha256: terminal_identity,
+                    source_generation_sha256: terminal_generation,
+                    first_seen_at_unix_nanos: terminal_first_seen,
+                    revision: terminal_revision,
+                    attempt_count: terminal_attempts,
+                    classification:
+                        recovery_control::IlmRecoveryClassification::Terminal | recovery_control::IlmRecoveryClassification::Abandoned,
+                    ..
+                },
+            ) => {
+                previous_identity == terminal_identity
+                    && (previous_generation == terminal_generation || terminal_attempts > previous_attempts)
+                    && previous_first_seen == terminal_first_seen
+                    && terminal_revision > previous_revision
+                    && terminal_attempts >= previous_attempts
             }
             _ => false,
         }
@@ -1219,6 +1319,35 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
                 },
             )
         }
+        DurableIlmRecordKind::RecoveryControl => {
+            let (protocol, control_id) = recovery_control::recovery_control_id_from_record_object_name(path)
+                .map_err(|err| Error::other(err.to_string()))?;
+            let control =
+                recovery_control::IlmRecoveryControl::decode(&control_id, data).map_err(|err| Error::other(err.to_string()))?;
+            let canonical = recovery_control::recovery_control_record_object_name(protocol, &control_id)
+                .map_err(|err| Error::other(err.to_string()))?;
+            if canonical != path || control.identity.protocol != protocol {
+                return Err(Error::other("ILM recovery control path is not canonical"));
+            }
+            let identity_sha256 = checkpoint_hash(&control.identity)?;
+            let source_generation_sha256 = checkpoint_hash(&control.observed_source_generation)?;
+            let owner_fence_sha256 = control.owner.as_ref().map(checkpoint_hash).transpose()?;
+            (
+                "control_id",
+                control_id,
+                DurableIlmRecordCheckpoint::RecoveryControl {
+                    content_sha256,
+                    identity_sha256,
+                    source_generation_sha256,
+                    first_seen_at_unix_nanos: control.first_seen_at_unix_nanos,
+                    revision: control.revision,
+                    classification: control.classification,
+                    attempt_count: control.attempt_count,
+                    consecutive_failure_count: control.consecutive_failure_count,
+                    owner_fence_sha256,
+                },
+            )
+        }
         DurableIlmRecordKind::ManualTransitionJob => {
             let job_id = manual_transition_job::manual_transition_job_id_from_record_object_name(path)
                 .map_err(|err| Error::other(err.to_string()))?;
@@ -1410,6 +1539,94 @@ mod tests {
         validate_durable_ilm_record(&path, &encoded)
             .expect("tier probe intent should validate")
             .checkpoint
+    }
+
+    fn recovery_control_fixture() -> recovery_control::IlmRecoveryControl {
+        let source_path = "ilm/transition-transactions/records/12/34/1234567890abcdef1234567890abcdef.json";
+        let generation = recovery_control::IlmRecoverySourceGeneration::new(
+            transition_transaction::TRANSITION_TRANSACTION_SCHEMA,
+            "source-etag",
+            "a".repeat(64),
+            vec![recovery_control::IlmRecoverySourceCopy {
+                authority: "pool-0/set-0".to_string(),
+                canonical_path: source_path.to_string(),
+                etag: "source-etag".to_string(),
+                encoded_len: 128,
+                content_sha256: "a".repeat(64),
+            }],
+        )
+        .expect("source generation should build");
+        recovery_control::IlmRecoveryControl::new(
+            recovery_control::IlmRecoveryControlIdentity {
+                protocol: recovery_control::IlmRecoveryProtocol::TransitionTransaction,
+                canonical_source_path: source_path.to_string(),
+                stable_operation_identity: "12345678-90ab-cdef-1234-567890abcdef".to_string(),
+                record_class: "transition_transaction_v1".to_string(),
+            },
+            generation,
+            recovery_control::IlmRecoveryClassification::Retrying,
+            1_000_000_000,
+            recovery_control::IlmRecoveryErrorCode::None,
+        )
+        .expect("recovery control should build")
+    }
+
+    fn recovery_control_checkpoint(control: &recovery_control::IlmRecoveryControl) -> DurableIlmRecordCheckpoint {
+        let control_id = control.identity.source_operation_digest().expect("control id should derive");
+        let path = recovery_control::recovery_control_record_object_name(control.identity.protocol, &control_id)
+            .expect("control path should build");
+        let encoded = control.encode().expect("control should encode");
+        let namespace = classify_durable_ilm_record(&path)
+            .expect("recovery control namespace should classify")
+            .expect("recovery control should be durable");
+        assert_eq!(namespace, &RECOVERY_CONTROL_NAMESPACE);
+        validate_durable_ilm_record(&path, &encoded)
+            .expect("recovery control should validate")
+            .checkpoint
+    }
+
+    #[test]
+    fn recovery_control_checkpoint_tracks_claim_retry_and_terminal_generations() {
+        let initial_control = recovery_control_fixture();
+        let initial = recovery_control_checkpoint(&initial_control);
+
+        let mut claimed_control = initial_control;
+        let mut advanced_generation = claimed_control.observed_source_generation.clone();
+        advanced_generation.source_schema = "rustfs-transition-transaction-v2".to_string();
+        claimed_control
+            .claim_for_source_generation("node-a", Uuid::new_v4(), 2_000_000_000, 300_000_000_000, advanced_generation)
+            .expect("control should claim");
+        let claimed = recovery_control_checkpoint(&claimed_control);
+        initial.validate_successor(&claimed).expect("claim should advance receipt");
+
+        let mut retry_control = claimed_control;
+        retry_control
+            .record_retryable_failure(3_000_000_000, recovery_control::IlmRecoveryErrorCode::BackendTimeout)
+            .expect("retry should persist");
+        let retry = recovery_control_checkpoint(&retry_control);
+        claimed.validate_successor(&retry).expect("retry should advance receipt");
+
+        let ready_at = retry_control
+            .next_attempt_at_unix_nanos
+            .expect("retry deadline should persist");
+        let mut terminal_control = retry_control;
+        terminal_control
+            .claim("node-b", Uuid::new_v4(), ready_at, 300_000_000_000)
+            .expect("retry should claim");
+        let reclaimed = recovery_control_checkpoint(&terminal_control);
+        retry.validate_successor(&reclaimed).expect("reclaim should advance receipt");
+        terminal_control
+            .finish_attempt(
+                recovery_control::IlmRecoveryClassification::Terminal,
+                recovery_control::IlmRecoveryErrorCode::None,
+            )
+            .expect("control should terminate");
+        let terminal = recovery_control_checkpoint(&terminal_control);
+        reclaimed
+            .validate_successor(&terminal)
+            .expect("terminal state should advance receipt");
+        assert!(initial.is_predecessor_of_terminal(&terminal));
+        assert!(!initial.is_predecessor_of_terminal(&retry));
     }
 
     #[test]

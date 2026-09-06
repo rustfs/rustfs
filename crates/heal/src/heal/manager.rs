@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::heal::{
+    outcome::HealTaskOutcome,
     progress::{HealProgress, HealStatistics},
     resume::{ReplacementPhase, ResumeGc, ResumeManager, ResumeState, ResumeUtils},
     storage::HealStorageAPI,
@@ -185,6 +186,7 @@ fn record_displaced_terminal(
     request: &HealRequest,
 ) -> Arc<CompletedHealStatus> {
     let terminal = Arc::new(CompletedHealStatus {
+        outcome: None,
         progress: None,
         retained_bytes: std::sync::OnceLock::new(),
         heal_type: request.heal_type.clone(),
@@ -268,6 +270,7 @@ async fn publish_completed_heal(
 
 #[derive(Debug, Clone)]
 pub struct HealTaskReport {
+    pub outcome: Option<Arc<HealTaskOutcome>>,
     pub status: HealTaskStatus,
     pub result_items: Vec<HealResultItem>,
     pub result_items_truncated: bool,
@@ -285,6 +288,7 @@ async fn active_task_report(task: &HealTask, since: Option<u64>) -> HealTaskRepo
     let window = task.get_result_items_since(since).await;
     HealTaskReport {
         status: task.get_status().await,
+        outcome: Some(Arc::new(task.get_outcome().await)),
         result_items: window.items,
         // The legacy flag stays set once anything was evicted; a lagging
         // incremental cursor additionally marks this response truncated so
@@ -298,6 +302,7 @@ async fn active_task_report(task: &HealTask, since: Option<u64>) -> HealTaskRepo
 
 fn empty_task_report(status: HealTaskStatus) -> HealTaskReport {
     HealTaskReport {
+        outcome: None,
         status,
         result_items: Vec::new(),
         result_items_truncated: false,
@@ -325,6 +330,7 @@ fn completed_task_report(completed: &CompletedHealStatus, since: Option<u64>) ->
     };
     HealTaskReport {
         status: completed.status.clone(),
+        outcome: completed.outcome.clone(),
         result_items,
         result_items_truncated: completed.result_items_truncated || lagged,
         progress: completed.progress.clone(),
@@ -596,13 +602,13 @@ pub struct HealConfig {
     pub set_bulkhead_enable: bool,
     /// Whether erasure-set page parallelism is enabled.
     pub page_parallel_enable: bool,
-    /// Whether foreground read pressure can delay best-effort heal task starts.
+    /// Whether foreground pressure delays best-effort starts and paces running admin work.
     pub mainline_throttle_enable: bool,
-    /// Foreground read permit utilization percentage that delays best-effort heal starts.
+    /// Foreground read utilization high watermark for start admission and admin pacing.
     pub mainline_read_utilization_high_percent: usize,
-    /// Foreground write utilization percentage that delays best-effort heal starts.
+    /// Foreground write utilization high watermark for start admission and admin pacing.
     pub mainline_write_utilization_high_percent: usize,
-    /// Delay before rechecking foreground pressure after delaying heal starts.
+    /// Start recheck interval; running admin pacing caps each holder's pause at one second.
     pub mainline_max_sleep: Duration,
 }
 

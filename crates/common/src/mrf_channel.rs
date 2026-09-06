@@ -422,9 +422,9 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// A repair the MRF consumer landed, fanned out so retry ledgers can drop
-/// entries the journal no longer tracks (backlog#1894 axis B). The payload
-/// mirrors the intent identity so consumers match without re-parsing.
+/// Legacy, unverified repair notice. Its identity lacks kind, set scope,
+/// bucket incarnation and responsibility generation. Consumers must not use
+/// it to discharge persisted repair responsibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MrfRepairedEvent {
     pub bucket: Arc<str>,
@@ -439,8 +439,8 @@ const MRF_REPAIRED_EVENT_CAP: usize = 4096;
 
 static MRF_REPAIRED_EVENTS: OnceLock<std::sync::Mutex<std::collections::VecDeque<MrfRepairedEvent>>> = OnceLock::new();
 
-/// Record that the MRF consumer landed a repair. Never blocks: the critical
-/// section is a deque push under a std mutex.
+/// Record a legacy notification for compatibility. This is not an
+/// acknowledgement of storage verification or durable repair completion.
 pub fn note_mrf_repaired(bucket: &str, object: &str, version_id: Option<[u8; 16]>) {
     let registry = MRF_REPAIRED_EVENTS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
     let Ok(mut events) = registry.lock() else {
@@ -515,6 +515,9 @@ mod tests {
         }
         coalescer_release(&key, Some(lease));
         let retry_lease = coalescer_admit(key.clone()).expect("released identity must admit a retry");
+        assert_ne!(lease, retry_lease);
+        coalescer_release(&key, Some(lease));
+        assert_eq!(coalescer_admit(key.clone()), Err(MrfIngressResult::Coalesced));
         coalescer_release(&key, Some(retry_lease));
     }
 

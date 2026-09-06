@@ -265,7 +265,7 @@ pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_basel
         receiver,
         leader_epoch,
         initial_baseline,
-        || async { false },
+        || async { None },
     )
     .await
 }
@@ -280,7 +280,7 @@ pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_basel
 ) -> DataUsagePersistOutcome
 where
     F: Fn() -> Fut + Send + Sync,
-    Fut: Future<Output = bool> + Send,
+    Fut: Future<Output = Option<ScannerCycleDeferReason>> + Send,
 {
     store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch(
         ctx,
@@ -308,7 +308,7 @@ pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_basel
 ) -> DataUsagePersistOutcome
 where
     F: Fn() -> Fut + Send + Sync,
-    Fut: Future<Output = bool> + Send,
+    Fut: Future<Output = Option<ScannerCycleDeferReason>> + Send,
 {
     store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch_and_lease_fence(
         ctx,
@@ -336,7 +336,7 @@ pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_basel
 ) -> DataUsagePersistOutcome
 where
     F: Fn() -> Fut + Send + Sync,
-    Fut: Future<Output = bool> + Send,
+    Fut: Future<Output = Option<ScannerCycleDeferReason>> + Send,
 {
     let ScannerPublicationFence {
         expected_publication_epoch,
@@ -374,18 +374,19 @@ where
         } else {
             DATA_USAGE_OBJ_NAME_PATH.as_str()
         };
-        if route_probe().await {
+        if let Some(reason) = route_probe().await {
             debug!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_PERSIST_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_RUNTIME,
-                path = %target_path,
                 state = "publication_blocked_before_reconcile",
-                "Scanner data usage publication deferred by the pool-state fence"
+                reason = reason.as_str(),
+                path = %target_path,
+                "Scanner data usage publication deferred by the publication fence"
             );
-            global_metrics().record_scanner_usage_deferred(ScannerCycleDeferReason::DataMovement.as_str());
-            outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+            global_metrics().record_scanner_usage_deferred(reason.as_str());
+            outcome = DataUsagePersistOutcome::Deferred(reason);
             break;
         }
 
@@ -626,17 +627,18 @@ where
             if ctx.is_cancelled() {
                 break 'updates;
             }
-            if route_probe().await {
+            if let Some(reason) = route_probe().await {
                 debug!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_PERSIST_STATE,
                     component = LOG_COMPONENT_SCANNER,
                     subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    path = %target_path,
                     state = "publication_blocked_before_save",
-                    "Scanner data usage publication deferred by the final pool-state fence"
+                    reason = reason.as_str(),
+                    path = %target_path,
+                    "Scanner data usage publication deferred by the final publication fence"
                 );
-                break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+                break DataUsagePersistOutcome::Deferred(reason);
             }
             if remote_lease_expired(remote_lease_deadline) {
                 break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded);
@@ -722,19 +724,19 @@ where
                     );
                 }
                 Err(e @ EcstoreError::ObjectNotFound(_, _)) => {
-                    let route_blocked = route_probe().await;
-                    if route_blocked {
+                    if let Some(reason) = route_probe().await {
                         warn!(
                             target: "rustfs::scanner",
                             event = EVENT_SCANNER_PERSIST_STATE,
                             component = LOG_COMPONENT_SCANNER,
                             subsystem = LOG_SUBSYSTEM_RUNTIME,
-                            path = %target_path,
                             state = "publication_deferred",
+                            reason = reason.as_str(),
+                            path = %target_path,
                             error = %e,
-                            "Scanner data usage route is blocked by data movement; retrying later"
+                            "Scanner data usage route remains blocked; retrying later"
                         );
-                        break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+                        break DataUsagePersistOutcome::Deferred(reason);
                     }
                     error!(
                         target: "rustfs::scanner",
