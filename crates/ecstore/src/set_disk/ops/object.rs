@@ -7497,6 +7497,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let transported = delete_file_info_with_replication_transport_metadata(fi);
         let fi = &transported;
         let disks = self.disk_inventory().await;
+        let namespace_owner = (!is_meta_bucketname(bucket)).then(|| self.ctx.begin_namespace_commit());
         let write_quorum = disks.len() / 2 + 1;
         let rollback_dir = Uuid::new_v4();
 
@@ -7504,10 +7505,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut errs = Vec::with_capacity(disks.len());
 
         for disk in disks.iter() {
+            let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
             futures.push(async move {
                 if let Some(disk) = disk {
                     match disk
-                        .delete_version(
+                        .delete_version_with_namespace_owner(
                             bucket,
                             object,
                             fi.clone(),
@@ -7516,6 +7518,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 old_data_dir: Some(rollback_dir),
                                 ..Default::default()
                             },
+                            disk_namespace_owner,
                         )
                         .await
                     {
@@ -7563,10 +7566,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let bucket = bucket.to_string();
             let object = object.to_string();
             let fi = fi.clone();
+            let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
             rollback_futures.push(async move {
                 if should_rollback {
                     if let Err(err) = disk
-                        .delete_version(
+                        .delete_version_with_namespace_owner(
                             &bucket,
                             &object,
                             fi,
@@ -7577,6 +7581,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 old_data_dir: Some(rollback_dir),
                                 ..Default::default()
                             },
+                            disk_namespace_owner,
                         )
                         .await
                     {
@@ -7591,7 +7596,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 } else {
                     let rollback_path = format!("{object}/{rollback_dir}");
                     if let Err(err) = disk
-                        .delete(
+                        .delete_with_namespace_owner(
                             &bucket,
                             &rollback_path,
                             DeleteOptions {
@@ -7599,6 +7604,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 immediate: true,
                                 ..Default::default()
                             },
+                            disk_namespace_owner,
                         )
                         .await
                         && err != DiskError::FileNotFound
@@ -7617,6 +7623,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         join_all(rollback_futures).await;
+        drop(namespace_owner);
         quorum_result
     }
 
@@ -21042,5 +21049,419 @@ mod body_cache_hook_e2e_tests {
             compressed.len() as i64,
             "restore read must publish the stored compressed size"
         );
+    }
+}
+
+#[cfg(test)]
+mod single_delete_namespace_owner_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks_isolated;
+    use super::*;
+    use crate::disk::ReadOptions;
+    #[cfg(not(windows))]
+    use crate::disk::STORAGE_FORMAT_FILE;
+    use crate::object_api::WriteCompletion;
+    #[cfg(not(windows))]
+    use tokio::io::AsyncReadExt;
+
+    async fn seed_version(set: &Arc<SetDisks>, bucket: &str, object: &str, version: Uuid, body: &[u8]) {
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(body.to_vec()),
+            &ObjectOptions {
+                versioned: true,
+                version_id: Some(version.to_string()),
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed a complete real object version");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn single_delete_advances_namespace_generation_through_cleanup() {
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "single-delete-namespace";
+        let object = "last-version";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("fixture bucket");
+        }
+        let version = Uuid::new_v4();
+        seed_version(&set, bucket, object, version, &vec![0x41; 256 * 1024]).await;
+        let before = set.ctx.namespace_commit_generation();
+        assert!(!set.ctx.namespace_commits_pending());
+        let request = FileInfo {
+            name: object.to_string(),
+            version_id: Some(version),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        let result =
+            tokio::time::timeout(Duration::from_secs(10), set.delete_object_version(bucket, object, &request, false)).await;
+        if !matches!(result, Ok(Ok(()))) {
+            let retained = dirs.into_iter().map(tempfile::TempDir::keep).collect::<Vec<_>>();
+            panic!("single delete and cleanup did not finish: {result:?}; retained roots: {retained:?}");
+        }
+        for (disk, dir) in disks.iter().zip(&dirs) {
+            let result = disk
+                .read_version("", bucket, object, &version.to_string(), &ReadOptions::default())
+                .await;
+            assert!(matches!(result, Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)));
+            assert!(
+                !dir.path().join(bucket).join(object).exists(),
+                "immediate cleanup must remove the rollback object tree"
+            );
+        }
+        assert!(!set.ctx.namespace_commits_pending());
+        assert_eq!(
+            set.ctx.namespace_commit_generation(),
+            before + 2,
+            "single delete must count one complete root lifetime"
+        );
+    }
+
+    #[cfg(not(windows))]
+    async fn assert_single_delete_physical_owner(case: &'static str) {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        use futures::FutureExt;
+
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60"))], async {
+            let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+            let bucket = "single-delete-physical-owner";
+            let first = Uuid::new_v4();
+            let second = Uuid::new_v4();
+            let first_body = vec![0x51; 256 * 1024];
+            let second_body = vec![0x62; 4096];
+            let missing = case == "missing-marker";
+            let rollback = case == "rollback";
+            let last = case == "last-version";
+            let cleanup = case == "immediate-cleanup";
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("fixture bucket");
+            }
+            if !missing {
+                seed_version(&set, bucket, case, first, &first_body).await;
+                if !last && !cleanup {
+                    seed_version(&set, bucket, case, second, &second_body).await;
+                }
+            }
+            let request = FileInfo {
+                name: case.to_string(),
+                version_id: Some(first),
+                deleted: missing,
+                mark_deleted: missing,
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            };
+            let before = set.ctx.namespace_commit_generation();
+            assert!(!set.ctx.namespace_commits_pending());
+            let mut metadata_paths = Vec::new();
+            let mut originals = Vec::new();
+            let mut cleanup_sources = Vec::new();
+            let mut cleanup_parts = Vec::new();
+            for disk in &disks {
+                let crate::disk::Disk::Local(local) = disk.as_ref() else {
+                    panic!("local fixture required");
+                };
+                let path = local
+                    .get_disk()
+                    .get_object_path_for_io(bucket, case)
+                    .expect("leased IO path")
+                    .join(STORAGE_FORMAT_FILE);
+                originals.push(if missing {
+                    None
+                } else {
+                    Some(std::fs::read(&path).expect("seeded raw metadata"))
+                });
+                if cleanup {
+                    let fi = disk.read_version("", bucket, case, &first.to_string(), &ReadOptions::default())
+                        .await.expect("real non-inline data directory");
+                    assert!(!fi.inline_data(), "cleanup fixture must have real shard files");
+                    let data = path.parent().expect("object parent").join(fi.data_dir.expect("data directory").to_string());
+                    cleanup_parts.push(std::fs::read(data.join("part.1")).expect("real pre-delete shard"));
+                    cleanup_sources.push(data);
+                }
+                metadata_paths.push(path);
+            }
+            if rollback {
+                // Two disks apply the real deletion and then error. Undo must
+                // restore all four disks, including these post-apply failures.
+                for disk in disks.iter().take(2) {
+                    crate::disk::local::set_delete_version_fail_after_commit(disk.path().as_path(), case);
+                }
+            }
+            let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut guards = Vec::new();
+            let mut destination_guards = Vec::new();
+            let later_guards = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut releases = Vec::new();
+            for (index, path) in metadata_paths.iter().enumerate() {
+                let tx = entered_tx.clone();
+                let (release, rx) = std::sync::mpsc::channel::<()>();
+                if last || cleanup {
+                    let source = if cleanup { &cleanup_sources[index] } else { path };
+                    destination_guards.push(hooks::observe_rename_destination(source, move |destination| {
+                        let _ = tx.send((index, destination.to_path_buf()));
+                        let _ = rx.recv();
+                    }));
+                } else {
+                    let hook_path = path.clone();
+                    let path = path.clone();
+                    let pause_path = path.clone();
+                    let later_guards = Arc::clone(&later_guards);
+                    guards.push(hooks::install_at(hooks::Stage::Rename, &hook_path, move || {
+                        let pause = move || {
+                            let _ = tx.send((index, pause_path));
+                            let _ = rx.recv();
+                        };
+                        if rollback {
+                            // This first callback precedes forward metadata publication.
+                            // Arm only the subsequent real backup-restore rename.
+                            let next = hooks::install_at(hooks::Stage::Rename, &path, pause);
+                            later_guards.lock().expect("fixture hook guards").push(next);
+                        } else {
+                            pause();
+                        }
+                    }));
+                }
+                releases.push(release);
+            }
+            drop(entered_tx);
+            let deleting_set = Arc::clone(&set);
+            let mut delete =
+                tokio::spawn(async move { deleting_set.delete_object_version(bucket, case, &request, missing).await });
+            let mut joined = false;
+            let mut counts = None;
+            let mut physical_keys = std::collections::BTreeMap::new();
+            let observations = std::panic::AssertUnwindSafe(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while physical_keys.len() < 4 {
+                        tokio::select! {
+                            entry = entered_rx.recv() => {
+                                let (index, key) = entry.expect("actual physical delete entry");
+                                assert!(physical_keys.insert(index, key).is_none());
+                            }
+                            result = &mut delete => {
+                                joined = true;
+                                panic!("delete returned before physical entry: {result:?}");
+                            }
+                        }
+                    }
+                })
+                .await
+                .expect("all four physical mutations must enter");
+                let pending_at_entry = set.ctx.namespace_commits_pending();
+                let generation_at_entry = set.ctx.namespace_commit_generation();
+                for (path, original) in metadata_paths.iter().zip(&originals) {
+                    if missing {
+                        assert!(!path.exists(), "missing marker must still be unpublished at entry");
+                    } else if cleanup {
+                        assert!(!path.exists(), "cleanup must follow the actual last-version deletion");
+                    } else {
+                        let bytes = std::fs::read(path).expect("paused metadata is readable");
+                        let metadata = rustfs_filemeta::FileMeta::load(&bytes).expect("real metadata must parse");
+                        if !last && !cleanup {
+                            assert!(metadata.find_version(Some(second)).is_ok());
+                        }
+                        assert_eq!(
+                            metadata.find_version(Some(first)).is_err(),
+                            rollback,
+                            "undo entry must follow actual deletion"
+                        );
+                        if !rollback {
+                            assert_eq!(Some(&bytes), original.as_ref());
+                        }
+                    }
+                }
+                if rollback {
+                    tokio::time::pause();
+                    tokio::time::advance(Duration::from_secs(61)).await;
+                    tokio::time::resume();
+                    let result = tokio::time::timeout(Duration::from_secs(5), &mut delete).await;
+                    joined = result.is_ok();
+                    let result = result
+                        .expect("ordinary undo deadlines must return")
+                        .expect("delete coordinator must not panic");
+                    assert!(
+                        matches!(&result, Err(StorageError::InsufficientWriteQuorum(error_bucket, error_object)) if error_bucket == bucket && error_object == case),
+                        "keep the original failed delete quorum: {result:?}"
+                    );
+                } else {
+                    delete.abort();
+                    let result = tokio::time::timeout(Duration::from_secs(5), &mut delete).await;
+                    joined = result.is_ok();
+                    assert!(
+                        result
+                            .expect("cancelled caller must join")
+                            .expect_err("the caller must be cancelled")
+                            .is_cancelled()
+                    );
+                }
+                counts = Some((
+                    pending_at_entry,
+                    generation_at_entry,
+                    set.ctx.namespace_commits_pending(),
+                    set.ctx.namespace_commit_generation(),
+                ));
+                for path in physical_keys.values() {
+                    assert!(
+                        hooks::drain_namespace_key(path)
+                            .now_or_never()
+                            .is_none(),
+                        "the physical metadata executor must still own its exact key"
+                    );
+                }
+            })
+            .catch_unwind()
+            .await;
+
+            drop(releases);
+            drop(guards);
+            drop(destination_guards);
+            let coordinator_drained = joined || tokio::time::timeout(Duration::from_secs(10), &mut delete).await.is_ok();
+            if !coordinator_drained {
+                delete.abort();
+                let _ = tokio::time::timeout(Duration::from_secs(5), &mut delete).await;
+            }
+            later_guards.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+            let drains = futures::future::join_all(physical_keys.values().map(|path| {
+                tokio::time::timeout(Duration::from_secs(5), hooks::drain_namespace_key(path))
+            })).await;
+            let owner_drained = tokio::time::timeout(Duration::from_secs(5), async {
+                while set.ctx.namespace_commits_pending() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            if physical_keys.len() != 4 || !coordinator_drained || !owner_drained || drains.iter().any(|result| result.is_err()) {
+                let retained = dirs.into_iter().map(tempfile::TempDir::keep).collect::<Vec<_>>();
+                eprintln!("single delete cleanup incomplete; retained roots: {retained:?}");
+                if let Err(panic) = observations {
+                    std::panic::resume_unwind(panic);
+                }
+                panic!("single delete physical cleanup did not drain");
+            }
+            if let Err(panic) = observations {
+                std::panic::resume_unwind(panic);
+            }
+            for (index, (disk, (path, original))) in disks.iter().zip(metadata_paths.iter().zip(&originals)).enumerate() {
+                if cleanup {
+                    assert!(!path.exists(), "metadata must remain deleted after cleanup cancellation");
+                    assert!(!cleanup_sources[index].exists(), "physical cleanup must remove the shard directory");
+                    assert_eq!(
+                        std::fs::read(physical_keys[&index].join("part.1")).expect("actual trashed shard"),
+                        cleanup_parts[index],
+                        "trash must contain the exact original shard"
+                    );
+                    continue;
+                }
+                if last {
+                    assert!(!path.exists(), "late trash rename must remove the last metadata");
+                    assert_eq!(
+                        Some(std::fs::read(&physical_keys[&index]).expect("actual trash destination")),
+                        *original,
+                        "last-version trash must contain the exact old metadata"
+                    );
+                    continue;
+                }
+                let bytes = std::fs::read(path).expect("late metadata publication must finish");
+                let metadata = rustfs_filemeta::FileMeta::load(&bytes).expect("final metadata must parse");
+                if missing {
+                    assert!(
+                        metadata
+                            .find_version(Some(first))
+                            .expect("the marker must be published")
+                            .1
+                            .delete_marker
+                            .is_some()
+                    );
+                } else {
+                    assert!(metadata.find_version(Some(second)).is_ok());
+                    assert_eq!(metadata.find_version(Some(first)).is_ok(), rollback);
+                    if rollback {
+                        assert_eq!(Some(&bytes), original.as_ref(), "physical undo must restore exact old metadata");
+                    }
+                    let fi = disk
+                        .read_version("", bucket, case, &second.to_string(), &ReadOptions { read_data: true, ..Default::default() })
+                        .await
+                        .expect("remaining version");
+                    if fi.inline_data() {
+                        assert!(fi.data.as_ref().is_some_and(|data| !data.is_empty()), "remaining inline shard must survive");
+                    } else {
+                        let parts = disk.check_parts(bucket, case, &fi).await.expect("remaining shard check");
+                        assert_eq!(parts.results, vec![crate::disk::CHECK_PART_SUCCESS; fi.parts.len()]);
+                    }
+                }
+            }
+            if !missing && !last && !cleanup {
+                let mut actual = Vec::new();
+                let read_opts = ObjectOptions {
+                    version_id: Some(if rollback { first } else { second }.to_string()),
+                    versioned: true,
+                    ..Default::default()
+                };
+                let mut reader = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    set.get_object_reader(bucket, case, None, HeaderMap::new(), &read_opts),
+                )
+                .await
+                .expect("final GET must finish")
+                .expect("the surviving version must be readable");
+                tokio::time::timeout(Duration::from_secs(5), reader.stream.read_to_end(&mut actual))
+                    .await
+                    .expect("body must drain")
+                    .expect("read surviving body");
+                assert_eq!(actual, if rollback { first_body } else { second_body });
+            }
+            let (pending_at_entry, generation_at_entry, pending_after_return, generation_after_return) =
+                counts.expect("complete observations");
+            assert!(
+                pending_at_entry && pending_after_return,
+                "physical single delete outlived namespace accounting: {case}"
+            );
+            assert_eq!(generation_at_entry, before + 1);
+            assert_eq!(generation_after_return, generation_at_entry);
+            assert_eq!(set.ctx.namespace_commit_generation(), before + 2);
+            assert!(!set.ctx.namespace_commits_pending());
+        })
+        .await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn single_delete_cancel_keeps_owner_until_immediate_data_cleanup() {
+        assert_single_delete_physical_owner("immediate-cleanup").await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn single_delete_cancel_keeps_owner_until_last_version_trash() {
+        assert_single_delete_physical_owner("last-version").await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn single_delete_cancel_keeps_owner_until_metadata_rewrite() {
+        assert_single_delete_physical_owner("remaining-version").await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn single_delete_cancel_keeps_owner_until_missing_marker_publication() {
+        assert_single_delete_physical_owner("missing-marker").await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn single_delete_failed_quorum_keeps_owner_until_physical_undo() {
+        assert_single_delete_physical_owner("rollback").await;
     }
 }

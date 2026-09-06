@@ -732,6 +732,46 @@ impl Disk {
         }
     }
 
+    pub(crate) async fn delete_version_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        match self {
+            Self::Local(disk) => {
+                disk.delete_version_with_namespace_owner(volume, path, fi, force_del_marker, opts, namespace_owner)
+                    .await
+            }
+            Self::Remote(disk) => {
+                let result = disk.delete_version(volume, path, fi, force_del_marker, opts).await;
+                // This is sender lifetime only, not proof of a remote physical drain.
+                drop(namespace_owner);
+                result
+            }
+        }
+    }
+
+    pub(crate) async fn delete_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        match self {
+            Self::Local(disk) => disk.delete_with_namespace_owner(volume, path, opts, namespace_owner).await,
+            Self::Remote(disk) => {
+                let result = disk.delete(volume, path, opts).await;
+                drop(namespace_owner);
+                result
+            }
+        }
+    }
+
     /// Keep local undo publication owned independently of the wrapper deadline.
     /// Remote undo retains its existing RPC contract; this is not a remote drain proof.
     pub(crate) async fn undo_write_with_namespace_owner(

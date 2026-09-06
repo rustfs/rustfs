@@ -5458,7 +5458,7 @@ impl TierConfigMgr {
         let manager = handle.read().await;
         let published_digest = if intents
             .iter()
-            .any(|recovered| recovered.is_peer_only_terminal() && recovered.intent.state == TierMutationIntentState::Committed)
+            .any(|recovered| recovered.intent.state == TierMutationIntentState::Committed)
         {
             Some(tier_config_candidate_digest(&manager).map_err(|err| {
                 let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
@@ -5468,18 +5468,29 @@ impl TierConfigMgr {
         } else {
             None
         };
+        let locally_published_committed_mutations = intents
+            .iter()
+            .filter(|recovered| {
+                recovered.intent.state == TierMutationIntentState::Committed
+                    && published_digest == Some(recovered.intent.candidate_digest)
+            })
+            .map(|recovered| recovered.intent.mutation_id)
+            .collect::<HashSet<_>>();
         let mut prepared_mutation_blocks = HashMap::new();
         let mut committed_mutation_blocks: HashMap<String, HashSet<uuid::Uuid>> = HashMap::new();
         for recovered in intents {
-            let settled_tombstone = recovered.is_peer_only_terminal()
-                && match recovered.intent.state {
-                    TierMutationIntentState::Aborted => true,
-                    TierMutationIntentState::Committed => {
-                        !retain_missing_mutation_blocks || published_digest == Some(recovered.intent.candidate_digest)
-                    }
-                    TierMutationIntentState::Prepared => false,
-                };
-            if settled_tombstone {
+            // A matching in-memory manager has already crossed the local
+            // publication boundary. Keep replaying and durably cleaning the
+            // record, but do not re-fence object operations while that
+            // terminal work finishes.
+            let skip_runtime_fence = locally_published_committed_mutations.contains(&recovered.intent.mutation_id)
+                || (recovered.is_peer_only_terminal()
+                    && match recovered.intent.state {
+                        TierMutationIntentState::Aborted => true,
+                        TierMutationIntentState::Committed => !retain_missing_mutation_blocks,
+                        TierMutationIntentState::Prepared => false,
+                    });
+            if skip_runtime_fence {
                 continue;
             }
             Self::collect_prepared_mutation_intent_block(&mut prepared_mutation_blocks, &recovered.intent)?;
@@ -5492,6 +5503,9 @@ impl TierConfigMgr {
         }
         if retain_missing_mutation_blocks {
             for (tier_name, mutation_id) in &runtime.prepared_mutation_blocks {
+                if locally_published_committed_mutations.contains(mutation_id) {
+                    continue;
+                }
                 match prepared_mutation_blocks.entry(tier_name.clone()) {
                     Entry::Vacant(entry) => {
                         entry.insert(*mutation_id);
@@ -5505,10 +5519,15 @@ impl TierConfigMgr {
                 }
             }
             for (tier_name, mutation_ids) in &runtime.committed_mutation_blocks {
-                committed_mutation_blocks
-                    .entry(tier_name.clone())
-                    .or_default()
-                    .extend(mutation_ids);
+                for mutation_id in mutation_ids {
+                    if locally_published_committed_mutations.contains(mutation_id) {
+                        continue;
+                    }
+                    committed_mutation_blocks
+                        .entry(tier_name.clone())
+                        .or_default()
+                        .insert(*mutation_id);
+                }
             }
         }
         let changed = runtime.prepared_mutation_blocks != prepared_mutation_blocks
@@ -11295,6 +11314,115 @@ mod tests {
         assert!(
             lock_unpoisoned(&runtime).committed_mutation_blocks.is_empty(),
             "a retained settled tombstone must not block the published runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn published_dual_terminal_intent_does_not_restore_local_runtime_fence_during_replay() {
+        use crate::services::tier::tier_mutation_intent::save_tier_mutation_intent_record;
+
+        let store = Arc::new(CasConfigStore::default());
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("published tier config fixture should persist");
+        let (_, current_etag) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("published tier config fixture should load with metadata");
+        let current_etag = current_etag.expect("published tier config fixture should have an ETag");
+        let affected_targets = build_tier_mutation_affected_targets(
+            TierMutationIntentKind::Add,
+            HashSet::from(["COLD-A".to_string()]),
+            &empty_mgr(),
+            &persisted,
+        )
+        .expect("published AddTier targets should build");
+        let mut intent = build_coordinator_tier_mutation_intent(TierMutationIntentKind::Add, None, &persisted, affected_targets)
+            .expect("published AddTier intent should build")
+            .expect("published AddTier should require a durable intent");
+        intent
+            .advance(TierMutationIntentState::Committed, Some(current_etag))
+            .expect("published AddTier intent should commit");
+        save_tier_coordinator_mutation_intent_record_if_absent(store.clone(), &intent)
+            .await
+            .expect("published coordinator intent should persist");
+        save_tier_mutation_intent_record(store.clone(), &intent)
+            .await
+            .expect("published peer intent should persist");
+
+        let manager = TierConfigMgr::new();
+        {
+            let mut guard = manager.write().await;
+            install_lease_backend(&mut guard, "COLD-A", LeaseTestBackend::ready("published"));
+        }
+        {
+            let guard = manager.read().await;
+            assert_eq!(
+                tier_config_candidate_digest(&guard).expect("published manager digest should build"),
+                intent.candidate_digest
+            );
+        }
+        TierConfigMgr::apply_committed_mutation_intent_block(&manager, &intent)
+            .await
+            .expect("pre-existing committed runtime fence should install");
+        assert!(
+            TierConfigMgr::acquire_operation_lease(&manager, "COLD-A").await.is_err(),
+            "fixture must begin with the committed runtime fence installed"
+        );
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        TIER_MUTATION_TEST_PEERS
+            .scope(
+                vec![Arc::new(BlockingCommitTierMutationPeer {
+                    started: started.clone(),
+                    release: release.clone(),
+                })],
+                async {
+                    let reload = TierConfigMgr::reload_handle_with(&manager, store.clone());
+                    tokio::pin!(reload);
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        tokio::select! {
+                            result = &mut reload => panic!("reload finished before terminal replay was released: {result:?}"),
+                            _ = started.notified() => {}
+                        }
+                    })
+                    .await
+                    .expect("terminal replay should reach the blocking peer");
+
+                    let lease = TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
+                        .await
+                        .expect("terminal cleanup must not re-fence an already-published tier");
+                    drop(lease);
+                    release.add_permits(1);
+                    tokio::time::timeout(Duration::from_secs(5), &mut reload)
+                        .await
+                        .expect("terminal replay should finish after the peer responds")
+                        .expect("terminal replay should succeed after the peer responds");
+                },
+            )
+            .await;
+
+        assert!(manager.read().await.tiers.contains_key("COLD-A"));
+        assert!(
+            TierConfigMgr::load_coordinator_mutation_intents(store.clone())
+                .await
+                .expect("coordinator cleanup should be readable")
+                .is_empty()
+        );
+        assert_eq!(
+            TierConfigMgr::load_tier_mutation_intents(store)
+                .await
+                .expect("retained peer tombstone should be readable"),
+            vec![intent]
+        );
+        let guard = manager.read().await;
+        let runtime = registered_tier_driver_runtime(&guard).expect("runtime should remain registered");
+        assert!(
+            lock_unpoisoned(&runtime).committed_mutation_blocks.is_empty(),
+            "retained terminal evidence must not restore the published runtime fence"
         );
     }
 
