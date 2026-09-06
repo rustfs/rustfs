@@ -21,6 +21,8 @@ RustFS currently accepts the documented `{"targets": [...]}` object format. It c
 3. Submit the ZIP to the existing authenticated `PUT /rustfs/admin/v3/import-bucket-metadata` endpoint with `ImportBucketMetadataAction` permission. Import validates the replacement and persists it against the bucket incarnation; it does not need to parse the old target payload successfully.
 4. Verify target listing and the intended replication configuration. Retry the ordinary metadata export and confirm it succeeds.
 
-Alternatively, `PUT /rustfs/admin/v3/set-remote-target?replace-unreadable=true` discards an undecodable target set as part of setting a replacement target. The flag is the operator's explicit acknowledgement that the stored set is being thrown away; without it the request is refused rather than rewriting an unreadable set from a partial view.
+Alternatively, use `PUT /rustfs/admin/v3/set-remote-target?bucket=<bucket>&replace-unreadable=true` with a complete target-create payload, including the endpoint, target bucket, target type, and credentials. This mode cannot be combined with `update=true`. Both `update` and `replace-unreadable` accept only a single `true` or `false` value; duplicate parameters and other values are rejected before any configuration write.
+
+RustFS validates the replacement target, then reads and updates the latest persisted target set under the bucket metadata transaction lock. The flag authorizes discarding that set only if it is still unreadable at this point. A readable set, including a repair already committed by another node, is preserved and merged using the ordinary target-create identity and conflict checks. Success is returned after persistence, and an actual discard is audited after the commit. Without this opt-in, target writes retain the unreadable-configuration refusal.
 
 Do not submit the diagnostic archive itself to the import endpoint. Copy only reviewed replacement entries into an ordinary import archive.

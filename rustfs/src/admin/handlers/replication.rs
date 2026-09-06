@@ -2972,8 +2972,22 @@ mod target_repair_tests {
                 BucketTargetSys::get().get_remote_arn(BUCKET, Some(&target), "").await,
                 (target.arn.clone(), true)
             );
+            assert!(
+                BucketTargetSys::get()
+                    .get_remote_target_client(BUCKET, &target.arn)
+                    .await
+                    .is_some()
+            );
 
             let arn = repair(&target, "replace-unreadable=true").await.expect("repair must commit");
+            assert_ne!(arn, target.arn);
+            assert!(
+                BucketTargetSys::get()
+                    .get_remote_target_client(BUCKET, &target.arn)
+                    .await
+                    .is_none()
+            );
+            assert!(BucketTargetSys::get().get_remote_target_client(BUCKET, &arn).await.is_some());
             let persisted = metadata_sys::get_config_from_disk(BUCKET)
                 .await
                 .expect("read repaired metadata");

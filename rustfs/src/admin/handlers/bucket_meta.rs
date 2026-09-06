@@ -155,62 +155,50 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> Result<Option<Vec<u
             Ok(Some(config_json))
         }
         BUCKET_NOTIFICATION_CONFIG => {
-            let config: s3s::dto::NotificationConfiguration = match metadata_sys::get_notification_config(bucket).await {
-                Ok(Some(res)) => res,
-                Err(e) => {
-                    if e == StorageError::ConfigNotFound {
-                        return Ok(None);
-                    }
-                    return Err(ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")));
-                }
-                Ok(None) => return Ok(None),
-            };
-
-            let raw_config = metadata_sys::get(bucket)
+            let metadata = metadata_sys::get(bucket)
                 .await
-                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?
-                .notification_config_xml
-                .clone();
-            let config_xml = checked_raw_xml(&config, raw_config, deserialize::<s3s::dto::NotificationConfiguration>)?;
-
+                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?;
+            if metadata.notification_config_xml.is_empty() {
+                return Ok(None);
+            }
+            let config = metadata
+                .notification_config
+                .as_ref()
+                .ok_or_else(|| ExportConfigError::unreadable("persisted bucket notification configuration is invalid"))?;
+            let config_xml = checked_raw_xml(
+                config,
+                metadata.notification_config_xml.clone(),
+                deserialize::<s3s::dto::NotificationConfiguration>,
+            )?;
             Ok(Some(config_xml))
         }
         BUCKET_LIFECYCLE_CONFIG => {
-            let config: BucketLifecycleConfiguration = match metadata_sys::get_lifecycle_config(bucket).await {
-                Ok((res, _)) => res,
-                Err(e) => {
-                    if e == StorageError::ConfigNotFound {
-                        return Ok(None);
-                    }
-                    return Err(ExportConfigError::unreadable(format!("failed to load bucket metadata: {e}")));
-                }
-            };
-            let raw_config = metadata_sys::get(bucket)
+            let metadata = metadata_sys::get(bucket)
                 .await
-                .map_err(|e| ExportConfigError::unreadable(format!("failed to load bucket metadata: {e}")))?
-                .lifecycle_config_xml
-                .clone();
-            let config_xml = checked_raw_xml(&config, raw_config, deserialize::<BucketLifecycleConfiguration>)?;
-
+                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?;
+            if metadata.lifecycle_config_xml.is_empty() {
+                return Ok(None);
+            }
+            let config = metadata
+                .lifecycle_config
+                .as_ref()
+                .ok_or_else(|| ExportConfigError::unreadable("persisted bucket lifecycle configuration is invalid"))?;
+            let config_xml =
+                checked_raw_xml(config, metadata.lifecycle_config_xml.clone(), deserialize::<BucketLifecycleConfiguration>)?;
             Ok(Some(config_xml))
         }
         BUCKET_TAGGING_CONFIG => {
-            let config: Tagging = match metadata_sys::get_tagging_config(bucket).await {
-                Ok((res, _)) => res,
-                Err(e) => {
-                    if e == StorageError::ConfigNotFound {
-                        return Ok(None);
-                    }
-                    return Err(ExportConfigError::unreadable(format!("failed to load bucket metadata: {e}")));
-                }
-            };
-            let raw_config = metadata_sys::get(bucket)
+            let metadata = metadata_sys::get(bucket)
                 .await
-                .map_err(|e| ExportConfigError::unreadable(format!("failed to load bucket metadata: {e}")))?
-                .tagging_config_xml
-                .clone();
-            let config_xml = checked_raw_xml(&config, raw_config, deserialize::<Tagging>)?;
-
+                .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?;
+            if metadata.tagging_config_xml.is_empty() {
+                return Ok(None);
+            }
+            let config = metadata
+                .tagging_config
+                .as_ref()
+                .ok_or_else(|| ExportConfigError::unreadable("persisted bucket tagging configuration is invalid"))?;
+            let config_xml = checked_raw_xml(config, metadata.tagging_config_xml.clone(), deserialize::<Tagging>)?;
             Ok(Some(config_xml))
         }
         BUCKET_QUOTA_CONFIG_FILE => {
@@ -1487,6 +1475,137 @@ mod backup_zip_compatibility_tests {
             .await
             .expect("root admin must import the compatibility archive");
         assert_eq!(response.output.0, StatusCode::OK);
+    }
+
+    async fn assert_unreadable_xml_export_is_explicit(config_file: &str) {
+        const RAW_SECRET: &[u8] = b"unreadable-xml-with-private-config";
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some(ROOT_ACCESS_KEY.to_string()),
+            Some(ROOT_SECRET_KEY.to_string()),
+        );
+        let temp = tempfile::tempdir().expect("create unreadable XML export test root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp.path())
+            .disk_count(1)
+            .build()
+            .await;
+        env.make_bucket(BUCKET, false).await;
+        rustfs_iam::store::object::ObjectStore::new(Arc::clone(&env.ecstore))
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+            .await
+            .expect("build test IAM");
+        publish_test_app_context(Arc::new(AppContext::with_default_interfaces(
+            Arc::clone(&env.ecstore),
+            iam,
+            Arc::new(rustfs_kms::KmsServiceManager::new()),
+        )));
+        metadata_sys::update(BUCKET, BUCKET_VERSIONING_CONFIG, VERSIONING_XML.to_vec())
+            .await
+            .expect("persist readable companion config");
+        assert!(
+            exported_bucket_config(BUCKET, config_file)
+                .await
+                .expect("absent configuration")
+                .is_none()
+        );
+
+        let mut metadata = metadata_sys::get_config_from_disk(BUCKET)
+            .await
+            .expect("load source metadata");
+        match config_file {
+            BUCKET_NOTIFICATION_CONFIG => metadata.notification_config_xml = RAW_SECRET.to_vec(),
+            BUCKET_LIFECYCLE_CONFIG => metadata.lifecycle_config_xml = RAW_SECRET.to_vec(),
+            BUCKET_TAGGING_CONFIG => metadata.tagging_config_xml = RAW_SECRET.to_vec(),
+            _ => panic!("unexpected unreadable XML fixture"),
+        }
+        metadata
+            .save_with_store(Arc::clone(&env.ecstore))
+            .await
+            .expect("persist raw configuration with a failed parse");
+        crate::storage::storage_api::set_bucket_metadata(BUCKET.to_string(), metadata)
+            .await
+            .expect("publish unreadable XML fixture");
+
+        let ordinary = ExportBucketMetadata {}
+            .call(
+                admin_request(Method::GET, Uri::from_static("/rustfs/admin/v3/export-bucket-metadata"), Vec::new()),
+                Params::new(),
+            )
+            .await
+            .expect_err("persisted invalid XML must not disappear from an ordinary backup");
+        assert_eq!(ordinary.code(), &s3s::S3ErrorCode::InternalError);
+
+        let diagnostic = ExportBucketMetadata {}
+            .call(
+                admin_request(
+                    Method::GET,
+                    Uri::from_static("/rustfs/admin/v3/export-bucket-metadata?diagnostic=true"),
+                    Vec::new(),
+                ),
+                Params::new(),
+            )
+            .await
+            .expect("diagnostic export must identify the omitted configuration");
+        assert_eq!(diagnostic.output.0, StatusCode::OK);
+        let bytes = diagnostic
+            .output
+            .1
+            .collect()
+            .await
+            .expect("read diagnostic archive")
+            .to_bytes();
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).expect("open diagnostic archive");
+        let mut files = HashMap::new();
+        for index in 0..archive.len() {
+            let mut file = archive.by_index(index).expect("read diagnostic entry");
+            let mut content = Vec::new();
+            file.read_to_end(&mut content).expect("read diagnostic config");
+            assert!(!content.windows(RAW_SECRET.len()).any(|window| window == RAW_SECRET));
+            files.insert(file.name().to_string(), content);
+        }
+        assert!(!files.contains_key(&format!("_diagnostic/{BUCKET}/{config_file}")));
+        assert_eq!(files[&format!("_diagnostic/{BUCKET}/{BUCKET_VERSIONING_CONFIG}")], VERSIONING_XML);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&files[DIAGNOSTIC_EXPORT_MANIFEST]).expect("decode diagnostic manifest");
+        assert_eq!(
+            manifest,
+            serde_json::json!({
+                "version": 1,
+                "mode": "diagnostic",
+                "complete": false,
+                "errors": [{ "bucket": BUCKET, "config": config_file, "code": "configuration_unavailable" }],
+            })
+        );
+        assert_eq!(
+            persisted_xml(
+                &metadata_sys::get_config_from_disk(BUCKET)
+                    .await
+                    .expect("read unchanged source"),
+                config_file
+            ),
+            RAW_SECRET
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unreadable_notification_xml_fails_backup_and_is_named_in_diagnostics() {
+        assert_unreadable_xml_export_is_explicit(BUCKET_NOTIFICATION_CONFIG).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unreadable_lifecycle_xml_fails_backup_and_is_named_in_diagnostics() {
+        assert_unreadable_xml_export_is_explicit(BUCKET_LIFECYCLE_CONFIG).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unreadable_tagging_xml_fails_backup_and_is_named_in_diagnostics() {
+        assert_unreadable_xml_export_is_explicit(BUCKET_TAGGING_CONFIG).await;
     }
 
     #[tokio::test]
