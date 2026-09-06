@@ -295,6 +295,8 @@ pub(crate) mod remote_s3_client {
 }
 
 pub(crate) mod metadata_sys {
+    #[cfg(test)]
+    pub(crate) use super::ecstore_bucket::metadata_sys::ConfigWriteLockProbe;
     use std::sync::Arc;
 
     use rustfs_policy::policy::BucketPolicy;
@@ -312,6 +314,7 @@ pub(crate) mod metadata_sys {
         super::ecstore_bucket::metadata_sys::get(bucket).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn update(bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
         crate::storage::storage_api::update_bucket_metadata_config(bucket, config_file, data).await
     }
@@ -667,7 +670,7 @@ pub(crate) mod replication {
 }
 
 pub(crate) mod target {
-    pub(crate) use super::ecstore_bucket::target::duration_from_secs_or_nanos;
+    pub(crate) use super::ecstore_bucket::target::{ARN, duration_from_secs_or_nanos};
     pub(crate) type BucketTarget = super::ecstore_bucket::target::BucketTarget;
     pub(crate) type BucketTargetType = super::ecstore_bucket::target::BucketTargetType;
     pub(crate) type BucketTargets = super::ecstore_bucket::target::BucketTargets;
