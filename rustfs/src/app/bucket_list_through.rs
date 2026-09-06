@@ -1731,7 +1731,9 @@ mod tests {
     // Freeze both its reader and writer; use real local storage and HTTP source
     // calls here, without claiming that this harness executes an old binary.
     async fn execute_e160_source_list(input: ListObjectsV2Input) -> S3Result<S3Response<ListObjectsV2Output>> {
-        use crate::app::storage_api::s3_api::bucket::{build_list_objects_v2_output, parse_list_objects_v2_params};
+        use crate::app::storage_api::bucket_usecase::s3_api::bucket::{
+            build_list_objects_v2_output, parse_list_objects_v2_params,
+        };
         use crate::on_demand_migration::list_through::e160_framed_reader as old;
 
         let params = parse_list_objects_v2_params(
