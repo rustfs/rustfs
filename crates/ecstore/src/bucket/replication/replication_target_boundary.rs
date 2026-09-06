@@ -290,18 +290,32 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
             // record may only add multipart-ness, never take it away.
             is_multipart = base_is_multipart || checksum_record_is_multipart;
 
-            for (key, value) in checksum_meta.iter() {
-                if key != AMZ_CHECKSUM_TYPE {
-                    meta.insert(key.clone(), value.clone());
-                }
-            }
-
             if !base_is_multipart
                 && checksum_meta
                     .get(AMZ_CHECKSUM_TYPE)
                     .is_some_and(|value| value == AMZ_CHECKSUM_TYPE_FULL_OBJECT)
             {
                 is_multipart = false;
+            }
+
+            // The record keys each checksum by algorithm name ("CRC32"); the
+            // target only reads `x-amz-checksum-<algorithm>`. Inserting the bare
+            // name here made `PutObjectOptions::header()` send it as user
+            // metadata (`x-amz-meta-crc32`), so no replica ever carried the
+            // source checksum (rustfs/backlog#2340). The object-level record
+            // describes one PUT body: a multipart replica is rebuilt part by
+            // part, and its CreateMultipartUpload must not announce a checksum
+            // the parts do not carry, so the record is forwarded on the
+            // single-PUT route only (MinIO `getCRCMeta` parity).
+            if !is_multipart {
+                for (key, value) in checksum_meta.iter() {
+                    if key == AMZ_CHECKSUM_TYPE {
+                        continue;
+                    }
+                    if let Some(header) = rustfs_rio::ChecksumType::from_string(key).key() {
+                        meta.insert(header.to_string(), value.clone());
+                    }
+                }
             }
         }
     }
@@ -1477,12 +1491,63 @@ mod tests {
                 ..Default::default()
             };
 
-            let (opts, _is_multipart) = replication_put_object_options("", &object_info).expect("build replication put options");
+            let (opts, is_multipart) = replication_put_object_options("", &object_info).expect("build replication put options");
 
+            assert!(!is_multipart, "{name}: a single-part checksum record must keep the single-PUT route");
+            let header = ty.key().expect("every forwarded algorithm has an x-amz-checksum header");
             assert_eq!(
-                opts.user_metadata.get(name),
+                opts.user_metadata.get(header),
                 Some(&checksum.encoded),
-                "replication must forward the {name} checksum into user_metadata identically to the classic algorithms"
+                "replication must forward the {name} checksum as the {header} header"
+            );
+            assert!(
+                !opts.user_metadata.contains_key(name),
+                "{name}: the bare algorithm name would leave as x-amz-meta user metadata"
+            );
+        }
+    }
+
+    /// The object-level record of a multipart upload (composite or full-object)
+    /// must not become a PutObject checksum header: the replica is rebuilt
+    /// through CreateMultipartUpload/UploadPart, and a checksum announced there
+    /// that the parts do not carry would be rejected by the target.
+    #[test]
+    fn replication_put_object_options_keeps_multipart_checksum_records_off_the_wire() {
+        let mut composite_type = rustfs_rio::ChecksumType::from_string("crc32");
+        composite_type
+            .merge(rustfs_rio::ChecksumType::MULTIPART)
+            .merge(rustfs_rio::ChecksumType::INCLUDES_MULTIPART);
+        let mut combined = Vec::new();
+        for part in [b"part-one".as_slice(), b"part-two".as_slice()] {
+            let part_checksum =
+                rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::from_string("crc32"), part).expect("part checksum");
+            combined.extend_from_slice(part_checksum.raw.as_slice());
+        }
+        let composite = rustfs_rio::Checksum::new_from_data(composite_type, &combined)
+            .expect("composite checksum")
+            .to_bytes(&combined);
+
+        for (label, checksum, etag) in [
+            ("composite", composite, "0123456789abcdef0123456789abcdef-2"),
+            (
+                "full-object",
+                full_object_multipart_checksum_record(),
+                "0123456789abcdef0123456789abcdef-3",
+            ),
+        ] {
+            let object_info = ObjectInfo {
+                etag: Some(etag.to_string()),
+                checksum: Some(checksum),
+                ..Default::default()
+            };
+            let (opts, is_multipart) = replication_put_object_options("", &object_info).expect("build replication put options");
+            assert!(is_multipart, "{label}: a multipart object must keep the multipart route");
+            assert!(
+                opts.user_metadata
+                    .keys()
+                    .all(|key| !key.starts_with("x-amz-checksum-") && key != "CRC32"),
+                "{label}: no object-level checksum may reach the target's CreateMultipartUpload: {:?}",
+                opts.user_metadata
             );
         }
     }

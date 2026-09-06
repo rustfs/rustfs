@@ -6,7 +6,7 @@
 ## What a replication PUT carries by default
 
 - A plain signed body with an exact `Content-Length`. The SDK does not add a streaming trailer checksum, so the body is never wrapped in `aws-chunked` framing (rustfs#6853: a target that does not decode that framing stored the frames verbatim while RustFS recorded COMPLETED).
-- Any object-level checksum the source object was uploaded with, forwarded as its `x-amz-checksum-*` header.
+- For a single-part object, the checksum the source object was uploaded with, forwarded as its `x-amz-checksum-<algorithm>` header (the value the source verified on upload). A multipart replica is rebuilt through CreateMultipartUpload/UploadPart and carries no object-level checksum header. Managed-SSE objects forward none.
 - On a PUT that carries Object Lock parameters and no forwarded checksum: `Content-MD5` derived from the source ETag, or an SDK CRC32 checksum when the ETag is not the MD5 of the wire bytes (rustfs#7082).
 - The source ETag, mtime and version id on `x-rustfs-source-*` headers (with `x-minio-source-*` twins), and the Object Lock mode, retain-until date and legal hold of the source version when present.
 - After the PUT, the target's ETag is compared with the source ETag when both are plain single-part MD5s; a mismatch fails the replication instead of reporting a corrupted replica as COMPLETED.
@@ -17,6 +17,7 @@
 | --- | --- | --- |
 | Rejects or mis-stores `aws-chunked` bodies (SeaweedFS 3.97) | Handled by the plain-payload default above. | Outbound target matrix, `RejectAwsChunked` mode |
 | Requires `Content-MD5` or `x-amz-checksum-*` on a PutObject with Object Lock parameters (AWS S3, MinIO, Impossible Cloud, most compatible stores) | Satisfied: a locked single PUT carries `Content-MD5` derived from the source ETag (plaintext objects whose ETag is the MD5 of the wire bytes) or an SDK CRC32 checksum (multipart-layout ETags, managed SSE, SSE-C passthrough — this one is an `aws-chunked` trailer, so a target that also rejects that framing cannot take such objects). Releases before this fix (`1.0.0-rc.5`) need `RUSTFS_REPLICATION_STREAMING_CHECKSUMS=true` as a workaround. | Outbound target matrix, `RequireChecksumWithObjectLock` mode |
+| Stores `x-amz-checksum-*` from a PutObject and returns it on `HEAD ?ChecksumMode=ENABLED` (AWS S3, Wasabi, RustFS) | Satisfied for single-part objects: the replica answers with the source's checksum. Before this fix (`1.0.0-rc.5`) the checksum left the source as `x-amz-meta-<algorithm>` user metadata and no replica carried it (rustfs/backlog#2340). | Outbound target matrix, `Checksummed` shape |
 | Mints its own version ids (AWS S3, Wasabi, Impossible Cloud) | Data lands; version-addressed convergence does not. See rustfs/backlog#2085 and `docs/operations/replication-check.md` (VersionFidelity). | `replication-check`, outbound target matrix, `MintOwnVersionIds` mode |
 | Returns an ETag that is not the content MD5 without announcing SSE | Every single-part object fails ETag verification. Set `RUSTFS_REPLICATION_REPLICA_ETAG_VERIFY=false`. | Replication status FAILED with `replica etag mismatch` |
 
@@ -24,7 +25,7 @@
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `RUSTFS_REPLICATION_STREAMING_CHECKSUMS` | unset (plain payloads) | `true` or `1` restores SDK trailer checksums (`RequestChecksumCalculation::WhenSupported`). Every streaming upload is then `aws-chunked` with an `x-amz-trailer`; use only when every target decodes that framing. |
+| `RUSTFS_REPLICATION_STREAMING_CHECKSUMS` | unset (plain payloads) | `true` or `1` restores SDK trailer checksums (`RequestChecksumCalculation::WhenSupported`). Every streaming upload is then `aws-chunked` with an `x-amz-trailer`, except a single-part PUT that forwards the source's `x-amz-checksum-*` header, which is sent plain so the target does not receive a second algorithm; use only when every target decodes that framing. |
 | `RUSTFS_REPLICATION_REPLICA_ETAG_VERIFY` | enabled | `false` or `0` disables the post-PUT ETag comparison for targets whose 32-hex ETags are legitimately not the content MD5. |
 
 Both knobs are read by the RustFS process that owns the replication target, at client build time; restart the server after changing them.

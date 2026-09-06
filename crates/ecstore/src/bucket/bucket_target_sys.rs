@@ -2199,7 +2199,15 @@ impl TargetClient {
             }
         }
 
-        match builder
+        // A forwarded source checksum is this PUT's integrity header. In
+        // streaming-checksum mode (`RUSTFS_REPLICATION_STREAMING_CHECKSUMS`)
+        // the SDK would still add its default CRC32 trailer, and a target that
+        // receives both keeps the trailer's algorithm: a forwarded SHA256
+        // vanished from the replica while the source reported COMPLETED. Pin
+        // this request to WhenRequired so nothing is sent beside the source's
+        // own checksum.
+        let forwards_source_checksum = headers.keys().any(|name| name.as_str().starts_with("x-amz-checksum-"));
+        let mut operation = builder
             .bucket(bucket)
             .key(object)
             .content_length(size)
@@ -2219,10 +2227,14 @@ impl TargetClient {
                 }
 
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
-            })
-            .send()
-            .await
-        {
+            });
+        if forwards_source_checksum {
+            operation = operation.config_override(
+                aws_sdk_s3::config::Builder::new()
+                    .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired),
+            );
+        }
+        match operation.send().await {
             Ok(output) => {
                 // Under SSE-KMS/DSSE or SSE-C the target's ETag is not the MD5
                 // of the stored plaintext, so it cannot be compared against the
@@ -2642,13 +2654,21 @@ mod tests {
     }
 
     fn header_recording_target_client(response_headers: Vec<(String, String)>) -> (TargetClient, RecordedHeaders) {
+        header_recording_target_client_with_checksums(response_headers, replication_request_checksum_calculation())
+    }
+
+    fn header_recording_target_client_with_checksums(
+        response_headers: Vec<(String, String)>,
+        checksums: RequestChecksumCalculation,
+    ) -> (TargetClient, RecordedHeaders) {
         let request_headers: RecordedHeaders = Arc::new(std::sync::Mutex::new(Vec::new()));
         let connector = SharedHttpConnector::new(RecordingHeaderConnector {
             request_headers: Arc::clone(&request_headers),
             response_headers,
         });
         let http_client = http_client_fn(move |_settings, _components| connector.clone());
-        let client = s3_client_for_test(443, Some(http_client));
+        let client =
+            s3_client_for_endpoint_test_with_checksums("https://localhost:443".to_string(), Some(http_client), checksums);
         (
             TargetClient {
                 endpoint: "https://localhost:443".to_string(),
@@ -2813,6 +2833,47 @@ mod tests {
                 "{label}: the SDK must announce a CRC32 checksum; headers: {headers:?}"
             );
         }
+    }
+
+    /// With streaming checksums enabled the SDK adds a CRC32 trailer to every
+    /// upload. A PUT that forwards the source's checksum must not get that
+    /// second algorithm: a target that receives both keeps the trailer's and
+    /// the forwarded SHA256 never reaches the replica (rustfs/backlog#2340).
+    #[tokio::test]
+    async fn streaming_put_object_with_forwarded_checksum_sends_no_sdk_checksum() {
+        let (client, recorded) =
+            header_recording_target_client_with_checksums(Vec::new(), RequestChecksumCalculation::WhenSupported);
+        let mut forwarded = PutObjectOptions::default();
+        forwarded.user_metadata.insert(
+            "x-amz-checksum-sha256".to_string(),
+            "OoJ3yNhRwv3wwtZoGqEIPrPX9xwTnfLl+ka0wStN1g0=".to_string(),
+        );
+        client
+            .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &forwarded)
+            .await
+            .expect("recorded put_object should succeed");
+        client
+            .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &PutObjectOptions::default())
+            .await
+            .expect("recorded put_object should succeed");
+        let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+        let with_forwarded = &recorded[0];
+        assert_eq!(
+            recorded_header(with_forwarded, "x-amz-checksum-sha256"),
+            Some("OoJ3yNhRwv3wwtZoGqEIPrPX9xwTnfLl+ka0wStN1g0=")
+        );
+        assert_eq!(
+            recorded_header(with_forwarded, "x-amz-trailer"),
+            None,
+            "the SDK must not add a trailer checksum"
+        );
+        assert_eq!(recorded_header(with_forwarded, "x-amz-sdk-checksum-algorithm"), None);
+        // Control: the same client still streams a trailer when nothing is forwarded.
+        let without_forwarded = &recorded[1];
+        assert!(
+            recorded_header(without_forwarded, "x-amz-trailer").is_some(),
+            "streaming mode must still apply to uploads without a forwarded checksum: {without_forwarded:?}"
+        );
     }
 
     /// A forwarded source checksum already satisfies the rule; nothing is added.
@@ -3180,6 +3241,14 @@ mod tests {
     }
 
     fn s3_client_for_endpoint_test(endpoint: String, http_client: Option<SharedHttpClient>) -> S3Client {
+        s3_client_for_endpoint_test_with_checksums(endpoint, http_client, replication_request_checksum_calculation())
+    }
+
+    fn s3_client_for_endpoint_test_with_checksums(
+        endpoint: String,
+        http_client: Option<SharedHttpClient>,
+        checksums: RequestChecksumCalculation,
+    ) -> S3Client {
         let credentials = SdkCredentials::builder()
             .access_key_id("test-access")
             .secret_access_key("test-secret")
@@ -3193,7 +3262,7 @@ mod tests {
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             // Mirror the production remote-target builder so recorded requests
             // exercise the same checksum/framing behavior (#6853).
-            .request_checksum_calculation(replication_request_checksum_calculation());
+            .request_checksum_calculation(checksums);
         if let Some(http_client) = http_client {
             config = config.http_client(http_client);
         }

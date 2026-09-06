@@ -3988,6 +3988,93 @@ async fn test_bucket_replication_version_purge_of_non_inline_object_releases_sou
     Ok(())
 }
 
+/// Regression for rustfs/backlog#2340 (not Wasabi specific): a single-part
+/// object uploaded with `x-amz-checksum-*` must reach the target with the same
+/// checksum. The outbound options keyed the stored record by algorithm name,
+/// which the target client sent as `x-amz-meta-*` user metadata, so a replica
+/// never carried a checksum although the source HEAD returned one.
+#[tokio::test]
+async fn test_bucket_replication_forwards_single_part_object_checksums() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-checksum-src";
+    let target_bucket = "replication-checksum-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let body = b"123456789";
+    let crc32_key = "checksum-crc32.txt";
+    let sha256_key = "checksum-sha256.txt";
+    let crc32_put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(crc32_key)
+        .body(ByteStream::from_static(body))
+        .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
+        .send()
+        .await?;
+    let expected_crc32 = crc32_put.checksum_crc32().ok_or("source PUT omitted CRC32")?.to_string();
+    let sha256_put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(sha256_key)
+        .body(ByteStream::from_static(body))
+        .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
+        .send()
+        .await?;
+    let expected_sha256 = sha256_put.checksum_sha256().ok_or("source PUT omitted SHA256")?.to_string();
+
+    for key in [crc32_key, sha256_key] {
+        wait_for_source_replication_status(&source_client, source_bucket, key, "COMPLETED", false).await?;
+    }
+
+    let replica = target_client
+        .head_object()
+        .bucket(target_bucket)
+        .key(crc32_key)
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(replica.checksum_crc32(), Some(expected_crc32.as_str()), "replica lost the CRC32 checksum");
+    let replica = target_client
+        .head_object()
+        .bucket(target_bucket)
+        .key(sha256_key)
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(
+        replica.checksum_sha256(),
+        Some(expected_sha256.as_str()),
+        "replica lost the SHA256 checksum"
+    );
+    // The bare algorithm name must not leak as user metadata either.
+    assert!(
+        replica
+            .metadata()
+            .is_none_or(|meta| !meta.keys().any(|k| k.eq_ignore_ascii_case("sha256"))),
+        "replica carries the checksum as user metadata: {:?}",
+        replica.metadata()
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_bucket_replication_disabled_delete_marker_does_not_propagate() -> TestResult {
     init_logging();

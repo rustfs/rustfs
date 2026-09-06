@@ -42,7 +42,8 @@ use crate::replication_extension_test::{
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::{ByteStream, DateTime};
 use aws_sdk_s3::types::{
-    Checksum, CompletedMultipartUpload, CompletedPart, ObjectAttributes, ObjectLockLegalHoldStatus, ObjectLockMode,
+    Checksum, ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, ObjectAttributes, ObjectLockLegalHoldStatus,
+    ObjectLockMode,
 };
 use bytes::Bytes;
 use std::error::Error;
@@ -114,10 +115,13 @@ enum ObjectShape {
     LockedMultipart,
     /// ODM stores two local parts while preserving a single-PUT source's MD5 ETag.
     OdmPreservedMd5Multipart,
+    /// Single-part object uploaded with `x-amz-checksum-sha256`; the replica
+    /// must carry the same header (rustfs/backlog#2340).
+    Checksummed,
 }
 
 impl ObjectShape {
-    const ALL: [ObjectShape; 7] = [
+    const ALL: [ObjectShape; 8] = [
         ObjectShape::Empty,
         ObjectShape::Plain,
         ObjectShape::Retention,
@@ -125,6 +129,7 @@ impl ObjectShape {
         ObjectShape::Multipart,
         ObjectShape::LockedMultipart,
         ObjectShape::OdmPreservedMd5Multipart,
+        ObjectShape::Checksummed,
     ];
 
     fn key(self) -> &'static str {
@@ -136,6 +141,16 @@ impl ObjectShape {
             ObjectShape::Multipart => "matrix/multipart.bin",
             ObjectShape::LockedMultipart => "matrix/locked-multipart.bin",
             ObjectShape::OdmPreservedMd5Multipart => "matrix/odm-preserved-md5.bin",
+            ObjectShape::Checksummed => "matrix/checksummed.bin",
+        }
+    }
+
+    /// The `x-amz-checksum-*` header the source stored and every upload of
+    /// the replica must repeat.
+    fn forwarded_checksum_header(self) -> Option<&'static str> {
+        match self {
+            ObjectShape::Checksummed => Some("x-amz-checksum-sha256"),
+            _ => None,
         }
     }
 
@@ -198,6 +213,18 @@ impl ObjectShape {
             ObjectShape::Multipart => multipart_put(client, bucket, key, 0x44, false).await,
             ObjectShape::LockedMultipart => multipart_put(client, bucket, key, 0x55, true).await,
             ObjectShape::OdmPreservedMd5Multipart => odm_preserved_md5_multipart(env, bucket, key).await,
+            ObjectShape::Checksummed => {
+                let body = payload(40 * 1024, 0x66);
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(ByteStream::from(body.clone()))
+                    .checksum_algorithm(ChecksumAlgorithm::Sha256)
+                    .send()
+                    .await?;
+                Ok(body)
+            }
         }
     }
 }
@@ -613,6 +640,19 @@ async fn check_completed_cell(
             && record.transport.checksum_headers.is_empty()
     }) {
         return Err(format!("a locked PutObject went out without any integrity header (rustfs#7082): {bare:?}").into());
+    }
+    // rustfs/backlog#2340 contract: a source checksum reaches the target as
+    // the `x-amz-checksum-*` header, not as user metadata; every PutObject of
+    // the shape carries it.
+    if let Some(header) = shape.forwarded_checksum_header()
+        && let Some(missing) = uploads.iter().find(|record| {
+            record.operation == FakeTargetOperation::PutObject
+                && !record.transport.checksum_headers.iter().any(|name| name == header)
+        })
+    {
+        return Err(
+            format!("a PutObject went out without the source's {header} header (rustfs/backlog#2340): {missing:?}").into(),
+        );
     }
     Ok(())
 }
