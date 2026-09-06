@@ -6809,10 +6809,14 @@ mod tests {
                 assert_eq!(requests.len(), 1, "unknown transformed boundaries retain one streaming PUT");
                 let request = &requests[0];
                 assert_eq!(request.method, http::Method::PUT);
+                let source_version = source.info.version_id.map(|id| id.to_string()).expect("versioned fixture");
                 assert_eq!(
                     request.query,
-                    HashMap::from([("x-id".to_string(), "PutObject".to_string())]),
-                    "single PUT has only the SDK operation query"
+                    HashMap::from([
+                        ("x-id".to_string(), "PutObject".to_string()),
+                        ("versionId".to_string(), source_version.clone()),
+                    ]),
+                    "single PUT carries only the SDK operation query and the source versionId the target must reuse"
                 );
                 assert_eq!(request.body, body, "single PUT includes every byte of both source parts");
                 assert_eq!(
@@ -6826,7 +6830,7 @@ mod tests {
                 assert_eq!(
                     rustfs_utils::http::get_header(&request.headers, rustfs_utils::http::SUFFIX_SOURCE_VERSION_ID)
                         .map(|value| value.into_owned()),
-                    source.info.version_id.map(|id| id.to_string()),
+                    Some(source_version),
                     "single PUT preserves the selected source version"
                 );
                 assert!(
