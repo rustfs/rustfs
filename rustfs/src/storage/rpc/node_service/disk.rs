@@ -1251,6 +1251,8 @@ impl NodeService {
         )?;
         let request = request.into_inner();
         let target = self.local_mutation_target();
+        #[cfg(feature = "e2e-test-hooks")]
+        super::rename_target_capture_test_hook::wait(&target, &request).await;
         let decoded_file_info = match decode_rename_data_request_file_info(&request.file_info_bin, &request.file_info) {
             Ok(file_info) => file_info,
             Err(err) => {

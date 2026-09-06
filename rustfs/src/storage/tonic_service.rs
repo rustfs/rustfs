@@ -18,3 +18,9 @@ pub(crate) use crate::storage::rpc::node_service::{heal::heal_topology_fingerpri
 pub(crate) use crate::storage::rpc::node_service::{make_scanner_control_server, make_server_for_slot};
 pub use crate::storage::rpc::{make_heal_control_server, make_server, make_tier_mutation_control_server};
 pub type NodeService = crate::storage::rpc::NodeService;
+
+#[cfg(feature = "e2e-test-hooks")]
+#[doc(hidden)]
+pub use crate::storage::rpc::node_service::rename_target_capture_test_hook::{
+    RenameTargetCapturePause, pause_rename_after_target_capture,
+};

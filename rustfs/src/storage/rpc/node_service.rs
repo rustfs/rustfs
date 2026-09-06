@@ -491,6 +491,90 @@ enum LocalMutationTarget {
     Unbound,
 }
 
+#[cfg(feature = "e2e-test-hooks")]
+pub(crate) mod rename_target_capture_test_hook {
+    use super::LocalMutationTarget;
+    use rustfs_protos::proto_gen::node_service::RenameDataRequest;
+    use std::sync::{LazyLock, Mutex};
+    use tokio::sync::oneshot;
+    use uuid::Uuid;
+
+    struct Hook {
+        id: Uuid,
+        disk: String,
+        volume: String,
+        path: String,
+        captured: oneshot::Sender<bool>,
+        release: oneshot::Receiver<()>,
+    }
+
+    static HOOK: LazyLock<Mutex<Option<Hook>>> = LazyLock::new(|| Mutex::new(None));
+
+    /// One exact signed rename paused after its listener target was captured.
+    /// Dropping the handle removes an unused hook and releases an entered one.
+    pub struct RenameTargetCapturePause {
+        id: Uuid,
+        captured: oneshot::Receiver<bool>,
+        release: Option<oneshot::Sender<()>>,
+    }
+
+    impl RenameTargetCapturePause {
+        pub async fn wait_until_captured(&mut self) -> bool {
+            (&mut self.captured)
+                .await
+                .expect("matching rename must report its actual captured target")
+        }
+    }
+
+    impl Drop for RenameTargetCapturePause {
+        fn drop(&mut self) {
+            let unused = HOOK
+                .lock()
+                .expect("rename capture hook lock")
+                .take_if(|hook| hook.id == self.id);
+            drop(unused);
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    pub fn pause_rename_after_target_capture(disk: &str, volume: &str, path: &str) -> RenameTargetCapturePause {
+        let id = Uuid::new_v4();
+        let (captured_tx, captured) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let mut active = HOOK.lock().expect("rename capture hook lock");
+        if active.is_some() {
+            drop(active);
+            panic!("only one rename capture hook may be active");
+        }
+        *active = Some(Hook {
+            id,
+            disk: disk.to_owned(),
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+            captured: captured_tx,
+            release: release_rx,
+        });
+        RenameTargetCapturePause {
+            id,
+            captured,
+            release: Some(release),
+        }
+    }
+
+    pub(super) async fn wait(target: &LocalMutationTarget, request: &RenameDataRequest) {
+        let hook = {
+            let mut active = HOOK.lock().expect("rename capture hook lock");
+            active.take_if(|hook| hook.disk == request.disk && hook.volume == request.dst_volume && hook.path == request.dst_path)
+        };
+        if let Some(hook) = hook {
+            let _ = hook.captured.send(matches!(target, LocalMutationTarget::Bootstrap(_)));
+            let _ = hook.release.await;
+        }
+    }
+}
+
 impl std::fmt::Debug for NodeService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeService")

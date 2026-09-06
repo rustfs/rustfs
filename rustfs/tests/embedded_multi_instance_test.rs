@@ -890,4 +890,180 @@ mod signed_target_rpc {
         timeout(WAIT, server_a.shutdown()).await.expect("bounded A shutdown");
         timeout(WAIT, server_b.shutdown()).await.expect("bounded B shutdown");
     }
+
+    #[test]
+    fn signed_bootstrap_request_does_not_upgrade_after_context_installation() {
+        common::run_embedded_test(|| async {
+            timeout(WAIT * 6, signed_delayed_bootstrap_body())
+                .await
+                .expect("bounded delayed Bootstrap fixture");
+        });
+    }
+
+    async fn signed_delayed_bootstrap_body() {
+        use rustfs::storage::tonic_service::pause_rename_after_target_capture;
+
+        let root_b = tempfile::tempdir().expect("B root");
+        let server_b = timeout(
+            WAIT,
+            RustFSServerBuilder::new()
+                .address(format!("127.0.0.1:{}", find_available_port().expect("B port")))
+                .volume(root_b.path().to_str().expect("B path"))
+                .access_key("delayed-bootstrap-access")
+                .secret_key("delayed-bootstrap-secret")
+                .build(),
+        )
+        .await
+        .expect("bounded B startup")
+        .expect("start global B");
+        let global_b = resolve_object_store_handle().expect("B's published context");
+        let disk_b = local_fixture_disk(root_b.path()).await;
+        let endpoints = global_b.instance_endpoints().expect("B instance topology");
+        let paths: Vec<_> = endpoints
+            .0
+            .iter()
+            .flat_map(|pool| pool.endpoints.as_ref().iter())
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(paths, [disk_b.endpoint().to_string()], "the ambient store owns B");
+        stage(&disk_b, USER_VOLUME, "delayed-sentinel", b"B-is-not-the-listener-target").await;
+        let sentinel_path = root_b.path().join(USER_VOLUME).join("delayed-sentinel/xl.meta");
+        let sentinel_before = tokio::fs::read(&sentinel_path).await.expect("B sentinel bytes");
+
+        let root_a = tempfile::tempdir().expect("A root");
+        let port_a = find_available_port().expect("A port");
+        let address_a = format!("127.0.0.1:{port_a}").parse().expect("A address");
+        let mut startup_barrier = Some(pause_embedded_startup_after_http_bind(port_a));
+        let startup_a = RustFSServerBuilder::new()
+            .address(format!("127.0.0.1:{port_a}"))
+            .volume(root_a.path().to_str().expect("A path"))
+            .access_key("delayed-bootstrap-access")
+            .secret_key("delayed-bootstrap-secret")
+            .build();
+        tokio::pin!(startup_a);
+        timeout(WAIT, async {
+            tokio::select! {
+                () = startup_barrier.as_mut().expect("startup barrier").wait_until_http_bound() => {}
+                startup = startup_a.as_mut() => {
+                    let _unexpected_server = startup.expect("A initial startup");
+                    panic!("A must reach its pre-AppContext barrier");
+                }
+            }
+        })
+        .await
+        .expect("bounded A listener startup");
+
+        let disk_a = local_fixture_disk(root_a.path()).await;
+        let delayed_info = stage(&disk_a, USER_VOLUME, "delayed-source", b"captured-Bootstrap-must-not-publish").await;
+        let control_info = stage(&disk_a, USER_VOLUME, "control-source", b"new-Ready-request-can-publish").await;
+        let source_path = root_a.path().join(USER_VOLUME).join("delayed-source/xl.meta");
+        let destination_path = root_a.path().join(USER_VOLUME).join("delayed-destination/xl.meta");
+        let source_before = tokio::fs::read(&source_path).await.expect("delayed source bytes");
+        let mut connection = SingleConnection::connect(address_a).await;
+        let mut server_a = None;
+        let mut startup_finished = false;
+
+        let (observations, delayed_result, source_after, destination_exists, sentinel_after) = {
+            let mut capture =
+                pause_rename_after_target_capture(&disk_a.endpoint().to_string(), USER_VOLUME, "delayed-destination");
+            let mut delayed_client = connection.client.clone();
+            let delayed = delayed_client.rename_data(signed_rename(
+                &disk_a,
+                USER_VOLUME,
+                "delayed-source",
+                "delayed-destination",
+                &delayed_info,
+            ));
+            tokio::pin!(delayed);
+            let mut early_response = None;
+
+            // Bound all work while the request is parked to less than the
+            // existing channel's 30-second deadline; no timeout is disabled.
+            let observations = std::panic::AssertUnwindSafe(timeout(Duration::from_secs(20), async {
+                let was_bootstrap = tokio::select! {
+                    observed = capture.wait_until_captured() => observed,
+                    response = delayed.as_mut() => {
+                        early_response = Some(response);
+                        panic!("signed request finished before the capture pause: {early_response:?}");
+                    },
+                };
+                assert!(was_bootstrap, "the actual authenticated handler captured Bootstrap");
+                assert!(Arc::ptr_eq(&global_b, &resolve_object_store_handle().expect("global B")));
+                assert_eq!(tokio::fs::read(&source_path).await.expect("source before install"), source_before);
+                assert!(!destination_path.exists());
+
+                startup_barrier.take().expect("unreleased startup barrier").release();
+                let started = startup_a.as_mut().await;
+                startup_finished = true;
+                server_a = Some(started.expect("normal A context installation"));
+                assert!(Arc::ptr_eq(&global_b, &resolve_object_store_handle().expect("global remains B")));
+                assert_eq!(connection.peer, server_a.as_ref().expect("A handle").address());
+
+                // A separate source prevents this control from consuming the
+                // delayed request's data and masking an erroneous second lookup.
+                let ready = connection
+                    .rename(signed_rename(&disk_a, USER_VOLUME, "control-source", "ready-control", &control_info))
+                    .await;
+                assert!(ready.success, "a fresh signed user request must actually use Ready: {:?}", ready.error);
+                assert_body(&disk_a, USER_VOLUME, "ready-control", &control_info).await;
+                assert_body(&disk_a, USER_VOLUME, "delayed-source", &delayed_info).await;
+                assert!(!destination_path.exists(), "the original request remains parked");
+                connection.assert_original_connection();
+            }))
+            .catch_unwind()
+            .await;
+
+            // Release on every assertion/timeout path, then drain the original
+            // RPC before shutting down the server and its connection.
+            drop(capture);
+            if let Some(barrier) = startup_barrier.take() {
+                barrier.release();
+            }
+            if !startup_finished {
+                let started = timeout(WAIT, startup_a.as_mut()).await;
+                if let Ok(Ok(started)) = started {
+                    server_a = Some(started);
+                }
+            }
+            let delayed_result = match early_response {
+                Some(response) => Ok(response),
+                None => timeout(WAIT, delayed.as_mut()).await,
+            };
+            let source_after = tokio::fs::read(&source_path).await;
+            let destination_exists = tokio::fs::try_exists(&destination_path).await;
+            let sentinel_after = tokio::fs::read(&sentinel_path).await;
+            (observations, delayed_result, source_after, destination_exists, sentinel_after)
+        };
+        let connection_attempts = connection.attempts.load(Ordering::SeqCst);
+        drop(connection);
+        let shutdown_a = if let Some(server) = server_a {
+            Some(timeout(WAIT, server.shutdown()).await)
+        } else {
+            None
+        };
+        let shutdown_b = timeout(WAIT, server_b.shutdown()).await;
+        if let Some(result) = shutdown_a {
+            result.expect("bounded A shutdown");
+        }
+        shutdown_b.expect("bounded B shutdown");
+
+        assert_eq!(connection_attempts, 1, "the original channel must not redial");
+        match observations {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(result) => result.expect("complete capture/install/Ready-control within the parked request deadline"),
+        }
+        let response = delayed_result
+            .expect("bounded original request drain")
+            .expect("the original signed request must return an application result")
+            .into_inner();
+        assert!(
+            !response.success,
+            "a captured Bootstrap request must not upgrade to Ready after its await"
+        );
+        let error: DiskError = response.error.expect("typed Bootstrap rejection").into();
+        assert_eq!(error, DiskError::FileAccessDenied);
+        assert_eq!(source_after.expect("original source remains readable"), source_before);
+        assert!(!destination_exists.expect("read original destination state"));
+        assert_eq!(sentinel_after.expect("global B sentinel survives"), sentinel_before);
+    }
 }
