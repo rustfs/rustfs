@@ -4373,7 +4373,7 @@ mod tests {
                     }
                     retry_source_info.parts = Arc::new(retry_source_parts);
                     assert_eq!(retry_source_info.etag.as_deref(), Some(retry_object_etag.as_str()));
-                    assert!(!retry_source_info.is_multipart());
+                    assert!(retry_source_info.is_multipart());
                     assert!(retry_source_info.parts.iter().all(|part| part.checksums.is_some()));
                     assert_eq!(retry_source_info.checksum.as_deref(), Some(retry_object_checksum_bytes.as_ref()));
                     assert!(

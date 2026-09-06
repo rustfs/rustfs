@@ -1597,7 +1597,7 @@ impl ObjectInfo {
     }
 
     pub fn is_multipart(&self) -> bool {
-        self.etag.as_ref().is_some_and(|v| v.len() != 32)
+        self.parts.len() > 1 || self.etag.as_ref().is_some_and(|v| v.len() != 32)
     }
 
     pub fn is_encrypted(&self) -> bool {
@@ -2234,6 +2234,35 @@ mod tests {
         assert!(!snapshot.is_for_store_bucket(store_id, "source-bucket", incarnation_id, OffsetDateTime::now_utc()));
     }
     use rustfs_filemeta::{FileInfo, FileMeta, MetaCacheEntry, TRANSITION_COMPLETE};
+
+    #[test]
+    fn multipart_identity_uses_stored_parts_and_preserves_the_etag_fallback() {
+        let plain_etag = "0123456789abcdef0123456789abcdef";
+        let multipart_etag = "0123456789abcdef0123456789abcdef-1";
+        for (case, part_count, etag, expected) in [
+            ("preserved source ETag", 2, Some(plain_etag), true),
+            ("missing ETag", 2, None, true),
+            ("ordinary PUT", 1, Some(plain_etag), false),
+            ("ordinary PUT without ETag", 1, None, false),
+            ("single-part MPU", 1, Some(multipart_etag), true),
+            ("legacy MPU without parts", 0, Some(multipart_etag), true),
+        ] {
+            let object = ObjectInfo {
+                etag: etag.map(str::to_string),
+                parts: Arc::new(
+                    (1..=part_count)
+                        .map(|number| ObjectPartInfo {
+                            number,
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            };
+
+            assert_eq!(object.is_multipart(), expected, "{case}");
+        }
+    }
 
     fn inline_fast_path_object(size: i64, versioned: bool) -> ObjectInfo {
         ObjectInfo {

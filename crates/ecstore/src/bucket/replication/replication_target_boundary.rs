@@ -518,6 +518,7 @@ fn is_standard_header(key: &str) -> bool {
 mod tests {
     use super::*;
     use aws_smithy_types::DateTime;
+    use rustfs_filemeta::ObjectPartInfo;
     use rustfs_replication::content_matches_by_etag;
     use rustfs_utils::http::{
         SSEC_ALGORITHM_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
@@ -583,6 +584,36 @@ mod tests {
     }
 
     #[test]
+    fn stored_multipart_parts_keep_the_replication_route_without_a_multipart_etag() {
+        for etag in [Some("0123456789abcdef0123456789abcdef"), None] {
+            for checksum in [None, Some(full_object_multipart_checksum_record())] {
+                let object_info = ObjectInfo {
+                    etag: etag.map(str::to_string),
+                    checksum,
+                    parts: Arc::new(
+                        (1..=2)
+                            .map(|number| ObjectPartInfo {
+                                number,
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
+                    ..Default::default()
+                };
+                let (options, is_multipart) =
+                    replication_put_object_options("STANDARD", &object_info).expect("build put options");
+
+                assert!(
+                    is_multipart,
+                    "stored parts must retain multipart routing: etag={etag:?}, checksum={:?}",
+                    object_info.checksum
+                );
+                assert_eq!(options.internal.source_etag, etag.unwrap_or_default());
+            }
+        }
+    }
+
+    #[test]
     fn checksum_record_never_changes_the_transport_a_single_part_object_needs() {
         // The mirror of the rustfs#6825 guard: an object stored as one PUT
         // must keep the single-PUT transport, or its replica's ETag would
@@ -592,6 +623,10 @@ mod tests {
         let object_info = ObjectInfo {
             etag: Some("0123456789abcdef0123456789abcdef".to_string()),
             checksum: Some(checksum.to_bytes(&[])),
+            parts: Arc::new(vec![ObjectPartInfo {
+                number: 1,
+                ..Default::default()
+            }]),
             ..Default::default()
         };
 

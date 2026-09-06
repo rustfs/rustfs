@@ -2673,7 +2673,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        assert!(!object_info.is_multipart());
+        assert!(object_info.is_multipart());
         assert!(should_use_multipart_data_movement(&object_info, false));
 
         let single_nonstandard_part = ObjectInfo {
@@ -3050,7 +3050,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(!object_info.is_multipart());
+        assert!(object_info.is_multipart());
         assert!(object_info.parts.iter().any(|part| part.checksums.is_some()));
         let opts = data_movement_put_object_opts(&object_info, 0);
         assert!(!rustfs_utils::http::contains_key_str(&opts.user_defined, SUFFIX_PART_CHECKSUMS));
