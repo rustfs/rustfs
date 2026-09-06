@@ -2326,11 +2326,11 @@ mod tests {
         }
 
         async fn save_group_info(&self, _name: &str, _item: GroupInfo) -> Result<()> {
-            Err(Error::InvalidArgument)
+            Ok(())
         }
 
         async fn delete_group_info(&self, _name: &str) -> Result<()> {
-            Err(Error::InvalidArgument)
+            Ok(())
         }
 
         async fn load_group(&self, name: &str, m: &mut HashMap<String, GroupInfo>) -> Result<()> {
@@ -2505,6 +2505,77 @@ mod tests {
         let store = StsTestMockStore::new(false);
         let cache = IamCache::new(store).await.expect("IAM cache should initialize");
         IamSys::new(cache)
+    }
+
+    /// Review finding on rustfs#7195: a replicated group edit carries a source
+    /// stamp that may predate this node's cache load time. The stamp belongs on
+    /// the record only; publishing the cache with it makes `LockedCache::exec`
+    /// drop the write, so the group is written to the store but unreadable
+    /// here and the receiver's next `set_group_status_at` fails with
+    /// `NoSuchGroup`. Add, status and removal must all publish with the local
+    /// clock while keeping the source stamp on `GroupInfo::update_at`.
+    #[tokio::test]
+    async fn group_writes_stamped_before_the_cache_load_time_still_publish() {
+        let iam_sys = test_iam_sys().await;
+        let member = "group-stamp-member";
+        let identity = UserIdentity {
+            version: 1,
+            credentials: Credentials {
+                access_key: member.to_string(),
+                secret_key: "longenoughsecret".to_string(),
+                status: "on".to_string(),
+                ..Default::default()
+            },
+            update_at: Some(OffsetDateTime::now_utc()),
+        };
+        iam_sys.store.cache.with_write_lock(|cache| {
+            cache.add_or_update_user(member, &identity, OffsetDateTime::now_utc());
+            // The startup load publishes every entity with the load time.
+            cache.replace_groups(CacheEntity::new(HashMap::new()));
+            cache.replace_user_group_memberships(CacheEntity::new(HashMap::new()));
+        });
+
+        let group = "group-stamp";
+        let source_time = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let stamped = iam_sys
+            .add_users_to_group_at(group, vec![member.to_string()], source_time)
+            .await
+            .expect("add members with a source stamp older than the cache load");
+        assert_eq!(stamped, source_time, "the returned stamp is the source time");
+        let info = iam_sys
+            .get_group_info(group)
+            .await
+            .expect("the group must be readable right after the add");
+        assert_eq!(info.members, vec![member.to_string()]);
+        assert_eq!(info.update_at, Some(source_time), "the record keeps the source stamp");
+        let memberships = iam_sys.store.cache.snapshot().user_group_memberships.get(member).cloned();
+        assert!(
+            memberships.is_some_and(|groups| groups.contains(group)),
+            "the membership index is published too"
+        );
+
+        let disabled_at = source_time + time::Duration::seconds(1);
+        iam_sys
+            .set_group_status_at(group, false, disabled_at)
+            .await
+            .expect("status change with a source stamp older than the cache load");
+        let info = iam_sys.get_group_info(group).await.expect("group after status change");
+        assert_eq!(info.status, "disabled");
+        assert_eq!(info.update_at, Some(disabled_at));
+
+        let removed_at = source_time + time::Duration::seconds(2);
+        iam_sys
+            .remove_users_from_group_at(group, vec![member.to_string()], removed_at)
+            .await
+            .expect("removal with a source stamp older than the cache load");
+        let info = iam_sys.get_group_info(group).await.expect("group after removal");
+        assert!(info.members.is_empty(), "the removal must be visible in the cache");
+        assert_eq!(info.update_at, Some(removed_at));
+        let memberships = iam_sys.store.cache.snapshot().user_group_memberships.get(member).cloned();
+        assert!(
+            !memberships.is_some_and(|groups| groups.contains(group)),
+            "the membership index follows the removal"
+        );
     }
 
     fn service_account_opts(access_key: &str, secret_key: &str) -> NewServiceAccountOpts {

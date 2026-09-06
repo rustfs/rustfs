@@ -1790,7 +1790,11 @@ where
         // The group's own timestamp moves with every membership or status
         // change: site replication judges an incoming group item against it
         // (backlog#2291), so it must reflect the last change, not creation.
-        let now = updated_at;
+        // `updated_at` is the record's stamp only; the cache is published
+        // with the local clock, because `LockedCache::exec` drops a write
+        // whose time predates the entity's load time — a replicated edit
+        // whose source time is older than this node's startup would
+        // otherwise never reach the cache.
         let gi = match cache.groups.get(group) {
             Some(res) => {
                 let mut gi = res.clone();
@@ -1799,15 +1803,16 @@ where
                 uniq_set.extend(members.iter().cloned());
 
                 gi.members = uniq_set.into_iter().collect();
-                gi.update_at = Some(now);
+                gi.update_at = Some(updated_at);
                 gi
             }
             None => {
                 let mut gi = GroupInfo::new(members.clone());
-                gi.update_at = Some(now);
+                gi.update_at = Some(updated_at);
                 gi
             }
         };
+        let now = OffsetDateTime::now_utc();
         drop(cache);
 
         self.api.save_group_info(group, gi.clone()).await?;
@@ -1823,7 +1828,7 @@ where
             });
         });
 
-        Ok(now)
+        Ok(updated_at)
     }
 
     pub async fn set_group_status(&self, name: &str, enable: bool) -> Result<OffsetDateTime> {
@@ -1850,14 +1855,15 @@ where
         } else {
             gi.status = STATUS_DISABLED.to_owned();
         }
-        let now = updated_at;
-        gi.update_at = Some(now);
+        gi.update_at = Some(updated_at);
 
         self.api.save_group_info(name, gi.clone()).await?;
 
-        self.cache.add_or_update_group(name, &gi, now);
+        // Cache publication time is the local clock, not the record stamp
+        // (see `add_users_to_group_at`).
+        self.cache.add_or_update_group(name, &gi, OffsetDateTime::now_utc());
 
-        Ok(now)
+        Ok(updated_at)
     }
 
     pub async fn get_group_description(&self, name: &str) -> Result<GroupDesc> {
@@ -1953,8 +1959,10 @@ where
         let s: HashSet<&String> = HashSet::from_iter(gi.members.iter());
         let d: HashSet<&String> = HashSet::from_iter(members.iter());
         gi.members = s.difference(&d).map(|v| v.to_string()).collect::<Vec<String>>();
-        let now = updated_at;
-        gi.update_at = Some(now);
+        gi.update_at = Some(updated_at);
+        // Cache publication time is the local clock, not the record stamp
+        // (see `add_users_to_group_at`).
+        let now = OffsetDateTime::now_utc();
 
         if !update_cache_only {
             self.api.save_group_info(name, gi.clone()).await?;
@@ -1973,7 +1981,7 @@ where
             });
         });
 
-        Ok(now)
+        Ok(updated_at)
     }
 
     pub async fn remove_users_from_group(&self, group: &str, members: Vec<String>) -> Result<OffsetDateTime> {
