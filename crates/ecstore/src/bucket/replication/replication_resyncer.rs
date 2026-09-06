@@ -4662,6 +4662,7 @@ struct MultipartReplicationReadPlan {
     part_size: i64,
     range: Option<HTTPRangeSpec>,
     next_offset: i64,
+    verify_empty_tail: bool,
 }
 
 fn multipart_replication_read_plan(
@@ -4671,10 +4672,12 @@ fn multipart_replication_read_plan(
     stored_size: usize,
     is_last: bool,
 ) -> std::io::Result<MultipartReplicationReadPlan> {
-    let empty_last_part = is_last && input.part_size == 0 && stored_size == 0;
+    let transformed = object_info.is_compressed() || object_info.is_encrypted();
+    let verify_empty_tail = !obj_opts.raw_data_movement_read && transformed && is_last && input.part_size == 0;
+    let empty_last_part = is_last && input.part_size == 0 && (stored_size == 0 || verify_empty_tail);
     // Raw reads address stored bytes. Only untransformed legacy parts may
     // substitute their stored size for a missing logical size.
-    if obj_opts.raw_data_movement_read || (input.part_size == 0 && !object_info.is_compressed() && !object_info.is_encrypted()) {
+    if obj_opts.raw_data_movement_read || (input.part_size == 0 && !transformed) {
         input.part_size = i64::try_from(stored_size).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "multipart replication stored part size exceeds i64")
         })?;
@@ -4693,6 +4696,7 @@ fn multipart_replication_read_plan(
             part_size: 0,
             range: None,
             next_offset: input.offset,
+            verify_empty_tail,
         });
     }
     let plan = replication_multipart_part_plan(input).map_err(std::io::Error::other)?;
@@ -4705,7 +4709,26 @@ fn multipart_replication_read_plan(
             end: plan.range.end,
         }),
         next_offset: plan.next_offset,
+        verify_empty_tail: false,
     })
+}
+
+async fn verify_transformed_empty_tail<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    expected_size: i64,
+) -> std::io::Result<()> {
+    let expected_size = u64::try_from(expected_size)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty multipart tail has a negative offset"))?;
+    // Read through EOF: stopping at the expected byte count would skip an
+    // empty encryption/compression frame and hide its validation error.
+    let actual_size = tokio::io::copy(reader, &mut tokio::io::sink()).await?;
+    if actual_size != expected_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("empty multipart tail expected {expected_size} plaintext bytes, read {actual_size}"),
+        ));
+    }
+    Ok(())
 }
 
 async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
@@ -4750,6 +4773,13 @@ async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
             let part_stream = wrap_with_bandwidth_monitor_with_header(part_reader.stream, src_bucket, arn, header_size);
             async_read_to_bytestream(part_stream)
         } else {
+            if part_plan.verify_empty_tail {
+                let mut reader = storage
+                    .get_object_reader(src_bucket, object, None, HeaderMap::new(), obj_opts)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                verify_transformed_empty_tail(&mut reader.stream, part_plan.next_offset).await?;
+            }
             ByteStream::from_static(b"")
         };
         header_size = 0;
@@ -4840,6 +4870,7 @@ mod tests {
             assert!(!range.is_suffix_length);
             assert_eq!((range.start, range.end), (start, end));
             assert_eq!(plan.next_offset, end + 1);
+            assert!(!plan.verify_empty_tail);
             offset = plan.next_offset;
         }
         assert_eq!(offset, object_info.size);
@@ -4872,12 +4903,36 @@ mod tests {
                         9,
                         true,
                     );
-                    if !raw && actual_size <= 0 {
+                    if !raw && actual_size < 0 {
                         let err = result.expect_err("transformed reads cannot substitute physical bytes for unknown plaintext");
                         assert!(matches!(
                             err.get_ref().and_then(|err| err.downcast_ref::<rustfs_replication::ReplicationMultipartPlanError>()),
                             Some(rustfs_replication::ReplicationMultipartPlanError::InvalidPartSize { part_size })
                                 if *part_size == actual_size
+                        ));
+                    } else if !raw && actual_size == 0 {
+                        let plan = result.expect("a transformed empty tail requires a full EOF check");
+                        assert_eq!(plan.part_number, 2);
+                        assert_eq!(plan.part_size, 0);
+                        assert!(plan.range.is_none());
+                        assert_eq!(plan.next_offset, 7);
+                        assert!(plan.verify_empty_tail);
+                        let err = multipart_replication_read_plan(
+                            &object_info,
+                            &ObjectOptions::default(),
+                            ReplicationMultipartPartInput {
+                                offset: 7,
+                                part_number: 2,
+                                part_size: 0,
+                            },
+                            9,
+                            false,
+                        )
+                        .expect_err("only the final transformed part can be verified as empty");
+                        assert!(matches!(
+                            err.get_ref()
+                                .and_then(|err| err.downcast_ref::<rustfs_replication::ReplicationMultipartPlanError>()),
+                            Some(rustfs_replication::ReplicationMultipartPlanError::InvalidPartSize { part_size: 0 })
                         ));
                     } else {
                         let plan = result.expect("the selected representation has a known positive size");
@@ -4887,6 +4942,7 @@ mod tests {
                         let range = plan.range.expect("a nonempty part must read a range");
                         assert_eq!((range.start, range.end), (7, 7 + expected_size - 1));
                         assert_eq!(plan.next_offset, 7 + expected_size);
+                        assert!(!plan.verify_empty_tail);
                     }
                 }
             }
@@ -4916,6 +4972,7 @@ mod tests {
                 assert_eq!(plan.part_size, 0);
                 assert!(plan.range.is_none());
                 assert_eq!(plan.next_offset, offset);
+                assert!(!plan.verify_empty_tail);
             }
         }
     }
@@ -4975,6 +5032,52 @@ mod tests {
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
             assert_eq!(err.to_string(), "multipart replication stored part size exceeds i64");
         }
+    }
+
+    #[tokio::test]
+    async fn transformed_empty_tail_verification_requires_exact_eof_length() {
+        for body in [b"four".as_slice(), b"first".as_slice(), b"longer".as_slice()] {
+            let result = verify_transformed_empty_tail(&mut std::io::Cursor::new(body), 5).await;
+            if body.len() == 5 {
+                result.expect("the complete plaintext stream matches the preceding parts");
+            } else {
+                let err = result.expect_err("a different plaintext length cannot certify an empty tail");
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+                assert_eq!(
+                    err.to_string(),
+                    format!("empty multipart tail expected 5 plaintext bytes, read {}", body.len())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transformed_empty_tail_verification_propagates_errors_after_the_plaintext_limit() {
+        for (tail, error_kind, message) in [
+            (
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "tail authentication failed")),
+                std::io::ErrorKind::InvalidData,
+                "tail authentication failed",
+            ),
+            (
+                Ok(bytes::Bytes::from_static(b"extra")),
+                std::io::ErrorKind::Other,
+                "input provided more bytes than specified",
+            ),
+        ] {
+            let stream = futures::stream::iter([Ok(bytes::Bytes::from_static(b"first")), tail]);
+            let mut reader = rustfs_rio::HardLimitReader::new(tokio_util::io::StreamReader::new(stream), 5);
+            let err = verify_transformed_empty_tail(&mut reader, 5)
+                .await
+                .expect_err("reading the expected plaintext is insufficient without a successful EOF");
+            assert_eq!(err.kind(), error_kind);
+            assert_eq!(err.to_string(), message);
+        }
+        let mut truncated = rustfs_rio::HardLimitReader::new(std::io::Cursor::new(b"four"), 5);
+        let err = verify_transformed_empty_tail(&mut truncated, 5)
+            .await
+            .expect_err("the complete reader must also reject truncated plaintext");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
