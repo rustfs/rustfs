@@ -1688,6 +1688,15 @@ impl PeerRestClient {
         Ok((self.topology_member.clone(), supported_version, epoch))
     }
 
+    pub async fn probe_ilm_recovery_export(&self, topology_fingerprint: String) -> Result<(String, Uuid)> {
+        let probe = rustfs_protos::ilm_recovery_export_capability_probe(Uuid::new_v4().as_bytes());
+        let result = self
+            .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, topology_fingerprint, probe)
+            .await?;
+        let epoch = decode_remote_version_state_capability(&self.topology_member, &result)?;
+        Ok((self.topology_member.clone(), epoch))
+    }
+
     pub async fn load_bucket_metadata(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
         let result = tokio::time::timeout(BUCKET_METADATA_RELOAD_TIMEOUT, async {
             let result = self.load_bucket_metadata_once(bucket, scanner_maintenance_change).await;

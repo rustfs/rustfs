@@ -189,37 +189,104 @@ fn completed_retention_count_ttl_and_alias_eviction_are_bounded() {
     );
     entries.insert("future".to_string(), Arc::new(completed_retention_fixture(now + Duration::from_nanos(1))));
     prune_completed_heal_statuses_at(&mut entries, now);
-    assert_eq!(entries.len(), 1);
+    assert_eq!(entries.len(), 2);
     assert!(entries.contains_key("ttl-boundary"));
+    assert!(entries.contains_key("future"), "clock rollback must not expire a new completion");
     prune_completed_heal_statuses_at(&mut entries, now + Duration::from_nanos(1));
+    assert_eq!(entries.len(), 1);
+    assert!(entries.contains_key("future"));
+    prune_completed_heal_statuses_at(&mut entries, now + Duration::from_nanos(1) + KEEP_HEAL_TASK_STATUS_DURATION);
+    assert!(entries.contains_key("future"), "the exact TTL boundary remains retained");
+    prune_completed_heal_statuses_at(&mut entries, now + Duration::from_nanos(2) + KEEP_HEAL_TASK_STATUS_DURATION);
     assert!(entries.is_empty());
+}
+
+#[tokio::test]
+async fn completed_retention_clock_rollback_preserves_terminal_alias_queries() {
+    let completed_at = SystemTime::now() + Duration::from_secs(3600);
+    for status in [
+        HealTaskStatus::Completed,
+        HealTaskStatus::Failed {
+            error: "fixture failure".to_string(),
+        },
+        HealTaskStatus::Cancelled,
+    ] {
+        let manager = HealManager::new(Arc::new(MockStorage), None);
+        let mut snapshot = completed_retention_fixture(completed_at);
+        snapshot.status = status.clone();
+        let expected_progress = snapshot.progress.clone();
+        let snapshot = Arc::new(snapshot);
+        {
+            let mut completed = manager.completed_heals.lock().await;
+            completed.insert("canonical".to_string(), Arc::clone(&snapshot));
+            completed.insert("alias".to_string(), Arc::clone(&snapshot));
+        }
+        for token in ["canonical", "alias"] {
+            let report = manager
+                .get_task_report_since(token, Some(3))
+                .await
+                .expect("a clock rollback must retain terminal queries");
+            assert_eq!(report.status, status);
+            assert_eq!(report.progress, expected_progress);
+            assert_eq!(report.result_items.len(), 1);
+            assert_eq!((report.min_seq, report.next_seq), (3, 5));
+            assert!(!report.result_items_truncated);
+        }
+        let mut completed = manager.completed_heals.lock().await;
+        prune_completed_heal_statuses_at(&mut completed, completed_at + KEEP_HEAL_TASK_STATUS_DURATION);
+        assert_eq!(completed.len(), 2, "both tokens remain at the exact TTL boundary");
+        prune_completed_heal_statuses_at(&mut completed, completed_at + KEEP_HEAL_TASK_STATUS_DURATION + Duration::from_nanos(1));
+        assert!(completed.is_empty(), "both tokens expire after the TTL");
+    }
+}
+
+#[test]
+fn completed_retention_clock_rollback_keeps_count_and_alias_eviction_bounded() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
+    let oldest = Arc::new(completed_retention_fixture(now + Duration::from_secs(1)));
+    let mut entries = HashMap::from([
+        ("oldest".to_string(), Arc::clone(&oldest)),
+        ("oldest-alias".to_string(), oldest),
+    ]);
+    for index in 2..=MAX_COMPLETED_HEAL_TOKENS {
+        entries.insert(
+            format!("task-{index}"),
+            Arc::new(completed_retention_fixture(now + Duration::from_secs(2))),
+        );
+    }
+    prune_completed_heal_statuses_at(&mut entries, now);
+    assert_eq!(entries.len(), MAX_COMPLETED_HEAL_TOKENS - 1);
+    assert!(!entries.contains_key("oldest"));
+    assert!(!entries.contains_key("oldest-alias"));
 }
 
 #[test]
 fn completed_retention_total_byte_cap_and_cap_plus_one() {
     let now = SystemTime::now();
-    let key = "large".to_string();
-    let mut entry = completed_retention_fixture(now);
-    let base_bytes = entry.retained_bytes() + key.capacity() + size_of::<(String, Arc<CompletedHealStatus>)>();
-    entry.retained_bytes.take();
-    entry.status = HealTaskStatus::Failed {
-        error: "x".repeat(MAX_COMPLETED_HEAL_BYTES - base_bytes),
-    };
-    assert_eq!(
-        entry.retained_bytes() + key.capacity() + size_of::<(String, Arc<CompletedHealStatus>)>(),
-        MAX_COMPLETED_HEAL_BYTES
-    );
-    let mut entries = HashMap::from([(key, Arc::new(entry))]);
-    prune_completed_heal_statuses_at(&mut entries, now);
-    assert_eq!(entries.len(), 1, "exact byte cap remains retained");
-    let mut over = Arc::try_unwrap(entries.remove("large").expect("entry retained")).expect("entry not shared");
-    over.retained_bytes.take();
-    if let HealTaskStatus::Failed { error } = &mut over.status {
-        *error = "x".repeat(error.len() + 1);
+    for completed_at in [now, now + Duration::from_secs(1)] {
+        let key = "large".to_string();
+        let mut entry = completed_retention_fixture(completed_at);
+        let base_bytes = entry.retained_bytes() + key.capacity() + size_of::<(String, Arc<CompletedHealStatus>)>();
+        entry.retained_bytes.take();
+        entry.status = HealTaskStatus::Failed {
+            error: "x".repeat(MAX_COMPLETED_HEAL_BYTES - base_bytes),
+        };
+        assert_eq!(
+            entry.retained_bytes() + key.capacity() + size_of::<(String, Arc<CompletedHealStatus>)>(),
+            MAX_COMPLETED_HEAL_BYTES
+        );
+        let mut entries = HashMap::from([(key, Arc::new(entry))]);
+        prune_completed_heal_statuses_at(&mut entries, now);
+        assert_eq!(entries.len(), 1, "exact byte cap remains retained");
+        let mut over = Arc::try_unwrap(entries.remove("large").expect("entry retained")).expect("entry not shared");
+        over.retained_bytes.take();
+        if let HealTaskStatus::Failed { error } = &mut over.status {
+            *error = "x".repeat(error.len() + 1);
+        }
+        entries.insert("large".to_string(), Arc::new(over));
+        prune_completed_heal_statuses_at(&mut entries, now);
+        assert!(entries.is_empty(), "oversized metadata cannot escape total byte bound");
     }
-    entries.insert("large".to_string(), Arc::new(over));
-    prune_completed_heal_statuses_at(&mut entries, now);
-    assert!(entries.is_empty(), "oversized metadata cannot escape total byte bound");
 }
 
 #[tokio::test]

@@ -830,6 +830,10 @@ mod tests {
                 IlmRecoveryProtocol, MAX_RECOVERY_ATTEMPTS, list_recovery_controls, load_recovery_control,
                 observe_recovery_source, save_recovery_control_if_absent,
             },
+            recovery_export::{
+                create_recovery_export, inspect_recovery_export_observation, load_recovery_export,
+                recovery_export_record_object_name,
+            },
             tier_delete_journal::{
                 DecommissionCheckpointTargetFailureHook, TIER_DELETE_DISPATCH_MANIFEST_PREFIX, TIER_DELETE_JOURNAL_PREFIX,
                 TierDeleteChunkTestBarrier, TierDeleteChunkTestStage, TierDeleteDispatchBatchLimitGuard,
@@ -16869,6 +16873,43 @@ mod tests {
                 schema => panic!("unexpected legacy recovery source schema: {schema}"),
             }
         }
+
+        let creator_sha256 = rustfs_utils::crypto::hex_sha256(b"legacy-export-actor", ToOwned::to_owned);
+        let mut created_exports = Vec::new();
+        for exportable in first_controls
+            .iter()
+            .filter(|control| control.classification == IlmRecoveryClassification::RetainedAmbiguous)
+        {
+            let observation = inspect_recovery_export_observation(store.clone(), &exportable.control_id)
+                .await
+                .expect("fresh legacy recovery observation should be exportable");
+            let created = create_recovery_export(store.clone(), &observation, &creator_sha256)
+                .await
+                .expect("legacy recovery export should be created exactly once");
+            assert!(!created.replayed);
+            let loaded = load_recovery_export(store.clone(), &created.export_id)
+                .await
+                .expect("created legacy recovery export should load");
+            assert_eq!(loaded.encoded, created.encoded, "export readback must preserve the exact committed bytes");
+            let replayed = create_recovery_export(store.clone(), &observation, &creator_sha256)
+                .await
+                .expect("the same observed generation should replay its immutable export");
+            assert!(replayed.replayed);
+            assert_eq!(replayed.encoded, created.encoded);
+            created_exports.push(created);
+        }
+        assert_eq!(created_exports.len(), 2, "both v1 and v2 legacy journals must have an export path");
+
+        let corrupt_export_id = &created_exports[0].export_id;
+        let export_path = recovery_export_record_object_name(IlmRecoveryProtocol::TierDeleteJournal, corrupt_export_id)
+            .expect("export path should build");
+        com::save_config(store.clone(), &export_path, Vec::new())
+            .await
+            .expect("zero-byte corruption fixture should persist");
+        let corrupt_export = load_recovery_export(store.clone(), corrupt_export_id)
+            .await
+            .expect_err("an existing zero-byte export must fail closed");
+        assert!(!matches!(corrupt_export, Error::ConfigNotFound));
 
         com::save_config(
             store.clone(),

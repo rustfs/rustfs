@@ -215,6 +215,16 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/v3/ilm/recovery/records/{control_id}",
             "/v3/ilm/recovery/records/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/ilm/recovery/records/{control_id}",
+            "/v3/ilm/recovery/records/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        admin_route_sample(
+            Method::GET,
+            "/v3/ilm/recovery/exports/{export_id}",
+            "/v3/ilm/recovery/exports/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
         admin_route(Method::POST, "/v3/ilm/transition/run"),
         admin_route_sample(
             Method::GET,
@@ -941,6 +951,16 @@ fn test_register_routes_cover_representative_admin_paths() {
         &router,
         Method::GET,
         &admin_path("/v3/ilm/recovery/records/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &admin_path("/v3/ilm/recovery/records/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &admin_path("/v3/ilm/recovery/exports/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
     );
     assert_route(&router, Method::POST, &admin_path("/v3/ilm/transition/run"));
     assert_route(

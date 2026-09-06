@@ -63,6 +63,7 @@ const EVENT_ADMIN_REQUEST_STATE: &str = "admin_request_state";
 const EVENT_ADMIN_REQUEST_REJECTED: &str = "admin_request_rejected";
 const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
 const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
+const POOL_ACTIVATION_FLEET_PROOF_REQUIRED: &str = "pool activation requires a live fleet capability proof";
 
 fn admin_request_id(headers: &HeaderMap) -> Option<&str> {
     headers
@@ -319,6 +320,17 @@ fn contextualize_admin_pool_api_error(
         message: format!("admin {operation} failed for {pool_context}: {}", err.message),
         source: err.source,
     }
+}
+
+fn decommission_start_api_error(err: crate::storage_api::error::StorageError) -> ApiError {
+    if crate::storage_api::capacity::is_pool_activation_fleet_proof_error(&err) {
+        return ApiError {
+            code: S3ErrorCode::InternalError,
+            message: POOL_ACTIVATION_FLEET_PROOF_REQUIRED.to_string(),
+            source: Some(Box::new(err)),
+        };
+    }
+    ApiError::from(err)
 }
 
 fn decommission_admin_not_initialized_error_with_audit(operation: &str, audit: PoolAuditContext<'_>) -> S3Error {
@@ -790,7 +802,24 @@ impl Operation for StartDecommission {
                 store
                     .decommission(ctx.clone(), pools_indices.clone())
                     .await
-                    .map_err(ApiError::from)
+                    .map_err(|err| {
+                        error!(
+                            event = EVENT_ADMIN_REQUEST_FAILED,
+                            component = LOG_COMPONENT_ADMIN_API,
+                            subsystem = LOG_SUBSYSTEM_POOL_ADMIN,
+                            operation = "start_decommission",
+                            action = "start_decommission",
+                            result = "failed",
+                            reason = "storage_decommission_failed",
+                            request_id = %request_id,
+                            actor = %actor,
+                            remote_addr = %remote_addr,
+                            pool_indices = ?pools_indices,
+                            error = %err,
+                            "admin request failed"
+                        );
+                        decommission_start_api_error(err)
+                    })
                     .map_err(|err| contextualize_admin_pool_api_error(err, "start decommission", &pool_context))?;
             }
         }
@@ -1018,9 +1047,10 @@ impl Operation for ClearDecommission {
 #[cfg(test)]
 mod pools_handler_tests {
     use super::{
-        AdminPoolStatus, Body, CancelDecommission, ClearDecommission, HeaderMap, ListPools, Method, Operation, Params,
-        PoolAuditContext, S3ErrorCode, S3Request, StartDecommission, StatusDecommission, StatusPool, Uri,
-        contextualize_admin_pool_api_error, decommission_admin_not_initialized_error_with_audit, decommission_peer_target,
+        AdminPoolStatus, Body, CancelDecommission, ClearDecommission, HeaderMap, ListPools, Method, Operation,
+        POOL_ACTIVATION_FLEET_PROOF_REQUIRED, Params, PoolAuditContext, S3ErrorCode, S3Request, StartDecommission,
+        StatusDecommission, StatusPool, Uri, contextualize_admin_pool_api_error,
+        decommission_admin_not_initialized_error_with_audit, decommission_peer_target, decommission_start_api_error,
         has_duplicate_indices, parse_mutation_pool_query, parse_pool_idx_by_id, parse_status_pool_query,
         pool_admin_missing_credentials_error, pool_admin_missing_credentials_error_with_request,
         pool_admin_pool_index_error_with_audit, pool_admin_pool_not_found_error_with_audit,
@@ -1207,6 +1237,21 @@ mod pools_handler_tests {
             err.message,
             "admin start decommission failed for pools [1, 3]: decommission already running"
         );
+    }
+
+    #[test]
+    fn test_decommission_start_api_error_preserves_fleet_proof_retry_marker() {
+        let err = crate::storage_api::error::StorageError::other(POOL_ACTIVATION_FLEET_PROOF_REQUIRED);
+
+        let err = decommission_start_api_error(err);
+
+        assert_eq!(err.code, s3s::S3ErrorCode::InternalError);
+        assert_eq!(err.message, POOL_ACTIVATION_FLEET_PROOF_REQUIRED);
+        assert!(err.source.is_some());
+
+        let unrelated = decommission_start_api_error(crate::storage_api::error::StorageError::other("disk read failed"));
+        assert_eq!(unrelated.code, s3s::S3ErrorCode::InternalError);
+        assert_eq!(unrelated.message, "We encountered an internal error, please try again.");
     }
 
     #[test]

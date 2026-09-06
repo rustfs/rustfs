@@ -731,11 +731,8 @@ pub(super) fn prune_completed_heal_statuses(completed_heals: &mut HashMap<String
 }
 
 pub(super) fn prune_completed_heal_statuses_at(completed_heals: &mut HashMap<String, Arc<CompletedHealStatus>>, now: SystemTime) {
-    completed_heals.retain(|_, completed| {
-        now.duration_since(completed.completed_at)
-            .map(|age| age <= KEEP_HEAL_TASK_STATUS_DURATION)
-            .unwrap_or(false)
-    });
+    completed_heals
+        .retain(|_, completed| now.duration_since(completed.completed_at).unwrap_or_default() <= KEEP_HEAL_TASK_STATUS_DURATION);
     let entry_bytes = |key: &String, value: &Arc<CompletedHealStatus>| {
         key.capacity()
             .saturating_add(size_of::<(String, Arc<CompletedHealStatus>)>())
