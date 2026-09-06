@@ -4808,6 +4808,7 @@ async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
 #[cfg(test)]
 mod tests {
     use super::super::replication_filemeta_boundary::ReplicateTargetDecision;
+    use super::super::replication_object_decision_boundary::ReplicationMultipartPlanError;
 
     #[test]
     fn multipart_read_plan_preserves_legacy_plain_part_ranges() {
@@ -4875,8 +4876,8 @@ mod tests {
                     if !raw && actual_size <= 0 {
                         let err = result.expect_err("transformed reads cannot substitute physical bytes for unknown plaintext");
                         assert!(matches!(
-                            err.get_ref().and_then(|err| err.downcast_ref::<super::super::replication_object_decision_boundary::ReplicationMultipartPlanError>()),
-                            Some(super::super::replication_object_decision_boundary::ReplicationMultipartPlanError::InvalidPartSize { part_size })
+                            err.get_ref().and_then(|err| err.downcast_ref::<ReplicationMultipartPlanError>()),
+                            Some(ReplicationMultipartPlanError::InvalidPartSize { part_size })
                                 if *part_size == actual_size
                         ));
                     } else {
@@ -4945,9 +4946,7 @@ mod tests {
             .expect_err("invalid part metadata must not become a successful transport plan");
             assert!(
                 err.kind() == std::io::ErrorKind::InvalidData
-                    || err.get_ref().is_some_and(|err| {
-                        err.is::<super::super::replication_object_decision_boundary::ReplicationMultipartPlanError>()
-                    }),
+                    || err.get_ref().is_some_and(|err| { err.is::<ReplicationMultipartPlanError>() }),
                 "the failure must preserve a typed metadata or planner error: {err}"
             );
         }
