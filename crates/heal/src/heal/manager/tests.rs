@@ -23,6 +23,8 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::Mutex as StdMutex;
 use tempfile::TempDir;
 
+mod running_mainline;
+
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk, storage_api::status::BucketInfo};
 
 #[tokio::test]

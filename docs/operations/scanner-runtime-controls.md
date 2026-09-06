@@ -280,16 +280,26 @@ Heal knobs are environment-only and read by `HealConfig::default` (`crates/heal/
 | `RUSTFS_HEAL_SET_BULKHEAD_ENABLE` | `true` (`DEFAULT_HEAL_SET_BULKHEAD_ENABLE`) | Per-set bulkhead scheduling. |
 | `RUSTFS_HEAL_PAGE_PARALLEL_ENABLE` | `true` (`DEFAULT_HEAL_PAGE_PARALLEL_ENABLE`) | Page-level parallel object healing during erasure-set repair. |
 | `RUSTFS_HEAL_PAGE_OBJECT_CONCURRENCY` | `8` (`DEFAULT_HEAL_PAGE_OBJECT_CONCURRENCY`) | Concurrent object heals within one erasure-set page. Forced to `1` when page parallelism is off, for `Deep` scan mode, and for `AutoHeal`-sourced requests (`ErasureSetHealer::effective_heal_page_object_concurrency_for_source`). |
-| `RUSTFS_HEAL_MAINLINE_THROTTLE_ENABLE` | `true` (`DEFAULT_HEAL_MAINLINE_THROTTLE_ENABLE`) | Pause best-effort heal task starts while foreground I/O is saturated. |
-| `RUSTFS_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT` | `80` (`DEFAULT_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT`, capped at 100) | Foreground read-permit utilization at which heal starts pause. |
-| `RUSTFS_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT` | `80` (`DEFAULT_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT`, capped at 100) | Foreground write utilization at which heal starts pause. |
-| `RUSTFS_HEAL_MAINLINE_MAX_SLEEP_MS` | `250` (`DEFAULT_HEAL_MAINLINE_MAX_SLEEP_MS`) | Recheck delay after deferring heal starts for foreground pressure. |
+| `RUSTFS_HEAL_MAINLINE_THROTTLE_ENABLE` | `true` (`DEFAULT_HEAL_MAINLINE_THROTTLE_ENABLE`) | Defer best-effort starts and cooperatively pace running admin heal at safe work boundaries. |
+| `RUSTFS_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT` | `80` (`DEFAULT_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT`, capped at 100) | Read-utilization high watermark for start admission and running admin pacing; zero disables this class. |
+| `RUSTFS_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT` | `80` (`DEFAULT_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT`, capped at 100) | Write-utilization high watermark for start admission and running admin pacing; zero disables this class. |
+| `RUSTFS_HEAL_MAINLINE_MAX_SLEEP_MS` | `250` (`DEFAULT_HEAL_MAINLINE_MAX_SLEEP_MS`) | Start recheck interval; running admin waits cap each pacing-gate holder at 1000 ms. Zero disables running pacing. |
 | `RUSTFS_HEAL_OVERLAP_POLICY` | `merge` (`DEFAULT_HEAL_OVERLAP_POLICY`) | `merge` dedups an admin heal start that overlaps a running or queued heal; `minio_error` returns a typed already-running / overlapping-paths rejection like madmin. |
 | `RUSTFS_HEAL_MRF_ENABLE` | `true` (`DEFAULT_HEAL_MRF_ENABLE`) | MRF intent pipeline: error paths deliver repair intents to the heal runtime and unconsumed intents replay from the durable journal after restart. |
 | `RUSTFS_HEAL_MRF_QUEUE_SIZE` | `100000` (`DEFAULT_HEAL_MRF_QUEUE_SIZE`) | MRF in-memory queue capacity. |
 | `RUSTFS_HEAL_MRF_JOURNAL_MAX_BYTES` | `8388608` (`DEFAULT_HEAL_MRF_JOURNAL_MAX_BYTES`, 8 MiB) | MRF journal size at which compaction runs. |
 | `RUSTFS_HEAL_MRF_REPLAY_BATCH` | `256` (`DEFAULT_HEAL_MRF_REPLAY_BATCH`) | Intents per replay push round. |
 | `RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS` | `3600` (`DEFAULT_HEAL_DANGLING_DELETE_GRACE_SECS`, `crates/ecstore/src/set_disk/core/io_primitives.rs`) | A recently modified object is never deleted as dangling inside this window; `0` disables the grace window. |
+
+### Running admin heal pacing
+
+The manager passes its existing workload provider and a configuration snapshot into each admin execution. Bucket/prefix listing and object boundaries resample foreground pressure; erasure-set page workers also resample after earlier work releases page capacity. `High`, `Urgent`, and `force_start` do not exempt ordinary admin execution from this runtime pacing. The existing start-time bypass and overlap-control meanings are unchanged.
+
+Each execution has its own pacing latch, with no new global manager or cross-set pacing lock. The low watermark for each enabled class is `max(1, floor(high * 3 / 4))`: the default high watermark 80 therefore recovers below 60. High pressure latches pacing, and intermediate pressure resets the recovery window. Unpaced starts resume after sampled pressure remains below the low watermarks for four pause intervals, normally one second. While pressure persists, a pacing-gate holder waits only one interval, at most one second, then permits maintenance to continue. Concurrent page waiters serialize through this task-local gate; queue waiting still counts against the existing task execution timeout.
+
+The pacing gate holds neither namespace locks nor I/O/page permits while sleeping. At final page admission, each real permit acquisition gets a fresh, nonblocking pressure decision. Low-pressure work keeps that permit; only a unit that needs a pause releases capacity to wait. A unit that has completed one bounded pause may proceed despite persistent pressure, which supplies minimum maintenance progress without an endless acquire/pause loop. Existing object operations and commit tails are not interrupted because pressure rose. Cancellation and deadlines remain interruptible, and disabling pacing cannot bypass the global, per-set or page-concurrency hard caps. The existing `RUSTFS_HEAL_MAINLINE_THROTTLE_ENABLE=false` setting is the operational opt-out for newly created executions; no additional request override is introduced.
+
+A missing provider, zero pause, or both class thresholds set to zero preserves unpaced execution. Missing counts follow the existing shared pressure interpreter; they are observations, not health, quorum or resource-ownership proof. The current provider exposes node-level workload classes, so this does not claim independent per-set foreground measurements or a hard global resource budget. Runtime waits increment `rustfs_heal_mainline_throttle_total` with `source=admin`, `result=delayed`, and a foreground-pressure or `recovery_window` reason. Real p99/throughput protection requires the separate W20 fixed-load ABBA measurements.
 
 ## Deliberate non-parity with MinIO
 
