@@ -667,6 +667,17 @@ mod tests {
         tokio_util::task::AbortOnDropHandle<Vec<String>>,
         tokio_util::sync::CancellationToken,
     ) {
+        list_source_with_response(pages, |_, body| body).await
+    }
+
+    async fn list_source_with_response(
+        pages: impl Iterator<Item = String> + Send + 'static,
+        mut response_body: impl FnMut(&str, String) -> String + Send + 'static,
+    ) -> (
+        String,
+        tokio_util::task::AbortOnDropHandle<Vec<String>>,
+        tokio_util::sync::CancellationToken,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind listing source");
@@ -699,6 +710,7 @@ mod tests {
                     "expected a path-style bucket-root LIST request, got {first_line:?}"
                 );
                 assert!(first_line.contains("list-type=2"), "expected a ListObjectsV2 query, got {first_line:?}");
+                let body = response_body(&first_line, body);
                 requests.push(first_line);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -1828,12 +1840,26 @@ mod tests {
                         ("no_proxy", Some("*")),
                     ],
                     async {
-                        let one_scan = [
-                            source_xml(Some("S"), true, Some("a")),
-                            source_xml(None, false, Some("c")),
-                            source_xml(None, false, Some("c")),
-                        ];
-                        let (endpoint, server) = scripted_list_source(one_scan.iter().chain(&one_scan).cloned().collect()).await;
+                        // Respond to the actual cursor, including a repeated start
+                        // from an incompatible reader, rather than to request order.
+                        let (endpoint, server, _) =
+                            list_source_with_response(std::iter::repeat_n(String::new(), 6), |request, _| {
+                                let uri: http::Uri = request
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .expect("request target")
+                                    .parse()
+                                    .expect("source LIST URI");
+                                let cursors: Vec<_> = url::form_urlencoded::parse(uri.query().expect("LIST query").as_bytes())
+                                    .filter_map(|(key, cursor)| (key == "continuation-token").then_some(cursor))
+                                    .collect();
+                                match cursors.as_slice() {
+                                    [] => source_xml(Some("S"), true, Some("a")),
+                                    [cursor] if cursor == "S" => source_xml(None, false, Some("c")),
+                                    _ => panic!("unexpected source cursor in {request}"),
+                                }
+                            })
+                            .await;
                         let (_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
                         let store = shared_gating_ecstore().await;
                         for key in ["b", "d"] {
@@ -1850,6 +1876,7 @@ mod tests {
                         input.max_keys = Some(1);
                         // First new writer -> e160 reader -> new reader. After all old
                         // readers leave, disabling issuance must retain this live frame.
+                        let mut framed_pages = Vec::new();
                         for (page, key) in ["a", "b", "c", "d", "z-local"].into_iter().enumerate() {
                             let response = if page == 1 {
                                 execute_e160_source_list(input.clone()).await
@@ -1869,18 +1896,23 @@ mod tests {
                             input.continuation_token = response.output.next_continuation_token;
                             if page != 4 {
                                 let wire = input.continuation_token.as_deref().expect("framed continuation");
-                                let crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor::Merged(old) =
-                                    e160_wire_cursor(wire)
-                                else {
-                                    panic!("e160 must recognize every active framed v1 token")
-                                };
-                                assert_eq!(old.v, 1);
-                                assert_eq!(old.last_key.as_deref(), Some(key));
-                                assert_eq!(old.no_progress, None);
-                                assert!(decode_wire_token(wire).framed);
+                                framed_pages.push((wire.to_string(), key));
                             } else {
                                 assert!(input.continuation_token.is_none());
                             }
+                        }
+                        for (wire, key) in &framed_pages {
+                            let wire = wire.as_str();
+                            let key = *key;
+                            let crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor::Merged(old) =
+                                e160_wire_cursor(wire)
+                            else {
+                                panic!("e160 must recognize every active framed v1 token")
+                            };
+                            assert_eq!(old.v, 1);
+                            assert_eq!(old.last_key.as_deref(), Some(key));
+                            assert_eq!(old.no_progress, None);
+                            assert!(decode_wire_token(wire).framed);
                         }
                         // A fresh bare chain is safe only after every reader is dual.
                         temp_env::async_with_vars([(ENV_LIST_FRAMED_TOKENS, Some("false"))], async {
