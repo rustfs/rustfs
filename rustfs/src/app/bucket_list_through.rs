@@ -2120,6 +2120,7 @@ mod tests {
     enum DisabledListScenario {
         FirstLocalPage,
         PartiallyConsumedLocalPage,
+        CacheTag(&'static str),
         CommonPrefixes,
         Reenable,
     }
@@ -2132,6 +2133,7 @@ mod tests {
             DisabledListScenario::PartiallyConsumedLocalPage => {
                 (vec!["a", "b", "c", "e"], ["d", "f"], ["a", "b"], vec!["e", "z-local"])
             }
+            DisabledListScenario::CacheTag(key) => (vec!["a", "b!", "b0", "c"], [key, "f"], ["a", "b!"], vec!["c", "z-local"]),
             DisabledListScenario::CommonPrefixes => (vec!["p/a/1", "p/c/1"], ["p/b/", "p/d/"], ["p/a/", "p/b/"], vec!["p/c/"]),
             DisabledListScenario::Reenable => (vec!["a", "c", "e"], ["b", "f"], ["a", "b"], vec!["c", "e"]),
         };
@@ -2200,23 +2202,41 @@ mod tests {
         let mut cursor = first.next_continuation_token.expect("merged cursor");
         let mut token = decode_wire_token(&cursor);
         assert_eq!(token.framed, framed);
-        if matches!(scenario, DisabledListScenario::PartiallyConsumedLocalPage) {
+        let second_page = match scenario {
+            DisabledListScenario::PartiallyConsumedLocalPage => Some((["c", "d"], ["c", "e"])),
+            DisabledListScenario::CacheTag(key) => Some((["b0", key], ["b0", "c"])),
+            _ => None,
+        };
+        if let Some((expected_second, expected_replay)) = second_page {
             let first_local = token.local.clone().expect("first local page was fully consumed");
             assert!(
-                first_local.starts_with("b[rustfs_cache:"),
+                first_local.starts_with(&format!("{}[rustfs_cache:", expected_first[1])),
                 "expected a real opaque cache cursor: {first_local}"
             );
             input.continuation_token = Some(cursor);
             let second = execute_source_list(input.clone()).await.expect("second merged page").output;
-            assert_eq!(page_names(&second), ["c", "d"]);
+            assert_eq!(page_names(&second), expected_second);
             cursor = second.next_continuation_token.expect("partially consumed local page");
             token = decode_wire_token(&cursor);
-            assert_eq!(token.local.as_deref(), Some(first_local.as_str()), "keep the page that still contains e");
-            assert_eq!(token.last_key.as_deref(), Some("d"));
+            assert_eq!(
+                token.local.as_deref(),
+                Some(first_local.as_str()),
+                "keep the partially consumed local page"
+            );
+            assert_eq!(token.last_key.as_deref(), Some(expected_second[1]));
             // ECStore prioritizes its opaque continuation over StartAfter. A
             // fix that merely passes both would still replay c from this page.
             let token_wins = Arc::clone(&store)
-                .list_objects_v2(&input.bucket, "", Some(first_local), None, 2, false, Some("d".to_string()), false)
+                .list_objects_v2(
+                    &input.bucket,
+                    "",
+                    Some(first_local),
+                    None,
+                    2,
+                    false,
+                    Some(expected_second[1].to_string()),
+                    false,
+                )
                 .await
                 .expect("verify the real storage continuation contract");
             assert_eq!(
@@ -2225,7 +2245,7 @@ mod tests {
                     .iter()
                     .map(|object| object.name.as_str())
                     .collect::<Vec<_>>(),
-                ["c", "e"]
+                expected_replay
             );
         } else {
             assert_eq!(token.local, None, "the first local page remains partially consumed");
@@ -2234,14 +2254,7 @@ mod tests {
         assert!(!token.local_done);
         assert!(!token.source_done);
         let requests_before_disable = source_requests.load(Ordering::SeqCst);
-        assert_eq!(
-            requests_before_disable,
-            if matches!(scenario, DisabledListScenario::PartiallyConsumedLocalPage) {
-                2
-            } else {
-                1
-            }
-        );
+        assert_eq!(requests_before_disable, if second_page.is_some() { 2 } else { 1 });
         let sys = OnDemandMigrationSys::get();
         let installed = sys.state(&input.bucket).expect("installed source state");
         let saved_config = installed.config().clone();
@@ -2350,6 +2363,16 @@ mod tests {
     fn list_through_disabled_resumes_partially_consumed_opaque_local_page() {
         run_large_stack_test("list-disabled-opaque", || {
             disabled_list_progress_matrix(DisabledListScenario::PartiallyConsumedLocalPage)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_through_disabled_treats_source_cache_tag_names_as_literal_keys() {
+        run_large_stack_test("list-disabled-literal-cache-tag", || async {
+            for key in ["b[rustfs_cache:v1,return:]", "b[rustfs_cache:v2,return:]"] {
+                disabled_list_progress_matrix(DisabledListScenario::CacheTag(key)).await;
+            }
         });
     }
 
