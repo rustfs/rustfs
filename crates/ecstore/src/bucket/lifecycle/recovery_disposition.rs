@@ -412,12 +412,8 @@ impl IlmRecoveryDisposition {
         };
         let minimum_distance = match (previous.state, self.state) {
             (IlmRecoveryDispositionState::Prepared, IlmRecoveryDispositionState::Prepared) => {
-                if previous.owner.is_none() && self.owner.is_some() {
-                    1
-                } else if previous.owner.is_some()
-                    && self.owner.is_some()
-                    && previous.owner != self.owner
-                    && owner_change_is_fenced()
+                if self.owner.is_some()
+                    && (previous.owner.is_none() || (previous.owner != self.owner && owner_change_is_fenced()))
                 {
                     1
                 } else {

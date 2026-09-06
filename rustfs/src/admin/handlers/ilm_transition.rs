@@ -2002,12 +2002,11 @@ mod tests {
             execute_json.replace(export_sha256.as_str(), "too-short"),
             execute_json.replace("opaque-execute", ""),
         ] {
-            match parse_recovery_record_mutation_request(invalid.as_bytes()) {
-                Ok(request) => assert!(
+            if let Ok(request) = parse_recovery_record_mutation_request(invalid.as_bytes()) {
+                assert!(
                     validate_recovery_record_mutation_request(&request).is_err(),
                     "request should fail closed: {invalid}"
-                ),
-                Err(_) => {}
+                );
             }
         }
 

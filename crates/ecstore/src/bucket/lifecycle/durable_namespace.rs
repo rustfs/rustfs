@@ -356,36 +356,7 @@ impl DurableIlmRecordCheckpoint {
             {
                 return Err(Error::other("durable ILM tier delete journal checkpoint is invalid"));
             }
-            if let Self::RecoveryDisposition {
-                content_sha256,
-                identity_sha256,
-                copy_manifest_sha256,
-                copy_manifest_count,
-                created_at_unix_nanos,
-                revision,
-                state,
-                owner_fence_sha256,
-                owner_lease_acquired_at_unix_nanos,
-                owner_lease_expires_at_unix_nanos,
-                confirmed_absent_sha256,
-                retain_until_unix_nanos,
-                ..
-            } = checkpoint
-                && !recovery_disposition_checkpoint_is_valid(
-                    content_sha256,
-                    identity_sha256,
-                    copy_manifest_sha256,
-                    *copy_manifest_count,
-                    *created_at_unix_nanos,
-                    *revision,
-                    state.clone(),
-                    owner_fence_sha256.as_deref(),
-                    *owner_lease_acquired_at_unix_nanos,
-                    *owner_lease_expires_at_unix_nanos,
-                    confirmed_absent_sha256,
-                    *retain_until_unix_nanos,
-                )
-            {
+            if !recovery_disposition_checkpoint_is_valid(checkpoint) {
                 return Err(Error::other("durable ILM recovery disposition checkpoint is invalid"));
             }
         }
@@ -761,35 +732,7 @@ impl DurableIlmRecordCheckpoint {
     /// purge older object versions exposed by that deletion.
     pub(crate) fn is_predecessor_of_terminal(&self, terminal: &Self) -> bool {
         for checkpoint in [self, terminal] {
-            if let Self::RecoveryDisposition {
-                content_sha256,
-                identity_sha256,
-                copy_manifest_sha256,
-                copy_manifest_count,
-                created_at_unix_nanos,
-                revision,
-                state,
-                owner_fence_sha256,
-                owner_lease_acquired_at_unix_nanos,
-                owner_lease_expires_at_unix_nanos,
-                confirmed_absent_sha256,
-                retain_until_unix_nanos,
-            } = checkpoint
-                && !recovery_disposition_checkpoint_is_valid(
-                    content_sha256,
-                    identity_sha256,
-                    copy_manifest_sha256,
-                    *copy_manifest_count,
-                    *created_at_unix_nanos,
-                    *revision,
-                    state.clone(),
-                    owner_fence_sha256.as_deref(),
-                    *owner_lease_acquired_at_unix_nanos,
-                    *owner_lease_expires_at_unix_nanos,
-                    confirmed_absent_sha256,
-                    *retain_until_unix_nanos,
-                )
-            {
+            if !recovery_disposition_checkpoint_is_valid(checkpoint) {
                 return false;
             }
         }
@@ -994,42 +937,52 @@ impl DurableIlmRecordCheckpoint {
     }
 }
 
-fn recovery_disposition_checkpoint_is_valid(
-    content_sha256: &str,
-    identity_sha256: &str,
-    copy_manifest_sha256: &str,
-    copy_manifest_count: usize,
-    created_at_unix_nanos: i64,
-    revision: u64,
-    state: recovery_disposition::IlmRecoveryDispositionState,
-    owner_fence_sha256: Option<&str>,
-    owner_lease_acquired_at_unix_nanos: Option<i64>,
-    owner_lease_expires_at_unix_nanos: Option<i64>,
-    confirmed_absent_sha256: &[String],
-    retain_until_unix_nanos: i64,
-) -> bool {
+fn recovery_disposition_checkpoint_is_valid(checkpoint: &DurableIlmRecordCheckpoint) -> bool {
     use recovery_disposition::IlmRecoveryDispositionState::{Applying, Completed, Prepared};
+
+    let DurableIlmRecordCheckpoint::RecoveryDisposition {
+        content_sha256,
+        identity_sha256,
+        copy_manifest_sha256,
+        copy_manifest_count,
+        created_at_unix_nanos,
+        revision,
+        state,
+        owner_fence_sha256,
+        owner_lease_acquired_at_unix_nanos,
+        owner_lease_expires_at_unix_nanos,
+        confirmed_absent_sha256,
+        retain_until_unix_nanos,
+    } = checkpoint
+    else {
+        return true;
+    };
+    let owner_fence_sha256 = owner_fence_sha256.as_deref();
 
     is_canonical_sha256(content_sha256)
         && is_canonical_sha256(identity_sha256)
         && is_canonical_sha256(copy_manifest_sha256)
-        && copy_manifest_count > 0
-        && created_at_unix_nanos > 0
-        && revision > 0
-        && retain_until_unix_nanos > 0
+        && *copy_manifest_count > 0
+        && *created_at_unix_nanos > 0
+        && *revision > 0
+        && *retain_until_unix_nanos > 0
         && owner_fence_sha256.is_none_or(is_canonical_sha256)
-        && match (owner_fence_sha256, owner_lease_acquired_at_unix_nanos, owner_lease_expires_at_unix_nanos) {
+        && match (
+            owner_fence_sha256,
+            *owner_lease_acquired_at_unix_nanos,
+            *owner_lease_expires_at_unix_nanos,
+        ) {
             (None, None, None) => true,
             (Some(_), Some(acquired), Some(expires)) => acquired > 0 && expires > acquired,
             _ => false,
         }
-        && confirmed_absent_sha256.len() <= copy_manifest_count
+        && confirmed_absent_sha256.len() <= *copy_manifest_count
         && confirmed_absent_sha256.iter().all(|digest| is_canonical_sha256(digest))
         && confirmed_absent_sha256.windows(2).all(|pair| pair[0] < pair[1])
-        && match state {
+        && match *state {
             Prepared => confirmed_absent_sha256.is_empty(),
             Applying => owner_fence_sha256.is_some(),
-            Completed => owner_fence_sha256.is_none() && confirmed_absent_sha256.len() == copy_manifest_count,
+            Completed => owner_fence_sha256.is_none() && confirmed_absent_sha256.len() == *copy_manifest_count,
         }
 }
 
