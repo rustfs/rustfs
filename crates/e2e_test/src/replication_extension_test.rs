@@ -3837,6 +3837,77 @@ async fn test_bucket_replication_converges_delete_marker_and_version_purge() -> 
     Ok(())
 }
 
+/// Regression for rustfs/backlog#2340 (not Wasabi specific): a directory
+/// marker (`prefix/` with a body) in a versioned bucket is stored as the null
+/// version, like MinIO (`putOpts`: "for directory objects skip creating new
+/// versions"), and must still replicate to completion instead of staying
+/// `PENDING`.
+#[tokio::test]
+async fn test_bucket_replication_replicates_directory_marker_in_versioned_bucket() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-dir-marker-src";
+    let target_bucket = "replication-dir-marker-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let marker_key = "dir/trailing/";
+    let body = b"directory marker body";
+    let put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(marker_key)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await?;
+    assert!(
+        put.version_id()
+            .is_none_or(|id| id == "null" || id == uuid::Uuid::nil().to_string()),
+        "a directory marker is the null version even in a versioned bucket: {:?}",
+        put.version_id()
+    );
+
+    wait_for_source_replication_status(&source_client, source_bucket, marker_key, "COMPLETED", false).await?;
+
+    let replica = target_client
+        .get_object()
+        .bucket(target_bucket)
+        .key(marker_key)
+        .send()
+        .await?;
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body);
+    let listed = target_client
+        .list_object_versions()
+        .bucket(target_bucket)
+        .prefix(marker_key)
+        .send()
+        .await?;
+    let marker_versions: Vec<_> = listed.versions().iter().filter(|v| v.key() == Some(marker_key)).collect();
+    assert_eq!(marker_versions.len(), 1, "the marker must land exactly once: {marker_versions:?}");
+    assert_eq!(
+        marker_versions[0].version_id(),
+        Some("null"),
+        "the replica keeps the null version identity"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_bucket_replication_disabled_delete_marker_does_not_propagate() -> TestResult {
     init_logging();
