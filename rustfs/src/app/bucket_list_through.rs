@@ -33,10 +33,9 @@ use super::storage_api::bucket_usecase::s3_api::bucket::ListObjectsV2Params;
 use crate::app::object::shared::{odm_source_unavailable_error, odm_state_error_class};
 use crate::error::ApiError;
 use crate::on_demand_migration::{
-    BucketOdmState, LIST_THROUGH_TOKEN_VERSION, ListEntryKey, ListPageError, ListThroughCursor, ListThroughMerger,
-    ListThroughToken, ListThroughTokenError, MergeSide, OnDemandMigrationSys, SOURCE_LIST_MAX_RATE_WAIT, SourceClient,
-    SourceError, SourceErrorPolicy, SourceListPlan, SourceListRequest, SourceObject, SourcePage, decode_continuation_token,
-    source_list_plan,
+    BucketOdmState, ListEntryKey, ListPageError, ListThroughCursor, ListThroughMerger, ListThroughToken, ListThroughTokenError,
+    MergeSide, OnDemandMigrationSys, SOURCE_LIST_MAX_RATE_WAIT, SourceClient, SourceError, SourceErrorPolicy, SourceListPlan,
+    SourceListRequest, SourceObject, SourcePage, decode_continuation_token, source_list_plan,
 };
 use futures::StreamExt;
 use rustfs_utils::http::{SUFFIX_SOURCE_PROXY_REQUEST, get_header};
@@ -61,15 +60,6 @@ const ENV_LIST_FRAMED_TOKENS: &str = "RUSTFS_ON_DEMAND_MIGRATION_LIST_FRAMED_TOK
 /// source-only keys for a shadowing delete marker.
 const DELETE_MARKER_PROBE_CONCURRENCY: usize = 32;
 
-/// Where the local side of a listing resumes.
-pub(crate) enum LocalListCursor {
-    /// Continuation token for the local store, `None` for the first page.
-    Token(Option<String>),
-    /// The local side of a merged listing was already exhausted, so a listing
-    /// that no longer merges has nothing left to return.
-    Exhausted,
-}
-
 /// Reads the (already base64-decoded) continuation token.
 ///
 /// This runs whether or not the bucket merges: a token handed out while
@@ -81,47 +71,6 @@ pub(crate) fn decode_list_cursor(decoded: Option<&str>) -> S3Result<Option<ListT
         Ok(_) => Ok(None),
         Err(err) => Err(invalid_continuation_token(&err)),
     }
-}
-
-/// The local cursor to use when the request is answered locally, given the
-/// decoded token.
-pub(crate) fn local_cursor(decoded: Option<&str>, merged: Option<&ListThroughToken>) -> LocalListCursor {
-    match merged {
-        Some(token) if token.local_done => LocalListCursor::Exhausted,
-        Some(token) => LocalListCursor::Token(token.local.clone()),
-        None => LocalListCursor::Token(decoded.map(str::to_string)),
-    }
-}
-
-/// A framed chain keeps its envelope when the bucket stops consulting source.
-pub(crate) fn preserve_framed_local_cursor(info: &mut ListObjectsV2Info, previous: Option<&ListThroughToken>) {
-    let Some(previous) = previous.filter(|token| token.framed) else {
-        return;
-    };
-    let Some(next) = info.next_continuation_token.take() else {
-        return;
-    };
-    let mut token = previous.clone();
-    token.local = Some(next);
-    token.local_done = false;
-    if let Some(last_key) = info
-        .objects
-        .iter()
-        .map(|object| object.name.as_str())
-        .chain(info.prefixes.iter().map(String::as_str))
-        .max()
-    {
-        token.last_key = Some(
-            token
-                .last_key
-                .as_deref()
-                .map_or(last_key, |previous| previous.max(last_key))
-                .to_string(),
-        );
-        token.v = LIST_THROUGH_TOKEN_VERSION;
-        token.no_progress = None;
-    }
-    info.next_continuation_token = Some(token.encode());
 }
 
 fn invalid_continuation_token(err: &ListThroughTokenError) -> S3Error {
@@ -240,7 +189,10 @@ fn source_page_entries(bucket: &str, page: SourcePage) -> Vec<SideEntry> {
     interleave(objects, page.common_prefixes)
 }
 
-/// Runs one merged `ListObjectsV2` page.
+/// Runs one merged `ListObjectsV2` page. With no source state, continues only
+/// the local side of an existing merged chain. The original local page cursor
+/// is reread and raw names are filtered against the last emitted key here;
+/// sending that key to storage as a marker could interpret literal cache tags.
 ///
 /// Cost: at most two listings per side per request — the first page of each
 /// side, plus one refill when the previous page had already consumed most of
@@ -249,30 +201,34 @@ fn source_page_entries(bucket: &str, page: SourcePage) -> Vec<SideEntry> {
 /// source listings.
 pub(crate) async fn merged_list_objects_v2(
     store: &Arc<ECStore>,
-    state: &Arc<BucketOdmState>,
+    state: Option<&Arc<BucketOdmState>>,
     bucket: &str,
     params: &ListObjectsV2Params,
     fetch_owner: bool,
     incl_deleted: bool,
     token: Option<&ListThroughToken>,
 ) -> S3Result<ListThroughOutcome> {
-    let policy = &state.config().policy;
     let max_keys = usize::try_from(params.max_keys).unwrap_or(0);
     let mut merger = ListThroughMerger::new(max_keys, token);
     let mut buffers: [Vec<Option<SideEntry>>; 2] = [Vec::new(), Vec::new()];
     let mut degraded = false;
 
-    let plan = source_list_plan(&params.prefix, state.config().filter.prefix.as_deref(), params.delimiter.as_deref());
+    let plan = state.map_or(SourceListPlan::Skip, |state| {
+        source_list_plan(&params.prefix, state.config().filter.prefix.as_deref(), params.delimiter.as_deref())
+    });
     let mut client: Option<Arc<SourceClient>> = None;
-    match &plan {
-        // Nothing the source holds can appear under this prefix; that is a
-        // filter decision, not a degradation.
-        SourceListPlan::Skip => merger.disable_source(),
-        _ => match state.client() {
-            Ok(ready) if state.breaker().allow_request() => client = Some(Arc::clone(ready)),
-            Ok(_) => degrade_or_fail(&mut merger, &mut degraded, policy.source_error, "breaker_open")?,
-            Err(error) => degrade_or_fail(&mut merger, &mut degraded, policy.source_error, odm_state_error_class(error))?,
-        },
+    match (state, &plan) {
+        // A disabled or excluded source is not a degradation. The merger
+        // retains its unconsumed source cursor for a later enabled request.
+        (None, _) | (_, SourceListPlan::Skip) => merger.disable_source(),
+        (Some(state), _) => {
+            let policy = &state.config().policy;
+            match state.client() {
+                Ok(ready) if state.breaker().allow_request() => client = Some(Arc::clone(ready)),
+                Ok(_) => degrade_or_fail(&mut merger, &mut degraded, policy.source_error, "breaker_open")?,
+                Err(error) => degrade_or_fail(&mut merger, &mut degraded, policy.source_error, odm_state_error_class(error))?,
+            }
+        }
     }
 
     while let Some(fetch) = merger.next_fetch() {
@@ -295,6 +251,8 @@ pub(crate) async fn merged_list_objects_v2(
                 (interleave(objects, info.prefixes), info.is_truncated, info.next_continuation_token)
             }
             MergeSide::Source => {
+                let state = state.expect("the source side is disabled without bucket state");
+                let policy = &state.config().policy;
                 let client = client.as_ref().expect("the source side is disabled without a client");
                 match fetch_source_page(state, client, bucket, params, &plan, fetch.token.as_deref()).await {
                     Ok(page) => page,
@@ -314,6 +272,7 @@ pub(crate) async fn merged_list_objects_v2(
         if let Err(error) = merger.push_page(fetch.side, keys, is_truncated, next_token) {
             match fetch.side {
                 MergeSide::Source => {
+                    let policy = &state.expect("only an enabled source can return a page").config().policy;
                     degrade_or_fail(&mut merger, &mut degraded, policy.source_error, "invalid_pagination")?;
                     continue;
                 }
@@ -324,10 +283,15 @@ pub(crate) async fn merged_list_objects_v2(
     }
 
     let issue_progress_tokens = rustfs_utils::get_env_bool(ENV_LIST_PROGRESS_TOKENS, false);
-    let framed = token.is_some_and(|token| token.framed) || rustfs_utils::get_env_bool(ENV_LIST_FRAMED_TOKENS, true);
+    let framed =
+        token.is_some_and(|token| token.framed) || (state.is_some() && rustfs_utils::get_env_bool(ENV_LIST_FRAMED_TOKENS, true));
     let outcome = match merger.finish(issue_progress_tokens) {
         Ok(outcome) => outcome,
         Err(ListPageError::NoProgress(MergeSide::Source)) => {
+            let policy = &state
+                .expect("a disabled source cannot exhaust the progress budget")
+                .config()
+                .policy;
             degrade_or_fail(&mut merger, &mut degraded, policy.source_error, "invalid_pagination")?;
             merger
                 .finish(issue_progress_tokens)
@@ -353,7 +317,10 @@ pub(crate) async fn merged_list_objects_v2(
         }
     }
 
-    if !source_only_keys.is_empty() && policy.respect_local_delete_marker && bucket_keeps_delete_markers(bucket).await {
+    if !source_only_keys.is_empty()
+        && state.is_some_and(|state| state.config().policy.respect_local_delete_marker)
+        && bucket_keeps_delete_markers(bucket).await
+    {
         let shadowed = local_delete_markers(store, bucket, &source_only_keys).await;
         objects.retain(|object| !shadowed.contains(&object.name));
     }
@@ -586,14 +553,18 @@ mod tests {
         let encoded = resume.encode();
         let decoded = decode_list_cursor(Some(&encoded)).expect("a valid envelope decodes");
         assert_eq!(decoded.as_ref(), Some(&resume));
-        assert!(matches!(
-            local_cursor(Some(&encoded), decoded.as_ref()),
-            LocalListCursor::Token(Some(local)) if local == "local-2"
-        ));
+        let mut merger = ListThroughMerger::new(2, decoded.as_ref());
+        merger.disable_source();
+        let fetch = merger.next_fetch().expect("unconsumed local page");
+        assert_eq!(fetch.side, MergeSide::Local);
+        assert_eq!(fetch.token.as_deref(), Some("local-2"));
 
         let encoded = token(None, true).encode();
         let decoded = decode_list_cursor(Some(&encoded)).expect("a valid envelope decodes");
-        assert!(matches!(local_cursor(Some(&encoded), decoded.as_ref()), LocalListCursor::Exhausted));
+        let mut merger = ListThroughMerger::new(2, decoded.as_ref());
+        merger.disable_source();
+        assert!(merger.next_fetch().is_none());
+        assert!(!merger.finish(false).expect("local EOF").is_truncated);
     }
 
     #[test]
@@ -606,31 +577,44 @@ mod tests {
             let encoded = resume.encode();
             let decoded = decode_list_cursor(Some(&encoded)).expect("a v2 envelope decodes");
             assert_eq!(decoded.as_ref(), Some(&resume));
-            assert!(matches!(
-                local_cursor(Some(&encoded), decoded.as_ref()),
-                LocalListCursor::Token(Some(local)) if local == "local-2"
-            ));
+            let mut merger = ListThroughMerger::new(2, decoded.as_ref());
+            merger.disable_source();
+            let fetch = merger.next_fetch().expect("unconsumed local page");
+            assert_eq!(fetch.side, MergeSide::Local);
+            assert_eq!(fetch.token.as_deref(), Some("local-2"));
             resume.local_done = true;
             let encoded = resume.encode();
             let decoded = decode_list_cursor(Some(&encoded)).expect("v2 with local EOF decodes");
-            assert!(matches!(local_cursor(Some(&encoded), decoded.as_ref()), LocalListCursor::Exhausted));
+            let mut merger = ListThroughMerger::new(2, decoded.as_ref());
+            merger.disable_source();
+            assert!(merger.next_fetch().is_none());
+            assert!(!merger.finish(false).expect("local EOF").is_truncated);
         }
     }
 
     #[test]
     fn a_plain_local_token_is_passed_through_and_a_tampered_one_is_rejected() {
+        use crate::app::storage_api::bucket_usecase::s3_api::bucket::parse_list_objects_v2_params;
+
         let json_key = r#"{"t":"odm-list","v":1,"local_done":true}"#;
         assert!(decode_list_cursor(Some(json_key)).expect("valid local key").is_none());
-        assert!(matches!(local_cursor(Some(json_key), None), LocalListCursor::Token(Some(local)) if local == json_key));
         assert!(
             decode_list_cursor(Some("photos/a.jpg"))
                 .expect("plain markers decode")
                 .is_none()
         );
-        assert!(matches!(
-            local_cursor(Some("photos/a.jpg"), None),
-            LocalListCursor::Token(Some(local)) if local == "photos/a.jpg"
-        ));
+
+        for marker in [json_key, "photos/a.jpg"] {
+            let params = parse_list_objects_v2_params(
+                None,
+                None,
+                Some(2),
+                Some(base64_simd::STANDARD.encode_to_string(marker.as_bytes())),
+                None,
+            )
+            .expect("plain local listing parameters");
+            assert_eq!(params.decoded_continuation_token.as_deref(), Some(marker));
+        }
 
         let tampered = token(Some("local-2"), false).encode().replace("\"v\":1", "\"v\":9");
         let err = decode_list_cursor(Some(&tampered)).expect_err("a bumped version is rejected");
@@ -1783,7 +1767,7 @@ mod tests {
             Duration::from_secs(10),
             merged_list_objects_v2(
                 &store,
-                &state,
+                Some(&state),
                 &input.bucket,
                 &params,
                 input.fetch_owner.unwrap_or_default(),
@@ -2391,70 +2375,28 @@ mod tests {
     }
 
     #[test]
-    fn framed_local_continuations_preserve_json_markers_and_zero_sized_budgets() {
+    fn local_merger_preserves_json_markers_and_resets_budget_on_progress() {
         let json_key = r#"{"t":"odm-list","v":1,"local_done":true}"#;
-        let mut resume = token(Some("local-2"), false);
-        resume.framed = true;
-        resume.v = 2;
-        resume.no_progress = Some(15);
-        let mut page = ListObjectsV2Info {
-            is_truncated: true,
-            next_continuation_token: Some(json_key.to_string()),
-            objects: vec![info(json_key)],
-            ..Default::default()
-        };
-        preserve_framed_local_cursor(&mut page, Some(&resume));
-        let raw = page.next_continuation_token.expect("local continuation");
-        assert!(raw.starts_with("\0odm-list:"));
-        let decoded = decode_list_cursor(Some(&raw))
-            .expect("framed local continuation")
-            .expect("envelope");
-        assert!(decoded.framed);
-        assert_eq!(
-            decoded.local.as_deref(),
-            Some(json_key),
-            "the local marker is embedded without another encoding"
-        );
-        assert_eq!(decoded.source, resume.source);
-        assert_eq!(decoded.last_key.as_deref(), Some(json_key));
-        assert_eq!(decoded.v, 1);
-        assert_eq!(decoded.no_progress, None);
-        assert!(matches!(local_cursor(Some(&raw), Some(&decoded)), LocalListCursor::Token(Some(local)) if local == json_key));
-
-        let mut prefix_page = ListObjectsV2Info {
-            is_truncated: true,
-            next_continuation_token: Some("photos/".to_string()),
-            prefixes: vec!["photos/".to_string()],
-            ..Default::default()
-        };
-        preserve_framed_local_cursor(&mut prefix_page, Some(&resume));
-        let prefix = decode_list_cursor(prefix_page.next_continuation_token.as_deref())
-            .expect("prefix continuation")
-            .expect("framed prefix envelope");
-        assert!(prefix.framed);
-        assert_eq!(prefix.last_key.as_deref(), Some("photos/"));
-        assert_eq!(prefix.v, 1);
-        assert_eq!(prefix.no_progress, None);
-
-        let mut zero = ListObjectsV2Info {
-            is_truncated: true,
-            next_continuation_token: resume.local.clone(),
-            ..Default::default()
-        };
-        preserve_framed_local_cursor(&mut zero, Some(&resume));
-        assert_eq!(
-            decode_list_cursor(zero.next_continuation_token.as_deref()).expect("zero-sized continuation"),
-            Some(resume.clone())
-        );
-
-        resume.framed = false;
-        let mut ordinary = ListObjectsV2Info {
-            is_truncated: true,
-            next_continuation_token: Some(json_key.to_string()),
-            ..Default::default()
-        };
-        preserve_framed_local_cursor(&mut ordinary, Some(&resume));
-        assert_eq!(ordinary.next_continuation_token.as_deref(), Some(json_key));
+        for key in [ListEntryKey::object(json_key), ListEntryKey::prefix("photos/")] {
+            let mut resume = token(Some("local-2"), false);
+            resume.v = 2;
+            resume.no_progress = Some(15);
+            let mut merger = ListThroughMerger::new(1, Some(&resume));
+            merger.disable_source();
+            merger
+                .push_page(MergeSide::Local, vec![key.clone()], true, Some(key.name.clone()))
+                .expect("valid local page");
+            let outcome = merger.finish(false).expect("local progress resets the budget");
+            assert_eq!(outcome.picks.len(), 1);
+            assert_eq!(outcome.picks[0].side, MergeSide::Local);
+            let next = outcome.next_token.expect("local continuation");
+            assert_eq!(next.local.as_deref(), Some(key.name.as_str()), "the local marker is embedded unchanged");
+            assert_eq!(next.source, resume.source);
+            assert_eq!(next.source_done, resume.source_done);
+            assert_eq!(next.last_key.as_deref(), Some(key.name.as_str()));
+            assert_eq!(next.v, 1);
+            assert_eq!(next.no_progress, None);
+        }
     }
 
     #[test]
