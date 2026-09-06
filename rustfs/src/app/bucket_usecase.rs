@@ -2797,41 +2797,34 @@ impl DefaultBucketUsecase {
                     false,
                 )
             }
-            (Some(state), _) => {
+            (None, None) => {
+                let infos = store
+                    .list_objects_v2(
+                        &bucket,
+                        &params.prefix,
+                        params.decoded_continuation_token.clone(),
+                        params.delimiter.clone(),
+                        params.max_keys,
+                        fetch_owner.unwrap_or_default(),
+                        params.start_after_for_query.clone(),
+                        incl_deleted,
+                    )
+                    .await
+                    .map_err(ApiError::from)?;
+                (infos, false)
+            }
+            (state, token) => {
                 let outcome = list_through::merged_list_objects_v2(
                     &store,
-                    &state,
+                    state.as_ref(),
                     &bucket,
                     &params,
                     fetch_owner.unwrap_or_default(),
                     incl_deleted,
-                    merged_token.as_ref(),
+                    token,
                 )
                 .await?;
                 (outcome.info, outcome.degraded)
-            }
-            (None, _) => {
-                let cursor = list_through::local_cursor(params.decoded_continuation_token.as_deref(), merged_token.as_ref());
-                match cursor {
-                    list_through::LocalListCursor::Exhausted => (StorageListObjectsV2Info::default(), false),
-                    list_through::LocalListCursor::Token(token) => {
-                        let mut infos = store
-                            .list_objects_v2(
-                                &bucket,
-                                &params.prefix,
-                                token,
-                                params.delimiter.clone(),
-                                params.max_keys,
-                                fetch_owner.unwrap_or_default(),
-                                params.start_after_for_query.clone(),
-                                incl_deleted,
-                            )
-                            .await
-                            .map_err(ApiError::from)?;
-                        list_through::preserve_framed_local_cursor(&mut infos, merged_token.as_ref());
-                        (infos, false)
-                    }
-                }
             }
         };
 
