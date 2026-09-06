@@ -69,12 +69,8 @@ crates/s3-client/src/transition_api.rs|clippy::all
 crates/s3-client/src/transition_api.rs|unused_must_use
 crates/s3-client/src/transition_api.rs|unused_variables
 crates/ecstore/src/services/event_notification.rs|unused_variables
-crates/ecstore/src/services/tier/tier.rs|clippy::all
-crates/ecstore/src/services/tier/tier.rs|unused_must_use
 crates/ecstore/src/services/tier/tier.rs|unused_variables
 crates/ecstore/src/services/tier/tier_admin.rs|unused_variables
-crates/ecstore/src/services/tier/warm_backend.rs|clippy::all
-crates/ecstore/src/services/tier/warm_backend.rs|unused_must_use
 crates/ecstore/src/services/tier/warm_backend.rs|unused_variables
 crates/ecstore/src/services/tier/warm_backend_aliyun.rs|unused_variables
 crates/ecstore/src/services/tier/warm_backend_azure.rs|unused_variables
@@ -83,7 +79,5 @@ crates/ecstore/src/services/tier/warm_backend_huaweicloud.rs|unused_variables
 crates/ecstore/src/services/tier/warm_backend_minio.rs|unused_variables
 crates/ecstore/src/services/tier/warm_backend_r2.rs|unused_variables
 crates/ecstore/src/services/tier/warm_backend_rustfs.rs|unused_variables
-crates/ecstore/src/services/tier/warm_backend_s3.rs|clippy::all
-crates/ecstore/src/services/tier/warm_backend_s3.rs|unused_must_use
 crates/ecstore/src/services/tier/warm_backend_s3.rs|unused_variables
 crates/ecstore/src/services/tier/warm_backend_tencent.rs|unused_variables
