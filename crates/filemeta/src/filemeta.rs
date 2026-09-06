@@ -692,10 +692,15 @@ impl FileMeta {
                             }
                         }
 
-                        let old_dir = v.object.as_ref().map(|v| v.data_dir).unwrap_or_default();
+                        // The version stays on disk while the purge replicates
+                        // (status PENDING/FAILED); its data dir must stay with
+                        // it. Returning the dir here made the disk layer delete
+                        // it, which turned every non-inline retained version
+                        // into an unreadable zombie: the purge state could never
+                        // be applied and the bucket could never be deleted.
                         self.set_idx(i, v)?;
 
-                        return Ok(old_dir);
+                        return Ok(None);
                     }
                     found_index = Some(i);
                 }
@@ -2700,6 +2705,58 @@ mod test {
             fm.versions.is_empty(),
             "delete-marker version purge should remove the local marker instead of rewriting purge metadata onto it"
         );
+    }
+
+    /// Regression for rustfs/backlog#2340: a version purge that still awaits
+    /// the replication target keeps the object version on disk with a pending
+    /// purge status. Its data dir must be retained with it; handing the dir
+    /// back here made the disk layer delete it, leaving every non-inline
+    /// retained version unreadable. The dir is released only once the purge
+    /// completes and the version itself goes away.
+    #[test]
+    fn delete_version_pending_version_purge_retains_object_data_dir() {
+        let version_id = Uuid::new_v4();
+        let data_dir = Uuid::new_v4();
+        let mut fm = FileMeta::new();
+        let mut fi = FileInfo::new("object", 2, 2);
+        fi.version_id = Some(version_id);
+        fi.data_dir = Some(data_dir);
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        fm.add_version(fi).unwrap();
+
+        let pending_purge = FileInfo {
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            mark_deleted: true,
+            replication_state_internal: Some(ReplicationState {
+                version_purge_status_internal: Some("target=PENDING;".to_string()),
+                purge_targets: version_purge_statuses_map("target=PENDING;"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let freed = fm.delete_version(&pending_purge).unwrap();
+        assert_eq!(freed, None, "a pending purge must not release the retained version's data dir");
+        assert_eq!(fm.versions.len(), 1, "the version must stay until the purge replicates");
+        let retained = fm
+            .into_fileinfo("vol", "object", &version_id.to_string(), false, false, true)
+            .unwrap();
+        assert_eq!(retained.data_dir, Some(data_dir));
+        assert_eq!(retained.version_purge_status(), VersionPurgeStatusType::Pending);
+
+        let completed_purge = FileInfo {
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            replication_state_internal: Some(ReplicationState {
+                version_purge_status_internal: Some("target=COMPLETE;".to_string()),
+                purge_targets: version_purge_statuses_map("target=COMPLETE;"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let freed = fm.delete_version(&completed_purge).unwrap();
+        assert_eq!(freed, Some(data_dir), "a completed purge removes the version and releases its data dir");
+        assert!(fm.versions.is_empty());
     }
 
     #[test]
