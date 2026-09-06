@@ -2300,7 +2300,7 @@ mod tests {
                 ssec_headers_from_key(key),
             ),
         ] {
-            fixture.object_info.etag = Some(format!("{:x}", Md5::digest(&fixture.plaintext)));
+            fixture.object_info.etag = Some(faster_hex::hex_string(Md5::digest(&fixture.plaintext).as_ref()));
             assert_eq!(fixture.object_info.etag.as_ref().expect("source ETag").len(), 32);
             assert_eq!(fixture.object_info.parts.len(), 2);
             let tail = &fixture.object_info.parts[1];
@@ -2357,7 +2357,7 @@ mod tests {
             bucket: "bucket".to_string(),
             name: "v2-empty-tail".to_string(),
             size: i64::try_from(ciphertext.len()).expect("fixture ciphertext size fits"),
-            etag: Some(format!("{:x}", Md5::digest(&plaintext))),
+            etag: Some(faster_hex::hex_string(Md5::digest(&plaintext).as_ref())),
             parts: Arc::new(parts),
             user_defined: Arc::new(legacy_ssec_multipart_metadata(key, plaintext.len())),
             ..Default::default()
@@ -3769,6 +3769,61 @@ mod tests {
             assert_eq!(plan.storage_length, object_info.size);
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn multipart_full_read_preserves_legacy_zero_and_negative_part_sizes() {
+        let key = [0x77; 32];
+        let part_sizes = [5 * 1024 * 1024, 1024 * 1024];
+        let encrypted = build_legacy_ssec_multipart_fixture(key, &part_sizes).await;
+        // The encrypted case supplies the fixture key explicitly. This covers
+        // full decrypted reads, not managed-key acquisition.
+        for (kind, fixture, headers) in [
+            ("compressed", compressed_multipart_fixture(&part_sizes).await, HeaderMap::new()),
+            (
+                "encrypted with supplied key",
+                CompressedMultipartFixture {
+                    object_info: encrypted.object_info,
+                    stored: encrypted.ciphertext,
+                    plaintext: encrypted.plaintext,
+                },
+                ssec_headers_from_key(key),
+            ),
+        ] {
+            let source_etag = faster_hex::hex_string(Md5::digest(&fixture.plaintext).as_ref());
+            assert_eq!(source_etag.len(), 32);
+            assert_eq!(fixture.plaintext.len(), 6 * 1024 * 1024);
+            for part_index in 0..part_sizes.len() {
+                assert!(fixture.object_info.parts[part_index].actual_size > 0, "the selected part is nonempty");
+                for actual_size in [0, -1] {
+                    let mut object_info = fixture.object_info.clone();
+                    object_info.etag = Some(source_etag.clone());
+                    Arc::make_mut(&mut object_info.parts)[part_index].actual_size = actual_size;
+                    let (mut reader, offset, length) = GetObjectReader::new(
+                        Box::new(Cursor::new(fixture.stored.clone())),
+                        None,
+                        &object_info,
+                        &ObjectOptions::default(),
+                        &headers,
+                    )
+                    .await
+                    .expect("the authoritative total size must keep full legacy reads available");
+                    assert_eq!(offset, 0);
+                    assert_eq!(length, i64::try_from(fixture.stored.len()).expect("stored size fits"));
+                    let mut body = Vec::new();
+                    reader
+                        .stream
+                        .read_to_end(&mut body)
+                        .await
+                        .expect("full read must reach EOF despite an unspecified per-part logical size");
+                    assert_eq!(
+                        body, fixture.plaintext,
+                        "{kind}: part {part_index} with actual_size={actual_size} must not lose readable data"
+                    );
+                    assert_eq!(reader.object_info.etag.as_deref(), Some(source_etag.as_str()));
+                }
+            }
+        }
     }
 
     /// The physical part sizes must add up to `oi.size` for a seek to be safe;
