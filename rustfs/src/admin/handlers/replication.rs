@@ -3472,10 +3472,16 @@ mod target_repair_tests {
         );
     }
 
+    const ORDINARY_TARGET_ENV: [(&str, Option<&str>); 3] = [
+        ("NO_PROXY", Some("*")),
+        ("no_proxy", Some("*")),
+        ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", Some("true")),
+    ];
+
     #[tokio::test]
     #[serial_test::serial]
     async fn ordinary_target_writes_preserve_repairs_missing_from_the_cache() {
-        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+        temp_env::async_with_vars(ORDINARY_TARGET_ENV, async {
             for operation in ["create", "update", "remove"] {
                 let (_temp, _env) = test_env().await;
                 let first = RemoteTargetServer::start().await;
@@ -3553,7 +3559,7 @@ mod target_repair_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn ordinary_target_writes_refuse_unreadable_disk_even_with_a_readable_cache() {
-        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+        temp_env::async_with_vars(ORDINARY_TARGET_ENV, async {
             let (_temp, env) = test_env().await;
             let server = RemoteTargetServer::start().await;
             let arn = repair(&server.target(), "").await.expect("create initial target");
@@ -3594,7 +3600,7 @@ mod target_repair_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn ordinary_target_create_is_idempotent_from_disk_when_the_remote_is_offline() {
-        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+        temp_env::async_with_vars(ORDINARY_TARGET_ENV, async {
             let (_temp, env) = test_env().await;
             let mut server = RemoteTargetServer::start().await;
             let target = server.target();
@@ -3634,7 +3640,7 @@ mod target_repair_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn ordinary_target_update_rejects_same_target_changes_during_remote_validation() {
-        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+        temp_env::async_with_vars(ORDINARY_TARGET_ENV, async {
             for deleted in [false, true] {
                 let (_temp, _env) = test_env().await;
                 let server = RemoteTargetServer::start().await;
@@ -3682,7 +3688,7 @@ mod target_repair_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn ordinary_target_update_preserves_a_repair_committed_during_validation() {
-        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+        temp_env::async_with_vars(ORDINARY_TARGET_ENV, async {
             let (_temp, _env) = test_env().await;
             let first = RemoteTargetServer::start().await;
             let second = RemoteTargetServer::start().await;
@@ -3740,11 +3746,15 @@ mod target_repair_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn ordinary_target_validation_does_not_lock_out_a_concurrent_repair() {
-        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+        temp_env::async_with_vars(ORDINARY_TARGET_ENV, async {
             let (_temp, _env) = test_env().await;
             let first = RemoteTargetServer::start().await;
             let second = RemoteTargetServer::start().await;
             let target = first.target();
+            BucketTargetSys::get()
+                .validate_target(BUCKET, &target)
+                .await
+                .expect("remote validation must succeed before pausing the create request");
             let (observed, release) = first.pause_next_request();
             let create = repair(&target, "");
             let concurrent_repair = async {
@@ -3773,7 +3783,7 @@ mod target_repair_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn ordinary_target_remove_keeps_both_guards_after_the_http_future_is_dropped() {
-        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+        temp_env::async_with_vars(ORDINARY_TARGET_ENV, async {
             let (_temp, _env) = test_env().await;
             let server = RemoteTargetServer::start().await;
             let arn = repair(&server.target(), "").await.expect("create initial target");
@@ -3822,7 +3832,7 @@ mod target_repair_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn ordinary_target_remove_checks_current_persisted_replication_rules() {
-        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+        temp_env::async_with_vars(ORDINARY_TARGET_ENV, async {
             for malformed in [false, true] {
                 let (_temp, env) = test_env().await;
                 let server = RemoteTargetServer::start().await;
