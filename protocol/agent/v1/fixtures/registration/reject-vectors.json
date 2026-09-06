@@ -809,6 +809,37 @@
                 "reason": "REGISTRATION_PROOF_INVALID",
                 "verifiesMathematically": false
             }
+        },
+        {
+            "name": "DNS subject alternative name whose value is classified as an IP address",
+            "stage": "certificateRequest",
+            "evaluatedAt": "2026-08-28T12:00:00Z",
+            "note": "The ASN.1 GeneralName is dNSName, but the pinned stock step-ca JWK path classifies the untyped authorization string 10.0.0.1 as an IP address before comparing it with the CSR. Connect refuses the mismatch as a stable protocol decision before asking the authority to guess.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBETCBtwIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR+TUddmyykdETq9JrvaQiHpzKCOGetvSPiPNKhP9ydmEYPt2k98OIkpzcIDHLbCE+HixdoZ1WWSqzOF9L3dRKboCYwJAYJKoZIhvcNAQkOMRcwFTATBgNVHREEDDAKgggxMC4wLjAuMTAKBggqhkjOPQQDAgNJADBGAiEA6q1VFU3kftE89kFMG0uEnPRSAs+GdTk+GB6q2xuR8Q8CIQCHvwA+1cR9xyJgtX+XUFJsNtMWsdjxajAxeHyTeFtOsA==",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:l86VX044RFdnKAS-VCo2bfNDjJFiNsxkZWXQfsydc5c\n",
+            "serverTranscriptSha256": "6f944e6044aa001e68b56c2409da76c179f52dc4e6d171de45bee52e617c12d6",
+            "expected": {
+                "accepted": false,
+                "reason": "CERTIFICATE_REQUEST_PROFILE_UNSUPPORTED",
+                "verifiesMathematically": false
+            }
         }
     ]
 }

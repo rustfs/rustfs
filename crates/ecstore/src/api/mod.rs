@@ -32,7 +32,7 @@ pub mod bucket {
     pub mod bucket_target_sys {
         pub use crate::bucket::bucket_target_sys::{
             AdvancedPutOptions, BucketTargetError, BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError,
-            SsecPassthroughCapability, TargetClient, append_version_id_query,
+            SsecPassthroughCapability, TargetClient, UnreadableTargetsPolicy, append_version_id_query,
         };
     }
 
@@ -69,6 +69,13 @@ pub mod bucket {
             };
         }
 
+        pub mod recovery_control {
+            pub use crate::bucket::lifecycle::recovery_control::{
+                IlmRecoveryClassification, IlmRecoveryControlPage, IlmRecoveryControlView, IlmRecoveryProtocol,
+                inspect_recovery_control, list_recovery_controls,
+            };
+        }
+
         pub mod transition_transaction {
             pub use crate::bucket::lifecycle::transition_transaction::{
                 TransitionOperatorDeleteResult, TransitionOperatorError, TransitionOperatorProbe, TransitionOperatorStatus,
@@ -89,8 +96,9 @@ pub mod bucket {
         #[allow(clippy::module_inception)]
         pub mod lifecycle {
             pub use crate::bucket::lifecycle::lifecycle::{
-                Event, ExpirationOptions, IlmAction, Lifecycle, LifecycleCalculate, ObjectOpts, RuleValidate,
-                TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time, object_opts_from_object_info,
+                Event, ExpirationOptions, IlmAction, LIFECYCLE_MALFORMED_XML_ERROR_KIND, Lifecycle, LifecycleCalculate,
+                ObjectOpts, RuleValidate, TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time,
+                object_opts_from_object_info,
             };
         }
 

@@ -825,6 +825,11 @@ mod tests {
                 manual_transition_scope_record_object_name, manual_transition_task_object_name,
                 manual_transition_worker_result_object_name, manual_transition_worker_result_task_key,
             },
+            recovery_control::{
+                IlmRecoveryClassification, IlmRecoveryControl, IlmRecoveryControlIdentity, IlmRecoveryErrorCode,
+                IlmRecoveryProtocol, MAX_RECOVERY_ATTEMPTS, load_recovery_control, observe_recovery_source,
+                save_recovery_control_if_absent,
+            },
             tier_delete_journal::{
                 DecommissionCheckpointTargetFailureHook, TIER_DELETE_DISPATCH_MANIFEST_PREFIX, TIER_DELETE_JOURNAL_PREFIX,
                 TierDeleteChunkTestBarrier, TierDeleteChunkTestStage, TierDeleteDispatchBatchLimitGuard,
@@ -844,12 +849,13 @@ mod tests {
             },
             transition_transaction::{
                 TRANSITION_TRANSACTION_RECORD_PREFIX, TransitionCleanupDecision, TransitionCleanupProof, TransitionOperatorError,
-                TransitionOperatorProbe, TransitionRecoveryClaimBarrier, TransitionRemoteVersion, TransitionSourceIdentity,
-                TransitionSourceVersionMode, TransitionTransaction, TransitionTransactionInit, TransitionTransactionState,
-                delete_transition_candidate_for_operator, finalize_missing_transition_transaction_for_operator,
-                inspect_transition_transaction_for_operator, load_transition_transaction_record,
-                recover_transition_transaction_records, recover_transition_transaction_records_at,
-                save_transition_transaction_record, save_transition_transaction_record_if_current,
+                TransitionOperatorProbe, TransitionRecoveryClaimBarrier, TransitionRecoveryTerminalBarrier,
+                TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction,
+                TransitionTransactionInit, TransitionTransactionState, delete_transition_candidate_for_operator,
+                finalize_missing_transition_transaction_for_operator, inspect_transition_transaction_for_operator,
+                load_transition_transaction_record, recover_transition_transaction_records,
+                recover_transition_transaction_records_at, save_transition_transaction_record,
+                save_transition_transaction_record_if_current, transition_recovery_control_id,
                 transition_transaction_record_object_name,
             },
             validate_durable_ilm_record,
@@ -19242,6 +19248,105 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_expires_abandoned_attempt_at_budget_bound() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "transition-transaction-expired-attempt-budget",
+            &[4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id: uuid::Uuid::new_v4(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id: uuid::Uuid::new_v4(),
+            source: TransitionSourceIdentity {
+                bucket: "source-bucket".to_string(),
+                object: "source-object".to_string(),
+                version_id: Some(uuid::Uuid::new_v4()),
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                size: 42,
+                etag: "source-etag".to_string(),
+                version_mode: TransitionSourceVersionMode::Versioned,
+            },
+            tier_name: "UNUSEDABANDONEDTIER".to_string(),
+            backend_fingerprint: [7; 32],
+            not_after_unix_nanos: 1,
+        })
+        .expect("transaction should build");
+        save_transition_transaction_record(store.clone(), &transaction)
+            .await
+            .expect("transaction record should persist");
+
+        let record_name =
+            transition_transaction_record_object_name(transaction.transaction_id).expect("transaction record name should derive");
+        let source = observe_recovery_source(
+            store.clone(),
+            &record_name,
+            crate::bucket::lifecycle::transition_transaction::TRANSITION_TRANSACTION_SCHEMA,
+        )
+        .await
+        .expect("transaction source generation should be observable");
+        let mut control = IlmRecoveryControl::new(
+            IlmRecoveryControlIdentity {
+                protocol: IlmRecoveryProtocol::TransitionTransaction,
+                canonical_source_path: record_name,
+                stable_operation_identity: transaction.transaction_id.to_string(),
+                record_class: "transition_transaction_v1".to_string(),
+            },
+            source.generation,
+            IlmRecoveryClassification::Retrying,
+            2_000_000_000,
+            IlmRecoveryErrorCode::None,
+        )
+        .expect("recovery control should build");
+        let mut now = 3_000_000_000;
+        for _ in 1..MAX_RECOVERY_ATTEMPTS {
+            now = now.max(control.next_attempt_at_unix_nanos.unwrap_or(now));
+            control
+                .claim("cancelled-or-timed-out-owner", uuid::Uuid::new_v4(), now, 1)
+                .expect("abandoned attempt should claim");
+            control
+                .record_expired_attempt(now + 1)
+                .expect("expired attempt should consume retry budget");
+            now += 2;
+        }
+        now = now.max(control.next_attempt_at_unix_nanos.expect("last retry should have a backoff"));
+        control
+            .claim("cancelled-or-timed-out-owner", uuid::Uuid::new_v4(), now, 1)
+            .expect("final abandoned attempt should claim");
+        save_recovery_control_if_absent(store.clone(), &control)
+            .await
+            .expect("claimed recovery control should persist");
+
+        let stats = recover_transition_transaction_records_at(store.clone(), 100, None, i128::from(now + 1))
+            .await
+            .expect("recovery should account for the expired attempt");
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 0, 1, 0));
+
+        let control_id = transition_recovery_control_id(&transaction).expect("control id should derive");
+        let persisted = load_recovery_control(store.clone(), IlmRecoveryProtocol::TransitionTransaction, &control_id)
+            .await
+            .expect("expired recovery control should remain inspectable");
+        assert_eq!(persisted.control.classification, IlmRecoveryClassification::OperatorRequired);
+        assert_eq!(persisted.control.attempt_count, u64::from(MAX_RECOVERY_ATTEMPTS));
+        assert_eq!(persisted.control.consecutive_failure_count, MAX_RECOVERY_ATTEMPTS);
+        assert_eq!(persisted.control.last_error_code, IlmRecoveryErrorCode::AttemptLeaseExpired);
+        assert!(persisted.control.owner.is_none());
+        assert_eq!(
+            transition_transaction_record_count(store).await,
+            1,
+            "budget exhaustion must retain the source record"
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn transition_transaction_recovery_retains_active_uploaded_candidate_until_commit() {
         let temp_dir = tempfile::tempdir().expect("create temp store dir");
         let (ctx, store, _shutdown) =
@@ -19351,6 +19456,7 @@ mod tests {
             ),
         ];
         let mut expected_removes = Vec::new();
+        let mut recovery_control_ids = Vec::new();
         for (case, put_version, remote_version, source_mode) in cases {
             let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
                 deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
@@ -19388,6 +19494,8 @@ mod tests {
             save_transition_transaction_record(store.clone(), &transaction)
                 .await
                 .expect("transaction record should persist");
+            recovery_control_ids
+                .push(transition_recovery_control_id(&transaction).expect("transition recovery control id should derive"));
             expected_removes.push((transaction.remote_object, put_version));
         }
 
@@ -19403,6 +19511,14 @@ mod tests {
         assert_eq!(actual_removes, expected_removes, "recovery must preserve each remote version shape");
         assert_eq!(backend.exact_remove_count(), 2);
         assert_eq!(backend.object_count().await, 0);
+        for control_id in recovery_control_ids {
+            let control = load_recovery_control(store.clone(), IlmRecoveryProtocol::TransitionTransaction, &control_id)
+                .await
+                .expect("completed recovery control should remain inspectable");
+            assert_eq!(control.control.classification, IlmRecoveryClassification::Terminal);
+            assert_eq!(control.control.attempt_count, 1);
+            assert!(control.control.owner.is_none());
+        }
 
         let replay = recover_transition_transaction_records(store, 100, None)
             .await
@@ -19413,6 +19529,94 @@ mod tests {
             3,
             "each expired candidate must be deleted only once"
         );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_resumes_source_cleanup_after_terminal_crash() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-transaction-terminal-crash", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXTERMINALCRASH";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let remote_version = uuid::Uuid::new_v4().to_string();
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id: uuid::Uuid::new_v4(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id: uuid::Uuid::new_v4(),
+            source: TransitionSourceIdentity {
+                bucket: "source-bucket".to_string(),
+                object: "source-object".to_string(),
+                version_id: Some(uuid::Uuid::new_v4()),
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                size: 42,
+                etag: "source-etag".to_string(),
+                version_mode: TransitionSourceVersionMode::Versioned,
+            },
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1,
+        })
+        .expect("transaction should build");
+        transaction
+            .advance(
+                transaction.fence(),
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::versioned(remote_version.clone())),
+            )
+            .expect("transaction should enter uploaded state");
+        backend.set_put_remote_version(Some(remote_version)).await;
+        let candidate = bytes::Bytes::from_static(b"terminal crash candidate");
+        backend
+            .put(
+                &transaction.remote_object,
+                ReaderImpl::Body(candidate.clone()),
+                i64::try_from(candidate.len()).expect("test candidate length should fit i64"),
+            )
+            .await
+            .expect("mock backend should accept candidate");
+        save_transition_transaction_record(store.clone(), &transaction)
+            .await
+            .expect("transaction record should persist");
+        let control_id = transition_recovery_control_id(&transaction).expect("control id should derive");
+
+        let barrier = TransitionRecoveryTerminalBarrier::install(transaction.transaction_id);
+        let recovery_store = store.clone();
+        let recovery = tokio::spawn(async move { recover_transition_transaction_records(recovery_store, 100, None).await });
+        barrier.wait_until_paused().await;
+        let terminal = load_recovery_control(store.clone(), IlmRecoveryProtocol::TransitionTransaction, &control_id)
+            .await
+            .expect("terminal control should persist before source cleanup");
+        assert_eq!(terminal.control.classification, IlmRecoveryClassification::Terminal);
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 1);
+        assert_eq!(backend.object_count().await, 0);
+        assert_eq!(backend.exact_remove_count(), 1);
+
+        recovery.abort();
+        assert!(
+            recovery
+                .await
+                .expect_err("recovery should be cancelled at the crash boundary")
+                .is_cancelled()
+        );
+        drop(barrier);
+
+        let replay = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("terminal control should resume source cleanup without another remote delete");
+        assert_eq!((replay.scanned, replay.recovered, replay.retained, replay.failed), (1, 1, 0, 0));
+        assert_eq!(transition_transaction_record_count(store).await, 0);
+        assert_eq!(backend.exact_remove_count(), 1, "terminal replay must not repeat the remote delete");
     }
 
     #[cfg(feature = "test-util")]
@@ -19472,6 +19676,8 @@ mod tests {
         save_transition_transaction_record(store.clone(), &uploaded)
             .await
             .expect("transaction record should persist");
+        let recovery_control_id =
+            transition_recovery_control_id(&uploaded).expect("transition recovery control id should derive");
 
         let barrier = TransitionRecoveryClaimBarrier::install(uploaded.transaction_id);
         let recovery_store = store.clone();
@@ -19493,11 +19699,17 @@ mod tests {
             .expect("recovery should treat the lost CAS as a retained transaction");
         assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 0, 1, 0));
         assert_eq!(
-            load_transition_transaction_record(store, uploaded.transaction_id)
+            load_transition_transaction_record(store.clone(), uploaded.transaction_id)
                 .await
                 .expect("newer transaction revision must remain"),
             active
         );
+        let control = load_recovery_control(store, IlmRecoveryProtocol::TransitionTransaction, &recovery_control_id)
+            .await
+            .expect("lost source CAS should retain a retryable recovery control");
+        assert_eq!(control.control.classification, IlmRecoveryClassification::Retrying);
+        assert_eq!(control.control.consecutive_failure_count, 1);
+        assert_eq!(control.control.last_error_code, IlmRecoveryErrorCode::SourceGenerationChanged);
         assert_eq!(backend.object_count().await, 1, "a stale recovery must not delete the candidate");
         assert_eq!(backend.remove_count().await, 0);
     }
@@ -19799,27 +20011,15 @@ mod tests {
             not_after_unix_nanos: 1_780_000_000_000_000_000,
         })
         .expect("transaction should build");
-        let uploaded_fence = transaction
+        transaction
             .advance(
                 transaction.fence(),
                 TransitionTransactionState::Uploaded,
-                Some(TransitionRemoteVersion::versioned(remote_version)),
+                Some(TransitionRemoteVersion::versioned(remote_version.clone())),
             )
             .expect("transaction should enter uploaded state");
-        transaction
-            .mark_cleanup_pending(
-                uploaded_fence,
-                TransitionCleanupProof {
-                    transaction_id: transaction.transaction_id,
-                    write_id: transaction.write_id,
-                    remote_object: transaction.remote_object.clone(),
-                    remote_version: transaction.remote_version.clone(),
-                    backend_fingerprint: transaction.backend_fingerprint,
-                    decision: TransitionCleanupDecision::UploadAbortedBeforeLocalCommit,
-                },
-            )
-            .expect("transaction should enter cleanup pending state");
         let candidate = bytes::Bytes::from_static(b"cleanup pending candidate retained after failure");
+        backend.set_put_remote_version(Some(remote_version)).await;
         backend
             .put(
                 &transaction.remote_object,
@@ -19831,6 +20031,8 @@ mod tests {
         save_transition_transaction_record(store.clone(), &transaction)
             .await
             .expect("transaction record should persist");
+        let recovery_control_id =
+            transition_recovery_control_id(&transaction).expect("transition recovery control id should derive");
 
         backend.set_remove_failure(true);
         let stats = recover_transition_transaction_records(store.clone(), 100, None)
@@ -19846,6 +20048,42 @@ mod tests {
         assert_eq!(backend.remove_versions().await, Vec::<(String, String)>::new());
         assert_eq!(backend.exact_remove_count(), 1);
         assert_eq!(backend.object_count().await, 1);
+        let control = load_recovery_control(store.clone(), IlmRecoveryProtocol::TransitionTransaction, &recovery_control_id)
+            .await
+            .expect("failed recovery control should persist");
+        assert_eq!(control.control.classification, IlmRecoveryClassification::Retrying);
+        assert_eq!(control.control.attempt_count, 1);
+        assert_eq!(control.control.consecutive_failure_count, 1);
+        assert!(
+            control
+                .control
+                .next_attempt_at_unix_nanos
+                .is_some_and(|next| next > OffsetDateTime::now_utc().unix_timestamp_nanos() as i64)
+        );
+
+        backend.set_remove_failure(false);
+        let replay = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("recovery before the persisted deadline should be skipped");
+        assert_eq!((replay.scanned, replay.recovered, replay.retained, replay.failed), (1, 0, 1, 0));
+        assert_eq!(backend.exact_remove_count(), 1, "persisted backoff must prevent an immediate retry");
+
+        let retry_at = control
+            .control
+            .next_attempt_at_unix_nanos
+            .expect("retry deadline should persist");
+        let retried = recover_transition_transaction_records_at(store.clone(), 100, None, i128::from(retry_at) + 1)
+            .await
+            .expect("recovery at the persisted deadline should retry the advanced source generation");
+        assert_eq!((retried.scanned, retried.recovered, retried.retained, retried.failed), (1, 1, 0, 0));
+        assert_eq!(backend.exact_remove_count(), 2);
+        assert_eq!(backend.object_count().await, 0);
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+        let terminal = load_recovery_control(store, IlmRecoveryProtocol::TransitionTransaction, &recovery_control_id)
+            .await
+            .expect("completed retry control should remain inspectable");
+        assert_eq!(terminal.control.classification, IlmRecoveryClassification::Terminal);
+        assert_eq!(terminal.control.attempt_count, 2);
     }
 
     #[cfg(feature = "test-util")]
@@ -20146,6 +20384,10 @@ mod tests {
         local_commit_started
             .advance(local_commit_started.fence(), TransitionTransactionState::LocalCommitStarted, None)
             .expect("transaction should enter local commit state");
+        let upload_started_control_id =
+            transition_recovery_control_id(&upload_started).expect("upload-started control id should derive");
+        let local_commit_control_id =
+            transition_recovery_control_id(&local_commit_started).expect("local-commit control id should derive");
 
         backend.set_put_remote_version(Some(remote_version)).await;
         for transaction in [&upload_started, &local_commit_started] {
@@ -20176,6 +20418,19 @@ mod tests {
         assert_eq!(backend.object_count().await, 2, "recovery must not delete an unproven remote candidate");
         assert_eq!(backend.remove_count().await, 0);
         assert_eq!(backend.exact_remove_count(), 0);
+        let upload_started_control =
+            load_recovery_control(store.clone(), IlmRecoveryProtocol::TransitionTransaction, &upload_started_control_id)
+                .await
+                .expect("upload-started control should persist");
+        assert_eq!(
+            upload_started_control.control.classification,
+            IlmRecoveryClassification::RetainedAmbiguous
+        );
+        let local_commit_control =
+            load_recovery_control(store, IlmRecoveryProtocol::TransitionTransaction, &local_commit_control_id)
+                .await
+                .expect("local-commit control should persist");
+        assert_eq!(local_commit_control.control.classification, IlmRecoveryClassification::OperatorRequired);
     }
 
     #[cfg(feature = "test-util")]
@@ -20514,7 +20769,7 @@ mod tests {
             .await;
         let unsupported_stats = recover_transition_transaction_records(store.clone(), 100, None)
             .await
-            .expect("unsupported provider recovery should fail closed");
+            .expect("active unknown ownership should remain fenced before provider recovery");
         assert_eq!(
             (
                 unsupported_stats.scanned,
@@ -20523,14 +20778,28 @@ mod tests {
                 unsupported_stats.failed
             ),
             (1, 0, 1, 0),
-            "an unsupported provider probe must retain the unknown upload"
+            "active unknown ownership must retain the upload before the recovery deadline"
         );
         assert_eq!(transition_transaction_record_count(store.clone()).await, 1);
+        let recovery_control_id =
+            transition_recovery_control_id(&transaction).expect("transition recovery control id should derive");
+        assert!(matches!(
+            load_recovery_control(store.clone(), IlmRecoveryProtocol::TransitionTransaction, &recovery_control_id).await,
+            Err(Error::ConfigNotFound)
+        ));
         assert!(
             backend.contains(&transaction.remote_object).await,
-            "unsupported recovery must not delete the candidate"
+            "active ownership must not delete the candidate"
         );
-        assert_eq!(backend.remove_count().await, 0, "unsupported recovery must not attempt cleanup");
+        assert_eq!(backend.remove_count().await, 0, "active ownership must not attempt cleanup");
+        assert!(
+            !backend
+                .op_log()
+                .await
+                .iter()
+                .any(|operation| matches!(operation, MockWarmOp::Probe { .. })),
+            "active ownership must not probe the provider"
+        );
 
         backend.set_transition_candidate_probe_override(None).await;
         let stats =
