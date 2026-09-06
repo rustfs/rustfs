@@ -124,6 +124,16 @@ async fn setup_two_pool_scanner_store() -> (tempfile::TempDir, Arc<ECStore>) {
     (temp_dir, store)
 }
 
+async fn wait_for_namespace_commit_tails(store: &ECStore) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while store.scanner_data_usage_publication_blocked().await {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("namespace commit tails should drain before the scanner fixture runs");
+}
+
 #[tokio::test]
 #[serial]
 async fn checkpoint_fixture_bucket_identity_uses_its_set_instance_owner() {
@@ -334,6 +344,7 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
             .await
             .expect("initial object should persist");
     }
+    wait_for_namespace_commit_tails(store.as_ref()).await;
     let mut baseline = None;
     for (index, (scan_mode, requires_full_scan, explicit_scope)) in [
         (HealScanMode::Normal, true, false),
@@ -352,6 +363,7 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
                 .put_object("cold-bucket", &format!("added-{index}"), &mut reader, &ScannerObjectOptions::default())
                 .await
                 .expect("cold bucket mutation should persist");
+            wait_for_namespace_commit_tails(store.as_ref()).await;
             // Only the hot bucket is in the usage hint. The cold result must
             // come from this cycle's storage walk, not its previous baseline.
             record_dirty_usage_bucket("hot-bucket");

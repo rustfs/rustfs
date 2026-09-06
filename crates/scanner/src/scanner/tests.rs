@@ -266,6 +266,11 @@ async fn running_main_loop_catches_up_pause_cleared_after_startup_observe() {
         }
         let pause_status = store.scanner_data_movement_pause_status().await;
         assert!(pause_status.paused);
+        assert_eq!(
+            scanner_local_publication_defer_reason(store.as_ref()).await,
+            Some(ScannerCycleDeferReason::DataMovement),
+            "an actual data-movement pause must retain durable catch-up tracking"
+        );
         paused_probe.wait().await;
         drop(paused_probe);
 
@@ -1171,6 +1176,9 @@ async fn run_data_scanner_cycle_publishes_activity_for_owner_lifetime() {
 async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledging_usage() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let mut pause_backlog = ScannerPauseBacklogController::claim(store.clone(), scanner_pause_backlog_now())
+        .await
+        .expect("scanner pause backlog should be available");
     let bucket = format!("scanner-coordinator-pending-{}", Uuid::new_v4().simple());
     store
         .make_bucket(&bucket, &crate::storage_api::scan::MakeBucketOptions::default())
@@ -1195,6 +1203,13 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
         .await
         .expect("fixture usage baseline should be readable");
     let pending = ecstore_hold_namespace_commit(store.as_ref());
+    assert_eq!(
+        scanner_local_publication_defer_reason(store.as_ref()).await,
+        Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+        "an ordinary namespace commit must not be classified as data movement"
+    );
+    let pause_backlog_attempt = pause_backlog.begin_attempt(scanner_pause_backlog_now()).await;
+    assert_eq!(pause_backlog_attempt, ScannerPauseBacklogAttemptDecision::Untracked);
     let ctx = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default());
     let mut cycle_info = CurrentCycle {
@@ -1209,7 +1224,15 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
     .await
     .expect("the coordinator must finish its namespace walk while a PUT is pending");
     assert_eq!(budget.progress().0, 1, "the coordinator must reach actual object traversal");
-    assert_eq!(outcome, ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
+    assert_eq!(
+        outcome,
+        ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+    );
+    finish_scanner_pause_backlog_cycle(&mut pause_backlog, &store, pause_backlog_attempt, outcome).await;
+    let pause_backlog_status = scanner_pause_backlog_status(store.clone()).await;
+    assert_eq!(pause_backlog_status.phase, ScannerPauseBacklogPhase::Idle);
+    assert!(!pause_backlog_status.pending_full_scan);
+    assert_eq!(pause_backlog_status.catch_up_attempts, 0);
     assert_eq!(cycle_info.next, 1, "a rejected publication must not advance the cycle");
     assert_eq!(revision, DataUsageCacheRevision::Missing);
     assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
@@ -5826,7 +5849,7 @@ async fn test_usage_save_object_not_found_defers_only_with_a_fresh_route_barrier
                 let probe_calls = route_probe_calls.clone();
                 async move {
                     let call = probe_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    route_blocked && call > 1
+                    (route_blocked && call > 1).then_some(ScannerCycleDeferReason::DataMovement)
                 }
             },
         )
@@ -5872,16 +5895,19 @@ async fn test_usage_save_route_barrier_prevents_missing_snapshot_creation() {
                 data: None,
                 revision: DataUsageCacheRevision::Missing,
             }),
-            || async { true },
+            || async { Some(ScannerCycleDeferReason::ActivityBaselineUnavailable) },
         )
         .await;
 
-        assert_eq!(outcome, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
+        assert_eq!(
+            outcome,
+            DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        );
         assert!(!store.objects.lock().await.contains_key(&target_key));
         assert_eq!(
             store.put_counts.lock().await.get(&target_key),
             None,
-            "the final pool-state fence must run before the first PUT"
+            "the final publication fence must run before the first PUT"
         );
     }
 }
@@ -5902,7 +5928,7 @@ async fn test_observational_usage_defers_when_authoritative_baseline_is_missing(
         receiver,
         None,
         None,
-        || async { false },
+        || async { None },
     )
     .await;
 
@@ -5950,7 +5976,7 @@ async fn test_observational_usage_uses_fenced_backup_when_v2_primary_has_no_iden
         receiver,
         None,
         None,
-        || async { false },
+        || async { None },
     )
     .await;
 
@@ -5991,7 +6017,7 @@ async fn test_observational_usage_uses_bootstrap_pending_primary_as_baseline() {
         receiver,
         None,
         None,
-        || async { false },
+        || async { None },
     )
     .await;
 
@@ -6051,7 +6077,7 @@ async fn test_usage_route_barrier_precedes_durable_reconciliation() {
             data: Some(Bytes::from(snapshot_data)),
             revision: DataUsageCacheRevision::Etag("memory-1".to_string()),
         }),
-        || async { true },
+        || async { Some(ScannerCycleDeferReason::DataMovement) },
     )
     .await;
 
@@ -6091,7 +6117,7 @@ async fn coordinator_does_not_put_after_remote_generation_flip() {
                 // Model the remote lease holder flipping its movement generation
                 // after the activity probe but before the coordinator's PUT.
                 route_store.publication_admission_blocked.store(true, Ordering::Release);
-                false
+                None
             }
         },
     )
@@ -6129,7 +6155,7 @@ async fn coordinator_classifies_an_expired_publication_lease() {
                 revision: DataUsageCacheRevision::Missing,
             }),
             ScannerPublicationFence::new(None, Some(expired), None),
-            || async { false },
+            || async { None },
         )
         .await;
 
@@ -6208,7 +6234,7 @@ async fn test_deferred_usage_save_keeps_last_real_save_metric() {
             data: None,
             revision: DataUsageCacheRevision::Missing,
         }),
-        || async { true },
+        || async { Some(ScannerCycleDeferReason::DataMovement) },
     )
     .await;
 
