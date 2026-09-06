@@ -317,12 +317,21 @@ pub struct IlmRecoveryExportFleetProofToken {
     _permit: FleetCapabilityProofPermit,
 }
 
+/// Effect-window authority for emitting the compact transition-transaction
+/// state sequence. The generation permit prevents a successor proof from
+/// being published until the admitted writer has finished.
+pub(crate) struct TransitionTransactionCompactionFleetProofToken {
+    token: FleetCapabilityProofToken,
+    _permit: FleetCapabilityProofPermit,
+}
+
 static REMOTE_VERSION_STATE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static CROSS_POOL_FENCE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static TIER_DELETE_JOURNAL_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static DECOMMISSION_TARGET_FENCE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static LEGACY_TRANSITION_STATE_RECONCILE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static ILM_RECOVERY_EXPORT_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
+static TRANSITION_TRANSACTION_COMPACTION_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static REMOTE_VERSION_STATE_PROBE_TOPOLOGY: OnceLock<String> = OnceLock::new();
 static ILM_RECOVERY_EXPORT_LOCAL_PROCESS_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
 
@@ -348,6 +357,10 @@ fn legacy_transition_state_reconcile_fleet_proof_slot() -> &'static std::sync::R
 
 fn ilm_recovery_export_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
     ILM_RECOVERY_EXPORT_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
+}
+
+fn transition_transaction_compaction_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
+    TRANSITION_TRANSACTION_COMPACTION_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
 }
 
 fn revoke_fleet_capability_proof_state(state: &mut FleetCapabilityProofState) {
@@ -448,6 +461,33 @@ fn acquire_fleet_capability_proof_from(
 
 pub(crate) fn remote_version_state_fleet_proof_matches(proof: &RemoteVersionStateFleetProofToken) -> bool {
     fleet_capability_proof_matches(remote_version_state_fleet_proof_slot(), &proof.0)
+}
+
+pub(crate) fn acquire_transition_transaction_compaction_fleet_proof() -> Option<TransitionTransactionCompactionFleetProofToken> {
+    let expected_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get()?;
+    let state = transition_transaction_compaction_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let token = acquire_fleet_capability_proof_from(&state, expected_topology, Instant::now())?;
+    let permit = state.proof.as_ref()?.generation.try_acquire()?;
+    Some(TransitionTransactionCompactionFleetProofToken { token, _permit: permit })
+}
+
+pub(crate) fn transition_transaction_compaction_fleet_proof_matches(
+    proof: &TransitionTransactionCompactionFleetProofToken,
+) -> bool {
+    let Some(expected_topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else {
+        return false;
+    };
+    let state = transition_transaction_compaction_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    proof._permit.generation.is_accepting()
+        && fleet_capability_proof_matches_at(&state, &proof.token, expected_topology, Instant::now())
+        && state
+            .proof
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.generation, &proof._permit.generation))
 }
 
 pub fn acquire_cross_pool_fence_fleet_proof() -> Option<CrossPoolFenceFleetProofToken> {
@@ -1072,6 +1112,35 @@ pub(crate) fn install_remote_version_state_fleet_proof_for_test(topology_fingerp
     RemoteVersionStateFleetProofGuard
 }
 
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) struct TransitionTransactionCompactionFleetProofGuard;
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for TransitionTransactionCompactionFleetProofGuard {
+    fn drop(&mut self) {
+        revoke_fleet_capability_proof(transition_transaction_compaction_fleet_proof_slot());
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) fn install_transition_transaction_compaction_fleet_proof_for_test(
+    topology_fingerprint: &str,
+) -> TransitionTransactionCompactionFleetProofGuard {
+    let _ = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.set(topology_fingerprint.to_string());
+    let effective_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY
+        .get()
+        .expect("transition transaction compaction test topology should be initialized");
+    if let Some(err) = publish_fleet_capability_probe_result(
+        transition_transaction_compaction_fleet_proof_slot(),
+        effective_topology,
+        Ok(BTreeMap::new()),
+        Instant::now(),
+    ) {
+        panic!("test proof installation must not fail: {err}");
+    }
+    TransitionTransactionCompactionFleetProofGuard
+}
+
 fn insert_remote_version_state_peer(peer_epochs: &mut BTreeMap<String, Uuid>, peer: String, epoch: Uuid) -> Result<()> {
     if epoch.is_nil() || peer_epochs.values().any(|existing| *existing == epoch) || peer_epochs.insert(peer, epoch).is_some() {
         return Err(Error::other("remote version state capability peer identity is invalid"));
@@ -1089,6 +1158,7 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 decommission_target_fence_fleet_proof_slot(),
                 legacy_transition_state_reconcile_fleet_proof_slot(),
                 ilm_recovery_export_fleet_proof_slot(),
+                transition_transaction_compaction_fleet_proof_slot(),
             ] {
                 mark_fleet_capability_topology_conflict(slot);
             }
@@ -1132,8 +1202,25 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                     None => Err(Error::other("ILM recovery export fleet capability notification system is unavailable")),
                 }
             };
-            let (result, fence_probe, recovery_export_result) =
-                tokio::join!(remote_version_state_probe, cross_pool_fence_probe, recovery_export_probe);
+            let transition_transaction_compaction_probe = async {
+                match notification_sys.as_ref() {
+                    Some(notification_sys) => timeout(
+                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                        notification_sys.probe_transition_transaction_compaction_fleet(&topology_fingerprint),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(Error::other("transition transaction compaction fleet capability probe timed out"))),
+                    None => Err(Error::other(
+                        "transition transaction compaction fleet capability notification system is unavailable",
+                    )),
+                }
+            };
+            let (result, fence_probe, recovery_export_result, transition_transaction_compaction_result) = tokio::join!(
+                remote_version_state_probe,
+                cross_pool_fence_probe,
+                recovery_export_probe,
+                transition_transaction_compaction_probe
+            );
             let (fence_result, journal_result, decommission_target_fence_result, reconcile_result) = match fence_probe {
                 Ok((peer_epochs, minimum_version)) => cross_pool_fence_policy_results(peer_epochs, minimum_version),
                 Err(err) => {
@@ -1157,6 +1244,7 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 revoke_fleet_capability_proof(decommission_target_fence_fleet_proof_slot());
                 revoke_fleet_capability_proof(legacy_transition_state_reconcile_fleet_proof_slot());
                 revoke_fleet_capability_proof(ilm_recovery_export_fleet_proof_slot());
+                revoke_fleet_capability_proof(transition_transaction_compaction_fleet_proof_slot());
             } else if let Some(err) = publish_fleet_capability_probe_result(
                 remote_version_state_fleet_proof_slot(),
                 &topology_fingerprint,
@@ -1196,6 +1284,24 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_NOTIFICATION,
                     capability = "ilm_recovery_export_v1",
+                    state = "failed_closed",
+                    error = %err,
+                    "notification capability probe"
+                );
+            }
+            if !topology_conflict
+                && let Some(err) = publish_fleet_capability_probe_result(
+                    transition_transaction_compaction_fleet_proof_slot(),
+                    &topology_fingerprint,
+                    transition_transaction_compaction_result,
+                    Instant::now(),
+                )
+            {
+                debug!(
+                    event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    capability = "transition_transaction_compaction_v1",
                     state = "failed_closed",
                     error = %err,
                     "notification capability probe"
@@ -1314,6 +1420,28 @@ impl NotificationSys {
                 .as_ref()
                 .ok_or_else(|| Error::other("remote version state capability peer is unreachable"))?;
             client.probe_remote_version_state(topology_fingerprint.to_string()).await
+        });
+        let mut peer_epochs = BTreeMap::new();
+        for result in join_all(probes).await {
+            let (peer, epoch) = result?;
+            insert_remote_version_state_peer(&mut peer_epochs, peer, epoch)?;
+        }
+        Ok(peer_epochs)
+    }
+
+    async fn probe_transition_transaction_compaction_fleet(&self, topology_fingerprint: &str) -> Result<BTreeMap<String, Uuid>> {
+        if self.peer_clients.len() != self.peer_topology_hosts.len() {
+            return Err(Error::other(
+                "transition transaction compaction capability fleet membership is incomplete",
+            ));
+        }
+        let probes = self.peer_clients.iter().map(|client| async {
+            let client = client
+                .as_ref()
+                .ok_or_else(|| Error::other("transition transaction compaction capability peer is unreachable"))?;
+            client
+                .probe_transition_transaction_compaction(topology_fingerprint.to_string())
+                .await
         });
         let mut peer_epochs = BTreeMap::new();
         for result in join_all(probes).await {

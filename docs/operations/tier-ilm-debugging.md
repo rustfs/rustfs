@@ -142,6 +142,8 @@ Inspect the aggregate counters before widening scope. Full object-key lists are 
 
 Historical transition transactions in `upload_outcome_unknown` state can use an explicit two-stage operator workflow when the tier probe is ambiguous and the provider supports exact version deletion. The endpoint refuses transactions that are still inside their ownership window or are in any other state.
 
+Current fleets can produce two valid v1 state profiles. The legacy profile begins at `upload_started@1` and normally reaches `upload_outcome_unknown@2`, `uploaded`, `local_commit_started`, and `committed`. The compact profile is admitted only while every current member proves `transition_transaction_compaction_v1`; it begins at `upload_outcome_unknown@1` and moves directly to `local_commit_started@2` with a known remote version. Treat `upload_outcome_unknown@1` as a pre-PUT fence, not proof that PUT ran. Treat `local_commit_started@2` as an exact commit fence: if the matching `xl.meta` tuple is complete, recovery removes only the record; otherwise it retains the owner evidence. Do not rewrite either state by hand. An unavailable or older peer automatically makes new transitions use the legacy profile.
+
 1. Inspect the transaction without changing it:
 
    ```text

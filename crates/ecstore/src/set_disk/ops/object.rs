@@ -5666,6 +5666,10 @@ impl Drop for TransitionUploadCleanup {
         if !self.armed {
             return;
         }
+        #[cfg(all(test, feature = "test-util"))]
+        if transition_transaction_kill_point_is_active(self.cleanup_transaction.as_ref()) {
+            return;
+        }
         let Some(candidate) = self.candidate.as_ref() else {
             return;
         };
@@ -5870,17 +5874,29 @@ fn transition_source_identity(
 }
 
 async fn save_transition_transaction_if_available(api: Option<&Arc<ECStore>>, transaction: &TransitionTransaction) -> Result<()> {
-    if let Some(api) = api {
-        return save_transition_transaction_record(api.clone(), transaction).await;
-    }
     #[cfg(test)]
-    {
-        Ok(())
-    }
-    #[cfg(not(test))]
-    {
-        Err(Error::other("transition transaction store is unavailable"))
-    }
+    let started = std::time::Instant::now();
+    let result = if let Some(api) = api {
+        save_transition_transaction_record(api.clone(), transaction).await
+    } else {
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+        #[cfg(not(test))]
+        {
+            Err(Error::other("transition transaction store is unavailable"))
+        }
+    };
+    #[cfg(test)]
+    record_transition_transaction_mutation(
+        transaction,
+        TransitionTransactionMutationKind::Create,
+        None,
+        started.elapsed(),
+        result.is_ok(),
+    );
+    result
 }
 
 async fn compare_and_save_transition_transaction_if_available(
@@ -5888,19 +5904,31 @@ async fn compare_and_save_transition_transaction_if_available(
     expected: &TransitionTransaction,
     next: &TransitionTransaction,
 ) -> Result<()> {
-    if let Some(api) = api {
+    #[cfg(test)]
+    let started = std::time::Instant::now();
+    let result = if let Some(api) = api {
         // The transition worker already has a deep poll chain. Keep the CAS
         // read/write/receipt future off Tokio's default worker stack.
-        return Box::pin(save_transition_transaction_record_if_current(api.clone(), expected, next)).await;
-    }
+        Box::pin(save_transition_transaction_record_if_current(api.clone(), expected, next)).await
+    } else {
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+        #[cfg(not(test))]
+        {
+            Err(Error::other("transition transaction store is unavailable"))
+        }
+    };
     #[cfg(test)]
-    {
-        Ok(())
-    }
-    #[cfg(not(test))]
-    {
-        Err(Error::other("transition transaction store is unavailable"))
-    }
+    record_transition_transaction_mutation(
+        next,
+        TransitionTransactionMutationKind::CompareAndSave,
+        Some(expected.state),
+        started.elapsed(),
+        result.is_ok(),
+    );
+    result
 }
 
 async fn advance_and_save_transition_transaction(
@@ -5909,8 +5937,6 @@ async fn advance_and_save_transition_transaction(
     next: TransitionTransactionState,
     remote_version: Option<TransitionRemoteVersion>,
 ) -> Result<()> {
-    #[cfg(test)]
-    record_transition_uploaded_save_attempt(transaction, next);
     let expected = transaction.clone();
     let mut advanced = expected.clone();
     advanced
@@ -5922,10 +5948,33 @@ async fn advance_and_save_transition_transaction(
 }
 
 #[cfg(test)]
-struct TransitionUploadedSaveProbeState {
+struct TransitionTransactionMutationProbeState {
     bucket: String,
     object: String,
-    attempts: std::sync::atomic::AtomicUsize,
+    observations: std::sync::Mutex<Vec<TransitionTransactionMutationObservation>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransitionTransactionMutationKind {
+    Create,
+    CompareAndSave,
+    Delete,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "full mutation measurements are consumed by tests behind `--features test-util`"
+)]
+pub(crate) struct TransitionTransactionMutationObservation {
+    pub(crate) kind: TransitionTransactionMutationKind,
+    pub(crate) previous_state: Option<TransitionTransactionState>,
+    pub(crate) state: TransitionTransactionState,
+    pub(crate) encoded_bytes: usize,
+    pub(crate) elapsed: std::time::Duration,
+    pub(crate) succeeded: bool,
 }
 
 #[cfg(test)]
@@ -5933,31 +5982,35 @@ struct TransitionUploadedSaveProbeState {
     dead_code,
     reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
 )]
-struct TransitionUploadedSaveProbe {
-    state: Arc<TransitionUploadedSaveProbeState>,
+pub(crate) struct TransitionTransactionMutationProbe {
+    state: Arc<TransitionTransactionMutationProbeState>,
 }
 
 #[cfg(test)]
-static TRANSITION_UPLOADED_SAVE_PROBE: std::sync::OnceLock<std::sync::Mutex<Option<Arc<TransitionUploadedSaveProbeState>>>> =
-    std::sync::OnceLock::new();
+static TRANSITION_TRANSACTION_MUTATION_PROBE: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<TransitionTransactionMutationProbeState>>>,
+> = std::sync::OnceLock::new();
 
 #[cfg(test)]
-impl TransitionUploadedSaveProbe {
+impl TransitionTransactionMutationProbe {
     #[allow(
         dead_code,
         reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
     )]
-    fn install(bucket: &str, object: &str) -> Self {
-        let state = Arc::new(TransitionUploadedSaveProbeState {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(TransitionTransactionMutationProbeState {
             bucket: bucket.to_string(),
             object: object.to_string(),
-            attempts: std::sync::atomic::AtomicUsize::new(0),
+            observations: std::sync::Mutex::new(Vec::new()),
         });
-        let mut slot = TRANSITION_UPLOADED_SAVE_PROBE
+        let mut slot = TRANSITION_TRANSACTION_MUTATION_PROBE
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
-            .expect("transition uploaded-save probe mutex should not poison");
-        assert!(slot.is_none(), "transition uploaded-save probe must be installed by one test at a time");
+            .expect("transition transaction mutation probe mutex should not poison");
+        assert!(
+            slot.is_none(),
+            "transition transaction mutation probe must be installed by one test at a time"
+        );
         *slot = Some(Arc::clone(&state));
         drop(slot);
         Self { state }
@@ -5968,17 +6021,31 @@ impl TransitionUploadedSaveProbe {
         reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
     )]
     fn attempts(&self) -> usize {
-        self.state.attempts.load(std::sync::atomic::Ordering::Acquire)
+        self.observations()
+            .into_iter()
+            .filter(|observation| {
+                observation.kind == TransitionTransactionMutationKind::CompareAndSave
+                    && observation.state == TransitionTransactionState::Uploaded
+            })
+            .count()
+    }
+
+    pub(crate) fn observations(&self) -> Vec<TransitionTransactionMutationObservation> {
+        self.state
+            .observations
+            .lock()
+            .expect("transition transaction mutation observations mutex should not poison")
+            .clone()
     }
 }
 
 #[cfg(test)]
-impl Drop for TransitionUploadedSaveProbe {
+impl Drop for TransitionTransactionMutationProbe {
     fn drop(&mut self) {
-        let mut slot = TRANSITION_UPLOADED_SAVE_PROBE
+        let mut slot = TRANSITION_TRANSACTION_MUTATION_PROBE
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
-            .expect("transition uploaded-save probe mutex should not poison");
+            .expect("transition transaction mutation probe mutex should not poison");
         if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
             *slot = None;
         }
@@ -5986,19 +6053,34 @@ impl Drop for TransitionUploadedSaveProbe {
 }
 
 #[cfg(test)]
-fn record_transition_uploaded_save_attempt(transaction: &TransitionTransaction, next: TransitionTransactionState) {
-    if next != TransitionTransactionState::Uploaded {
-        return;
-    }
-    let state = TRANSITION_UPLOADED_SAVE_PROBE
+fn record_transition_transaction_mutation(
+    transaction: &TransitionTransaction,
+    kind: TransitionTransactionMutationKind,
+    previous_state: Option<TransitionTransactionState>,
+    elapsed: std::time::Duration,
+    succeeded: bool,
+) {
+    let state = TRANSITION_TRANSACTION_MUTATION_PROBE
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
-        .expect("transition uploaded-save probe mutex should not poison")
+        .expect("transition transaction mutation probe mutex should not poison")
         .as_ref()
         .filter(|state| state.bucket == transaction.source.bucket && state.object == transaction.source.object)
         .cloned();
     if let Some(state) = state {
-        state.attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let encoded_bytes = transaction.encode().map_or(0, |encoded| encoded.len());
+        state
+            .observations
+            .lock()
+            .expect("transition transaction mutation observations mutex should not poison")
+            .push(TransitionTransactionMutationObservation {
+                kind,
+                previous_state,
+                state: transaction.state,
+                encoded_bytes,
+                elapsed,
+                succeeded,
+            });
     }
 }
 
@@ -6006,12 +6088,24 @@ async fn delete_transition_transaction_if_available(
     api: Option<&Arc<ECStore>>,
     transaction: &TransitionTransaction,
 ) -> Result<()> {
-    if let Some(api) = api {
+    #[cfg(test)]
+    let started = std::time::Instant::now();
+    let result = if let Some(api) = api {
         // Conditional delete now includes a read and terminal receipt; box it
         // for the same transition-worker stack bound as the CAS path above.
-        return Box::pin(delete_transition_transaction_record(api.clone(), transaction)).await;
-    }
-    Ok(())
+        Box::pin(delete_transition_transaction_record(api.clone(), transaction)).await
+    } else {
+        Ok(())
+    };
+    #[cfg(test)]
+    record_transition_transaction_mutation(
+        transaction,
+        TransitionTransactionMutationKind::Delete,
+        Some(transaction.state),
+        started.elapsed(),
+        result.is_ok(),
+    );
+    result
 }
 
 async fn delete_transition_transaction_after_remote_cleanup(
@@ -6237,6 +6331,103 @@ async fn pause_after_transition_uploaded_persisted(bucket: &str, object: &str) {
         barrier.arrived.notify_one();
         barrier.release.notified().await;
     }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransitionTransactionKillPoint {
+    AfterPrePutFence,
+    AfterUploadBeforeCommitFence,
+    AfterCommitFenceBeforeLocalCommit,
+    AfterLocalCommitBeforeDelete,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+struct TransitionTransactionKillPointBarrierState {
+    bucket: String,
+    object: String,
+    point: TransitionTransactionKillPoint,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) struct TransitionTransactionKillPointBarrier {
+    state: Arc<TransitionTransactionKillPointBarrierState>,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+static TRANSITION_TRANSACTION_KILL_POINT_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<TransitionTransactionKillPointBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, feature = "test-util"))]
+impl TransitionTransactionKillPointBarrier {
+    pub(crate) fn install(bucket: &str, object: &str, point: TransitionTransactionKillPoint) -> Self {
+        let state = Arc::new(TransitionTransactionKillPointBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            point,
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = TRANSITION_TRANSACTION_KILL_POINT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition transaction kill-point barrier mutex should not poison");
+        assert!(slot.is_none(), "one transition transaction kill-point may be installed at a time");
+        *slot = Some(Arc::clone(&state));
+        drop(slot);
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("transition should reach the requested transaction kill-point");
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for TransitionTransactionKillPointBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = TRANSITION_TRANSACTION_KILL_POINT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition transaction kill-point barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+async fn pause_transition_transaction_at(bucket: &str, object: &str, point: TransitionTransactionKillPoint) {
+    let barrier = TRANSITION_TRANSACTION_KILL_POINT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("transition transaction kill-point barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.point == point)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+fn transition_transaction_kill_point_is_active(transaction: Option<&TransitionTransaction>) -> bool {
+    let Some(transaction) = transaction else {
+        return false;
+    };
+    TRANSITION_TRANSACTION_KILL_POINT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("transition transaction kill-point barrier mutex should not poison")
+        .as_ref()
+        .is_some_and(|barrier| barrier.bucket == transaction.source.bucket && barrier.object == transaction.source.object)
 }
 
 #[cfg(test)]
@@ -8987,7 +9178,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
         let transaction_api = transition_object_store(&self.ctx).await;
-        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+        let transition_compaction_fleet_proof =
+            crate::services::notification_sys::acquire_transition_transaction_compaction_fleet_proof();
+        let compact_transition_transaction = transition_compaction_fleet_proof
+            .as_ref()
+            .is_some_and(crate::services::notification_sys::transition_transaction_compaction_fleet_proof_matches);
+        let transaction_init = TransitionTransactionInit {
             deployment_id: transition_deployment_id(&self.ctx)?,
             transaction_id: Uuid::new_v4(),
             owner_epoch: Uuid::new_v4(),
@@ -8996,9 +9192,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             tier_name: opts.transition.tier.clone(),
             backend_fingerprint: tgt_client.backend_identity(),
             not_after_unix_nanos: transition_transaction_not_after_unix_nanos()?,
-        })
+        };
+        let mut transaction = if compact_transition_transaction {
+            TransitionTransaction::new_compact(transaction_init)
+        } else {
+            TransitionTransaction::new(transaction_init)
+        }
         .map_err(Error::other)?;
         save_transition_transaction_if_available(transaction_api.as_ref(), &transaction).await?;
+        #[cfg(all(test, feature = "test-util"))]
+        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::AfterPrePutFence).await;
         let transaction_id = transaction.transaction_id;
         let dest_obj = transaction.remote_object.clone();
         let mut transition_meta = (*oi.user_defined).clone();
@@ -9075,14 +9278,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj);
         upload_cleanup.set_cleanup_owner(transaction_api.clone(), &transaction);
-        advance_and_save_transition_transaction(
-            transaction_api.as_ref(),
-            &mut transaction,
-            TransitionTransactionState::UploadOutcomeUnknown,
-            None,
-        )
-        .await?;
-        upload_cleanup.update_cleanup_transaction(&transaction);
+        if !compact_transition_transaction {
+            advance_and_save_transition_transaction(
+                transaction_api.as_ref(),
+                &mut transaction,
+                TransitionTransactionState::UploadOutcomeUnknown,
+                None,
+            )
+            .await?;
+            upload_cleanup.update_cleanup_transaction(&transaction);
+        }
         let remote_upload = {
             let lease = &upload_cleanup.lease;
             let recorded_candidate = &mut upload_cleanup.candidate;
@@ -9142,27 +9347,31 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     return Err(err.into());
                 }
             };
-        if let Err(err) = advance_and_save_transition_transaction(
-            transaction_api.as_ref(),
-            &mut transaction,
-            TransitionTransactionState::Uploaded,
-            Some(TransitionRemoteVersion::known_from_put_response(candidate.remote_version().to_string())),
-        )
-        .await
-        {
-            let cleanup_api = transition_cleanup_store(&self.ctx).await;
-            if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api, &mut transaction).await {
-                return Err(StorageError::Io(std::io::Error::other(format!(
-                    "{err}; uploaded transition transaction persist failed and cleanup failed: {cleanup_err}"
-                ))));
+        if !compact_transition_transaction {
+            if let Err(err) = advance_and_save_transition_transaction(
+                transaction_api.as_ref(),
+                &mut transaction,
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::known_from_put_response(candidate.remote_version().to_string())),
+            )
+            .await
+            {
+                let cleanup_api = transition_cleanup_store(&self.ctx).await;
+                if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api, &mut transaction).await {
+                    return Err(StorageError::Io(std::io::Error::other(format!(
+                        "{err}; uploaded transition transaction persist failed and cleanup failed: {cleanup_err}"
+                    ))));
+                }
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object).await;
+                return Err(err);
             }
-            delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object).await;
-            return Err(err);
+            upload_cleanup.update_cleanup_transaction(&transaction);
         }
-        upload_cleanup.update_cleanup_transaction(&transaction);
 
         #[cfg(all(test, feature = "test-util"))]
         pause_after_transition_uploaded_persisted(bucket, object).await;
+        #[cfg(all(test, feature = "test-util"))]
+        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::AfterUploadBeforeCommitFence).await;
 
         let commit_opts = opts.as_commit_opts();
         // Note: Using clone() here is necessary because ObjectOptions has 124 fields.
@@ -9273,11 +9482,25 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
             return Err(Error::other("remote version state fleet capability changed during transition"));
         }
+        if compact_transition_transaction
+            && !transition_compaction_fleet_proof
+                .as_ref()
+                .is_some_and(crate::services::notification_sys::transition_transaction_compaction_fleet_proof_matches)
+        {
+            drop(transition_lock_guard);
+            if upload_cleanup.cleanup().await.is_ok() {
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object).await;
+            }
+            return Err(Error::other(
+                "transition transaction compaction fleet capability changed during transition",
+            ));
+        }
         if let Err(err) = advance_and_save_transition_transaction(
             transaction_api.as_ref(),
             &mut transaction,
             TransitionTransactionState::LocalCommitStarted,
-            None,
+            compact_transition_transaction
+                .then(|| TransitionRemoteVersion::known_from_put_response(candidate.remote_version().to_string())),
         )
         .await
         {
@@ -9287,6 +9510,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
             return Err(err);
         }
+        upload_cleanup.update_cleanup_transaction(&transaction);
+        #[cfg(all(test, feature = "test-util"))]
+        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::AfterCommitFenceBeforeLocalCommit).await;
         upload_cleanup.disarm();
         if let Err(err) = self.delete_object_version(bucket, object, &fi, false).await {
             warn!(
@@ -9299,33 +9525,47 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             drop(transition_lock_guard);
             return Err(err);
         }
-        match advance_and_save_transition_transaction(
-            transaction_api.as_ref(),
-            &mut transaction,
-            TransitionTransactionState::Committed,
-            None,
-        )
-        .await
-        {
-            Ok(()) => {
-                if let Err(err) = delete_transition_transaction_if_available(transaction_api.as_ref(), &transaction).await {
-                    warn!(
-                        bucket = bucket,
-                        object = object,
-                        transaction_id = %transaction_id,
-                        error = ?err,
-                        "transition committed locally but transaction cleanup failed"
-                    );
-                }
-            }
-            Err(err) => {
+        #[cfg(all(test, feature = "test-util"))]
+        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::AfterLocalCommitBeforeDelete).await;
+        if compact_transition_transaction {
+            if let Err(err) = delete_transition_transaction_if_available(transaction_api.as_ref(), &transaction).await {
                 warn!(
                     bucket = bucket,
                     object = object,
                     transaction_id = %transaction_id,
                     error = ?err,
-                    "transition committed locally but transaction committed-state advance failed"
+                    "transition committed locally but compact transaction cleanup failed"
                 );
+            }
+        } else {
+            match advance_and_save_transition_transaction(
+                transaction_api.as_ref(),
+                &mut transaction,
+                TransitionTransactionState::Committed,
+                None,
+            )
+            .await
+            {
+                Ok(()) => {
+                    if let Err(err) = delete_transition_transaction_if_available(transaction_api.as_ref(), &transaction).await {
+                        warn!(
+                            bucket = bucket,
+                            object = object,
+                            transaction_id = %transaction_id,
+                            error = ?err,
+                            "transition committed locally but transaction cleanup failed"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        bucket = bucket,
+                        object = object,
+                        transaction_id = %transaction_id,
+                        error = ?err,
+                        "transition committed locally but transaction committed-state advance failed"
+                    );
+                }
             }
         }
 
@@ -14929,6 +15169,7 @@ mod transition_upload_integrity_tests {
     use super::*;
     use crate::bucket::lifecycle::lifecycle::{TRANSITION_PENDING, TransitionOptions};
     use crate::layout::endpoints::SetupType;
+    use crate::services::notification_sys::install_transition_transaction_compaction_fleet_proof_for_test;
     use crate::services::tier::test_util::register_mock_tier;
     use crate::set_disk::replication::RestoreFinalizeBarrier;
     use http::HeaderMap;
@@ -16195,6 +16436,7 @@ mod transition_upload_integrity_tests {
         let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        let _compaction_proof = install_transition_transaction_compaction_fleet_proof_for_test("object-transaction-fencing-test");
         let barrier = TransitionCommitBarrier::install(bucket, object);
 
         let transition_set = Arc::clone(&set_disks);
@@ -16397,7 +16639,7 @@ mod transition_upload_integrity_tests {
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
         backend.set_put_remote_version(Some(String::new())).await;
-        let save_probe = TransitionUploadedSaveProbe::install(bucket, object);
+        let save_probe = TransitionTransactionMutationProbe::install(bucket, object);
 
         set_disks
             .transition_object(bucket, object, &transition_options(&original, tier_name))
@@ -16461,7 +16703,7 @@ mod transition_upload_integrity_tests {
         let remote_version = Uuid::nil().to_string();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
         backend.set_put_remote_version(Some(remote_version.clone())).await;
-        let save_probe = TransitionUploadedSaveProbe::install(bucket, object);
+        let save_probe = TransitionTransactionMutationProbe::install(bucket, object);
 
         set_disks
             .transition_object(bucket, object, &transition_options(&original, tier_name))

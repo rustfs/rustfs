@@ -191,6 +191,7 @@ fn encode_heal_capability_response(
     topology_member: &str,
     remote_version_state_probe: bool,
     recovery_export_probe: bool,
+    transition_transaction_compaction_probe: bool,
 ) -> Result<Vec<u8>, Status> {
     if recovery_export_probe {
         rustfs_protos::encode_remote_version_state_capability(
@@ -198,7 +199,7 @@ fn encode_heal_capability_response(
             crate::storage::storage_api::ilm_recovery_export_local_process_epoch().as_bytes(),
         )
         .map_err(|_| Status::internal("ILM recovery export capability length cannot be represented"))
-    } else if remote_version_state_probe {
+    } else if remote_version_state_probe || transition_transaction_compaction_probe {
         rustfs_protos::encode_remote_version_state_capability(topology_member, NODE_CAPABILITY_SERVER_EPOCH.as_bytes())
             .map_err(|_| Status::internal("remote version state capability length cannot be represented"))
     } else {
@@ -1028,7 +1029,13 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
         let remote_version_state_probe = rustfs_protos::is_remote_version_state_capability_probe(&request.get_ref().command);
         let cross_pool_fence_probe = rustfs_protos::is_cross_pool_fence_capability_probe(&request.get_ref().command);
         let recovery_export_probe = rustfs_protos::is_ilm_recovery_export_capability_probe(&request.get_ref().command);
-        if remote_version_state_probe || cross_pool_fence_probe || recovery_export_probe {
+        let transition_transaction_compaction_probe =
+            rustfs_protos::is_transition_transaction_compaction_capability_probe(&request.get_ref().command);
+        if remote_version_state_probe
+            || cross_pool_fence_probe
+            || recovery_export_probe
+            || transition_transaction_compaction_probe
+        {
             let topology_member = self
                 .endpoint_pools()
                 .await
@@ -1038,7 +1045,12 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
             if topology_member.is_empty() {
                 return Err(Status::failed_precondition("local topology member identity is unavailable"));
             }
-            let result = encode_heal_capability_response(&topology_member, remote_version_state_probe, recovery_export_probe)?;
+            let result = encode_heal_capability_response(
+                &topology_member,
+                remote_version_state_probe,
+                recovery_export_probe,
+                transition_transaction_compaction_probe,
+            )?;
             let canonical_response = rustfs_protos::canonical_heal_control_response_body(
                 request.get_ref().version,
                 &request.get_ref().topology_fingerprint,
@@ -4055,9 +4067,50 @@ mod tests {
             .expect_err("proof from one challenge must not be reusable");
     }
 
+    #[tokio::test]
+    async fn transition_transaction_compaction_probe_authenticates_the_current_topology() {
+        let _ = rustfs_credentials::set_global_rpc_secret("transition-compaction-node-service-test-secret".to_string());
+        let endpoints = heal_control_test_endpoints_with_coordinator("node-d", true);
+        let fingerprint = heal_topology_fingerprint(&endpoints).expect("test topology should hash");
+        let (service, source) = super::make_heal_control_server_for_source();
+        *source.write().await = Some(endpoints);
+        let probe_command = rustfs_protos::transition_transaction_compaction_capability_probe(&[9; 16]);
+        let mut request = Request::new(HealControlRequest {
+            version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            topology_fingerprint: fingerprint.clone(),
+            command: Bytes::from(probe_command.clone()),
+        });
+        let body = rustfs_protos::canonical_heal_control_request_body(
+            request.get_ref().version,
+            &request.get_ref().topology_fingerprint,
+            &request.get_ref().command,
+        )
+        .expect("probe should encode");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut request);
+        let response = service
+            .heal_control(request)
+            .await
+            .expect("matching topology should admit transition compaction")
+            .into_inner();
+        let (member, epoch) = rustfs_protos::decode_remote_version_state_capability(&response.result)
+            .expect("transition compaction capability should decode");
+        assert_eq!(member, "node-a:9000");
+        assert!(!Uuid::from_slice(epoch).expect("capability epoch should be a UUID").is_nil());
+        let canonical_response = rustfs_protos::canonical_heal_control_response_body(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            &fingerprint,
+            &probe_command,
+            &response.result,
+        )
+        .expect("response should encode");
+        crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical_response, &response.response_proof)
+            .expect("outer proof should bind the compaction challenge");
+    }
+
     #[test]
     fn ilm_recovery_export_probe_uses_the_shared_local_process_epoch() {
-        let result = super::encode_heal_capability_response("node-a:9000", false, true)
+        let result = super::encode_heal_capability_response("node-a:9000", false, true, false)
             .expect("ILM recovery export capability should encode");
         let (member, epoch) =
             rustfs_protos::decode_remote_version_state_capability(&result).expect("ILM recovery export capability should decode");
@@ -4066,6 +4119,19 @@ mod tests {
             Uuid::from_slice(epoch).expect("capability epoch should be a UUID"),
             crate::storage::storage_api::ilm_recovery_export_local_process_epoch(),
         );
+    }
+
+    #[test]
+    fn transition_transaction_compaction_probe_uses_the_node_capability_epoch() {
+        let remote_version = super::encode_heal_capability_response("node-a:9000", true, false, false)
+            .expect("remote version capability should encode");
+        let compaction = super::encode_heal_capability_response("node-a:9000", false, false, true)
+            .expect("transition transaction compaction capability should encode");
+        let remote_version = rustfs_protos::decode_remote_version_state_capability(&remote_version)
+            .expect("remote version capability should decode");
+        let compaction = rustfs_protos::decode_remote_version_state_capability(&compaction)
+            .expect("transition transaction compaction capability should decode");
+        assert_eq!(compaction, remote_version);
     }
 
     #[tokio::test]

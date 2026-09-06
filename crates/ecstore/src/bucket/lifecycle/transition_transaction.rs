@@ -273,6 +273,14 @@ pub struct TransitionTransactionInit {
 
 impl TransitionTransaction {
     pub fn new(init: TransitionTransactionInit) -> Result<Self> {
+        Self::new_with_initial_state(init, TransitionTransactionState::UploadStarted)
+    }
+
+    pub(crate) fn new_compact(init: TransitionTransactionInit) -> Result<Self> {
+        Self::new_with_initial_state(init, TransitionTransactionState::UploadOutcomeUnknown)
+    }
+
+    fn new_with_initial_state(init: TransitionTransactionInit, state: TransitionTransactionState) -> Result<Self> {
         let remote_object =
             canonical_transition_remote_object(init.deployment_id, &init.source.bucket, init.transaction_id, init.write_id)?;
         let transaction = Self {
@@ -286,7 +294,7 @@ impl TransitionTransaction {
             backend_fingerprint: init.backend_fingerprint,
             remote_object,
             remote_version: TransitionRemoteVersion::unknown(),
-            state: TransitionTransactionState::UploadStarted,
+            state,
             not_after_unix_nanos: init.not_after_unix_nanos,
         };
         transaction.validate()?;
@@ -356,7 +364,7 @@ impl TransitionTransaction {
         remote_version: Option<TransitionRemoteVersion>,
     ) -> Result<TransitionTransactionFence> {
         self.check_fence(fence)?;
-        if !state_change_allowed(self.state, next) {
+        if !state_change_allowed_at(self.state, next, self.revision) {
             return Err(TransitionTransactionError::InvalidStateChange {
                 from: self.state,
                 to: next,
@@ -387,6 +395,14 @@ impl TransitionTransaction {
                     ));
                 }
                 self.remote_version = TransitionRemoteVersion::unknown();
+            }
+            TransitionTransactionState::LocalCommitStarted if self.state == TransitionTransactionState::UploadOutcomeUnknown => {
+                let remote_version =
+                    remote_version.ok_or(TransitionTransactionError::Corrupt("compact local commit requires remote version"))?;
+                if remote_version.is_unknown() {
+                    return Err(TransitionTransactionError::Corrupt("compact local commit requires known remote version"));
+                }
+                self.remote_version = remote_version;
             }
             TransitionTransactionState::LocalCommitStarted | TransitionTransactionState::Committed => {
                 if let Some(remote_version) = remote_version
@@ -640,7 +656,7 @@ pub(crate) async fn save_transition_transaction_record_if_current(
 ) -> EcstoreResult<()> {
     let object = transition_transaction_record_object_name(next.transaction_id).map_err(transition_transaction_store_error)?;
     let revision_is_next = expected.revision.checked_add(1) == Some(next.revision);
-    let state_is_next = state_change_allowed(expected.state, next.state)
+    let state_is_next = state_change_allowed_at(expected.state, next.state, expected.revision)
         || matches!(
             (expected.state, next.state),
             (
@@ -1954,7 +1970,7 @@ where
     }
 }
 
-fn state_change_allowed(from: TransitionTransactionState, to: TransitionTransactionState) -> bool {
+fn state_change_allowed_at(from: TransitionTransactionState, to: TransitionTransactionState, revision: u64) -> bool {
     matches!(
         (from, to),
         (TransitionTransactionState::UploadStarted, TransitionTransactionState::Uploaded)
@@ -1966,7 +1982,9 @@ fn state_change_allowed(from: TransitionTransactionState, to: TransitionTransact
             | (TransitionTransactionState::UploadOutcomeUnknown, TransitionTransactionState::Uploaded)
             | (TransitionTransactionState::Uploaded, TransitionTransactionState::LocalCommitStarted)
             | (TransitionTransactionState::LocalCommitStarted, TransitionTransactionState::Committed)
-    )
+    ) || (revision == 1
+        && from == TransitionTransactionState::UploadOutcomeUnknown
+        && to == TransitionTransactionState::LocalCommitStarted)
 }
 
 fn state_requires_known_remote_version(state: TransitionTransactionState) -> bool {
@@ -2382,6 +2400,57 @@ mod tests {
             .expect("commit should succeed");
         assert_eq!(committed_fence.revision, 4);
         assert_eq!(transaction.state, TransitionTransactionState::Committed);
+    }
+
+    #[test]
+    fn compact_state_sequence_is_distinguishable_and_keeps_legacy_edges_strict() {
+        let init = TransitionTransactionInit {
+            deployment_id: Uuid::new_v4(),
+            transaction_id: Uuid::new_v4(),
+            owner_epoch: Uuid::new_v4(),
+            write_id: Uuid::new_v4(),
+            source: source_identity(TransitionSourceVersionMode::Versioned),
+            tier_name: "warm-tier".to_string(),
+            backend_fingerprint: BACKEND_FINGERPRINT,
+            not_after_unix_nanos: 1_780_000_000_000_000_000,
+        };
+        let mut compact = TransitionTransaction::new_compact(init).expect("compact transaction should be created");
+        assert_eq!(compact.state, TransitionTransactionState::UploadOutcomeUnknown);
+        assert_eq!(compact.revision, 1);
+        let remote_version = TransitionRemoteVersion::versioned(Uuid::new_v4().to_string());
+        let fence = compact
+            .advance(
+                compact.fence(),
+                TransitionTransactionState::LocalCommitStarted,
+                Some(remote_version.clone()),
+            )
+            .expect("compact upload should persist its exact candidate at the local commit fence");
+        assert_eq!(fence.revision, 2);
+        assert_eq!(compact.remote_version, remote_version);
+        assert_eq!(compact.state, TransitionTransactionState::LocalCommitStarted);
+        let encoded = compact
+            .encode()
+            .expect("compact transaction should encode as v1-compatible bytes");
+        assert_eq!(
+            TransitionTransaction::decode(compact.transaction_id, &encoded).expect("compact transaction should decode"),
+            compact
+        );
+
+        let mut legacy_unknown = new_transaction();
+        legacy_unknown
+            .advance(legacy_unknown.fence(), TransitionTransactionState::UploadOutcomeUnknown, None)
+            .expect("legacy transaction should persist its pre-upload fence");
+        assert!(matches!(
+            legacy_unknown.advance(
+                legacy_unknown.fence(),
+                TransitionTransactionState::LocalCommitStarted,
+                Some(TransitionRemoteVersion::unversioned()),
+            ),
+            Err(TransitionTransactionError::InvalidStateChange {
+                from: TransitionTransactionState::UploadOutcomeUnknown,
+                to: TransitionTransactionState::LocalCommitStarted,
+            })
+        ));
     }
 
     #[test]

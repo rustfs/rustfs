@@ -499,9 +499,7 @@ impl DurableIlmRecordCheckpoint {
                 },
             ) => {
                 previous_identity == next_identity
-                    && transition_state_distance(*previous_state, *next_state)
-                        .and_then(|distance| previous_revision.checked_add(distance))
-                        .is_some_and(|expected_revision| *next_revision == expected_revision)
+                    && transition_state_revision_is_successor(*previous_state, *previous_revision, *next_state, *next_revision)
                     && (!previous_remote_version_known || previous_remote_version == next_remote_version)
             }
             (
@@ -1028,6 +1026,22 @@ fn transition_state_distance(
         (LocalCommitStarted, Committed | CleanupPending) => Some(1),
         _ => None,
     }
+}
+
+fn transition_state_revision_is_successor(
+    from: transition_transaction::TransitionTransactionState,
+    from_revision: u64,
+    to: transition_transaction::TransitionTransactionState,
+    to_revision: u64,
+) -> bool {
+    use transition_transaction::TransitionTransactionState::{LocalCommitStarted, UploadOutcomeUnknown};
+
+    if from == UploadOutcomeUnknown && from_revision == 1 && to == LocalCommitStarted {
+        return to_revision == 2;
+    }
+    transition_state_distance(from, to)
+        .and_then(|distance| from_revision.checked_add(distance))
+        .is_some_and(|expected_revision| to_revision == expected_revision)
 }
 
 fn tier_probe_state_reaches(
@@ -2171,6 +2185,64 @@ mod tests {
             rebound.encode().is_err(),
             "dormant v1 must reject owner takeover before producing a checkpoint"
         );
+    }
+
+    #[test]
+    fn transition_checkpoint_accepts_only_the_distinguishable_compact_edge() {
+        let identity_sha256 = "a".repeat(64);
+        let unknown_remote_sha256 = "b".repeat(64);
+        let known_remote_sha256 = "c".repeat(64);
+        let checkpoint = |revision, state, remote_version_sha256: String, remote_version_known| {
+            DurableIlmRecordCheckpoint::TransitionTransaction {
+                content_sha256: format!("{revision:064x}"),
+                identity_sha256: identity_sha256.clone(),
+                remote_version_sha256,
+                remote_version_known,
+                revision,
+                state,
+            }
+        };
+        let compact_unknown = checkpoint(
+            1,
+            transition_transaction::TransitionTransactionState::UploadOutcomeUnknown,
+            unknown_remote_sha256.clone(),
+            false,
+        );
+        let compact_local_commit = checkpoint(
+            2,
+            transition_transaction::TransitionTransactionState::LocalCommitStarted,
+            known_remote_sha256.clone(),
+            true,
+        );
+        compact_unknown
+            .validate_successor(&compact_local_commit)
+            .expect("compact pre-upload fence should advance directly to the exact local-commit fence");
+
+        let legacy_unknown = checkpoint(
+            2,
+            transition_transaction::TransitionTransactionState::UploadOutcomeUnknown,
+            unknown_remote_sha256,
+            false,
+        );
+        let invalid_legacy_skip = checkpoint(
+            3,
+            transition_transaction::TransitionTransactionState::LocalCommitStarted,
+            known_remote_sha256.clone(),
+            true,
+        );
+        assert!(
+            legacy_unknown.validate_successor(&invalid_legacy_skip).is_err(),
+            "legacy UploadOutcomeUnknown@2 must not masquerade as the compact edge"
+        );
+        let valid_legacy_skip = checkpoint(
+            4,
+            transition_transaction::TransitionTransactionState::LocalCommitStarted,
+            known_remote_sha256,
+            true,
+        );
+        legacy_unknown
+            .validate_successor(&valid_legacy_skip)
+            .expect("legacy receipts may still observe the existing two-edge state advance");
     }
 
     #[test]

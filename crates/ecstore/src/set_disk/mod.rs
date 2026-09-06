@@ -883,6 +883,17 @@ pub(crate) use ops::object::body_cache_plaintext_len;
 pub(crate) use ops::object::cleanup_rejected_transition_upload_durably;
 #[cfg(any(test, feature = "test-util"))]
 pub use ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) use ops::object::{
+    TransitionTransactionKillPoint as SetDiskTransitionTransactionKillPoint,
+    TransitionTransactionKillPointBarrier as SetDiskTransitionTransactionKillPointBarrier,
+};
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) use ops::object::{
+    TransitionTransactionMutationKind as SetDiskTransitionTransactionMutationKind,
+    TransitionTransactionMutationObservation as SetDiskTransitionTransactionMutationObservation,
+    TransitionTransactionMutationProbe as SetDiskTransitionTransactionMutationProbe,
+};
 mod read;
 mod replication;
 pub(crate) mod shard_source;

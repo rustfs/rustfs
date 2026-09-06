@@ -870,7 +870,11 @@ mod tests {
         data_movement::SourceCleanupDeleteBarrier,
         disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE},
         runtime::{global::set_object_store_resolver, sources as runtime_sources},
-        services::notification_sys::acquire_tier_delete_journal_fleet_proof,
+        services::notification_sys::{
+            acquire_tier_delete_journal_fleet_proof, acquire_transition_transaction_compaction_fleet_proof,
+            install_transition_transaction_compaction_fleet_proof_for_test,
+            transition_transaction_compaction_fleet_proof_matches,
+        },
         services::tier::{
             test_util::{MockWarmBackend, MockWarmOp, TransitionCleanupStoreBarrier, register_mock_tier},
             tier::{
@@ -892,7 +896,14 @@ mod tests {
             },
             warm_backend::{TransitionCandidateProbe, WarmBackend},
         },
-        set_disk::SetDiskTransitionUploadedCommitBarrier as TransitionUploadedCommitBarrier,
+        set_disk::{
+            SetDiskTransitionTransactionKillPoint as TransitionTransactionKillPoint,
+            SetDiskTransitionTransactionKillPointBarrier as TransitionTransactionKillPointBarrier,
+            SetDiskTransitionTransactionMutationKind as TransitionTransactionMutationKind,
+            SetDiskTransitionTransactionMutationObservation as TransitionTransactionMutationObservation,
+            SetDiskTransitionTransactionMutationProbe as TransitionTransactionMutationProbe,
+            SetDiskTransitionUploadedCommitBarrier as TransitionUploadedCommitBarrier,
+        },
         storage_api_contracts::list::ListOperations as _,
     };
     #[cfg(feature = "test-util")]
@@ -11580,6 +11591,36 @@ mod tests {
     }
 
     #[cfg(feature = "test-util")]
+    async fn only_transition_transaction(store: Arc<crate::store::ECStore>) -> TransitionTransaction {
+        let records = store
+            .clone()
+            .list_objects_v2(
+                RUSTFS_META_BUCKET,
+                TRANSITION_TRANSACTION_RECORD_PREFIX,
+                None,
+                None,
+                100,
+                false,
+                None,
+                false,
+            )
+            .await
+            .expect("transition transaction records should be listable")
+            .objects;
+        assert_eq!(records.len(), 1, "test fixture should have exactly one transition transaction");
+        let transaction_id = records[0]
+            .name
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|name| uuid::Uuid::parse_str(name).ok())
+            .expect("transition transaction path should end in its UUID");
+        load_transition_transaction_record(store, transaction_id)
+            .await
+            .expect("transition transaction should load")
+    }
+
+    #[cfg(feature = "test-util")]
     async fn register_transition_reconcile_test_tier(
         handle: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
         tier_name: &str,
@@ -19284,6 +19325,330 @@ mod tests {
     }
 
     #[cfg(feature = "test-util")]
+    fn transition_mutation_measurement(observations: &[TransitionTransactionMutationObservation]) -> (usize, usize, u128) {
+        (
+            observations.len(),
+            observations.iter().map(|observation| observation.encoded_bytes).sum(),
+            observations.iter().map(|observation| observation.elapsed.as_micros()).sum(),
+        )
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn compact_transition_transactions_halve_success_path_quorum_mutations() {
+        let temp_dir = tempfile::tempdir().expect("create transition mutation measurement dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-mutation-measurement", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "MUTATION-MEASURE";
+        register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "transition-mutation-measurement";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("measurement bucket should be created");
+
+        let run_case = |profile: &'static str, size: usize| {
+            let store = store.clone();
+            async move {
+                let object = format!("{profile}-{size}.bin");
+                let mut reader = PutObjReader::from_vec(vec![b'm'; size]);
+                let original = store
+                    .put_object(bucket, &object, &mut reader, &ObjectOptions::default())
+                    .await
+                    .expect("measurement source should be written");
+                let probe = TransitionTransactionMutationProbe::install(bucket, &object);
+                store
+                    .transition_object(
+                        bucket,
+                        &object,
+                        &ObjectOptions {
+                            transition: TransitionOptions {
+                                status: TRANSITION_PENDING.to_string(),
+                                tier: tier_name.to_string(),
+                                etag: original.etag.clone().expect("measurement source should have an ETag"),
+                                ..Default::default()
+                            },
+                            version_id: original.version_id.map(|version| version.to_string()),
+                            mod_time: original.mod_time,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("measurement transition should commit");
+                probe.observations()
+            }
+        };
+
+        let sizes = [4 * 1024, 1024 * 1024];
+        let mut legacy = Vec::with_capacity(sizes.len());
+        for size in sizes {
+            legacy.push((size, run_case("legacy", size).await));
+        }
+
+        let compaction_proof = install_transition_transaction_compaction_fleet_proof_for_test("object-transaction-fencing-test");
+        for ((size, legacy_observations), compact_size) in legacy.into_iter().zip(sizes) {
+            assert_eq!(size, compact_size);
+            let compact_observations = run_case("compact", size).await;
+            let legacy_measurement = transition_mutation_measurement(&legacy_observations);
+            let compact_measurement = transition_mutation_measurement(&compact_observations);
+            assert_eq!(legacy_measurement.0, 6, "legacy success should use five saves and one delete");
+            assert_eq!(compact_measurement.0, 3, "compact success should use two saves and one delete");
+            assert!(
+                compact_measurement.1 < legacy_measurement.1,
+                "compact transaction bodies should write fewer aggregate bytes"
+            );
+            assert_eq!(
+                legacy_observations
+                    .iter()
+                    .map(|observation| (observation.kind, observation.previous_state, observation.state))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (TransitionTransactionMutationKind::Create, None, TransitionTransactionState::UploadStarted),
+                    (
+                        TransitionTransactionMutationKind::CompareAndSave,
+                        Some(TransitionTransactionState::UploadStarted),
+                        TransitionTransactionState::UploadOutcomeUnknown,
+                    ),
+                    (
+                        TransitionTransactionMutationKind::CompareAndSave,
+                        Some(TransitionTransactionState::UploadOutcomeUnknown),
+                        TransitionTransactionState::Uploaded,
+                    ),
+                    (
+                        TransitionTransactionMutationKind::CompareAndSave,
+                        Some(TransitionTransactionState::Uploaded),
+                        TransitionTransactionState::LocalCommitStarted,
+                    ),
+                    (
+                        TransitionTransactionMutationKind::CompareAndSave,
+                        Some(TransitionTransactionState::LocalCommitStarted),
+                        TransitionTransactionState::Committed,
+                    ),
+                    (
+                        TransitionTransactionMutationKind::Delete,
+                        Some(TransitionTransactionState::Committed),
+                        TransitionTransactionState::Committed,
+                    ),
+                ]
+            );
+            assert_eq!(
+                compact_observations
+                    .iter()
+                    .map(|observation| (observation.kind, observation.previous_state, observation.state))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (
+                        TransitionTransactionMutationKind::Create,
+                        None,
+                        TransitionTransactionState::UploadOutcomeUnknown,
+                    ),
+                    (
+                        TransitionTransactionMutationKind::CompareAndSave,
+                        Some(TransitionTransactionState::UploadOutcomeUnknown),
+                        TransitionTransactionState::LocalCommitStarted,
+                    ),
+                    (
+                        TransitionTransactionMutationKind::Delete,
+                        Some(TransitionTransactionState::LocalCommitStarted),
+                        TransitionTransactionState::LocalCommitStarted,
+                    ),
+                ]
+            );
+            assert!(legacy_observations.iter().all(|observation| observation.succeeded));
+            assert!(compact_observations.iter().all(|observation| observation.succeeded));
+            println!(
+                "transition_mutation_measurement,profile=legacy,size={size},mutations={},encoded_bytes={},latency_us={},quorum_operations={}",
+                legacy_measurement.0, legacy_measurement.1, legacy_measurement.2, legacy_measurement.0
+            );
+            println!(
+                "transition_mutation_measurement,profile=compact,size={size},mutations={},encoded_bytes={},latency_us={},quorum_operations={}",
+                compact_measurement.0, compact_measurement.1, compact_measurement.2, compact_measurement.0
+            );
+        }
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+        let admitted = acquire_transition_transaction_compaction_fleet_proof()
+            .expect("published homogeneous proof should admit one compact writer");
+        assert!(transition_transaction_compaction_fleet_proof_matches(&admitted));
+        drop(compaction_proof);
+        assert!(
+            !transition_transaction_compaction_fleet_proof_matches(&admitted),
+            "revocation must fence a writer admitted by the previous process-epoch snapshot"
+        );
+        drop(admitted);
+        assert!(
+            acquire_transition_transaction_compaction_fleet_proof().is_none(),
+            "revoking the homogeneous proof must restore the legacy writer profile"
+        );
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn compact_transition_kill_points_preserve_the_only_remote_owner() {
+        let temp_dir = tempfile::tempdir().expect("create compact transition kill-point dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "compact-transition-kill-points", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "COMPACT-KILL";
+        let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let _tier_lease = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("mock tier lease should remain available during recovery");
+        let bucket = "compact-transition-kill-points";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("kill-point bucket should be created");
+        let _compaction_proof = install_transition_transaction_compaction_fleet_proof_for_test("object-transaction-fencing-test");
+
+        for (index, point, expected_state, expected_revision, expected_committed, expected_recovered) in [
+            (
+                0,
+                TransitionTransactionKillPoint::AfterPrePutFence,
+                TransitionTransactionState::UploadOutcomeUnknown,
+                1,
+                false,
+                true,
+            ),
+            (
+                1,
+                TransitionTransactionKillPoint::AfterUploadBeforeCommitFence,
+                TransitionTransactionState::UploadOutcomeUnknown,
+                1,
+                false,
+                true,
+            ),
+            (
+                2,
+                TransitionTransactionKillPoint::AfterLocalCommitBeforeDelete,
+                TransitionTransactionState::LocalCommitStarted,
+                2,
+                true,
+                true,
+            ),
+            (
+                3,
+                TransitionTransactionKillPoint::AfterCommitFenceBeforeLocalCommit,
+                TransitionTransactionState::LocalCommitStarted,
+                2,
+                false,
+                false,
+            ),
+        ] {
+            let object = format!("kill-point-{index}.bin");
+            let payload = vec![b'k' + u8::try_from(index).expect("small case index should fit u8"); 64 * 1024];
+            let mut reader = PutObjReader::from_vec(payload.clone());
+            let source = store
+                .put_object(bucket, &object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("kill-point source should be written");
+            let remote_before = backend.object_count().await;
+            let barrier = TransitionTransactionKillPointBarrier::install(bucket, &object, point);
+            let transition_store = store.clone();
+            let transition_object = object.clone();
+            let transition = tokio::spawn(async move {
+                transition_store
+                    .transition_object(
+                        bucket,
+                        &transition_object,
+                        &ObjectOptions {
+                            transition: TransitionOptions {
+                                status: TRANSITION_PENDING.to_string(),
+                                tier: tier_name.to_string(),
+                                etag: source.etag.clone().expect("kill-point source should have an ETag"),
+                                ..Default::default()
+                            },
+                            version_id: source.version_id.map(|version| version.to_string()),
+                            mod_time: source.mod_time,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            barrier.wait_until_paused().await;
+            transition.abort();
+            assert!(
+                transition
+                    .await
+                    .expect_err("kill-point transition should be cancelled")
+                    .is_cancelled(),
+                "kill-point transition should stop without unwinding"
+            );
+            drop(barrier);
+
+            let transaction = only_transition_transaction(store.clone()).await;
+            assert_eq!((transaction.state, transaction.revision), (expected_state, expected_revision));
+            let paused_source = store
+                .get_object_info(
+                    bucket,
+                    &object,
+                    &ObjectOptions {
+                        metadata_cache_safe: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("kill-point source metadata should remain readable");
+            assert_eq!(
+                paused_source.transitioned_object.status == rustfs_filemeta::TRANSITION_COMPLETE,
+                expected_committed
+            );
+            let expected_remote_at_pause = remote_before + usize::from(point != TransitionTransactionKillPoint::AfterPrePutFence);
+            assert_eq!(backend.object_count().await, expected_remote_at_pause);
+
+            let stats = recover_transition_transaction_records_at(
+                store.clone(),
+                100,
+                None,
+                i128::from(transaction.not_after_unix_nanos) + 1,
+            )
+            .await
+            .expect("kill-point transaction recovery should complete");
+            if expected_recovered {
+                assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
+                assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+            } else {
+                assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 0, 1, 0));
+                assert_eq!(
+                    transition_transaction_record_count(store.clone()).await,
+                    1,
+                    "an uncommitted local-commit fence must retain its exact remote owner"
+                );
+            }
+            let expected_remote_after_recovery = if matches!(
+                point,
+                TransitionTransactionKillPoint::AfterLocalCommitBeforeDelete
+                    | TransitionTransactionKillPoint::AfterCommitFenceBeforeLocalCommit
+            ) {
+                remote_before + 1
+            } else {
+                remote_before
+            };
+            assert_eq!(backend.object_count().await, expected_remote_after_recovery);
+            assert_eq!(backend.remove_count().await, usize::from(index >= 1));
+
+            let mut restored = Vec::new();
+            store
+                .get_object_reader(bucket, &object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("kill-point source should remain readable through its authoritative location")
+                .stream
+                .read_to_end(&mut restored)
+                .await
+                .expect("kill-point source body should drain");
+            assert_eq!(restored, payload);
+
+            if !expected_recovered {
+                break;
+            }
+        }
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn cancelled_transition_cleanup_recovers_from_its_own_instance_transaction() {
@@ -20867,6 +21232,7 @@ mod tests {
 
         let tier_name = "TXRESPONSELOSS";
         let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let _compaction_proof = install_transition_transaction_compaction_fleet_proof_for_test("object-transaction-fencing-test");
         let bucket = "transition-response-loss-bucket";
         let object = "source.bin";
         store
@@ -20935,6 +21301,7 @@ mod tests {
             TransitionTransactionState::UploadOutcomeUnknown,
             "a response-lost PUT must not remain in UploadStarted"
         );
+        assert_eq!(transaction.revision, 1, "compact response loss must retain the pre-PUT fence generation");
         assert!(
             backend.contains(&transaction.remote_object).await,
             "the test backend must retain the remote candidate"
