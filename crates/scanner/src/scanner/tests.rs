@@ -27,6 +27,7 @@ use crate::{
 use serial_test::serial;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::Poll;
 use temp_env::{with_var, with_var_unset};
@@ -55,11 +56,17 @@ async fn setup_scanner_cycle_store_with_pool_count(
 ) -> (tempfile::TempDir, Arc<ECStore>) {
     init_ecstore_config_for_scanner_tests();
     let temp_dir = tempfile::tempdir().expect("scanner cycle test directory should be created");
+    let store = setup_scanner_cycle_store_at_path(temp_dir.path(), seed_usage_baseline, pool_count).await;
+    (temp_dir, store)
+}
+
+async fn setup_scanner_cycle_store_at_path(root: &Path, seed_usage_baseline: bool, pool_count: usize) -> Arc<ECStore> {
+    init_ecstore_config_for_scanner_tests();
     let mut pools = Vec::with_capacity(pool_count);
     for pool_index in 0..pool_count {
         let mut endpoints = Vec::new();
         for disk_index in 0..4 {
-            let disk_path = temp_dir.path().join(format!("pool{pool_index}/disk{disk_index}"));
+            let disk_path = root.join(format!("pool{pool_index}/disk{disk_index}"));
             tokio::fs::create_dir_all(&disk_path)
                 .await
                 .expect("scanner cycle test disk should be created");
@@ -109,7 +116,7 @@ async fn setup_scanner_cycle_store_with_pool_count(
         .expect("scanner cycle usage baseline should persist");
     }
 
-    (temp_dir, store)
+    store
 }
 
 async fn restart_scanner_cycle_store_from(store: &Arc<ECStore>) -> Arc<ECStore> {
