@@ -5548,6 +5548,12 @@ fn canonical_legacy_tier_delete_journal_identity(object_name: &str) -> Option<&s
     .then_some(identity)
 }
 
+pub(crate) fn validate_legacy_tier_delete_recovery_path(object_name: &str) -> Result<()> {
+    canonical_legacy_tier_delete_journal_identity(object_name)
+        .map(|_| ())
+        .ok_or_else(|| Error::other("legacy tier delete journal path is not canonical"))
+}
+
 fn legacy_tier_delete_recovery_descriptor(entry: &Jentry) -> Option<(&'static str, &'static str)> {
     match entry.persisted_version {
         1 => Some((TIER_DELETE_JOURNAL_V1_RECOVERY_SCHEMA, TIER_DELETE_JOURNAL_V1_RECOVERY_CLASS)),
@@ -5557,9 +5563,7 @@ fn legacy_tier_delete_recovery_descriptor(entry: &Jentry) -> Option<(&'static st
 }
 
 pub(crate) fn validate_legacy_tier_delete_recovery_source(object_name: &str, source_schema: &str, data: &[u8]) -> Result<()> {
-    if canonical_legacy_tier_delete_journal_identity(object_name).is_none() {
-        return Err(Error::other("legacy tier delete journal path is not canonical"));
-    }
+    validate_legacy_tier_delete_recovery_path(object_name)?;
     let persisted: PersistedTierDeleteJournalEntry =
         serde_json::from_slice(data).map_err(|err| Error::other(format!("decode tier delete journal failed: {err}")))?;
     persisted.validate_legacy_recovery_shape()?;

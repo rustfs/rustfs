@@ -141,7 +141,7 @@ impl IlmRecoveryExport {
         {
             return Err(Error::other("ILM recovery export source bytes do not match the observed generation"));
         }
-        if export_id(&self.control_id, &self.source_generation)? != self.export_id {
+        if recovery_export_id(&self.control_id, &self.source_generation)? != self.export_id {
             return Err(Error::other("ILM recovery export ID does not match its source generation"));
         }
         Ok(())
@@ -289,7 +289,7 @@ pub async fn create_recovery_export(
         return Err(Error::PreconditionFailed);
     }
     let current_source_base64 = base64_simd::STANDARD.encode_to_string(current_source_bytes);
-    let candidate_export_id = export_id(&current.control_id, &current.source_generation)?;
+    let candidate_export_id = recovery_export_id(&current.control_id, &current.source_generation)?;
     let object = recovery_export_record_object_name(current.protocol, &candidate_export_id)?;
     match load_recovery_export_decoded(api.clone(), &candidate_export_id).await {
         Ok((existing, export)) if export_matches_observation(&export, observation) => {
@@ -552,7 +552,7 @@ fn build_export_from_source(
         .checked_add(EXPORT_RETENTION_NANOS)
         .ok_or_else(|| Error::other("ILM recovery export retention timestamp overflow"))?;
     let export = IlmRecoveryExport {
-        export_id: export_id(&observation.control_id, &observation.source_generation)?,
+        export_id: recovery_export_id(&observation.control_id, &observation.source_generation)?,
         control_id: observation.control_id.clone(),
         protocol: observation.protocol,
         control_etag: observation.control_etag.clone(),
@@ -571,7 +571,7 @@ fn build_export_from_source(
     Ok(export)
 }
 
-fn export_id(control_id: &str, generation: &IlmRecoverySourceGeneration) -> Result<String> {
+pub(crate) fn recovery_export_id(control_id: &str, generation: &IlmRecoverySourceGeneration) -> Result<String> {
     validate_sha256(control_id, "ILM recovery export control ID is invalid")?;
     validate_sha256(&generation.content_sha256, "ILM recovery export source checksum is invalid")?;
     validate_sha256(&generation.copy_set_sha256, "ILM recovery export copy-set checksum is invalid")?;
@@ -760,7 +760,10 @@ mod tests {
             &base64_simd::STANDARD.encode_to_string(legacy_source()),
         )
         .expect("export should be valid");
-        assert_eq!(export.export_id, export_id(&observed.control_id, &observed.source_generation).unwrap());
+        assert_eq!(
+            export.export_id,
+            recovery_export_id(&observed.control_id, &observed.source_generation).unwrap()
+        );
         let encoded = export.encode().expect("export should encode");
         assert_eq!(encoded, PINNED_V1_EXPORT, "v1 export wire format must remain pinned");
         assert_eq!(IlmRecoveryExport::decode(&export.export_id, &encoded).unwrap(), export);
