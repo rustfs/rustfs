@@ -368,23 +368,23 @@ impl Drop for SlowReplicationTargetGuard {
 // Mirrors madmin-go `ResyncTargetsInfo`/`ResyncTarget` json tags — the same
 // shape `mc replicate resync status` decodes.
 #[derive(Debug, Clone, serde::Deserialize)]
-struct ReplicationResetStatusResponse {
+pub(crate) struct ReplicationResetStatusResponse {
     #[serde(rename = "target", default)]
-    targets: Vec<ReplicationResetStatusTarget>,
+    pub(crate) targets: Vec<ReplicationResetStatusTarget>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-struct ReplicationResetStatusTarget {
+pub(crate) struct ReplicationResetStatusTarget {
     #[serde(rename = "arn", default)]
-    arn: String,
+    pub(crate) arn: String,
     #[serde(rename = "resetid", default)]
-    reset_id: String,
+    pub(crate) reset_id: String,
     #[serde(rename = "resyncStatus", default)]
-    status: String,
+    pub(crate) status: String,
     #[serde(rename = "replicationCount", default)]
-    replicated_count: i64,
+    pub(crate) replicated_count: i64,
     #[serde(rename = "object", default)]
-    object: String,
+    pub(crate) object: String,
 }
 
 fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
@@ -2294,7 +2294,7 @@ async fn site_replication_state_edit(
 /// return the target `(arn, reset_id)`, asserting the response carries the
 /// madmin `ResyncTargetsInfo` shape (`target[0].arn` / `target[0].resetid`)
 /// that `mc replicate resync start` decodes.
-async fn start_bucket_replication_reset(
+pub(crate) async fn start_bucket_replication_reset(
     env: &RustFSTestEnvironment,
     bucket: &str,
 ) -> Result<(String, String), Box<dyn Error + Send + Sync>> {
@@ -2314,7 +2314,7 @@ async fn start_bucket_replication_reset(
     Ok((arn, reset_id))
 }
 
-async fn get_replication_reset_status(
+pub(crate) async fn get_replication_reset_status(
     env: &RustFSTestEnvironment,
     bucket: &str,
     arn: &str,

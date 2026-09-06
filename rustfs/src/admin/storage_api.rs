@@ -211,6 +211,7 @@ pub(crate) mod bucket_target_sys {
     pub(crate) type RemoveObjectOptions = super::ecstore_bucket::bucket_target_sys::RemoveObjectOptions;
     pub(crate) type S3ClientError = super::ecstore_bucket::bucket_target_sys::S3ClientError;
     pub(crate) type SsecPassthroughCapability = super::ecstore_bucket::bucket_target_sys::SsecPassthroughCapability;
+    pub(crate) type VersionIdentityCapability = super::ecstore_bucket::bucket_target_sys::VersionIdentityCapability;
     pub(crate) type TargetClient = super::ecstore_bucket::bucket_target_sys::TargetClient;
 }
 
