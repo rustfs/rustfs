@@ -62,6 +62,29 @@ fn emit_fatal_stderr(context: &str, error: impl std::fmt::Display) {
 }
 
 async fn async_main() -> Result<()> {
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Ok(nonce) = std::env::var("RUSTFS_E2E_STARTUP_CAS_PROBE") {
+        let nonce = uuid::Uuid::parse_str(&nonce).map_err(Error::other)?;
+        // This precedes CLI parsing and observability, including `--help`.
+        println!(
+            "RUSTFS_E2E_STARTUP_CAS {}",
+            serde_json::json!({
+                "kind": "capability", "schema": "fresh-startup-cas/v1", "nonce": nonce,
+            })
+        );
+        return Ok(());
+    }
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Ok(nonce) = std::env::var("RUSTFS_E2E_STARTUP_CAS_NONCE") {
+        let nonce = uuid::Uuid::parse_str(&nonce).map_err(Error::other)?;
+        let line = format!(
+            "RUSTFS_E2E_STARTUP_CAS {}\n",
+            serde_json::json!({
+                "kind": "observer-ready", "nonce": nonce, "pid": std::process::id(),
+            })
+        );
+        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
+    }
     hotpath::tokio_runtime!();
 
     // Log container resource detection early in startup
@@ -159,6 +182,33 @@ async fn run(config: Config) -> Result<()> {
         store,
         shutdown_token: ctx,
     } = init_startup_storage_runtime(server_addr, &endpoint_pools, readiness.clone(), instance_ctx).await?;
+
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Ok(nonce) = std::env::var("RUSTFS_E2E_STARTUP_CAS_NONCE") {
+        let nonce = uuid::Uuid::parse_str(&nonce).map_err(Error::other)?;
+        let release = std::path::PathBuf::from(
+            std::env::var_os("RUSTFS_E2E_STARTUP_CAS_RELEASE")
+                .ok_or_else(|| Error::other("startup CAS fixture requires a release path"))?,
+        );
+        if server_ctx.installed_object_store().is_some() {
+            return Err(Error::other("startup CAS gate reached an installed slot"));
+        }
+        let line = format!(
+            "RUSTFS_E2E_STARTUP_CAS {}\n",
+            serde_json::json!({
+                "kind": "gate", "nonce": nonce, "pid": std::process::id(), "slot_installed": false,
+            })
+        );
+        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
+        tokio::time::timeout(std::time::Duration::from_secs(180), async {
+            while !tokio::fs::try_exists(&release).await? {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            Ok::<_, Error>(())
+        })
+        .await
+        .map_err(|_| Error::other("startup CAS gate release timed out"))??;
+    }
 
     let capacity_tasks = crate::capacity::capacity_integration::init_capacity_management_managed().await;
 

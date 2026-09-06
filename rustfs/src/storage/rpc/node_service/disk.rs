@@ -39,6 +39,29 @@ use tonic::{Request, Response, Status};
 use tracing::debug;
 use uuid::Uuid;
 
+#[cfg(feature = "e2e-test-hooks")]
+fn startup_cas_rename_observation(
+    target: &LocalMutationTarget,
+    request: &RenameDataRequest,
+    file_info: &FileInfo,
+) -> Option<serde_json::Value> {
+    use sha2::{Digest, Sha256};
+    if request.dst_volume != ".rustfs.sys" || !matches!(request.dst_path.as_str(), "pool.bin" | "pool.bin.identity") {
+        return None;
+    }
+    let nonce = uuid::Uuid::parse_str(&std::env::var("RUSTFS_E2E_STARTUP_CAS_NONCE").ok()?).ok()?;
+    let body = rustfs_protos::canonical_rename_data_request_body(request).ok()?;
+    Some(serde_json::json!({
+        "kind": "receiver", "nonce": nonce, "pid": std::process::id(),
+        "target": match target { LocalMutationTarget::Ready(_) => "ready", LocalMutationTarget::Bootstrap(_) => "bootstrap", LocalMutationTarget::Unbound => "unbound" },
+        "disk": request.disk, "src_volume": request.src_volume, "src_path": request.src_path,
+        "dst_volume": request.dst_volume, "dst_path": request.dst_path,
+        "body_sha256": format!("{:x}", Sha256::digest(body)),
+        "etag": file_info.metadata.get("etag"),
+        "mod_time": file_info.mod_time.map(|time| time.unix_timestamp_nanos().to_string()),
+    }))
+}
+
 impl LocalMutationTarget {
     async fn rename_local_data(
         &self,
@@ -1275,7 +1298,9 @@ impl NodeService {
             Some(token)
         };
         let request_decoded_from_msgpack = decoded_file_info.from_msgpack;
-        match target
+        #[cfg(feature = "e2e-test-hooks")]
+        let observation = startup_cas_rename_observation(&target, &request, &decoded_file_info.value);
+        let result = target
             .rename_local_data(
                 &request.disk,
                 (&request.src_volume, &request.src_path),
@@ -1283,8 +1308,15 @@ impl NodeService {
                 (&request.dst_volume, &request.dst_path),
                 scanner_publication_lease_token,
             )
-            .await
-        {
+            .await;
+        #[cfg(feature = "e2e-test-hooks")]
+        if let Some(mut observation) = observation {
+            observation["ok"] = serde_json::json!(result.is_ok());
+            observation["error"] = serde_json::json!(result.as_ref().err().map(ToString::to_string));
+            let line = format!("RUSTFS_E2E_STARTUP_CAS {observation}\n");
+            let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
+        }
+        match result {
             Ok(rename_data_resp) => match encode_rename_data_response_payloads(&rename_data_resp, request_decoded_from_msgpack) {
                 Ok((rename_data_resp, rename_data_resp_bin)) => Ok(Response::new(RenameDataResponse {
                     success: true,

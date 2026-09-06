@@ -5480,6 +5480,21 @@ fn pool_meta_cas_preconditions(token: &PoolMetaCasToken, object: &str) -> Result
     }
 }
 
+// Direct JSON diagnostics are independent of the startup tracing subscriber.
+#[cfg(feature = "e2e-test-hooks")]
+fn startup_cas_test_observe(mut observation: serde_json::Value) {
+    let Some(nonce) = std::env::var("RUSTFS_E2E_STARTUP_CAS_NONCE")
+        .ok()
+        .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+    else {
+        return;
+    };
+    observation["nonce"] = serde_json::json!(nonce);
+    observation["pid"] = serde_json::json!(std::process::id());
+    let line = format!("RUSTFS_E2E_STARTUP_CAS {observation}\n");
+    let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
+}
+
 async fn save_pool_meta_object_cas<S>(
     pool: Arc<S>,
     object: &str,
@@ -5500,13 +5515,33 @@ where
         ..Default::default()
     };
     fence.add_to_options(&mut opts);
+    #[cfg(feature = "e2e-test-hooks")]
+    let observation = std::env::var_os("RUSTFS_E2E_STARTUP_CAS_NONCE").map(|_| {
+        serde_json::json!({
+            "kind": "cas", "object": object, "phase": phase,
+            "payload_sha256": format!("{:x}", Sha256::digest(&data)),
+            "if_match": opts.http_preconditions.as_ref().and_then(|p| p.if_match.as_deref()),
+            "if_none_match": opts.http_preconditions.as_ref().and_then(|p| p.if_none_match.as_deref()),
+            "tail_drained": opts.write_completion == crate::object_api::WriteCompletion::TailDrained,
+            "no_lock": opts.no_lock,
+        })
+    });
     let result = save_config_with_opts_and_metadata(pool, object, data, &opts).await;
     if matches!(&result, Err(Error::PreconditionFailed)) {
         record_pool_meta_stale_write_rejection(phase);
     }
-    let object_info = result?;
-    fence.ensure_held()?;
-    Ok(object_info)
+    let result = result.and_then(|object_info| {
+        fence.ensure_held()?;
+        Ok(object_info)
+    });
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(mut observation) = observation {
+        observation["ok"] = serde_json::json!(result.is_ok());
+        observation["etag"] = serde_json::json!(result.as_ref().ok().and_then(|info| info.etag.as_deref()));
+        observation["error"] = serde_json::json!(result.as_ref().err().map(ToString::to_string));
+        startup_cas_test_observe(observation);
+    }
+    result
 }
 
 async fn persist_pool_meta_identity<S>(
@@ -6805,6 +6840,13 @@ impl PoolMeta {
         };
         if confirmed.revision == revision && confirmed.canonical.as_ref() == Some(&durable) {
             persist_pool_meta_identity(pools, write_state, true, fence).await?;
+            #[cfg(feature = "e2e-test-hooks")]
+            startup_cas_test_observe(serde_json::json!({
+                "kind": "confirmed", "object": POOL_META_NAME,
+                "payload_sha256": format!("{:x}", Sha256::digest(&durable)),
+                "generation": confirmed.revision.generation,
+                "transaction_id": confirmed.revision.transaction_id,
+            }));
             return Ok(confirmed.meta);
         }
         if !commit_succeeded {
