@@ -445,7 +445,34 @@ pub(crate) type ScannerActivitySnapshot = BTreeMap<String, ScannerNodeActivity>;
 pub(crate) struct ScannerDirtyUsageAcknowledgement {
     pub(crate) host: String,
     pub(crate) instance_id: String,
-    pub(crate) generation: u64,
+    pub(crate) kind: ScannerDirtyUsageAcknowledgementKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ScannerDirtyUsageAcknowledgementKind {
+    Generation(u64),
+    Scoped {
+        owner_id: String,
+        entries: Vec<crate::storage_api::EcstoreScannerScopedDirtyUsageAckEntry>,
+    },
+}
+
+impl From<ScannerDirtyUsageAcknowledgement> for crate::storage_api::EcstoreScannerDirtyUsageAcknowledgement {
+    fn from(acknowledgement: ScannerDirtyUsageAcknowledgement) -> Self {
+        match acknowledgement.kind {
+            ScannerDirtyUsageAcknowledgementKind::Generation(generation) => Self::Generation {
+                host: acknowledgement.host,
+                instance_id: acknowledgement.instance_id,
+                generation,
+            },
+            ScannerDirtyUsageAcknowledgementKind::Scoped { owner_id, entries } => Self::Scoped {
+                host: acknowledgement.host,
+                owner_id,
+                instance_id: acknowledgement.instance_id,
+                entries,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -974,7 +1001,7 @@ pub(crate) fn scanner_dirty_usage_acknowledgements(snapshot: &ScannerActivitySna
         .map(|(host, activity)| ScannerDirtyUsageAcknowledgement {
             host: host.clone(),
             instance_id: activity.instance_id.clone(),
-            generation: activity.dirty_usage_generation,
+            kind: ScannerDirtyUsageAcknowledgementKind::Generation(activity.dirty_usage_generation),
         })
         .collect()
 }

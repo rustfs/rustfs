@@ -1561,6 +1561,7 @@ fn peer_dirty_usage_snapshot(
     buckets: &[(&str, u64)],
 ) -> EcstoreScannerPeerDirtyUsageSnapshot {
     EcstoreScannerPeerDirtyUsageSnapshot {
+        owner_id: uuid::Uuid::from_u128(0x11111111111111111111111111111111).to_string(),
         instance_id: instance_id.to_string(),
         generation,
         pending_bucket_count: u64::try_from(buckets.len()).expect("test bucket count should fit"),
@@ -1568,7 +1569,15 @@ fn peer_dirty_usage_snapshot(
         complete,
         buckets: buckets
             .iter()
-            .map(|(bucket, generation)| ((*bucket).to_string(), *generation))
+            .map(|(bucket, generation)| {
+                (
+                    (*bucket).to_string(),
+                    crate::storage_api::EcstoreScannerPeerDirtyUsageBucket {
+                        bucket_incarnation: uuid::Uuid::from_u128(0x22222222222222222222222222222222),
+                        generation: *generation,
+                    },
+                )
+            })
             .collect(),
     }
 }
@@ -1595,7 +1604,7 @@ fn verified_remote_dirty_usage_buckets_merges_only_complete_current_snapshots() 
     ]);
 
     assert_eq!(
-        verified_remote_dirty_usage_buckets(
+        verified_remote_dirty_usage(
             &expected_peers,
             vec![
                 (
@@ -1608,8 +1617,61 @@ fn verified_remote_dirty_usage_buckets_merges_only_complete_current_snapshots() 
                 ),
             ],
         ),
-        Some(HashSet::from(["photos".to_string(), "archive".to_string()]))
+        Some(VerifiedRemoteDirtyUsage {
+            dirty_buckets: HashSet::from(["photos".to_string(), "archive".to_string()]),
+            acknowledgements: vec![
+                crate::scanner::ScannerDirtyUsageAcknowledgement {
+                    host: "node-a:9000".to_string(),
+                    instance_id: "instance-a".to_string(),
+                    kind: crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped {
+                        owner_id: uuid::Uuid::from_u128(0x11111111111111111111111111111111).to_string(),
+                        entries: vec![crate::storage_api::EcstoreScannerScopedDirtyUsageAckEntry {
+                            bucket: "photos".to_string(),
+                            bucket_incarnation: uuid::Uuid::from_u128(0x22222222222222222222222222222222),
+                            generation: 7,
+                        }],
+                    },
+                },
+                crate::scanner::ScannerDirtyUsageAcknowledgement {
+                    host: "node-b:9000".to_string(),
+                    instance_id: "instance-b".to_string(),
+                    kind: crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped {
+                        owner_id: uuid::Uuid::from_u128(0x11111111111111111111111111111111).to_string(),
+                        entries: vec![crate::storage_api::EcstoreScannerScopedDirtyUsageAckEntry {
+                            bucket: "archive".to_string(),
+                            bucket_incarnation: uuid::Uuid::from_u128(0x22222222222222222222222222222222),
+                            generation: 3,
+                        }],
+                    },
+                },
+            ],
+        })
     );
+}
+
+#[test]
+fn scanner_scoped_dirty_usage_ack_cost_threshold_is_single_protocol_batch() {
+    let acknowledgement = |entry_count: usize| crate::scanner::ScannerDirtyUsageAcknowledgement {
+        host: "node-a:9000".to_string(),
+        instance_id: "instance-a".to_string(),
+        kind: crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped {
+            owner_id: uuid::Uuid::from_u128(0x11111111111111111111111111111111).to_string(),
+            entries: (0..entry_count)
+                .map(|index| crate::storage_api::EcstoreScannerScopedDirtyUsageAckEntry {
+                    bucket: format!("bucket-{index:02}"),
+                    bucket_incarnation: uuid::Uuid::from_u128(0x22222222222222222222222222222222),
+                    generation: 7,
+                })
+                .collect(),
+        },
+    };
+
+    assert!(!scanner_scoped_dirty_usage_ack_exceeds_cost_threshold(&[acknowledgement(
+        crate::SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES
+    )]));
+    assert!(scanner_scoped_dirty_usage_ack_exceeds_cost_threshold(&[acknowledgement(
+        crate::SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES + 1
+    )]));
 }
 
 #[test]
@@ -1630,7 +1692,7 @@ fn verified_remote_dirty_usage_buckets_rejects_incomplete_or_stale_peer_state() 
         peer_dirty_usage_snapshot("instance-a", 7, true, &[]),
     ] {
         assert!(
-            verified_remote_dirty_usage_buckets(&expected_peers, vec![("node-a:9000".to_string(), snapshot)]).is_none(),
+            verified_remote_dirty_usage(&expected_peers, vec![("node-a:9000".to_string(), snapshot)]).is_none(),
             "incomplete, stale, mismatched, or empty pending peer state must fall back to a full scan"
         );
     }

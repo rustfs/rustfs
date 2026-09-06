@@ -7433,7 +7433,7 @@ fn finalizing_a_saved_enum_without_proof_keeps_dirty_pending() {
     let remote_acknowledgement = ScannerDirtyUsageAcknowledgement {
         host: "node-2".to_string(),
         instance_id: "0123456789abcdef0123456789abcdef".to_string(),
-        generation: 11,
+        kind: ScannerDirtyUsageAcknowledgementKind::Generation(11),
     };
     let unsaved = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot.clone()))
         .with_remote_dirty_usage_acknowledgements(vec![remote_acknowledgement.clone()]);
@@ -8982,7 +8982,7 @@ fn post_lease_activity_proof_rejects_a_put_tail_that_finished_before_lease_acqui
         ScannerDirtyUsageAcknowledgement {
             host: "node-2".to_string(),
             instance_id: "epoch-a".to_string(),
-            generation: 5,
+            kind: ScannerDirtyUsageAcknowledgementKind::Generation(5),
         },
     ]);
     let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(
@@ -9142,7 +9142,7 @@ fn scanner_dirty_usage_acknowledgements_exclude_local_and_clean_nodes() {
         vec![ScannerDirtyUsageAcknowledgement {
             host: "node-3".to_string(),
             instance_id: "epoch-dirty".to_string(),
-            generation: 11,
+            kind: ScannerDirtyUsageAcknowledgementKind::Generation(11),
         }]
     );
 }

@@ -148,19 +148,26 @@ struct ScannerPeerDirtyUsageExpectation {
     pending: bool,
 }
 
-fn verified_remote_dirty_usage_buckets(
+#[derive(Debug, PartialEq, Eq)]
+struct VerifiedRemoteDirtyUsage {
+    dirty_buckets: HashSet<String>,
+    acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+}
+
+fn verified_remote_dirty_usage(
     expected_peers: &HashMap<String, ScannerPeerDirtyUsageExpectation>,
     peer_snapshots: Vec<(String, EcstoreScannerPeerDirtyUsageSnapshot)>,
-) -> Option<HashSet<String>> {
+) -> Option<VerifiedRemoteDirtyUsage> {
     if expected_peers.is_empty() || peer_snapshots.len() != expected_peers.len() {
         return None;
     }
 
     let mut received_peers = HashSet::with_capacity(peer_snapshots.len());
     let mut dirty_buckets = HashSet::new();
+    let mut acknowledgements = Vec::new();
     for (host, snapshot) in peer_snapshots {
         let expected = expected_peers.get(&host)?;
-        if !received_peers.insert(host)
+        if !received_peers.insert(host.clone())
             || snapshot.instance_id != expected.instance_id
             || snapshot.generation != expected.generation
             || snapshot.generation == u64::MAX
@@ -171,10 +178,44 @@ fn verified_remote_dirty_usage_buckets(
         {
             return None;
         }
-        dirty_buckets.extend(snapshot.buckets.into_keys());
+        let entries = snapshot
+            .buckets
+            .iter()
+            .map(|(bucket, state)| crate::storage_api::EcstoreScannerScopedDirtyUsageAckEntry {
+                bucket: bucket.clone(),
+                bucket_incarnation: state.bucket_incarnation,
+                generation: state.generation,
+            })
+            .collect::<Vec<_>>();
+        dirty_buckets.extend(snapshot.buckets.keys().cloned());
+        if !entries.is_empty() {
+            acknowledgements.push(crate::scanner::ScannerDirtyUsageAcknowledgement {
+                host,
+                instance_id: snapshot.instance_id,
+                kind: crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped {
+                    owner_id: snapshot.owner_id,
+                    entries,
+                },
+            });
+        }
     }
 
-    (received_peers.len() == expected_peers.len()).then_some(dirty_buckets)
+    (received_peers.len() == expected_peers.len()).then_some(VerifiedRemoteDirtyUsage {
+        dirty_buckets,
+        acknowledgements,
+    })
+}
+
+fn scanner_scoped_dirty_usage_ack_exceeds_cost_threshold(
+    acknowledgements: &[crate::scanner::ScannerDirtyUsageAcknowledgement],
+) -> bool {
+    acknowledgements.iter().any(|acknowledgement| {
+        matches!(
+            &acknowledgement.kind,
+            crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped { entries, .. }
+                if entries.len() > crate::SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES
+        )
+    })
 }
 
 fn complete_scanner_cache_snapshot_plan_digest(

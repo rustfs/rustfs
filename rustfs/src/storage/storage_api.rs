@@ -550,8 +550,8 @@ pub(crate) mod ecstore_rpc {
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
-        build_put_file_auth_trailer, gen_signature_headers, gen_tonic_signature_headers, set_tonic_canonical_body_digest,
-        verify_put_file_capability, verify_tonic_rpc_response_proof,
+        ScannerScopedDirtyUsageAckEntry, build_put_file_auth_trailer, gen_signature_headers, gen_tonic_signature_headers,
+        set_tonic_canonical_body_digest, verify_put_file_capability, verify_tonic_rpc_response_proof,
     };
 }
 
@@ -694,6 +694,8 @@ pub(crate) type ServerContextSlot = crate::storage::runtime_sources::ServerConte
 pub(crate) type LocalPeerS3Client = ecstore_rpc::LocalPeerS3Client;
 #[cfg(test)]
 pub(crate) type PeerRestClient = ecstore_rpc::PeerRestClient;
+#[cfg(test)]
+pub(crate) type ScannerScopedDirtyUsageAckEntry = ecstore_rpc::ScannerScopedDirtyUsageAckEntry;
 pub(crate) type MetricType = ecstore_metrics::MetricType;
 pub(crate) type ObjectPartInfo = rustfs_filemeta::ObjectPartInfo;
 pub(crate) type ObjectLockBlockReason = ecstore_bucket::object_lock::objectlock_sys::ObjectLockBlockReason;

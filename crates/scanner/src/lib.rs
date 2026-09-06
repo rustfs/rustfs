@@ -100,6 +100,7 @@ pub use storage_api::ScannerReplicationConfig as ReplicationConfig;
 pub use storage_api::scan::{
     SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES,
     SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
+    SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES,
 };
 pub use workload_admission::set_scanner_workload_admission_snapshot_provider;
 
