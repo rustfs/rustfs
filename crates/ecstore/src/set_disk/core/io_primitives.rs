@@ -11038,6 +11038,16 @@ mod tests {
                     assert_eq!(stored.size, 11);
                     assert_eq!(stored.data.as_deref(), Some(b"inline-body".as_slice()));
                 }
+                // The lease releases its locks before dropping the namespace owner, and the
+                // owner's `Drop` runs after its `Weak` probe stops upgrading, so wait for the
+                // pending counter itself instead of asserting it right after the drain.
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while ctx.namespace_commits_pending() || namespace_probe.upgrade().is_some() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("released physical publishers must release namespace ownership");
                 let generation_after_publication = ctx.namespace_commit_generation();
                 assert!(!ctx.namespace_commits_pending());
                 assert!(namespace_probe.upgrade().is_none());
@@ -11177,6 +11187,13 @@ mod tests {
                 .await
                 .expect("late physical tail drains");
                 drop(lease);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while ctx.namespace_commits_pending() || owner_probe.upgrade().is_some() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("late physical tail must release namespace ownership");
                 for dir in &dirs {
                     let stored = reopen_local_disk(dir)
                         .await

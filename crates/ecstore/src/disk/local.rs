@@ -13291,7 +13291,7 @@ mod test {
                             }),
                         _ => unreachable!(),
                     };
-                    if published && owner_probe.upgrade().is_none() {
+                    if published && owner_probe.upgrade().is_none() && !ctx.namespace_commits_pending() {
                         break;
                     }
                     tokio::task::yield_now().await;
@@ -13429,7 +13429,10 @@ mod test {
         let generation = ctx.namespace_commit_generation();
         drop(release_tx);
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !std::fs::read(&xl_path).is_ok_and(|data| data == old_meta) || owner_probe.upgrade().is_some() {
+            while !std::fs::read(&xl_path).is_ok_and(|data| data == old_meta)
+                || owner_probe.upgrade().is_some()
+                || ctx.namespace_commits_pending()
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -13554,7 +13557,7 @@ mod test {
                 .expect("quota claim drains after syscall")
                 .expect("revoke");
             tokio::time::timeout(Duration::from_secs(5), async {
-                while owner_probe.upgrade().is_some() {
+                while owner_probe.upgrade().is_some() || ctx.namespace_commits_pending() {
                     tokio::task::yield_now().await;
                 }
             })

@@ -6437,7 +6437,12 @@ mod tests {
         let generations = (first_ctx.namespace_commit_generation(), second_ctx.namespace_commit_generation());
         drop(release_tx);
         tokio::time::timeout(Duration::from_secs(5), async {
-            while Arc::strong_count(&group.dir_file) != 1 || first_probe.upgrade().is_some() || second_probe.upgrade().is_some() {
+            while Arc::strong_count(&group.dir_file) != 1
+                || first_probe.upgrade().is_some()
+                || second_probe.upgrade().is_some()
+                || first_ctx.namespace_commits_pending()
+                || second_ctx.namespace_commits_pending()
+            {
                 tokio::task::yield_now().await;
             }
         })
