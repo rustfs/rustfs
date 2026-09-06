@@ -470,6 +470,14 @@ async fn authorize_manual_transition_request(req: &S3Request<Body>) -> S3Result<
 /// The credential pre-check keeps this endpoint family's historical
 /// missing-credentials message (the shared gate reports "get cred failed") and
 /// still yields the masked actor every transition audit log records.
+async fn authorize_recovery_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<String> {
+    if req.credentials.is_none() {
+        return Err(admin_s3_error(AdminS3ErrorCode::InvalidRequest, "authentication required"));
+    }
+    let credentials = authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    Ok(recovery_actor_sha256(&credentials))
+}
+
 async fn authorize_transition_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<String> {
     let Some(input_cred) = req.credentials.as_ref() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
@@ -479,14 +487,6 @@ async fn authorize_transition_admin_request(req: &S3Request<Body>, action: Admin
     authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
 
     Ok(actor)
-}
-
-async fn authorize_recovery_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<String> {
-    if req.credentials.is_none() {
-        return Err(admin_s3_error(AdminS3ErrorCode::InvalidRequest, "authentication required"));
-    }
-    let credentials = authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
-    Ok(recovery_actor_sha256(&credentials))
 }
 
 fn transition_transaction_id_from_params(params: &Params<'_, '_>) -> S3Result<Uuid> {
@@ -1498,23 +1498,6 @@ impl Operation for ManualTransitionJobCancelHandler {
     }
 }
 
-pub struct TransitionReconcileInspectHandler {}
-
-#[async_trait::async_trait]
-impl Operation for TransitionReconcileInspectHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_transition_admin_request(&req, AdminAction::ListTierAction).await?;
-        let transaction_id = transition_transaction_id_from_params(&params)?;
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
-            return Err(s3_error!(InternalError, "object store is not initialized"));
-        };
-        let status = inspect_transition_transaction_for_operator(store, transaction_id)
-            .await
-            .map_err(map_transition_operator_error)?;
-        json_response(StatusCode::OK, &status)
-    }
-}
-
 pub struct IlmRecoveryControlListHandler {}
 
 #[async_trait::async_trait]
@@ -1631,6 +1614,23 @@ impl Operation for IlmRecoveryExportDownloadHandler {
             .map_err(map_recovery_export_error)?;
         let headers = recovery_export_download_headers(&export_id, export.encoded.len())?;
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(export.encoded)), headers))
+    }
+}
+
+pub struct TransitionReconcileInspectHandler {}
+
+#[async_trait::async_trait]
+impl Operation for TransitionReconcileInspectHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_transition_admin_request(&req, AdminAction::ListTierAction).await?;
+        let transaction_id = transition_transaction_id_from_params(&params)?;
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
+            return Err(s3_error!(InternalError, "object store is not initialized"));
+        };
+        let status = inspect_transition_transaction_for_operator(store, transaction_id)
+            .await
+            .map_err(map_transition_operator_error)?;
+        json_response(StatusCode::OK, &status)
     }
 }
 
