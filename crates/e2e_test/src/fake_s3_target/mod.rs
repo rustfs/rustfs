@@ -2967,6 +2967,37 @@ mod tests {
         for key in ["held", "unrelated"] {
             target.put_seed_object(bucket, key, Bytes::from_static(b"payload"), &SeedMetadata::default());
         }
+        {
+            let gate = target.hold_get_object(bucket, "held");
+            let request = || S3Request {
+                input: GetObjectInput {
+                    bucket: bucket.to_string(),
+                    key: "held".to_string(),
+                    ..Default::default()
+                },
+                method: Method::GET,
+                uri: Uri::from_static("/gated-target/held"),
+                headers: HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            // Without a fault, only the gate can suspend this backend method.
+            let mut first = target.backend.get_object(request());
+            assert!(futures::poll!(first.as_mut()).is_pending(), "the first GET must wait at the gate");
+            drop(first);
+            let mut retry = target.backend.get_object(request());
+            assert!(futures::poll!(retry.as_mut()).is_pending(), "a cancelled GET must not consume the gate");
+            drop(gate);
+            let std::task::Poll::Ready(response) = futures::poll!(retry.as_mut()) else {
+                panic!("dropping the gate must release the waiting GET");
+            };
+            let mut body = response?.output.body.expect("released GET body");
+            assert_eq!(body.next().await.transpose()?, Some(Bytes::from_static(b"payload")));
+            assert!(body.next().await.is_none(), "released GET body must be complete");
+        }
         let client = client(&target);
         let mut gate = target.hold_get_object(bucket, "held");
         let mut requests = tokio::task::JoinSet::new();
