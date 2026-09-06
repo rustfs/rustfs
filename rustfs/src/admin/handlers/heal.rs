@@ -1636,6 +1636,44 @@ mod tests {
         assert!(executed.load(Ordering::SeqCst));
     }
 
+    #[tokio::test]
+    async fn heal_start_retry_preflight_failures_do_not_create_request_identities() {
+        let hip = HealInitParams {
+            bucket: "bucket".to_string(),
+            ..Default::default()
+        };
+        let mut request_ids = Vec::new();
+        for attempt in 0..3 {
+            let executed_ids = &mut request_ids;
+            let request_params = &hip;
+            let result = execute_after_heal_control_capability(
+                || async {
+                    if attempt < 2 {
+                        Err(super::cluster_heal_control_unavailable("test_capability_failure"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || async move {
+                    let request = build_heal_channel_request(request_params);
+                    executed_ids.push(request.id);
+                    Ok(())
+                },
+            )
+            .await;
+            if attempt < 2 {
+                assert!(result.is_err(), "failed capability checks must not start a heal");
+                assert!(
+                    request_ids.is_empty(),
+                    "preflight failure must precede request construction and admission"
+                );
+            } else {
+                result.expect("restored capabilities allow the first execution");
+                assert_eq!(request_ids.len(), 1);
+            }
+        }
+    }
+
     #[test]
     fn replacement_recovery_status_response_reports_cluster_proof() {
         let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
@@ -1741,6 +1779,21 @@ mod tests {
         .expect("missing rpc should not be a transport failure");
 
         assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn heal_start_retry_conflicts_keep_actionable_public_reasons() {
+        for (reason, label) in [
+            (HealAdmissionDropReason::AlreadyRunning, "already_running"),
+            (HealAdmissionDropReason::OverlappingPaths, "overlapping_paths"),
+        ] {
+            let error = reject_heal_admission(HealAdmissionResult::Dropped(reason));
+            assert_eq!(error.code(), &S3ErrorCode::OperationAborted);
+            assert!(
+                error.to_string().contains(label),
+                "the caller must distinguish conflicts from transient coordination failure"
+            );
+        }
     }
 
     #[test]

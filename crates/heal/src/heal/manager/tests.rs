@@ -14,6 +14,9 @@
 
 use super::*;
 use crate::heal::EcstoreError;
+use crate::heal::outcome::{
+    HealAbortReason, HealDeferredReason, HealExecutionOutcome, HealObjectDisposition, HealTraversalCoverage,
+};
 use crate::heal::resume::{CheckpointManager, ReplacementTargetIdentity};
 use crate::heal::storage::{HealObjectInfo, HealStorageAPI};
 use crate::heal::task::{BatchHealFailure, HealOptions, HealPriority, HealRequest, HealTask, HealType};
@@ -515,10 +518,15 @@ impl HealStorageAPI for MockStorage {
     async fn heal_object(
         &self,
         bucket: &str,
-        _object: &str,
+        object: &str,
         _version_id: Option<&str>,
         _opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
+        if bucket.starts_with("heal-start-retry-deadline-object-") && object == "blocked" {
+            let hook = COMPLETED_RETENTION_HOOKS.lock().await[bucket].clone();
+            hook.started.notify_one();
+            std::future::pending::<()>().await;
+        }
         if bucket == "completed-retention-failed" {
             return Err(Error::TaskExecutionFailed {
                 message: "retention fixture failure".to_string(),
@@ -580,11 +588,35 @@ impl HealStorageAPI for MockStorage {
 
     async fn list_objects_for_heal_page(
         &self,
-        _bucket: &str,
+        bucket: &str,
         _prefix: &str,
-        _continuation_token: Option<&str>,
+        continuation_token: Option<&str>,
         _include_lifecycle_object_info: bool,
     ) -> Result<(Vec<crate::heal::storage::HealListItem>, Option<String>, bool)> {
+        if bucket.starts_with("heal-start-retry-deadline-") {
+            if continuation_token.is_some() {
+                let hook = COMPLETED_RETENTION_HOOKS.lock().await[bucket].clone();
+                hook.started.notify_one();
+                std::future::pending::<()>().await;
+            }
+            let listing_timeout = bucket.starts_with("heal-start-retry-deadline-listing-");
+            let names = if listing_timeout {
+                vec!["completed"]
+            } else {
+                vec!["completed", "blocked"]
+            };
+            let objects = names
+                .into_iter()
+                .map(|name| crate::heal::storage::HealListItem {
+                    name: name.to_string(),
+                    version_id: None,
+                    mod_time_unix_nanos: None,
+                    lifecycle_object_info: None,
+                    is_delete_marker: false,
+                })
+                .collect();
+            return Ok((objects, listing_timeout.then(|| "next".to_string()), listing_timeout));
+        }
         Ok((Vec::new(), None, false))
     }
 
@@ -605,6 +637,161 @@ impl HealStorageAPI for MockStorage {
             hook.replacement_resume_disk.clone(),
         ))
     }
+}
+
+async fn assert_heal_start_retry_control_preserves_real_executor_progress(cancel: bool) {
+    for phase in ["listing", "object"] {
+        let bucket = format!("heal-start-retry-deadline-{phase}-{cancel}");
+        let manager = HealManager::new(Arc::new(MockStorage), None);
+        let mut request = HealRequest::new(
+            HealType::Prefix {
+                bucket: bucket.clone(),
+                prefix: String::new(),
+            },
+            HealOptions {
+                timeout: Some(if cancel {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::from_millis(200)
+                }),
+                ..Default::default()
+            },
+            HealPriority::High,
+        );
+        request.source = HealRequestSource::Admin;
+        let task_id = request.id.clone();
+        let hook = Arc::new(CompletedRetentionHook::default());
+        {
+            let mut hooks = COMPLETED_RETENTION_HOOKS.lock().await;
+            hooks.insert(bucket.clone(), Arc::clone(&hook));
+            hooks.insert(task_id.clone(), Arc::clone(&hook));
+        }
+        manager.submit_heal_request(request).await.expect("admit deadline task");
+        process_manager_queue_once(&manager).await;
+        tokio::time::timeout(Duration::from_secs(5), hook.started.notified())
+            .await
+            .expect("executor reaches blocked storage");
+        let active = manager.get_task_report(&task_id).await.expect("active report");
+        assert_eq!(active.progress.expect("real completed object progress").objects_healed, 1);
+        if cancel {
+            manager.active_heals.lock().await[&task_id].cancel_token.cancel();
+        }
+        tokio::time::timeout(Duration::from_secs(5), hook.handoff.notified())
+            .await
+            .expect("deadline archives task");
+        let report = manager.get_task_report(&task_id).await.expect("terminal report");
+        assert_eq!(
+            report.status,
+            if cancel {
+                HealTaskStatus::Cancelled
+            } else {
+                HealTaskStatus::Timeout
+            },
+            "blocked {phase}"
+        );
+        let progress = report.progress.expect("terminal progress retained");
+        assert_eq!(progress.objects_healed, 1);
+        assert_eq!(progress.objects_failed, 0, "interrupted object has no terminal storage result");
+        assert_eq!(report.result_items.len(), 1, "completed result retained");
+        let outcome = report.outcome.expect("canonical terminal outcome retained");
+        assert_eq!(
+            outcome.execution,
+            HealExecutionOutcome::Aborted(if cancel {
+                HealAbortReason::Cancelled
+            } else {
+                HealAbortReason::Deadline
+            })
+        );
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Partial);
+        assert_eq!(outcome.counters.healed, 0, "legacy success supplies no authoritative repair proof");
+        let completed = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.object == "completed")
+            .expect("completed object diagnostic retained");
+        assert_eq!(completed.disposition, HealObjectDisposition::Unknown);
+        if phase == "object" {
+            let interrupted = outcome
+                .objects
+                .iter()
+                .find(|item| item.identity.object == "blocked")
+                .expect("interrupted object diagnostic retained");
+            assert_eq!(
+                interrupted.disposition,
+                if cancel {
+                    HealObjectDisposition::Cancelled
+                } else {
+                    HealObjectDisposition::Deferred {
+                        reason: HealDeferredReason::Deadline,
+                        retry_not_before: None,
+                    }
+                }
+            );
+        } else {
+            assert_eq!(outcome.objects.len(), 1, "an unread page cannot supply object identities");
+        }
+        assert!(!manager.active_heals.lock().await.contains_key(&task_id));
+        assert!(!manager.retrying_heals.lock().await.contains_key(&task_id));
+        assert!(!manager.heal_queue.lock().await.contains_request_id(&task_id));
+        hook.finish.notify_one();
+        COMPLETED_RETENTION_HOOKS
+            .lock()
+            .await
+            .retain(|key, _| key != &bucket && key != &task_id);
+    }
+}
+
+#[tokio::test]
+async fn heal_start_retry_deadline_preserves_real_executor_progress() {
+    assert_heal_start_retry_control_preserves_real_executor_progress(false).await;
+}
+
+#[tokio::test]
+async fn heal_start_retry_cancellation_preserves_real_executor_progress() {
+    assert_heal_start_retry_control_preserves_real_executor_progress(true).await;
+}
+
+#[tokio::test]
+async fn heal_start_retry_scheduler_carries_explicit_budget_and_identity() {
+    let manager = HealManager::new(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            task_timeout: Duration::ZERO,
+            ..Default::default()
+        }),
+    );
+    let mut request = HealRequest::object("retry-transition".to_string(), "object".to_string(), None);
+    request.source = HealRequestSource::Admin;
+    request.options.timeout = Some(Duration::from_secs(60));
+    let task_id = request.id.clone();
+    let created_at = request.created_at;
+    let hook = Arc::new(CompletedRetentionHook::default());
+    COMPLETED_RETENTION_HOOKS
+        .lock()
+        .await
+        .insert(task_id.clone(), Arc::clone(&hook));
+    manager
+        .submit_heal_request(request)
+        .await
+        .expect("admit explicit-budget task");
+    process_manager_queue_once(&manager).await;
+    tokio::time::timeout(Duration::from_secs(5), hook.handoff.notified())
+        .await
+        .expect("real read-quorum failure prepares retry");
+    let retry = manager.retrying_heals.lock().await[&task_id].request.clone();
+    assert_eq!(retry.id, task_id);
+    assert_eq!(retry.created_at, created_at);
+    assert_eq!(retry.source, HealRequestSource::Admin);
+    assert_eq!(retry.retry_attempts, 1);
+    let remaining = retry.options.timeout.expect("retry retains explicit budget");
+    assert!(remaining > Duration::ZERO && remaining < Duration::from_secs(60));
+    assert!(matches!(
+        manager.get_task_status(&task_id).await.expect("retry remains queryable"),
+        HealTaskStatus::Retrying { retry_attempt: 1, .. }
+    ));
+    manager.cancel_task(&task_id).await.expect("cancel held retry");
+    hook.finish.notify_one();
+    COMPLETED_RETENTION_HOOKS.lock().await.remove(&task_id);
 }
 
 struct ManagerRecoveryTestHook {
