@@ -3652,6 +3652,64 @@ mod target_repair_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn ordinary_target_update_preserves_a_repair_committed_during_validation() {
+        temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
+            let (_temp, _env) = test_env().await;
+            let first = RemoteTargetServer::start().await;
+            let second = RemoteTargetServer::start().await;
+            let first_arn = repair(&first.target(), "").await.expect("create initial target");
+            let mut requested = persisted_targets().await.targets.remove(0);
+            requested.replication_sync = true;
+            let (observed, release) = first.pause_next_request();
+            let update = repair(&requested, "update=true&sync=true");
+            let concurrent_repair = async {
+                tokio::time::timeout(Duration::from_secs(10), observed)
+                    .await
+                    .expect("update validation must reach HTTP source")
+                    .expect("observe update validation");
+                let repaired =
+                    tokio::time::timeout(Duration::from_secs(10), repair(&second.target(), "replace-unreadable=true")).await;
+                let second_arn = repaired
+                    .expect("repair must complete during validation")
+                    .expect("commit concurrent repair");
+                let repaired = persisted_targets()
+                    .await
+                    .targets
+                    .into_iter()
+                    .find(|target| target.arn == second_arn)
+                    .expect("read committed repair");
+                release.send(()).expect("release update validation response");
+                repaired
+            };
+            let (updated_arn, repaired) = tokio::join!(update, concurrent_repair);
+            assert_eq!(updated_arn.expect("an unrelated target change must not conflict"), first_arn);
+            let targets = persisted_targets().await;
+            assert_eq!(targets.targets.len(), 2);
+            let updated = targets
+                .targets
+                .iter()
+                .find(|target| target.arn == first_arn)
+                .expect("updated target");
+            assert_eq!(
+                serde_json::to_value(updated).expect("encode updated target"),
+                serde_json::to_value(requested).expect("encode requested target")
+            );
+            let kept = targets
+                .targets
+                .iter()
+                .find(|target| target.arn == repaired.arn)
+                .expect("retained repair");
+            assert_eq!(
+                serde_json::to_value(kept).expect("encode retained repair"),
+                serde_json::to_value(repaired).expect("encode committed repair")
+            );
+            assert_published_targets(&targets).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn ordinary_target_validation_does_not_lock_out_a_concurrent_repair() {
         temp_env::async_with_vars([("NO_PROXY", Some("*")), ("no_proxy", Some("*"))], async {
             let (_temp, _env) = test_env().await;
