@@ -4706,14 +4706,14 @@ mod tests {
 
     async fn stage_target_rpc(fixture: &TargetRpcFixture) -> (super::DiskStore, rustfs_filemeta::FileInfo, Vec<u8>) {
         use crate::storage::storage_api::ecstore_disk::{DiskAPI, ReadOptions};
-        let disk = fixture
-            .instance
-            .local_disk_map()
-            .read()
-            .await
-            .values()
-            .find_map(Clone::clone)
-            .expect("local target");
+        let set = fixture
+            .env
+            .ecstore
+            .all_set_disks()
+            .into_iter()
+            .next()
+            .expect("target erasure set");
+        let disk = set.disks.read().await.iter().find_map(Clone::clone).expect("local target");
         let mut fi = rustfs_filemeta::FileInfo::new("destination", 1, 0);
         fi.erasure.index = 1;
         fi.version_id = Some(Uuid::new_v4());
