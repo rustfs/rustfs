@@ -12,6 +12,12 @@
     ],
     "reasons": [
         {
+            "reason": "DOCUMENT_MALFORMED",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "meaning": "An enrollment challenge envelope or decoded challenge document cannot provide the padded-base64 JSON structure and pre-verification fields required to locate its trust chain and signing key. No partial challenge is processed."
+        },
+        {
             "reason": "UNSUPPORTED_PROTOCOL",
             "httpStatus": 400,
             "status": "INVALID_ARGUMENT",
@@ -27,7 +33,7 @@
             "reason": "SIGNATURE_MALFORMED",
             "httpStatus": 400,
             "status": "INVALID_ARGUMENT",
-            "meaning": "The signature is not 64 octets of fixed-width r||s in unpadded base64url, or r or s is out of range."
+            "meaning": "A top-level challenge or response signature algorithm is not ES256, keyId is malformed, the value is not 64 octets of fixed-width r||s in unpadded base64url, or r or s is out of range. A trust-link signature failure is TRUST_CHAIN_INVALID instead."
         },
         {
             "reason": "SIGNATURE_NOT_CANONICAL",
@@ -51,7 +57,7 @@
             "reason": "TRUST_CHAIN_INVALID",
             "httpStatus": 401,
             "status": "UNAUTHENTICATED",
-            "meaning": "A trust link failed its own signature check, named the wrong issuer, carried an unknown role, or was outside its validity at the challenge issuedAt."
+            "meaning": "The pinned-root chain has the wrong length or role order, or a trust link is structurally invalid, exceeds its role validity limit, fails its signature check, names the wrong issuer, or is outside its validity at the challenge issuedAt."
         },
         {
             "reason": "CONNECT_KEY_UNCHAINED",
@@ -75,7 +81,7 @@
             "reason": "CHALLENGE_EXPIRED",
             "httpStatus": 401,
             "status": "UNAUTHENTICATED",
-            "meaning": "The evaluation time is more than the skew tolerance after expiresAt."
+            "meaning": "The evaluation time is more than the skew tolerance after effectiveExpiresAt, which never exceeds issuedAt plus the frozen maximum challenge lifetime."
         },
         {
             "reason": "CHALLENGE_PROOF_INVALID",

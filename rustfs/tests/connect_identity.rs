@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use base64_simd::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
 use rustfs::connect::identity::{DeviceIdentity, IdentityError, RegistrationTranscript};
 use rustfs::connect::identity_store::{IdentityStore, StoreError};
+use x509_parser::prelude::{FromDer as _, X509CertificationRequest};
 
 fn transcript_fixture() -> serde_json::Value {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../protocol/agent/v1/fixtures/registration/transcript.json");
@@ -32,6 +33,11 @@ fn transcript_fixture() -> serde_json::Value {
 fn accept_vectors() -> serde_json::Value {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../protocol/agent/v1/fixtures/registration/accept-vectors.json");
     serde_json::from_slice(&fs::read(path).expect("read accept-vectors.json")).expect("accept-vectors.json parses")
+}
+
+fn reject_vectors() -> serde_json::Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../protocol/agent/v1/fixtures/registration/reject-vectors.json");
+    serde_json::from_slice(&fs::read(path).expect("read reject-vectors.json")).expect("reject-vectors.json parses")
 }
 
 /// Extract the SubjectPublicKeyInfo from a PKCS#10 request.
@@ -357,6 +363,33 @@ fn certificate_request_presents_a_p256_key() {
         "the certificate request must present an ECDSA P-256 SubjectPublicKeyInfo"
     );
     assert_eq!(der[0], 0x30, "a PKCS#10 request is a DER SEQUENCE");
+}
+
+#[test]
+fn certificate_request_uses_the_frozen_no_san_authorization_profile() {
+    let profile = &transcript_fixture()["request"]["certificateRequestProfile"]["authorizationCompatibility"];
+    assert_eq!(profile["noSubjectAlternativeNameAccepted"].as_bool(), Some(true));
+    assert_eq!(profile["mismatchedTypeReason"].as_str(), Some("CERTIFICATE_REQUEST_PROFILE_UNSUPPORTED"));
+
+    let identity = DeviceIdentity::generate();
+    let der = identity.certificate_request_der().expect("certificate request builds");
+    let (remaining, request) = X509CertificationRequest::from_der(&der).expect("certificate request parses");
+    assert!(remaining.is_empty(), "the certificate request has no trailing octets");
+    assert!(
+        request
+            .requested_extensions()
+            .is_none_or(|mut extensions| extensions.next().is_none()),
+        "RustFS must not send a subject alternative name in its registration request"
+    );
+
+    let profile_vector = reject_vectors()["vectors"]
+        .as_array()
+        .expect("reject vectors are a list")
+        .iter()
+        .find(|vector| vector["expected"]["reason"] == "CERTIFICATE_REQUEST_PROFILE_UNSUPPORTED")
+        .expect("the frozen profile rejection vector exists")
+        .clone();
+    assert_eq!(profile_vector["stage"].as_str(), Some("certificateRequest"));
 }
 
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
