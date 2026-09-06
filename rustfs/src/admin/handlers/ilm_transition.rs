@@ -483,7 +483,7 @@ async fn authorize_transition_admin_request(req: &S3Request<Body>, action: Admin
 
 async fn authorize_recovery_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<String> {
     if req.credentials.is_none() {
-        return Err(s3_error!(InvalidRequest, "authentication required"));
+        return Err(admin_s3_error(AdminS3ErrorCode::InvalidRequest, "authentication required"));
     }
     let credentials = authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
     Ok(recovery_actor_sha256(&credentials))
@@ -2476,6 +2476,19 @@ mod tests {
         )
         .await
         .expect_err("a transition admin request without credentials must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
+    }
+
+    #[tokio::test]
+    async fn recovery_admin_gate_keeps_its_missing_credentials_response() {
+        let err = authorize_recovery_admin_request(
+            &manual_transition_job_request(Method::GET, "/rustfs/admin/v3/ilm/recovery/controls/control-123"),
+            AdminAction::ListTierAction,
+        )
+        .await
+        .expect_err("a recovery admin request without credentials must fail");
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("authentication required"));
