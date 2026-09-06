@@ -67,6 +67,7 @@ const ERR_LIFECYCLE_RULE_MUST_HAVE_ACTION: &str = "Rule must have at least one o
 const ERR_LIFECYCLE_PREFIX_FILTER_CONFLICT: &str = "Legacy Prefix and Filter cannot both be present in a lifecycle rule. Use Filter.Prefix instead of the top-level Prefix element.";
 const ERR_LIFECYCLE_INVALID_NEWER_NONCURRENT_VERSIONS: &str = "'NewerNoncurrentVersions' must be a non-negative integer";
 const ERR_LIFECYCLE_FILTER_AND_TOO_FEW_PREDICATES: &str = "Filter And must contain at least two predicates";
+const ERR_LIFECYCLE_FILTER_TOO_MANY_PREDICATES: &str = "Filter has too many predicates";
 const ERR_LIFECYCLE_FILTER_DUPLICATE_TAG_KEY: &str = "Filter must not repeat a tag key";
 const ERR_LIFECYCLE_FILTER_INVALID_TAG: &str = "Tag key must be 1-128 characters and tag value must be at most 256 characters";
 const ERR_LIFECYCLE_FILTER_NEGATIVE_SIZE: &str = "ObjectSizeGreaterThan and ObjectSizeLessThan must not be negative";
@@ -286,11 +287,14 @@ impl RuleValidate for LifecycleRule {
 /// `Filter` as "applies to every object in the bucket", and rejecting it would
 /// break the most common way to write an unconditional rule.
 fn validate_lifecycle_filter(filter: &LifecycleRuleFilter) -> Result<(), std::io::Error> {
-    // AWS S3 allows multiple top-level predicates (Prefix, Tag, ObjectSize*)
-    // as siblings in Filter without an explicit And wrapper — botocore sends
-    // this layout when a rule combines Prefix with Tag. The evaluation code
-    // already treats sibling predicates as implicit AND, so we validate each
-    // predicate individually rather than enforcing a single-predicate limit.
+    let top_level_predicates = usize::from(filter.prefix.is_some())
+        + usize::from(filter.tag.is_some())
+        + usize::from(filter.object_size_greater_than.is_some())
+        + usize::from(filter.object_size_less_than.is_some())
+        + usize::from(filter.and.is_some());
+    if top_level_predicates > 1 {
+        return Err(malformed_xml_error(ERR_LIFECYCLE_FILTER_TOO_MANY_PREDICATES));
+    }
 
     if let Some(tag) = filter.tag.as_ref() {
         validate_lifecycle_tag(tag)?;
@@ -4713,7 +4717,7 @@ mod tests {
                     tag: Some(tag("env", "prod")),
                     ..Default::default()
                 },
-                expected: None,
+                expected: Some((ERR_LIFECYCLE_FILTER_TOO_MANY_PREDICATES, LIFECYCLE_MALFORMED_XML_ERROR_KIND)),
             },
             Case {
                 name: "prefix alongside And",
@@ -4726,7 +4730,7 @@ mod tests {
                     }),
                     ..Default::default()
                 },
-                expected: None,
+                expected: Some((ERR_LIFECYCLE_FILTER_TOO_MANY_PREDICATES, LIFECYCLE_MALFORMED_XML_ERROR_KIND)),
             },
             Case {
                 name: "And with a single member",
