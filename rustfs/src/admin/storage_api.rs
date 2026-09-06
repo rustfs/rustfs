@@ -298,10 +298,7 @@ pub(crate) mod metadata_sys {
     use std::sync::Arc;
 
     use rustfs_policy::policy::BucketPolicy;
-    use s3s::dto::{
-        BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ServerSideEncryptionConfiguration,
-        Tagging, VersioningConfiguration,
-    };
+    use s3s::dto::{ObjectLockConfiguration, ServerSideEncryptionConfiguration, VersioningConfiguration};
     use time::OffsetDateTime;
 
     use super::Result;
@@ -418,14 +415,6 @@ pub(crate) mod metadata_sys {
         serde_json::from_slice(&metadata.bucket_targets_config_json).map_err(super::Error::other)
     }
 
-    pub(crate) async fn get_lifecycle_config(bucket: &str) -> Result<(BucketLifecycleConfiguration, OffsetDateTime)> {
-        super::ecstore_bucket::metadata_sys::get_lifecycle_config(bucket).await
-    }
-
-    pub(crate) async fn get_notification_config(bucket: &str) -> Result<Option<NotificationConfiguration>> {
-        super::ecstore_bucket::metadata_sys::get_notification_config(bucket).await
-    }
-
     pub(crate) async fn get_object_lock_config(bucket: &str) -> Result<(ObjectLockConfiguration, OffsetDateTime)> {
         super::ecstore_bucket::metadata_sys::get_object_lock_config(bucket).await
     }
@@ -446,10 +435,6 @@ pub(crate) mod metadata_sys {
 
     pub(crate) async fn get_sse_config(bucket: &str) -> Result<(ServerSideEncryptionConfiguration, OffsetDateTime)> {
         super::ecstore_bucket::metadata_sys::get_sse_config(bucket).await
-    }
-
-    pub(crate) async fn get_tagging_config(bucket: &str) -> Result<(Tagging, OffsetDateTime)> {
-        super::ecstore_bucket::metadata_sys::get_tagging_config(bucket).await
     }
 
     pub(crate) async fn get_versioning_config(bucket: &str) -> Result<(VersioningConfiguration, OffsetDateTime)> {
