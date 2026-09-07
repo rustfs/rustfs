@@ -365,14 +365,16 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
     .enumerate()
     {
         if index > 0 {
+            let mutated_bucket = if index == 1 { "hot-bucket" } else { "cold-bucket" };
             let mut reader = ScannerPutObjReader::from_vec(b"maintenance".to_vec());
             store.pools[0].disk_set[0]
-                .put_object("cold-bucket", &format!("added-{index}"), &mut reader, &ScannerObjectOptions::default())
+                .put_object(mutated_bucket, &format!("added-{index}"), &mut reader, &ScannerObjectOptions::default())
                 .await
-                .expect("cold bucket mutation should persist");
+                .expect("maintenance object should persist");
             wait_for_namespace_commit_tails(store.as_ref()).await;
-            // Only the hot bucket is in the usage hint. The cold result must
-            // come from this cycle's storage walk, not its previous baseline.
+            // Only the hot bucket is in the dirty-usage hint. The ordinary
+            // dirty cycle exercises scoped reuse; the following maintenance
+            // cycles mutate cold storage and must still walk it.
             record_dirty_usage_bucket("hot-bucket");
         }
         let requested_scope = if explicit_scope {
@@ -425,11 +427,14 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
         }
         let mut snapshot = receiver.recv().await.expect("cycle should publish a snapshot");
         assert!(snapshot.usage_snapshot_complete, "cycle {cycle}");
-        assert_eq!(
-            snapshot.buckets_usage["cold-bucket"].objects_count,
-            u64::try_from(index + 1).expect("count should fit")
-        );
-        assert_eq!(snapshot.buckets_usage["hot-bucket"].objects_count, 1);
+        let expected_hot_count = if index >= 1 { 2 } else { 1 };
+        let expected_cold_count = if index >= 2 {
+            u64::try_from(index).expect("count should fit")
+        } else {
+            1
+        };
+        assert_eq!(snapshot.buckets_usage["cold-bucket"].objects_count, expected_cold_count);
+        assert_eq!(snapshot.buckets_usage["hot-bucket"].objects_count, expected_hot_count);
         assert_eq!(snapshot.scanner_cycle, Some(cycle));
         assert_eq!(snapshot.scanner_epoch, Some(11));
         snapshot.usage_snapshot_converged = Some(true);
