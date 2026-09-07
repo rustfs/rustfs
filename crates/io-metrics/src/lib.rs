@@ -226,6 +226,7 @@ pub mod lock_metrics;
 pub mod performance;
 pub mod process_lock_metrics;
 pub mod s3_api_metrics;
+pub mod s3_http_metrics;
 pub mod sampler;
 pub mod system_path_metrics;
 pub mod timeout_metrics;

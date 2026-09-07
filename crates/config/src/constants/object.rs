@@ -376,21 +376,39 @@ pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 250;
 ///
 /// SDK-default multipart clients send every part of an upload concurrently, so
 /// a single node routinely sees several times more parts in flight than the
-/// permit pool allows. Those parts have not ingested a body yet, so queueing
-/// them costs a connection rather than memory or internode streams; the pool
-/// still bounds the number of parts being written. The wait is long enough for
-/// an ordinary queue to drain on modest hardware, and a part that cannot get a
-/// permit within it fails with S3 `SlowDown`/503 for the client to retry.
-/// `0` rejects immediately when the pool is full.
+/// permit pool allows. A queued part waits before body ingest, so the pool
+/// still bounds the number of parts being written, but the wait is not free:
+/// RustFS does not read the request body while the part is queued (hyper only
+/// sends `100 Continue` once the body is first polled, and the AWS SDKs send
+/// the body after a 1-3 s `Expect: 100-continue` grace anyway), so the
+/// client's socket write stalls once the kernel buffers fill, and whatever
+/// timeout the client or an intermediary has configured decides the outcome.
+/// botocore applies its `connect_timeout` (60 s) to the body write, the AWS
+/// SDK for Java v2 has a 30 s socket write timeout, and MinIO bounds the same
+/// wait with a 10 s request deadline. The wait must leave margin under the
+/// shortest of those, not merely fall below an SDK default, so the part
+/// receives S3 `SlowDown`/503 for the client to retry instead of losing its
+/// connection (issue #7385). `0` rejects immediately when the pool is full.
 pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: &str =
     "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS";
-pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 10_000;
+
+// A queued part holds the client's body write open for the whole wait. The
+// shortest write timeout among mainstream S3 SDKs is the AWS SDK for Java v2's
+// 30 s socket write timeout; keep the compiled default at no more than a third
+// of it. This locks only the default; the environment variable may still raise
+// the wait past any client timeout.
+const _: () = assert!(DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS * 3 <= 30_000);
 
 /// Maximum multipart UploadPart requests waiting for a foreground write permit per process.
 ///
 /// Parts beyond this queue depth are rejected with S3 `SlowDown`/503 without
 /// waiting, so a genuinely saturated node still fails fast instead of holding
-/// an unbounded set of connections open for the whole wait timeout.
+/// an unbounded set of connections open for the whole wait timeout. Each
+/// queued HTTP/1 part also holds whatever unread body the client already
+/// pushed into that connection's kernel receive buffer, and a queued HTTP/2
+/// part holds up to its flow-control window in process memory, so the depth
+/// bounds socket and window memory as well as connections.
 /// `0` derives the depth from the permit limit.
 pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING: &str = "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING";
 pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING: usize = 0;

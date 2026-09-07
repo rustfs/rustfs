@@ -1014,6 +1014,10 @@ pub async fn start_http_server(
         // Common setup for both IPv4 and successful dual-stack IPv6
         let backlog = get_listen_backlog();
         let keepalive = get_default_tcp_keepalive();
+        let recv_buffer_bytes = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_HTTP_SOCKET_RECV_BUFFER_BYTES,
+            rustfs_config::DEFAULT_HTTP_SOCKET_RECV_BUFFER_BYTES,
+        );
 
         // Helper to configure socket with optimized parameters
         let configure_socket = |socket: &socket2::Socket| -> Result<()> {
@@ -1068,10 +1072,25 @@ pub async fn start_http_server(
                 );
             }
 
-            // 4. Increase receive/send buffer to support BDP at GB-level throughput.
+            // 4. Socket buffers. The receive buffer is left to kernel autotuning
+            // unless RUSTFS_HTTP_SOCKET_RECV_BUFFER_BYTES is set: a fixed SO_RCVBUF
+            // is inherited by every accepted socket and disables autotuning, so a
+            // request whose body is not being read yet (a multipart part queued
+            // for a foreground write permit) lets up to the fixed size of unread
+            // body accumulate in kernel memory — the former hard-coded 4 MiB held
+            // up to 8 MiB per queued connection on Linux, which doubles the
+            // requested size. Autotuning keeps an unread connection at the
+            // kernel's initial size and grows only connections that are actually
+            // being drained (issue #7385). The send buffer stays fixed at 4 MiB
+            // because the stock Linux send autotuning ceiling (`tcp_wmem` max,
+            // 4 MiB) is below what a GB-level response stream needs, whereas the
+            // receive ceiling (`tcp_rmem` max, 6 MiB) already exceeds the old
+            // fixed request.
             // Some constrained local environments reject these socket options with
             // EPERM/ENOPROTOOPT-style failures; log and continue in that case.
-            if let Err(e) = socket.set_recv_buffer_size(4 * rustfs_config::MI_B) {
+            if recv_buffer_bytes > 0
+                && let Err(e) = socket.set_recv_buffer_size(recv_buffer_bytes)
+            {
                 debug!(
                     event = "socket_option_unavailable",
                     component = LOG_COMPONENT_SERVER,
@@ -1566,9 +1585,11 @@ pub async fn start_http_server(
             let socket_ref = SockRef::from(&socket);
 
             // ── POST-ACCEPT SOCKET SYSCALLS ──
-            // The listening socket already sets TCP_NODELAY, TCP_KEEPALIVE,
-            // SO_RCVBUF, and SO_SNDBUF. On Linux/BSD, these are inherited by
-            // accepted sockets, so we skip redundant re-application here.
+            // The listening socket already sets TCP_NODELAY, TCP_KEEPALIVE, and
+            // SO_SNDBUF (SO_RCVBUF stays kernel-autotuned unless
+            // RUSTFS_HTTP_SOCKET_RECV_BUFFER_BYTES is set, see the listener
+            // setup). On Linux/BSD, these are inherited by accepted sockets, so
+            // we skip redundant re-application here.
             //
             // Only TCP_QUICKACK (Linux) is kept — it is inherently per-connection
             // and NOT inherited from the listening socket.

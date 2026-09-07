@@ -159,6 +159,13 @@ fi
 
 case_field "$CASE_ID" name >/dev/null
 TEST_FILTER="$(test_filter_for "$CASE_ID")"
+case "$CASE_ID" in
+  background-target-crash|background-target-restart)
+    export RUSTFS_HEAL_CHAOS_OBJECT_COUNT="${RUSTFS_HEAL_CHAOS_OBJECT_COUNT:-64}"
+    export RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES="${RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES:-16777216}"
+    export RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS="${RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS:-120}"
+    ;;
+esac
 if [[ -z "$RUN_DIR" ]]; then
     RUN_DIR="$ROOT/target/scanner-heal-evidence/${CASE_ID}-$(date -u +%Y%m%dT%H%M%SZ)"
 elif [[ "$RUN_DIR" != /* ]]; then
@@ -197,6 +204,11 @@ fi
 printf '%s' "$BUILD_FEATURES" >"$ROOT/target/debug/rustfs.features"
 
 LISTING_TMP="$TMP_DIR/listing.json"
+NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}" \
+HTTP_PROXY= \
+HTTPS_PROXY= \
+RUSTFS_SCANNER_HEAL_RUN_DIR="$RUN_DIR" \
+cargo nextest run --profile "$PROFILE" -p e2e_test -E "$TEST_FILTER" --no-run --no-tests=fail
 cargo nextest list --profile "$PROFILE" -p e2e_test -E "$TEST_FILTER" --message-format json >"$LISTING_TMP"
 TEST_BINARY="$(test_binary_from_listing "$LISTING_TMP" "$CASE_ID")"
 

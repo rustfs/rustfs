@@ -997,10 +997,56 @@ pub struct Metrics {
     pub cpu: Option<CPUMetrics>,
     #[serde(rename = "rpc", skip_serializing_if = "Option::is_none")]
     pub rpc: Option<RPCMetrics>,
+    /// Absent means this node did not report HTTP outcomes, not zero traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpMetrics>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HttpMetrics {
+    #[serde(rename = "collected")]
+    pub collected_at: Timestamp,
+    pub requests: Vec<HttpRequestMetric>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpRequestMetric {
+    pub method: String,
+    pub operation: String,
+    pub outcome: String,
+    pub total: u64,
+}
+
+impl HttpMetrics {
+    fn merge(&mut self, other: &Self) {
+        self.collected_at = self.collected_at.max(other.collected_at);
+        let mut totals = std::collections::BTreeMap::new();
+        for series in self.requests.drain(..).chain(other.requests.iter().cloned()) {
+            let total = totals
+                .entry((series.method, series.operation, series.outcome))
+                .or_insert(0_u64);
+            *total = total.saturating_add(series.total);
+        }
+        self.requests = totals
+            .into_iter()
+            .map(|((method, operation, outcome), total)| HttpRequestMetric {
+                method,
+                operation,
+                outcome,
+                total,
+            })
+            .collect();
+    }
 }
 
 impl Metrics {
     pub fn merge(&mut self, other: &Self) {
+        if let Some(http) = &other.http {
+            match &mut self.http {
+                Some(existing) => existing.merge(http),
+                None => self.http = Some(http.clone()),
+            }
+        }
         if let Some(scanner) = other.scanner.as_ref() {
             match self.scanner {
                 Some(ref mut s_scanner) => s_scanner.merge(scanner),
@@ -1471,6 +1517,70 @@ mod tests {
 
     fn fixed_timestamp() -> Timestamp {
         Timestamp::constant(1_700_000_000, 123_456_000)
+    }
+
+    #[test]
+    fn http_metrics_merge_preserves_outcomes_and_missing_node_support() {
+        #[derive(Serialize, Deserialize, Default)]
+        #[serde(default)]
+        struct LegacyMetrics {
+            rpc: Option<RPCMetrics>,
+        }
+        let old_map = rmp_serde::to_vec_named(&LegacyMetrics::default()).expect("legacy map");
+        assert!(rmp_serde::from_slice::<Metrics>(&old_map).expect("new reader").http.is_none());
+        let missing: Metrics = serde_json::from_str("{}").expect("old node metrics");
+        assert!(missing.http.is_none());
+        let mut combined = RealtimeMetrics::default();
+        for (host, successes, failures) in [("node1", 99, 1), ("node2", 0, 100)] {
+            let metrics = Metrics {
+                http: Some(HttpMetrics {
+                    collected_at: fixed_timestamp(),
+                    requests: [("2xx", successes), ("5xx", failures)]
+                        .into_iter()
+                        .map(|(outcome, total)| HttpRequestMetric {
+                            method: "PUT".into(),
+                            operation: "s3:PutObject".into(),
+                            outcome: outcome.into(),
+                            total,
+                        })
+                        .collect(),
+                }),
+                ..Default::default()
+            };
+            let encoded = rmp_serde::to_vec_named(&metrics).expect("peer metric map");
+            let old_reader: LegacyMetrics = rmp_serde::from_slice(&encoded).expect("old reader ignores HTTP field");
+            assert!(old_reader.rpc.is_none());
+            let decoded: Metrics = rmp_serde::from_slice(&encoded).expect("peer metric roundtrip");
+            combined.merge(RealtimeMetrics {
+                aggregated: decoded,
+                by_host: HashMap::from([(host.into(), metrics)]),
+                hosts: vec![host.into()],
+                ..Default::default()
+            });
+        }
+        let aggregate = combined.aggregated.http.as_ref().expect("HTTP support");
+        assert_eq!(
+            aggregate
+                .requests
+                .iter()
+                .find(|s| s.outcome == "5xx")
+                .expect("failures")
+                .total,
+            101
+        );
+        assert_eq!(aggregate.requests.iter().map(|s| s.total).sum::<u64>(), 200);
+        assert_eq!(combined.by_host["node2"].http.as_ref().expect("node2").requests[1].total, 100);
+        combined.aggregated.merge(&missing);
+        assert_eq!(
+            combined
+                .aggregated
+                .http
+                .as_ref()
+                .expect("supported peers remain")
+                .requests
+                .len(),
+            2
+        );
     }
 
     #[test]
