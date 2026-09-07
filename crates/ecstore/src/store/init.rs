@@ -19507,7 +19507,7 @@ mod tests {
         for (index, point, expected_state, expected_revision, expected_committed, expected_recovered) in [
             (
                 0,
-                TransitionTransactionKillPoint::AfterPrePutFence,
+                TransitionTransactionKillPoint::PrePutFence,
                 TransitionTransactionState::UploadOutcomeUnknown,
                 1,
                 false,
@@ -19515,7 +19515,7 @@ mod tests {
             ),
             (
                 1,
-                TransitionTransactionKillPoint::AfterUploadBeforeCommitFence,
+                TransitionTransactionKillPoint::UploadBeforeCommitFence,
                 TransitionTransactionState::UploadOutcomeUnknown,
                 1,
                 false,
@@ -19523,7 +19523,7 @@ mod tests {
             ),
             (
                 2,
-                TransitionTransactionKillPoint::AfterLocalCommitBeforeDelete,
+                TransitionTransactionKillPoint::LocalCommitBeforeDelete,
                 TransitionTransactionState::LocalCommitStarted,
                 2,
                 true,
@@ -19531,7 +19531,7 @@ mod tests {
             ),
             (
                 3,
-                TransitionTransactionKillPoint::AfterCommitFenceBeforeLocalCommit,
+                TransitionTransactionKillPoint::CommitFenceBeforeLocalCommit,
                 TransitionTransactionState::LocalCommitStarted,
                 2,
                 false,
@@ -19596,7 +19596,7 @@ mod tests {
                 paused_source.transitioned_object.status == rustfs_filemeta::TRANSITION_COMPLETE,
                 expected_committed
             );
-            let expected_remote_at_pause = remote_before + usize::from(point != TransitionTransactionKillPoint::AfterPrePutFence);
+            let expected_remote_at_pause = remote_before + usize::from(point != TransitionTransactionKillPoint::PrePutFence);
             assert_eq!(backend.object_count().await, expected_remote_at_pause);
 
             let stats = recover_transition_transaction_records_at(
@@ -19620,8 +19620,8 @@ mod tests {
             }
             let expected_remote_after_recovery = if matches!(
                 point,
-                TransitionTransactionKillPoint::AfterLocalCommitBeforeDelete
-                    | TransitionTransactionKillPoint::AfterCommitFenceBeforeLocalCommit
+                TransitionTransactionKillPoint::LocalCommitBeforeDelete
+                    | TransitionTransactionKillPoint::CommitFenceBeforeLocalCommit
             ) {
                 remote_before + 1
             } else {

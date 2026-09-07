@@ -6336,10 +6336,10 @@ async fn pause_after_transition_uploaded_persisted(bucket: &str, object: &str) {
 #[cfg(all(test, feature = "test-util"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TransitionTransactionKillPoint {
-    AfterPrePutFence,
-    AfterUploadBeforeCommitFence,
-    AfterCommitFenceBeforeLocalCommit,
-    AfterLocalCommitBeforeDelete,
+    PrePutFence,
+    UploadBeforeCommitFence,
+    CommitFenceBeforeLocalCommit,
+    LocalCommitBeforeDelete,
 }
 
 #[cfg(all(test, feature = "test-util"))]
@@ -9201,7 +9201,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         .map_err(Error::other)?;
         save_transition_transaction_if_available(transaction_api.as_ref(), &transaction).await?;
         #[cfg(all(test, feature = "test-util"))]
-        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::AfterPrePutFence).await;
+        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::PrePutFence).await;
         let transaction_id = transaction.transaction_id;
         let dest_obj = transaction.remote_object.clone();
         let mut transition_meta = (*oi.user_defined).clone();
@@ -9371,7 +9371,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         #[cfg(all(test, feature = "test-util"))]
         pause_after_transition_uploaded_persisted(bucket, object).await;
         #[cfg(all(test, feature = "test-util"))]
-        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::AfterUploadBeforeCommitFence).await;
+        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::UploadBeforeCommitFence).await;
 
         let commit_opts = opts.as_commit_opts();
         // Note: Using clone() here is necessary because ObjectOptions has 124 fields.
@@ -9512,7 +9512,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
         upload_cleanup.update_cleanup_transaction(&transaction);
         #[cfg(all(test, feature = "test-util"))]
-        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::AfterCommitFenceBeforeLocalCommit).await;
+        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::CommitFenceBeforeLocalCommit).await;
         upload_cleanup.disarm();
         if let Err(err) = self.delete_object_version(bucket, object, &fi, false).await {
             warn!(
@@ -9526,7 +9526,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             return Err(err);
         }
         #[cfg(all(test, feature = "test-util"))]
-        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::AfterLocalCommitBeforeDelete).await;
+        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::LocalCommitBeforeDelete).await;
         if compact_transition_transaction {
             if let Err(err) = delete_transition_transaction_if_available(transaction_api.as_ref(), &transaction).await {
                 warn!(
