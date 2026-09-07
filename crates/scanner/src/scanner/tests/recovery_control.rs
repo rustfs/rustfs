@@ -244,6 +244,75 @@ async fn scanner_recovery_intent_accept_is_durable_and_idempotent() {
 
 #[tokio::test]
 #[serial]
+async fn scanner_recovery_intent_executor_persists_completed_progress() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let request = recovery_intent_request("intent-key-0001-exec", "operator-a");
+
+    let record = match accept_scanner_usage_recovery_intent(store.clone(), request.clone())
+        .await
+        .expect("intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("first request must create a durable intent: {other:?}"),
+    };
+
+    let reset = run_scanner_usage_recovery_intent(CancellationToken::new(), store.clone(), record.intent_id.clone())
+        .await
+        .expect("accepted intent should execute")
+        .expect("accepted intent should produce a reset");
+    assert_eq!(reset.status, "reset");
+    assert_eq!(reset.mode, "full-rebuild");
+
+    let completed = get_scanner_usage_recovery_intent(store.clone(), &record.intent_id)
+        .await
+        .expect("completed intent should read")
+        .expect("completed intent should remain durable");
+    assert_eq!(completed.state, "completed");
+    assert_eq!(completed.intent_id, record.intent_id);
+
+    let restarted = restart_scanner_cycle_store_from(&store).await;
+    let replay = accept_scanner_usage_recovery_intent(restarted.clone(), request)
+        .await
+        .expect("lost response retry should return the durable completed intent");
+    assert_eq!(replay, ScannerRecoveryIntentAcceptResult::Replayed { record: completed });
+    let rerun = run_scanner_usage_recovery_intent(CancellationToken::new(), restarted, record.intent_id)
+        .await
+        .expect("terminal intent should not be an execution error");
+    assert!(rerun.is_none(), "completed intent must not start a second reset");
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_recovery_intent_executor_persists_failed_progress() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let record = match accept_scanner_usage_recovery_intent(
+        store.clone(),
+        recovery_intent_request("intent-key-0001-failed", "operator-a"),
+    )
+    .await
+    .expect("intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("first request must create a durable intent: {other:?}"),
+    };
+
+    let ctx = CancellationToken::new();
+    ctx.cancel();
+    let error = run_scanner_usage_recovery_intent(ctx, store.clone(), record.intent_id.clone())
+        .await
+        .expect_err("cancelled intent execution should fail");
+    assert!(error.to_string().contains("cancelled"), "{error}");
+
+    let failed = get_scanner_usage_recovery_intent(store, &record.intent_id)
+        .await
+        .expect("failed intent should read")
+        .expect("failed intent should remain durable");
+    assert_eq!(failed.state, "failed");
+    assert_eq!(failed.intent_id, record.intent_id);
+}
+
+#[tokio::test]
+#[serial]
 async fn scanner_recovery_intent_rejects_same_namespace_conflict() {
     let (_dir, store) = setup_scanner_cycle_store().await;
     let request = recovery_intent_request("intent-key-0002", "operator-a");

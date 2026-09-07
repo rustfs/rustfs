@@ -369,6 +369,18 @@ fn scanner_recovery_intent_accept_response(
     }
 }
 
+fn scanner_recovery_intent_executor_id(result: &rustfs_scanner::ScannerRecoveryIntentAcceptResult) -> Option<String> {
+    match result {
+        rustfs_scanner::ScannerRecoveryIntentAcceptResult::Accepted { record }
+        | rustfs_scanner::ScannerRecoveryIntentAcceptResult::Replayed { record }
+            if matches!(record.state.as_str(), "accepted" | "running") =>
+        {
+            Some(record.intent_id.clone())
+        }
+        _ => None,
+    }
+}
+
 pub struct ScannerStatusHandler {}
 
 #[async_trait::async_trait]
@@ -466,9 +478,20 @@ impl Operation for ScannerUsageStateResetHandler {
                 idempotency_key,
                 actor_sha256: rustfs_scanner::scanner_recovery_actor_sha256(&_cred.access_key),
             };
+            let executor_store = store.clone();
             let accepted = rustfs_scanner::accept_scanner_usage_recovery_intent(store, request)
                 .await
                 .map_err(scanner_recovery_intent_error)?;
+            if let Some(intent_id) = scanner_recovery_intent_executor_id(&accepted) {
+                tokio::spawn(async move {
+                    let _ = rustfs_scanner::scanner::run_scanner_usage_recovery_intent(
+                        CancellationToken::new(),
+                        executor_store,
+                        intent_id,
+                    )
+                    .await;
+                });
+            }
             return scanner_recovery_intent_accept_response(accepted);
         }
         if reset.idempotency_key.is_some() {
@@ -647,6 +670,53 @@ mod tests {
                 .expect("accepted intent response");
 
         assert_eq!(response.output.0, StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn scanner_recovery_intent_executor_only_starts_non_terminal_work() {
+        let mut record = rustfs_scanner::ScannerRecoveryIntentRecord {
+            schema_version: 1,
+            intent_id: "0".repeat(64),
+            action: rustfs_scanner::SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD.to_string(),
+            mode: "full-rebuild".to_string(),
+            state: "accepted".to_string(),
+            actor_sha256: "1".repeat(64),
+            idempotency_key_sha256: "2".repeat(64),
+            request_sha256: "3".repeat(64),
+            accepted_at_unix_secs: 7,
+        };
+
+        assert_eq!(
+            scanner_recovery_intent_executor_id(&rustfs_scanner::ScannerRecoveryIntentAcceptResult::Accepted {
+                record: record.clone(),
+            })
+            .as_deref(),
+            Some(record.intent_id.as_str())
+        );
+        record.state = "running".to_string();
+        assert_eq!(
+            scanner_recovery_intent_executor_id(&rustfs_scanner::ScannerRecoveryIntentAcceptResult::Replayed {
+                record: record.clone(),
+            })
+            .as_deref(),
+            Some(record.intent_id.as_str())
+        );
+        record.state = "completed".to_string();
+        assert!(
+            scanner_recovery_intent_executor_id(&rustfs_scanner::ScannerRecoveryIntentAcceptResult::Replayed {
+                record: record.clone(),
+            })
+            .is_none()
+        );
+        assert!(
+            scanner_recovery_intent_executor_id(&rustfs_scanner::ScannerRecoveryIntentAcceptResult::Conflict {
+                existing: rustfs_scanner::ScannerRecoveryIntentConflict {
+                    intent_id: record.intent_id,
+                    state: "accepted".to_string(),
+                },
+            })
+            .is_none()
+        );
     }
 
     #[test]
