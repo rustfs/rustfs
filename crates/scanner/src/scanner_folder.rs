@@ -833,9 +833,17 @@ impl RawEnumerationProgress {
     }
 
     fn page_index(&self) -> Option<RawEnumerationPageIndex> {
-        self.page_index.clone().and_then(|index| match index.indexed_entries() {
-            Ok(entries) if !entries.is_empty() => Some(index),
-            _ => None,
+        self.page_index.clone().and_then(|mut index| {
+            if let Some(generation) = index.generation()
+                && matches!(index.status(), crate::raw_page_index::RawEnumerationPageOwnerStatus::Building { .. })
+                && index.commit_building_page(generation).is_err()
+            {
+                return None;
+            }
+            match index.indexed_entries() {
+                Ok(entries) if !entries.is_empty() => Some(index),
+                _ => None,
+            }
         })
     }
 }
@@ -1131,6 +1139,29 @@ impl FolderScanner {
         if let Some(progress) = self.raw_enumeration_progress.last_mut() {
             progress.record_entry(entry);
         }
+    }
+
+    fn raw_enumeration_committed_entry_oracle(&self, parent: &str) -> HashSet<String> {
+        let Some(index) = self.old_cache.validated_raw_enumeration_page_index() else {
+            return HashSet::new();
+        };
+        let generation_matches_parent = match index.status() {
+            crate::raw_page_index::RawEnumerationPageOwnerStatus::Building {
+                generation,
+                parent: index_parent,
+                ..
+            }
+            | crate::raw_page_index::RawEnumerationPageOwnerStatus::Ready {
+                generation,
+                parent: index_parent,
+                ..
+            } => generation > 0 && index_parent == parent,
+            crate::raw_page_index::RawEnumerationPageOwnerStatus::Unsupported => false,
+        };
+        if !generation_matches_parent {
+            return HashSet::new();
+        }
+        index.committed_entries().unwrap_or_default().into_iter().collect()
     }
 
     fn finish_raw_enumeration_parent(&mut self, parent: &str) {
@@ -1481,6 +1512,7 @@ impl FolderScanner {
             let mut pending_entry_progress = 0_u64;
             let mut last_entry_progress = Instant::now();
             let mut raw_enumeration_complete = false;
+            let raw_enumeration_committed_entries = self.raw_enumeration_committed_entry_oracle(&folder.name);
 
             loop {
                 let entry = match dir_reader.next_entry().await {
@@ -1519,19 +1551,22 @@ impl FolderScanner {
                     }
                     Err(e) => return Err(ScannerError::Io(e)),
                 };
-                #[cfg(test)]
-                tests::enumeration_restart::observe_raw_entry(&dir_path, &entry.file_name(), &self.budget);
-                pending_entry_progress = pending_entry_progress.saturating_add(1);
-                if pending_entry_progress >= SCANNER_ENTRY_PROGRESS_BATCH
-                    || last_entry_progress.elapsed() >= SCANNER_ENTRY_PROGRESS_INTERVAL
-                {
-                    self.budget.record_entries_visited(pending_entry_progress);
-                    pending_entry_progress = 0;
-                    last_entry_progress = Instant::now();
-                }
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if file_name.is_empty() || file_name == "." || file_name == ".." {
                     continue;
+                }
+                let raw_entry_consumed_by_owner_index = raw_enumeration_committed_entries.contains(&file_name);
+                if !raw_entry_consumed_by_owner_index {
+                    #[cfg(test)]
+                    tests::enumeration_restart::observe_raw_entry(&dir_path, &entry.file_name(), &self.budget);
+                    pending_entry_progress = pending_entry_progress.saturating_add(1);
+                    if pending_entry_progress >= SCANNER_ENTRY_PROGRESS_BATCH
+                        || last_entry_progress.elapsed() >= SCANNER_ENTRY_PROGRESS_INTERVAL
+                    {
+                        self.budget.record_entries_visited(pending_entry_progress);
+                        pending_entry_progress = 0;
+                        last_entry_progress = Instant::now();
+                    }
                 }
                 self.record_raw_enumeration_entry(&folder.name, &file_name);
                 let is_storage_format_entry = file_name == STORAGE_FORMAT_FILE;

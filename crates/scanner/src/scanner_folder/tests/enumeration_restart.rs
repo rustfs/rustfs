@@ -29,6 +29,9 @@ pub(in crate::scanner_folder) fn observe_raw_entry(dir: &str, name: &std::ffi::O
         let relative_dir = Path::new(dir)
             .strip_prefix(&observation.root)
             .unwrap_or_else(|_| Path::new(""));
+        if relative_dir.components().count() != 1 {
+            return;
+        }
         let entry_marker = relative_dir.join(name).to_string_lossy().to_string();
         observation.first_entry.get_or_insert_with(|| entry_marker.clone());
         observation.last_entry = Some(entry_marker);
@@ -130,7 +133,13 @@ async fn round(request: &Request) -> serde_json::Value {
     .await
     .expect("open synthetic disk in this process");
     let parent = CancellationToken::new();
-    let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
+    let budget = ScannerCycleBudget::new_with_progress_tracking(
+        &parent,
+        crate::scanner_budget::ScannerCycleBudgetConfig {
+            max_objects: Some(request.raw_entry_budget),
+            ..Default::default()
+        },
+    );
     let _observation_guard = install_raw_entry_budget(disk.path(), request.raw_entry_budget);
     let result = scan_data_folder(
         budget.token(),
@@ -157,6 +166,16 @@ async fn round(request: &Request) -> serde_json::Value {
     let reloaded = DataUsageCache::unmarshal(&read_bounded(&cache_path).await).expect("reload returned cache codec");
     let retained = reloaded.checked_flatten("bucket").expect("reloaded bucket root");
     let scanned = returned.checked_flatten("bucket").expect("returned bucket root");
+    let raw_page_index_committed_entries = reloaded
+        .validated_raw_enumeration_page_index()
+        .and_then(|index| index.committed_entries().ok())
+        .map(|entries| entries.len())
+        .unwrap_or(0);
+    let raw_page_index_indexed_entries = reloaded
+        .validated_raw_enumeration_page_index()
+        .and_then(|index| index.indexed_entries().ok())
+        .map(|entries| entries.len())
+        .unwrap_or(0);
     assert_eq!(
         (retained.objects, retained.versions, retained.size),
         (scanned.objects, scanned.versions, scanned.size)
@@ -169,6 +188,8 @@ async fn round(request: &Request) -> serde_json::Value {
         "objects_expected": request.objects, "raw_entry_budget": request.raw_entry_budget,
         "raw_entries": observation.entries, "raw_name_bytes": observation.name_bytes,
         "raw_first_entry": observation.first_entry, "raw_last_entry": observation.last_entry,
+        "raw_page_index_committed_entries": raw_page_index_committed_entries,
+        "raw_page_index_indexed_entries": raw_page_index_indexed_entries,
         "objects_processed": budget.progress().0,
         "objects_before": before, "objects_retained": retained.objects,
         "versions_retained": retained.versions, "bytes_retained": retained.size,
@@ -194,16 +215,16 @@ async fn enumeration_restart_worker() {
         let temp = tempfile::tempdir().expect("healthy fixture directory");
         let report = round(&Request {
             workspace: temp.path().to_path_buf(),
-            objects: 4,
+            objects: 8,
             raw_entry_budget: 16,
             round: 0,
         })
         .await;
         assert_eq!(report["outcome"], "complete");
         assert_eq!(report["snapshot_complete"], true);
-        assert_eq!(report["objects_retained"], 4);
-        assert_eq!(report["versions_retained"], 4);
-        assert_eq!(report["bytes_retained"], 4);
+        assert_eq!(report["objects_retained"], 8);
+        assert_eq!(report["versions_retained"], 8);
+        assert_eq!(report["bytes_retained"], 8);
         assert!(report["raw_entries"].as_u64().expect("observed entries") >= 8, "{report}");
     }
 }

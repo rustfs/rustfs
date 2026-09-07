@@ -30,15 +30,21 @@ def validate_report(report, *, round_number, pid, objects, budget):
         if type(report.get(key)) is not int or report[key] != value:
             raise ValueError(f"worker report mismatch: {key}")
     for key in ("raw_entries", "raw_name_bytes", "objects_before", "objects_retained",
-                "versions_retained", "bytes_retained", "objects_processed"):
+                "versions_retained", "bytes_retained", "objects_processed",
+                "raw_page_index_committed_entries", "raw_page_index_indexed_entries"):
         if type(report.get(key)) is not int or not 0 <= report[key] <= 1048576:
             raise ValueError(f"invalid bounded counter: {key}")
-    if report["raw_entries"] == 0:
+    made_budgeted_object_progress = report["objects_processed"] > 0
+    if report["raw_entries"] == 0 and not made_budgeted_object_progress:
         raise ValueError("nonempty fixture must observe raw entries; budget hook may not have run")
     if report["raw_entries"] > budget:
         raise ValueError("raw-entry budget exceeded; no unbudgeted tail is permitted")
+    if report["objects_processed"] > budget:
+        raise ValueError("object budget exceeded; no unbudgeted scan tail is permitted")
     for key in ("raw_first_entry", "raw_last_entry"):
         value = report.get(key)
+        if report["raw_entries"] == 0 and made_budgeted_object_progress and value is None:
+            continue
         if type(value) is not str or not 0 < len(value.encode("utf-8")) <= 512:
             raise ValueError(f"invalid raw entry marker: {key}")
     if type(report.get("snapshot_complete")) is not bool:

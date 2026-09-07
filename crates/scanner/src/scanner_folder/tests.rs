@@ -2733,8 +2733,15 @@ async fn test_scan_data_folder_returns_raw_cursor_on_enumeration_cancel_without_
         1
     );
     assert_eq!(
-        page_index.committed_entries().expect("uncommitted raw page should validate"),
-        Vec::<String>::new()
+        page_index
+            .committed_entries()
+            .expect("checkpointed raw page should validate as committed coverage"),
+        vec![
+            raw_cursor
+                .last_entry
+                .clone()
+                .expect("checkpointed page should include the observed entry")
+        ]
     );
     assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Runtime));
 }
@@ -3410,7 +3417,27 @@ fn raw_enumeration_progress_waits_for_resume_index_floor_before_revalidation() {
 }
 
 #[test]
-fn raw_enumeration_progress_rejects_resume_index_after_floor_mismatch() {
+fn raw_enumeration_progress_checkpoint_commits_budgeted_page_for_oracle() {
+    let mut progress = RawEnumerationProgress::new("bucket", None);
+    progress.record_entry("entry-b");
+
+    let page_index = progress
+        .page_index()
+        .expect("checkpointed raw progress should retain a committed owner page");
+    let page_entries = page_index
+        .committed_entries()
+        .expect("checkpointed owner page should validate by digest");
+    assert_eq!(page_entries, vec!["entry-b".to_string()]);
+    assert_eq!(
+        page_index
+            .indexed_entries()
+            .expect("checkpointed owner index should validate"),
+        page_entries
+    );
+}
+
+#[test]
+fn raw_enumeration_progress_retains_resume_index_until_unordered_entries_reappear() {
     let mut index = RawEnumerationPageIndex::new("bucket", 2).expect("raw page index should initialize");
     let generation = index.generation().expect("raw page index should expose generation");
     index
@@ -3425,7 +3452,13 @@ fn raw_enumeration_progress_rejects_resume_index_after_floor_mismatch() {
 
     progress.record_entry("entry-c");
     assert!(
-        progress.page_index.is_none(),
-        "resume index must be discarded once enough current observations prove source drift"
+        progress.page_index.is_some(),
+        "partial observations must not discard the resume index before an unordered old entry can reappear"
+    );
+
+    progress.record_entry("entry-b");
+    assert!(
+        progress.page_index.is_some(),
+        "same source identity should keep the resume index even when read_dir order changes"
     );
 }

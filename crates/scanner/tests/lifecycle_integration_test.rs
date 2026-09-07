@@ -2552,7 +2552,7 @@ mod serial_tests {
                 .expect("Failed to upload multipart part");
             completed.push(CompletePart {
                 part_num: idx + 1,
-                etag: part.etag.clone(),
+                etag: part.etag,
                 ..Default::default()
             });
             offset += part_size;

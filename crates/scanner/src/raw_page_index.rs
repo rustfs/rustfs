@@ -195,10 +195,10 @@ impl RawEnumerationPageIndex {
         if inner.generation != expected_generation {
             return Err(RawEnumerationPageIndexError::StaleGeneration);
         }
-        let mut entries = normalize_owner_entries(entries)?;
+        let entries = normalize_owner_entries(entries)?;
         let committed_entries = inner.validated_committed_entries()?;
         if inner.complete {
-            if entries != committed_entries {
+            if !entry_sets_match(&entries, &committed_entries) {
                 return Err(RawEnumerationPageIndexError::IdentityMismatch);
             }
             return Ok(RawEnumerationPageBuildOutcome {
@@ -207,23 +207,24 @@ impl RawEnumerationPageIndex {
             });
         }
 
-        if !entries.starts_with(&committed_entries) {
+        if source_complete && !entries_contain_all(&entries, &committed_entries) {
             return Err(RawEnumerationPageIndexError::IdentityMismatch);
         }
 
-        let mut indexed_entries = committed_entries.len();
+        let mut indexed_entries = committed_entries.clone();
         if let Some(building) = &inner.building {
             building.validate(
                 u64::try_from(inner.pages.len()).unwrap_or(u64::MAX),
                 u64::try_from(committed_entries.len()).unwrap_or(u64::MAX),
                 inner.page_entry_limit,
             )?;
-            if !entries[committed_entries.len()..].starts_with(&building.entries) {
+            if source_complete && !entries_contain_all(&entries, &building.entries) {
                 return Err(RawEnumerationPageIndexError::IdentityMismatch);
             }
-            indexed_entries = indexed_entries.saturating_add(building.entries.len());
+            indexed_entries.extend(building.entries.iter().cloned());
         }
-        if source_complete && indexed_entries == entries.len() && inner.building.is_none() {
+        let indexed_entries = normalize_owner_entries(indexed_entries)?;
+        if source_complete && entry_sets_match(&entries, &indexed_entries) && inner.building.is_none() {
             inner.complete = true;
             inner.generation = inner.generation.saturating_add(1);
             return Ok(RawEnumerationPageBuildOutcome {
@@ -232,6 +233,7 @@ impl RawEnumerationPageIndex {
             });
         }
 
+        let mut drop_empty_building = false;
         let ready_to_commit = {
             let page_index = u64::try_from(inner.pages.len()).unwrap_or(u64::MAX);
             let entries_start = u64::try_from(committed_entries.len()).unwrap_or(u64::MAX);
@@ -245,25 +247,39 @@ impl RawEnumerationPageIndex {
                 true
             } else {
                 let remaining_page_slots = inner.page_entry_limit.saturating_sub(building.entries.len());
-                let append_count = max_new_entries
-                    .min(remaining_page_slots)
-                    .min(entries.len().saturating_sub(indexed_entries));
+                let append_entries = entries
+                    .iter()
+                    .filter(|entry| indexed_entries.binary_search(entry).is_err())
+                    .take(max_new_entries.min(remaining_page_slots))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let append_count = append_entries.len();
                 if append_count == 0 {
                     if source_complete && !building.terminal {
                         building.terminal = true;
                         inner.generation = inner.generation.saturating_add(1);
+                    } else if building.entries.is_empty() {
+                        drop_empty_building = true;
                     }
                 } else {
-                    let source_entries = entries.len();
-                    building
-                        .entries
-                        .extend(entries.drain(indexed_entries..indexed_entries + append_count));
-                    building.terminal = source_complete && indexed_entries.saturating_add(append_count) == source_entries;
+                    building.entries.extend(append_entries);
+                    building.entries.sort();
+                    building.entries.dedup();
+                    let source_entries_indexed = source_complete && {
+                        let mut indexed_after_append = indexed_entries;
+                        indexed_after_append.extend(building.entries.iter().cloned());
+                        let indexed_after_append = normalize_owner_entries(indexed_after_append)?;
+                        entry_sets_match(&indexed_after_append, &entries)
+                    };
+                    building.terminal = source_entries_indexed;
                     inner.generation = inner.generation.saturating_add(1);
                 }
                 !building.entries.is_empty() && (building.terminal || building.entries.len() >= inner.page_entry_limit)
             }
         };
+        if drop_empty_building {
+            inner.building = None;
+        }
 
         Ok(RawEnumerationPageBuildOutcome {
             status: inner.status(),
@@ -368,6 +384,12 @@ impl RawEnumerationPageIndexInner {
             entries.extend(page.entries.iter().cloned());
         }
         if self.complete && self.pages.last().is_some_and(|page| !page.terminal) {
+            return Err(RawEnumerationPageIndexError::CorruptIndex);
+        }
+        let mut unique_entries = entries.clone();
+        unique_entries.sort();
+        unique_entries.dedup();
+        if unique_entries.len() != entries.len() {
             return Err(RawEnumerationPageIndexError::CorruptIndex);
         }
         Ok(entries)
@@ -495,6 +517,14 @@ fn entries_are_normalized(entries: &[String]) -> bool {
         && entries
             .windows(2)
             .all(|window| window.first().zip(window.get(1)).is_some_and(|(left, right)| left < right))
+}
+
+fn entries_contain_all(entries: &[String], required: &[String]) -> bool {
+    required.iter().all(|entry| entries.binary_search(entry).is_ok())
+}
+
+fn entry_sets_match(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len() && entries_contain_all(left, right)
 }
 
 fn raw_page_digest(parent: &str, building: &RawEnumerationPageBuilder) -> [u8; 32] {
@@ -752,6 +782,26 @@ mod tests {
     }
 
     #[test]
+    fn complete_owner_source_missing_committed_entry_fails_closed() {
+        let mut owner = RawEnumerationPageIndex::new("bucket", 2).expect("page owner should initialize");
+        let generation = owner.generation().expect("supported owner should expose generation");
+        owner
+            .ingest_owner_entries(entries(&["entry-a", "entry-b"]), 2, generation)
+            .expect("initial complete source should build a committed page");
+        let generation = owner.generation().expect("supported owner should expose generation");
+        owner
+            .commit_building_page(generation)
+            .expect("initial committed page should validate");
+
+        let generation = owner.generation().expect("supported owner should expose generation");
+        assert_eq!(
+            owner.ingest_owner_entries(entries(&["entry-a", "entry-c"]), 2, generation),
+            Err(RawEnumerationPageIndexError::IdentityMismatch),
+            "only complete source identity can prove a previously committed raw entry disappeared"
+        );
+    }
+
+    #[test]
     fn terminal_marker_advances_generation_before_commit() {
         let initial_source = entries(&["entry-a", "entry-b", "entry-c"]);
         let current_source = entries(&["entry-a", "entry-b"]);
@@ -862,6 +912,40 @@ mod tests {
         );
         assert_eq!(
             decoded.commit_building_page(decoded.generation().expect("decoded owner should expose generation")),
+            Err(RawEnumerationPageIndexError::CorruptIndex)
+        );
+    }
+
+    #[test]
+    fn deserialized_duplicate_entries_across_pages_fail_closed() {
+        let mut owner = RawEnumerationPageIndex::new("bucket", 1).expect("page owner should initialize");
+        for source in [entries(&["entry-b"]), entries(&["entry-b", "entry-a"])] {
+            let generation = owner.generation().expect("owner should expose generation");
+            let outcome = owner
+                .ingest_partial_owner_entries(source, 1, generation)
+                .expect("single entry page should build");
+            assert!(outcome.ready_to_commit);
+            let generation = owner.generation().expect("ready page should expose generation");
+            owner
+                .commit_building_page(generation)
+                .expect("single entry page should commit");
+        }
+
+        let encoded = rmp_serde::to_vec(&owner).expect("page index should encode");
+        let mut decoded: RawEnumerationPageIndex = rmp_serde::from_slice(&encoded).expect("page index should decode");
+        let RawEnumerationPageIndexState::Supported(inner) = &mut decoded.state else {
+            panic!("decoded owner should be supported");
+        };
+        inner.pages[1] = inner.pages[0].clone();
+
+        assert_eq!(decoded.committed_entries(), Err(RawEnumerationPageIndexError::CorruptIndex));
+        assert_eq!(decoded.indexed_entries(), Err(RawEnumerationPageIndexError::CorruptIndex));
+        assert_eq!(
+            decoded.ingest_partial_owner_entries(
+                entries(&["entry-a", "entry-b"]),
+                1,
+                decoded.generation().expect("decoded owner should expose generation")
+            ),
             Err(RawEnumerationPageIndexError::CorruptIndex)
         );
     }
