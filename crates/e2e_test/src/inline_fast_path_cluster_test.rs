@@ -1676,6 +1676,8 @@ async fn four_node_inline_storage_and_get_boundaries() -> TestResult {
     let collector = OtlpMetricCollector::start().await?;
     let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
     configure_reader_metric_cluster(&mut cluster, &collector);
+    // Inspect every disk only after the PUT rename fanout has drained.
+    cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
     cluster.start().await?;
 
     for (state_index, state) in [VersionState::Unversioned, VersionState::Enabled, VersionState::Suspended]
