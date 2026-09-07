@@ -627,7 +627,7 @@ async fn put_bucket_replication_rules(
     Ok(())
 }
 
-async fn delete_bucket_replication(
+pub(crate) async fn delete_bucket_replication(
     env: &RustFSTestEnvironment,
     bucket: &str,
 ) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
