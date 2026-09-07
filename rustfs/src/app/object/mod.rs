@@ -121,7 +121,7 @@ use crate::error::ApiError;
 use crate::shared_types::convert_ecstore_object_info;
 use crate::table_catalog;
 use bytes::{BufMut as _, Bytes, BytesMut};
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::{Digest as Md5Digest, Md5};
 use metrics::{counter, histogram};
