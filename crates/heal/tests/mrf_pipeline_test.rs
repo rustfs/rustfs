@@ -31,7 +31,7 @@ use rustfs_heal::heal::{
 use serial_test::serial;
 use std::{
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::Arc,
     time::Duration,
 };
@@ -463,6 +463,56 @@ fn mrf_successor_flush_child_process_fixture() {
     std::process::exit(78);
 }
 
+#[test]
+#[cfg(unix)]
+fn mrf_successor_flush_waiting_child_process_fixture() {
+    let Ok(root) = std::env::var("RUSTFS_MRF_SUCCESSOR_KILL_CHILD_ROOT") else {
+        return;
+    };
+    let ready_path = std::env::var("RUSTFS_MRF_SUCCESSOR_KILL_READY")
+        .map(PathBuf::from)
+        .expect("ready marker path should be provided");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("child runtime should build");
+    runtime.block_on(async {
+        let (disk_paths, storage) = heal_env_at(Some(Path::new(&root))).await;
+        register_local_disks(&disk_paths, "mrf-successor-kill-child").await;
+
+        let mut startup = journal_record(1, "service-kill-bucket", "first-object", None, 0);
+        startup.extend(journal_record(1, "service-kill-bucket", "second-object", None, 0));
+        write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &startup);
+        write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &startup);
+
+        let manager = Arc::new(HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                heal_interval: Duration::from_secs(3600),
+                enable_auto_heal: false,
+                ..Default::default()
+            }),
+        ));
+        mrf_queue::spawn_mrf_consumer(manager.clone());
+        let expected_successor = journal_record(1, "service-kill-bucket", "second-object", None, 2);
+        let flushed = wait_until(Duration::from_secs(10), || async {
+            manager.operations_snapshot().await.queued_by_source.mrf == 1
+                && journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &expected_successor)
+                && journal_matches_on_all_disks(&disk_paths, JOURNAL_REL, &expected_successor)
+        })
+        .await;
+        assert!(
+            flushed,
+            "child process must publish the pending successor snapshot before it can be killed"
+        );
+        std::fs::write(&ready_path, b"ready").expect("write ready marker");
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+}
+
 /// A journal published by a different OS process must remain a durable anchor
 /// when the restarted process can only admit a prefix of the replayed intents.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -543,5 +593,58 @@ async fn journal_replay_survives_successor_flush_before_delete() {
                 && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
         }),
         "a fully consumed successor snapshot may be deleted after restart replay"
+    );
+}
+
+/// A service-style hard kill after successor flush must be equivalent to a
+/// crash at the flush-before-delete boundary: restart may replay the smaller
+/// successor snapshot, but must not lose or merge stale startup records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[cfg(unix)]
+async fn journal_replay_survives_service_kill_after_successor_flush() {
+    let temp_dir = tempfile::tempdir().expect("successor-kill MRF root");
+    let ready = temp_dir.path().join("successor-flushed.ready");
+    let mut child = Command::new(std::env::current_exe().expect("test binary path"))
+        .arg("mrf_successor_flush_waiting_child_process_fixture")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("RUSTFS_MRF_SUCCESSOR_KILL_CHILD_ROOT", temp_dir.path())
+        .env("RUSTFS_MRF_SUCCESSOR_KILL_READY", &ready)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("child MRF successor fixture should start");
+    let ready_seen = wait_until(Duration::from_secs(10), || {
+        let ready = ready.clone();
+        async move { ready.exists() }
+    })
+    .await;
+    assert!(ready_seen, "child process did not reach the successor flush boundary");
+    child.kill().expect("kill child fixture");
+    let status = child.wait().expect("wait for killed child fixture");
+    assert!(!status.success(), "child fixture must be terminated instead of exiting cleanly");
+
+    let (disk_paths, storage) = heal_env_at(Some(temp_dir.path())).await;
+    let expected_successor = journal_record(1, "service-kill-bucket", "second-object", None, 2);
+    assert!(
+        journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &expected_successor),
+        "restarted process must see the successor snapshot produced before the kill"
+    );
+
+    let restarted = make_manager(storage);
+    let replayed = mrf_queue::replay_journal_once(&restarted).await;
+    assert_eq!(replayed, 1, "restart after service kill must replay only the still-pending tail");
+    assert_eq!(
+        restarted.operations_snapshot().await.queued_by_source.mrf,
+        1,
+        "the successor tail must be accepted after service kill restart"
+    );
+    assert!(
+        disk_paths.iter().all(|path| {
+            !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+                && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+        }),
+        "a fully consumed successor snapshot may be deleted after service-kill restart replay"
     );
 }
