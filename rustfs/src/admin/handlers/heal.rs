@@ -339,6 +339,19 @@ fn add_source_counts(total: &mut rustfs_heal::HealSourceCounts, next: rustfs_hea
     total.mrf = total.mrf.saturating_add(next.mrf);
 }
 
+fn add_admission_telemetry(total: &mut rustfs_heal::HealAdmissionTelemetry, next: rustfs_heal::HealAdmissionTelemetry) {
+    total.accepted = total.accepted.saturating_add(next.accepted);
+    total.merged = total.merged.saturating_add(next.merged);
+    total.full = total.full.saturating_add(next.full);
+    total.dropped = total.dropped.saturating_add(next.dropped);
+    total.duplicate = total.duplicate.saturating_add(next.duplicate);
+    total.overlap_rejected = total.overlap_rejected.saturating_add(next.overlap_rejected);
+    total.displaced = total.displaced.saturating_add(next.displaced);
+    total.force_start = total.force_start.saturating_add(next.force_start);
+    total.max_start_duration_micros = total.max_start_duration_micros.max(next.max_start_duration_micros);
+    total.max_lock_phase_micros = total.max_lock_phase_micros.max(next.max_lock_phase_micros);
+}
+
 fn add_operations(total: &mut rustfs_heal::HealOperationsSnapshot, next: rustfs_heal::HealOperationsSnapshot) {
     total.queue_length = total.queue_length.saturating_add(next.queue_length);
     total.active_tasks = total.active_tasks.saturating_add(next.active_tasks);
@@ -349,6 +362,7 @@ fn add_operations(total: &mut rustfs_heal::HealOperationsSnapshot, next: rustfs_
     add_source_counts(&mut total.queued_by_source, next.queued_by_source);
     add_source_counts(&mut total.active_by_source, next.active_by_source);
     add_source_counts(&mut total.retrying_by_source, next.retrying_by_source);
+    add_admission_telemetry(&mut total.admission, next.admission);
 }
 
 fn aggregate_cluster_heal_status(snapshots: Vec<NodeHealStatusSnapshot>) -> ClusterHealStatusSnapshot {
@@ -2307,6 +2321,10 @@ mod tests {
         assert!(json["healOperations"]["queuedBySource"]["admin"].is_u64());
         assert!(json["healOperations"]["queuedByPriority"]["low"].is_u64());
         assert!(json["healOperations"]["queuedByPriority"]["high"].is_u64());
+        assert!(json["healOperations"]["admission"]["accepted"].is_u64());
+        assert!(json["healOperations"]["admission"]["duplicate"].is_u64());
+        assert!(json["healOperations"]["admission"]["forceStart"].is_u64());
+        assert!(json["healOperations"]["admission"]["maxLockPhaseMicros"].is_u64());
         assert_eq!(json["state"], "active");
         assert_eq!(json["clusterStatusComplete"], true);
         assert!(json["progress"].is_null());
@@ -2486,6 +2504,18 @@ mod tests {
             queued_by_source: sources(value),
             active_by_source: sources(value),
             retrying_by_source: sources(value),
+            admission: rustfs_heal::HealAdmissionTelemetry {
+                accepted: value,
+                merged: value,
+                full: value,
+                dropped: value,
+                duplicate: value,
+                overlap_rejected: value,
+                displaced: value,
+                force_start: value,
+                max_start_duration_micros: value,
+                max_lock_phase_micros: value,
+            },
         };
         let progress = |value| NodeHealProgress {
             objects_scanned: value,
