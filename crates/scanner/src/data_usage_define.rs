@@ -71,6 +71,8 @@ const EVENT_SCANNER_CACHE_SAVE_STATE: &str = "scanner_cache_save_state";
 static CACHE_SAVE_METRICS_ONCE: Once = Once::new();
 
 pub const DATA_USAGE_SCAN_CHECKPOINT_VERSION: u16 = 1;
+pub const DATA_USAGE_RAW_ENUMERATION_CURSOR_VERSION: u16 = 1;
+const DATA_USAGE_SCAN_CURSOR_MAX_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DataUsageCacheRevision {
@@ -401,6 +403,54 @@ impl DataUsageScanCheckpoint {
     }
 }
 
+/// Durable raw directory-page cursor for a bucket scan.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DataUsageRawEnumerationCursor {
+    pub version: u16,
+    pub parent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_entry: Option<String>,
+    pub entries_seen: u64,
+    pub page_digest: [u8; 32],
+}
+
+impl DataUsageRawEnumerationCursor {
+    pub fn new(parent: String, last_entry: Option<String>, entries_seen: u64, page_digest: [u8; 32]) -> Self {
+        Self {
+            version: DATA_USAGE_RAW_ENUMERATION_CURSOR_VERSION,
+            parent,
+            last_entry,
+            entries_seen,
+            page_digest,
+        }
+    }
+
+    fn is_valid_for_bucket(&self, bucket: &str) -> bool {
+        self.version == DATA_USAGE_RAW_ENUMERATION_CURSOR_VERSION
+            && bucket != DATA_USAGE_ROOT
+            && path_is_in_bucket_scope(bucket, &self.parent)
+            && self.parent.len() <= DATA_USAGE_SCAN_CURSOR_MAX_BYTES
+            && self.page_digest != [0; 32]
+            && match &self.last_entry {
+                Some(last_entry) => {
+                    !last_entry.is_empty()
+                        && self.entries_seen > 0
+                        && last_entry.len() <= DATA_USAGE_SCAN_CURSOR_MAX_BYTES
+                        && !last_entry.contains(SLASH_SEPARATOR)
+                }
+                None => self.entries_seen == 0,
+            }
+    }
+}
+
+fn path_is_in_bucket_scope(bucket: &str, path: &str) -> bool {
+    path == bucket
+        || path
+            .strip_prefix(bucket)
+            .is_some_and(|suffix| suffix.starts_with(SLASH_SEPARATOR))
+}
+
 /// Durable scope of a bucket checkpoint, independent of namespace mutation counters.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -550,6 +600,8 @@ pub struct DataUsageCacheInfo {
     #[serde(default)]
     pub scan_checkpoint: Option<DataUsageScanCheckpoint>,
     #[serde(default)]
+    pub scan_raw_enumeration_cursor: Option<DataUsageRawEnumerationCursor>,
+    #[serde(default)]
     pub scan_identity: Option<DataUsageScanIdentity>,
     #[serde(default)]
     pub scan_progress: Option<DataUsageScanProgress>,
@@ -608,6 +660,7 @@ impl Serialize for DataUsageCacheInfo {
         // Keep this metadata map-encoded so older readers can ignore fields
         // appended by newer scanner versions during rolling upgrades.
         let field_count = 16
+            + usize::from(self.scan_raw_enumeration_cursor.is_some())
             + usize::from(self.scan_identity.is_some())
             + usize::from(self.scan_progress.is_some())
             + usize::from(self.scan_coverage_receipt.is_some())
@@ -631,6 +684,9 @@ impl Serialize for DataUsageCacheInfo {
         state.serialize_entry("failed_objects", &self.failed_objects)?;
         state.serialize_entry("scan_resume_after", &self.scan_resume_after)?;
         state.serialize_entry("scan_checkpoint", &self.scan_checkpoint)?;
+        if let Some(cursor) = &self.scan_raw_enumeration_cursor {
+            state.serialize_entry("scan_raw_enumeration_cursor", cursor)?;
+        }
         if let Some(identity) = self.scan_identity {
             state.serialize_entry("scan_identity", &identity)?;
         }
@@ -838,6 +894,7 @@ impl DataUsageCache {
             && self.info.snapshot_complete
             && self.info.scan_progress.is_none()
             && self.info.scan_checkpoint.is_none()
+            && self.info.scan_raw_enumeration_cursor.is_none()
             && self.info.scan_resume_after.is_none()
             && self.info.scan_coverage_receipt.is_none()
             && self.info.scan_plan_digest == Some(scan_plan_digest)
@@ -862,10 +919,15 @@ impl DataUsageCache {
             self.info.pending_heals = pending_heals;
             self.info.size_reconciliation = size_reconciliation;
         }
+        if self.validated_raw_enumeration_cursor().is_none() {
+            self.info.scan_raw_enumeration_cursor = None;
+        }
         let cursor_is_valid = (self.info.scan_checkpoint.is_none()
+            && self.info.scan_raw_enumeration_cursor.is_none()
             && self.info.scan_resume_after.is_none()
             && self.info.scan_coverage_receipt.is_none())
-            || self.validated_scan_frontier().is_some();
+            || self.validated_scan_frontier().is_some()
+            || self.info.scan_raw_enumeration_cursor.is_some();
         if !cursor_is_valid {
             self.info.scan_progress = None;
         }
@@ -886,6 +948,7 @@ impl DataUsageCache {
             });
             self.info.scan_resume_after = None;
             self.info.scan_checkpoint = None;
+            self.info.scan_raw_enumeration_cursor = None;
             self.info.scan_coverage_receipt = None;
         }
         // Old readers do not understand coverage sweeps. An absent plan makes
@@ -952,6 +1015,15 @@ impl DataUsageCache {
             && self.find(&receipt.through).is_some()
             && self.coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest))
         .then_some(receipt.through.as_str())
+    }
+
+    pub(crate) fn validated_raw_enumeration_cursor(&self) -> Option<&DataUsageRawEnumerationCursor> {
+        let cursor = self.info.scan_raw_enumeration_cursor.as_ref()?;
+        (self.info.scan_progress.is_some()
+            && self.info.scan_identity.is_some_and(|identity| identity.is_valid())
+            && self.info.source.is_some()
+            && cursor.is_valid_for_bucket(&self.info.name))
+        .then_some(cursor)
     }
 
     /// Seal only the frontier supplied by completed traversal, never a restored cursor.
