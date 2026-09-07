@@ -16,6 +16,7 @@ use crate::server::runtime_sources;
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
 use crate::storage_api::cluster::control_plane::ClusterControlPlane;
+use crate::storage_api::error::StorageError;
 use crate::storage_api::server::readiness::contract::admin::StorageAdminApi;
 use crate::storage_api::server::readiness::{Endpoint, EndpointServerPools, is_dist_erasure};
 #[cfg(test)]
@@ -262,7 +263,29 @@ struct StorageReadinessCacheEntry {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct StorageWriteReadinessStatus {
     ready: bool,
-    pool_meta_write_blocked: bool,
+    pool_metadata_reason: Option<ReadinessDegradedReason>,
+}
+
+fn pool_metadata_write_readiness(result: Result<(), StorageError>) -> StorageWriteReadinessStatus {
+    match result {
+        Ok(()) => StorageWriteReadinessStatus {
+            ready: true,
+            pool_metadata_reason: None,
+        },
+        Err(error) => {
+            let pool_metadata_reason = if error.pool_metadata_failure().is_some() {
+                Some(ReadinessDegradedReason::PoolMetaWriteBlocked)
+            } else if matches!(error, StorageError::Timeout) {
+                Some(ReadinessDegradedReason::PoolMetadataCheckTimeout)
+            } else {
+                None
+            };
+            StorageWriteReadinessStatus {
+                ready: false,
+                pool_metadata_reason,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -677,14 +700,12 @@ fn degraded_reasons(readiness: DependencyReadiness) -> Vec<ReadinessDegradedReas
 
 fn degraded_reasons_with_pool_meta_status(
     readiness: DependencyReadiness,
-    pool_meta_write_blocked: bool,
+    pool_metadata_reason: Option<ReadinessDegradedReason>,
 ) -> Vec<ReadinessDegradedReason> {
     let mut reasons = degraded_reasons(readiness);
-    if pool_meta_write_blocked {
+    if let Some(reason) = pool_metadata_reason {
         reasons.retain(|reason| *reason != ReadinessDegradedReason::StorageQuorumUnavailable);
-        if !reasons.contains(&ReadinessDegradedReason::PoolMetaWriteBlocked) {
-            reasons.insert(0, ReadinessDegradedReason::PoolMetaWriteBlocked);
-        }
+        reasons.insert(0, reason);
     }
     reasons
 }
@@ -717,7 +738,7 @@ fn dependency_readiness_report_from_write_status(
     storage: StorageWriteReadinessStatus,
 ) -> DependencyReadinessReport {
     DependencyReadinessReport {
-        degraded_reasons: degraded_reasons_with_pool_meta_status(readiness, storage.pool_meta_write_blocked),
+        degraded_reasons: degraded_reasons_with_pool_meta_status(readiness, storage.pool_metadata_reason),
         readiness,
     }
 }
@@ -846,11 +867,7 @@ async fn collect_lock_quorum_status() -> LockQuorumStatus {
 
 async fn node_pool_meta_write_readiness() -> StorageWriteReadinessStatus {
     if let Some(store) = runtime_sources::current_object_store_handle() {
-        let ready = store.pool_meta_writes_ready().await;
-        return StorageWriteReadinessStatus {
-            ready,
-            pool_meta_write_blocked: !ready,
-        };
+        return pool_metadata_write_readiness(store.pool_meta_write_status().await);
     }
 
     StorageWriteReadinessStatus::default()
@@ -858,16 +875,14 @@ async fn node_pool_meta_write_readiness() -> StorageWriteReadinessStatus {
 
 async fn collect_storage_write_readiness_uncached() -> StorageWriteReadinessStatus {
     if let Some(store) = runtime_sources::current_object_store_handle() {
-        if !store.pool_meta_writes_ready().await {
-            return StorageWriteReadinessStatus {
-                ready: false,
-                pool_meta_write_blocked: true,
-            };
+        let metadata = pool_metadata_write_readiness(store.pool_meta_write_status().await);
+        if !metadata.ready {
+            return metadata;
         }
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
         StorageWriteReadinessStatus {
             ready: storage_ready_from_runtime_state(&storage_info),
-            pool_meta_write_blocked: false,
+            pool_metadata_reason: None,
         }
     } else {
         StorageWriteReadinessStatus::default()
@@ -1900,6 +1915,48 @@ mod tests {
         );
     }
 
+    fn blocked_pool_metadata_status() -> StorageWriteReadinessStatus {
+        use crate::storage_api::error::{PoolMetadataError, PoolMetadataFailure};
+        pool_metadata_write_readiness(Err(StorageError::other(PoolMetadataError {
+            kind: PoolMetadataFailure::TransactionUnknown,
+            operation: "private operation".to_owned(),
+            phase: "prepare_cas",
+            since: time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed block time"),
+            source: Some(Arc::new(StorageError::other("private replica failure"))),
+        })))
+    }
+
+    #[test]
+    fn pool_metadata_observation_distinguishes_block_timeout_and_unavailable() {
+        let blocked = blocked_pool_metadata_status();
+        assert!(!blocked.ready);
+        assert_eq!(blocked.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetaWriteBlocked));
+        assert!(!format!("{blocked:?}").contains("private"));
+        let writable = pool_metadata_write_readiness(Ok(()));
+        assert!(writable.ready);
+        assert_eq!(writable.pool_metadata_reason, None);
+        let timed_out = pool_metadata_write_readiness(Err(StorageError::Timeout));
+        assert!(!timed_out.ready);
+        assert_eq!(timed_out.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetadataCheckTimeout));
+        let unavailable = pool_metadata_write_readiness(Err(StorageError::other("pool metadata writes remain blocked")));
+        assert!(!unavailable.ready);
+        assert_eq!(
+            unavailable.pool_metadata_reason, None,
+            "error text alone must not be interpreted as a typed write block"
+        );
+
+        let readiness = DependencyReadiness {
+            storage_ready: false,
+            iam_ready: true,
+            lock_quorum_ready: true,
+            peer_health_ready: true,
+        };
+        let report = dependency_readiness_report_from_write_status(readiness, timed_out);
+        assert!(!report.readiness.storage_ready, "inspection timeout must remain fail-closed");
+        assert_eq!(report.degraded_reasons, vec![ReadinessDegradedReason::PoolMetadataCheckTimeout]);
+        assert_eq!(report.degraded_reasons[0].as_str(), "pool_metadata_check_timeout");
+    }
+
     #[test]
     fn degraded_reasons_report_pool_meta_write_blocked() {
         let readiness = DependencyReadiness {
@@ -1910,7 +1967,7 @@ mod tests {
         };
 
         assert_eq!(
-            degraded_reasons_with_pool_meta_status(readiness, true),
+            degraded_reasons_with_pool_meta_status(readiness, blocked_pool_metadata_status().pool_metadata_reason),
             vec![ReadinessDegradedReason::PoolMetaWriteBlocked]
         );
     }
@@ -1925,7 +1982,7 @@ mod tests {
         };
 
         assert_eq!(
-            degraded_reasons_with_pool_meta_status(readiness, true),
+            degraded_reasons_with_pool_meta_status(readiness, blocked_pool_metadata_status().pool_metadata_reason),
             vec![
                 ReadinessDegradedReason::PoolMetaWriteBlocked,
                 ReadinessDegradedReason::StorageAndLockUnavailable,

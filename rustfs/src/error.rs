@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::storage_api::error::contract::{StorageErrorCode, range::HTTPRangeError};
-use crate::storage_api::error::{QuotaError, StorageError};
+use crate::storage_api::error::{PoolMetadataError, QuotaError, StorageError};
 use http::StatusCode;
 use rustfs_kms::KmsUnavailableError;
 use s3s::{S3Error, S3ErrorCode};
@@ -89,7 +89,26 @@ pub(crate) struct ApiErrorDiagnostic {
     pub storage_code: Option<StorageErrorCode>,
     pub io_kind: Option<std::io::ErrorKind>,
     pub rpc_code: Option<tonic::Code>,
+    pub pool_metadata: Option<PoolMetadataDiagnostic>,
     pub truncated: bool,
+}
+
+/// Safe projection of local metadata failure context, without operation text or sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PoolMetadataDiagnostic {
+    pub reason: &'static str,
+    pub phase: &'static str,
+    pub since_unix_secs: i64,
+}
+
+impl From<&PoolMetadataError> for PoolMetadataDiagnostic {
+    fn from(context: &PoolMetadataError) -> Self {
+        Self {
+            reason: context.kind.as_str(),
+            phase: context.phase,
+            since_unix_secs: context.since.unix_timestamp(),
+        }
+    }
 }
 
 impl ApiError {
@@ -105,6 +124,11 @@ impl ApiError {
             }
             if let Some(status) = error.downcast_ref::<tonic::Status>() {
                 diagnostic.rpc_code = Some(status.code());
+            }
+            if diagnostic.pool_metadata.is_none()
+                && let Some(context) = error.downcast_ref::<PoolMetadataError>()
+            {
+                diagnostic.pool_metadata = Some(context.into());
             }
             current = if let Some(io) = error.downcast_ref::<std::io::Error>() {
                 diagnostic.io_kind = Some(io.kind());
@@ -954,6 +978,7 @@ mod tests {
     #[test]
     fn pool_metadata_failures_map_to_503_and_preserve_typed_private_context() {
         use crate::storage_api::error::{PoolMetadataError, PoolMetadataFailure};
+        let since = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed failure time");
         for kind in [
             PoolMetadataFailure::ReadUnavailable,
             PoolMetadataFailure::RecoveryRequired,
@@ -962,9 +987,9 @@ mod tests {
         ] {
             let error = StorageError::other(PoolMetadataError {
                 kind,
-                operation: "pool metadata test".to_owned(),
+                operation: "private operation path".to_owned(),
                 phase: "prepare_cas",
-                since: time::OffsetDateTime::now_utc(),
+                since,
                 source: Some(std::sync::Arc::new(StorageError::other("private disk failure"))),
             });
             let error = StorageError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, error));
@@ -977,6 +1002,18 @@ mod tests {
             assert!(!api.message.contains("private"));
             let source = api.source.as_ref().unwrap().downcast_ref::<StorageError>().unwrap();
             assert_eq!(source.pool_metadata_failure().unwrap().kind, kind);
+            let diagnostic = api.diagnostic();
+            assert_eq!(
+                diagnostic.pool_metadata,
+                Some(PoolMetadataDiagnostic {
+                    reason: kind.as_str(),
+                    phase: "prepare_cas",
+                    since_unix_secs: since.unix_timestamp(),
+                })
+            );
+            assert!(!diagnostic.truncated);
+            assert!(!format!("{diagnostic:?}").contains("private"));
+            assert_eq!(api.diagnostic(), diagnostic, "inspection must preserve the original failure time");
         }
     }
 

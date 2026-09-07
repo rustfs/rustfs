@@ -29,7 +29,7 @@ The expansion fixture is an all-current-binary fleet, so it initializes pool met
 - Object Lock COMPLIANCE, GOVERNANCE and bypass, legal hold, bucket default retention, and non-lock bucket rejection
 - Versioning, exact historical reads, delete-marker removal, and suspended null-version overwrite semantics
 - Bucket replication between two 4-node clusters, including metadata/tags and target-outage retry; hard quota admission and absence of rejected keys
-- Ready/live probes on every node, exact 4-server/16-disk inventory, realtime metrics on every node, and correlated audit-webhook delivery
+- Ready/live probes on every node, exact 4-server/16-disk inventory, realtime metrics on every node, and correlated audit-webhook delivery. The observability case runs at WARN and suspends two node processes to model nonresponsive peers: cached drives become unknown immediately, exact per-node HTTP PUT deltas expose sub-quorum failures, the local metadata snapshot does not invent a write latch, and resumed peers allow new writes and byte-identical reads from every node. This models stalled processes, not a physical network partition.
 - Pool expand, decommission, rebalance, checksum integrity, versioned and multipart data, and S3 during active movement
 - Bidirectional site-replication convergence plus enabled/synchronized peer state on both sites
 - A 24-worker mixed PUT/HEAD/GET/COPY/DELETE workload; concurrent PUT during active decommission

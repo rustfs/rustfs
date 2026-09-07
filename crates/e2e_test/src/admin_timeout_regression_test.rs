@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{RustFSTestClusterEnvironment, init_logging, local_http_client};
+use crate::common::{RustFSTestClusterEnvironment, init_logging, local_http_client, signal_process};
 use aws_sdk_s3::primitives::ByteStream;
 use http::header::HOST;
 use reqwest::StatusCode;
@@ -22,7 +22,6 @@ use rustfs_signer::sign_v4;
 use s3s::Body;
 use serde::Deserialize;
 use std::error::Error;
-use std::process::Command;
 use tokio::time::{Duration, sleep, timeout};
 use uuid::Uuid;
 
@@ -80,15 +79,6 @@ async fn parse_json_response<T: serde::de::DeserializeOwned>(
     }
 
     Ok(serde_json::from_slice(&body)?)
-}
-
-fn signal_process(pid: u32, signal: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let output = Command::new("kill").arg(format!("-{signal}")).arg(pid.to_string()).output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    Err(format!("kill -{signal} {pid} failed: {}", String::from_utf8_lossy(&output.stderr)).into())
 }
 
 fn offline_server_count(info: &InfoMessage) -> usize {

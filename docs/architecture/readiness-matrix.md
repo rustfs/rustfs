@@ -41,8 +41,12 @@ an unknown or unsupported peer-health snapshot degrades readiness with
   lock quorum, or peer health.
 - Node readiness reports local dependency readiness.
 - A blocked pool metadata writer degrades node and cluster-write readiness with
-  `pool_metadata_blocked`. Metadata save-gate inspection is bounded to 100 ms;
+  `pool_meta_write_blocked`. Metadata save-gate inspection is bounded to 100 ms;
   contention reports `pool_metadata_check_timeout` without installing a block.
+- The authenticated cluster snapshot extends its existing node-local metadata
+  gate inspection with safe reason, failure phase, and original block time. It
+  distinguishes timeout from a block and changes no admission or recovery
+  decision. Runtime readiness and gate status are separate bounded observations.
 - Cluster write readiness requires write quorum and the runtime dependency
   readiness used by `FullReady`.
 - Cluster read readiness may use the read-quorum path and cluster-health
