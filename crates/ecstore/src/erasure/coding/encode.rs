@@ -1652,7 +1652,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_writer_short_write_fails_before_shutdown() {
-        let mut writers = vec![Some(bitrot_writer(ShortWriteWriter, 16))];
+        let mut writers = vec![Some(bitrot_writer(ShortWriteWriter, 32))];
         let err = {
             let mut writer = MultiWriter::new(&mut writers, 1);
             writer
@@ -1714,7 +1714,7 @@ mod tests {
     #[tokio::test]
     async fn multi_writer_reports_quorum_failure_when_quorum_exceeds_writer_count() {
         let committed = Arc::new(Mutex::new(Vec::new()));
-        let mut writers = vec![Some(bitrot_writer(DeferredCommitWriter::new(committed), 16))];
+        let mut writers = vec![Some(bitrot_writer(DeferredCommitWriter::new(committed), 32))];
         let mut writer = MultiWriter::new(&mut writers, 2);
 
         let err = writer
