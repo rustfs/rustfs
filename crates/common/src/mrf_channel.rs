@@ -432,12 +432,33 @@ pub struct MrfRepairedEvent {
     pub version_id: Option<[u8; 16]>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MrfVerifiedRepairDisposition {
+    Repaired,
+    VerifiedHealthy,
+    AuthoritativelyAbsent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MrfVerifiedRepairEvent {
+    pub kind: MrfKind,
+    pub bucket: Arc<str>,
+    pub object: Arc<str>,
+    pub version_id: Option<[u8; 16]>,
+    pub scope: Option<MrfScope>,
+    pub lease: Option<MrfIngressLease>,
+    pub bucket_incarnation_id: Uuid,
+    pub disposition: MrfVerifiedRepairDisposition,
+}
+
 /// Bound on the repaired-event backlog. Notices are best-effort hints; when
 /// the ring is full the oldest are dropped and the affected ledger entries
 /// simply expire through their own attempts/age limits.
 const MRF_REPAIRED_EVENT_CAP: usize = 4096;
 
 static MRF_REPAIRED_EVENTS: OnceLock<std::sync::Mutex<std::collections::VecDeque<MrfRepairedEvent>>> = OnceLock::new();
+static MRF_VERIFIED_REPAIR_EVENTS: OnceLock<std::sync::Mutex<std::collections::VecDeque<MrfVerifiedRepairEvent>>> =
+    OnceLock::new();
 
 /// Record a legacy notification for compatibility. This is not an
 /// acknowledgement of storage verification or durable repair completion.
@@ -460,6 +481,43 @@ pub fn note_mrf_repaired(bucket: &str, object: &str, version_id: Option<[u8; 16]
 /// notices in place for their own scanners.
 pub fn take_mrf_repaired_events_for(bucket: &str) -> Vec<MrfRepairedEvent> {
     let Some(registry) = MRF_REPAIRED_EVENTS.get() else {
+        return Vec::new();
+    };
+    let Ok(mut events) = registry.lock() else {
+        return Vec::new();
+    };
+    let mut taken = Vec::new();
+    let mut retained = std::collections::VecDeque::with_capacity(events.len());
+    while let Some(event) = events.pop_front() {
+        if event.bucket.as_ref() == bucket {
+            taken.push(event);
+        } else {
+            retained.push_back(event);
+        }
+    }
+    *events = retained;
+    taken
+}
+
+/// Record a storage-owned MRF completion proof. Unlike the legacy repaired
+/// event, this identity is complete enough for future durable ledgers to make
+/// an exact responsibility decision.
+pub fn note_mrf_verified_repair(event: MrfVerifiedRepairEvent) {
+    let registry = MRF_VERIFIED_REPAIR_EVENTS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let Ok(mut events) = registry.lock() else {
+        return;
+    };
+    if events.len() >= MRF_REPAIRED_EVENT_CAP {
+        events.pop_front();
+    }
+    events.push_back(event);
+}
+
+/// Take verified repair events recorded for `bucket`, leaving other buckets'
+/// proofs in place. Consumers still have to match kind, object, version, scope
+/// lease and incarnation before discharging durable responsibility.
+pub fn take_mrf_verified_repair_events_for(bucket: &str) -> Vec<MrfVerifiedRepairEvent> {
+    let Some(registry) = MRF_VERIFIED_REPAIR_EVENTS.get() else {
         return Vec::new();
     };
     let Ok(mut events) = registry.lock() else {
@@ -609,5 +667,33 @@ mod tests {
         let flooded = take_mrf_repaired_events_for("flood-bucket");
         assert_eq!(flooded.len(), MRF_REPAIRED_EVENT_CAP);
         assert_eq!(flooded[0].object.as_ref(), "object-9", "the oldest notices past the cap are dropped");
+    }
+
+    #[test]
+    fn verified_repair_events_preserve_full_identity_and_bucket_scope() {
+        let bucket_incarnation_id = Uuid::new_v4();
+        let event = MrfVerifiedRepairEvent {
+            kind: MrfKind::PartialWrite,
+            bucket: Arc::from("verified-bucket-a"),
+            object: Arc::from("object-a"),
+            version_id: Some([4u8; 16]),
+            scope: Some(MrfScope {
+                pool_index: 2,
+                set_index: 3,
+            }),
+            lease: Some(MrfIngressLease::new(42)),
+            bucket_incarnation_id,
+            disposition: MrfVerifiedRepairDisposition::Repaired,
+        };
+        note_mrf_verified_repair(event.clone());
+        note_mrf_verified_repair(MrfVerifiedRepairEvent {
+            bucket: Arc::from("verified-bucket-b"),
+            ..event.clone()
+        });
+
+        let taken = take_mrf_verified_repair_events_for("verified-bucket-a");
+        assert_eq!(taken, vec![event]);
+        assert!(take_mrf_verified_repair_events_for("verified-bucket-a").is_empty());
+        assert_eq!(take_mrf_verified_repair_events_for("verified-bucket-b").len(), 1);
     }
 }

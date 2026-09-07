@@ -1095,6 +1095,191 @@ fn queued_request_id_for_dedup_key_tracks_the_representative() {
 }
 
 #[test]
+fn mrf_verified_repair_event_requires_positive_exact_identity() {
+    use crate::heal::outcome::{HealObjectIdentity, HealObjectKind, HealObjectOutcome};
+    use rustfs_common::mrf_channel::{MrfKind, MrfScope, MrfVerifiedRepairDisposition};
+
+    let version = uuid::Uuid::new_v4();
+    let incarnation = uuid::Uuid::new_v4();
+    let target = MrfRepairNoticeTarget {
+        bucket: Arc::from("bucket"),
+        object: Arc::from("object"),
+        version_id: Some(*version.as_bytes()),
+        kind: MrfKind::PartialWrite,
+        scope: Some(MrfScope {
+            pool_index: 1,
+            set_index: 2,
+        }),
+        lease: None,
+    };
+    let matching = HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: "bucket".to_string(),
+            object: "object".to_string(),
+            version_id: Some(version.to_string()),
+            bucket_incarnation_id: Some(incarnation),
+            pool_index: Some(1),
+            set_index: Some(2),
+        },
+        disposition: HealObjectDisposition::Repaired,
+        detail: None,
+    };
+
+    let event = mrf_verified_repair_event_for_target(&target, &matching).expect("matching positive receipt should publish");
+    assert_eq!(event.kind, MrfKind::PartialWrite);
+    assert_eq!(event.bucket.as_ref(), "bucket");
+    assert_eq!(event.object.as_ref(), "object");
+    assert_eq!(event.version_id, Some(*version.as_bytes()));
+    assert_eq!(
+        event.scope,
+        Some(MrfScope {
+            pool_index: 1,
+            set_index: 2
+        })
+    );
+    assert_eq!(event.lease, None);
+    assert_eq!(event.bucket_incarnation_id, incarnation);
+    assert_eq!(event.disposition, MrfVerifiedRepairDisposition::Repaired);
+
+    assert!(
+        mrf_verified_repair_event_for_target(
+            &MrfRepairNoticeTarget {
+                kind: MrfKind::DecodeFailure,
+                ..target.clone()
+            },
+            &matching
+        )
+        .is_none(),
+        "only receipt-producing partial-write object heals can publish verified events today"
+    );
+
+    for rejected in [
+        HealObjectOutcome {
+            disposition: HealObjectDisposition::Unknown,
+            ..matching.clone()
+        },
+        HealObjectOutcome {
+            identity: HealObjectIdentity {
+                bucket_incarnation_id: None,
+                ..matching.identity.clone()
+            },
+            ..matching.clone()
+        },
+        HealObjectOutcome {
+            identity: HealObjectIdentity {
+                object: "other".to_string(),
+                ..matching.identity.clone()
+            },
+            ..matching.clone()
+        },
+        HealObjectOutcome {
+            identity: HealObjectIdentity {
+                pool_index: Some(3),
+                ..matching.identity.clone()
+            },
+            ..matching
+        },
+    ] {
+        assert!(
+            mrf_verified_repair_event_for_target(&target, &rejected).is_none(),
+            "legacy, incomplete or mismatched outcomes must not discharge MRF responsibility"
+        );
+    }
+}
+
+#[test]
+fn completed_mrf_notice_publishes_only_verified_positive_events() {
+    use crate::heal::outcome::{HealObjectIdentity, HealObjectKind, HealObjectOutcome, HealTaskOutcome};
+    use rustfs_common::mrf_channel::{MrfKind, MrfScope, take_mrf_verified_repair_events_for};
+
+    let bucket = Arc::<str>::from("verified-mrf-completed-bucket");
+    let _ = take_mrf_verified_repair_events_for(bucket.as_ref());
+    let version = uuid::Uuid::new_v4();
+    let incarnation = uuid::Uuid::new_v4();
+    let matching_target = MrfRepairNoticeTarget {
+        bucket: bucket.clone(),
+        object: Arc::from("object-a"),
+        version_id: Some(*version.as_bytes()),
+        kind: MrfKind::PartialWrite,
+        scope: Some(MrfScope {
+            pool_index: 1,
+            set_index: 2,
+        }),
+        lease: None,
+    };
+    let mismatch_target = MrfRepairNoticeTarget {
+        object: Arc::from("object-b"),
+        ..matching_target.clone()
+    };
+    let mut outcome = HealTaskOutcome::default();
+    outcome.execution = HealExecutionOutcome::Completed;
+    outcome.coverage = crate::heal::outcome::HealTraversalCoverage::Complete;
+    outcome.record(HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: bucket.to_string(),
+            object: "object-a".to_string(),
+            version_id: Some(version.to_string()),
+            bucket_incarnation_id: Some(incarnation),
+            pool_index: Some(1),
+            set_index: Some(2),
+        },
+        disposition: HealObjectDisposition::VerifiedHealthy,
+        detail: None,
+    });
+    outcome.record(HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: bucket.to_string(),
+            object: "object-b".to_string(),
+            version_id: Some(version.to_string()),
+            bucket_incarnation_id: None,
+            pool_index: Some(1),
+            set_index: Some(2),
+        },
+        disposition: HealObjectDisposition::Repaired,
+        detail: None,
+    });
+    let completed = CompletedHealStatus {
+        outcome: Some(Arc::new(outcome)),
+        ..completed_retention_fixture(SystemTime::now())
+    };
+
+    publish_verified_mrf_repair_events(&[matching_target.clone(), mismatch_target], &completed);
+
+    let events = take_mrf_verified_repair_events_for(bucket.as_ref());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].object.as_ref(), "object-a");
+    assert_eq!(events[0].lease, None);
+    assert_eq!(events[0].bucket_incarnation_id, incarnation);
+
+    let failed = CompletedHealStatus {
+        status: HealTaskStatus::Failed {
+            error: "terminal failure".to_string(),
+        },
+        ..completed.clone()
+    };
+    publish_verified_mrf_repair_events(std::slice::from_ref(&matching_target), &failed);
+    assert!(
+        take_mrf_verified_repair_events_for(bucket.as_ref()).is_empty(),
+        "failed terminal tasks must not publish a verified repair event"
+    );
+
+    let mut completed_with_errors_outcome = completed.outcome.as_ref().expect("completed outcome").as_ref().clone();
+    completed_with_errors_outcome.execution = crate::heal::outcome::HealExecutionOutcome::CompletedWithErrors;
+    let completed_with_errors = CompletedHealStatus {
+        outcome: Some(Arc::new(completed_with_errors_outcome)),
+        ..completed
+    };
+    publish_verified_mrf_repair_events(std::slice::from_ref(&matching_target), &completed_with_errors);
+    assert!(
+        take_mrf_verified_repair_events_for(bucket.as_ref()).is_empty(),
+        "non-success canonical outcomes must not publish a verified repair event"
+    );
+}
+
+#[test]
 fn test_priority_queue_ordering() {
     let mut queue = PriorityHealQueue::new();
 
