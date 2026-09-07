@@ -5,8 +5,11 @@ description: Debug ILM tiering / lifecycle transition issues — NoSuchVersion o
 
 # Tier / ILM Debugging
 
-Full playbook: [docs/operations/tier-ilm-debugging.md](../../../docs/operations/tier-ilm-debugging.md)
-— read it before changing tier code.
+Playbook: [docs/operations/tier-ilm-debugging.md](../../../docs/operations/tier-ilm-debugging.md).
+Read the section matching the symptom: metadata/`xl.meta`, runtime versionId,
+manual jobs, or retained-record recovery. Read the local-first expiry invariant
+before changing cleanup ordering. Before a reconcile/disposition action, read
+its entire procedure and retain its exact-evidence and confirmation gates.
 
 Quick moves:
 

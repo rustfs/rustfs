@@ -51,14 +51,17 @@ prior key versions would go green.
 
 The lane creates real keys under unique names (`behavior-kv2-*`,
 `behavior-transit-*`) and does not remove them, so a dev Vault accumulates them
-across runs. Clear them out periodically — against a dev server only:
+across runs. On a dev server, remove only exact keys confirmed to belong to the
+current task. A shared prefix does not prove ownership; preserve another run's
+keys and leave ambiguous keys for the operator.
 
 ```bash
-vault list -format=json transit/keys | jq -r '.[] | select(startswith("behavior-transit-"))' | while read -r k; do vault write "transit/keys/$k/config" deletion_allowed=true >/dev/null && vault delete "transit/keys/$k"; done
+vault write transit/keys/<task-owned-transit-key>/config deletion_allowed=true
+vault delete transit/keys/<task-owned-transit-key>
 ```
 
 ```bash
-vault list -format=json secret/metadata/rustfs/kms/keys | jq -r '.[] | select(startswith("behavior-kv2-"))' | xargs -I{} vault kv metadata delete secret/rustfs/kms/keys/{}
+vault kv metadata delete secret/rustfs/kms/keys/<task-owned-kv2-key>
 ```
 
 ## Local Key Export for SSE-S3 Migration Tests
