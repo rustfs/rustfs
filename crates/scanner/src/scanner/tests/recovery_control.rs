@@ -97,6 +97,15 @@ async fn run_disabled_startup(ctx: CancellationToken, store: Arc<ECStore>) {
     );
 }
 
+fn recovery_intent_request(key: &str, actor: &str) -> ScannerRecoveryIntentRequest {
+    ScannerRecoveryIntentRequest {
+        action: SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD.to_string(),
+        mode: "full-rebuild".to_string(),
+        idempotency_key: key.to_string(),
+        actor_sha256: scanner_recovery_actor_sha256(actor),
+    }
+}
+
 async fn assert_reset_fences(store: &Arc<ECStore>) {
     let data = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
         .await
@@ -201,6 +210,124 @@ async fn disabled_cleanup_recovers_after_child_process_crash_boundaries() {
             assert_reset_fences(&restarted).await;
         }
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_recovery_intent_accept_is_durable_and_idempotent() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let request = recovery_intent_request("intent-key-0001", "operator-a");
+
+    let first = accept_scanner_usage_recovery_intent(store.clone(), request.clone())
+        .await
+        .expect("first intent should persist");
+    let record = match first {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("first request must create a durable intent: {other:?}"),
+    };
+    assert_eq!(record.state, "accepted");
+    assert_eq!(record.action, SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD);
+    assert_ne!(record.idempotency_key_sha256, request.idempotency_key);
+
+    let restarted = restart_scanner_cycle_store_from(&store).await;
+    let queried = get_scanner_usage_recovery_intent(restarted.clone(), &record.intent_id)
+        .await
+        .expect("persisted intent should read after restart")
+        .expect("persisted intent should exist");
+    assert_eq!(queried, record);
+
+    let replay = accept_scanner_usage_recovery_intent(restarted, request)
+        .await
+        .expect("lost response retry should be idempotent");
+    assert_eq!(replay, ScannerRecoveryIntentAcceptResult::Replayed { record });
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_recovery_intent_rejects_same_namespace_conflict() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let request = recovery_intent_request("intent-key-0002", "operator-a");
+    let record = match accept_scanner_usage_recovery_intent(store.clone(), request.clone())
+        .await
+        .expect("first intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("first request must create a durable intent: {other:?}"),
+    };
+
+    let mut unsupported = request.clone();
+    unsupported.mode = "future-mode".to_string();
+    let error = accept_scanner_usage_recovery_intent(store.clone(), unsupported)
+        .await
+        .expect_err("unsupported mode must fail before it can collide with a durable record");
+    assert!(error.to_string().contains("mode is unsupported"));
+
+    let same_key_other_actor = recovery_intent_request("intent-key-0002", "operator-b");
+    let accepted_other_actor = accept_scanner_usage_recovery_intent(store.clone(), same_key_other_actor)
+        .await
+        .expect("another actor owns an independent idempotency namespace");
+    assert!(matches!(accepted_other_actor, ScannerRecoveryIntentAcceptResult::Accepted { .. }));
+
+    let path = format!(".usage.v2.recovery-intents/{}.json", record.intent_id);
+    let mut existing = record.clone();
+    existing.request_sha256 = scanner_recovery_actor_sha256("different-request");
+    save_config(store.clone(), &path, serde_json::to_vec(&existing).expect("mutated record should encode"))
+        .await
+        .expect("mutate durable record");
+    let conflict = accept_scanner_usage_recovery_intent(store, request)
+        .await
+        .expect("same namespace collision should be reported");
+    assert_eq!(
+        conflict,
+        ScannerRecoveryIntentAcceptResult::Conflict {
+            existing: ScannerRecoveryIntentConflict {
+                intent_id: record.intent_id,
+                state: "accepted".to_string(),
+            },
+        }
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_recovery_intent_query_rejects_corrupt_or_unknown_records() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let request = recovery_intent_request("intent-key-0003", "operator-a");
+    let record = match accept_scanner_usage_recovery_intent(store.clone(), request)
+        .await
+        .expect("first intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("first request must create a durable intent: {other:?}"),
+    };
+    let path = format!(".usage.v2.recovery-intents/{}.json", record.intent_id);
+    save_config(store.clone(), &path, b"{corrupt".to_vec())
+        .await
+        .expect("corrupt durable record");
+    let error = get_scanner_usage_recovery_intent(store.clone(), &record.intent_id)
+        .await
+        .expect_err("corrupt intent must not decode as absent");
+    assert!(error.to_string().contains("scanner recovery intent is invalid"));
+    let unknown = get_scanner_usage_recovery_intent(store, &scanner_recovery_actor_sha256("missing"))
+        .await
+        .expect("missing intent should read as absent");
+    assert!(unknown.is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_recovery_intent_query_rejects_oversized_records() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let intent_id = scanner_recovery_actor_sha256("oversized-intent");
+    let path = format!(".usage.v2.recovery-intents/{intent_id}.json");
+    save_config(store.clone(), &path, vec![b'a'; 16 * 1024 + 1])
+        .await
+        .expect("oversized durable record");
+
+    let error = get_scanner_usage_recovery_intent(store, &intent_id)
+        .await
+        .expect_err("oversized intent must not be materialized");
+    assert!(error.to_string().contains("bounded object size"), "{error}");
 }
 
 #[tokio::test]
