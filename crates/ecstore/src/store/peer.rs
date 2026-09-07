@@ -156,7 +156,7 @@ async fn admit_local_disk(
     ctx: &Arc<InstanceContext>,
     disk: &DiskStore,
     disk_id: Option<Uuid>,
-    volume: &str,
+    mutates_namespace: bool,
 ) -> DiskResult<Option<Arc<NamespaceCommitGuard>>> {
     if !matches!(disk.as_ref(), Disk::Local(_)) {
         return Err(DiskError::DiskNotFound);
@@ -179,7 +179,7 @@ async fn admit_local_disk(
     }
     // Admission linearizes under the registry read: replacement/quarantine
     // before this point rejects; later changes do not revoke physical I/O.
-    Ok((!is_meta_bucketname(volume)).then(|| ctx.begin_namespace_commit()))
+    Ok(mutates_namespace.then(|| ctx.begin_namespace_commit()))
 }
 
 async fn rename_local_data_with_ctx(
@@ -191,7 +191,8 @@ async fn rename_local_data_with_ctx(
     mut guards: RenameDataGuards,
 ) -> DiskResult<RenameDataResp> {
     let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
-    let owner = admit_local_disk(ctx, &disk, disk_id, destination.0).await?;
+    let mutates_namespace = !is_meta_bucketname(source.0) || !is_meta_bucketname(destination.0);
+    let owner = admit_local_disk(ctx, &disk, disk_id, mutates_namespace).await?;
     guards.namespace_owner = owner.as_ref().map(|owner| owner.clone() as Arc<dyn Send + Sync>);
     let result = disk
         .rename_data_borrowed_with_fence_observed(source.0, source.1, fi, destination.0, destination.1, guards)
@@ -213,7 +214,7 @@ async fn undo_local_write_with_ctx(
         return Err(DiskError::other("target undo requires undo_write"));
     }
     let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
-    let owner = admit_local_disk(ctx, &disk, disk_id, volume).await?;
+    let owner = admit_local_disk(ctx, &disk, disk_id, !is_meta_bucketname(volume)).await?;
     let physical_owner = owner.as_ref().map(|owner| owner.clone() as Arc<dyn Send + Sync>);
     let result = disk
         .undo_write_with_namespace_owner(volume, path, fi, opts, physical_owner)
@@ -631,7 +632,7 @@ mod tests {
             }
             drop(entries);
             assert!(
-                matches!(admit_local_disk(&ctx, &disk, None, "target-bucket").await, Err(DiskError::DiskNotFound)),
+                matches!(admit_local_disk(&ctx, &disk, None, true).await, Err(DiskError::DiskNotFound)),
                 "{state}"
             );
             assert!(!ctx.namespace_commits_pending());
