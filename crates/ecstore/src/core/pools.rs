@@ -4490,11 +4490,20 @@ impl PoolMetaWriteState {
 
     fn observe_selection(&mut self, selection: &PoolMetaSelection) -> Result<()> {
         self.pool_meta_absent = selection.absent;
+        self.validate_selection(selection)?;
+        if self.cluster_epoch.is_none()
+            && let Some((_, metadata_epoch)) = selection.generation_identity
+        {
+            self.cluster_epoch = Some(metadata_epoch);
+        }
+        Ok(())
+    }
+
+    fn validate_selection(&self, selection: &PoolMetaSelection) -> Result<()> {
         if let Some(expected_cluster_id) = self.expected_cluster_id
             && let Some((cluster_id, _)) = selection.generation_identity
             && cluster_id != expected_cluster_id
         {
-            self.block_writes();
             return Err(Error::other(format!(
                 "pool metadata incompatible: cluster identity {cluster_id} does not match deployment {expected_cluster_id}"
             )));
@@ -4503,16 +4512,10 @@ impl PoolMetaWriteState {
             && let Some((_, metadata_epoch)) = selection.generation_identity
             && metadata_epoch != identity_epoch
         {
-            self.block_writes();
             return Err(Error::other(format!(
                 "pool metadata recovery required: committed epoch {} does not match cluster identity epoch {identity_epoch}",
                 metadata_epoch
             )));
-        }
-        if self.cluster_epoch.is_none()
-            && let Some((_, metadata_epoch)) = selection.generation_identity
-        {
-            self.cluster_epoch = Some(metadata_epoch);
         }
         Ok(())
     }
@@ -4546,26 +4549,25 @@ impl PoolMetaWriteState {
         if !self.pool_meta_absent {
             return Ok(());
         }
+        let result = self.validate_missing_metadata_can_initialize();
+        if result.is_err() {
+            self.block_writes();
+        }
+        result
+    }
+
+    fn validate_missing_metadata_can_initialize(&self) -> Result<()> {
         match self.identity_initialized {
             Some(false) if self.bootstrap_identity_proven() && self.identity_fresh_bootstrap_nonce.is_some() => Ok(()),
-            Some(false) => {
-                self.block_writes();
-                Err(Error::other(
-                    "pool metadata recovery required: pending cluster identity exists but this startup has no verified fresh-bootstrap proof or legacy-adoption proof",
-                ))
-            }
-            Some(true) => {
-                self.block_writes();
-                Err(Error::other(
-                    "pool metadata recovery required: initialized cluster identity exists but every pool.bin replica is missing",
-                ))
-            }
-            None => {
-                self.block_writes();
-                Err(Error::other(
-                    "pool metadata recovery required: no durable bootstrap identity or pool.bin replica is available",
-                ))
-            }
+            Some(false) => Err(Error::other(
+                "pool metadata recovery required: pending cluster identity exists but this startup has no verified fresh-bootstrap proof or legacy-adoption proof",
+            )),
+            Some(true) => Err(Error::other(
+                "pool metadata recovery required: initialized cluster identity exists but every pool.bin replica is missing",
+            )),
+            None => Err(Error::other(
+                "pool metadata recovery required: no durable bootstrap identity or pool.bin replica is available",
+            )),
         }
     }
 
@@ -5145,12 +5147,12 @@ fn select_pool_meta_replicas_for_read_probe<R>(
 where
     R: Into<PoolMetaReplicaRead>,
 {
-    // Read-only planning probes must fail the current request on unsafe pool
-    // metadata, but they must not permanently poison the shared writer gate.
-    let mut probe_state = write_state.clone();
-    let selection = select_pool_meta_replicas_observing(&mut probe_state, replicas)?;
-    probe_state.observe_replicas(selection.replica_state);
-    probe_state.ensure_write_safe(operation)?;
+    let selection = select_pool_meta_replica_reads(replicas.into_iter().map(Into::into).collect())?;
+    write_state.validate_selection(&selection)?;
+    selection.replica_state.ensure_write_safe(operation)?;
+    if selection.absent && (write_state.expected_cluster_id.is_some() || write_state.identity_initialized.is_some()) {
+        write_state.validate_missing_metadata_can_initialize()?;
+    }
     Ok(selection)
 }
 
@@ -9014,7 +9016,7 @@ impl ECStore {
 
     async fn acquire_pool_meta_read_guard(
         &self,
-        write_state: &mut PoolMetaWriteState,
+        write_state: &PoolMetaWriteState,
         operation: &str,
     ) -> Result<(rustfs_lock::NamespaceLockGuard, PoolMeta)> {
         write_state.ensure_write_safe(operation)?;
@@ -9172,9 +9174,9 @@ impl ECStore {
         target_pool_indices: &[usize],
         phase: &'static str,
     ) -> Result<(rustfs_lock::NamespaceLockGuard, bool)> {
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let save_guard = self.pool_meta_save_gate.lock().await;
         let (pool_meta_guard, snapshot) = self
-            .acquire_pool_meta_read_guard(&mut save_guard, "target capacity admission failed")
+            .acquire_pool_meta_read_guard(&save_guard, "target capacity admission failed")
             .await?;
         for target_pool_index in target_pool_indices.iter().copied() {
             ensure_external_decommission_target_admission(&snapshot, target_pool_index, phase)?;
@@ -9208,9 +9210,9 @@ impl ECStore {
     pub(crate) async fn acquire_decommission_capacity_release_fence_with_active_source(
         &self,
     ) -> Result<(rustfs_lock::NamespaceLockGuard, bool)> {
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let save_guard = self.pool_meta_save_gate.lock().await;
         let (pool_meta_guard, snapshot) = self
-            .acquire_pool_meta_read_guard(&mut save_guard, "capacity release fence failed")
+            .acquire_pool_meta_read_guard(&save_guard, "capacity release fence failed")
             .await?;
         let has_active_source = pool_meta_has_active_decommission(&snapshot);
         drop(save_guard);
@@ -9275,9 +9277,9 @@ impl ECStore {
         }
 
         let (reconciliations, model_version) = {
-            let mut save_guard = self.pool_meta_save_gate.lock().await;
+            let save_guard = self.pool_meta_save_gate.lock().await;
             let (_read_guard, snapshot) = self
-                .acquire_pool_meta_read_guard(&mut save_guard, "exact delete capacity reconciliation failed")
+                .acquire_pool_meta_read_guard(&save_guard, "exact delete capacity reconciliation failed")
                 .await?;
             let reconciliations = plan_exact_delete_capacity_reconciliations(&snapshot, object, exact)?;
             let model_version = active_decommission_capacity_model(&snapshot)?;
@@ -9882,9 +9884,9 @@ impl ECStore {
         let non_growing_replacement = matches!(mode, DecommissionCapacityMutationMode::NonGrowingReplacement);
         let temporary_release = matches!(mode, DecommissionCapacityMutationMode::TemporaryRelease);
         let mut operation = Some(operation);
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let save_guard = self.pool_meta_save_gate.lock().await;
         let (read_guard, snapshot) = self
-            .acquire_pool_meta_read_guard(&mut save_guard, "target capacity admission failed")
+            .acquire_pool_meta_read_guard(&save_guard, "target capacity admission failed")
             .await?;
         let admission_now = OffsetDateTime::now_utc();
         let admitted_owner = capacity_owner.and_then(|owner| {
@@ -10267,6 +10269,14 @@ impl ECStore {
 
     pub(crate) async fn ensure_pool_meta_side_effects_safe(&self, operation: &str) -> Result<()> {
         self.pool_meta_save_gate.lock().await.ensure_write_safe(operation)
+    }
+
+    /// Reports whether pool metadata side effects are currently writable.
+    /// Read-only admission probes do not change this state; startup and real
+    /// metadata transactions still latch it on unrecoverable conditions.
+    pub async fn pool_meta_writes_ready(&self) -> bool {
+        let write_state = self.pool_meta_save_gate.lock().await;
+        !write_state.write_blocked && !write_state.aborted_transaction.load(Ordering::SeqCst)
     }
 
     async fn load_runtime_pool_meta_observing(&self, write_state: &mut PoolMetaWriteState, operation: &str) -> Result<PoolMeta> {
@@ -10891,9 +10901,9 @@ impl ECStore {
         // global lock, then fence the exact target cohort before taking the
         // write lock used to publish the terminal transition.
         let terminal_fence_plan = if acquire_runtime_fence {
-            let mut read_save_guard = self.pool_meta_save_gate.lock().await;
+            let read_save_guard = self.pool_meta_save_gate.lock().await;
             let (read_guard, snapshot) = self
-                .acquire_pool_meta_read_guard(&mut read_save_guard, "decommission cancel fence planning failed")
+                .acquire_pool_meta_read_guard(&read_save_guard, "decommission cancel fence planning failed")
                 .await?;
             let plan = decommission_capacity_terminal_fence_plan(&snapshot, idx)?;
             drop(read_guard);
@@ -16889,6 +16899,87 @@ mod tests {
         assert!(err.to_string().contains("requires 60 bytes, but 59 bytes are available"));
     }
 
+    async fn single_pool_capacity_admission_test_store() -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
+        let (temp_dirs, store) =
+            crate::services::rebalance::test_store_with_persisted_rebalance_meta(RebalanceMeta::default()).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        (temp_dirs, store)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn single_pool_public_writes_skip_decommission_capacity_admission() {
+        let (_temp_dirs, store) = single_pool_capacity_admission_test_store().await;
+        let bucket = format!("single-pool-capacity-skip-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create single-pool bucket before blocking pool metadata writes");
+        let incarnation = store.bucket_incarnation_id(&bucket).await.expect("load bucket incarnation");
+        store.pool_meta_save_gate.lock().await.block_writes_after_fence_loss();
+
+        let object = "ordinary-put.bin";
+        let mut put_data = crate::object_api::PutObjReader::from_vec(b"ordinary single-pool body".to_vec());
+        store
+            .put_object(&bucket, object, &mut put_data, &ObjectOptions::default())
+            .await
+            .expect("single-pool ordinary PUT must not enter decommission capacity admission");
+        store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("single-pool ordinary PUT must remain readable");
+
+        let multipart_object = "ordinary-multipart.bin";
+        let upload = store
+            .new_multipart_upload(
+                &bucket,
+                multipart_object,
+                &ObjectOptions {
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("single-pool MPU creation must not enter decommission capacity admission");
+        let mut part_data = crate::object_api::PutObjReader::from_vec(b"single-pool multipart body".to_vec());
+        let part = store
+            .put_object_part(
+                &bucket,
+                multipart_object,
+                &upload.upload_id,
+                1,
+                &mut part_data,
+                &ObjectOptions {
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("single-pool UploadPart must not enter decommission capacity admission");
+        store
+            .clone()
+            .complete_multipart_upload(
+                &bucket,
+                multipart_object,
+                &upload.upload_id,
+                vec![crate::storage_api_contracts::multipart::CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions {
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("single-pool CompleteMultipartUpload must not enter decommission capacity admission");
+        store
+            .get_object_info(&bucket, multipart_object, &ObjectOptions::default())
+            .await
+            .expect("single-pool completed MPU must remain readable");
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn multipart_mutations_locate_later_upload_before_reserved_pool_admission() {
@@ -17962,6 +18053,67 @@ mod tests {
     }
 
     #[test]
+    fn pool_meta_read_probe_does_not_latch_writer_state() {
+        let write_state = PoolMetaWriteState::default();
+        select_pool_meta_replicas_for_read_probe(
+            &write_state,
+            vec![PoolMetaReplica::Unreadable("transient read failure".to_string())],
+            "capacity probe",
+        )
+        .expect_err("an unreadable probe replica must fail the current admission");
+
+        assert!(
+            write_state.ensure_write_safe("ordinary object write").is_ok(),
+            "a read-only capacity probe must not permanently latch the pool metadata writer"
+        );
+    }
+
+    #[test]
+    fn pool_meta_read_probe_rejects_missing_runtime_metadata_without_latching() {
+        let write_state = PoolMetaWriteState {
+            expected_cluster_id: Some(uuid::Uuid::new_v4()),
+            identity_initialized: Some(true),
+            ..Default::default()
+        };
+        select_pool_meta_replicas_for_read_probe(&write_state, vec![PoolMetaReplica::Missing], "capacity probe")
+            .expect_err("runtime metadata disappearance must reject the current probe");
+        write_state
+            .ensure_write_safe("ordinary object write")
+            .expect("a missing-metadata probe must not permanently latch the writer");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_read_guard_does_not_latch_after_unreadable_replica() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let mut saved_disks = Vec::new();
+        for set in &store.pools[1].disk_set {
+            let mut disks = set.disks.write().await;
+            let original = std::mem::take(&mut *disks);
+            let disk_count = original.len();
+            saved_disks.push((set.clone(), original));
+            *disks = vec![None; disk_count];
+        }
+
+        let write_state = store.pool_meta_save_gate.lock().await;
+        store
+            .acquire_pool_meta_read_guard(&write_state, "capacity probe")
+            .await
+            .expect_err("an unreadable metadata replica must reject this probe");
+        write_state
+            .ensure_write_safe("ordinary object write")
+            .expect("a failed read-only probe must remain retryable");
+
+        for (set, disks) in saved_disks {
+            *set.disks.write().await = disks;
+        }
+        store
+            .acquire_pool_meta_read_guard(&write_state, "capacity probe retry")
+            .await
+            .expect("a read-only probe must succeed after the replica recovers");
+    }
+
+    #[test]
     fn pool_meta_write_state_blocks_when_selection_has_no_valid_replica() {
         let replicas = vec![
             PoolMetaReplica::Unreadable("pool 0 read quorum unavailable".to_string()),
@@ -17978,41 +18130,6 @@ mod tests {
             err.to_string()
                 .contains("restart after all replicas are readable and consistent")
         );
-    }
-
-    #[test]
-    fn pool_meta_read_probe_does_not_latch_writer_state() {
-        let write_state = PoolMetaWriteState::default();
-        select_pool_meta_replicas_for_read_probe(
-            &write_state,
-            vec![PoolMetaReplica::Unreadable("transient read failure".to_string())],
-            "capacity probe",
-        )
-        .expect_err("an unreadable probe replica must fail the current admission");
-
-        write_state
-            .ensure_write_safe("ordinary object write")
-            .expect("a read-only capacity probe must not permanently latch the pool metadata writer");
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn pool_meta_read_guard_does_not_latch_after_unreadable_replica() {
-        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
-        for set in &store.pools[1].disk_set {
-            let mut disks = set.disks.write().await;
-            let disk_count = disks.len();
-            *disks = vec![None; disk_count];
-        }
-
-        let mut write_state = store.pool_meta_save_gate.lock().await;
-        store
-            .acquire_pool_meta_read_guard(&mut write_state, "capacity probe")
-            .await
-            .expect_err("an unreadable metadata replica must reject this probe");
-        write_state
-            .ensure_write_safe("ordinary object write")
-            .expect("a failed read-only probe must remain retryable");
     }
 
     #[test]

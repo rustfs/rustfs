@@ -72,7 +72,12 @@ def report_number(value):
 
 def digest(path):
     with Path(path).open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        if hasattr(hashlib, "file_digest"):
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+        hasher = hashlib.sha256()
+        while chunk := stream.read(1024 * 1024):
+            hasher.update(chunk)
+        return hasher.hexdigest()
 
 
 def read_json(path):
