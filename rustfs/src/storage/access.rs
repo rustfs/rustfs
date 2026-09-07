@@ -20,6 +20,7 @@ use crate::auth::{
     VerifiedSigV4Request, check_key_valid_with_context, get_condition_values_with_client_info,
     get_condition_values_with_query_and_client_info, get_request_auth_type_with_query, get_session_token,
     parse_presigned_multipart_max_total_object_size, parse_presigned_put_max_content_length,
+    reject_unsigned_amz_headers_on_presigned_request,
 };
 use crate::error::ApiError;
 use crate::license::license_check;
@@ -1838,6 +1839,11 @@ impl S3Access for FS {
 
         // Publish this server's context slot so downstream data-plane handlers
         // resolve the same store (backlog#1052 S6).
+        // GHSA-g8w9-qw9q-fghr: a presigned URL only authorises the headers it
+        // signed. Reject unsigned `x-amz-*` headers before any operation-level
+        // authorization or handler can read them.
+        reject_unsigned_amz_headers_on_presigned_request(cx.headers(), cx.uri().query())?;
+
         let auth_type = get_request_auth_type_with_query(cx.headers(), cx.uri().query());
         let verified_presigned = matches!(auth_type, AuthType::Presigned);
         let verified_sigv4 = matches!(auth_type, AuthType::Presigned | AuthType::Signed);
