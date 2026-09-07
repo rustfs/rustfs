@@ -47,10 +47,24 @@ def validate_report(report, *, round_number, pid, objects, budget):
             continue
         if type(value) is not str or not 0 < len(value.encode("utf-8")) <= 512:
             raise ValueError(f"invalid raw entry marker: {key}")
+    if "raw_page_index_parent" not in report:
+        raise ValueError("missing raw page index parent")
+    raw_page_index_parent = report.get("raw_page_index_parent")
+    if raw_page_index_parent is not None and (type(raw_page_index_parent) is not str
+                                              or not 0 < len(raw_page_index_parent.encode("utf-8")) <= 512):
+        raise ValueError("invalid raw page index parent")
+    if type(report.get("raw_page_index_complete")) is not bool:
+        raise ValueError("missing raw page index completeness")
     if type(report.get("snapshot_complete")) is not bool:
         raise ValueError("missing explicit completeness")
     if report.get("outcome") not in ("complete", "partial", "cancelled_without_cache"):
         raise ValueError("unexpected scanner outcome")
+    if report["raw_page_index_committed_entries"] > report["raw_page_index_indexed_entries"]:
+        raise ValueError("raw page index committed entries exceed indexed entries")
+    if report["raw_page_index_parent"] == "bucket" and report["raw_page_index_indexed_entries"] > objects:
+        raise ValueError("raw page index exceeds fixture object count")
+    if report["objects_retained"] > report["objects_before"] + report["objects_processed"]:
+        raise ValueError("retained coverage advanced beyond classified object work")
 
 
 def converged(report, objects):
@@ -64,6 +78,38 @@ def replays_raw_window(previous, current):
             and previous["raw_last_entry"] == current["raw_last_entry"]
             and previous["objects_retained"] == current["objects_before"]
             and current["objects_retained"] == previous["objects_retained"])
+
+
+def validate_recoverable_quantum(reports, *, objects, budget, require_converged):
+    if not reports:
+        raise ValueError("no scanner restart reports were produced")
+    previous = None
+    made_enumeration_progress = False
+    made_classification_progress = False
+    made_durable_progress = False
+    for index, report in enumerate(reports):
+        validate_report(report, round_number=index, pid=report["pid"], objects=objects, budget=budget)
+        if previous is not None:
+            if report["objects_before"] != previous["objects_retained"]:
+                raise ValueError("durable retained coverage did not survive process restart")
+            if report["objects_retained"] < previous["objects_retained"]:
+                raise ValueError("durable retained coverage regressed across restart")
+            if (report["raw_page_index_parent"] == previous["raw_page_index_parent"]
+                    and report["raw_page_index_committed_entries"] < previous["raw_page_index_committed_entries"]
+                    and not previous["raw_page_index_complete"]):
+                raise ValueError("committed raw enumeration page coverage regressed before completion")
+        made_enumeration_progress |= report["raw_entries"] > 0 or report["raw_page_index_indexed_entries"] > 0
+        made_classification_progress |= report["objects_processed"] > 0
+        made_durable_progress |= report["objects_retained"] > report["objects_before"]
+        previous = report
+    if not made_enumeration_progress:
+        raise ValueError("restart proof did not exercise raw enumeration")
+    if not made_classification_progress:
+        raise ValueError("restart proof did not exercise object classification")
+    if not made_durable_progress:
+        raise ValueError("restart proof did not persist processed object coverage")
+    if require_converged and not converged(reports[-1], objects):
+        raise ValueError("fixed-budget restart convergence was not established")
 
 
 def run(args):
@@ -103,15 +149,15 @@ def run(args):
             report = json.loads(raw)
             validate_report(report, round_number=round_number, pid=worker.pid,
                             objects=args.objects, budget=args.raw_entry_budget)
-        if reports and report["objects_before"] != reports[-1]["objects_retained"]:
-            raise ValueError("cache coverage did not survive the process boundary")
         if reports and replays_raw_window(reports[-1], report):
             replayed_raw_window = True
         reports.append(report)
         print(json.dumps(report, sort_keys=True), flush=True)
         if converged(report, args.objects):
-            print("PASS: bounded scanner-worker restart convergence for this fixture only")
+            validate_recoverable_quantum(reports, objects=args.objects, budget=args.raw_entry_budget, require_converged=True)
+            print("PASS: bounded scanner-worker restart convergence with enumeration/classification/processing evidence")
             return 0
+    validate_recoverable_quantum(reports, objects=args.objects, budget=args.raw_entry_budget, require_converged=False)
     reason = "replayed raw enumeration window" if replayed_raw_window else "no bounded restart convergence"
     print(f"FAIL: fixed-budget restart convergence not established ({reason}); R-E gate remains unmet",
           file=sys.stderr)

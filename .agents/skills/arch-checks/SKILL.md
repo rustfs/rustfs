@@ -1,12 +1,13 @@
 ---
 name: arch-checks
-description: Resolve failures from the repository's architecture guard scripts — check_layer_dependencies.sh, check_architecture_migration_rules.sh, check_unsafe_code_allowances.sh, check_logging_guardrails.sh, check_doc_paths.sh. Use when make pre-commit / pre-pr or CI fails on one of these checks.
+description: Diagnose failures from check_layer_dependencies.sh, check_architecture_migration_rules.sh, check_unsafe_code_allowances.sh, check_logging_guardrails.sh, check_doc_paths.sh, or check_no_planning_docs.sh. Use when one of these guards fails, not for every architecture question or documentation edit.
 ---
 
 # Architecture Guard Checks
 
-All five run in `make pre-commit` / `make pre-pr` and in CI. Fix the cause;
-never weaken a check to get green.
+Read only the section for the failing guard. Use `.config/make/` and the current
+workflow to verify its wiring; not every guard is part of every gate. Fix the
+cause and rerun the failed guard; never weaken a check to get green.
 
 ## `check_layer_dependencies.sh` — layer DAG in `rustfs/src`
 
@@ -54,7 +55,8 @@ Instruction docs (`AGENTS.md`, `CLAUDE.md`, `ARCHITECTURE.md`) and every
 Markdown file under `docs/` (architecture, operations, testing, index) must not
 reference repo file paths that no longer exist. If your refactor moved code,
 update the docs that point at it — the error message lists `doc -> stale-path`
-pairs. Cite paths plus symbol names, never line numbers (see `docs/README.md`).
+pairs. In durable docs, cite paths plus symbol names rather than line numbers
+(see `docs/architecture/README.md`). Review findings still need `file:line`.
 
 ## `check_no_planning_docs.sh`
 

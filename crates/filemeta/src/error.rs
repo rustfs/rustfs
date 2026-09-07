@@ -37,6 +37,9 @@ pub enum Error {
     #[error("Method not allowed")]
     MethodNotAllowed,
 
+    #[error("You've exceeded the limit on the number of versions you can create on this object")]
+    MaxVersionsExceeded,
+
     #[error("Unexpected error")]
     Unexpected,
 
@@ -86,6 +89,7 @@ impl PartialEq for Error {
             (Error::FileCorrupt, Error::FileCorrupt) => true,
             (Error::DoneForNow, Error::DoneForNow) => true,
             (Error::MethodNotAllowed, Error::MethodNotAllowed) => true,
+            (Error::MaxVersionsExceeded, Error::MaxVersionsExceeded) => true,
             (Error::FileNotFound, Error::FileNotFound) => true,
             (Error::FileVersionNotFound, Error::FileVersionNotFound) => true,
             (Error::VolumeNotFound, Error::VolumeNotFound) => true,
@@ -111,6 +115,7 @@ impl Clone for Error {
             Error::FileCorrupt => Error::FileCorrupt,
             Error::DoneForNow => Error::DoneForNow,
             Error::MethodNotAllowed => Error::MethodNotAllowed,
+            Error::MaxVersionsExceeded => Error::MaxVersionsExceeded,
             Error::VolumeNotFound => Error::VolumeNotFound,
             Error::Io(e) => Error::Io(std::io::Error::new(e.kind(), e.to_string())),
             Error::RmpSerdeDecode(s) => Error::RmpSerdeDecode(s.clone()),

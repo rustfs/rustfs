@@ -1,6 +1,6 @@
 ---
 name: test-coverage-improver
-description: Run project coverage checks, rank high-risk gaps, and propose high-impact tests to improve regression confidence for changed and critical code paths before release.
+description: Analyze a supplied coverage report or perform an explicitly requested RustFS coverage assessment, rank uncovered risks, and propose focused tests. Do not trigger for ordinary implementation verification, a single regression test, documentation wording, or release preparation without a coverage request.
 ---
 
 # Test Coverage Improver
@@ -9,58 +9,49 @@ Use this skill when you need a prioritized, risk-aware plan to improve tests fro
 
 ## Usage assumptions
 - Focus scope is either changed lines/files, a module, or the whole repository.
-- Coverage artifact must be generated or provided in a supported format.
+- Reuse a supplied coverage artifact when its revision, scope, and format match.
 - If required context is missing, call out assumptions explicitly before proposing work.
 
 ## Workflow
 
 1. Define scope and baseline
-   - Confirm target language, framework, and branch.
-   - Confirm whether the scope is changed files only or full-repo.
+   - Derive the revision and scope from the request, diff, or supplied report.
+   - Default to the affected files/module; whole-workspace coverage requires that
+     scope in the request. Ask only if a wrong scope would change the result.
 
-2. Produce coverage snapshot
-   - Rust: `cargo llvm-cov` (or `cargo tarpaulin`) with existing repo config.
-   - JavaScript/TypeScript: `npm test -- --coverage` and read `coverage/coverage-final.json`.
-   - Python: `pytest --cov=<pkg> --cov-report=json` and read `coverage.json`.
-   - Collect total, per-file, and changed-line coverage.
+2. Obtain coverage evidence
+   - First inspect a matching existing artifact; do not regenerate it merely
+     because this skill was selected.
+   - If measurement is needed, read the Coverage section of
+     [the testing guide](../../../docs/testing/README.md#coverage), check disk
+     space/tool availability, and select package/test-scoped `cargo llvm-cov`
+     using the repository's nextest configuration. `make coverage` measures the
+     whole workspace (excluding E2E) and is only for that requested scope.
+   - Collect only metrics the report supports. Missing branch/changed-line
+     coverage is unknown, not zero.
+   - If measurement cannot run, continue with code-based test proposals and
+     mark measured coverage unverified; do not invent a coverage percentage.
 
 3. Rank highest-risk gaps
    - Prioritize changed code, branch coverage gaps, and low-confidence boundaries.
    - Apply the risk rubric in [coverage-prioritization.md](references/coverage-prioritization.md).
-   - Keep shortlist to 5–8 gaps.
+   - Report up to 5–8 evidenced gaps; do not pad a small scope.
    - For each gap, capture: file, lines, uncovered branches, and estimated risk score.
 
 4. Propose high-impact tests
-   - For each shortlisted gap, output:
-     - Intent and expected behavior.
-     - Normal, edge, and failure scenarios.
-     - Assertions and side effects to verify.
-     - Setup needs (fixtures, mocks, integration dependencies).
-     - Estimated effort (`S/M/L`).
+   - For each gap, name the behavior and regression, distinguishing assertions,
+     relevant normal/edge/failure cases, necessary setup, and estimated effort.
+   - Include only scenarios and setup that apply; reuse shared fixture details.
 
 5. Close with validation plan
    - State which gaps remain after proposals.
-   - Provide concrete verification command and acceptance threshold.
+   - Give a scoped verification command and behavior-based acceptance criterion;
+     use a coverage threshold only when the task or repository requires one.
    - List assumptions or blockers (environment, fixtures, flaky dependencies).
 
-## Output template
+## Report
 
-### Coverage Snapshot
-- total / branch coverage
-- changed-file coverage
-- top missing regions by size
-
-### Top Gaps (ranked)
-- `path:line-range` | risk score | why critical
-
-### Test Proposals
-- `path:line-range`
-  - Test name
-  - scenarios
-  - assertions
-  - effort
-
-### Validation Plan
-- command
-- pass criteria
-- remaining risk
+Summarize the supported metrics, then combine each ranked gap with its proposed
+test and validation. Include source lines only when supplied or inspected;
+mark missing metrics or locations as unknown. Do not duplicate gaps and tests
+in separate templates or fill empty categories for an otherwise small report.

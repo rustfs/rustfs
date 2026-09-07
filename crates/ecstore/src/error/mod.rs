@@ -588,6 +588,7 @@ impl From<rustfs_filemeta::Error> for StorageError {
             rustfs_filemeta::Error::FileVersionNotFound => StorageError::FileVersionNotFound,
             rustfs_filemeta::Error::FileCorrupt => StorageError::FileCorrupt,
             rustfs_filemeta::Error::Unexpected => StorageError::Unexpected,
+            rustfs_filemeta::Error::MaxVersionsExceeded => StorageError::MaxVersionsExceeded,
             rustfs_filemeta::Error::Io(io_error) => io_error.into(),
             _ => StorageError::Io(std::io::Error::other(e)),
         }
