@@ -1232,6 +1232,19 @@ fn complete_set_usage_cache(buckets: &[(&str, usize)], scan_plan_digest: DataUsa
     cache
 }
 
+fn test_bucket_incarnations(buckets: &[&str]) -> HashMap<String, Uuid> {
+    buckets
+        .iter()
+        .enumerate()
+        .map(|(index, bucket)| {
+            (
+                (*bucket).to_string(),
+                Uuid::from_u128(u128::try_from(index).expect("test index should fit") + 1),
+            )
+        })
+        .collect()
+}
+
 #[tokio::test]
 #[serial]
 async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers() {
@@ -2082,6 +2095,7 @@ fn scoped_set_scan_rebuilds_selected_buckets_and_drops_deleted_buckets() {
             source: DataUsageCacheSource::new(1, 2),
             scan_plan_digest: current_digest,
         },
+        None,
     )
     .expect("complete matching set cache should support a scoped scan");
 
@@ -2103,6 +2117,57 @@ fn scoped_set_scan_rebuilds_selected_buckets_and_drops_deleted_buckets() {
     assert!(prepared.cache.info.lkg_snapshot_complete);
     assert_eq!(prepared.cache.info.lkg_next_cycle, Some(7));
     assert_eq!(prepared.cache.info.lkg_scan_plan_digest, Some(baseline_digest));
+}
+
+#[test]
+fn scoped_set_scan_reuses_unselected_buckets_with_matching_incarnations() {
+    let baseline_digest = DataUsageScanPlanDigest([1; 32]);
+    let current_digest = DataUsageScanPlanDigest([2; 32]);
+    let mut old_cache = complete_set_usage_cache(&[("stable", 10), ("dirty", 20)], baseline_digest);
+    old_cache.replace(
+        "stable/prefix",
+        "stable",
+        DataUsageEntry {
+            size: 5,
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    old_cache.info.scan_bucket_incarnations = test_bucket_incarnations(&["stable", "dirty"]);
+    let current_incarnations = old_cache.info.scan_bucket_incarnations.clone();
+    let all_buckets = vec![
+        bucket_info_with_created_time("stable"),
+        bucket_info_with_created_time("dirty"),
+    ];
+
+    let prepared = prepare_scoped_set_scan(
+        &old_cache,
+        &all_buckets,
+        &all_buckets,
+        &ScannerBucketScanScope {
+            selected_buckets: Some(Arc::new(HashSet::from(["dirty".to_string()]))),
+            selected_bucket_prefixes: None,
+            baseline_scan_plan_digest: Some(baseline_digest),
+        },
+        ScannerSetCacheGeneration {
+            want_cycle: 8,
+            leader_epoch: 11,
+            tier_registry_generation: 13,
+            source: DataUsageCacheSource::new(1, 2),
+            scan_plan_digest: current_digest,
+        },
+        Some(&current_incarnations),
+    )
+    .expect("matching bucket incarnations should authorize cold bucket reuse");
+
+    assert_eq!(prepared.buckets.iter().map(|bucket| bucket.name.as_str()).collect::<Vec<_>>(), ["dirty"]);
+    let stable = prepared
+        .cache
+        .checked_flatten("stable")
+        .expect("unselected stable bucket should be copied with children");
+    assert_eq!((stable.size, stable.objects), (15, 2));
+    assert_eq!(prepared.cache.find("dirty").map(|entry| (entry.size, entry.objects)), Some((0, 0)));
+    assert_eq!(prepared.cache.info.scan_bucket_incarnations, current_incarnations);
 }
 
 #[test]
@@ -2130,10 +2195,22 @@ fn scoped_set_scan_rejects_unbound_bucket_incarnations() {
         stable.created = created;
         let buckets = vec![stable, bucket_info_with_created_time("dirty")];
         assert!(
-            prepare_scoped_set_scan(&old_cache, &buckets, &buckets, &scope, generation).is_none(),
+            prepare_scoped_set_scan(&old_cache, &buckets, &buckets, &scope, generation, None).is_none(),
             "missing identity, volume timestamps and same-name recreation must all rebuild"
         );
     }
+    let mut mismatched = test_bucket_incarnations(&["stable", "dirty"]);
+    mismatched.insert("stable".to_string(), Uuid::from_u128(99));
+    let mut old_cache = old_cache;
+    old_cache.info.scan_bucket_incarnations = test_bucket_incarnations(&["stable", "dirty"]);
+    let buckets = vec![
+        bucket_info_with_created_time("stable"),
+        bucket_info_with_created_time("dirty"),
+    ];
+    assert!(
+        prepare_scoped_set_scan(&old_cache, &buckets, &buckets, &scope, generation, Some(&mismatched)).is_none(),
+        "a same-name unselected bucket with a different incarnation must rebuild"
+    );
 }
 
 #[test]
@@ -2159,6 +2236,7 @@ fn scoped_set_scan_falls_back_when_an_unselected_bucket_has_no_baseline() {
                 source: DataUsageCacheSource::new(1, 2),
                 scan_plan_digest: DataUsageScanPlanDigest([4; 32]),
             },
+            Some(&test_bucket_incarnations(&["stable", "new"])),
         )
         .is_none()
     );
@@ -2183,19 +2261,19 @@ fn scoped_set_scan_requires_an_exact_complete_baseline() {
 
     let mut incomplete = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);
     incomplete.info.snapshot_complete = false;
-    assert!(prepare_scoped_set_scan(&incomplete, &all_buckets, &all_buckets, &scope, generation).is_none());
+    assert!(prepare_scoped_set_scan(&incomplete, &all_buckets, &all_buckets, &scope, generation, None).is_none());
 
     let mut not_durable = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);
     not_durable.info.last_update = None;
-    assert!(prepare_scoped_set_scan(&not_durable, &all_buckets, &all_buckets, &scope, generation).is_none());
+    assert!(prepare_scoped_set_scan(&not_durable, &all_buckets, &all_buckets, &scope, generation, None).is_none());
 
     let mut unscoped_usage = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);
     unscoped_usage.cache.get_mut(DATA_USAGE_ROOT).expect("set root").objects = 1;
-    assert!(prepare_scoped_set_scan(&unscoped_usage, &all_buckets, &all_buckets, &scope, generation).is_none());
+    assert!(prepare_scoped_set_scan(&unscoped_usage, &all_buckets, &all_buckets, &scope, generation, None).is_none());
 
     let mut wrong_digest = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);
     wrong_digest.info.scan_plan_digest = Some(DataUsageScanPlanDigest([7; 32]));
-    assert!(prepare_scoped_set_scan(&wrong_digest, &all_buckets, &all_buckets, &scope, generation).is_none());
+    assert!(prepare_scoped_set_scan(&wrong_digest, &all_buckets, &all_buckets, &scope, generation, None).is_none());
 
     let empty_scope = ScannerBucketScanScope {
         selected_buckets: Some(Arc::new(HashSet::new())),
@@ -2203,18 +2281,18 @@ fn scoped_set_scan_requires_an_exact_complete_baseline() {
         baseline_scan_plan_digest: Some(baseline_digest),
     };
     let complete = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);
-    assert!(prepare_scoped_set_scan(&complete, &all_buckets, &all_buckets, &empty_scope, generation).is_none());
-    assert!(prepare_scoped_set_scan(&complete, &all_buckets, &all_buckets, &scope, generation).is_some());
+    assert!(prepare_scoped_set_scan(&complete, &all_buckets, &all_buckets, &empty_scope, generation, None).is_none());
+    assert!(prepare_scoped_set_scan(&complete, &all_buckets, &all_buckets, &scope, generation, None).is_some());
 
     let unidentified_buckets = vec![bucket_info("dirty")];
     assert!(
-        prepare_scoped_set_scan(&complete, &unidentified_buckets, &unidentified_buckets, &scope, generation).is_some(),
+        prepare_scoped_set_scan(&complete, &unidentified_buckets, &unidentified_buckets, &scope, generation, None).is_some(),
         "fully selected buckets are rebuilt without reusing an unproven incarnation"
     );
 
     let mut future_cache = complete_set_usage_cache(&[("dirty", 10)], baseline_digest);
     future_cache.info.next_cycle = generation.want_cycle.saturating_add(1);
-    assert!(prepare_scoped_set_scan(&future_cache, &all_buckets, &all_buckets, &scope, generation).is_none());
+    assert!(prepare_scoped_set_scan(&future_cache, &all_buckets, &all_buckets, &scope, generation, None).is_none());
 }
 
 #[test]
@@ -3083,6 +3161,7 @@ fn apply_bucket_result_to_cache_updates_bucket_entry() {
                 objects: 2,
                 ..Default::default()
             },
+            bucket_incarnation: Some(Uuid::from_u128(7)),
             tier_registry_generation: None,
         },
         update_time,
@@ -3092,6 +3171,7 @@ fn apply_bucket_result_to_cache_updates_bucket_entry() {
     let entry = cache.find("bucket").expect("bucket entry should remain present");
     assert_eq!(entry.size, 10);
     assert_eq!(entry.objects, 2);
+    assert_eq!(cache.info.scan_bucket_incarnations.get("bucket"), Some(&Uuid::from_u128(7)));
 }
 
 #[test]
@@ -3122,6 +3202,7 @@ fn apply_bucket_result_to_cache_rejects_a_different_tier_generation() {
                 size: 11,
                 ..Default::default()
             },
+            bucket_incarnation: Some(Uuid::from_u128(7)),
             tier_registry_generation: Some(8),
         },
         SystemTime::now(),

@@ -741,6 +741,11 @@ pub(crate) fn cache_root_entry_info(cache: &DataUsageCache) -> std::result::Resu
         name: cache.info.name.clone(),
         parent: DATA_USAGE_ROOT.to_string(),
         entry,
+        bucket_incarnation: cache
+            .info
+            .scan_identity
+            .map(|identity| identity.bucket_incarnation)
+            .filter(|incarnation| !incarnation.is_nil()),
         tier_registry_generation: cache.info.tier_registry_generation,
     })
 }
@@ -751,6 +756,14 @@ fn apply_bucket_result_to_cache(cache: &mut DataUsageCache, result: DataUsageEnt
         // this cycle. Leaving it unapplied makes the cycle incomplete and
         // forces the caller to re-account it under one frozen registry.
         return false;
+    }
+    match result.bucket_incarnation {
+        Some(incarnation) if !incarnation.is_nil() => {
+            cache.info.scan_bucket_incarnations.insert(result.name.clone(), incarnation);
+        }
+        _ => {
+            cache.info.scan_bucket_incarnations.remove(&result.name);
+        }
     }
     cache.replace(&result.name, &result.parent, result.entry);
     cache.info.last_update = Some(update_time);

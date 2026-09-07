@@ -34,17 +34,12 @@ pub(super) fn prepare_scoped_set_scan(
     all_buckets: &[BucketInfo],
     scope: &ScannerBucketScanScope,
     generation: ScannerSetCacheGeneration,
+    current_bucket_incarnations: Option<&HashMap<String, uuid::Uuid>>,
 ) -> Option<PreparedScopedSetScan> {
     let (Some(selected_buckets), Some(baseline_scan_plan_digest)) = (&scope.selected_buckets, scope.baseline_scan_plan_digest)
     else {
         return None;
     };
-    // The existing cache does not bind each bucket to a durable incarnation.
-    // Listing creation times can come from volume metadata, so even Some(time)
-    // cannot prove that an unselected same-name bucket is the cached bucket.
-    if all_buckets.iter().any(|bucket| !selected_buckets.contains(&bucket.name)) {
-        return None;
-    }
     if selected_buckets.is_empty()
         || !old_cache.info.snapshot_complete
         || old_cache.info.last_update.is_none()
@@ -56,6 +51,7 @@ pub(super) fn prepare_scoped_set_scan(
         || old_cache.info.scan_plan_digest != Some(baseline_scan_plan_digest)
         || old_cache.info.cache_key_format != DATA_USAGE_CACHE_KEY_FORMAT
         || !old_cache.has_complete_root_inventory(&old_cache.find(DATA_USAGE_ROOT)?.children)
+        || !unselected_bucket_incarnations_match(old_cache, all_buckets, selected_buckets, current_bucket_incarnations)
     {
         return None;
     }
@@ -75,6 +71,7 @@ pub(super) fn prepare_scoped_set_scan(
             lkg_last_update: old_cache.info.last_update,
             lkg_leader_epoch: Some(old_cache.info.leader_epoch),
             lkg_scan_plan_digest: old_cache.info.scan_plan_digest,
+            scan_bucket_incarnations: old_cache.info.scan_bucket_incarnations.clone(),
             ..Default::default()
         },
         cache: HashMap::new(),
@@ -85,7 +82,15 @@ pub(super) fn prepare_scoped_set_scan(
         if !current_bucket_names.insert(bucket.name.as_str()) {
             return None;
         }
-        cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
+        if selected_buckets.contains(&bucket.name) {
+            cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
+        } else {
+            cache.copy_with_children(
+                old_cache,
+                &rustfs_data_usage::hash_path(&bucket.name),
+                &Some(rustfs_data_usage::hash_path(DATA_USAGE_ROOT)),
+            );
+        }
     }
 
     Some(PreparedScopedSetScan {
@@ -96,6 +101,47 @@ pub(super) fn prepare_scoped_set_scan(
             .collect(),
         cache,
     })
+}
+
+fn unselected_bucket_incarnations_match(
+    old_cache: &DataUsageCache,
+    all_buckets: &[BucketInfo],
+    selected_buckets: &HashSet<String>,
+    current_bucket_incarnations: Option<&HashMap<String, uuid::Uuid>>,
+) -> bool {
+    let Some(current_bucket_incarnations) = current_bucket_incarnations else {
+        return all_buckets.iter().all(|bucket| selected_buckets.contains(&bucket.name));
+    };
+    all_buckets
+        .iter()
+        .filter(|bucket| !selected_buckets.contains(&bucket.name))
+        .all(|bucket| {
+            let Some(current) = current_bucket_incarnations
+                .get(&bucket.name)
+                .filter(|incarnation| !incarnation.is_nil())
+            else {
+                return false;
+            };
+            old_cache
+                .info
+                .scan_bucket_incarnations
+                .get(&bucket.name)
+                .filter(|cached| !cached.is_nil())
+                == Some(current)
+        })
+}
+
+async fn scanner_current_bucket_incarnations(set: &SetDisks, all_buckets: &[BucketInfo]) -> Option<HashMap<String, uuid::Uuid>> {
+    let mut incarnations = HashMap::with_capacity(all_buckets.len());
+    for bucket in all_buckets {
+        let Ok(incarnation) = set.bucket_incarnation_id_from_disk(&bucket.name).await else {
+            return None;
+        };
+        if incarnation.is_nil() || incarnations.insert(bucket.name.clone(), incarnation).is_some() {
+            return None;
+        }
+    }
+    Some(incarnations)
 }
 
 #[async_trait::async_trait]
@@ -158,6 +204,7 @@ impl ScannerIOCache for SetDisks {
                 None
             }
         };
+        let current_bucket_incarnations = scanner_current_bucket_incarnations(self.as_ref(), &all_buckets).await;
         let scoped_scan = prepare_scoped_set_scan(
             &old_cache,
             &buckets,
@@ -170,6 +217,7 @@ impl ScannerIOCache for SetDisks {
                 source,
                 scan_plan_digest,
             },
+            current_bucket_incarnations.as_ref(),
         );
         let mut scoped_cache = scoped_scan.map(|mut prepared| {
             buckets = prepared.buckets;
@@ -191,6 +239,7 @@ impl ScannerIOCache for SetDisks {
                             scan_plan_digest: Some(scan_plan_digest),
                             scan_coverage_digest: Some(bucket_coverage_digest),
                             cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+                            scan_bucket_incarnations: current_bucket_incarnations.clone().unwrap_or_default(),
                             ..Default::default()
                         },
                         cache: HashMap::new(),
@@ -486,6 +535,7 @@ impl ScannerIOCache for SetDisks {
                     lkg_last_update: old_cache.info.lkg_last_update,
                     lkg_leader_epoch: old_cache.info.lkg_leader_epoch,
                     lkg_scan_plan_digest: old_cache.info.lkg_scan_plan_digest,
+                    scan_bucket_incarnations: current_bucket_incarnations.clone().unwrap_or_default(),
                     ..Default::default()
                 },
                 cache: HashMap::new(),

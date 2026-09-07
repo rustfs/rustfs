@@ -82,8 +82,8 @@ async fn persist_baseline(store: &Arc<ECStore>, baseline: &DataUsageInfo) {
     .expect("fixture baseline should persist");
 }
 
-// Every invocation uses the production default scope. The expected walker set
-// comes from storage's per-source inventory, not the resolver's selected names.
+// Every invocation uses the production default scope. Once durable bucket
+// incarnations are present, the expected walker set follows the resolved scope.
 async fn run_entry(store: &Arc<ECStore>, cycle: u64, selected: Option<&str>, expect_walks: bool) -> DataUsageInfo {
     let drives = drive_identities(store).await;
     let inventory = store
@@ -99,6 +99,7 @@ async fn run_entry(store: &Arc<ECStore>, cycle: u64, selected: Option<&str>, exp
                 let source = DataUsageCacheSource::new(set.pool_index, set.set_index);
                 set.buckets.into_iter().map(move |bucket| ((source, bucket.name), 1_u64))
             })
+            .filter(|((_, bucket), _)| selected.is_none_or(|selected| bucket == selected))
             .collect::<HashMap<_, _>>()
     } else {
         HashMap::new()
@@ -201,8 +202,8 @@ async fn scoped_entry_fallback_distinguishes_planned_scope_from_real_cold_walks(
     let baseline = run_entry(&store, 1, None, true).await;
     persist_baseline(&store, &baseline).await;
 
-    // A same-intent, same-cycle Current cache is a retry, not proof that a
-    // later cycle may reuse unselected buckets without durable incarnation.
+    // Same-cycle Current remains a retry. The later cycle may skip the cold
+    // bucket only after the prior complete set cache has durable incarnations.
     run_entry(&store, 1, Some(&hot), false).await;
     let usage = run_entry(&store, 2, Some(&hot), true).await;
     assert_eq!(usage.buckets_usage[&hot].objects_count, 1);
