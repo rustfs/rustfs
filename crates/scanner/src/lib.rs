@@ -60,6 +60,7 @@ use uuid::Uuid;
 pub mod data_usage_define;
 pub mod error;
 pub mod prefix_usage;
+pub mod raw_page_index;
 mod remote_scanner;
 pub mod runtime_config;
 pub mod scanner;
