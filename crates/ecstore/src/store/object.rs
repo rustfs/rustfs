@@ -4178,6 +4178,24 @@ impl ECStore {
 
     #[instrument(level = "trace", skip(self))]
     pub(super) async fn handle_get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.get_object_info_snapshot(bucket, object, opts, false).await
+    }
+
+    /// Return metadata for DELETE preflight, including an explicitly addressed
+    /// delete marker. Read APIs must keep using `get_object_info`; authorization
+    /// and Object Lock enforcement still belong to the caller and locked delete.
+    #[instrument(level = "trace", skip_all)]
+    pub async fn get_object_info_for_delete(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.get_object_info_snapshot(bucket, object, opts, true).await
+    }
+
+    async fn get_object_info_snapshot(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        allow_delete_marker: bool,
+    ) -> Result<ObjectInfo> {
         check_object_args(bucket, object)?;
 
         let object = encode_dir_object(object);
@@ -4188,6 +4206,8 @@ impl ECStore {
 
         let info = if self.single_pool() {
             self.pools[0].get_object_info(bucket, object.as_str(), &opts).await?
+        } else if allow_delete_marker {
+            self.get_latest_object_info_with_idx(bucket, object.as_str(), &opts).await?.0
         } else {
             self.get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
                 .await?
