@@ -431,7 +431,7 @@ impl<'a> MultiWriter<'a> {
             errs = ?self.errs,
             "Erasure encode write quorum unavailable: {summary_text}"
         );
-        Err(std::io::Error::other(format!("Failed to write data: {summary_text}")))
+        Err(write_err.into())
     }
 
     async fn shutdown_writer(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>) {
@@ -503,7 +503,7 @@ impl<'a> MultiWriter<'a> {
             errs = ?self.errs,
             "Erasure encode shutdown quorum unavailable: {summary_text}"
         );
-        Err(std::io::Error::other(format!("Failed to shutdown writers: {summary_text}")))
+        Err(write_err.into())
     }
 }
 
