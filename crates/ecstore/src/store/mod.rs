@@ -442,7 +442,7 @@ pub(crate) mod utils;
 
 use peer::init_local_peer;
 pub use peer::{
-    all_local_disk, all_local_disk_path, find_local_disk_by_ref, get_disk_infos, init_local_disks,
+    BootstrapLocalTarget, all_local_disk, all_local_disk_path, find_local_disk_by_ref, get_disk_infos, init_local_disks,
     init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
     prewarm_local_disk_id_map_with_instance_ctx,
 };
@@ -1812,7 +1812,7 @@ mod tests {
 
     // Build a minimal ECStore carrying an explicit instance context. Empty
     // pools/disks are sufficient: the Phase 5 accessors read only `self.ctx`.
-    fn build_store_with_ctx(ctx: Arc<InstanceContext>) -> Arc<ECStore> {
+    pub(super) fn build_store_with_ctx(ctx: Arc<InstanceContext>) -> Arc<ECStore> {
         let endpoint_pools = EndpointServerPools::default();
         Arc::new(ECStore {
             id: uuid::Uuid::new_v4(),

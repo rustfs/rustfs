@@ -384,6 +384,8 @@ pub mod data_usage {
 pub mod disk {
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
     pub use crate::disk::local::ScanGuard;
+    #[cfg(all(feature = "test-util", not(windows)))]
+    pub use crate::disk::os::{LocalPublicationPause, LocalPublicationStage};
     pub use crate::disk::{
         BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
         CheckPartsResp, ConditionalFileUpdate, DeleteOptions, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption,
@@ -564,8 +566,8 @@ pub mod storage {
     pub use crate::core::pools::HealLifecycleExpiryContext;
     pub use crate::store::HealWalkVersion;
     pub use crate::store::{
-        ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk, all_local_disk_path,
-        find_local_disk_by_ref, init_local_disks, init_local_disks_with_instance_ctx, init_lock_clients,
+        BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
+        all_local_disk_path, find_local_disk_by_ref, init_local_disks, init_local_disks_with_instance_ctx, init_lock_clients,
         prewarm_local_disk_id_map, prewarm_local_disk_id_map_with_instance_ctx,
     };
 }
