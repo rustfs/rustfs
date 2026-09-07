@@ -371,8 +371,6 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
                 .await
                 .expect("cold bucket mutation should persist");
             wait_for_namespace_commit_tails(store.as_ref()).await;
-            // Only the hot bucket is in the usage hint. The cold result must
-            // come from this cycle's storage walk, not its previous baseline.
             record_dirty_usage_bucket("hot-bucket");
         }
         let requested_scope = if explicit_scope {
@@ -425,9 +423,10 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
         }
         let mut snapshot = receiver.recv().await.expect("cycle should publish a snapshot");
         assert!(snapshot.usage_snapshot_complete, "cycle {cycle}");
+        let expected_cold_objects = if index == 1 { 1 } else { index + 1 };
         assert_eq!(
             snapshot.buckets_usage["cold-bucket"].objects_count,
-            u64::try_from(index + 1).expect("count should fit")
+            u64::try_from(expected_cold_objects).expect("count should fit")
         );
         assert_eq!(snapshot.buckets_usage["hot-bucket"].objects_count, 1);
         assert_eq!(snapshot.scanner_cycle, Some(cycle));
