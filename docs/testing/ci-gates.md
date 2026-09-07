@@ -228,6 +228,19 @@ these. The external `rustfs/auto-testing` functional workflows propagate suite
 failures. Their workflow status does not establish this registry's required
 case coverage, build provenance, or object-level oracles.
 
+For automation, `--check-scanner-heal-release "$RUN_DIR"` emits one compact
+JSON decision and exits nonzero while blocked. `verified_cases` contains only
+cases that pass the complete receipt, build provenance, nextest/JUnit and real
+oracle checks; `rejected_cases` names registered cases that do not, and
+`pending_gates` names the unimplemented release requirements. Approval requires
+every registered case to verify, `pending_gates` to be empty, and a future
+registry schema capable of representing the complete release matrix. Schema 1
+is deliberately marked `release_schema_capable: false`: it models only the
+single-version, unversioned-object restart/crash cases and cannot represent
+mixed-version, rollback, EC8+4 or performance evidence. A focused run,
+synthetic harness, compile-only result, skipped/retried test, ordinary CI
+success, or removal of pending text therefore cannot become a release approval.
+
 Run parser/receipt regressions with
 `scripts/python_bin.sh scripts/check_test_wiring.py --self-test`. Those fixtures
 validate the checker only and produce no runtime or performance evidence.
