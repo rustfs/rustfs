@@ -195,6 +195,13 @@ fn resolve_drive_timeout_profile_from_env() -> DriveTimeoutProfile {
     DriveTimeoutProfile::parse(rustfs_config::DEFAULT_DRIVE_TIMEOUT_PROFILE).unwrap_or(DriveTimeoutProfile::Default)
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Artificial `disk_info` latency for tests that pin how the admin storage
+    /// walk composes per-drive probe time.
+    pub(crate) static DISK_INFO_PROBE_DELAY_FOR_TEST: Duration;
+}
+
 fn get_drive_timeout_profile() -> DriveTimeoutProfile {
     #[cfg(test)]
     {
@@ -2036,6 +2043,10 @@ impl DiskAPI for LocalDiskWrapper {
             .track_disk_health_with_op_and_timeout_action(
                 "disk_info",
                 || async {
+                    #[cfg(test)]
+                    if let Ok(delay) = DISK_INFO_PROBE_DELAY_FOR_TEST.try_with(|delay| *delay) {
+                        tokio::time::sleep(delay).await;
+                    }
                     let result = self.disk.disk_info(opts).await?;
 
                     if let Some(current_disk_id) = *self.disk_id.read().await

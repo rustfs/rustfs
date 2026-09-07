@@ -6463,113 +6463,114 @@ pub fn should_heal_object_on_disk(
     (false, false, None)
 }
 
+/// Probe every drive of the set at once. Each live probe is bounded by the
+/// drive `disk_info` timeout, and the admin peer probe budget only covers one
+/// such timeout; a sequential walk over several stalled drives after a power
+/// cut would exceed it and make healthy peers render as unknown (#6488).
 async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<rustfs_madmin::Disk> {
-    let mut ret = Vec::new();
+    join_all(disks.iter().zip(eps).map(|(disk, ep)| disk_admin_info(disk.as_ref(), ep))).await
+}
 
-    for (i, pool) in disks.iter().enumerate() {
-        if let Some(disk) = pool {
-            let runtime_state = disk.runtime_state();
-            let offline_duration_seconds = disk.offline_duration_secs();
-            let capacity_snapshot = disk.last_capacity_snapshot();
-            let cached_disk_id = disk.cached_disk_id().await;
-            if runtime_state.should_probe_for_admin() || runtime_state == disk::health_state::RuntimeDriveHealthState::Suspect {
-                match disk
-                    .disk_info(&DiskInfoOptions {
-                        metrics: true,
-                        ..Default::default()
-                    })
-                    .await
-                {
-                    Ok(res) => {
-                        disk.record_capacity_probe(res.total, res.used, res.free);
-                        ret.push(rustfs_madmin::Disk {
-                            endpoint: eps[i].to_string(),
-                            local: eps[i].is_local,
-                            pool_index: eps[i].pool_idx,
-                            set_index: eps[i].set_idx,
-                            disk_index: eps[i].disk_idx,
-                            state: "ok".to_owned(),
+async fn disk_admin_info(disk: Option<&DiskStore>, ep: &Endpoint) -> rustfs_madmin::Disk {
+    let Some(disk) = disk else {
+        return rustfs_madmin::Disk {
+            endpoint: ep.to_string(),
+            drive_path: ep.get_file_path(),
+            local: ep.is_local,
+            pool_index: ep.pool_idx,
+            set_index: ep.set_idx,
+            disk_index: ep.disk_idx,
+            runtime_state: None,
+            offline_duration_seconds: None,
+            state: DiskError::DiskNotFound.to_string(),
+            capacity_observation_source: Some("missing".to_owned()),
+            capacity_observation_age_seconds: Some(0),
+            ..Default::default()
+        };
+    };
 
-                            root_disk: res.root_disk,
-                            drive_path: res.mount_path.clone(),
-                            healing: res.healing,
-                            scanning: res.scanning,
-                            runtime_state: Some(runtime_state.as_str().to_string()),
-                            offline_duration_seconds,
-                            capacity_observation_source: Some("live_probe".to_owned()),
-                            capacity_observation_age_seconds: Some(0),
-
-                            uuid: res.id.map_or_else(|| "".to_string(), |id| id.to_string()),
-                            major: res.major as u32,
-                            minor: res.minor as u32,
-                            model: None,
-                            total_space: res.total,
-                            used_space: res.used,
-                            available_space: res.free,
-                            physical_device_ids: (!res.physical_device_ids.is_empty()).then_some(res.physical_device_ids.clone()),
-                            utilization: utilization_percent(res.total, res.used),
-                            used_inodes: res.used_inodes,
-                            free_inodes: res.free_inodes,
-                            metrics: Some(res.metrics),
-                            ..Default::default()
-                        });
-                    }
-                    Err(err) => {
-                        let mut disk_info = rustfs_madmin::Disk {
-                            state: err.to_string(),
-                            endpoint: eps[i].to_string(),
-                            drive_path: eps[i].get_file_path(),
-                            local: eps[i].is_local,
-                            pool_index: eps[i].pool_idx,
-                            set_index: eps[i].set_idx,
-                            disk_index: eps[i].disk_idx,
-                            runtime_state: Some(runtime_state.as_str().to_string()),
-                            offline_duration_seconds,
-                            metrics: disk.metrics_snapshot(),
-                            uuid: cached_disk_id.map_or_else(String::new, |id| id.to_string()),
-                            ..Default::default()
-                        };
-                        if let Some((total, used, free, _)) = capacity_snapshot {
-                            disk_info.total_space = total;
-                            disk_info.used_space = used;
-                            disk_info.available_space = free;
-                            disk_info.utilization = utilization_percent(total, used);
-                            disk_info.capacity_observation_source = Some("snapshot".to_owned());
-                            disk_info.capacity_observation_age_seconds = capacity_snapshot
-                                .map(|(_, _, _, probe_unix_secs)| capacity_snapshot_age_seconds(probe_unix_secs));
-                        } else {
-                            disk_info.capacity_observation_source = Some("missing".to_owned());
-                            disk_info.capacity_observation_age_seconds = Some(0);
-                        }
-                        ret.push(disk_info);
-                    }
-                }
-            } else {
-                let mut disk_info =
-                    build_runtime_snapshot_disk(&eps[i], runtime_state, offline_duration_seconds, capacity_snapshot);
-                disk_info.metrics = disk.metrics_snapshot();
-                disk_info.uuid = cached_disk_id.map_or_else(String::new, |id| id.to_string());
-                ret.push(disk_info);
-            }
-        } else {
-            ret.push(rustfs_madmin::Disk {
-                endpoint: eps[i].to_string(),
-                drive_path: eps[i].get_file_path(),
-                local: eps[i].is_local,
-                pool_index: eps[i].pool_idx,
-                set_index: eps[i].set_idx,
-                disk_index: eps[i].disk_idx,
-                runtime_state: None,
-                offline_duration_seconds: None,
-                state: DiskError::DiskNotFound.to_string(),
-                capacity_observation_source: Some("missing".to_owned()),
-                capacity_observation_age_seconds: Some(0),
-                ..Default::default()
-            })
-        }
+    let runtime_state = disk.runtime_state();
+    let offline_duration_seconds = disk.offline_duration_secs();
+    let capacity_snapshot = disk.last_capacity_snapshot();
+    let cached_disk_id = disk.cached_disk_id().await;
+    if !(runtime_state.should_probe_for_admin() || runtime_state == disk::health_state::RuntimeDriveHealthState::Suspect) {
+        let mut disk_info = build_runtime_snapshot_disk(ep, runtime_state, offline_duration_seconds, capacity_snapshot);
+        disk_info.metrics = disk.metrics_snapshot();
+        disk_info.uuid = cached_disk_id.map_or_else(String::new, |id| id.to_string());
+        return disk_info;
     }
 
-    ret
+    match disk
+        .disk_info(&DiskInfoOptions {
+            metrics: true,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(res) => {
+            disk.record_capacity_probe(res.total, res.used, res.free);
+            rustfs_madmin::Disk {
+                endpoint: ep.to_string(),
+                local: ep.is_local,
+                pool_index: ep.pool_idx,
+                set_index: ep.set_idx,
+                disk_index: ep.disk_idx,
+                state: "ok".to_owned(),
+
+                root_disk: res.root_disk,
+                drive_path: res.mount_path.clone(),
+                healing: res.healing,
+                scanning: res.scanning,
+                runtime_state: Some(runtime_state.as_str().to_string()),
+                offline_duration_seconds,
+                capacity_observation_source: Some("live_probe".to_owned()),
+                capacity_observation_age_seconds: Some(0),
+
+                uuid: res.id.map_or_else(|| "".to_string(), |id| id.to_string()),
+                major: res.major as u32,
+                minor: res.minor as u32,
+                model: None,
+                total_space: res.total,
+                used_space: res.used,
+                available_space: res.free,
+                physical_device_ids: (!res.physical_device_ids.is_empty()).then_some(res.physical_device_ids.clone()),
+                utilization: utilization_percent(res.total, res.used),
+                used_inodes: res.used_inodes,
+                free_inodes: res.free_inodes,
+                metrics: Some(res.metrics),
+                ..Default::default()
+            }
+        }
+        Err(err) => {
+            let mut disk_info = rustfs_madmin::Disk {
+                state: err.to_string(),
+                endpoint: ep.to_string(),
+                drive_path: ep.get_file_path(),
+                local: ep.is_local,
+                pool_index: ep.pool_idx,
+                set_index: ep.set_idx,
+                disk_index: ep.disk_idx,
+                runtime_state: Some(runtime_state.as_str().to_string()),
+                offline_duration_seconds,
+                metrics: disk.metrics_snapshot(),
+                uuid: cached_disk_id.map_or_else(String::new, |id| id.to_string()),
+                ..Default::default()
+            };
+            if let Some((total, used, free, _)) = capacity_snapshot {
+                disk_info.total_space = total;
+                disk_info.used_space = used;
+                disk_info.available_space = free;
+                disk_info.utilization = utilization_percent(total, used);
+                disk_info.capacity_observation_source = Some("snapshot".to_owned());
+                disk_info.capacity_observation_age_seconds =
+                    capacity_snapshot.map(|(_, _, _, probe_unix_secs)| capacity_snapshot_age_seconds(probe_unix_secs));
+            } else {
+                disk_info.capacity_observation_source = Some("missing".to_owned());
+                disk_info.capacity_observation_age_seconds = Some(0);
+            }
+            disk_info
+        }
+    }
 }
 
 fn build_runtime_snapshot_disk(
@@ -10688,6 +10689,41 @@ mod tests {
         assert!(
             info[2].metrics.is_some(),
             "offline runtime fallback should preserve disk metrics snapshot"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_get_disks_info_probes_drives_concurrently() {
+        use crate::disk::disk_store::DISK_INFO_PROBE_DELAY_FOR_TEST;
+
+        let format = FormatV3::new(1, 4);
+        let mut temp_dirs = Vec::new();
+        let mut endpoints = Vec::new();
+        let mut disks = Vec::new();
+        for disk_idx in 0..4 {
+            let (dir, endpoint, disk) = make_formatted_local_disk_for_info_test(disk_idx, &format).await;
+            temp_dirs.push(dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let probe_delay = std::time::Duration::from_secs(2);
+        let started = tokio::time::Instant::now();
+        let info = DISK_INFO_PROBE_DELAY_FOR_TEST
+            .scope(probe_delay, get_disks_info(&disks, &endpoints))
+            .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(info.len(), 4);
+        assert!(info.iter().all(|disk| disk.state == "ok"), "every drive should still report a live probe");
+        assert_eq!(
+            info.iter().map(|disk| disk.disk_index).collect::<Vec<_>>(),
+            endpoints.iter().map(|ep| ep.disk_idx).collect::<Vec<_>>(),
+            "concurrent probes must keep endpoint order"
+        );
+        assert!(
+            elapsed < probe_delay * 2,
+            "four stalled drives must cost one probe delay, not four; took {elapsed:?}"
         );
     }
 
