@@ -608,7 +608,11 @@ where
 }
 
 fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
-    storage_ready_from_runtime_state_with_quorum(info, pool_write_quorum)
+    storage_ready_from_runtime_state_with_pool_meta(info, true)
+}
+
+fn storage_ready_from_runtime_state_with_pool_meta(info: &StorageInfo, pool_meta_ready: bool) -> bool {
+    pool_meta_ready && storage_ready_from_runtime_state_with_quorum(info, pool_write_quorum)
 }
 
 fn storage_read_ready_from_runtime_state(info: &StorageInfo) -> bool {
@@ -720,7 +724,10 @@ pub async fn collect_cluster_read_health_report() -> DependencyReadinessReport {
 
 pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
     let readiness = DependencyReadiness {
-        storage_ready: runtime_sources::current_object_store_handle().is_some(),
+        storage_ready: match runtime_sources::current_object_store_handle() {
+            Some(store) => store.pool_meta_writes_ready().await,
+            None => false,
+        },
         iam_ready: runtime_sources::current_iam_ready(),
         lock_quorum_ready: collect_lock_quorum_status().await.ready,
         peer_health_ready: collect_peer_health_readiness(),
@@ -810,6 +817,9 @@ async fn collect_lock_quorum_status() -> LockQuorumStatus {
 
 async fn collect_storage_readiness_uncached() -> bool {
     if let Some(store) = runtime_sources::current_object_store_handle() {
+        if !store.pool_meta_writes_ready().await {
+            return false;
+        }
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
         storage_ready_from_runtime_state(&storage_info)
     } else {
@@ -1555,6 +1565,7 @@ mod tests {
         };
 
         assert!(storage_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state_with_pool_meta(&info, false));
     }
 
     #[test]

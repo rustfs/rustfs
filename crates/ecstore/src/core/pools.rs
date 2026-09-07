@@ -9174,9 +9174,9 @@ impl ECStore {
         target_pool_indices: &[usize],
         phase: &'static str,
     ) -> Result<(rustfs_lock::NamespaceLockGuard, bool)> {
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let save_guard = self.pool_meta_save_gate.lock().await;
         let (pool_meta_guard, snapshot) = self
-            .acquire_pool_meta_read_guard(&mut save_guard, "target capacity admission failed")
+            .acquire_pool_meta_read_guard(&save_guard, "target capacity admission failed")
             .await?;
         for target_pool_index in target_pool_indices.iter().copied() {
             ensure_external_decommission_target_admission(&snapshot, target_pool_index, phase)?;
@@ -9210,9 +9210,9 @@ impl ECStore {
     pub(crate) async fn acquire_decommission_capacity_release_fence_with_active_source(
         &self,
     ) -> Result<(rustfs_lock::NamespaceLockGuard, bool)> {
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let save_guard = self.pool_meta_save_gate.lock().await;
         let (pool_meta_guard, snapshot) = self
-            .acquire_pool_meta_read_guard(&mut save_guard, "capacity release fence failed")
+            .acquire_pool_meta_read_guard(&save_guard, "capacity release fence failed")
             .await?;
         let has_active_source = pool_meta_has_active_decommission(&snapshot);
         drop(save_guard);
@@ -9277,9 +9277,9 @@ impl ECStore {
         }
 
         let (reconciliations, model_version) = {
-            let mut save_guard = self.pool_meta_save_gate.lock().await;
+            let save_guard = self.pool_meta_save_gate.lock().await;
             let (_read_guard, snapshot) = self
-                .acquire_pool_meta_read_guard(&mut save_guard, "exact delete capacity reconciliation failed")
+                .acquire_pool_meta_read_guard(&save_guard, "exact delete capacity reconciliation failed")
                 .await?;
             let reconciliations = plan_exact_delete_capacity_reconciliations(&snapshot, object, exact)?;
             let model_version = active_decommission_capacity_model(&snapshot)?;
@@ -9884,9 +9884,9 @@ impl ECStore {
         let non_growing_replacement = matches!(mode, DecommissionCapacityMutationMode::NonGrowingReplacement);
         let temporary_release = matches!(mode, DecommissionCapacityMutationMode::TemporaryRelease);
         let mut operation = Some(operation);
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let save_guard = self.pool_meta_save_gate.lock().await;
         let (read_guard, snapshot) = self
-            .acquire_pool_meta_read_guard(&mut save_guard, "target capacity admission failed")
+            .acquire_pool_meta_read_guard(&save_guard, "target capacity admission failed")
             .await?;
         let admission_now = OffsetDateTime::now_utc();
         let admitted_owner = capacity_owner.and_then(|owner| {
@@ -10269,6 +10269,14 @@ impl ECStore {
 
     pub(crate) async fn ensure_pool_meta_side_effects_safe(&self, operation: &str) -> Result<()> {
         self.pool_meta_save_gate.lock().await.ensure_write_safe(operation)
+    }
+
+    /// Reports whether pool metadata side effects are currently writable.
+    /// Read-only admission probes do not change this state; startup and real
+    /// metadata transactions still latch it on unrecoverable conditions.
+    pub async fn pool_meta_writes_ready(&self) -> bool {
+        let write_state = self.pool_meta_save_gate.lock().await;
+        !write_state.write_blocked && !write_state.aborted_transaction.load(Ordering::SeqCst)
     }
 
     async fn load_runtime_pool_meta_observing(&self, write_state: &mut PoolMetaWriteState, operation: &str) -> Result<PoolMeta> {
@@ -10893,9 +10901,9 @@ impl ECStore {
         // global lock, then fence the exact target cohort before taking the
         // write lock used to publish the terminal transition.
         let terminal_fence_plan = if acquire_runtime_fence {
-            let mut read_save_guard = self.pool_meta_save_gate.lock().await;
+            let read_save_guard = self.pool_meta_save_gate.lock().await;
             let (read_guard, snapshot) = self
-                .acquire_pool_meta_read_guard(&mut read_save_guard, "decommission cancel fence planning failed")
+                .acquire_pool_meta_read_guard(&read_save_guard, "decommission cancel fence planning failed")
                 .await?;
             let plan = decommission_capacity_terminal_fence_plan(&snapshot, idx)?;
             drop(read_guard);
@@ -17981,9 +17989,11 @@ mod tests {
 
     #[test]
     fn pool_meta_read_probe_rejects_missing_runtime_metadata_without_latching() {
-        let mut write_state = PoolMetaWriteState::default();
-        write_state.expected_cluster_id = Some(uuid::Uuid::new_v4());
-        write_state.identity_initialized = Some(true);
+        let write_state = PoolMetaWriteState {
+            expected_cluster_id: Some(uuid::Uuid::new_v4()),
+            identity_initialized: Some(true),
+            ..Default::default()
+        };
         select_pool_meta_replicas_for_read_probe(&write_state, vec![PoolMetaReplica::Missing], "capacity probe")
             .expect_err("runtime metadata disappearance must reject the current probe");
         write_state
@@ -18004,9 +18014,9 @@ mod tests {
             *disks = vec![None; disk_count];
         }
 
-        let mut write_state = store.pool_meta_save_gate.lock().await;
+        let write_state = store.pool_meta_save_gate.lock().await;
         store
-            .acquire_pool_meta_read_guard(&mut write_state, "capacity probe")
+            .acquire_pool_meta_read_guard(&write_state, "capacity probe")
             .await
             .expect_err("an unreadable metadata replica must reject this probe");
         write_state
@@ -18017,7 +18027,7 @@ mod tests {
             *set.disks.write().await = disks;
         }
         store
-            .acquire_pool_meta_read_guard(&mut write_state, "capacity probe retry")
+            .acquire_pool_meta_read_guard(&write_state, "capacity probe retry")
             .await
             .expect("a read-only probe must succeed after the replica recovers");
     }
