@@ -339,6 +339,52 @@ async fn disabled_cleanup_lock_busy_preserves_intent_without_force_unlock() {
 
 #[tokio::test]
 #[serial]
+async fn concurrent_full_rescan_requests_converge_to_one_recovery_fence() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    seed_cleanup(&store, "blocked").await;
+    let before = persisted_state(&store).await;
+    let lock = store
+        .new_ns_lock(RUSTFS_META_BUCKET, "leader.lock")
+        .await
+        .expect("leader lock");
+    let guard = lock
+        .get_write_lock_quiet(Duration::from_secs(1))
+        .await
+        .expect("hold live leader before concurrent admin resets");
+
+    let first = tokio::spawn(reset_scanner_cycle_recovery(CancellationToken::new(), store.clone()));
+    let second = tokio::spawn(reset_scanner_cycle_recovery(CancellationToken::new(), store.clone()));
+    tokio::task::yield_now().await;
+    assert_eq!(
+        persisted_state(&store).await,
+        before,
+        "waiting admin reset requests must not mutate state before leader ownership"
+    );
+
+    drop(guard);
+    let (first, second) = tokio::time::timeout(Duration::from_secs(15), async { tokio::join!(first, second) })
+        .await
+        .expect("both admin reset requests should finish after the live owner releases the lock");
+    let first = first.expect("first admin reset task should not panic");
+    let second = second.expect("second admin reset task should not panic");
+    assert!(first.is_ok(), "first admin reset failed: {first:?}");
+    assert!(second.is_ok(), "second admin reset failed: {second:?}");
+
+    assert_reset_fences(&store).await;
+    let completed = persisted_state(&store).await;
+    reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+        .await
+        .expect("lost-reply retry after a completed reset should be idempotent");
+    assert_eq!(
+        persisted_state(&store).await,
+        completed,
+        "a later retry must not create a second reset identity or rewrite durable fences"
+    );
+    assert_eq!(scanner_cycle_recovery_status().state, "healthy");
+}
+
+#[tokio::test]
+#[serial]
 async fn disabled_cleanup_movement_pause_preserves_intent_for_later_startup() {
     let (_dir, store) = setup_scanner_cycle_store().await;
     seed_cleanup(&store, "cleanup-pending").await;
