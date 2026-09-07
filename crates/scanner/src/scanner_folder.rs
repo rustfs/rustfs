@@ -21,8 +21,8 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::ReplTargetSizeSummary;
 use crate::data_usage_define::{
     DATA_USAGE_SCAN_CHECKPOINT_VERSION, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageHash, DataUsageHashMap,
-    DataUsageScanCheckpoint, DataUsageScanCheckpointReason, PendingScannerHeal, PendingScannerHealKind, ScannerSizeSummaryExt,
-    SizeReconciliationEntry, SizeSummary, hash_path,
+    DataUsageRawEnumerationCursor, DataUsageScanCheckpoint, DataUsageScanCheckpointReason, PendingScannerHeal,
+    PendingScannerHealKind, ScannerSizeSummaryExt, SizeReconciliationEntry, SizeSummary, hash_path,
 };
 use crate::error::ScannerError;
 use crate::runtime_config::{
@@ -55,6 +55,7 @@ use rustfs_scanner_metrics::metrics::{
     UpdateCurrentPathFn, current_path_updater, global_metrics,
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc;
@@ -733,6 +734,7 @@ pub struct FolderScanner {
     coverage_frontier: Option<String>,
     resume_frontier: Option<String>,
     coverage_gap: bool,
+    raw_enumeration_progress: Vec<RawEnumerationProgress>,
     pending_heal_sync_deferred: bool,
     pending_heal_batch_dirty: bool,
     #[cfg(test)]
@@ -742,6 +744,50 @@ pub struct FolderScanner {
     pending_size_reconciliation_truncated: bool,
     #[cfg(test)]
     list_path_raw_options_observer: Option<mpsc::UnboundedSender<ListPathRawTimeoutSnapshot>>,
+}
+
+struct RawEnumerationProgress {
+    parent: String,
+    last_entry: Option<String>,
+    entries_seen: u64,
+    digest: Sha256,
+}
+
+impl RawEnumerationProgress {
+    fn new(parent: &str) -> Self {
+        let mut digest = Sha256::new();
+        update_raw_enumeration_digest(&mut digest, b"parent", parent.as_bytes());
+        Self {
+            parent: parent.to_string(),
+            last_entry: None,
+            entries_seen: 0,
+            digest,
+        }
+    }
+
+    fn record_entry(&mut self, entry: &str) {
+        update_raw_enumeration_digest(&mut self.digest, b"entry", entry.as_bytes());
+        self.last_entry = Some(entry.to_string());
+        self.entries_seen = self.entries_seen.saturating_add(1);
+    }
+
+    fn into_cursor(self) -> Option<DataUsageRawEnumerationCursor> {
+        if self.entries_seen == 0 {
+            return None;
+        }
+        Some(DataUsageRawEnumerationCursor::new(
+            self.parent,
+            self.last_entry,
+            self.entries_seen,
+            self.digest.finalize().into(),
+        ))
+    }
+}
+
+fn update_raw_enumeration_digest(digest: &mut Sha256, label: &[u8], value: &[u8]) {
+    digest.update(label);
+    digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+    digest.update(value);
 }
 
 fn size_reconciliation_entry_bytes(entry: &SizeReconciliationEntry) -> usize {
@@ -997,6 +1043,41 @@ impl FolderScanner {
         if !keep_existing {
             self.record_scan_resume_hint(folder);
         }
+    }
+
+    fn record_raw_enumeration_entry(&mut self, parent: &str, entry: &str) {
+        if self.old_cache.info.scan_progress.is_none() {
+            return;
+        }
+        if let Some(position) = self
+            .raw_enumeration_progress
+            .iter()
+            .position(|progress| progress.parent == parent)
+        {
+            self.raw_enumeration_progress.truncate(position + 1);
+        } else {
+            self.raw_enumeration_progress.push(RawEnumerationProgress::new(parent));
+        }
+        if let Some(progress) = self.raw_enumeration_progress.last_mut() {
+            progress.record_entry(entry);
+        }
+    }
+
+    fn finish_raw_enumeration_parent(&mut self, parent: &str) {
+        self.raw_enumeration_progress.retain(|progress| {
+            progress.parent != parent
+                && !progress
+                    .parent
+                    .strip_prefix(parent)
+                    .is_some_and(|suffix| suffix.starts_with(SLASH_SEPARATOR))
+        });
+    }
+
+    fn take_raw_enumeration_cursor(&mut self) -> Option<DataUsageRawEnumerationCursor> {
+        self.raw_enumeration_progress
+            .drain(..)
+            .next()
+            .and_then(RawEnumerationProgress::into_cursor)
     }
 
     fn carry_forward_old_children(&mut self, parent_hash: &DataUsageHash, entry: &mut DataUsageEntry) {
@@ -1329,11 +1410,15 @@ impl FolderScanner {
             };
             let mut pending_entry_progress = 0_u64;
             let mut last_entry_progress = Instant::now();
+            let mut raw_enumeration_complete = false;
 
             loop {
                 let entry = match dir_reader.next_entry().await {
                     Ok(Some(entry)) => entry,
-                    Ok(None) => break,
+                    Ok(None) => {
+                        raw_enumeration_complete = true;
+                        break;
+                    }
                     Err(e) if e.kind() == ErrorKind::NotFound => {
                         debug!(
                             target: "rustfs::scanner::folder",
@@ -1345,6 +1430,7 @@ impl FolderScanner {
                             error = %e,
                             "Scanner folder state updated"
                         );
+                        raw_enumeration_complete = true;
                         break;
                     }
                     Err(e) if e.kind() == ErrorKind::NotADirectory => {
@@ -1358,6 +1444,7 @@ impl FolderScanner {
                             error = %e,
                             "Scanner folder state updated"
                         );
+                        raw_enumeration_complete = true;
                         break;
                     }
                     Err(e) => return Err(ScannerError::Io(e)),
@@ -1376,6 +1463,7 @@ impl FolderScanner {
                 if file_name.is_empty() || file_name == "." || file_name == ".." {
                     continue;
                 }
+                self.record_raw_enumeration_entry(&folder.name, &file_name);
                 let is_storage_format_entry = file_name == STORAGE_FORMAT_FILE;
 
                 let file_path = entry.path().to_string_lossy().to_string();
@@ -1686,6 +1774,9 @@ impl FolderScanner {
                 }
             }
             self.budget.record_entries_visited(pending_entry_progress);
+            if raw_enumeration_complete {
+                self.finish_raw_enumeration_parent(&folder.name);
+            }
 
             let mut found_erasure_data_directory = false;
             if self.is_erasure_mode && !found_object_metadata {
@@ -2533,6 +2624,7 @@ pub(crate) async fn scan_data_folder_scoped(
         coverage_gap: false,
         pending_heal_sync_deferred: false,
         pending_heal_batch_dirty: false,
+        raw_enumeration_progress: Vec::new(),
         #[cfg(test)]
         pending_heal_sync_count: 0,
         pending_size_reconciliation_keys: HashSet::new(),
@@ -2593,6 +2685,7 @@ pub(crate) async fn scan_data_folder_scoped(
             let had_scan_checkpoint = cache.info.scan_checkpoint.is_some() || new_cache.info.scan_checkpoint.is_some();
             new_cache.info.scan_resume_after = None;
             new_cache.info.scan_checkpoint = None;
+            new_cache.info.scan_raw_enumeration_cursor = None;
             new_cache.info.scan_coverage_receipt = None;
             if had_scan_checkpoint {
                 global_metrics().record_scanner_checkpoint_cleared();
@@ -2610,6 +2703,9 @@ pub(crate) async fn scan_data_folder_scoped(
                 let root_hash = hash_path(&cache.info.name);
                 let root_has_progress = data_usage_root_has_progress(&root);
                 let pending_heals_changed = scanner.pending_heals_changed;
+                let raw_enumeration_cursor = scanner.take_raw_enumeration_cursor();
+                let carry_forward_cache =
+                    (raw_enumeration_cursor.is_some() && !root_has_progress).then(|| scanner.old_cache.cache.clone());
                 if root_has_progress {
                     scanner.carry_forward_old_children(&root_hash, &mut root);
                 }
@@ -2617,8 +2713,19 @@ pub(crate) async fn scan_data_folder_scoped(
                 let new_cache = scanner.as_mut_new_cache();
                 if root_has_progress {
                     new_cache.replace_hashed(&root_hash, &None, &root);
+                } else if let Some(cache) = carry_forward_cache {
+                    new_cache.cache = cache;
                 }
-                if partial_cache_is_useful(&root, pending_heals_changed) || !new_cache.info.size_reconciliation.is_empty() {
+                if raw_enumeration_cursor.is_some() {
+                    new_cache.info.scan_raw_enumeration_cursor = raw_enumeration_cursor;
+                    new_cache.info.scan_checkpoint = None;
+                    new_cache.info.scan_resume_after = None;
+                    new_cache.info.scan_coverage_receipt = None;
+                }
+                if partial_cache_is_useful(&root, pending_heals_changed)
+                    || new_cache.info.scan_raw_enumeration_cursor.is_some()
+                    || !new_cache.info.size_reconciliation.is_empty()
+                {
                     if new_cache.root().is_some() {
                         new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
                     }
