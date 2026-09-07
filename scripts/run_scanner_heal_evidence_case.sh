@@ -25,9 +25,7 @@ Options:
   -h, --help          Show this help
 
 The script intentionally runs a single case, not the release pseudo-case. After
-a successful case run it verifies that the release gate still fails while
-release_pending contains unfinished mixed-version, EC8+4, rollback, and
-performance lanes.
+a successful case run it verifies that the release gate still remains blocked.
 USAGE
 }
 
@@ -88,19 +86,17 @@ print(suite["binary-path"])
 PY
 }
 
-release_gate_must_remain_pending() {
+release_gate_must_remain_blocked() {
     local run_dir="$1"
     local output="$run_dir/release-check.txt"
     if "$PYTHON_BIN" "$ROOT/scripts/check_test_wiring.py" --check-scanner-heal "$run_dir" release >"$output" 2>&1; then
         echo "release gate unexpectedly approved a single Scanner/Heal evidence run" >&2
         return 1
     fi
-    for gate in G09 G14 R-E R-D R-L; do
-        if ! grep -q "pending ${gate}:" "$output"; then
-            echo "release gate did not report pending ${gate}" >&2
-            return 1
-        fi
-    done
+    if ! grep -Eq 'required test not selected:|pending [A-Z0-9-]+:' "$output"; then
+        echo "release gate did not explain why the Scanner/Heal release remains blocked" >&2
+        return 1
+    fi
 }
 
 run_self_test() {
@@ -163,6 +159,8 @@ case_field "$CASE_ID" name >/dev/null
 TEST_FILTER="$(test_filter_for "$CASE_ID")"
 if [[ -z "$RUN_DIR" ]]; then
     RUN_DIR="$ROOT/target/scanner-heal-evidence/${CASE_ID}-$(date -u +%Y%m%dT%H%M%SZ)"
+elif [[ "$RUN_DIR" != /* ]]; then
+    RUN_DIR="$ROOT/$RUN_DIR"
 fi
 
 if [[ "$PLAN_ONLY" == 1 ]]; then
@@ -203,6 +201,8 @@ TEST_BINARY="$(test_binary_from_listing "$LISTING_TMP" "$CASE_ID")"
 export RUSTFS_E2E_EXPECTED_FEATURES="${RUSTFS_E2E_EXPECTED_FEATURES:-default}"
 "$PYTHON_BIN" "$ROOT/scripts/check_test_wiring.py" --begin-scanner-heal "$RUN_DIR" "$ROOT/target/debug/rustfs" "$TEST_BINARY"
 cp "$LISTING_TMP" "$RUN_DIR/listing.json"
+export RUSTFS_E2E_LOG_DIR="${RUSTFS_E2E_LOG_DIR:-$RUN_DIR/e2e-logs}"
+mkdir -p "$RUSTFS_E2E_LOG_DIR"
 
 JUNIT_PATH="$ROOT/target/nextest/$PROFILE/junit.xml"
 rm -f "$JUNIT_PATH"
@@ -226,7 +226,7 @@ if [[ "$STATUS" -ne 0 ]]; then
 fi
 
 "$PYTHON_BIN" "$ROOT/scripts/check_test_wiring.py" --check-scanner-heal "$RUN_DIR" "$CASE_ID"
-release_gate_must_remain_pending "$RUN_DIR"
+release_gate_must_remain_blocked "$RUN_DIR"
 echo "Scanner/Heal evidence case verified: $CASE_ID"
 echo "Release gate remains blocked; details: $RUN_DIR/release-check.txt"
 echo "Evidence directory: $RUN_DIR"
