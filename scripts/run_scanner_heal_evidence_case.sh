@@ -200,7 +200,7 @@ LISTING_TMP="$TMP_DIR/listing.json"
 cargo nextest list --profile "$PROFILE" -p e2e_test -E "$TEST_FILTER" --message-format json >"$LISTING_TMP"
 TEST_BINARY="$(test_binary_from_listing "$LISTING_TMP" "$CASE_ID")"
 
-export RUSTFS_E2E_EXPECTED_FEATURES="${RUSTFS_E2E_EXPECTED_FEATURES:-}"
+export RUSTFS_E2E_EXPECTED_FEATURES="${RUSTFS_E2E_EXPECTED_FEATURES:-default}"
 "$PYTHON_BIN" "$ROOT/scripts/check_test_wiring.py" --begin-scanner-heal "$RUN_DIR" "$ROOT/target/debug/rustfs" "$TEST_BINARY"
 cp "$LISTING_TMP" "$RUN_DIR/listing.json"
 
