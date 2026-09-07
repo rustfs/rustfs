@@ -1,11 +1,11 @@
 ---
 name: adversarial-validation
-description: Review a final RustFS diff adversarially when the user requests adversarial review, the root AGENTS.md classifies the change as high risk, or a substantial PR is being reviewed. Do not use for ordinary questions, diagnosis, planning, status, documentation-only work, or routine low-risk implementation.
+description: Review RustFS diffs or designs for explicit adversarial requests, high-risk changes under the repository review policy, or substantial PR reviews. Skip ordinary questions, diagnosis, planning, status, routine low-risk implementation, and prose with no execution effect.
 ---
 
 # RustFS Adversarial Validation
 
-Use the risk tier and review shape defined in the root `AGENTS.md`. This skill
+Use the [repository risk tiers and review shape](../../references/adversarial-validation.md). This skill
 routes a review to RustFS-specific probes without loading unrelated domains.
 
 ## Select Lenses
@@ -31,15 +31,18 @@ adversarial review.
 
 ## Review Protocol
 
-1. Freeze the exact final diff/head and list the selected lenses.
-2. Run the review shape required by root `AGENTS.md`.
+1. Freeze the exact final diff/head (or the design under review) and list the
+   selected lenses.
+2. Run the review shape required by the repository risk tier.
 3. For each selected lens, either report a concrete finding or a null verdict
    naming the attacks performed.
-4. A finding needs `file:line`, a triggering input/state/interleaving, the wrong
-   outcome, and a focused fix or missing regression check.
-5. Fix or rebut every finding with code-path, test, or invariant evidence.
+4. Apply root `AGENTS.md`'s finding standard. Test each candidate against callers,
+   existing coverage, and invariants before accepting it; an adversarial role
+   does not have to produce a defect.
+5. Fix or rebut supported findings with code-path, test, or invariant evidence.
 6. After a non-trivial edit, rerun only lenses affected by that edit against the
    new exact diff.
 
 Do not turn a null verdict into a long checklist. Record concise evidence that
-the relevant failure classes were attacked.
+the relevant failure classes were attacked, then stop under the root completion
+rule. Keep the required per-lens verdicts for high-risk PRs.

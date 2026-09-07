@@ -15,14 +15,14 @@ Keep changes narrow and source-driven.
 
 ## Source of Truth
 
-Before changing behavior, read these files first:
+Start with the file that owns the changed behavior; follow callers and shared
+types only as needed:
 
-- `src/scan.rs`
-- `src/capacity_manager.rs`
-- `src/capacity_scope.rs`
-- `src/types.rs`
-- `../../rustfs/src/capacity/service.rs`
-- `../config/src/constants/capacity.rs`
+- Scan/sampling: `src/scan.rs`.
+- Refresh and per-disk cache state: `src/capacity_manager.rs`.
+- Scope propagation: `src/capacity_scope.rs`; shared data shapes: `src/types.rs`.
+- Admin integration: `../../rustfs/src/capacity/service.rs`.
+- Configuration/defaults: `../config/src/constants/capacity.rs`.
 
 Do not treat shell scripts or old docs as the authoritative behavior definition when the Rust code says otherwise.
 
