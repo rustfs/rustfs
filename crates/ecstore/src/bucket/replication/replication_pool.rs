@@ -3220,12 +3220,15 @@ pub(crate) async fn queue_replication_heal_internal(
         }
         ReplicationHealQueueAction::QueueDelete(dv) => {
             // A purge the peer denied under object lock cannot succeed until
-            // the lock lapses (#6850); requeuing it every heal cycle only
+            // the lock lapses (#6850), and one whose replica cannot be told
+            // apart on a target that mints its own version ids cannot
+            // succeed until the ledger or an operator resolves it
+            // (rustfs/backlog#2340); requeuing either every heal cycle only
             // burns bandwidth and failure counters. The backoff expires on
             // its own, so the purge is probed again — and converges — once
-            // the retention window has a chance of being over.
+            // the condition has a chance of being over.
             if super::replication_object_decision_boundary::is_version_delete_replication(&dv.delete_object)
-                && super::replication_resyncer::object_lock_denied_purge_backoff_active(&dv)
+                && super::replication_resyncer::purge_backoff_active(&dv)
             {
                 return ReplicationHealQueueResult {
                     object_info: roi,

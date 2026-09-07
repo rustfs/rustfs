@@ -33,6 +33,8 @@ use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
 use aws_sdk_s3::operation::get_object_tagging::{GetObjectTaggingError, GetObjectTaggingOutput};
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_sdk_s3::operation::put_object_legal_hold::{PutObjectLegalHoldError, PutObjectLegalHoldOutput};
+use aws_sdk_s3::operation::put_object_retention::{PutObjectRetentionError, PutObjectRetentionOutput};
 use aws_sdk_s3::operation::put_object_tagging::{PutObjectTaggingError, PutObjectTaggingOutput};
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
 use aws_sdk_s3::primitives::ByteStream;
@@ -42,6 +44,7 @@ use aws_sdk_s3::types::{
     ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
     ServerSideEncryption,
 };
+use aws_sdk_s3::types::{ObjectLockLegalHold, ObjectLockRetention};
 use aws_sdk_s3::{Client as S3Client, operation::head_object::HeadObjectOutput};
 use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
 use futures::{StreamExt, stream};
@@ -139,9 +142,12 @@ fn same_replication_service(edited: &BucketTarget, previous: &BucketTarget) -> b
         && access_key(edited) == access_key(previous)
 }
 
-/// Page size and page budget for [`TargetClient::find_version_by_etag`].
+/// Page size and page budget for [`TargetClient::locate_replica_by_etag`].
 const FIND_VERSION_BY_ETAG_PAGE_SIZE: i32 = 1000;
 const FIND_VERSION_BY_ETAG_MAX_PAGES: usize = 8;
+/// Candidate cap for [`TargetClient::replica_candidates_by_etag`]: more than
+/// this many same-content versions of one key is ambiguity by any measure.
+const FIND_VERSION_BY_ETAG_MAX_MATCHES: usize = 16;
 pub type GetObjectSdkError = Box<SdkError<GetObjectError>>;
 pub type GetObjectTaggingSdkError = Box<SdkError<GetObjectTaggingError>>;
 pub type PutObjectTaggingSdkError = Box<SdkError<PutObjectTaggingError>>;
@@ -1363,6 +1369,7 @@ fn generate_arn(t: &BucketTarget, depl_id: &str) -> String {
     arn.to_string()
 }
 
+#[derive(Debug, Clone)]
 pub struct RemoveObjectOptions {
     pub force_delete: bool,
     pub governance_bypass: bool,
@@ -1971,22 +1978,29 @@ impl TargetClient {
             .map_err(Box::new)
     }
 
-    /// Locate a replica by content identity on a target that mints its own
-    /// version ids: page `ListObjectVersions` under the exact key and return
-    /// the newest live version whose ETag matches `source_etag`. Delete
-    /// markers and prefix siblings never match. Bounded to
-    /// [`FIND_VERSION_BY_ETAG_MAX_PAGES`] pages so a key with a very deep
-    /// history cannot turn one convergence check into an unbounded scan; a
-    /// replica beyond that window reads as missing, which only costs a
+    /// Candidate replicas by content identity on a target that mints its own
+    /// version ids: page `ListObjectVersions` under the exact key and report
+    /// the live versions whose ETag matches `source_etag`, newest first.
+    /// Delete markers and prefix siblings never match. Bounded to
+    /// [`FIND_VERSION_BY_ETAG_MAX_PAGES`] pages and
+    /// [`FIND_VERSION_BY_ETAG_MAX_MATCHES`] candidates so a key with a very
+    /// deep history cannot turn one convergence check into an unbounded scan;
+    /// a replica beyond that window reads as missing, which only costs a
     /// re-PUT (today's behaviour), never a lost object.
-    pub async fn find_version_by_etag(
+    ///
+    /// Content identity is not version identity: two source generations with
+    /// the same bytes have the same ETag. Callers drop the candidates other
+    /// source versions already claim through their ledgers and refuse an
+    /// [`ReplicaLocation::Ambiguous`] remainder before mutating or deleting.
+    pub async fn replica_candidates_by_etag(
         &self,
         bucket: &str,
         object: &str,
         source_etag: &str,
-    ) -> Result<Option<String>, Box<SdkError<aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError>>> {
+    ) -> Result<Vec<String>, Box<SdkError<aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError>>> {
         let mut key_marker: Option<String> = None;
         let mut version_id_marker: Option<String> = None;
+        let mut matches: Vec<String> = Vec::new();
         for _ in 0..FIND_VERSION_BY_ETAG_MAX_PAGES {
             let page = self
                 .client
@@ -1999,32 +2013,88 @@ impl TargetClient {
                 .send()
                 .await
                 .map_err(Box::new)?;
-            if let Some(version) = page.versions().iter().find(|version| {
-                version.key() == Some(object)
-                    && version.version_id().is_some_and(|id| !id.is_empty())
-                    && replication_etags_match(Some(source_etag), version.e_tag())
-            }) {
-                return Ok(version.version_id().map(str::to_string));
-            }
-            // Every listed key is >= the prefix; once the listing moved past
-            // the exact key there is nothing left to find.
-            if page
-                .versions()
-                .iter()
-                .any(|version| version.key().is_some_and(|key| key > object))
+            matches.extend(
+                page.versions()
+                    .iter()
+                    .filter(|version| {
+                        version.key() == Some(object)
+                            && version.version_id().is_some_and(|id| !id.is_empty())
+                            && replication_etags_match(Some(source_etag), version.e_tag())
+                    })
+                    .filter_map(|version| version.version_id().map(str::to_string)),
+            );
+            // A listing that moved past the exact key (every listed key is >=
+            // the prefix), ended, or already filled the candidate cap decides.
+            if matches.len() >= FIND_VERSION_BY_ETAG_MAX_MATCHES
+                || page
+                    .versions()
+                    .iter()
+                    .any(|version| version.key().is_some_and(|key| key > object))
+                || !page.is_truncated().unwrap_or(false)
             {
-                return Ok(None);
-            }
-            if !page.is_truncated().unwrap_or(false) {
-                return Ok(None);
+                break;
             }
             key_marker = page.next_key_marker().map(str::to_string);
             version_id_marker = page.next_version_id_marker().map(str::to_string);
             if key_marker.is_none() {
-                return Ok(None);
+                break;
             }
         }
-        Ok(None)
+        matches.truncate(FIND_VERSION_BY_ETAG_MAX_MATCHES);
+        Ok(matches)
+    }
+
+    /// PutObjectRetention against a replica version on a target that does not
+    /// take retention through the replication PUT's own headers (it mints its
+    /// own version ids, so a re-PUT would create another version instead of
+    /// updating this one). Anti-loop marker always added.
+    pub async fn put_object_retention(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        mode: ObjectLockRetentionMode,
+        retain_until: aws_sdk_s3::primitives::DateTime,
+    ) -> Result<PutObjectRetentionOutput, Box<SdkError<PutObjectRetentionError>>> {
+        let headers = proxy_outbound_headers(HeaderMap::new());
+        self.client
+            .put_object_retention()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .retention(
+                ObjectLockRetention::builder()
+                    .mode(mode)
+                    .retain_until_date(retain_until)
+                    .build(),
+            )
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
+            .send()
+            .await
+            .map_err(Box::new)
+    }
+
+    /// PutObjectLegalHold counterpart of [`Self::put_object_retention`].
+    pub async fn put_object_legal_hold(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        status: ObjectLockLegalHoldStatus,
+    ) -> Result<PutObjectLegalHoldOutput, Box<SdkError<PutObjectLegalHoldError>>> {
+        let headers = proxy_outbound_headers(HeaderMap::new());
+        self.client
+            .put_object_legal_hold()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .legal_hold(ObjectLockLegalHold::builder().status(status).build())
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
+            .send()
+            .await
+            .map_err(Box::new)
     }
 
     /// HEAD used by the read-proxy path (GET/HEAD of an object not yet
@@ -2474,6 +2544,45 @@ impl TargetClient {
                     "remove_object request failed for bucket:{bucket} object:{object}: {other:?}"
                 ))),
             },
+        }
+    }
+}
+
+/// Where a replica stands on a target that mints its own version ids, by
+/// content identity (exact key + ETag) after the candidates other source
+/// versions claim were removed. See
+/// [`TargetClient::replica_candidates_by_etag`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplicaLocation {
+    /// No live version under the key carries the source ETag.
+    Missing,
+    /// Exactly one live version carries it: safe to address.
+    Unique(String),
+    /// More than one live version carries it (same bytes replicated for
+    /// several source generations). `newest` is the most recently listed
+    /// one — good enough to prove the replica exists, never good enough to
+    /// pick which one to mutate or delete.
+    Ambiguous { newest: String },
+}
+
+impl ReplicaLocation {
+    /// `matches` newest first, as the target listed them.
+    pub fn from_matches(mut matches: Vec<String>) -> Self {
+        match matches.len() {
+            0 => Self::Missing,
+            1 => Self::Unique(matches.remove(0)),
+            _ => Self::Ambiguous {
+                newest: matches.remove(0),
+            },
+        }
+    }
+
+    /// The version to read for existence/ETag checks, where an ambiguous
+    /// match is still a located replica.
+    pub fn any_version_id(&self) -> Option<&str> {
+        match self {
+            Self::Missing => None,
+            Self::Unique(version_id) | Self::Ambiguous { newest: version_id } => Some(version_id),
         }
     }
 }

@@ -38,7 +38,7 @@ use time::format_description::well_known::Rfc3339;
 
 pub(crate) use crate::bucket::bucket_target_sys::{
     AdvancedPutOptions, HeadObjectSdkError, PutObjectOptions, PutObjectPartOptions, RemotePutObjectResponse, RemoveObjectOptions,
-    S3ClientError, TargetClient, resolve_read_api_version_id,
+    ReplicaLocation, S3ClientError, TargetClient, resolve_read_api_version_id,
 };
 #[cfg(test)]
 pub(crate) use crate::bucket::target::BucketTarget;

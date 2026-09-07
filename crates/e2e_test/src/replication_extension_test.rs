@@ -512,7 +512,7 @@ pub(crate) async fn put_bucket_replication(
     put_bucket_replication_with_delete_statuses(env, bucket, target_arn, "Enabled", None).await
 }
 
-async fn put_bucket_replication_with_delete_statuses(
+pub(crate) async fn put_bucket_replication_with_delete_statuses(
     env: &RustFSTestEnvironment,
     bucket: &str,
     target_arn: &str,
