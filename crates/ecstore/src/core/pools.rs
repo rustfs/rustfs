@@ -10813,18 +10813,30 @@ impl ECStore {
         else {
             return PoolMetaWriteGateStatus {
                 writes_ready: false,
+                check_timed_out: true,
                 ..PoolMetaWriteGateStatus::default()
             };
         };
         let transaction_aborted = write_state.aborted_transaction.load(Ordering::SeqCst);
+        let writes_ready = !write_state.write_blocked && !transaction_aborted;
+        let failure = if writes_ready {
+            None
+        } else {
+            write_state.ensure_write_safe("pool metadata snapshot").err()
+        };
+        let context = failure.as_ref().and_then(Error::pool_metadata_failure);
         PoolMetaWriteGateStatus {
-            writes_ready: !write_state.write_blocked && !transaction_aborted,
+            writes_ready,
+            check_timed_out: false,
             write_blocked: write_state.write_blocked,
             transaction_aborted,
             pool_meta_absent: write_state.pool_meta_absent,
             identity_initialized: write_state.identity_initialized,
             identity_needs_repair: write_state.identity_needs_repair,
             cluster_epoch: write_state.cluster_epoch,
+            reason: context.map(|context| context.kind.as_str()),
+            phase: context.map(|context| context.phase),
+            since_unix_secs: context.map(|context| context.since.unix_timestamp()),
         }
     }
 
@@ -19133,6 +19145,12 @@ mod tests {
         drop(outstanding);
         assert!(store.recover_pool_meta_transaction().await.unwrap());
         assert!(store.pool_meta_writes_ready().await);
+        let recovered = store.pool_meta_write_gate_status().await;
+        assert!(recovered.writes_ready);
+        assert!(!recovered.check_timed_out);
+        assert!(!recovered.write_blocked);
+        assert!(!recovered.transaction_aborted);
+        assert_eq!((recovered.reason, recovered.phase, recovered.since_unix_secs), (None, None, None));
         assert_eq!(store.pool_meta.read().await.pools[0].last_update, requested.pools[0].last_update);
         assert!(!store.recover_pool_meta_transaction().await.unwrap());
         store.pool_meta_save_gate.lock().await.block_writes_after_fence_loss();
@@ -19149,17 +19167,39 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result, Err(Error::Timeout)));
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_gate_status())
+            .await
+            .unwrap();
+        assert!(!snapshot.writes_ready);
+        assert!(snapshot.check_timed_out);
+        assert!(!snapshot.write_blocked);
+        assert!(!snapshot.transaction_aborted);
+        assert_eq!((snapshot.reason, snapshot.phase, snapshot.since_unix_secs), (None, None, None));
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn pool_meta_cancelled_recovery_and_new_integrity_block_never_clear_original_gate() {
         let (_dirs, store, _peer) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let since = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         {
             let state = store.pool_meta_save_gate.lock().await;
             let mut arm = state.arm_transaction();
             arm.phase = Some("publication");
+            drop(arm);
+            // An old fixed timestamp detects polling-time resets without sleeping.
+            state.transaction_failure.lock().unwrap().as_mut().unwrap().since = since;
+            *state.block_started_at.lock().unwrap() = Some(since);
         }
+        let original = store.pool_meta_write_gate_status().await;
+        assert!(!original.writes_ready);
+        assert!(!original.check_timed_out);
+        assert!(!original.write_blocked);
+        assert!(original.transaction_aborted);
+        assert_eq!(original.reason, Some("transaction_unknown"));
+        assert_eq!(original.phase, Some("publication"));
+        assert_eq!(original.since_unix_secs, Some(since.unix_timestamp()));
+        assert_eq!(store.pool_meta_write_gate_status().await, original);
         let publication_guard = store.pool_meta.write().await;
         let recovery = tokio::spawn({
             let store = store.clone();
@@ -19179,6 +19219,7 @@ mod tests {
         assert!(recovery.await.unwrap_err().is_cancelled());
         drop(publication_guard);
         assert!(!store.pool_meta_writes_ready().await);
+        assert_eq!(store.pool_meta_write_gate_status().await, original);
         let start_guard = store.start_gate.lock().await;
         let recovery = tokio::spawn({
             let store = store.clone();
@@ -19197,6 +19238,12 @@ mod tests {
                 .kind,
             crate::error::PoolMetadataFailure::FenceLost
         );
+        let fenced = store.pool_meta_write_gate_status().await;
+        assert!(!fenced.writes_ready);
+        assert!(fenced.write_blocked);
+        assert_eq!(fenced.reason, Some("fence_lost"));
+        assert_eq!(fenced.phase, Some("format_heal"));
+        assert_eq!(fenced.since_unix_secs, original.since_unix_secs);
     }
 
     #[test]

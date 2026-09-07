@@ -313,6 +313,7 @@ impl HealManager {
                         completed_status_entry.outcome = Some(Arc::new(task.get_outcome().await));
                     }
                     let terminal_completion = !matches!(completed_status, HealTaskStatus::Retrying { .. });
+                    let completed_status_for_verified_events = completed_status_entry.clone();
                     // Keep retry ownership continuous: status snapshots acquire
                     // these locks in the same active -> retrying order.
                     let mut retrying_heals_guard = if let (Some((request, _, error)), Some(cancel_token)) =
@@ -358,6 +359,15 @@ impl HealManager {
                     tests::pause_completed_retention_handoff(&task_id).await;
 
                     if completed_task.is_some() {
+                        let notice_targets = if terminal_completion {
+                            take_mrf_repair_notice_targets(&mrf_repair_notice_targets_clone, &task_id)
+                        } else {
+                            Vec::new()
+                        };
+                        if terminal_completion {
+                            release_mrf_repair_notice_targets(&notice_targets);
+                        }
+                        publish_verified_mrf_repair_events(&notice_targets, &completed_status_for_verified_events);
                         // update statistics
                         let mut stats = statistics_clone.write().await;
                         match completed_status {
@@ -372,14 +382,6 @@ impl HealManager {
                         }
                         stats.update_running_tasks(usize_to_u64_saturated(active_count));
                         drop(stats);
-                        if terminal_completion {
-                            let notice_targets = take_mrf_repair_notice_targets(&mrf_repair_notice_targets_clone, &task_id);
-                            // Neither task status nor the diagnostic outcome
-                            // window supplies a storage-owned repair receipt.
-                            // Release only the ingress lease for rediscovery;
-                            // preserve the producer's existing retry hints.
-                            release_mrf_repair_notice_targets(notice_targets);
-                        }
                     }
 
                     if let (Some((retry_request, retry_delay, retry_error)), Some(retry_cancel_token)) =
@@ -705,7 +707,7 @@ fn move_mrf_repair_notice_targets(
     }
 }
 
-fn release_mrf_repair_notice_targets(targets: Vec<MrfRepairNoticeTarget>) {
+fn release_mrf_repair_notice_targets(targets: &[MrfRepairNoticeTarget]) {
     for target in targets {
         rustfs_common::mrf_channel::release_mrf_identity(
             target.kind,
@@ -715,6 +717,73 @@ fn release_mrf_repair_notice_targets(targets: Vec<MrfRepairNoticeTarget>) {
             target.scope,
             target.lease,
         );
+    }
+}
+
+pub(super) fn mrf_verified_repair_event_for_target(
+    target: &MrfRepairNoticeTarget,
+    outcome: &crate::heal::outcome::HealObjectOutcome,
+) -> Option<rustfs_common::mrf_channel::MrfVerifiedRepairEvent> {
+    use crate::heal::outcome::{HealObjectDisposition, HealObjectKind};
+    use rustfs_common::mrf_channel::{MrfKind, MrfVerifiedRepairDisposition};
+
+    let disposition = match outcome.disposition {
+        HealObjectDisposition::Repaired => MrfVerifiedRepairDisposition::Repaired,
+        HealObjectDisposition::VerifiedHealthy => MrfVerifiedRepairDisposition::VerifiedHealthy,
+        HealObjectDisposition::AuthoritativelyAbsent => MrfVerifiedRepairDisposition::AuthoritativelyAbsent,
+        _ => return None,
+    };
+    if target.kind != MrfKind::PartialWrite {
+        return None;
+    }
+    let expected_kind = HealObjectKind::Object;
+    if outcome.identity.kind != expected_kind
+        || outcome.identity.bucket.as_str() != target.bucket.as_ref()
+        || outcome.identity.object.as_str() != target.object.as_ref()
+    {
+        return None;
+    }
+    let version_id = target.version_id.filter(|bytes| *bytes != [0; 16]);
+    let expected_version = version_id.map(|bytes| uuid::Uuid::from_bytes(bytes).to_string());
+    if outcome.identity.version_id != expected_version {
+        return None;
+    }
+    let expected_pool = target.scope.and_then(|scope| usize::try_from(scope.pool_index).ok());
+    let expected_set = target.scope.and_then(|scope| usize::try_from(scope.set_index).ok());
+    if outcome.identity.pool_index != expected_pool || outcome.identity.set_index != expected_set {
+        return None;
+    }
+    let bucket_incarnation_id = outcome.identity.bucket_incarnation_id?;
+    Some(rustfs_common::mrf_channel::MrfVerifiedRepairEvent {
+        kind: target.kind,
+        bucket: target.bucket.clone(),
+        object: target.object.clone(),
+        version_id,
+        scope: target.scope,
+        lease: target.lease,
+        bucket_incarnation_id,
+        disposition,
+    })
+}
+
+pub(super) fn publish_verified_mrf_repair_events(targets: &[MrfRepairNoticeTarget], completed: &CompletedHealStatus) {
+    if completed.status != HealTaskStatus::Completed {
+        return;
+    }
+    let Some(outcome) = completed.outcome.as_ref() else {
+        return;
+    };
+    if outcome.execution != crate::heal::outcome::HealExecutionOutcome::Completed {
+        return;
+    }
+    for target in targets {
+        if let Some(event) = outcome
+            .objects
+            .iter()
+            .find_map(|object| mrf_verified_repair_event_for_target(target, object))
+        {
+            rustfs_common::mrf_channel::note_mrf_verified_repair(event);
+        }
     }
 }
 

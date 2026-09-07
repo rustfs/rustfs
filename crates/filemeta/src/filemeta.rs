@@ -70,12 +70,8 @@ const _XL_FLAG_INLINE_DATA: u8 = 1 << 2;
 const META_DATA_READ_DEFAULT: usize = 4 << 10;
 const MSGP_UINT32_SIZE: usize = 5;
 
-/// Default max object versions per object, aligned with MinIO's default.
-pub const DEFAULT_OBJECT_MAX_VERSIONS: usize = if usize::BITS >= 64 {
-    9_223_372_036_854_775_807
-} else {
-    usize::MAX
-};
+/// Default max object versions per object.
+pub const DEFAULT_OBJECT_MAX_VERSIONS: usize = rustfs_config::DEFAULT_API_OBJECT_MAX_VERSIONS;
 
 static OBJECT_MAX_VERSIONS: AtomicUsize = AtomicUsize::new(DEFAULT_OBJECT_MAX_VERSIONS);
 

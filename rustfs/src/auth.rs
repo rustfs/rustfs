@@ -50,6 +50,7 @@ const EVENT_KEYSTONE_CREDENTIALS_DETECTED: &str = "keystone_credentials_detected
 const EVENT_KEYSTONE_CREDENTIALS_VALIDATED: &str = "keystone_credentials_validated";
 const EVENT_KEYSTONE_CONTEXT_MISSING: &str = "keystone_context_missing";
 const EVENT_SESSION_TOKEN_EXTRACTION: &str = "session_token_extraction";
+const EVENT_PRESIGNED_UNSIGNED_AMZ_HEADER: &str = "presigned_unsigned_amz_header";
 
 /// RustFS-specific query capability for a single presigned PutObject request.
 pub(crate) const RUSTFS_MAX_CONTENT_LENGTH_QUERY: &str = "x-rustfs-max-content-length";
@@ -1031,6 +1032,102 @@ pub fn get_query_param<'a>(query: &'a str, param_name: &str) -> Option<&'a str> 
     None
 }
 
+/// `x-amz-*` request headers a SigV4 presigned request may carry without
+/// listing them in `X-Amz-SignedHeaders`.
+///
+/// CloudFront stamps `x-amz-cf-id` on every origin request it forwards, so a
+/// presigned URL served through a CDN could never be honoured if that header
+/// had to be signed; nothing in RustFS reads it, so it cannot change what the
+/// request does.
+const PRESIGNED_UNSIGNED_AMZ_HEADER_ALLOWLIST: &[&str] = &["x-amz-cf-id"];
+
+pub(crate) const UNSIGNED_HEADERS_MESSAGE: &str = "There were headers present in the request which were not signed";
+
+/// GHSA-g8w9-qw9q-fghr: reject `x-amz-*` request headers that a SigV4 presigned
+/// URL did not sign.
+///
+/// A presigned URL is a bounded capability: the presigner authorises one
+/// method, key, expiry and the header set named in `X-Amz-SignedHeaders`. The
+/// upstream verifier only proves that the signed headers match; any other
+/// `x-amz-*` header (tagging, storage class, ACL, metadata, website redirect,
+/// Object Lock, SSE selection) would still reach the handlers and take effect,
+/// so the untrusted holder of an upload URL could set object properties the
+/// presign never covered. AWS S3 rejects such a request with `AccessDenied`
+/// ("There were headers present in the request which were not signed"); this
+/// check mirrors that at the access boundary, before any handler reads a
+/// header.
+///
+/// Only query-string SigV4 requests are checked. SigV2 canonicalises every
+/// `x-amz-*` header into the string to sign, so adding one there already breaks
+/// the signature, and a header-signed SigV4 request is sent by the credential
+/// holder itself, so an unsigned header there is not a delegation bypass.
+///
+/// Detection keys on the query, not on the derived [`AuthType`], because the
+/// upstream verifier dispatches to the presigned path whenever the query
+/// carries `X-Amz-Signature`, even if an `Authorization` header is present too.
+/// The rule relies on the verifier signing every query parameter except the
+/// signature itself, so neither `X-Amz-SignedHeaders` nor a property-carrying
+/// query parameter can be added after presigning.
+pub(crate) fn reject_unsigned_amz_headers_on_presigned_request(header: &HeaderMap, query: Option<&str>) -> S3Result<()> {
+    let Some(query) = query else {
+        return Ok(());
+    };
+
+    // Presence detection is case-insensitive so a query the upstream verifier
+    // would not treat as presigned still fails closed here; the signed list is
+    // read with the exact key the verifier uses (`X-Amz-SignedHeaders`, unique),
+    // so both sides always see the same list. A duplicate or missing key
+    // yields an empty list, which signs nothing.
+    let mut is_presigned_v4 = false;
+    let mut signed_headers: Option<String> = None;
+    let mut duplicate_signed_headers = false;
+    for (name, value) in form_urlencoded::parse(query.as_bytes()) {
+        if name.eq_ignore_ascii_case("x-amz-signature") {
+            is_presigned_v4 = true;
+        } else if name == "X-Amz-SignedHeaders" {
+            if signed_headers.is_some() {
+                duplicate_signed_headers = true;
+            }
+            signed_headers = Some(value.into_owned());
+        }
+    }
+    if !is_presigned_v4 {
+        return Ok(());
+    }
+    if duplicate_signed_headers {
+        signed_headers = None;
+    }
+
+    let signed: Vec<String> = signed_headers
+        .as_deref()
+        .unwrap_or_default()
+        .split(';')
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+
+    for name in header.keys() {
+        // `HeaderName` is already lowercase.
+        let name = name.as_str();
+        if !name.starts_with("x-amz-") || PRESIGNED_UNSIGNED_AMZ_HEADER_ALLOWLIST.contains(&name) {
+            continue;
+        }
+        if !signed.iter().any(|signed_name| signed_name == name) {
+            warn!(
+                event = EVENT_PRESIGNED_UNSIGNED_AMZ_HEADER,
+                component = LOG_COMPONENT_AUTH,
+                subsystem = LOG_SUBSYSTEM_REQUEST,
+                reason = "unsigned_amz_header",
+                header = name,
+                "Presigned request rejected"
+            );
+            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, UNSIGNED_HEADERS_MESSAGE.to_string()));
+        }
+    }
+
+    Ok(())
+}
+
 /// Parse the RustFS presigned PutObject size capability after authentication.
 ///
 /// The query value is covered by SigV4 when it is present before presigning, but
@@ -1912,6 +2009,126 @@ mod tests {
                 .code(),
             &S3ErrorCode::InvalidRequest
         );
+    }
+
+    /// GHSA-g8w9-qw9q-fghr: `x-amz-*` request headers that are not listed in
+    /// `X-Amz-SignedHeaders` must not survive the presigned access boundary.
+    #[test]
+    fn ghsa_g8w9_presigned_request_rejects_unsigned_x_amz_headers() {
+        let presigned_host_only = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test/20260827/us-east-1/s3/aws4_request&X-Amz-Signature=signature";
+
+        for header in [
+            "x-amz-tagging",
+            "x-amz-website-redirect-location",
+            "x-amz-storage-class",
+            "x-amz-acl",
+            "x-amz-meta-owner",
+            "x-amz-object-lock-mode",
+            "x-amz-server-side-encryption",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", HeaderValue::from_static("text/plain"));
+            headers.insert(header, HeaderValue::from_static("attacker-controlled"));
+            let error = reject_unsigned_amz_headers_on_presigned_request(&headers, Some(presigned_host_only)).unwrap_err();
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied, "{header} must be rejected when unsigned");
+            assert_eq!(error.message(), Some(UNSIGNED_HEADERS_MESSAGE));
+        }
+
+        // Non-`x-amz-*` headers are outside the SigV4 rule and stay allowed.
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("text/plain"));
+        headers.insert("cache-control", HeaderValue::from_static("no-store"));
+        reject_unsigned_amz_headers_on_presigned_request(&headers, Some(presigned_host_only)).unwrap();
+
+        // A missing SignedHeaders list signs nothing and still fails closed.
+        let missing_signed_headers = presigned_host_only.replace("&X-Amz-SignedHeaders=host", "");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-tagging", HeaderValue::from_static("a=b"));
+        assert_eq!(
+            reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&missing_signed_headers))
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::AccessDenied
+        );
+
+        // Detection follows the upstream dispatch: any query carrying the
+        // signature is a presigned request, whatever the key's case.
+        let lowercase_query = presigned_host_only.to_ascii_lowercase();
+        assert_eq!(
+            reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&lowercase_query))
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::AccessDenied
+        );
+
+        // Only the exact key the upstream verifier reads counts; a second
+        // (or differently cased) list must not widen the signed set, and a
+        // duplicate exact key signs nothing at all.
+        let widened_by_case = format!("{presigned_host_only}&x-amz-signedheaders=host%3Bx-amz-tagging");
+        assert_eq!(
+            reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&widened_by_case))
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::AccessDenied
+        );
+        let duplicated = format!("{presigned_host_only}&X-Amz-SignedHeaders=host%3Bx-amz-tagging");
+        assert_eq!(
+            reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&duplicated))
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::AccessDenied
+        );
+    }
+
+    #[test]
+    fn ghsa_g8w9_presigned_request_accepts_signed_or_exempt_x_amz_headers() {
+        let signed_tagging = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host%3Bx-amz-tagging%3Bx-amz-meta-owner&X-Amz-Credential=test/20260827/us-east-1/s3/aws4_request&X-Amz-Signature=signature";
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-tagging", HeaderValue::from_static("owner=app"));
+        headers.insert("X-Amz-Meta-Owner", HeaderValue::from_static("app"));
+        reject_unsigned_amz_headers_on_presigned_request(&headers, Some(signed_tagging)).unwrap();
+
+        // Case differences in the signed list do not matter; header names are
+        // canonicalised to lowercase on both sides.
+        let uppercase_list = signed_tagging.replace("x-amz-tagging", "X-Amz-Tagging");
+        reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&uppercase_list)).unwrap();
+
+        // The CDN request id is the only unsigned `x-amz-*` header tolerated.
+        headers.insert("x-amz-cf-id", HeaderValue::from_static("cloudfront-request-id"));
+        reject_unsigned_amz_headers_on_presigned_request(&headers, Some(signed_tagging)).unwrap();
+
+        // Adding one more unsigned header on top of signed ones still fails.
+        headers.insert("x-amz-storage-class", HeaderValue::from_static("REDUCED_REDUNDANCY"));
+        assert_eq!(
+            reject_unsigned_amz_headers_on_presigned_request(&headers, Some(signed_tagging))
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::AccessDenied
+        );
+    }
+
+    #[test]
+    fn ghsa_g8w9_check_ignores_header_signed_sigv2_and_anonymous_requests() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-tagging", HeaderValue::from_static("owner=app"));
+        headers.insert("x-amz-storage-class", HeaderValue::from_static("STANDARD"));
+
+        // No query at all: nothing to bind against.
+        reject_unsigned_amz_headers_on_presigned_request(&headers, None).unwrap();
+
+        // Header-signed SigV4 and SigV2 carry no `X-Amz-Signature` query.
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static(
+                "AWS4-HMAC-SHA256 Credential=test/20260827/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abc",
+            ),
+        );
+        reject_unsigned_amz_headers_on_presigned_request(&headers, Some("versioning=")).unwrap();
+
+        // SigV2 presigned URLs sign every `x-amz-*` header in the string to sign.
+        let sigv2_query = "AWSAccessKeyId=test&Expires=1893456000&Signature=abc";
+        reject_unsigned_amz_headers_on_presigned_request(&headers, Some(sigv2_query)).unwrap();
     }
 
     #[test]

@@ -83,8 +83,9 @@ pub(crate) mod error {
         }
     }
 
+    pub(crate) use crate::storage::storage_api::ecstore_error::PoolMetadataError;
     #[cfg(test)]
-    pub(crate) use crate::storage::storage_api::ecstore_error::{PoolMetadataError, PoolMetadataFailure};
+    pub(crate) use crate::storage::storage_api::ecstore_error::PoolMetadataFailure;
     pub(crate) use crate::storage::storage_api::{QuotaError, StorageError};
 }
 

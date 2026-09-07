@@ -457,7 +457,7 @@ async fn scanner_recovery_intent_startup_rejects_corrupt_pending_record() {
 
 #[tokio::test]
 #[serial]
-async fn scanner_recovery_intent_disabled_startup_executes_persisted_non_terminal_intent() {
+async fn scanner_recovery_intent_disabled_startup_preserves_non_terminal_intent() {
     let (_dir, store) = setup_scanner_cycle_store().await;
     let record = match accept_scanner_usage_recovery_intent(
         store.clone(),
@@ -473,12 +473,12 @@ async fn scanner_recovery_intent_disabled_startup_executes_persisted_non_termina
     let restarted = restart_scanner_cycle_store_from(&store).await;
     run_disabled_startup(CancellationToken::new(), restarted.clone()).await;
 
-    let completed = get_scanner_usage_recovery_intent(restarted, &record.intent_id)
+    let preserved = get_scanner_usage_recovery_intent(restarted, &record.intent_id)
         .await
-        .expect("startup-executed intent should read")
-        .expect("startup-executed intent should remain durable");
-    assert_eq!(completed.state, "completed");
-    assert_eq!(completed.intent_id, record.intent_id);
+        .expect("startup-skipped intent should read")
+        .expect("startup-skipped intent should remain durable");
+    assert_eq!(preserved.state, "accepted");
+    assert_eq!(preserved.intent_id, record.intent_id);
 }
 
 #[tokio::test]

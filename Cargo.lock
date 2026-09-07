@@ -9907,6 +9907,7 @@ dependencies = [
  "regex",
  "rmp",
  "rmp-serde",
+ "rustfs-config",
  "rustfs-utils",
  "s3s",
  "serde",

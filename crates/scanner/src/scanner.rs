@@ -988,17 +988,6 @@ pub async fn init_scanner_with_recovery(
         return None;
     }
     Some(tokio::spawn(async move {
-        if let Err(error) = run_scanner_usage_recovery_intents_for_startup(ctx.clone(), storeapi.clone()).await {
-            warn!(
-                target: "rustfs::scanner",
-                event = EVENT_SCANNER_PERSIST_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_RUNTIME,
-                state = "recovery_intent_startup_discovery_failed",
-                error = %error,
-                "Disabled scanner recovery intent startup discovery failed"
-            );
-        }
         if let Err(error) = resume_scanner_cycle_cleanup(ctx, storeapi).await {
             warn!(
                 target: "rustfs::scanner",

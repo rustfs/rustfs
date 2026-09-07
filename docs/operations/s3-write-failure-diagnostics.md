@@ -45,9 +45,22 @@ The probe round timeout is configured independently; see [Admin peer probe timeo
 
 ## Correlate bounded diagnostics
 
-Normal operation does not require success logs at WARN. Request counters remain available with WARN logging, while existing runtime readiness diagnostics distinguish `pool_meta_write_blocked` from insufficient storage quorum. Do not clear a metadata write fence merely to make readiness green.
+Normal operation does not require success logs at WARN. Request counters remain available with WARN logging, while runtime readiness diagnostics distinguish `pool_meta_write_blocked`, `pool_metadata_check_timeout`, and insufficient storage quorum. Do not clear a metadata write fence merely to make readiness green.
+
+Query the authenticated `/rustfs/admin/v4/cluster/snapshot` endpoint on the affected node. `snapshot.pool_meta_write_gate` describes that node's metadata writer, not a fleet-wide aggregate. Its existing booleans are preserved; `state` and optional block details extend the same bounded, read-only gate inspection. This starts no recovery, disk reads, or additional RPCs. Runtime readiness and the gate are inspected separately, so a whole cluster snapshot is not atomic across sections.
+
+| `state` | Meaning |
+| --- | --- |
+| `writable` | No metadata write block was observed. Other dependencies may still make the node unready. |
+| `blocked` | A metadata write block was observed; `reason`, `phase`, and `sinceUnixSecs` describe its typed failure context. |
+| `check_timeout` | The existing 100 ms inspection budget expired. Readiness remains false, but a write block is not asserted. |
+| `unavailable` | The object store or a recognized metadata observation was unavailable; no block details are invented. |
+
+For `blocked`, `reason` reuses the metadata failure classification, `phase` identifies the operation stage that caused the block (not live recovery-worker progress), and `sinceUnixSecs` is the original block time in Unix seconds. Polling does not reset that time. Recovery replaces the observation with `writable` and removes the previous block details. An unavailable store reports `writesReady=false` with `state="unavailable"`. Older responses may omit `state` and block details; missing fields alone do not prove a healthy writer. Operation text, raw replica errors, disk paths, and credentials are excluded. See [Pool metadata recovery](pool-metadata-recovery.md) for recovery and escalation boundaries.
 
 PUT storage failures retain their typed source chain internally and emit bounded S3/storage error codes, I/O kinds, and RPC status codes alongside the existing request ID, bucket, and key. Raw nested error strings and RPC metadata are not logged by this diagnostic. A repeated PUT diagnostic is limited to one event per five seconds; HTTP server-error logs are limited per status code over the same interval for accounted S3 traffic. `suppressed_errors` reports suppressed events at the next emitted event; use the HTTP counter, not log-line counts, to measure failures. HTTP server-error URI diagnostics omit query strings, including presigned credentials.
+
+Typed pool metadata failures additionally carry `pool_metadata_reason`, `pool_metadata_phase`, and `pool_metadata_since_unix_secs` in the PUT diagnostic. These describe the request's failure context: `read_unavailable` before write dispatch is retryable and does not by itself imply a latched write block. Use the current admin snapshot to distinguish that case from a persistent block. Public S3 errors remain sanitized `503 ServiceUnavailable` responses.
 
 Storage inventory emits a WARN event on the first failed probe and an INFO event on recovery, using `event="storage_info_probe"`. A recovery event confirms the RPC succeeded, not that every reported disk is healthy. Bucket metadata load/retry errors include the bucket and a bounded error code, so one failing bucket can be identified without dumping its metadata.
 

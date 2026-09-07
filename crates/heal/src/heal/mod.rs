@@ -34,7 +34,7 @@ use storage_api::owner::{
 };
 
 pub use erasure_healer::ErasureSetHealer;
-pub use manager::{HealManager, HealOperationsSnapshot, HealPriorityCounts, HealSourceCounts};
+pub use manager::{HealAdmissionTelemetry, HealManager, HealOperationsSnapshot, HealPriorityCounts, HealSourceCounts};
 pub use resume::{CheckpointManager, ResumeCheckpoint, ResumeManager, ResumeState, ResumeUtils};
 pub use task::{HealOptions, HealPriority, HealRequest, HealTask, HealType};
 

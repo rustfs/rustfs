@@ -94,6 +94,8 @@ def fake_adapter():
                 result["metrics"].update(walk_objects=100, cold_walk_objects=0)
         elif fault == "missing-metric":
             del result["metrics"]["save_bytes"]
+        elif fault == "missing-pacing-metric":
+            del result["metrics"]["heal_mainline_throttle_delayed"]
         elif fault == "incomplete-repair":
             result["metrics"]["healed_objects"] = 0
         elif fault == "zero-pressure-samples":
@@ -102,6 +104,12 @@ def fake_adapter():
             result["metrics"]["foreground_pressure_high_samples"] = result["metrics"]["foreground_pressure_samples"] + 1
         elif fault == "attempt-accounting":
             result["metrics"]["heal_attempt_failures"] = result["metrics"]["heal_attempts"] + 1
+        elif fault == "pacing-benefit" and request["scenario"] == "running-heal" \
+                and request["comparison"] == "build" and request["leg"].startswith("B"):
+            result["metrics"].update(p99_ms=9, heal_mainline_throttle_delayed=5)
+        elif fault == "pacing-pending" and request["scenario"] == "running-heal" \
+                and request["comparison"] == "build" and request["leg"].startswith("B"):
+            result["metrics"]["heal_mainline_throttle_delayed"] = 0
     harness.write_json(Path(output_path), result)
     return 0
 
@@ -278,6 +286,31 @@ class ScannerAbbaTest(unittest.TestCase):
                     self.assertEqual({r["leg"] for r in legs}, set(harness.LEGS))
         self.assertTrue(all(c["p2_max_work_multiple"] == 1.2 for c in report["comparisons"]))
         for comparison in report["comparisons"]:
+            w22 = comparison["w22"]
+            self.assertEqual(w22["baseline"]["save_to_encode_byte_amplification"], 1.0)
+            self.assertEqual(w22["candidate"]["clone_to_encode_byte_ratio"], 1.0)
+            self.assertEqual(
+                w22["candidate_vs_baseline"],
+                {"cache_clone_bytes_change": 0.0, "encode_bytes_change": 0.0, "save_bytes_change": 0.0},
+            )
+            if comparison["scenario"] == "running-heal" and comparison["comparison"] == "build":
+                self.assertEqual(
+                    comparison["w10"],
+                    {
+                        "status": "no_measured_benefit",
+                        "pacing_observed": True,
+                        "candidate_pressure_high_ratio": 1.0,
+                        "baseline_delay_events": 10.0,
+                        "candidate_delay_events": 10.0,
+                        "baseline_heal_attempts_per_second": 10.0,
+                        "candidate_heal_attempts_per_second": 10.0,
+                        "heal_attempt_rate_change": 0.0,
+                        "foreground_p99_change": 0.0,
+                        "foreground_throughput_change": 0.0,
+                    },
+                )
+            else:
+                self.assertIsNone(comparison["w10"])
             w10_w11 = comparison["w10_w11"]
             self.assertEqual(w10_w11["foreground_pressure_high_sample_ratios"], [1.0, 1.0, 1.0, 1.0])
             self.assertEqual(w10_w11["heal_lock_wait_p99_ms"], [10, 10, 10, 10])
@@ -288,7 +321,8 @@ class ScannerAbbaTest(unittest.TestCase):
     def test_fail_closed_adapter_and_data_errors(self):
         for fault in ("measure-exit", "oracle-exit", "missing-oracle", "oracle-mismatch", "zero-samples",
                       "zero-requests", "request-errors", "load-drift", "missing-metric", "incomplete-repair",
-                      "zero-pressure-samples", "pressure-sample-order", "attempt-accounting"):
+                      "zero-pressure-samples", "pressure-sample-order", "attempt-accounting",
+                      "missing-pacing-metric"):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
                 self.root = Path(directory)
                 with self.assertRaises((ValueError, OSError, subprocess.SubprocessError)):
@@ -301,6 +335,36 @@ class ScannerAbbaTest(unittest.TestCase):
         with patch.object(harness, "SCENARIOS", ("cold-hot",)):
             self.assertEqual(self.run_harness("noise"), 3)
         self.assertEqual(harness.read_json(self.root / "out/report.json")["status"], "inconclusive")
+
+    def test_noisy_running_heal_does_not_claim_pacing_benefit(self):
+        with patch.object(harness, "SCENARIOS", ("running-heal",)):
+            self.assertEqual(self.run_harness("noise"), 3)
+        comparisons = harness.read_json(self.root / "out/report.json")["comparisons"]
+        build = next(comparison for comparison in comparisons if comparison["comparison"] == "build")
+        self.assertEqual(build["w10"]["status"], "inconclusive")
+
+    def test_idle_cache_window_reports_unavailable_ratios(self):
+        metrics = dict.fromkeys(harness.METRICS, 0)
+        self.assertEqual(
+            harness.scanner_cache_cost(metrics),
+            {
+                "clone_bytes_per_walk_object": None,
+                "encode_bytes_per_walk_object": None,
+                "save_bytes_per_walk_object": None,
+                "clone_to_encode_byte_ratio": None,
+                "save_to_encode_byte_amplification": None,
+            },
+        )
+
+    def test_running_heal_pacing_status_requires_engagement_and_benefit(self):
+        for fault, expected in (("pacing-benefit", "observed"), ("pacing-pending", "pending")):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                self.root = Path(directory)
+                with patch.object(harness, "SCENARIOS", ("running-heal",)):
+                    self.assertEqual(self.run_harness(fault), 0)
+                comparisons = harness.read_json(self.root / "out/report.json")["comparisons"]
+                build = next(comparison for comparison in comparisons if comparison["comparison"] == "build")
+                self.assertEqual(build["w10"]["status"], expected)
 
     def test_missing_first_publication_is_inconclusive(self):
         with patch.object(harness, "SCENARIOS", ("cold-hot",)):

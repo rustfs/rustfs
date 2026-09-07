@@ -846,6 +846,16 @@ impl RawEnumerationProgress {
             }
         })
     }
+
+    fn has_checkpointable_page_index(&self) -> bool {
+        self.page_index().is_some()
+    }
+
+    fn checkpointable_entry_count(&self) -> usize {
+        self.page_index()
+            .and_then(|index| index.indexed_entries().ok())
+            .map_or(0, |entries| entries.len())
+    }
 }
 
 fn update_raw_enumeration_digest(digest: &mut Sha256, label: &[u8], value: &[u8]) {
@@ -1165,20 +1175,33 @@ impl FolderScanner {
     }
 
     fn finish_raw_enumeration_parent(&mut self, parent: &str) {
+        let scan_root = self.old_cache.info.name.as_str();
         self.raw_enumeration_progress.retain(|progress| {
-            progress.parent != parent
-                && !progress
-                    .parent
-                    .strip_prefix(parent)
-                    .is_some_and(|suffix| suffix.starts_with(SLASH_SEPARATOR))
+            if progress.parent == parent {
+                return parent == scan_root && progress.has_checkpointable_page_index();
+            }
+
+            !progress
+                .parent
+                .strip_prefix(parent)
+                .is_some_and(|suffix| suffix.starts_with(SLASH_SEPARATOR))
         });
     }
 
     fn take_raw_enumeration_resume_state(&mut self) -> (Option<DataUsageRawEnumerationCursor>, Option<RawEnumerationPageIndex>) {
-        match self.raw_enumeration_progress.drain(..).next() {
-            Some(progress) => (progress.cursor(), progress.page_index()),
-            None => (None, None),
+        if self.raw_enumeration_progress.is_empty() {
+            return (None, None);
         }
+        let progress_index = self
+            .raw_enumeration_progress
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, progress)| (progress.checkpointable_entry_count(), std::cmp::Reverse(*index)))
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        let progress = self.raw_enumeration_progress.swap_remove(progress_index);
+        self.raw_enumeration_progress.clear();
+        (progress.cursor(), progress.page_index())
     }
 
     fn carry_forward_old_children(&mut self, parent_hash: &DataUsageHash, entry: &mut DataUsageEntry) {

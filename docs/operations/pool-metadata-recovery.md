@@ -49,7 +49,7 @@ An unreadable replica, lost fence, or conditional-write conflict leaves the orig
 
 - The first block emits `decommission_state` with `state=pool_metadata_blocked`, `reason`, `phase`, and `blocked_since`. A change in recovery failure classification emits `state=pool_metadata_recovery_pending`; successful recovery emits `state=pool_metadata_recovered` with the original timestamp.
 - `rustfs_pool_metadata_blocks_total{reason}` and `rustfs_pool_metadata_recoveries_total` count block and recovery transitions. The original cause and phase remain attached to local typed errors; storage/RPC error numbers and on-disk formats are unchanged.
-- Node and cluster-write readiness include `pool_metadata_blocked`. Waiting for the metadata save mutex is bounded to 100 ms and reports `pool_metadata_check_timeout`, not a persistent block. Cluster probes retain their existing cache and overall timeout behavior. Liveness and cluster-read quorum checks are unchanged.
+- Node and cluster-write readiness include `pool_meta_write_blocked`. Waiting for the metadata save mutex is bounded to 100 ms and reports `pool_metadata_check_timeout`, not a persistent block. Cluster probes retain their existing cache and overall timeout behavior. Liveness and cluster-read quorum checks are unchanged. The authenticated node-local status and safe error fields are described in [S3 write failure diagnostics](s3-write-failure-diagnostics.md).
 
 If a block persists, inspect the first block and subsequent recovery phase, restore disk/peer readability, and verify every metadata and identity copy before restarting. Do not delete metadata to make readiness green.
 

@@ -478,11 +478,12 @@ pub(crate) mod ecstore_disk {
 }
 
 pub(crate) mod ecstore_error {
-    pub(crate) use rustfs_ecstore::api::error::{
-        Error, Result, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
-    };
     #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::error::{PoolMetadataError, PoolMetadataFailure};
+    pub(crate) use rustfs_ecstore::api::error::PoolMetadataFailure;
+    pub(crate) use rustfs_ecstore::api::error::{
+        Error, PoolMetadataError, Result, StorageError, is_err_bucket_not_found, is_err_object_not_found,
+        is_err_version_not_found,
+    };
 }
 
 pub(crate) mod ecstore_event {

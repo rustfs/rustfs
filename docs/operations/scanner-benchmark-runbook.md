@@ -125,12 +125,30 @@ and `metrics`. All metrics must be finite nonnegative numbers: `p99_ms`,
 `throughput_ops`, `rss_bytes`, `cpu_seconds`, `iops`, `rpc_count`,
 `cache_clone_bytes`, `encode_bytes`, `save_bytes`, `oldest_age_seconds`,
 `walk_objects`, `cold_walk_objects`, `healed_objects`, `errors`, and `requests`.
+The adapter also reports the measurement-window delta of
+`rustfs_heal_mainline_throttle_total{source="admin",result="delayed"}` as
+`heal_mainline_throttle_delayed`; a cumulative process-lifetime value is not a
+valid input.
+The clone, encode, and save byte fields are also deltas from the same window.
 Requests, throughput, and p99 must be positive; errors must be zero. Repair
 counts must match the manifest when background work is on. Keep underlying
 request samples, counter reset checks, profiler captures, and per-node telemetry
 in the cell artifact directory; aggregate values alone do not establish their
 measurement provenance. Missing production instrumentation is a pending gate,
 not permission to report a fabricated zero.
+
+Each comparison records a `w22` section with clone, encode, and save bytes per
+walked object, clone/encode and save/encode byte ratios, and candidate changes.
+These are traffic amplification indicators, not allocation attribution or an
+fsync profile. The `running-heal` build comparison also records a `w10`
+section. `status=observed` requires sampled high foreground pressure, at least
+one admin pacing delay in the same window, and an improvement in either
+foreground p99 or throughput. `no_measured_benefit` means pacing ran but neither
+foreground metric improved; `pending` means the run did not prove that pacing
+engaged; `inconclusive` means ABBA repeatability failed. Baseline and candidate
+delay counts are both retained so an operator can reject unrelated or
+process-lifetime counter contamination. Correct repair oracles and the existing
+regression limits still apply in every case.
 
 For P2, `measure.convergence` contains booleans `writes_stopped`,
 `last_mutation_observed`, `first_complete_publication`; numeric
@@ -170,6 +188,22 @@ performance acceptance gate. Run the fake-adapter self-tests with:
 ```bash
 scripts/test_scanner_validation_harness.sh
 ```
+
+For CI summaries, PR evidence tables, and operator handoff, collapse the raw
+matrix into a quiet one-line verdict plus durable JSON/Markdown artifacts:
+
+```bash
+scripts/summarize_scanner_heal_perf.py \
+  --abba-dir /path/to/new-artifacts \
+  --cache-cost-log /path/to/cache-cost-profile.log \
+  --json-out /path/to/new-artifacts/perf-summary.json \
+  --markdown-out /path/to/new-artifacts/perf-summary.md
+```
+
+The command prints only `PASS scanner_heal_perf ...` for measured passing ABBA
+evidence, otherwise `FAIL scanner_heal_perf ...`. The JSON and Markdown outputs
+carry the key p99/throughput/P1/P2/cache-cost fields and artifact provenance
+hashes; raw per-cell logs remain in the original artifact tree for audit.
 
 They cover the complete 120-cell schedule, data isolation, missing builds and
 oracles, zero samples/requests, swallowed request errors, offered-load drift,

@@ -726,6 +726,7 @@ mod tests {
         assert_eq!(decoded.info().bitrot_start_cycle, 9);
         assert_eq!(decoded.operations.queue_length, 2);
         assert_eq!(decoded.operations.queued_by_source.mrf, 0);
+        assert_eq!(decoded.operations.admission, rustfs_heal::HealAdmissionTelemetry::default());
         let progress = decoded.progress.expect("legacy progress should decode");
         assert_eq!(progress.objects_scanned, 7);
         assert!(!progress.baseline_known);
