@@ -75,6 +75,7 @@ pub(crate) const SCANNER_PUBLICATION_LEASE_TTL: std::time::Duration = std::time:
 pub(crate) struct ScannerPublicationLeaseEntry {
     pub(crate) expires_at: Instant,
     pub(crate) movement_generation: u64,
+    pub(crate) namespace_generation: u64,
     pub(crate) _operation_guard: OwnedRwLockReadGuard<()>,
 }
 
@@ -305,6 +306,7 @@ impl InstanceContext {
         token: Uuid,
         expires_at: Instant,
         movement_generation: u64,
+        namespace_generation: u64,
         operation_guard: OwnedRwLockReadGuard<()>,
     ) -> bool {
         let mut leases = self.scanner_publication_leases.lock().await;
@@ -316,6 +318,7 @@ impl InstanceContext {
             ScannerPublicationLeaseEntry {
                 expires_at,
                 movement_generation,
+                namespace_generation,
                 _operation_guard: operation_guard,
             },
         );
@@ -326,39 +329,21 @@ impl InstanceContext {
         self.scanner_publication_leases.lock().await.remove(&token).is_some()
     }
 
-    /// Check a lease token while the caller holds the movement read guard.
-    ///
-    /// The token table is deliberately process-owned and non-persistent: a
-    /// restarted instance has no entries from the previous process, so an old
-    /// coordinator proof cannot become valid again merely because the
-    /// movement generation counter restarted at zero.
-    pub(crate) async fn scanner_publication_lease_is_active(&self, token: Uuid) -> bool {
+    /// Return both generations from the same live lease while the caller holds
+    /// the movement read guard. Namespace commits do not take that guard, so
+    /// the caller must compare the saved namespace generation after this await.
+    /// The process-owned table rejects tokens from a prior instance or expiry.
+    pub(crate) async fn scanner_publication_lease_generations(&self, token: Uuid) -> Option<(u64, u64)> {
         let mut leases = self.scanner_publication_leases.lock().await;
         let now = Instant::now();
-        let Some(expires_at) = leases.get(&token).map(|entry| entry.expires_at) else {
-            return false;
-        };
-        if expires_at <= now {
-            leases.remove(&token);
-            return false;
-        }
-        true
-    }
-
-    /// Return the generation bound to a live lease.  The lease entry owns the
-    /// movement read guard, so a successful lookup remains valid for the
-    /// caller's guard-protected operation; expiry is still fail-closed.
-    pub(crate) async fn scanner_publication_lease_generation(&self, token: Uuid) -> Option<u64> {
-        let mut leases = self.scanner_publication_leases.lock().await;
-        let now = Instant::now();
-        let (expires_at, movement_generation) = leases
+        let (expires_at, movement_generation, namespace_generation) = leases
             .get(&token)
-            .map(|entry| (entry.expires_at, entry.movement_generation))?;
+            .map(|entry| (entry.expires_at, entry.movement_generation, entry.namespace_generation))?;
         if expires_at <= now {
             leases.remove(&token);
             return None;
         }
-        Some(movement_generation)
+        Some((movement_generation, namespace_generation))
     }
 
     pub(crate) async fn expire_scanner_publication_lease(&self, token: Uuid, expires_at: Instant) {
@@ -514,6 +499,11 @@ impl InstanceContext {
             .store(epoch == u64::MAX, Ordering::Release);
         self.scanner_publication_state
             .store(SCANNER_PUBLICATION_STATE_UNKNOWN, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_namespace_commit_generation_for_test(&self, generation: u64) {
+        self.namespace_commit_generation.store(generation, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -860,6 +850,26 @@ mod tests {
             assert_eq!(ctx.namespace_commit_generation(), u64::MAX);
             assert_eq!(ctx.namespace_commits.load(Ordering::Acquire), count);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scanner_lease_generations_remain_bound_until_expiry() {
+        let ctx = Arc::new(InstanceContext::new());
+        let token = Uuid::new_v4();
+        let gate = ctx.data_movement_operation_gate();
+        let permit = gate.clone().read_owned().await;
+        assert!(
+            ctx.install_scanner_publication_lease(token, Instant::now() + SCANNER_PUBLICATION_LEASE_TTL, 7, 11, permit)
+                .await
+        );
+        drop(ctx.begin_namespace_commit());
+        assert_eq!(ctx.namespace_commit_generation(), 2);
+        assert_eq!(ctx.scanner_publication_lease_generations(token).await, Some((7, 11)));
+        assert!(gate.clone().try_write_owned().is_err(), "lookup must retain the stored permit");
+        tokio::time::advance(SCANNER_PUBLICATION_LEASE_TTL).await;
+        assert_eq!(ctx.scanner_publication_lease_generations(token).await, None);
+        assert!(!ctx.remove_scanner_publication_lease(token).await);
+        assert!(gate.try_write_owned().is_ok(), "expiry releases the stored permit");
     }
 
     // The SetupType inputs must derive the exact (is_erasure,
