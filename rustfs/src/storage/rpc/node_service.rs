@@ -28,9 +28,9 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
     SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _,
     StorageResult, all_local_disk_path, find_local_disk_by_ref, reload_transition_tier_config,
 };
-use crate::storage::storage_api::runtime_sources_consumer::{EndpointServerPools, runtime_sources};
+use crate::storage::storage_api::runtime_sources_consumer::{EndpointServerPools, ServerContextSlot, runtime_sources};
 use crate::storage::storage_api::{
-    sign_tonic_rpc_response_proof, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
+    BootstrapLocalTarget, sign_tonic_rpc_response_proof, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
     verify_tonic_mutation_body_digest_reject_unsigned,
 };
 use bytes::Bytes;
@@ -520,6 +520,97 @@ mod metrics;
 pub struct NodeService {
     local_peer: LocalPeerS3Client,
     context: Option<Arc<runtime_sources::AppContext>>,
+    server_ctx: Option<Arc<ServerContextSlot>>,
+}
+
+enum LocalMutationTarget {
+    Ready(Arc<ECStore>),
+    Bootstrap(BootstrapLocalTarget),
+    Unbound,
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+pub(crate) mod rename_target_capture_test_hook {
+    use super::LocalMutationTarget;
+    use rustfs_protos::proto_gen::node_service::RenameDataRequest;
+    use std::sync::{LazyLock, Mutex};
+    use tokio::sync::oneshot;
+    use uuid::Uuid;
+
+    struct Hook {
+        id: Uuid,
+        disk: String,
+        volume: String,
+        path: String,
+        captured: oneshot::Sender<bool>,
+        release: oneshot::Receiver<()>,
+    }
+
+    static HOOK: LazyLock<Mutex<Option<Hook>>> = LazyLock::new(|| Mutex::new(None));
+
+    /// One exact signed rename paused after its listener target was captured.
+    /// Dropping the handle removes an unused hook and releases an entered one.
+    pub struct RenameTargetCapturePause {
+        id: Uuid,
+        captured: oneshot::Receiver<bool>,
+        release: Option<oneshot::Sender<()>>,
+    }
+
+    impl RenameTargetCapturePause {
+        pub async fn wait_until_captured(&mut self) -> bool {
+            (&mut self.captured)
+                .await
+                .expect("matching rename must report its actual captured target")
+        }
+    }
+
+    impl Drop for RenameTargetCapturePause {
+        fn drop(&mut self) {
+            let unused = HOOK
+                .lock()
+                .expect("rename capture hook lock")
+                .take_if(|hook| hook.id == self.id);
+            drop(unused);
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    pub fn pause_rename_after_target_capture(disk: &str, volume: &str, path: &str) -> RenameTargetCapturePause {
+        let id = Uuid::new_v4();
+        let (captured_tx, captured) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let mut active = HOOK.lock().expect("rename capture hook lock");
+        if active.is_some() {
+            drop(active);
+            panic!("only one rename capture hook may be active");
+        }
+        *active = Some(Hook {
+            id,
+            disk: disk.to_owned(),
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+            captured: captured_tx,
+            release: release_rx,
+        });
+        RenameTargetCapturePause {
+            id,
+            captured,
+            release: Some(release),
+        }
+    }
+
+    pub(super) async fn wait(target: &LocalMutationTarget, request: &RenameDataRequest) {
+        let hook = {
+            let mut active = HOOK.lock().expect("rename capture hook lock");
+            active.take_if(|hook| hook.disk == request.disk && hook.volume == request.dst_volume && hook.path == request.dst_path)
+        };
+        if let Some(hook) = hook {
+            let _ = hook.captured.send(matches!(target, LocalMutationTarget::Bootstrap(_)));
+            let _ = hook.release.await;
+        }
+    }
 }
 
 impl std::fmt::Debug for NodeService {
@@ -545,7 +636,19 @@ pub fn make_server() -> NodeService {
 
 pub fn make_server_for_context(context: Option<Arc<runtime_sources::AppContext>>) -> NodeService {
     let local_peer = LocalPeerS3Client::new(None, None);
-    NodeService { local_peer, context }
+    NodeService {
+        local_peer,
+        context,
+        server_ctx: None,
+    }
+}
+
+pub(crate) fn make_server_for_slot(server_ctx: Arc<ServerContextSlot>) -> NodeService {
+    // Unrelated RPCs retain their existing context policy. Target mutations
+    // resolve exclusively through this listener slot on each request.
+    let mut service = make_server();
+    service.server_ctx = Some(server_ctx);
+    service
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1114,6 +1217,24 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
 }
 
 impl NodeService {
+    fn local_mutation_target(&self) -> LocalMutationTarget {
+        if let Some(slot) = &self.server_ctx {
+            // Capture exactly once per request, not at connection acceptance.
+            // A captured Bootstrap request cannot upgrade across a later await.
+            if let Some(store) = slot.installed_object_store() {
+                LocalMutationTarget::Ready(store)
+            } else if let Some(target) = slot.bootstrap_target() {
+                LocalMutationTarget::Bootstrap(target)
+            } else {
+                LocalMutationTarget::Unbound
+            }
+        } else if let Some(context) = &self.context {
+            LocalMutationTarget::Ready(context.object_store())
+        } else {
+            LocalMutationTarget::Unbound
+        }
+    }
+
     fn resolve_object_store(&self) -> Option<Arc<ECStore>> {
         let context = self.context.clone().or_else(runtime_sources::current_app_context);
         runtime_sources::current_object_store_handle_for_context(context.as_deref())
@@ -2723,6 +2844,7 @@ mod tests {
         validate_admin_heal_control_start,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
+    use crate::storage::storage_api::ecstore_disk::DiskAPI as _;
     use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo};
     use crate::storage::storage_api::set_tonic_canonical_body_digest;
     use crate::storage::storage_api::{
@@ -5201,6 +5323,687 @@ mod tests {
         let rename_response = response.unwrap().into_inner();
         assert!(!rename_response.success);
         assert!(rename_response.error.is_some());
+    }
+
+    struct TargetRpcFixture {
+        _root: tempfile::TempDir,
+        env: rustfs_test_utils::TestECStoreEnv,
+        instance: Arc<crate::storage::storage_api::InstanceContext>,
+        context: Arc<crate::runtime_sources::AppContext>,
+        iam: Arc<rustfs_iam::sys::IamSys<ObjectStore>>,
+    }
+
+    async fn target_rpc_fixture() -> TargetRpcFixture {
+        super::timeout(Duration::from_secs(90), async {
+            let root = tempfile::tempdir().expect("target RPC root");
+            let env = rustfs_test_utils::TestECStoreEnv::builder()
+                .base_dir(root.path())
+                .init_bucket_metadata(false)
+                .build()
+                .await;
+            ObjectStore::new(env.ecstore.clone())
+                .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+                .await
+                .expect("seed real IAM format");
+            let iam = rustfs_iam::build_iam_sys(env.ecstore.clone())
+                .await
+                .expect("build fixture IAM");
+            let context = Arc::new(crate::runtime_sources::AppContext::with_default_interfaces(
+                env.ecstore.clone(),
+                iam.clone(),
+                Arc::new(KmsServiceManager::new()),
+            ));
+            let instance = crate::storage::storage_api::bootstrap_instance_ctx();
+            assert!(
+                super::BootstrapLocalTarget::new(instance.clone()).is_for_store(&env.ecstore),
+                "the standard builder must use this exact instance context"
+            );
+            super::timeout(Duration::from_secs(10), async {
+                while env.ecstore.scanner_data_usage_publication_blocked().await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("startup namespace commits drain before test");
+            TargetRpcFixture {
+                _root: root,
+                env,
+                instance,
+                context,
+                iam,
+            }
+        })
+        .await
+        .expect("bounded real fixture initialization")
+    }
+
+    async fn stage_target_rpc(fixture: &TargetRpcFixture) -> (super::DiskStore, rustfs_filemeta::FileInfo, Vec<u8>) {
+        use crate::storage::storage_api::ecstore_disk::{DiskAPI, ReadOptions};
+        let set = fixture
+            .env
+            .ecstore
+            .all_set_disks()
+            .into_iter()
+            .next()
+            .expect("target erasure set");
+        let disk = set.disks.read().await.iter().find_map(Clone::clone).expect("local target");
+        let mut fi = rustfs_filemeta::FileInfo::new("destination", 1, 0);
+        fi.erasure.index = 1;
+        fi.version_id = Some(Uuid::new_v4());
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        fi.size = 17;
+        fi.parts = vec![rustfs_filemeta::ObjectPartInfo {
+            number: 1,
+            size: 17,
+            actual_size: 17,
+            ..Default::default()
+        }];
+        fi.data = Some(Bytes::from_static(b"target-rpc-inline"));
+        fi.set_inline_data();
+        disk.make_volume("target-rpc").await.expect("target volume");
+        disk.write_metadata("target-rpc", "target-rpc", "staged", fi.clone())
+            .await
+            .expect("stage real inline body");
+        let read = disk
+            .read_version(
+                "target-rpc",
+                "target-rpc",
+                "staged",
+                &fi.version_id.expect("version").to_string(),
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read staged body before mutation");
+        assert_eq!(read.data, fi.data);
+        let before = tokio::fs::read(disk.path().join("target-rpc/staged/xl.meta"))
+            .await
+            .expect("staged bytes");
+        (disk, fi, before)
+    }
+
+    fn target_rename_request(disk: &super::DiskStore, fi: &rustfs_filemeta::FileInfo) -> Request<RenameDataRequest> {
+        let mut request = Request::new(RenameDataRequest {
+            disk: disk.endpoint().to_string(),
+            src_volume: "target-rpc".to_string(),
+            src_path: "staged".to_string(),
+            dst_volume: "target-rpc".to_string(),
+            dst_path: "destination".to_string(),
+            file_info: serde_json::to_string(fi).expect("real FileInfo JSON"),
+            ..Default::default()
+        });
+        let body = rustfs_protos::canonical_rename_data_request_body(request.get_ref()).expect("canonical target body");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("body digest");
+        // Direct-handler precondition only; this does not stand in for wire authentication.
+        mark_v2_authenticated(&mut request);
+        request
+    }
+
+    #[tokio::test]
+    async fn target_slot_rejects_mismatched_and_repeated_install_before_global_publication() {
+        let fixture = target_rpc_fixture().await;
+        assert!(
+            crate::runtime_sources::current_app_context().is_none(),
+            "requires a separate nextest process"
+        );
+        let wrong = super::ServerContextSlot::with_instance_context(crate::storage::storage_api::new_instance_ctx());
+        let error = crate::runtime_sources::AppContext::ensure_startup_after_iam(
+            fixture.env.ecstore.clone(),
+            Arc::new(KmsServiceManager::new()),
+            &wrong,
+            fixture.iam.clone(),
+        )
+        .expect_err("mismatched startup must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(wrong.installed_app_context().is_none());
+        assert!(
+            crate::runtime_sources::current_app_context().is_none(),
+            "failed install must not publish globally"
+        );
+        assert!(!wrong.install(fixture.context.clone()), "bool adapter cannot bypass identity checks");
+        let slot = super::ServerContextSlot::with_instance_context(fixture.instance.clone());
+        crate::runtime_sources::AppContext::ensure_startup_after_iam(
+            fixture.env.ecstore.clone(),
+            Arc::new(KmsServiceManager::new()),
+            &slot,
+            fixture.iam,
+        )
+        .expect("matching startup installation");
+        let installed = slot.installed_app_context().expect("installed A");
+        assert!(Arc::ptr_eq(
+            &crate::runtime_sources::current_app_context().expect("published A"),
+            &installed
+        ));
+        assert_eq!(
+            slot.try_install(installed.clone())
+                .expect_err("same Arc is still a duplicate")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(!slot.install(installed.clone()));
+        assert!(Arc::ptr_eq(&slot.installed_app_context().expect("first winner retained"), &installed));
+    }
+
+    #[tokio::test]
+    async fn target_slot_captures_bootstrap_once_and_next_request_observes_ready() {
+        let fixture = target_rpc_fixture().await;
+        let (disk, fi, before) = stage_target_rpc(&fixture).await;
+        let slot = super::ServerContextSlot::with_instance_context(fixture.instance.clone());
+        let service = super::make_server_for_slot(slot.clone());
+        let captured = service.local_mutation_target();
+        slot.try_install(fixture.context.clone())
+            .expect("install after the request captures bootstrap");
+        let super::LocalMutationTarget::Bootstrap(target) = captured else {
+            panic!("pre-install request must capture bootstrap");
+        };
+        assert!(
+            target
+                .rename_local_data(
+                    &disk.endpoint().to_string(),
+                    ("target-rpc", "staged"),
+                    &fi,
+                    ("target-rpc", "destination"),
+                    None
+                )
+                .await
+                .is_err(),
+            "captured request cannot acquire Ready privileges"
+        );
+        assert_eq!(
+            tokio::fs::read(disk.path().join("target-rpc/staged/xl.meta"))
+                .await
+                .expect("original source"),
+            before
+        );
+        assert!(!disk.path().join("target-rpc/destination").exists());
+        assert!(
+            matches!(service.local_mutation_target(), super::LocalMutationTarget::Ready(_)),
+            "the same service must read the installed slot for its next request"
+        );
+        let result = service
+            .rename_data(target_rename_request(&disk, &fi))
+            .await
+            .expect("ready handler")
+            .into_inner();
+        assert!(result.success, "{:?}", result.error);
+    }
+
+    #[tokio::test]
+    async fn target_unbound_slot_never_mutates_a_published_global_store() {
+        let fixture = target_rpc_fixture().await;
+        let (disk, fi, before) = stage_target_rpc(&fixture).await;
+        let published = crate::runtime_sources::publish_test_app_context(fixture.context.clone());
+        assert!(Arc::ptr_eq(&published, &fixture.context));
+        let service = super::make_server_for_slot(super::ServerContextSlot::new());
+        let result = service
+            .rename_data(target_rename_request(&disk, &fi))
+            .await
+            .expect("handler reply")
+            .into_inner();
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        assert_eq!(
+            tokio::fs::read(disk.path().join("target-rpc/staged/xl.meta"))
+                .await
+                .expect("source remains"),
+            before
+        );
+        assert!(!disk.path().join("target-rpc/destination").exists());
+        assert!(!fixture.env.ecstore.scanner_data_usage_publication_blocked().await);
+    }
+
+    #[tokio::test]
+    async fn target_undo_rejects_force_delete_marker_before_mutation() {
+        let fixture = target_rpc_fixture().await;
+        let (disk, fi, before) = stage_target_rpc(&fixture).await;
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let opts = crate::storage::storage_api::ecstore_disk::DeleteOptions {
+            undo_write: true,
+            ..Default::default()
+        };
+        let mut request = Request::new(DeleteVersionRequest {
+            disk: disk.endpoint().to_string(),
+            volume: "target-rpc".to_string(),
+            path: "staged".to_string(),
+            file_info: serde_json::to_string(&fi).expect("FileInfo"),
+            opts: serde_json::to_string(&opts).expect("opts"),
+            force_del_marker: true,
+            ..Default::default()
+        });
+        let body = rustfs_protos::canonical_delete_version_request_body(request.get_ref()).expect("canonical undo body");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("body digest");
+        mark_v2_authenticated(&mut request);
+        let result = service.delete_version(request).await.expect("handler reply").into_inner();
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        assert_eq!(
+            tokio::fs::read(disk.path().join("target-rpc/staged/xl.meta"))
+                .await
+                .expect("source remains"),
+            before
+        );
+        assert!(!fixture.env.ecstore.scanner_data_usage_publication_blocked().await);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn target_handler_cancellation_retains_namespace_through_physical_rename() {
+        use crate::storage::storage_api::{
+            LocalPublicationPause, LocalPublicationStage,
+            ecstore_disk::{DiskAPI, ReadOptions},
+        };
+        let fixture = target_rpc_fixture().await;
+        let (disk, fi, _) = stage_target_rpc(&fixture).await;
+        let slot = super::ServerContextSlot::with_instance_context(fixture.instance.clone());
+        slot.try_install(fixture.context.clone()).expect("ready target");
+        let service = super::make_server_for_slot(slot);
+        let mut pause =
+            LocalPublicationPause::install(&disk, "target-rpc", "destination/xl.meta", LocalPublicationStage::PreparedRename)
+                .expect("install scoped physical pause");
+        let mut handler = Box::pin(service.rename_data(target_rename_request(&disk, &fi)));
+        super::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut handler => panic!("handler completed before physical entry: {result:?}"),
+                entered = pause.entered() => entered.expect("physical executor entered"),
+            }
+        })
+        .await
+        .expect("bounded physical entry");
+        drop(handler);
+        assert!(
+            fixture.env.ecstore.scanner_data_usage_publication_blocked().await,
+            "dropping the actual target handler must not release its physical owner"
+        );
+        drop(pause);
+        super::timeout(Duration::from_secs(10), async {
+            while fixture.env.ecstore.scanner_data_usage_publication_blocked().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("physical owner must drain");
+        let read = disk
+            .read_version(
+                "target-rpc",
+                "target-rpc",
+                "destination",
+                &fi.version_id.expect("version").to_string(),
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read real late commit");
+        assert_eq!(read.data, fi.data);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn target_undo_handler_cancellation_retains_owner_until_backup_restoration() {
+        use crate::storage::storage_api::{
+            LocalPublicationPause, LocalPublicationStage,
+            ecstore_disk::{DeleteOptions, DiskAPI, ReadOptions},
+        };
+        let fixture = target_rpc_fixture().await;
+        let (disk, fi, _) = stage_target_rpc(&fixture).await;
+        let mut old = fi.clone();
+        old.data = Some(Bytes::from_static(b"previous-rpc-body"));
+        assert_eq!(old.data.as_ref().expect("old body").len(), 17);
+        disk.write_metadata("target-rpc", "target-rpc", "destination", old.clone())
+            .await
+            .expect("old actual version");
+        let old_bytes = tokio::fs::read(disk.path().join("target-rpc/destination/xl.meta"))
+            .await
+            .expect("old metadata bytes");
+        let committed = fixture
+            .env
+            .ecstore
+            .rename_local_data(
+                &disk.endpoint().to_string(),
+                ("target-rpc", "staged"),
+                &fi,
+                ("target-rpc", "destination"),
+                None,
+            )
+            .await
+            .expect("real overwrite creates rollback backup");
+        let opts = DeleteOptions {
+            undo_write: true,
+            old_data_dir: Some(committed.rollback_data_dir.expect("real rollback backup")),
+            ..Default::default()
+        };
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let mut request = Request::new(DeleteVersionRequest {
+            disk: disk.endpoint().to_string(),
+            volume: "target-rpc".to_string(),
+            path: "destination".to_string(),
+            file_info: serde_json::to_string(&fi).expect("FileInfo"),
+            opts: serde_json::to_string(&opts).expect("undo options"),
+            ..Default::default()
+        });
+        let body = rustfs_protos::canonical_delete_version_request_body(request.get_ref()).expect("canonical undo body");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("body digest");
+        mark_v2_authenticated(&mut request);
+        let mut pause = LocalPublicationPause::install(&disk, "target-rpc", "destination/xl.meta", LocalPublicationStage::Rename)
+            .expect("pause actual backup restoration");
+        let mut handler = Box::pin(service.delete_version(request));
+        super::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut handler => panic!("undo completed before physical entry: {result:?}"),
+                entered = pause.entered() => entered.expect("physical restore entered"),
+            }
+        })
+        .await
+        .expect("bounded physical restore entry");
+        drop(handler);
+        assert!(fixture.env.ecstore.scanner_data_usage_publication_blocked().await);
+        drop(pause);
+        super::timeout(Duration::from_secs(10), async {
+            while fixture.env.ecstore.scanner_data_usage_publication_blocked().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("restore owner drains");
+        assert_eq!(
+            tokio::fs::read(disk.path().join("target-rpc/destination/xl.meta"))
+                .await
+                .expect("restored bytes"),
+            old_bytes
+        );
+        let read = disk
+            .read_version(
+                "target-rpc",
+                "target-rpc",
+                "destination",
+                &fi.version_id.expect("version").to_string(),
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("restored readable version");
+        assert_eq!(read.data, old.data);
+    }
+
+    #[tokio::test]
+    async fn rename_data_same_uuid_uses_captured_instance_instead_of_global_disk() {
+        use crate::storage::storage_api::{
+            ECStore,
+            ecstore_disk::{DiskAPI, RUSTFS_META_BUCKET, ReadOptions},
+            init_local_disks_with_instance_ctx, new_instance_ctx, read_config_no_lock,
+        };
+        use rustfs_filemeta::{FileInfo, ObjectPartInfo};
+        use tokio_util::sync::CancellationToken;
+
+        async fn build_store(root: &std::path::Path) -> Arc<ECStore> {
+            let mut endpoints = Vec::new();
+            for index in 0..4 {
+                let path = root.join(format!("disk{index}"));
+                tokio::fs::create_dir_all(&path).await.expect("create instance disk");
+                let mut endpoint = Endpoint::try_from(path.to_str().expect("UTF-8 disk path")).expect("local endpoint");
+                endpoint.set_pool_index(0);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(index);
+                endpoints.push(endpoint);
+            }
+            let pools = EndpointServerPools(vec![PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: 4,
+                endpoints: Endpoints::from(endpoints),
+                cmd_line: "namespace-target-context".to_string(),
+                platform: "test".to_string(),
+            }]);
+            let instance = new_instance_ctx();
+            init_local_disks_with_instance_ctx(&instance, pools.clone())
+                .await
+                .expect("register this instance's real disks");
+            // Match the isolated ECStore fixtures: startup still runs, while
+            // unrelated background recovery is cancelled for this process.
+            let shutdown = CancellationToken::new();
+            shutdown.cancel();
+            ECStore::new_with_instance_ctx("127.0.0.1:0".parse().expect("local address"), pools, shutdown, instance)
+                .await
+                .expect("initialize isolated ECStore")
+        }
+
+        async fn context(store: &Arc<ECStore>) -> Arc<crate::runtime_sources::AppContext> {
+            ObjectStore::new(store.clone())
+                .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+                .await
+                .expect("seed isolated IAM format");
+            let iam = rustfs_iam::build_iam_sys(store.clone()).await.expect("build isolated IAM");
+            Arc::new(crate::runtime_sources::AppContext::with_default_interfaces(
+                store.clone(),
+                iam,
+                Arc::new(KmsServiceManager::new()),
+            ))
+        }
+
+        async fn internal_snapshot(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+            let mut snapshot = std::collections::BTreeMap::new();
+            let mut directories = (0..4)
+                .map(|index| std::path::PathBuf::from(format!("disk{index}/{RUSTFS_META_BUCKET}")))
+                .collect::<Vec<_>>();
+            while let Some(relative) = directories.pop() {
+                let mut entries = tokio::fs::read_dir(root.join(&relative))
+                    .await
+                    .expect("read internal snapshot directory");
+                snapshot.insert(relative.clone(), None);
+                while let Some(entry) = entries.next_entry().await.expect("read internal snapshot entry") {
+                    let path = relative.join(entry.file_name());
+                    let file_type = entry.file_type().await.expect("read internal snapshot entry type");
+                    if file_type.is_dir() {
+                        directories.push(path);
+                    } else {
+                        assert!(file_type.is_file(), "fixture snapshot must contain only directories and regular files");
+                        snapshot.insert(path, Some(tokio::fs::read(entry.path()).await.expect("read snapshot file bytes")));
+                    }
+                }
+            }
+            snapshot
+        }
+
+        fn file_info(object: &str, version: Uuid, body: Bytes) -> FileInfo {
+            let mut fi = FileInfo::new(object, 1, 0);
+            fi.erasure.index = 1;
+            fi.name = object.to_string();
+            fi.version_id = Some(version);
+            fi.size = i64::try_from(body.len()).expect("small fixture body");
+            fi.parts = vec![ObjectPartInfo {
+                number: 1,
+                size: body.len(),
+                actual_size: fi.size,
+                ..Default::default()
+            }];
+            fi.data = Some(body);
+            fi.set_inline_data();
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fi
+        }
+
+        // Both global publications are first-writer-wins. Run this fixture in
+        // its own nextest process; do not reset or replace another test's state.
+        assert!(
+            crate::runtime_sources::current_app_context().is_none(),
+            "requires an unpublished AppContext"
+        );
+        super::timeout(Duration::from_secs(90), async {
+            let root_b = tempfile::tempdir().expect("instance B directory");
+            let root_a = tempfile::tempdir().expect("instance A directory");
+            let store_b = build_store(root_b.path()).await;
+            let context_b = context(&store_b).await;
+            let published = crate::runtime_sources::publish_test_app_context(context_b.clone());
+            assert!(Arc::ptr_eq(&published, &context_b), "B must win the process AppContext publication");
+
+            // Existing formats require their committed pool metadata on restart.
+            // Copy the complete internal trees, including erasure part data,
+            // without editing disk IDs, cluster identity, epochs or pool topology.
+            super::timeout(Duration::from_secs(10), async {
+                while store_b.scanner_data_usage_publication_blocked().await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("B startup namespace commits must drain before its snapshot");
+            let snapshot_generation = store_b.scanner_namespace_mutation_generation();
+            let pool_config = read_config_no_lock(store_b.clone(), "pool.bin")
+                .await
+                .expect("read B's actually committed pool metadata");
+            let pool_identity = read_config_no_lock(store_b.clone(), "pool.bin.identity")
+                .await
+                .expect("read B's actually committed pool identity");
+            let snapshot = internal_snapshot(root_b.path()).await;
+            for (relative, contents) in &snapshot {
+                let target = root_a.path().join(relative);
+                match contents {
+                    None => tokio::fs::create_dir_all(target).await.expect("copy internal directory"),
+                    Some(bytes) => tokio::fs::write(target, bytes).await.expect("copy complete internal file"),
+                }
+            }
+            assert_eq!(internal_snapshot(root_a.path()).await, snapshot, "A must receive the complete physical snapshot");
+            assert_eq!(internal_snapshot(root_b.path()).await, snapshot, "B's source snapshot must remain unchanged");
+            assert!(!store_b.scanner_data_usage_publication_blocked().await);
+            assert_eq!(store_b.scanner_namespace_mutation_generation(), snapshot_generation);
+            let store_a = build_store(root_a.path()).await;
+            assert_eq!(
+                read_config_no_lock(store_a.clone(), "pool.bin").await.expect("read A's restarted pool metadata"),
+                pool_config,
+                "A must load the same committed topology without a bootstrap rewrite"
+            );
+            assert_eq!(
+                read_config_no_lock(store_a.clone(), "pool.bin.identity")
+                    .await
+                    .expect("read A's restarted pool identity"),
+                pool_identity,
+                "A must preserve the initialized cluster identity and epoch"
+            );
+            let service = make_server_for_context(Some(context(&store_a).await));
+            assert!(Arc::ptr_eq(&service.resolve_object_store().expect("captured store"), &store_a));
+            assert!(Arc::ptr_eq(
+                &crate::runtime_sources::current_object_store_handle().expect("global store"),
+                &store_b
+            ));
+            let disk_a = store_a.disk_map[&0][0].as_ref().expect("A disk zero").clone();
+            let disk_b = store_b.disk_map[&0][0].as_ref().expect("B disk zero").clone();
+            assert!(disk_a.is_local() && disk_b.is_local());
+            assert!(!Arc::ptr_eq(&disk_a, &disk_b));
+            let disk_id = disk_a.get_disk_id().await.expect("A disk ID").expect("formatted A disk");
+            assert!(!disk_id.is_nil());
+            assert_eq!(disk_b.get_disk_id().await.expect("B disk ID"), Some(disk_id));
+            let global_disk = super::find_local_disk_by_ref(&disk_id.to_string())
+                .await
+                .expect("global UUID lookup must resolve B before the request");
+            assert!(Arc::ptr_eq(&global_disk, &disk_b));
+
+            let volume = "namespace-target-context";
+            let object = "destination";
+            let staging = "staged";
+            let version = Uuid::new_v4();
+            let new_body = Bytes::from_static(b"committed-through-captured-A");
+            let new_fi = file_info(object, version, new_body.clone());
+            let opts = ReadOptions { read_data: true, ..Default::default() };
+            for (disk, old_body) in [
+                (&disk_a, Bytes::from_static(b"old-body-A")),
+                (&disk_b, Bytes::from_static(b"old-body-B")),
+            ] {
+                disk.make_volume(volume).await.expect("create destination volume");
+                disk.write_metadata(volume, volume, object, file_info(object, version, old_body.clone()))
+                    .await
+                    .expect("write real old object metadata and inline body");
+                disk.write_metadata(volume, volume, staging, new_fi.clone())
+                    .await
+                    .expect("stage identical valid metadata on both physical disks");
+                let seeded = disk
+                    .read_version(volume, volume, object, &version.to_string(), &opts)
+                    .await
+                    .expect("decode seeded inline object before invoking the handler");
+                assert_eq!(seeded.data, Some(old_body), "the real reader must return the seeded body");
+            }
+            let a_meta = disk_a.path().join(volume).join(object).join("xl.meta");
+            let b_meta = disk_b.path().join(volume).join(object).join("xl.meta");
+            let a_staging = disk_a.path().join(volume).join(staging).join("xl.meta");
+            let b_staging = disk_b.path().join(volume).join(staging).join("xl.meta");
+            let a_before = tokio::fs::read(&a_meta).await.expect("A old metadata bytes");
+            let b_before = tokio::fs::read(&b_meta).await.expect("B old metadata bytes");
+            let b_staging_before = tokio::fs::read(&b_staging).await.expect("B staged metadata bytes");
+            assert!(tokio::fs::try_exists(&a_staging).await.expect("A staging exists"));
+            assert_ne!(a_before, b_before, "the old on-disk bodies must distinguish A from B");
+            super::timeout(Duration::from_secs(10), async {
+                while store_a.scanner_data_usage_publication_blocked().await
+                    || store_b.scanner_data_usage_publication_blocked().await
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("startup namespace commits must drain before measuring the handler");
+            let generation_before = (
+                store_a.scanner_namespace_mutation_generation(),
+                store_b.scanner_namespace_mutation_generation(),
+            );
+
+            let mut request = Request::new(RenameDataRequest {
+                disk: disk_id.to_string(),
+                src_volume: volume.to_string(),
+                src_path: staging.to_string(),
+                dst_volume: volume.to_string(),
+                dst_path: object.to_string(),
+                file_info: serde_json::to_string(&new_fi).expect("encode real FileInfo"),
+                file_info_bin: Vec::new().into(),
+                scanner_publication_lease_token: Vec::new().into(),
+            });
+            let body = rustfs_protos::canonical_rename_data_request_body(request.get_ref()).expect("canonical rename body");
+            set_tonic_canonical_body_digest(&mut request, &body).expect("body-bound handler request");
+            mark_v2_authenticated(&mut request);
+            let response = super::timeout(Duration::from_secs(10), service.rename_data(request))
+                .await
+                .expect("real rename handler must finish within ten seconds")
+                .expect("rename handler response")
+                .into_inner();
+            assert!(response.success, "the valid staged rename must execute: {:?}", response.error);
+
+            let a_after = disk_a
+                .read_version(volume, volume, object, &version.to_string(), &opts)
+                .await
+                .expect("read A's physical object after rename");
+            let b_after = disk_b
+                .read_version(volume, volume, object, &version.to_string(), &opts)
+                .await
+                .expect("read B's physical object after rename");
+            let a_bytes_after = tokio::fs::read(&a_meta).await.expect("A metadata after rename");
+            let b_bytes_after = tokio::fs::read(&b_meta).await.expect("B metadata after rename");
+            let b_staging_after = tokio::fs::read(&b_staging).await.ok();
+            let generation_after = (
+                store_a.scanner_namespace_mutation_generation(),
+                store_b.scanner_namespace_mutation_generation(),
+            );
+            let pending_after = (
+                store_a.scanner_data_usage_publication_blocked().await,
+                store_b.scanner_data_usage_publication_blocked().await,
+            );
+            for disk in store_a.disk_map.values().chain(store_b.disk_map.values()).flatten().flatten() {
+                disk.close().await.expect("close real fixture disk before assertions and directory cleanup");
+            }
+            assert_eq!(
+                a_after.data,
+                Some(new_body),
+                "RenameData must commit to captured A, even when global B owns the same UUID; B body={:?}, generations={generation_before:?}->{generation_after:?}, pending={pending_after:?}",
+                b_after.data
+            );
+            assert_ne!(a_bytes_after, a_before, "A metadata must actually be replaced");
+            assert_eq!(b_after.data, Some(Bytes::from_static(b"old-body-B")), "B body must remain unchanged");
+            assert_eq!(b_bytes_after, b_before, "B metadata must remain byte-for-byte unchanged");
+            assert_eq!(b_staging_after, Some(b_staging_before), "B staging must not be consumed");
+            assert_eq!(pending_after, (false, false), "both stores must reach a stable terminal state");
+        })
+        .await
+        .expect("two-instance handler fixture must finish within ninety seconds");
     }
 
     #[tokio::test]

@@ -630,14 +630,27 @@ impl ECStore {
             .pools
             .first()
             .is_some_and(|pool| pool_first_endpoint_is_local(&pool.endpoints));
+        #[cfg(feature = "e2e-test-hooks")]
+        let startup_attempt = uuid::Uuid::new_v4();
         let (meta, pool_meta_replica_state) = {
             let mut write_state = self.pool_meta_save_gate.lock().await;
             establish_pool_meta_bootstrap_identity_if_proven(self.pools.clone(), &mut write_state, should_persist_pool_meta)
                 .await
                 .map_err(|err| Error::other(format!("store init failed during establish_pool_meta_bootstrap_identity: {err}")))?;
-            load_pool_meta_for_startup(self.pools.clone(), &mut write_state).await?
+            let load = load_pool_meta_for_startup(self.pools.clone(), &mut write_state);
+            #[cfg(feature = "e2e-test-hooks")]
+            let load = crate::core::pools::startup_cas_test_scope(startup_attempt, "load", &self.pools, load);
+            load.await?
         };
         let update = meta.validate(self.pools.clone())?;
+        #[cfg(feature = "e2e-test-hooks")]
+        crate::core::pools::startup_cas_test_observe(serde_json::json!({
+            "kind": "startup-classifier", "attempt": startup_attempt,
+            "elected_writer": should_persist_pool_meta,
+            "needs_repair": pool_meta_replica_state.needs_repair,
+            "repair_write_safe": pool_meta_replica_state.repair_write_safe,
+            "topology_update": update,
+        }));
         let endpoints = runtime_sources::endpoint_pools_or_default();
 
         let mut installed_pool_meta = if update {
@@ -649,15 +662,17 @@ impl ECStore {
         // distributed startup can race on the same lock and replay the prior init bug.
         {
             let mut write_state = self.pool_meta_save_gate.lock().await;
-            installed_pool_meta = persist_pool_meta_for_startup_if_safe(
+            let persist = persist_pool_meta_for_startup_if_safe(
                 &installed_pool_meta,
                 self.pools.clone(),
                 pool_meta_replica_state,
                 &mut write_state,
                 update,
                 should_persist_pool_meta,
-            )
-            .await?;
+            );
+            #[cfg(feature = "e2e-test-hooks")]
+            let persist = crate::core::pools::startup_cas_test_scope(startup_attempt, "persist", &self.pools, persist);
+            installed_pool_meta = persist.await?;
         }
 
         {
