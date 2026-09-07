@@ -256,7 +256,13 @@ pub async fn publish_ready_when_runtime_ready(
 #[derive(Debug, Clone, Copy)]
 struct StorageReadinessCacheEntry {
     captured_at: Instant,
-    storage_ready: bool,
+    status: StorageWriteReadinessStatus,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StorageWriteReadinessStatus {
+    ready: bool,
+    pool_meta_write_blocked: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -356,7 +362,7 @@ async fn reset_cluster_health_report_caches() {
     *cluster_read_health_report_cache().lock().await = None;
 }
 
-async fn load_cached_storage_readiness() -> Option<bool> {
+async fn load_cached_storage_readiness() -> Option<StorageWriteReadinessStatus> {
     let ttl = health_readiness_cache_ttl();
     if ttl.is_zero() {
         return None;
@@ -365,7 +371,7 @@ async fn load_cached_storage_readiness() -> Option<bool> {
     let cache = storage_readiness_cache().lock().await;
     let entry = cache.as_ref()?;
     if entry.captured_at.elapsed() <= ttl {
-        return Some(entry.storage_ready);
+        return Some(entry.status);
     }
 
     None
@@ -398,7 +404,7 @@ async fn update_cluster_health_report_cache(kind: ClusterHealthProbeKind, report
     });
 }
 
-async fn update_storage_readiness_cache(storage_ready: bool) {
+async fn update_storage_readiness_cache(status: StorageWriteReadinessStatus) {
     if health_readiness_cache_ttl().is_zero() {
         return;
     }
@@ -406,7 +412,7 @@ async fn update_storage_readiness_cache(storage_ready: bool) {
     let mut cache = storage_readiness_cache().lock().await;
     *cache = Some(StorageReadinessCacheEntry {
         captured_at: Instant::now(),
-        storage_ready,
+        status,
     });
 }
 
@@ -669,6 +675,20 @@ fn degraded_reasons(readiness: DependencyReadiness) -> Vec<ReadinessDegradedReas
     reasons
 }
 
+fn degraded_reasons_with_pool_meta_status(
+    readiness: DependencyReadiness,
+    pool_meta_write_blocked: bool,
+) -> Vec<ReadinessDegradedReason> {
+    let mut reasons = degraded_reasons(readiness);
+    if pool_meta_write_blocked {
+        reasons.retain(|reason| *reason != ReadinessDegradedReason::StorageQuorumUnavailable);
+        if !reasons.contains(&ReadinessDegradedReason::PoolMetaWriteBlocked) {
+            reasons.insert(0, ReadinessDegradedReason::PoolMetaWriteBlocked);
+        }
+    }
+    reasons
+}
+
 fn record_readiness_report(report: &DependencyReadinessReport) {
     let ready = report.readiness.storage_ready
         && report.readiness.iam_ready
@@ -692,24 +712,34 @@ fn dependency_readiness_report_from_readiness(readiness: DependencyReadiness) ->
     }
 }
 
+fn dependency_readiness_report_from_write_status(
+    readiness: DependencyReadiness,
+    storage: StorageWriteReadinessStatus,
+) -> DependencyReadinessReport {
+    DependencyReadinessReport {
+        degraded_reasons: degraded_reasons_with_pool_meta_status(readiness, storage.pool_meta_write_blocked),
+        readiness,
+    }
+}
+
 pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport {
     let iam_ready_raw = runtime_sources::current_iam_ready();
-    let storage_ready = if let Some(cached) = load_cached_storage_readiness().await {
+    let storage = if let Some(cached) = load_cached_storage_readiness().await {
         cached
     } else {
-        let computed = collect_storage_readiness_uncached().await;
+        let computed = collect_storage_write_readiness_uncached().await;
         update_storage_readiness_cache(computed).await;
         computed
     };
     let lock_quorum_status = collect_lock_quorum_status().await;
 
     let readiness = DependencyReadiness {
-        storage_ready,
+        storage_ready: storage.ready,
         iam_ready: iam_ready_raw,
         lock_quorum_ready: lock_quorum_status.ready,
         peer_health_ready: collect_peer_health_readiness(),
     };
-    let report = dependency_readiness_report_from_readiness(readiness);
+    let report = dependency_readiness_report_from_write_status(readiness, storage);
     record_readiness_report(&report);
     report
 }
@@ -723,16 +753,14 @@ pub async fn collect_cluster_read_health_report() -> DependencyReadinessReport {
 }
 
 pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
+    let storage = node_pool_meta_write_readiness().await;
     let readiness = DependencyReadiness {
-        storage_ready: match runtime_sources::current_object_store_handle() {
-            Some(store) => store.pool_meta_writes_ready().await,
-            None => false,
-        },
+        storage_ready: storage.ready,
         iam_ready: runtime_sources::current_iam_ready(),
         lock_quorum_ready: collect_lock_quorum_status().await.ready,
         peer_health_ready: collect_peer_health_readiness(),
     };
-    let report = dependency_readiness_report_from_readiness(readiness);
+    let report = dependency_readiness_report_from_write_status(readiness, storage);
     record_readiness_report(&report);
     report
 }
@@ -795,14 +823,15 @@ pub async fn collect_cluster_read_dependency_readiness_report() -> DependencyRea
 }
 
 pub(crate) async fn snapshot_dependency_readiness_report() -> DependencyReadinessReport {
+    let storage = collect_storage_write_readiness_uncached().await;
     let readiness = DependencyReadiness {
-        storage_ready: collect_storage_readiness_uncached().await,
+        storage_ready: storage.ready,
         iam_ready: runtime_sources::current_iam_ready(),
         lock_quorum_ready: collect_lock_quorum_status_uncached().await.ready,
         peer_health_ready: collect_peer_health_readiness(),
     };
 
-    dependency_readiness_report_from_readiness(readiness)
+    dependency_readiness_report_from_write_status(readiness, storage)
 }
 
 async fn collect_lock_quorum_status() -> LockQuorumStatus {
@@ -815,15 +844,33 @@ async fn collect_lock_quorum_status() -> LockQuorumStatus {
     }
 }
 
-async fn collect_storage_readiness_uncached() -> bool {
+async fn node_pool_meta_write_readiness() -> StorageWriteReadinessStatus {
+    if let Some(store) = runtime_sources::current_object_store_handle() {
+        let ready = store.pool_meta_writes_ready().await;
+        return StorageWriteReadinessStatus {
+            ready,
+            pool_meta_write_blocked: !ready,
+        };
+    }
+
+    StorageWriteReadinessStatus::default()
+}
+
+async fn collect_storage_write_readiness_uncached() -> StorageWriteReadinessStatus {
     if let Some(store) = runtime_sources::current_object_store_handle() {
         if !store.pool_meta_writes_ready().await {
-            return false;
+            return StorageWriteReadinessStatus {
+                ready: false,
+                pool_meta_write_blocked: true,
+            };
         }
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
-        storage_ready_from_runtime_state(&storage_info)
+        StorageWriteReadinessStatus {
+            ready: storage_ready_from_runtime_state(&storage_info),
+            pool_meta_write_blocked: false,
+        }
     } else {
-        false
+        StorageWriteReadinessStatus::default()
     }
 }
 
@@ -1799,6 +1846,40 @@ mod tests {
         assert_eq!(
             base_degraded_reasons(false, false, false),
             vec![ReadinessDegradedReason::StorageIamAndLockUnavailable]
+        );
+    }
+
+    #[test]
+    fn degraded_reasons_report_pool_meta_write_blocked() {
+        let readiness = DependencyReadiness {
+            storage_ready: false,
+            iam_ready: true,
+            lock_quorum_ready: true,
+            peer_health_ready: true,
+        };
+
+        assert_eq!(
+            degraded_reasons_with_pool_meta_status(readiness, true),
+            vec![ReadinessDegradedReason::PoolMetaWriteBlocked]
+        );
+    }
+
+    #[test]
+    fn degraded_reasons_keep_pool_meta_source_with_other_failures() {
+        let readiness = DependencyReadiness {
+            storage_ready: false,
+            iam_ready: true,
+            lock_quorum_ready: false,
+            peer_health_ready: false,
+        };
+
+        assert_eq!(
+            degraded_reasons_with_pool_meta_status(readiness, true),
+            vec![
+                ReadinessDegradedReason::PoolMetaWriteBlocked,
+                ReadinessDegradedReason::StorageAndLockUnavailable,
+                ReadinessDegradedReason::PeerHealthUnavailable,
+            ]
         );
     }
 

@@ -656,6 +656,7 @@ fn summarize_storage_readiness(snapshot: &ClusterReadOnlySnapshot) -> Capability
         .iter()
         .filter_map(|reason| match reason {
             ReadinessDegradedReason::StorageQuorumUnavailable
+            | ReadinessDegradedReason::PoolMetaWriteBlocked
             | ReadinessDegradedReason::StorageAndIamUnavailable
             | ReadinessDegradedReason::StorageAndLockUnavailable
             | ReadinessDegradedReason::StorageIamAndLockUnavailable => Some(reason.as_str()),
@@ -1280,6 +1281,41 @@ mod tests {
         assert_eq!(view.components.usage.condition, "stale");
         assert_eq!(view.components.usage.last_usage_save_unix_secs, 123);
         assert_eq!(view.components.usage.last_usage_save_result, "skipped_stale");
+    }
+
+    #[test]
+    fn cluster_snapshot_storage_summary_reports_pool_meta_write_blocked() {
+        let snapshot = ClusterReadOnlySnapshot {
+            topology: TopologySnapshot::default(),
+            membership: ClusterMembershipSnapshot::default(),
+            pool_state: ClusterPoolStateSnapshot::default(),
+            local_storage: ClusterLocalNodeStorageSnapshot::default(),
+            peer_health: ClusterPeerHealthSnapshot::default(),
+            rpc_boundary: sample_rpc_boundary_snapshot(),
+            observability: ObservabilitySnapshot::default(),
+            workload_admission: WorkloadAdmissionRegistrySnapshot::new(Vec::new()),
+            runtime_status: ClusterRuntimeStatusSnapshot {
+                readiness: DependencyReadiness {
+                    storage_ready: false,
+                    iam_ready: true,
+                    lock_quorum_ready: true,
+                    peer_health_ready: true,
+                },
+                state: ClusterRuntimeReadinessState::Degraded,
+                degraded_reasons: vec![ReadinessDegradedReason::PoolMetaWriteBlocked],
+            },
+            usage_freshness: ClusterUsageFreshnessSnapshot::default(),
+            listing_diagnostics: ClusterListingDiagnosticsSnapshot::default(),
+        };
+
+        let view = ClusterSnapshotView::from(snapshot);
+
+        assert_eq!(view.components.storage.status.state, CapabilityState::Unknown);
+        assert_eq!(
+            view.components.storage.status.reason.as_deref(),
+            Some("storage readiness degraded: pool_meta_write_blocked")
+        );
+        assert_eq!(view.components.storage.condition, "degraded");
     }
 
     #[test]
