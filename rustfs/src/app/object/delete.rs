@@ -1237,7 +1237,7 @@ mod tests {
                         store
                             .update_bucket_metadata_config(
                                 &bucket,
-                                crate::app::storage_api::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+                                crate::app::storage_api::test::bucket::metadata::BUCKET_VERSIONING_CONFIG,
                                 b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
                             )
                             .await
