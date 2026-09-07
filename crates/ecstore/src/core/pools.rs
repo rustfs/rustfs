@@ -1852,7 +1852,7 @@ fn reserve_decommission_target_pending(
                 target.pending_physical_bytes = requested_physical_bytes;
                 reservation.pending_target_physical_bytes = reservation.pending_target_physical_bytes.saturating_add(additional);
                 renew_decommission_capacity_reservation(reservation, now, true);
-                pool.last_update = now;
+                pool.last_update = pool.last_update.max(now);
                 return Ok(additional);
             }
             pending_mutation_id => {
@@ -1874,7 +1874,7 @@ fn reserve_decommission_target_pending(
     target.pending_physical_bytes = target.pending_physical_bytes.saturating_add(additional);
     reservation.pending_target_physical_bytes = reservation.pending_target_physical_bytes.saturating_add(additional);
     renew_decommission_capacity_reservation(reservation, now, true);
-    pool.last_update = now;
+    pool.last_update = pool.last_update.max(now);
     Ok(additional)
 }
 
@@ -1970,7 +1970,7 @@ fn settle_decommission_target_non_growing_replacement(
     reservation.inflight_target_physical_bytes = reservation.inflight_target_physical_bytes.saturating_sub(released);
     if changed {
         renew_decommission_capacity_reservation(reservation, now, true);
-        pool.last_update = now;
+        pool.last_update = pool.last_update.max(now);
     }
     Ok(changed)
 }
@@ -2045,7 +2045,7 @@ fn record_decommission_target_consumption(
         signed_capacity_difference(reservation.observed_target_physical_bytes, reservation.consumed_target_physical_bytes);
     renew_decommission_capacity_reservation(reservation, now, true);
     info.capacity_blocked_reason = None;
-    pool.last_update = now;
+    pool.last_update = pool.last_update.max(now);
     Ok(())
 }
 
@@ -2106,7 +2106,7 @@ fn record_decommission_target_inflight(
     reservation.prediction_error_bytes =
         signed_capacity_difference(reservation.observed_target_physical_bytes, reservation.consumed_target_physical_bytes);
     renew_decommission_capacity_reservation(reservation, now, true);
-    pool.last_update = now;
+    pool.last_update = pool.last_update.max(now);
     Ok(ledger_changed)
 }
 
@@ -2143,7 +2143,7 @@ fn record_decommission_target_observation(
     reservation.prediction_error_bytes =
         signed_capacity_difference(reservation.observed_target_physical_bytes, reservation.consumed_target_physical_bytes);
     renew_decommission_capacity_reservation(reservation, now, true);
-    pool.last_update = now;
+    pool.last_update = pool.last_update.max(now);
     Ok(())
 }
 
@@ -2232,7 +2232,7 @@ fn release_decommission_target_inflight(
     let changed = released > 0 || temporary_mutation_changed || cleared_pending > 0;
     if changed {
         renew_decommission_capacity_reservation(reservation, now, true);
-        pool.last_update = now;
+        pool.last_update = pool.last_update.max(now);
     }
     Ok(changed)
 }
@@ -3245,6 +3245,68 @@ fn publish_pool_meta_updates(current: &mut PoolMeta, saved: &PoolMeta, indices: 
             *current_pool = saved_pool.clone();
         }
     }
+}
+
+/// Callers retain the save gate and namespace fence from the durable read/save
+/// through publication, so capacity snapshots cannot publish out of order.
+fn publish_decommission_capacity_update(current: &mut PoolMeta, saved: &PoolMeta, idx: usize) -> Result<()> {
+    let stale = |reason| Error::StalePoolMetadataUpdate {
+        operation: "publish decommission capacity".to_string(),
+        pool_index: idx,
+        reason,
+    };
+    let saved_pool = saved
+        .pools
+        .get(idx)
+        .ok_or_else(|| invalid_decommission_pool_index_error(saved.pools.len(), idx))?;
+    let current_count = current.pools.len();
+    let pool = current
+        .pools
+        .get_mut(idx)
+        .ok_or_else(|| invalid_decommission_pool_index_error(current_count, idx))?;
+    if pool.id != idx || saved_pool.id != idx || pool.cmd_line != saved_pool.cmd_line || saved.version < current.version {
+        return Err(stale("pool identity changed before capacity publication"));
+    }
+    let info = pool
+        .decommission
+        .as_mut()
+        .ok_or_else(|| stale("decommission cleared before capacity publication"))?;
+    let saved_info = saved_pool
+        .decommission
+        .as_ref()
+        .ok_or_else(|| stale("persisted decommission is missing during capacity publication"))?;
+    if (info.start_time, info.queued, info.complete, info.failed, info.canceled)
+        != (
+            saved_info.start_time,
+            saved_info.queued,
+            saved_info.complete,
+            saved_info.failed,
+            saved_info.canceled,
+        )
+    {
+        return Err(stale("decommission generation or terminal state changed before capacity publication"));
+    }
+    let identity = |reservation: &DecommissionCapacityReservation| {
+        (
+            reservation.source_pool_index,
+            reservation.operation_id,
+            reservation.generation,
+            reservation.owner_nonce,
+            reservation.model_version,
+        )
+    };
+    if info.capacity_reservation.as_ref().map(identity) != saved_info.capacity_reservation.as_ref().map(identity) {
+        return Err(stale("decommission capacity owner changed before publication"));
+    }
+
+    // Capacity transactions do not checkpoint the worker's counters or queue.
+    // Keep their clock separate before advancing the shared pool revision.
+    info.progress_save_last_at.get_or_insert(pool.last_update);
+    info.capacity_reservation = saved_info.capacity_reservation.clone();
+    info.capacity_blocked_reason = saved_info.capacity_blocked_reason.clone();
+    pool.last_update = pool.last_update.max(saved_pool.last_update);
+    current.version = current.version.max(saved.version);
+    Ok(())
 }
 
 fn resolve_start_decommission_pool_meta_reload_result(result: Result<()>) -> Result<()> {
@@ -6140,6 +6202,7 @@ impl TryFrom<PersistedPoolDecommissionInfo> for PoolDecommissionInfo {
             unresolved_entries: value.unresolved_entries,
             progress_save_item_baseline: value.items_decommissioned.saturating_add(value.items_decommission_failed),
             progress_save_retry_after: None,
+            progress_save_last_at: None,
         })
     }
 }
@@ -6175,6 +6238,7 @@ impl TryFrom<PersistedPoolDecommissionInfoV1> for PoolDecommissionInfo {
             unresolved_entries: Vec::new(),
             progress_save_item_baseline: value.items_decommissioned.saturating_add(value.items_decommission_failed),
             progress_save_retry_after: None,
+            progress_save_last_at: None,
         })
     }
 }
@@ -6210,6 +6274,7 @@ impl TryFrom<LegacyPoolDecommissionInfo> for PoolDecommissionInfo {
             unresolved_entries: Vec::new(),
             progress_save_item_baseline: value.items_decommissioned.saturating_add(value.items_decommission_failed),
             progress_save_retry_after: None,
+            progress_save_last_at: None,
         })
     }
 }
@@ -6565,6 +6630,7 @@ impl PoolMeta {
         for pool in &mut self.pools {
             if let Some(info) = pool.decommission.as_mut() {
                 info.mark_progress_saved();
+                info.progress_save_last_at = Some(pool.last_update);
             }
         }
     }
@@ -6590,7 +6656,8 @@ impl PoolMeta {
             return Ok(None);
         }
 
-        let time_threshold_reached = now.unix_timestamp() - pool.last_update.unix_timestamp() >= duration.whole_seconds();
+        let last_progress_save = info.progress_save_last_at.unwrap_or(pool.last_update);
+        let time_threshold_reached = now.unix_timestamp() - last_progress_save.unix_timestamp() >= duration.whole_seconds();
         let item_threshold_reached = info.items_since_last_progress_save() >= DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD;
         if !time_threshold_reached && !item_threshold_reached {
             return Ok(None);
@@ -6636,6 +6703,10 @@ impl PoolMeta {
 
         info.progress_save_item_baseline = info.progress_save_item_baseline.max(checkpoint.counted_items);
         info.progress_save_retry_after = None;
+        info.progress_save_last_at = Some(
+            info.progress_save_last_at
+                .map_or(checkpoint.checkpoint_at, |at| at.max(checkpoint.checkpoint_at)),
+        );
         if let (Some(operation_id), Some(owner_nonce), Some(expires_at), Some(reservation)) = (
             checkpoint.capacity_operation_id,
             checkpoint.capacity_owner_nonce,
@@ -8403,6 +8474,8 @@ pub struct PoolDecommissionInfo {
     pub progress_save_item_baseline: usize,
     #[serde(skip)]
     pub progress_save_retry_after: Option<OffsetDateTime>,
+    #[serde(skip)]
+    pub progress_save_last_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8480,8 +8553,6 @@ impl PoolDecommissionInfo {
         false
     }
     pub fn bucket_pop(&mut self, bucket: &String) -> bool {
-        self.decommissioned_buckets.push(bucket.clone());
-
         let mut found = None;
         for (i, b) in self.queued_buckets.iter().enumerate() {
             if b == bucket {
@@ -8491,6 +8562,9 @@ impl PoolDecommissionInfo {
         }
 
         if let Some(i) = found {
+            if !self.is_bucket_decommissioned(bucket) {
+                self.decommissioned_buckets.push(bucket.clone());
+            }
             self.queued_buckets.remove(i);
             if &self.bucket == bucket {
                 self.bucket = "".to_owned();
@@ -9821,7 +9895,9 @@ impl ECStore {
         }
         {
             let mut pool_meta = self.pool_meta.write().await;
-            publish_pool_meta_updates(&mut pool_meta, &outcome.committed, &source_pool_indices);
+            for source_pool_index in source_pool_indices {
+                publish_decommission_capacity_update(&mut pool_meta, &outcome.committed, source_pool_index)?;
+            }
         }
         ensure_pool_meta_write_fence(&write_guard, "exact delete capacity reconciliation save failed")?;
         for (target_pool_index, target_guard) in &target_guards {
@@ -9875,22 +9951,9 @@ impl ECStore {
         let expected_target_physical_bytes = capacity_target_physical_bytes(expected_data_bytes.max(1), target_layout)?;
         if target_pending_physical_bytes == 0 {
             if target_consumed_physical_bytes >= expected_target_physical_bytes {
-                let persisted_info = snapshot
-                    .pools
-                    .get(source_pool_index)
-                    .and_then(|pool| pool.decommission.as_ref())
-                    .cloned()
-                    .ok_or_else(|| decommission_metadata_not_initialized_error("publish equivalent target reconciliation"))?;
                 let mut pool_meta = self.pool_meta.write().await;
-                let pool_count = pool_meta.pools.len();
-                pool_meta.version = pool_meta.version.max(snapshot.version);
-                let info = pool_meta
-                    .pools
-                    .get_mut(source_pool_index)
-                    .and_then(|pool| pool.decommission.as_mut())
-                    .ok_or_else(|| invalid_decommission_pool_index_error(pool_count, source_pool_index))?;
-                info.capacity_reservation = persisted_info.capacity_reservation;
-                info.capacity_blocked_reason = persisted_info.capacity_blocked_reason;
+                ensure_pool_meta_write_fence(&pool_meta_guard, "equivalent target idempotent publication")?;
+                publish_decommission_capacity_update(&mut pool_meta, &snapshot, source_pool_index)?;
                 if let Some(target_guard) = target_guard.as_ref() {
                     ensure_decommission_capacity_target_fence(
                         target_guard,
@@ -9942,23 +10005,8 @@ impl ECStore {
             ensure_decommission_capacity_target_fence(target_guard, target_pool_index, "equivalent target capacity save")?;
         }
         {
-            let persisted_info = outcome
-                .committed
-                .pools
-                .get(source_pool_index)
-                .and_then(|pool| pool.decommission.as_ref())
-                .cloned()
-                .ok_or_else(|| decommission_metadata_not_initialized_error("publish equivalent target reconciliation"))?;
             let mut pool_meta = self.pool_meta.write().await;
-            let pool_count = pool_meta.pools.len();
-            pool_meta.version = pool_meta.version.max(outcome.committed.version);
-            let info = pool_meta
-                .pools
-                .get_mut(source_pool_index)
-                .and_then(|pool| pool.decommission.as_mut())
-                .ok_or_else(|| invalid_decommission_pool_index_error(pool_count, source_pool_index))?;
-            info.capacity_reservation = persisted_info.capacity_reservation;
-            info.capacity_blocked_reason = persisted_info.capacity_blocked_reason;
+            publish_decommission_capacity_update(&mut pool_meta, &outcome.committed, source_pool_index)?;
         }
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission equivalent target reconciliation save failed")?;
         if let Some(target_guard) = target_guard.as_ref() {
@@ -10149,24 +10197,9 @@ impl ECStore {
                 "equivalent temporary target capacity save",
             )?;
         }
-        let persisted_info = outcome
-            .committed
-            .pools
-            .get(source_pool_index)
-            .and_then(|pool| pool.decommission.as_ref())
-            .cloned()
-            .ok_or_else(|| decommission_metadata_not_initialized_error("publish equivalent temporary target reconciliation"))?;
         {
             let mut pool_meta = self.pool_meta.write().await;
-            let pool_count = pool_meta.pools.len();
-            pool_meta.version = pool_meta.version.max(outcome.committed.version);
-            let info = pool_meta
-                .pools
-                .get_mut(source_pool_index)
-                .and_then(|pool| pool.decommission.as_mut())
-                .ok_or_else(|| invalid_decommission_pool_index_error(pool_count, source_pool_index))?;
-            info.capacity_reservation = persisted_info.capacity_reservation;
-            info.capacity_blocked_reason = persisted_info.capacity_blocked_reason;
+            publish_decommission_capacity_update(&mut pool_meta, &outcome.committed, source_pool_index)?;
         }
         ensure_pool_meta_write_fence(&pool_meta_guard, "equivalent temporary target reconciliation save failed")?;
         if let Some(target_guard) = target_guard.as_ref() {
@@ -10445,22 +10478,8 @@ impl ECStore {
             ensure_pool_meta_write_fence(&write_guard, "decommission target capacity intent save failed")?;
             snapshot = outcome.committed.clone();
             {
-                let persisted_info = snapshot
-                    .pools
-                    .get(source_pool_index)
-                    .and_then(|pool| pool.decommission.as_ref())
-                    .cloned()
-                    .ok_or_else(|| decommission_metadata_not_initialized_error("publish target capacity intent"))?;
                 let mut pool_meta = self.pool_meta.write().await;
-                let pool_count = pool_meta.pools.len();
-                pool_meta.version = pool_meta.version.max(snapshot.version);
-                let info = pool_meta
-                    .pools
-                    .get_mut(source_pool_index)
-                    .and_then(|pool| pool.decommission.as_mut())
-                    .ok_or_else(|| invalid_decommission_pool_index_error(pool_count, source_pool_index))?;
-                info.capacity_reservation = persisted_info.capacity_reservation;
-                info.capacity_blocked_reason = persisted_info.capacity_blocked_reason;
+                publish_decommission_capacity_update(&mut pool_meta, &snapshot, source_pool_index)?;
             }
             ensure_pool_meta_write_fence(&write_guard, "decommission target capacity intent save failed")?;
             outcome.disarm();
@@ -10633,23 +10652,8 @@ impl ECStore {
             ensure_decommission_capacity_target_fence(target_guard, target_pool_index, "capacity progress save")?;
         }
         {
-            let persisted_info = outcome
-                .committed
-                .pools
-                .get(source_pool_index)
-                .and_then(|pool| pool.decommission.as_ref())
-                .cloned()
-                .ok_or_else(|| decommission_metadata_not_initialized_error("publish target capacity progress"))?;
             let mut pool_meta = self.pool_meta.write().await;
-            let pool_count = pool_meta.pools.len();
-            pool_meta.version = pool_meta.version.max(outcome.committed.version);
-            let info = pool_meta
-                .pools
-                .get_mut(source_pool_index)
-                .and_then(|pool| pool.decommission.as_mut())
-                .ok_or_else(|| invalid_decommission_pool_index_error(pool_count, source_pool_index))?;
-            info.capacity_reservation = persisted_info.capacity_reservation;
-            info.capacity_blocked_reason = persisted_info.capacity_blocked_reason;
+            publish_decommission_capacity_update(&mut pool_meta, &outcome.committed, source_pool_index)?;
         }
         ensure_pool_meta_write_fence(write_guard, "decommission target capacity progress save failed")?;
         if let Some(target_guard) = target_guard.as_ref() {
@@ -11037,38 +11041,60 @@ impl ECStore {
         Ok(committed)
     }
 
-    async fn mark_decommission_bucket_done_and_save(&self, idx: usize, bucket: &DecomBucketInfo) -> Result<bool> {
+    async fn mark_decommission_bucket_done_and_save(
+        &self,
+        idx: usize,
+        generation: OffsetDateTime,
+        bucket: &DecomBucketInfo,
+    ) -> Result<bool> {
+        // Lock order: save gate -> pool metadata namespace -> rebalance metadata
+        // -> short local pool metadata sections. Publish only after the save.
         let mut save_guard = self.pool_meta_save_gate.lock().await;
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission bucket completion save failed")
             .await?;
-        let changed = {
-            let mut pool_meta = self.pool_meta.write().await;
-            let changed = mark_decommission_bucket_done(&mut pool_meta, idx, bucket)?;
-            if changed {
-                merge_pool_meta_updates_for_save(
-                    &mut snapshot,
-                    &pool_meta,
-                    &[idx],
-                    "decommission bucket completion save failed",
-                )?;
+        ensure_decommission_generation(&snapshot, idx, generation)?;
+        let rebalance_meta = self.rebalance_meta.read().await.clone();
+        let checkpoint = {
+            let pool_meta = self.pool_meta.read().await;
+            ensure_decommission_generation(&pool_meta, idx, generation)?;
+            let mut current = pool_meta.clone();
+            publish_decommission_capacity_update(&mut current, &snapshot, idx)?;
+            if !mark_decommission_bucket_done(&mut current, idx, bucket)? {
+                return Ok(false);
             }
-            changed
+            let checkpoint_at = current.next_scanner_data_movement_update(OffsetDateTime::now_utc(), rebalance_meta.as_ref());
+            current.pools[idx].last_update = checkpoint_at;
+            let info = current.pools[idx]
+                .decommission
+                .as_ref()
+                .ok_or_else(|| decommission_metadata_not_initialized_error("prepare decommission bucket completion"))?;
+            let checkpoint = DecommissionProgressCheckpoint {
+                start_time: Some(generation),
+                queued: false,
+                counted_items: info.counted_items(),
+                checkpoint_at,
+                capacity_operation_id: None,
+                capacity_owner_nonce: None,
+                capacity_lease_expires_at: None,
+            };
+            merge_pool_meta_updates_for_save(&mut snapshot, &current, &[idx], "decommission bucket completion save failed")?;
+            checkpoint
         };
-        if !changed {
-            return Ok(false);
-        }
 
+        #[cfg(test)]
+        decommission_test_wrap_result("bucket_completion_before_save", &bucket.name, &bucket.prefix, 0, Ok(()))?;
         let outcome = snapshot
             .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), &[idx])
-            .await
-            .map_err(|err| {
-                Error::other(format!("decommission metadata save failed for pool {idx} bucket {}: {err}", bucket.name))
-            })?;
+            .await?;
+        #[cfg(test)]
+        decommission_test_wrap_result("bucket_completion_after_save", &bucket.name, &bucket.prefix, 0, Ok(()))?;
         let mut pool_meta = self.pool_meta.write().await;
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission bucket completion save failed")?;
-        pool_meta.version = pool_meta.version.max(outcome.committed.version);
-        pool_meta.mark_decommission_progress_saved();
+        ensure_decommission_generation(&pool_meta, idx, generation)?;
+        publish_decommission_capacity_update(&mut pool_meta, &outcome.committed, idx)?;
+        mark_decommission_bucket_done(&mut pool_meta, idx, bucket)?;
+        pool_meta.commit_decommission_progress_checkpoint(idx, checkpoint);
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission bucket completion save failed")?;
         drop(pool_meta);
         outcome.disarm();
@@ -14544,25 +14570,27 @@ impl ECStore {
         self: &Arc<Self>,
         rx: CancellationToken,
         idx: usize,
-        pool: Arc<Sets>,
+        generation: OffsetDateTime,
         bucket: DecomBucketInfo,
         entry_budget: Arc<Semaphore>,
         source_changed_exhaustions: Arc<AtomicUsize>,
     ) -> Result<()> {
         let is_decommissioned = {
             let pool_meta = self.pool_meta.read().await;
+            ensure_decommission_generation(&pool_meta, idx, generation)?;
             resolve_decommission_bucket_state(&pool_meta, idx, &bucket)?
         };
 
         if is_decommissioned {
             warn!("decommission: already done, moving on {}", bucket.to_string());
 
-            self.mark_decommission_bucket_done_and_save(idx, &bucket).await?;
+            self.mark_decommission_bucket_done_and_save(idx, generation, &bucket).await?;
             return Ok(());
         }
 
         warn!("decommission: currently on bucket {}", &bucket.name);
 
+        let pool = get_by_index(self.pools.as_slice(), idx, "load decommission background pool")?.clone();
         if let Err(err) = self
             .decommission_pool(rx.clone(), idx, pool, bucket.clone(), entry_budget, source_changed_exhaustions)
             .await
@@ -14578,7 +14606,7 @@ impl ECStore {
             return Err(err);
         }
 
-        self.mark_decommission_bucket_done_and_save(idx, &bucket).await?;
+        self.mark_decommission_bucket_done_and_save(idx, generation, &bucket).await?;
 
         warn!("decommission: decommission_pool bucket_done {}", &bucket.name);
 
@@ -14594,8 +14622,6 @@ impl ECStore {
         entry_budget: Arc<Semaphore>,
     ) -> Result<()> {
         self.ensure_decommission_runtime_capacity_available(idx, generation).await?;
-        let pool = get_by_index(self.pools.as_slice(), idx, "load decommission background pool")?.clone();
-
         let pending = {
             let pool_meta = self.pool_meta.read().await;
             pool_meta.pending_buckets(idx)
@@ -14606,12 +14632,11 @@ impl ECStore {
         let store = Arc::clone(self);
         run_decommission_phases(rx.clone(), regular_buckets, meta_buckets, bucket_concurrency, move |bucket, rx| {
             let store = Arc::clone(&store);
-            let pool = pool.clone();
             let entry_budget = entry_budget.clone();
             let source_changed_exhaustions = Arc::clone(&source_changed_exhaustions);
             Box::pin(async move {
                 store
-                    .decommission_pending_bucket(rx, idx, pool, bucket, entry_budget, source_changed_exhaustions)
+                    .decommission_pending_bucket(rx, idx, generation, bucket, entry_budget, source_changed_exhaustions)
                     .await
             })
         })
@@ -17125,6 +17150,206 @@ mod tests {
                 .as_ref()
                 .is_some_and(DecommissionCapacityReservation::active)
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_capacity_publication_allows_immediate_bucket_completion() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        crate::services::rebalance::promote_test_pool_meta_to_v2(&store).await;
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacity = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 20, 100, 80),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 200, 200, 0),
+        ];
+        set_decommission_capacity_info_overrides_for_test(store.id, vec![capacity.clone(), capacity.clone(), capacity]);
+        let bucket = DecomBucketInfo {
+            name: "capacity-publication-bucket".to_string(),
+            prefix: String::new(),
+        };
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], vec![bucket.clone()])
+            .await
+            .expect("activate a reservation and queue the regression bucket");
+        let (owner, initial_update, generation) = {
+            let mut meta = store.pool_meta.write().await;
+            meta.count_item(0, 17, false);
+            let reservation = meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("the source must own an active reservation");
+            (
+                DecommissionCapacityOwner {
+                    source_pool_index: 0,
+                    operation_id: reservation.operation_id,
+                    generation: reservation.generation,
+                    owner_nonce: reservation.owner_nonce,
+                    mutation_id: Some(uuid::Uuid::new_v4()),
+                },
+                meta.pools[0].last_update,
+                meta.pools[0]
+                    .decommission
+                    .as_ref()
+                    .and_then(|info| info.start_time)
+                    .expect("active worker generation"),
+            )
+        };
+        store
+            .run_decommission_capacity_admitted_mutation(1, Some(owner), Some(17), || async {
+                let meta = store.pool_meta.read().await;
+                assert!(
+                    meta.pools[0].last_update > initial_update,
+                    "durable capacity intent must publish its revision before target I/O"
+                );
+                assert_eq!(
+                    meta.pools[0]
+                        .decommission
+                        .as_ref()
+                        .expect("active source")
+                        .items_decommissioned,
+                    1
+                );
+                Ok(())
+            })
+            .await
+            .expect("capacity intent and consumption must commit without a progress checkpoint");
+        let persisted = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("reload capacity consumption before bucket completion");
+        {
+            let meta = store.pool_meta.read().await;
+            assert_eq!(meta.pools[0].last_update, persisted.meta.pools[0].last_update);
+            let info = meta.pools[0].decommission.as_ref().expect("active source");
+            assert_eq!(info.items_decommissioned, 1, "capacity publication must retain uncheckpointed progress");
+            assert_eq!(
+                info.progress_save_item_baseline, 0,
+                "capacity-only saves do not checkpoint object counters"
+            );
+        }
+        assert!(
+            store
+                .mark_decommission_bucket_done_and_save(0, generation, &bucket)
+                .await
+                .expect("bucket completion immediately after capacity persistence must not reject its own revision")
+        );
+        let persisted = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("bucket completion must survive a metadata reload");
+        let info = persisted.meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("durable source progress");
+        assert!(info.queued_buckets.is_empty());
+        assert_eq!(info.decommissioned_buckets, vec![bucket.to_string()]);
+        assert_eq!((info.items_decommissioned, info.bytes_done), (1, 17));
+        let reservation = info.capacity_reservation.as_ref().expect("durable capacity consumption");
+        assert_eq!(reservation.pending_target_physical_bytes, 0);
+        assert_eq!(reservation.consumed_target_physical_bytes, 17);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_bucket_completion_publishes_only_committed_progress() {
+        for fault_stage in [
+            "bucket_completion_before_save",
+            "bucket_completion_after_save",
+            "count_during_save",
+        ] {
+            let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            set_decommission_capacity_info_overrides_for_test(
+                store.id,
+                vec![vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 20, 100, 80),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 200, 200, 0),
+                ]],
+            );
+            let bucket = DecomBucketInfo {
+                name: format!("bucket-completion-{fault_stage}"),
+                prefix: String::new(),
+            };
+            store
+                .save_current_pool_meta_for_decommission_start(&[0], vec![bucket.clone()])
+                .await
+                .expect("activate the bucket completion fixture");
+            let generation = {
+                let mut meta = store.pool_meta.write().await;
+                meta.count_item(0, 17, false);
+                meta.pools[0]
+                    .decommission
+                    .as_ref()
+                    .and_then(|info| info.start_time)
+                    .expect("active generation")
+            };
+            let hook_store = Arc::clone(&store);
+            let observed = Arc::new(AtomicBool::new(false));
+            let hook_observed = Arc::clone(&observed);
+            let expected_bucket = bucket.name.clone();
+            let fault = DecommissionTestFaultGuard::install(Arc::new(move |stage, name, _, _, success| {
+                if name != expected_bucket || !success {
+                    return false;
+                }
+                if stage == fault_stage {
+                    hook_observed.store(true, Ordering::SeqCst);
+                    return true;
+                }
+                if fault_stage == "count_during_save" && stage == "bucket_completion_after_save" {
+                    hook_observed.store(true, Ordering::SeqCst);
+                    hook_store
+                        .pool_meta
+                        .try_write()
+                        .expect("publication must not hold the local metadata lock over I/O")
+                        .count_item(0, 23, false);
+                }
+                false
+            }));
+            let result = store.mark_decommission_bucket_done_and_save(0, generation, &bucket).await;
+            assert!(
+                observed.load(Ordering::SeqCst),
+                "{fault_stage}: the production save boundary was not reached"
+            );
+            drop(fault);
+            let persisted = load_pool_meta_replicas(store.pools.clone(), true)
+                .await
+                .expect("durable metadata remains readable");
+            let durable = persisted.meta.pools[0].decommission.as_ref().expect("durable progress");
+            let local = store.pool_meta.read().await;
+            let live = local.pools[0].decommission.as_ref().expect("live progress");
+            if fault_stage == "count_during_save" {
+                assert!(result.expect("successful bucket completion"));
+                assert_eq!((live.items_decommissioned, live.bytes_done, live.progress_save_item_baseline), (2, 40, 1));
+                assert_eq!((durable.items_decommissioned, durable.bytes_done), (1, 17));
+                assert!(live.queued_buckets.is_empty());
+                assert_eq!(live.decommissioned_buckets, vec![bucket.to_string()]);
+            } else {
+                let err = result.expect_err("injected failure must reach the caller");
+                assert!(err.to_string().contains(fault_stage));
+                assert_eq!(live.queued_buckets, vec![bucket.to_string()]);
+                assert!(live.decommissioned_buckets.is_empty());
+                assert_eq!(live.progress_save_item_baseline, 0);
+                if fault_stage == "bucket_completion_before_save" {
+                    assert_eq!(durable.queued_buckets, vec![bucket.to_string()]);
+                    assert!(durable.decommissioned_buckets.is_empty());
+                } else {
+                    assert!(durable.queued_buckets.is_empty());
+                    assert_eq!(durable.decommissioned_buckets, vec![bucket.to_string()]);
+                    assert_eq!((durable.items_decommissioned, durable.bytes_done), (1, 17));
+                }
+            }
+            drop(local);
+            if fault_stage == "bucket_completion_after_save" {
+                store
+                    .ensure_pool_meta_side_effects_safe("ambiguous bucket completion")
+                    .await
+                    .expect_err("commit without publication must require recovery before another write");
+            } else {
+                store
+                    .ensure_pool_meta_side_effects_safe("bucket completion")
+                    .await
+                    .expect("no ambiguous commit");
+            }
+        }
     }
 
     #[tokio::test]
@@ -22739,6 +22964,147 @@ mod pools_tests {
     }
 
     #[test]
+    fn test_decommission_capacity_publication_preserves_progress_and_checkpoint_deadline() {
+        let mut current = decommission_test_active_model_meta(&[DECOMMISSION_CAPACITY_MODEL_VERSION]);
+        let start = OffsetDateTime::UNIX_EPOCH;
+        current.pools[0].last_update = start;
+        current.count_item(0, 17, false);
+        let mut saved = current.clone();
+        saved.pools[0]
+            .decommission
+            .as_mut()
+            .expect("persisted source")
+            .items_decommissioned = 0;
+        saved.pools[0].decommission.as_mut().expect("persisted source").bytes_done = 0;
+        for seconds in [10, 20, 29] {
+            saved.pools[0].last_update = start + Duration::seconds(seconds);
+            super::publish_decommission_capacity_update(&mut current, &saved, 0).expect("same-owner capacity publication");
+        }
+        let info = current.pools[0].decommission.as_ref().expect("live source");
+        assert_eq!((info.items_decommissioned, info.bytes_done, info.progress_save_item_baseline), (1, 17, 0));
+        assert_eq!(info.progress_save_last_at, Some(start));
+        let checkpoint = current
+            .decommission_progress_checkpoint(0, DECOMMISSION_PROGRESS_SAVE_INTERVAL, start + Duration::seconds(30), None)
+            .expect("checkpoint should remain due despite capacity writes")
+            .expect("capacity updates must not postpone the 30-second progress checkpoint");
+        current.count_item(0, 19, false);
+        assert!(current.commit_decommission_progress_checkpoint(0, checkpoint));
+        let info = current.pools[0].decommission.as_ref().expect("live source");
+        assert_eq!(
+            info.items_since_last_progress_save(),
+            1,
+            "only the committed snapshot advances the watermark"
+        );
+        assert_eq!(info.progress_save_last_at, Some(checkpoint.checkpoint_at));
+        assert!(
+            current
+                .decommission_progress_checkpoint(0, DECOMMISSION_PROGRESS_SAVE_INTERVAL, start + Duration::seconds(31), None)
+                .expect("next checkpoint timing")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_decommission_capacity_publication_rejects_changed_identity_without_mutation() {
+        let baseline = decommission_test_active_model_meta(&[DECOMMISSION_CAPACITY_MODEL_VERSION]);
+        for changed_field in [
+            "layout",
+            "start",
+            "queued",
+            "terminal",
+            "operation",
+            "generation",
+            "owner",
+            "model",
+            "cleared",
+        ] {
+            let mut current = baseline.clone();
+            let mut saved = baseline.clone();
+            saved.pools[0].last_update += Duration::seconds(1);
+            let pool = &mut current.pools[0];
+            let info = pool.decommission.as_mut().expect("current source");
+            match changed_field {
+                "layout" => pool.cmd_line.push_str("-replaced"),
+                "start" => info.start_time = Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(1)),
+                "queued" => info.queued = true,
+                "terminal" => info.canceled = true,
+                "operation" => info.capacity_reservation.as_mut().expect("owner").operation_id = uuid::Uuid::new_v4(),
+                "generation" => info.capacity_reservation.as_mut().expect("owner").generation += 1,
+                "owner" => info.capacity_reservation.as_mut().expect("owner").owner_nonce = uuid::Uuid::new_v4(),
+                "model" => info.capacity_reservation.as_mut().expect("owner").model_version += 1,
+                "cleared" => pool.decommission = None,
+                _ => unreachable!("fixed test matrix"),
+            }
+            let before = format!("{current:?}");
+            let err = super::publish_decommission_capacity_update(&mut current, &saved, 0)
+                .expect_err("changed operation identity must reject publication");
+            assert!(matches!(err, Error::StalePoolMetadataUpdate { .. }), "{changed_field}: {err}");
+            assert_eq!(format!("{current:?}"), before, "{changed_field}: rejected publication mutated live state");
+        }
+    }
+
+    #[test]
+    fn test_decommission_capacity_revision_does_not_regress_when_clock_moves_backwards() {
+        let mut meta = decommission_test_cleanup_meta(DECOMMISSION_CAPACITY_MODEL_VERSION, Vec::new(), 0, None);
+        let revision = meta.pools[0].last_update;
+        let mutation = uuid::Uuid::new_v4();
+        reserve_decommission_target_pending(&mut meta, 0, 1, 1, mutation, OffsetDateTime::UNIX_EPOCH)
+            .expect("clock rollback must not prevent a valid owned reservation");
+        assert_eq!(meta.pools[0].last_update, revision);
+        resolve_decommission_target_pending(&mut meta, 0, 1, 1, mutation).expect("resolve the exact intent");
+        record_decommission_target_consumption(
+            &mut meta,
+            0,
+            1,
+            DecommissionTargetConsumption {
+                committed_data_bytes: 1,
+                target_physical_bytes: 1,
+                observed_physical_bytes: 1,
+            },
+            mutation,
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("commit consumption during clock rollback");
+        assert_eq!(meta.pools[0].last_update, revision);
+    }
+
+    #[test]
+    fn test_mark_decommission_bucket_done_is_idempotent_and_ignores_unknown_buckets() {
+        let bucket = DecomBucketInfo {
+            name: "bucket-a".to_string(),
+            prefix: String::new(),
+        };
+        let unknown = DecomBucketInfo {
+            name: "bucket-b".to_string(),
+            prefix: String::new(),
+        };
+        let mut meta = PoolMeta {
+            pools: vec![decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    queued_buckets: vec![bucket.to_string()],
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        };
+        assert!(!mark_decommission_bucket_done(&mut meta, 0, &unknown).expect("an unknown bucket is not completed"));
+        assert!(
+            meta.pools[0]
+                .decommission
+                .as_ref()
+                .expect("source progress")
+                .decommissioned_buckets
+                .is_empty()
+        );
+        assert!(mark_decommission_bucket_done(&mut meta, 0, &bucket).expect("complete the queued bucket once"));
+        assert!(!mark_decommission_bucket_done(&mut meta, 0, &bucket).expect("repeat completion is a no-op"));
+        let info = meta.pools[0].decommission.as_ref().expect("source progress");
+        assert!(info.queued_buckets.is_empty());
+        assert_eq!(info.decommissioned_buckets, vec![bucket.to_string()]);
+    }
+
+    #[test]
     fn test_mark_decommission_bucket_done_rejects_missing_decommission_meta() {
         let mut meta = PoolMeta {
             pools: vec![PoolStatus {
@@ -27181,7 +27547,7 @@ mod pools_tests {
             });
 
         let err = store
-            .mark_decommission_bucket_done_and_save(0, &bucket)
+            .mark_decommission_bucket_done_and_save(0, OffsetDateTime::UNIX_EPOCH, &bucket)
             .await
             .expect_err("bucket completion must stop before mutating sticky pool metadata");
         assert!(
