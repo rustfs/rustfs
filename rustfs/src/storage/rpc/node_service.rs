@@ -3371,6 +3371,34 @@ mod tests {
             "exact replay must not duplicate a destructive forced start"
         );
 
+        let mut duplicate_request = request.clone();
+        duplicate_request.id = Uuid::new_v4().to_string();
+        duplicate_request.force_start = false;
+        let duplicate_id = duplicate_request.id.clone();
+        let duplicate_metadata = rustfs_protos::heal_control::RequestMetadata {
+            nonce: *Uuid::new_v4().as_bytes(),
+            ..metadata
+        };
+        let duplicate_command = encode_transport_start(duplicate_request, duplicate_metadata);
+        let duplicate = call_heal_control_transport(&mut retry, fingerprint, duplicate_command)
+            .await
+            .expect("same-target duplicate producer should receive a canonical receipt");
+        let duplicate = rustfs_protos::heal_control::decode_result(&duplicate)
+            .and_then(|result| result.into_outcome(&duplicate_id, metadata.coordinator_epoch))
+            .expect("duplicate producer should carry a canonical receipt");
+        assert!(matches!(
+            duplicate,
+            rustfs_protos::heal_control::Outcome::Start {
+                task_id,
+                admission: rustfs_protos::heal_control::Admission::Merged,
+            } if task_id == first_id
+        ));
+        assert_eq!(
+            manager.operations_snapshot().await.queue_length,
+            1,
+            "a duplicate producer after lost response must not create a second task"
+        );
+
         let mut fresh_request = request;
         fresh_request.id = Uuid::new_v4().to_string();
         let fresh_id = fresh_request.id.clone();

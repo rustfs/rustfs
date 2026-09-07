@@ -29,6 +29,11 @@ use rustfs_heal::heal::{
     storage::{ECStoreHealStorage, HealStorageAPI},
 };
 use serial_test::serial;
+#[cfg(unix)]
+use std::{
+    fs::{File, OpenOptions},
+    io::Write,
+};
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -162,6 +167,27 @@ fn write_journal_path_to_disks(disk_paths: &[std::path::PathBuf], relative_path:
         let journal = path.join(META_BUCKET).join(relative_path);
         std::fs::create_dir_all(journal.parent().expect("journal parent")).expect("create journal dir");
         std::fs::write(&journal, data).expect("write journal fixture");
+    }
+}
+
+#[cfg(unix)]
+fn write_journal_path_to_disks_synced(disk_paths: &[std::path::PathBuf], relative_path: &str, data: &[u8]) {
+    for path in disk_paths {
+        let journal = path.join(META_BUCKET).join(relative_path);
+        let parent = journal.parent().expect("journal parent");
+        std::fs::create_dir_all(parent).expect("create journal dir");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&journal)
+            .expect("open synced journal fixture");
+        file.write_all(data).expect("write synced journal fixture");
+        file.sync_all().expect("sync journal fixture");
+        File::open(parent)
+            .expect("open journal parent for sync")
+            .sync_all()
+            .expect("sync journal parent");
     }
 }
 
@@ -513,6 +539,42 @@ fn mrf_successor_flush_waiting_child_process_fixture() {
     });
 }
 
+#[test]
+#[cfg(unix)]
+fn mrf_authoritative_fsync_waiting_child_process_fixture() {
+    let Ok(root) = std::env::var("RUSTFS_MRF_FSYNC_KILL_CHILD_ROOT") else {
+        return;
+    };
+    let ready_path = std::env::var("RUSTFS_MRF_FSYNC_KILL_READY")
+        .map(PathBuf::from)
+        .expect("ready marker path should be provided");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("child runtime should build");
+    runtime.block_on(async {
+        let (disk_paths, _storage) = heal_env_at(Some(Path::new(&root))).await;
+        register_local_disks(&disk_paths, "mrf-fsync-kill-child").await;
+
+        let mut startup = journal_record(1, "fsync-kill-bucket", "first-object", None, 0);
+        startup.extend(journal_record(1, "fsync-kill-bucket", "second-object", None, 0));
+        write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &startup);
+        write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &startup);
+
+        let successor = journal_record(1, "fsync-kill-bucket", "second-object", None, 2);
+        write_journal_path_to_disks_synced(&disk_paths, SCOPED_JOURNAL_REL, &successor);
+        assert!(
+            journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &successor)
+                && journal_matches_on_all_disks(&disk_paths, JOURNAL_REL, &startup),
+            "child process must reach the canonical-fsync/stale-legacy boundary"
+        );
+        std::fs::write(&ready_path, b"ready").expect("write ready marker");
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+}
+
 /// A journal published by a different OS process must remain a durable anchor
 /// when the restarted process can only admit a prefix of the replayed intents.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -646,5 +708,68 @@ async fn journal_replay_survives_service_kill_after_successor_flush() {
                 && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
         }),
         "a fully consumed successor snapshot may be deleted after service-kill restart replay"
+    );
+}
+
+/// A hard kill between the authoritative successor fsync and the legacy mirror
+/// rewrite must prefer the canonical successor tail over the stale legacy
+/// startup epoch. This models the mixed-version boundary conservatively: new
+/// readers must not merge epochs, while the old mirror remains crash-visible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[cfg(unix)]
+async fn journal_replay_survives_sigkill_after_authoritative_successor_fsync_before_legacy_mirror() {
+    let temp_dir = tempfile::tempdir().expect("fsync-kill MRF root");
+    let ready = temp_dir.path().join("authoritative-synced.ready");
+    let mut child = Command::new(std::env::current_exe().expect("test binary path"))
+        .arg("mrf_authoritative_fsync_waiting_child_process_fixture")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("RUSTFS_MRF_FSYNC_KILL_CHILD_ROOT", temp_dir.path())
+        .env("RUSTFS_MRF_FSYNC_KILL_READY", &ready)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("child MRF fsync fixture should start");
+    let ready_seen = wait_until(Duration::from_secs(10), || {
+        let ready = ready.clone();
+        async move { ready.exists() }
+    })
+    .await;
+    assert!(ready_seen, "child process did not reach the authoritative fsync boundary");
+    child.kill().expect("kill child fixture");
+    let status = child.wait().expect("wait for killed child fixture");
+    assert!(!status.success(), "child fixture must be terminated instead of exiting cleanly");
+
+    let (disk_paths, storage) = heal_env_at(Some(temp_dir.path())).await;
+    let expected_successor = journal_record(1, "fsync-kill-bucket", "second-object", None, 2);
+    let stale_startup = {
+        let mut startup = journal_record(1, "fsync-kill-bucket", "first-object", None, 0);
+        startup.extend(journal_record(1, "fsync-kill-bucket", "second-object", None, 0));
+        startup
+    };
+    assert!(
+        journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &expected_successor),
+        "restarted process must see the fsynced authoritative successor"
+    );
+    assert!(
+        journal_matches_on_all_disks(&disk_paths, JOURNAL_REL, &stale_startup),
+        "legacy mirror intentionally remains at the stale startup epoch"
+    );
+
+    let restarted = make_manager(storage);
+    let replayed = mrf_queue::replay_journal_once(&restarted).await;
+    assert_eq!(replayed, 1, "new reader must replay only the authoritative successor tail");
+    assert_eq!(
+        restarted.operations_snapshot().await.queued_by_source.mrf,
+        1,
+        "the successor tail must be accepted after the fsync-boundary restart"
+    );
+    assert!(
+        disk_paths.iter().all(|path| {
+            !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+                && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+        }),
+        "a fully consumed authoritative successor may clean both epochs after restart replay"
     );
 }
