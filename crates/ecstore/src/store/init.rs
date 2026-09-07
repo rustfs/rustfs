@@ -14,8 +14,8 @@
 
 use super::*;
 use crate::core::pools::{
-    PoolMetaBootstrapAuthority, PoolMetaReplicaState, PoolMetaWriteState, load_pool_meta_identity_observing,
-    local_decommission_queue_prefix, persist_pool_meta_identity_for_startup, pool_meta_has_active_decommission,
+    PoolMetaBootstrapAuthority, PoolMetaReplicaState, PoolMetaWriteState, local_decommission_queue_prefix,
+    persist_pool_meta_identity_for_startup, pool_meta_has_active_decommission,
 };
 use crate::runtime::instance::InstanceContext;
 use crate::runtime::sources as runtime_sources;
@@ -153,14 +153,11 @@ async fn load_pool_meta_for_startup<S>(
 where
     S: EcstoreObjectIO,
 {
-    load_pool_meta_identity_observing(pools.clone(), write_state)
-        .await
-        .map_err(|err| Error::other(format!("store init failed during load_pool_meta_identity: {err}")))?;
     let mut meta = PoolMeta::default();
     let replica_state = meta
-        .load_no_lock_from_replicas_observing(pools, write_state)
+        .load_for_startup_observing(pools, write_state)
         .await
-        .map_err(|err| Error::other(format!("store init failed during load_pool_meta: {err}")))?;
+        .map_err(|err| Error::other_with_context("store init failed during load_pool_meta", err))?;
     write_state.observe_replicas(replica_state);
     write_state
         .ensure_missing_metadata_can_initialize()
@@ -768,6 +765,33 @@ impl ECStore {
                 supervise_local_decommission_after_init(store, decommission_rx).await;
             });
         }
+
+        let recovery_store = self.clone();
+        let recovery_rx = rx.clone();
+        tokio::spawn(async move {
+            let mut delay = std::time::Duration::from_secs(5);
+            loop {
+                tokio::select! {
+                    _ = recovery_rx.cancelled() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                let result = tokio::select! {
+                    _ = recovery_rx.cancelled() => return,
+                    result = tokio::time::timeout(std::time::Duration::from_secs(30), recovery_store.recover_pool_meta_transaction()) => result,
+                };
+                delay = match result {
+                    Ok(Ok(_)) => std::time::Duration::from_secs(5),
+                    failure => {
+                        let error = match failure {
+                            Ok(Err(error)) => error,
+                            _ => Error::Timeout,
+                        };
+                        recovery_store.record_pool_meta_recovery_failure(error);
+                        (delay * 2).min(std::time::Duration::from_secs(60))
+                    }
+                };
+            }
+        });
 
         runtime_sources::init_bucket_monitor_for_current_endpoints();
         crate::bucket::bucket_target_sys::BucketTargetSys::get().start_heartbeat();
@@ -2491,6 +2515,106 @@ mod tests {
             .expect("target body should stream");
         assert_eq!(target_body, payload);
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn pool_metadata_preflight_recovery_preserves_single_and_multi_pool_public_mutations() {
+        for layout in [vec![4], vec![4, 4]] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let (_ctx, store, shutdown) =
+                without_storage_class_env(build_isolated_test_store(temp_dir.path(), "pool-meta-retry", &layout)).await;
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+            let bucket = format!("pool-meta-retry-{}", Uuid::new_v4());
+            store.make_bucket(&bucket, &MakeBucketOptions::default()).await.unwrap();
+            let mut saved_disks = Vec::new();
+            for set in &store.pools[0].disk_set {
+                let mut disks = set.disks.write().await;
+                let count = disks.len();
+                saved_disks.push((set.clone(), std::mem::replace(&mut *disks, vec![None; count])));
+            }
+            let indices = (0..layout.len()).collect::<Vec<_>>();
+            let err = store.save_current_pool_meta_for_test(&indices).await.unwrap_err();
+            assert_eq!(
+                err.pool_metadata_failure().unwrap().kind,
+                crate::error::PoolMetadataFailure::ReadUnavailable
+            );
+            for (set, disks) in saved_disks {
+                *set.disks.write().await = disks;
+            }
+            store.save_current_pool_meta_for_test(&indices).await.unwrap();
+            assert!(store.pool_meta_writes_ready().await);
+
+            let payload = b"pool metadata recovery payload".to_vec();
+            store
+                .put_object(&bucket, "put", &mut PutObjReader::from_vec(payload.clone()), &ObjectOptions::default())
+                .await
+                .unwrap();
+            let mut reader = store
+                .get_object_reader(&bucket, "put", None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .unwrap();
+            let mut actual = Vec::new();
+            reader.stream.read_to_end(&mut actual).await.unwrap();
+            assert_eq!(actual, payload);
+            drop(reader);
+            store.delete_object(&bucket, "put", ObjectOptions::default()).await.unwrap();
+            assert!(crate::error::is_err_object_not_found(
+                &store
+                    .get_object_info(&bucket, "put", &ObjectOptions::default())
+                    .await
+                    .unwrap_err()
+            ));
+
+            let upload = store
+                .new_multipart_upload(&bucket, "multipart", &ObjectOptions::default())
+                .await
+                .unwrap();
+            let part = store
+                .put_object_part(
+                    &bucket,
+                    "multipart",
+                    &upload.upload_id,
+                    1,
+                    &mut PutObjReader::from_vec(payload.clone()),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .unwrap();
+            store
+                .clone()
+                .complete_multipart_upload(
+                    &bucket,
+                    "multipart",
+                    &upload.upload_id,
+                    vec![crate::storage_api_contracts::multipart::CompletePart {
+                        part_num: part.part_num,
+                        etag: part.etag,
+                        ..Default::default()
+                    }],
+                    &ObjectOptions::default(),
+                )
+                .await
+                .unwrap();
+            let mut reader = store
+                .get_object_reader(&bucket, "multipart", None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .unwrap();
+            actual.clear();
+            reader.stream.read_to_end(&mut actual).await.unwrap();
+            assert_eq!(actual, payload);
+            drop(reader);
+            let upload = store
+                .new_multipart_upload(&bucket, "abort", &ObjectOptions::default())
+                .await
+                .unwrap();
+            store
+                .abort_multipart_upload(&bucket, "abort", &upload.upload_id, &ObjectOptions::default())
+                .await
+                .unwrap();
+            assert!(store.pool_meta_writes_ready().await);
+            shutdown.cancel();
+        }
     }
 
     #[cfg(feature = "test-util")]

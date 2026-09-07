@@ -69,6 +69,8 @@ pub mod scanner_folder;
 #[cfg(test)]
 mod scanner_heal_admission_baseline;
 pub mod scanner_io;
+#[doc(hidden)]
+pub mod segment_invalidation;
 pub mod sleeper;
 pub(crate) mod storage_api;
 mod workload_admission;
