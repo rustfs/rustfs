@@ -1,6 +1,7 @@
 //! Fixture-only range diagnostics. No result is supplied to a scan selector.
 
 use super::*;
+use crate::DATA_USAGE_CACHE_KEY_FORMAT;
 use std::collections::BTreeSet;
 
 const MAX_SEGMENTS: usize = 4;
@@ -13,6 +14,89 @@ enum ProposalError {
     EntryLimit,
     ByteLimit,
     InvalidKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProducerKind {
+    Put,
+    Delete,
+    DeleteMarker,
+    Multipart,
+    Replication,
+    Tier,
+    DirectoryObject,
+}
+
+impl ProducerKind {
+    const REQUIRED: [Self; 7] = [
+        Self::Put,
+        Self::Delete,
+        Self::DeleteMarker,
+        Self::Multipart,
+        Self::Replication,
+        Self::Tier,
+        Self::DirectoryObject,
+    ];
+}
+
+#[derive(Clone, Debug)]
+struct SegmentObservationEnvelope<'a> {
+    source: DataUsageCacheSource,
+    bucket_incarnation: uuid::Uuid,
+    key_format: u16,
+    baseline_scan_plan_digest: DataUsageScanPlanDigest,
+    process_epoch: &'a str,
+    generation_start: u64,
+    generation_end: u64,
+    restart_gap: bool,
+    overflow: bool,
+    producers: BTreeSet<&'a str>,
+    keys: &'a [&'a str],
+}
+
+#[derive(Clone, Debug)]
+struct SegmentObservationProof<'a> {
+    source: DataUsageCacheSource,
+    bucket_incarnation: uuid::Uuid,
+    key_format: u16,
+    baseline_scan_plan_digest: DataUsageScanPlanDigest,
+    process_epoch: &'a str,
+}
+
+fn producer_name(kind: ProducerKind) -> &'static str {
+    match kind {
+        ProducerKind::Put => "put",
+        ProducerKind::Delete => "delete",
+        ProducerKind::DeleteMarker => "delete_marker",
+        ProducerKind::Multipart => "multipart",
+        ProducerKind::Replication => "replication",
+        ProducerKind::Tier => "tier",
+        ProducerKind::DirectoryObject => "directory_object",
+    }
+}
+
+fn trusted_fixture_proposal(
+    envelope: &SegmentObservationEnvelope<'_>,
+    proof: &SegmentObservationProof<'_>,
+) -> Result<BTreeSet<String>, ProposalError> {
+    if envelope.source != proof.source
+        || envelope.bucket_incarnation.is_nil()
+        || envelope.bucket_incarnation != proof.bucket_incarnation
+        || envelope.key_format != proof.key_format
+        || envelope.baseline_scan_plan_digest != proof.baseline_scan_plan_digest
+        || envelope.process_epoch != proof.process_epoch
+        || envelope.generation_start == 0
+        || envelope.generation_end < envelope.generation_start
+        || envelope.restart_gap
+        || envelope.overflow
+        || !ProducerKind::REQUIRED
+            .iter()
+            .all(|producer| envelope.producers.contains(producer_name(*producer)))
+    {
+        return Err(ProposalError::InvalidKey);
+    }
+
+    fixture_proposal(envelope.keys)
 }
 
 // Keys come from successful fixture writes, not a production mutation stream.
@@ -52,6 +136,78 @@ fn segment_observation_fixture_proposal_bounds() {
     for key in ["", "/hot", "hot/../cold", "hot//one", "hot\\one", "hot/\0"] {
         assert_eq!(fixture_proposal(&[key]), Err(ProposalError::InvalidKey));
     }
+}
+
+#[test]
+fn segment_observation_trusted_proposal_requires_identity_and_complete_producer_coverage() {
+    let source = DataUsageCacheSource::new(2, 3);
+    let incarnation = uuid::Uuid::from_u128(0x12345678123456781234567812345678);
+    let baseline = DataUsageScanPlanDigest([9; 32]);
+    let producers = ProducerKind::REQUIRED
+        .iter()
+        .map(|producer| producer_name(*producer))
+        .collect::<BTreeSet<_>>();
+    let envelope = SegmentObservationEnvelope {
+        source,
+        bucket_incarnation: incarnation,
+        key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+        baseline_scan_plan_digest: baseline,
+        process_epoch: "epoch-a",
+        generation_start: 11,
+        generation_end: 13,
+        restart_gap: false,
+        overflow: false,
+        producers,
+        keys: &["hot/one", "hot/two", "archive/delete-marker"],
+    };
+    let proof = SegmentObservationProof {
+        source,
+        bucket_incarnation: incarnation,
+        key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+        baseline_scan_plan_digest: baseline,
+        process_epoch: "epoch-a",
+    };
+
+    assert_eq!(
+        trusted_fixture_proposal(&envelope, &proof),
+        Ok(BTreeSet::from(["archive".to_string(), "hot".to_string()]))
+    );
+
+    let mut wrong_source = envelope.clone();
+    wrong_source.source = DataUsageCacheSource::new(2, 4);
+    assert_eq!(trusted_fixture_proposal(&wrong_source, &proof), Err(ProposalError::InvalidKey));
+
+    let mut missing_incarnation = envelope.clone();
+    missing_incarnation.bucket_incarnation = uuid::Uuid::nil();
+    assert_eq!(trusted_fixture_proposal(&missing_incarnation, &proof), Err(ProposalError::InvalidKey));
+
+    let mut wrong_key_format = envelope.clone();
+    wrong_key_format.key_format = DATA_USAGE_CACHE_KEY_FORMAT.saturating_add(1);
+    assert_eq!(trusted_fixture_proposal(&wrong_key_format, &proof), Err(ProposalError::InvalidKey));
+
+    let mut wrong_baseline = envelope.clone();
+    wrong_baseline.baseline_scan_plan_digest = DataUsageScanPlanDigest([8; 32]);
+    assert_eq!(trusted_fixture_proposal(&wrong_baseline, &proof), Err(ProposalError::InvalidKey));
+
+    let mut wrong_epoch = envelope.clone();
+    wrong_epoch.process_epoch = "epoch-b";
+    assert_eq!(trusted_fixture_proposal(&wrong_epoch, &proof), Err(ProposalError::InvalidKey));
+
+    let mut restart_gap = envelope.clone();
+    restart_gap.restart_gap = true;
+    assert_eq!(trusted_fixture_proposal(&restart_gap, &proof), Err(ProposalError::InvalidKey));
+
+    let mut overflow = envelope.clone();
+    overflow.overflow = true;
+    assert_eq!(trusted_fixture_proposal(&overflow, &proof), Err(ProposalError::InvalidKey));
+
+    let mut generation_gap = envelope.clone();
+    generation_gap.generation_end = generation_gap.generation_start - 1;
+    assert_eq!(trusted_fixture_proposal(&generation_gap, &proof), Err(ProposalError::InvalidKey));
+
+    let mut missing_producer = envelope.clone();
+    missing_producer.producers.remove(producer_name(ProducerKind::Replication));
+    assert_eq!(trusted_fixture_proposal(&missing_producer, &proof), Err(ProposalError::InvalidKey));
 }
 
 fn cache_value(cache: &DataUsageCache) -> serde_json::Value {
@@ -180,10 +336,6 @@ async fn walk_and_save(observe: bool) -> (Vec<String>, serde_json::Value) {
             walked_segments.len() - proposed.len(),
             2,
             "the two non-proposed segments must still be walked"
-        );
-        eprintln!(
-            "segment fixture: proposed={proposed:?}, actual_segments={walked_segments:?}, actual_walk_callbacks={}, production_producer_coverage=unverified",
-            paths.len()
         );
     } else {
         assert!(proposed_walked.lock().expect("read disabled observations").is_empty());

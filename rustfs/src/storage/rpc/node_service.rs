@@ -2750,12 +2750,12 @@ mod tests {
         GetAllBucketStatsRequest, GetBucketInfoRequest, GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest,
         GetMetacacheListingRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest,
         GetProcInfoRequest, GetSeLinuxInfoRequest, GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest,
-        HealBucketRequest, HealControlRequest, ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest,
-        LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
-        LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
-        MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest,
-        ReadVersionRequest, ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest,
-        RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest,
+        HealBucketRequest, HealControlRequest, HealControlResponse, ListBucketRequest, ListDirRequest, ListVolumesRequest,
+        LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest,
+        LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest,
+        MakeVolumeRequest, MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest,
+        ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest,
+        RenameDataRequest, RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest,
         ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest,
         SignalServiceRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
         StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationAbortRequest,
@@ -2992,6 +2992,162 @@ mod tests {
         (manager, request, metadata)
     }
 
+    #[derive(Clone, Copy)]
+    enum HealControlTransportFault {
+        None,
+        DropBeforeAdmission,
+        DropAfterAdmission,
+    }
+
+    struct HealControlTransportFaultService {
+        manager: Arc<HealManager>,
+        fingerprint: String,
+        coordinator_epoch: u64,
+        fault: HealControlTransportFault,
+    }
+
+    #[tonic::async_trait]
+    impl rustfs_protos::proto_gen::node_service::heal_control_service_server::HealControlService
+        for HealControlTransportFaultService
+    {
+        async fn heal_control(&self, request: Request<HealControlRequest>) -> Result<Response<HealControlResponse>, Status> {
+            let command = request.get_ref().command.to_vec();
+            let body = rustfs_protos::canonical_heal_control_request_body(
+                request.get_ref().version,
+                &request.get_ref().topology_fingerprint,
+                &request.get_ref().command,
+            )
+            .map_err(|_| Status::invalid_argument("heal control request length cannot be represented"))?;
+            crate::storage::storage_api::verify_tonic_canonical_body_digest(&request, &body)
+                .map_err(|err| Status::permission_denied(format!("heal control authentication failed: {err}")))?;
+            if request.get_ref().version != rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION {
+                return Err(Status::failed_precondition("unsupported heal control protocol version"));
+            }
+            if request.get_ref().topology_fingerprint != self.fingerprint {
+                return Err(Status::failed_precondition("heal control topology does not match"));
+            }
+            if matches!(self.fault, HealControlTransportFault::DropBeforeAdmission) {
+                return Err(Status::unavailable("transport failed before heal admission"));
+            }
+
+            let envelope = rustfs_protos::heal_control::decode_envelope(&command).map_err(Status::invalid_argument)?;
+            let result =
+                execute_heal_control_envelope_with_manager(envelope, self.coordinator_epoch, Some(Arc::clone(&self.manager)))
+                    .await?;
+            if matches!(self.fault, HealControlTransportFault::DropAfterAdmission) {
+                return Err(Status::unavailable("transport failed after heal admission"));
+            }
+
+            let canonical_response = rustfs_protos::canonical_heal_control_response_body(
+                request.get_ref().version,
+                &self.fingerprint,
+                &command,
+                &result,
+            )
+            .map_err(|_| Status::internal("heal control response length cannot be represented"))?;
+            let response_proof = crate::storage::storage_api::sign_tonic_rpc_response_proof(&canonical_response)
+                .map_err(|_| Status::internal("heal control response proof is unavailable"))?;
+            Ok(Response::new(HealControlResponse {
+                success: true,
+                result: result.into(),
+                error_info: None,
+                response_proof: response_proof.into(),
+            }))
+        }
+    }
+
+    async fn connect_faulty_heal_control_client(
+        manager: Arc<HealManager>,
+        fingerprint: &str,
+        coordinator_epoch: u64,
+        fault: HealControlTransportFault,
+    ) -> Option<HealControlServiceClient<tonic::transport::Channel>> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
+        let service = HealControlTransportFaultService {
+            manager,
+            fingerprint: fingerprint.to_string(),
+            coordinator_epoch,
+            fault,
+        };
+
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    HealControlServiceServer::new(service)
+                        .max_decoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE)
+                        .max_encoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE),
+                )
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .expect("faulty heal control transport server should run");
+        });
+
+        Some(
+            HealControlServiceClient::connect(format!("http://{addr}"))
+                .await
+                .expect("faulty heal control test client should connect"),
+        )
+    }
+
+    fn signed_heal_control_request(fingerprint: &str, command: Vec<u8>) -> Request<HealControlRequest> {
+        let mut request = Request::new(HealControlRequest {
+            version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            topology_fingerprint: fingerprint.to_string(),
+            command: command.into(),
+        });
+        request.set_timeout(rustfs_protos::heal_control_execution_timeout());
+        let body = rustfs_protos::canonical_heal_control_request_body(
+            request.get_ref().version,
+            &request.get_ref().topology_fingerprint,
+            &request.get_ref().command,
+        )
+        .expect("heal control transport request should encode");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut request);
+        request
+    }
+
+    async fn call_heal_control_transport(
+        client: &mut HealControlServiceClient<tonic::transport::Channel>,
+        fingerprint: &str,
+        command: Vec<u8>,
+    ) -> Result<Vec<u8>, Status> {
+        let response = client
+            .heal_control(signed_heal_control_request(fingerprint, command.clone()))
+            .await?
+            .into_inner();
+        if !response.success {
+            return Err(Status::unknown(
+                response
+                    .error_info
+                    .unwrap_or_else(|| "peer heal control failed without an error".to_string()),
+            ));
+        }
+        let canonical_response = rustfs_protos::canonical_heal_control_response_body(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            fingerprint,
+            &command,
+            &response.result,
+        )
+        .map_err(|_| Status::internal("heal control response length cannot be represented"))?;
+        crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical_response, &response.response_proof)
+            .map_err(|err| Status::permission_denied(format!("heal control response proof failed: {err}")))?;
+        Ok(response.result.to_vec())
+    }
+
+    fn encode_transport_start(
+        request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+        metadata: rustfs_protos::heal_control::RequestMetadata,
+    ) -> Vec<u8> {
+        let envelope = rustfs_protos::heal_control::Envelope::start(request, metadata).expect("valid start envelope");
+        rustfs_protos::heal_control::encode_envelope(&envelope).expect("valid start command should encode")
+    }
+
     #[tokio::test]
     async fn heal_start_retry_exact_forced_envelope_returns_cached_admission() {
         let (manager, request, metadata) = heal_start_retry_fixture();
@@ -3101,6 +3257,146 @@ mod tests {
             manager.get_task_status(&request_id).await,
             Err(rustfs_heal::Error::TaskNotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn heal_control_transport_pre_admission_loss_retries_original_deadline_envelope() {
+        let _ = rustfs_credentials::set_global_rpc_secret("heal-control-transport-fault-test-secret".to_string());
+        let (manager, request, metadata) = heal_start_retry_fixture();
+        let fingerprint = "transport-pre-admission-fingerprint";
+        let command = encode_transport_start(request.clone(), metadata);
+        let mut lost_before_admission = match connect_faulty_heal_control_client(
+            Arc::clone(&manager),
+            fingerprint,
+            metadata.coordinator_epoch,
+            HealControlTransportFault::DropBeforeAdmission,
+        )
+        .await
+        {
+            Some(client) => client,
+            None => return,
+        };
+
+        let lost = call_heal_control_transport(&mut lost_before_admission, fingerprint, command.clone())
+            .await
+            .expect_err("transport loss before admission must be visible to the caller");
+        assert_eq!(lost.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            manager.operations_snapshot().await.queue_length,
+            0,
+            "pre-admission transport loss must not create a canonical task"
+        );
+        assert!(matches!(
+            manager.get_task_status(&request.id).await,
+            Err(rustfs_heal::Error::TaskNotFound { .. })
+        ));
+
+        let mut retry = connect_faulty_heal_control_client(
+            Arc::clone(&manager),
+            fingerprint,
+            metadata.coordinator_epoch,
+            HealControlTransportFault::None,
+        )
+        .await
+        .expect("retry listener should bind");
+        let accepted = call_heal_control_transport(&mut retry, fingerprint, command)
+            .await
+            .expect("original envelope should remain usable within its deadline");
+        let outcome = rustfs_protos::heal_control::decode_result(&accepted)
+            .and_then(|result| result.into_outcome(&request.id, metadata.coordinator_epoch))
+            .expect("accepted retry should carry a canonical receipt");
+        assert!(matches!(
+            outcome,
+            rustfs_protos::heal_control::Outcome::Start {
+                task_id,
+                admission: rustfs_protos::heal_control::Admission::Accepted,
+            } if task_id == request.id
+        ));
+        assert_eq!(manager.operations_snapshot().await.queue_length, 1);
+    }
+
+    #[tokio::test]
+    async fn heal_control_transport_post_admission_loss_replays_receipt_but_fresh_force_start_is_distinct() {
+        let _ = rustfs_credentials::set_global_rpc_secret("heal-control-transport-fault-test-secret".to_string());
+        let (manager, request, metadata) = heal_start_retry_fixture();
+        let fingerprint = "transport-post-admission-fingerprint";
+        let first_id = request.id.clone();
+        let first_command = encode_transport_start(request.clone(), metadata);
+        let mut lost_after_admission = match connect_faulty_heal_control_client(
+            Arc::clone(&manager),
+            fingerprint,
+            metadata.coordinator_epoch,
+            HealControlTransportFault::DropAfterAdmission,
+        )
+        .await
+        {
+            Some(client) => client,
+            None => return,
+        };
+
+        let lost = call_heal_control_transport(&mut lost_after_admission, fingerprint, first_command.clone())
+            .await
+            .expect_err("post-admission response loss must be visible to the caller");
+        assert_eq!(lost.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            manager.operations_snapshot().await.queue_length,
+            1,
+            "post-admission response loss must leave exactly one canonical task"
+        );
+
+        let mut retry = connect_faulty_heal_control_client(
+            Arc::clone(&manager),
+            fingerprint,
+            metadata.coordinator_epoch,
+            HealControlTransportFault::None,
+        )
+        .await
+        .expect("retry listener should bind");
+        let replayed = call_heal_control_transport(&mut retry, fingerprint, first_command)
+            .await
+            .expect("exact transport retry should replay the original receipt");
+        let replayed = rustfs_protos::heal_control::decode_result(&replayed)
+            .and_then(|result| result.into_outcome(&first_id, metadata.coordinator_epoch))
+            .expect("replayed retry should carry a canonical receipt");
+        assert!(matches!(
+            replayed,
+            rustfs_protos::heal_control::Outcome::Start {
+                task_id,
+                admission: rustfs_protos::heal_control::Admission::Accepted,
+            } if task_id == first_id
+        ));
+        assert_eq!(
+            manager.operations_snapshot().await.queue_length,
+            1,
+            "exact replay must not duplicate a destructive forced start"
+        );
+
+        let mut fresh_request = request;
+        fresh_request.id = Uuid::new_v4().to_string();
+        let fresh_id = fresh_request.id.clone();
+        let fresh_metadata = rustfs_protos::heal_control::RequestMetadata {
+            nonce: *Uuid::new_v4().as_bytes(),
+            ..metadata
+        };
+        let fresh_command = encode_transport_start(fresh_request, fresh_metadata);
+        let fresh = call_heal_control_transport(&mut retry, fingerprint, fresh_command)
+            .await
+            .expect("fresh forceStart should keep explicit new-start semantics");
+        let fresh = rustfs_protos::heal_control::decode_result(&fresh)
+            .and_then(|result| result.into_outcome(&fresh_id, metadata.coordinator_epoch))
+            .expect("fresh forceStart should carry its own receipt");
+        assert!(matches!(
+            fresh,
+            rustfs_protos::heal_control::Outcome::Start {
+                task_id,
+                admission: rustfs_protos::heal_control::Admission::Accepted,
+            } if task_id == fresh_id && task_id != first_id
+        ));
+        assert_eq!(
+            manager.operations_snapshot().await.queue_length,
+            2,
+            "a new forceStart request must be counted as a distinct canonical task"
+        );
     }
 
     #[tokio::test]
