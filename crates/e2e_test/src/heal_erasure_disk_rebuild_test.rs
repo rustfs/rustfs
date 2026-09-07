@@ -54,6 +54,23 @@ mod tests {
         test_binary: EvidenceBuild,
     }
 
+    #[derive(Clone, Copy)]
+    struct ScannerHealEvidenceCase {
+        id: &'static str,
+        oracle: &'static str,
+    }
+
+    const BACKGROUND_TARGET_RESTART_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
+        id: "background-target-restart",
+        oracle: "background-target-restart.json",
+    };
+
+    struct RestartEvidenceContext {
+        directory: PathBuf,
+        run: RestartEvidenceRun,
+        case: ScannerHealEvidenceCase,
+    }
+
     fn file_sha256(path: &Path) -> Result<String, Box<dyn Error + Send + Sync>> {
         let mut file = std::fs::File::open(path)?;
         let mut digest = Sha256::new();
@@ -68,10 +85,22 @@ mod tests {
         Ok(digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
-    fn restart_evidence_run(binary: &Path) -> Result<Option<(PathBuf, RestartEvidenceRun)>, Box<dyn Error + Send + Sync>> {
+    fn restart_evidence_run(
+        binary: &Path,
+        case: ScannerHealEvidenceCase,
+    ) -> Result<Option<RestartEvidenceContext>, Box<dyn Error + Send + Sync>> {
         let Some(directory) = std::env::var_os("RUSTFS_SCANNER_HEAL_RUN_DIR") else {
             return Ok(None);
         };
+        if case.id.is_empty()
+            || case.oracle.is_empty()
+            || !case.oracle.ends_with(".json")
+            || case.oracle.contains('/')
+            || case.oracle.contains('\\')
+            || case.oracle.contains("..")
+        {
+            return Err("invalid scanner/heal evidence case".into());
+        }
         let directory = PathBuf::from(directory);
         let receipt = directory.join("run.json");
         if receipt.metadata()?.len() > 1024 * 1024 {
@@ -91,10 +120,10 @@ mod tests {
             run.test_binary.sha256,
             "test executable must match the run receipt"
         );
-        if directory.join("background-target-restart.json").exists() {
+        if directory.join(case.oracle).exists() {
             return Err("scanner/heal oracle already exists; create a new execution receipt".into());
         }
-        Ok(Some((directory, run)))
+        Ok(Some(RestartEvidenceContext { directory, run, case }))
     }
 
     fn compiled_test_identity() -> serde_json::Value {
@@ -964,7 +993,7 @@ mod tests {
     async fn run_cluster_root_heal_interruption(scenario: InterruptionScenario) -> Result<(), Box<dyn Error + Send + Sync>> {
         let server_binary = rustfs_binary_path();
         let evidence_run = if scenario == InterruptionScenario::BackgroundTargetRestart {
-            restart_evidence_run(&server_binary)?
+            restart_evidence_run(&server_binary, BACKGROUND_TARGET_RESTART_EVIDENCE)?
         } else {
             None
         };
@@ -1613,15 +1642,20 @@ mod tests {
             return Err(format!("heal data rebuilt but task did not finish successfully: {task_status}").into());
         }
 
-        if let Some((directory, run)) = evidence_run {
+        if let Some(evidence_context) = evidence_run {
             let restarted_pid = cluster.nodes[1].process.as_ref().ok_or("restarted target is absent")?.id();
             assert_ne!(target_pid, restarted_pid, "target must be a new process");
-            assert_eq!(file_sha256(&server_binary)?, run.binary.sha256, "server build changed during restart");
+            assert_eq!(
+                file_sha256(&server_binary)?,
+                evidence_context.run.binary.sha256,
+                "server build changed during restart"
+            );
             let evidence = serde_json::json!({
-                "schema": 1, "case": "background-target-restart", "evidence": "process-restart",
-                "run_id": run.run_id, "source_revision": run.source_revision,
+                "schema": 1, "case": evidence_context.case.id, "evidence": "process-restart",
+                "run_id": evidence_context.run.run_id, "source_revision": evidence_context.run.source_revision,
                 "test_build": compiled_test_identity(),
-                "binary_sha256": run.binary.sha256, "test_binary_sha256": run.test_binary.sha256,
+                "binary_sha256": evidence_context.run.binary.sha256,
+                "test_binary_sha256": evidence_context.run.test_binary.sha256,
                 "topology": {"nodes": cluster.nodes.len(), "drives_per_node": cluster.nodes[0].data_dirs.len()},
                 "pid_before": target_pid, "pid_after": restarted_pid,
                 "objects": evidence_objects, "node_listings": node_listings,
@@ -1633,7 +1667,7 @@ mod tests {
             let mut output = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(directory.join("background-target-restart.json"))?;
+                .open(evidence_context.directory.join(evidence_context.case.oracle))?;
             output.write_all(&data)?;
             output.sync_all()?;
         }

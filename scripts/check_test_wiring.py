@@ -1309,6 +1309,29 @@ class SelfTests(unittest.TestCase):
             self.assertIn("alternate-target-restart.json", read_json(run_dir / "execution.json")["artifacts"])
             self.assertEqual(check_scanner_heal_evidence(root, run_dir, "alternate-target-restart"), [])
 
+    def test_scanner_heal_release_consumes_multiple_registry_oracles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            alternate = dict(registry["cases"]["background-target-restart"])
+            alternate["oracle"] = "alternate-target-restart.json"
+            registry["cases"]["alternate-target-restart"] = alternate
+            write_json(root / ".config/scanner-heal-required-tests.json", registry)
+            oracle = read_json(run_dir / "background-target-restart.json")
+            oracle["case"] = "alternate-target-restart"
+            write_json(run_dir / "alternate-target-restart.json", oracle)
+            (run_dir / "execution.json").unlink()
+
+            finish_scanner_heal_receipt(run_dir, 0, root)
+
+            artifacts = read_json(run_dir / "execution.json")["artifacts"]
+            self.assertIn("background-target-restart.json", artifacts)
+            self.assertIn("alternate-target-restart.json", artifacts)
+            self.assertEqual(check_scanner_heal_evidence(root, run_dir, "alternate-target-restart"), [])
+            errors = check_scanner_heal_evidence(root, run_dir, "release")
+            self.assertEqual(len(errors), 21)
+            self.assertTrue(all(error.startswith("pending ") for error in errors))
+
     def test_scanner_heal_rejects_broken_execution_and_artifacts(self) -> None:
         for fault in ("exit", "missing", "zero", "skipped", "failed", "retry", "filtered", "ignored", "stale",
                       "hash", "binary", "synthetic", "wrong-run", "same-pid", "body", "parts", "listing", "topology"):
