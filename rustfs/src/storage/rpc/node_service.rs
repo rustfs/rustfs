@@ -3148,6 +3148,16 @@ mod tests {
         rustfs_protos::heal_control::encode_envelope(&envelope).expect("valid start command should encode")
     }
 
+    fn decode_transport_start_outcome(
+        result: &[u8],
+        request_id: &str,
+        coordinator_epoch: u64,
+    ) -> rustfs_protos::heal_control::Outcome {
+        rustfs_protos::heal_control::decode_result(result)
+            .and_then(|result| result.into_outcome(request_id, coordinator_epoch))
+            .expect("heal-control start response should carry a matching canonical receipt")
+    }
+
     #[tokio::test]
     async fn heal_start_retry_exact_forced_envelope_returns_cached_admission() {
         let (manager, request, metadata) = heal_start_retry_fixture();
@@ -3396,6 +3406,105 @@ mod tests {
             manager.operations_snapshot().await.queue_length,
             2,
             "a new forceStart request must be counted as a distinct canonical task"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_control_transport_peer_restart_replays_observed_receipt_without_readmission() {
+        let _ = rustfs_credentials::set_global_rpc_secret("heal-control-transport-fault-test-secret".to_string());
+        let (manager, request, metadata) = heal_start_retry_fixture();
+        let fingerprint = "transport-peer-restart-fingerprint";
+        let first_id = request.id.clone();
+        let first_command = encode_transport_start(request.clone(), metadata);
+        let mut lost_after_admission = match connect_faulty_heal_control_client(
+            Arc::clone(&manager),
+            fingerprint,
+            metadata.coordinator_epoch,
+            HealControlTransportFault::DropAfterAdmission,
+        )
+        .await
+        {
+            Some(client) => client,
+            None => return,
+        };
+
+        let lost = call_heal_control_transport(&mut lost_after_admission, fingerprint, first_command.clone())
+            .await
+            .expect_err("post-admission response loss must be visible before receipt replay");
+        assert_eq!(lost.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            manager.operations_snapshot().await.queue_length,
+            1,
+            "the lost response path must still admit one canonical task"
+        );
+
+        let mut retry = connect_faulty_heal_control_client(
+            Arc::clone(&manager),
+            fingerprint,
+            metadata.coordinator_epoch,
+            HealControlTransportFault::None,
+        )
+        .await
+        .expect("retry listener should bind");
+        let replayed = call_heal_control_transport(&mut retry, fingerprint, first_command.clone())
+            .await
+            .expect("exact retry should return the canonical receipt before restart");
+        assert!(matches!(
+            decode_transport_start_outcome(&replayed, &first_id, metadata.coordinator_epoch),
+            rustfs_protos::heal_control::Outcome::Start {
+                task_id,
+                admission: rustfs_protos::heal_control::Admission::Accepted,
+            } if task_id == first_id
+        ));
+
+        let restarted_manager = Arc::new(HealManager::new(Arc::new(HealControlMockStorage), None));
+        let mut restarted_peer = connect_faulty_heal_control_client(
+            Arc::clone(&restarted_manager),
+            fingerprint,
+            metadata.coordinator_epoch,
+            HealControlTransportFault::None,
+        )
+        .await
+        .expect("restarted peer listener should bind");
+        let replayed_after_restart = call_heal_control_transport(&mut restarted_peer, fingerprint, first_command)
+            .await
+            .expect("restarted peer should replay an observed receipt for the exact envelope");
+        assert_eq!(
+            replayed_after_restart, replayed,
+            "restart after receipt replay must return the same canonical receipt bytes"
+        );
+        assert_eq!(
+            restarted_manager.operations_snapshot().await.queue_length,
+            0,
+            "exact replay to a restarted peer must not re-admit the destructive start"
+        );
+        assert!(matches!(
+            restarted_manager.get_task_status(&first_id).await,
+            Err(rustfs_heal::Error::TaskNotFound { .. })
+        ));
+
+        let mut fresh_request = request;
+        fresh_request.id = Uuid::new_v4().to_string();
+        let fresh_id = fresh_request.id.clone();
+        let fresh_metadata = rustfs_protos::heal_control::RequestMetadata {
+            nonce: *Uuid::new_v4().as_bytes(),
+            ..metadata
+        };
+        let fresh_command = encode_transport_start(fresh_request, fresh_metadata);
+        let fresh = call_heal_control_transport(&mut restarted_peer, fingerprint, fresh_command)
+            .await
+            .expect("fresh forceStart after peer restart remains an explicit new start");
+        assert!(matches!(
+            decode_transport_start_outcome(&fresh, &fresh_id, metadata.coordinator_epoch),
+            rustfs_protos::heal_control::Outcome::Start {
+                task_id,
+                admission: rustfs_protos::heal_control::Admission::Accepted,
+            } if task_id == fresh_id && task_id != first_id
+        ));
+        assert_eq!(
+            restarted_manager.operations_snapshot().await.queue_length,
+            1,
+            "fresh forceStart after restart must be counted separately from receipt replay"
         );
     }
 
