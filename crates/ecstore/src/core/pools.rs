@@ -5137,6 +5137,23 @@ where
     }
 }
 
+fn select_pool_meta_replicas_for_read_probe<R>(
+    write_state: &PoolMetaWriteState,
+    replicas: Vec<R>,
+    operation: &str,
+) -> Result<PoolMetaSelection>
+where
+    R: Into<PoolMetaReplicaRead>,
+{
+    // Read-only planning probes must fail the current request on unsafe pool
+    // metadata, but they must not permanently poison the shared writer gate.
+    let mut probe_state = write_state.clone();
+    let selection = select_pool_meta_replicas_observing(&mut probe_state, replicas)?;
+    probe_state.observe_replicas(selection.replica_state);
+    probe_state.ensure_write_safe(operation)?;
+    Ok(selection)
+}
+
 async fn load_pool_meta_replicas<S>(pools: Vec<Arc<S>>, no_lock: bool) -> Result<PoolMetaSelection>
 where
     S: EcstoreObjectIO,
@@ -5154,6 +5171,19 @@ where
 {
     let replicas = read_pool_meta_replicas(pools, no_lock).await;
     select_pool_meta_replicas_observing(write_state, replicas)
+}
+
+async fn load_pool_meta_replicas_for_read_probe<S>(
+    pools: Vec<Arc<S>>,
+    no_lock: bool,
+    write_state: &PoolMetaWriteState,
+    operation: &str,
+) -> Result<PoolMetaSelection>
+where
+    S: EcstoreObjectIO,
+{
+    let replicas = read_pool_meta_replicas(pools, no_lock).await;
+    select_pool_meta_replicas_for_read_probe(write_state, replicas, operation)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8997,9 +9027,7 @@ impl ECStore {
         })?;
         let pool_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
         let pool_meta_guard = pool_meta_lock.get_read_lock(get_lock_acquire_timeout()).await?;
-        let selection = load_pool_meta_replicas_observing(self.pools.clone(), true, write_state).await?;
-        write_state.observe_replicas(selection.replica_state);
-        write_state.ensure_write_safe(operation)?;
+        let selection = load_pool_meta_replicas_for_read_probe(self.pools.clone(), true, write_state, operation).await?;
         Ok((pool_meta_guard, selection.meta))
     }
 
@@ -17950,6 +17978,41 @@ mod tests {
             err.to_string()
                 .contains("restart after all replicas are readable and consistent")
         );
+    }
+
+    #[test]
+    fn pool_meta_read_probe_does_not_latch_writer_state() {
+        let write_state = PoolMetaWriteState::default();
+        select_pool_meta_replicas_for_read_probe(
+            &write_state,
+            vec![PoolMetaReplica::Unreadable("transient read failure".to_string())],
+            "capacity probe",
+        )
+        .expect_err("an unreadable probe replica must fail the current admission");
+
+        write_state
+            .ensure_write_safe("ordinary object write")
+            .expect("a read-only capacity probe must not permanently latch the pool metadata writer");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_read_guard_does_not_latch_after_unreadable_replica() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        for set in &store.pools[1].disk_set {
+            let mut disks = set.disks.write().await;
+            let disk_count = disks.len();
+            *disks = vec![None; disk_count];
+        }
+
+        let mut write_state = store.pool_meta_save_gate.lock().await;
+        store
+            .acquire_pool_meta_read_guard(&mut write_state, "capacity probe")
+            .await
+            .expect_err("an unreadable metadata replica must reject this probe");
+        write_state
+            .ensure_write_safe("ordinary object write")
+            .expect("a failed read-only probe must remain retryable");
     }
 
     #[test]

@@ -18,6 +18,8 @@ use crate::data_usage_define::{
     DATA_USAGE_BLOOM_RECOVERY_PATH, DATA_USAGE_RECOVERY_PATH, usage_floor_primary_read_error_allows_backup,
 };
 use crate::storage_api::owner::ObjectIO as _;
+use rustfs_filemeta::MetaCacheEntry;
+use std::collections::BTreeSet;
 use std::sync::atomic::AtomicU64;
 use tokio::io::AsyncReadExt as _;
 
@@ -42,6 +44,9 @@ const SCANNER_RECOVERY_INTENT_STATE_RUNNING: &str = "running";
 const SCANNER_RECOVERY_INTENT_STATE_COMPLETED: &str = "completed";
 const SCANNER_RECOVERY_INTENT_STATE_FAILED: &str = "failed";
 pub const SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD: &str = "scanner-usage-full-rebuild";
+const MAX_SCANNER_RECOVERY_INTENT_STARTUP_CANDIDATES: usize = 4096;
+const SCANNER_RECOVERY_INTENT_STARTUP_PAGE_SIZE: usize = 128;
+const MAX_SCANNER_RECOVERY_INTENT_STARTUP_REPLAY: usize = 64;
 
 #[cfg(test)]
 pub(super) mod cleanup_io_fault {
@@ -465,6 +470,14 @@ fn scanner_recovery_intent_path(intent_id: &str) -> Result<String, ScannerError>
     Ok(format!("{SCANNER_RECOVERY_INTENT_PREFIX}/{intent_id}.json"))
 }
 
+fn scanner_recovery_intent_id_from_entry_name(entry_name: &str) -> Option<String> {
+    let relative = entry_name
+        .strip_prefix(SCANNER_RECOVERY_INTENT_PREFIX)
+        .and_then(|name| name.strip_prefix('/'))?;
+    let intent_id = relative.strip_suffix(".json")?;
+    (!intent_id.contains('/') && is_canonical_sha256(intent_id)).then(|| intent_id.to_string())
+}
+
 pub fn scanner_recovery_actor_sha256(actor: &str) -> String {
     sha256_hex(&[b"scanner-recovery-actor-v1", actor.as_bytes()])
 }
@@ -621,6 +634,117 @@ pub async fn get_scanner_usage_recovery_intent(
 ) -> Result<Option<ScannerRecoveryIntentRecord>, ScannerError> {
     let path = scanner_recovery_intent_path(intent_id)?;
     read_recovery_intent_record(storeapi, &path).await
+}
+
+fn scanner_recovery_intent_is_replayable(record: &ScannerRecoveryIntentRecord) -> bool {
+    matches!(
+        record.state.as_str(),
+        SCANNER_RECOVERY_INTENT_STATE_ACCEPTED | SCANNER_RECOVERY_INTENT_STATE_RUNNING
+    )
+}
+
+pub(super) async fn scanner_usage_recovery_intents_for_startup(
+    ctx: &CancellationToken,
+    storeapi: Arc<ECStore>,
+) -> Result<Vec<String>, ScannerError> {
+    let discovered = Arc::new(StdMutex::new(BTreeSet::<String>::new()));
+    for set in storeapi.all_set_disks() {
+        if ctx.is_cancelled() {
+            break;
+        }
+        let disks = set.get_local_disks().await;
+        if disks.is_empty() {
+            continue;
+        }
+        let read_quorum = disks.len().saturating_sub(set.default_parity_count).clamp(1, disks.len());
+        let mut forward_to = None;
+        loop {
+            let page_entries = Arc::new(StdMutex::new(Vec::<String>::new()));
+            let page_entries_for_set = page_entries.clone();
+            let list_result = list_path_raw(
+                ctx.child_token(),
+                ListPathRawOptions {
+                    disks: disks.clone(),
+                    bucket: RUSTFS_META_BUCKET.to_string(),
+                    path: SCANNER_RECOVERY_INTENT_PREFIX.to_string(),
+                    recursive: true,
+                    skip_hidden_prefix_check: true,
+                    forward_to: forward_to.clone(),
+                    min_disks: read_quorum,
+                    report_not_found: true,
+                    per_disk_limit: i32::try_from(SCANNER_RECOVERY_INTENT_STARTUP_PAGE_SIZE).unwrap_or(i32::MAX),
+                    agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                        let page_entries = page_entries_for_set.clone();
+                        Box::pin(async move {
+                            if scanner_recovery_intent_id_from_entry_name(&entry.name).is_some() {
+                                page_entries
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .push(entry.name);
+                            }
+                        })
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await;
+            match list_result {
+                Ok(()) => {}
+                Err(DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound) => break,
+                Err(err) => {
+                    return Err(ScannerError::Other(format!("failed to list scanner recovery intents for startup: {err}")));
+                }
+            }
+
+            let page = {
+                let mut guard = page_entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.sort();
+                guard.dedup();
+                std::mem::take(&mut *guard)
+            };
+            if page.is_empty() {
+                break;
+            }
+
+            {
+                let mut all = discovered.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                for entry_name in &page {
+                    if let Some(intent_id) = scanner_recovery_intent_id_from_entry_name(entry_name) {
+                        all.insert(intent_id);
+                    }
+                    if all.len() >= MAX_SCANNER_RECOVERY_INTENT_STARTUP_CANDIDATES {
+                        break;
+                    }
+                }
+                if all.len() >= MAX_SCANNER_RECOVERY_INTENT_STARTUP_CANDIDATES {
+                    break;
+                }
+            }
+
+            if page.len() < SCANNER_RECOVERY_INTENT_STARTUP_PAGE_SIZE {
+                break;
+            }
+            forward_to = page.last().cloned();
+        }
+    }
+
+    let intent_ids = {
+        let guard = discovered.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.iter().cloned().collect::<Vec<_>>()
+    };
+    let mut replayable = Vec::new();
+    for intent_id in intent_ids {
+        let Some(record) = get_scanner_usage_recovery_intent(storeapi.clone(), &intent_id).await? else {
+            continue;
+        };
+        if scanner_recovery_intent_is_replayable(&record) {
+            replayable.push(record.intent_id);
+            if replayable.len() >= MAX_SCANNER_RECOVERY_INTENT_STARTUP_REPLAY {
+                break;
+            }
+        }
+    }
+    Ok(replayable)
 }
 
 pub async fn accept_scanner_usage_recovery_intent(

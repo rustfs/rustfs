@@ -70,12 +70,13 @@ use crate::storage_api::scan::{
     SCANNER_ACTIVITY_PROTOCOL_VERSION,
 };
 use crate::{
-    ECStore, EcstoreError, RUSTFS_META_BUCKET, SCANNER_PUBLICATION_EPOCH_CHANGED, ScannerLifecycleConfigExt as _,
-    ScannerReplicationConfigExt as _, delete_config_with_publication_admission_for_epoch, get_lifecycle_config,
-    get_replication_config, invalidate_admin_data_usage_snapshot_cache, invalidate_data_usage_snapshot_cache, read_config,
-    replace_bucket_usage_memory_from_info, save_config, save_config_shared_with_preconditions_and_lease_fence_and_scope,
-    save_config_with_preconditions, save_config_with_publication_admission_for_epoch, scanner_publication_admission_for_epoch,
-    scanner_publication_epoch, scanner_publication_epoch_changed,
+    DiskError, ECStore, EcstoreError, ListPathRawOptions, RUSTFS_META_BUCKET, SCANNER_PUBLICATION_EPOCH_CHANGED,
+    ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _, delete_config_with_publication_admission_for_epoch,
+    get_lifecycle_config, get_replication_config, invalidate_admin_data_usage_snapshot_cache,
+    invalidate_data_usage_snapshot_cache, list_path_raw, read_config, replace_bucket_usage_memory_from_info, save_config,
+    save_config_shared_with_preconditions_and_lease_fence_and_scope, save_config_with_preconditions,
+    save_config_with_publication_admission_for_epoch, scanner_publication_admission_for_epoch, scanner_publication_epoch,
+    scanner_publication_epoch_changed,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -947,6 +948,22 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     init_data_scanner_with_storage(ctx, storeapi).await;
 }
 
+async fn run_scanner_usage_recovery_intents_for_startup(
+    ctx: CancellationToken,
+    storeapi: Arc<ECStore>,
+) -> Result<usize, ScannerError> {
+    let intent_ids = scanner_usage_recovery_intents_for_startup(&ctx, storeapi.clone()).await?;
+    let mut attempted = 0usize;
+    for intent_id in intent_ids {
+        if ctx.is_cancelled() {
+            break;
+        }
+        run_scanner_usage_recovery_intent(ctx.child_token(), storeapi.clone(), intent_id).await?;
+        attempted = attempted.saturating_add(1);
+    }
+    Ok(attempted)
+}
+
 /// Start normal scanning when enabled, or one resume-only cleanup attempt.
 /// The disabled branch returns a finite task for the startup owner to join;
 /// it never enables ordinary namespace scanning or accepts a new reset intent.
@@ -956,10 +973,32 @@ pub async fn init_scanner_with_recovery(
     enabled: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if enabled {
+        if let Err(error) = run_scanner_usage_recovery_intents_for_startup(ctx.clone(), storeapi.clone()).await {
+            warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "recovery_intent_startup_discovery_failed",
+                error = %error,
+                "Scanner recovery intent startup discovery failed"
+            );
+        }
         init_data_scanner(ctx, storeapi).await;
         return None;
     }
     Some(tokio::spawn(async move {
+        if let Err(error) = run_scanner_usage_recovery_intents_for_startup(ctx.clone(), storeapi.clone()).await {
+            warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "recovery_intent_startup_discovery_failed",
+                error = %error,
+                "Disabled scanner recovery intent startup discovery failed"
+            );
+        }
         if let Err(error) = resume_scanner_cycle_cleanup(ctx, storeapi).await {
             warn!(
                 target: "rustfs::scanner",
@@ -2216,11 +2255,14 @@ where
         false
     } else if let Some(notification_system) = storeapi.scanner_notification_system() {
         let acknowledgement_count = remote_dirty_usage_acknowledgements.len();
+        let acknowledgement_proof = remote_dirty_usage_acknowledgements.clone();
         let acknowledgements = remote_dirty_usage_acknowledgements.into_iter().map(Into::into).collect();
         remote_dirty_usage_acknowledgement_pending(
             cycle_info.current,
             acknowledgement_count,
+            &acknowledgement_proof,
             notification_system.acknowledge_scanner_dirty_usage(acknowledgements),
+            || probe_scanner_activity(storeapi.as_ref(), true),
         )
         .await
     } else {

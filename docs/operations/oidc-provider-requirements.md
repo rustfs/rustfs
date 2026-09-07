@@ -7,6 +7,8 @@ RustFS is a standard OpenID Connect relying party using the authorization-code f
 
 ## Requirements
 
+The table below describes Console login. For endpoint-free STS issuers, use the [workload contract](#sts-workload-providers) below.
+
 | # | Requirement | Details | Code anchor |
 | --- | --- | --- | --- |
 | 1 | Discovery document | `RUSTFS_IDENTITY_OPENID_CONFIG_URL` names the provider (issuer base or full discovery URL); RustFS fetches `{issuer}/.well-known/openid-configuration` and needs `issuer`, `authorization_endpoint`, `token_endpoint`, `jwks_uri`, and the standard `*_supported` arrays. When `RUSTFS_IDENTITY_OPENID_ISSUER` is set, the document's `issuer` must equal it exactly; otherwise RustFS tries the issuer candidates derived from the config URL. | `crates/iam/src/oidc.rs` `discover_provider`, `discover_provider_from_config_url` |
@@ -19,6 +21,16 @@ RustFS is a standard OpenID Connect relying party using the authorization-code f
 | 8 | Authorization claims in the ID token | Policy mapping reads the claim named by `RUSTFS_IDENTITY_OPENID_CLAIM_NAME` (default `groups`, `OIDC_DEFAULT_CLAIM_NAME`) together with `RUSTFS_IDENTITY_OPENID_GROUPS_CLAIM` and the optional `RUSTFS_IDENTITY_OPENID_ROLES_CLAIM`, as a string or array of strings, optionally prefixed by `RUSTFS_IDENTITY_OPENID_CLAIM_PREFIX`. Values must equal RustFS policy names (for example `consoleAdmin`, `readwrite`, `readonly`). Email and username come from `RUSTFS_IDENTITY_OPENID_EMAIL_CLAIM` (default `email`) and `RUSTFS_IDENTITY_OPENID_USERNAME_CLAIM` (default `preferred_username`). A provider that returns only a user id can authenticate but cannot express RustFS authorization. | `crates/iam/src/oidc.rs` `map_claims_to_policies`, `extract_canonical_group_values` |
 | 9 | Registered redirect URI | The provider must accept the callback `{public-origin}/rustfs/admin/v3/oidc/callback/{provider_id}`. RustFS picks the origin in this order: the provider's `redirect_uri` (`RUSTFS_IDENTITY_OPENID_REDIRECT_URI`), then `RUSTFS_BROWSER_REDIRECT_URL`, then the request's own scheme and host — the last only when `RUSTFS_IDENTITY_OPENID_REDIRECT_URI_DYNAMIC` is enabled. | `rustfs/src/admin/handlers/oidc.rs` `derive_callback_uri_with_provider_config`, `browser_redirect_url` |
 | 10 | Logout endpoint (optional) | When discovery advertises `end_session_endpoint`, RustFS builds an RP-initiated logout URL with `id_token_hint`, `client_id`, and `post_logout_redirect_uri`. Without it, logout falls back to the console login page. | `crates/iam/src/oidc.rs` `build_logout_url` (reads `end_session_endpoint` from `ProviderMetadataWithLogout`) |
+
+## STS workload providers
+
+For workload identity tokens exchanged through `AssumeRoleWithWebIdentity` (for example Kubernetes service-account tokens), set `RUSTFS_IDENTITY_OPENID_HIDE_FROM_UI=on` (`hide_from_ui=on` in persisted configuration, or `hide_from_ui: true` in the admin JSON API) when discovery omits `authorization_endpoint`. The default is off; without this setting, RustFS applies the Console discovery contract and rejects the missing endpoint.
+
+Endpoint-free workload discovery requires `issuer`, `jwks_uri`, and `id_token_signing_alg_values_supported`. `token_endpoint` is optional; browser authorization endpoints, `response_types_supported`, and `subject_types_supported` are not required for this path. An explicitly null, empty, or malformed `authorization_endpoint` is rejected rather than treated as absent. Configuration validation returns `authorization_endpoint: null` for an accepted workload-only provider.
+
+Set `RUSTFS_IDENTITY_OPENID_CONFIG_URL` to the issuer/discovery URL and `RUSTFS_IDENTITY_OPENID_CLIENT_ID` to the intended token audience. Configure policy claims or `RUSTFS_IDENTITY_OPENID_ROLE_POLICY` to grant the required RustFS permissions. Signature, issuer, audience, and expiration verification remain enforced, and private endpoints still require the outbound allowlist. JWKS requests accept both `application/json` and `application/jwk-set+json`.
+
+Workload-only providers cannot perform Console authorization-code login. Hiding a provider with complete discovery metadata only hides its listing; its existing direct Console login remains available.
 
 ## Deployment notes
 

@@ -7498,13 +7498,28 @@ fn finalizing_post_scan_observation_advances_partially_without_dirty_ack() {
 
 #[tokio::test]
 async fn scanner_cycle_keeps_remote_pending_acknowledgement() {
-    let pending = remote_dirty_usage_acknowledgement_pending(7, 1, std::future::ready(Ok::<bool, std::io::Error>(true))).await;
+    let acknowledgements = Vec::new();
+    let pending = remote_dirty_usage_acknowledgement_pending(
+        7,
+        1,
+        &acknowledgements,
+        std::future::ready(Ok::<bool, std::io::Error>(true)),
+        || async { Ok(BTreeMap::new()) },
+    )
+    .await;
     assert_eq!(
         scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, pending),
         ScannerCycleOutcome::CompletedWithPendingMaintenance
     );
 
-    let cleared = remote_dirty_usage_acknowledgement_pending(7, 1, std::future::ready(Ok::<bool, std::io::Error>(false))).await;
+    let cleared = remote_dirty_usage_acknowledgement_pending(
+        7,
+        1,
+        &acknowledgements,
+        std::future::ready(Ok::<bool, std::io::Error>(false)),
+        || async { Ok(BTreeMap::new()) },
+    )
+    .await;
     assert_eq!(
         scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, cleared),
         ScannerCycleOutcome::Completed
@@ -7513,12 +7528,84 @@ async fn scanner_cycle_keeps_remote_pending_acknowledgement() {
     let failed = remote_dirty_usage_acknowledgement_pending(
         7,
         1,
+        &acknowledgements,
         std::future::ready(Err::<bool, _>(std::io::Error::other("injected acknowledgement failure"))),
+        || async { Err("confirmation probe failed".to_string()) },
     )
     .await;
     assert_eq!(
         scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, failed),
         ScannerCycleOutcome::CompletedWithPendingMaintenance
+    );
+}
+
+#[tokio::test]
+async fn scanner_cycle_confirms_lost_remote_ack_from_activity_snapshot() {
+    let acknowledgement = ScannerDirtyUsageAcknowledgement {
+        host: "node-2".to_string(),
+        instance_id: "epoch-a".to_string(),
+        kind: ScannerDirtyUsageAcknowledgementKind::Generation(5),
+    };
+    let cleared_activity = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+    let response_lost = remote_dirty_usage_acknowledgement_pending(
+        8,
+        1,
+        std::slice::from_ref(&acknowledgement),
+        std::future::ready(Err::<bool, _>(std::io::Error::other("response lost after peer ack"))),
+        || async { Ok(cleared_activity) },
+    )
+    .await;
+    assert_eq!(
+        scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, response_lost),
+        ScannerCycleOutcome::Completed,
+        "a same-instance activity confirmation with no dirty work closes the uncertain ACK"
+    );
+
+    let duplicate_acknowledgements = vec![acknowledgement.clone(), acknowledgement.clone()];
+    let duplicate_target = remote_dirty_usage_acknowledgement_pending(
+        8,
+        duplicate_acknowledgements.len(),
+        &duplicate_acknowledgements,
+        std::future::ready(Err::<bool, _>(std::io::Error::other("duplicate target rejected before peer ack"))),
+        || async { Ok(BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))])) },
+    )
+    .await;
+    assert_eq!(
+        scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, duplicate_target),
+        ScannerCycleOutcome::CompletedWithPendingMaintenance,
+        "a request rejected before peer delivery cannot be recovered by a clean activity snapshot"
+    );
+
+    let restarted_activity = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-b", 7, 3))]);
+    let peer_restarted = remote_dirty_usage_acknowledgement_pending(
+        8,
+        1,
+        std::slice::from_ref(&acknowledgement),
+        std::future::ready(Err::<bool, _>(std::io::Error::other("response lost before restart was observed"))),
+        || async { Ok(restarted_activity) },
+    )
+    .await;
+    assert_eq!(
+        scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, peer_restarted),
+        ScannerCycleOutcome::CompletedWithPendingMaintenance,
+        "a new peer instance cannot confirm whether the old ACK reached durable dirty state"
+    );
+
+    let mut written_activity = scanner_node_activity("epoch-a", 7, 3);
+    written_activity.dirty_usage_generation = 6;
+    written_activity.dirty_usage_pending = true;
+    let concurrent_write = remote_dirty_usage_acknowledgement_pending(
+        8,
+        1,
+        &[acknowledgement],
+        std::future::ready(Err::<bool, _>(std::io::Error::other("response lost before concurrent write"))),
+        || async { Ok(BTreeMap::from([("node-2".to_string(), written_activity)])) },
+    )
+    .await;
+    assert_eq!(
+        scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, concurrent_write),
+        ScannerCycleOutcome::CompletedWithPendingMaintenance,
+        "new dirty usage on the same peer must keep maintenance pending"
     );
 }
 

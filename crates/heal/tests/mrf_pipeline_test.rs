@@ -29,7 +29,7 @@ use rustfs_heal::heal::{
     storage::{ECStoreHealStorage, HealStorageAPI},
 };
 use serial_test::serial;
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{path::Path, process::Command, sync::Arc, time::Duration};
 
 mod storage_api;
 
@@ -40,10 +40,15 @@ const JOURNAL_REL: &str = "buckets/.heal/mrf/journal.bin";
 const SCOPED_JOURNAL_REL: &str = "buckets/.heal/mrf/journal-scoped.bin";
 
 async fn heal_env() -> (Vec<std::path::PathBuf>, Arc<dyn HealStorageAPI>) {
-    let env = rustfs_test_utils::TestECStoreEnv::builder()
-        .prefix("rustfs_heal_mrf_test")
-        .build()
-        .await;
+    heal_env_at(None).await
+}
+
+async fn heal_env_at(base_dir: Option<&Path>) -> (Vec<std::path::PathBuf>, Arc<dyn HealStorageAPI>) {
+    let mut builder = rustfs_test_utils::TestECStoreEnv::builder().prefix("rustfs_heal_mrf_test");
+    if let Some(base_dir) = base_dir {
+        builder = builder.base_dir(base_dir);
+    }
+    let env = builder.build().await;
     let heal_storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
     (env.disk_paths, heal_storage)
 }
@@ -115,6 +120,12 @@ fn write_journal_path_to_disks(disk_paths: &[std::path::PathBuf], relative_path:
 
 fn write_journal_to_disks(disk_paths: &[std::path::PathBuf], data: &[u8]) {
     write_journal_path_to_disks(disk_paths, JOURNAL_REL, data);
+}
+
+fn journal_exists_on_all_disks(disk_paths: &[std::path::PathBuf], relative_path: &str) -> bool {
+    disk_paths
+        .iter()
+        .all(|path| Path::new(path).join(META_BUCKET).join(relative_path).exists())
 }
 
 async fn wait_until<F, Fut>(deadline: Duration, mut probe: F) -> bool
@@ -311,5 +322,71 @@ async fn journal_replay_retains_file_when_manager_is_full() {
             .iter()
             .all(|path| Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()),
         "the anchor remains until a successor snapshot can safely replace it"
+    );
+}
+
+#[test]
+fn mrf_journal_child_process_fixture() {
+    let Ok(root) = std::env::var("RUSTFS_MRF_REPLAY_CHILD_ROOT") else {
+        return;
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("child runtime should build");
+    runtime.block_on(async {
+        let (disk_paths, _storage) = heal_env_at(Some(Path::new(&root))).await;
+        let mut journal = journal_record(1, "child-restart-bucket", "first-object", None, 0);
+        journal.extend(journal_record(1, "child-restart-bucket", "second-object", None, 0));
+        write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &journal);
+        write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &journal);
+        assert!(
+            journal_exists_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL),
+            "child process must publish the authoritative MRF journal before exiting"
+        );
+    });
+    std::process::exit(77);
+}
+
+/// A journal published by a different OS process must remain a durable anchor
+/// when the restarted process can only admit a prefix of the replayed intents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn journal_replay_retains_child_process_anchor_when_manager_is_full() {
+    let temp_dir = tempfile::tempdir().expect("child process MRF root");
+    let status = Command::new(std::env::current_exe().expect("test binary path"))
+        .arg("mrf_journal_child_process_fixture")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("RUSTFS_MRF_REPLAY_CHILD_ROOT", temp_dir.path())
+        .status()
+        .expect("child MRF fixture should start");
+    assert_eq!(status.code(), Some(77), "child process did not reach the MRF journal boundary");
+
+    let (disk_paths, storage) = heal_env_at(Some(temp_dir.path())).await;
+    assert!(
+        journal_exists_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL),
+        "restarted process must see the authoritative MRF journal left by the child"
+    );
+
+    let restarted = Arc::new(HealManager::new(
+        storage,
+        Some(HealConfig {
+            queue_size: 1,
+            heal_interval: Duration::from_secs(3600),
+            enable_auto_heal: false,
+            ..Default::default()
+        }),
+    ));
+    let replayed = mrf_queue::replay_journal_once(&restarted).await;
+    assert_eq!(replayed, 2, "the restarted process must decode the complete child journal");
+    assert_eq!(
+        restarted.operations_snapshot().await.queued_by_source.mrf,
+        1,
+        "bounded admission may accept only the prefix, but must not lose the replayed tail"
+    );
+    assert!(
+        journal_exists_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL),
+        "replay must retain the child-published journal until a successor snapshot can replace it"
     );
 }
