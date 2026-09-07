@@ -37,6 +37,8 @@ fn segment_proof() -> SegmentInvalidationProof {
         key_format: envelope.key_format,
         baseline_scan_plan_digest: envelope.baseline_scan_plan_digest,
         process_epoch: envelope.process_epoch,
+        generation_start: envelope.generation_start,
+        generation_end: envelope.generation_end,
         durable_producer_identity: true,
         invalidation_domain: SegmentInvalidationDomain::LocalSingleSet,
         distributed_ec_invalidation: false,
@@ -123,6 +125,20 @@ fn segment_observation_trusted_proposal_requires_identity_and_complete_producer_
     wrong_epoch.process_epoch = "epoch-b".to_string();
     assert_eq!(
         admit_segment_invalidation(&wrong_epoch, &proof, ["hot/one"]),
+        Err(SegmentInvalidationError::InvalidProof)
+    );
+
+    let mut wrong_generation_start = proof.clone();
+    wrong_generation_start.generation_start = wrong_generation_start.generation_start.saturating_sub(1);
+    assert_eq!(
+        admit_segment_invalidation(&envelope, &wrong_generation_start, ["hot/one"]),
+        Err(SegmentInvalidationError::InvalidProof)
+    );
+
+    let mut wrong_generation_end = proof.clone();
+    wrong_generation_end.generation_end = wrong_generation_end.generation_end.saturating_add(1);
+    assert_eq!(
+        admit_segment_invalidation(&envelope, &wrong_generation_end, ["hot/one"]),
         Err(SegmentInvalidationError::InvalidProof)
     );
 
