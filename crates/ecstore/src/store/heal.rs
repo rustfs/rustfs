@@ -2353,11 +2353,17 @@ mod tests {
             .await
             .expect("quorum boundary heal should return a mapped result");
         *store.pools[0].disk_set[0].disks.write().await = original_quorum_disks;
+        let quorum_err_text = quorum_err.as_ref().map(ToString::to_string);
         assert!(
-            quorum_err.as_ref().is_some_and(|err| err
-                .to_string()
-                .contains("pool metadata writes remain blocked after a recovery-required replica state")),
+            quorum_err_text.as_deref().is_some_and(|err| {
+                err.contains("target capacity admission failed")
+                    && err.contains("pool metadata update cannot overwrite an unreadable replica")
+            }),
             "heal must fail closed when capacity admission cannot verify pool metadata, got {quorum_err:?}"
+        );
+        assert!(
+            store.pool_meta_writes_ready().await,
+            "read-only capacity admission failure must not latch the pool metadata writer"
         );
         shutdown.cancel();
     }
