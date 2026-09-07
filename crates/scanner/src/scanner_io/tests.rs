@@ -1877,24 +1877,26 @@ async fn distributed_scoped_scan_falls_back_when_remote_ack_exceeds_protocol_bat
     let result = super::io_cycle::resolve_scanner_bucket_scan_scope_for_tests(
         store.as_ref(),
         true,
-        ScannerBucketScanScope::default(),
-        ScannerCacheBaselineProof {
-            authoritative_data: Some(&baseline),
-            observed_candidate_data: None,
-            expected_sources: &expected_sources,
-            leader_epoch: 11,
-            want_cycle: 8,
-            scan_plan_digest: baseline_digest,
+        super::io_cycle::ScannerBucketScopeResolution {
+            requested_scope: ScannerBucketScanScope::default(),
+            baseline_proof: ScannerCacheBaselineProof {
+                authoritative_data: Some(&baseline),
+                observed_candidate_data: None,
+                expected_sources: &expected_sources,
+                leader_epoch: 11,
+                want_cycle: 8,
+                scan_plan_digest: baseline_digest,
+            },
+            activity_before: &activity_before,
+            dirty_usage_snapshot: &dirty_usage_snapshot,
+            all_buckets: &all_buckets,
+            requires_full_scan: false,
+            test_peer_snapshots: Some(vec![(
+                "node-a:9000".to_string(),
+                peer_dirty_usage_snapshot("instance-a", 7, true, &snapshot_buckets),
+            )]),
+            test_scoped_dirty_usage_capability: Some(true),
         },
-        &activity_before,
-        &dirty_usage_snapshot,
-        &all_buckets,
-        false,
-        Some(vec![(
-            "node-a:9000".to_string(),
-            peer_dirty_usage_snapshot("instance-a", 7, true, &snapshot_buckets),
-        )]),
-        Some(true),
     )
     .await;
 
@@ -1933,24 +1935,26 @@ async fn distributed_scoped_scan_falls_back_when_remote_scoped_ack_capability_is
         let result = super::io_cycle::resolve_scanner_bucket_scan_scope_for_tests(
             store.as_ref(),
             true,
-            ScannerBucketScanScope::default(),
-            ScannerCacheBaselineProof {
-                authoritative_data: Some(&baseline),
-                observed_candidate_data: None,
-                expected_sources: &expected_sources,
-                leader_epoch: 11,
-                want_cycle: 8,
-                scan_plan_digest,
+            super::io_cycle::ScannerBucketScopeResolution {
+                requested_scope: ScannerBucketScanScope::default(),
+                baseline_proof: ScannerCacheBaselineProof {
+                    authoritative_data: Some(&baseline),
+                    observed_candidate_data: None,
+                    expected_sources: &expected_sources,
+                    leader_epoch: 11,
+                    want_cycle: 8,
+                    scan_plan_digest,
+                },
+                activity_before: &activity_before,
+                dirty_usage_snapshot: &dirty_usage_snapshot,
+                all_buckets: &[bucket_info_with_created_time("photos")],
+                requires_full_scan: false,
+                test_peer_snapshots: Some(vec![(
+                    "node-a:9000".to_string(),
+                    peer_dirty_usage_snapshot("instance-a", 7, true, &[("photos", 7)]),
+                )]),
+                test_scoped_dirty_usage_capability: Some(capability),
             },
-            &activity_before,
-            &dirty_usage_snapshot,
-            &[bucket_info_with_created_time("photos")],
-            false,
-            Some(vec![(
-                "node-a:9000".to_string(),
-                peer_dirty_usage_snapshot("instance-a", 7, true, &[("photos", 7)]),
-            )]),
-            Some(capability),
         )
         .await;
 

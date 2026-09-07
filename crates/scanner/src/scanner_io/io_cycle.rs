@@ -98,17 +98,17 @@ pub(crate) struct ScannerCycleRequest {
     pub(crate) resolved_scope_observer: Option<tokio::sync::oneshot::Sender<ScannerBucketScanScope>>,
 }
 
-struct ScannerBucketScopeResolution<'a> {
-    requested_scope: ScannerBucketScanScope,
-    baseline_proof: ScannerCacheBaselineProof<'a>,
-    activity_before: &'a crate::scanner::ScannerActivitySnapshot,
-    dirty_usage_snapshot: &'a DirtyUsageSnapshot,
-    all_buckets: &'a [BucketInfo],
-    requires_full_scan: bool,
+pub(super) struct ScannerBucketScopeResolution<'a> {
+    pub(super) requested_scope: ScannerBucketScanScope,
+    pub(super) baseline_proof: ScannerCacheBaselineProof<'a>,
+    pub(super) activity_before: &'a crate::scanner::ScannerActivitySnapshot,
+    pub(super) dirty_usage_snapshot: &'a DirtyUsageSnapshot,
+    pub(super) all_buckets: &'a [BucketInfo],
+    pub(super) requires_full_scan: bool,
     #[cfg(test)]
-    test_peer_snapshots: Option<Vec<(String, crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot)>>,
+    pub(super) test_peer_snapshots: Option<Vec<(String, crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot)>>,
     #[cfg(test)]
-    test_scoped_dirty_usage_capability: Option<bool>,
+    pub(super) test_scoped_dirty_usage_capability: Option<bool>,
 }
 
 async fn resolve_scanner_bucket_scan_scope<S>(
@@ -254,33 +254,12 @@ where
 pub(super) async fn resolve_scanner_bucket_scan_scope_for_tests<S>(
     store: &S,
     distributed: bool,
-    requested_scope: ScannerBucketScanScope,
-    baseline_proof: ScannerCacheBaselineProof<'_>,
-    activity_before: &crate::scanner::ScannerActivitySnapshot,
-    dirty_usage_snapshot: &DirtyUsageSnapshot,
-    all_buckets: &[BucketInfo],
-    requires_full_scan: bool,
-    test_peer_snapshots: Option<Vec<(String, crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot)>>,
-    test_scoped_dirty_usage_capability: Option<bool>,
+    resolution: ScannerBucketScopeResolution<'_>,
 ) -> ScannerBucketScopeResolutionResult
 where
     S: ScannerStorage,
 {
-    resolve_scanner_bucket_scan_scope(
-        store,
-        distributed,
-        ScannerBucketScopeResolution {
-            requested_scope,
-            baseline_proof,
-            activity_before,
-            dirty_usage_snapshot,
-            all_buckets,
-            requires_full_scan,
-            test_peer_snapshots,
-            test_scoped_dirty_usage_capability,
-        },
-    )
-    .await
+    resolve_scanner_bucket_scan_scope(store, distributed, resolution).await
 }
 
 pub(crate) async fn nsscanner_with_storage_status_scoped<S>(store: &S, request: ScannerCycleRequest) -> Result<ScannerCycleResult>
