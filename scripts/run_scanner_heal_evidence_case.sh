@@ -159,6 +159,13 @@ fi
 
 case_field "$CASE_ID" name >/dev/null
 TEST_FILTER="$(test_filter_for "$CASE_ID")"
+case "$CASE_ID" in
+  background-target-crash|background-target-restart)
+    export RUSTFS_HEAL_CHAOS_OBJECT_COUNT="${RUSTFS_HEAL_CHAOS_OBJECT_COUNT:-64}"
+    export RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES="${RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES:-16777216}"
+    export RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS="${RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS:-120}"
+    ;;
+esac
 if [[ -z "$RUN_DIR" ]]; then
     RUN_DIR="$ROOT/target/scanner-heal-evidence/${CASE_ID}-$(date -u +%Y%m%dT%H%M%SZ)"
 elif [[ "$RUN_DIR" != /* ]]; then
