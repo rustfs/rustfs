@@ -584,6 +584,10 @@ struct MultipartPart {
     body: Bytes,
     e_tag: String,
     digest: [u8; 16],
+    /// Plaintext length declared by an SSE-C passthrough sender
+    /// (`x-rustfs-replication-part-actual-size`); RustFS validates the 5 MiB
+    /// minimum against it rather than against the stored bytes.
+    actual_size: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -2624,6 +2628,11 @@ impl S3 for FakeBackend {
 
     async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
         let fault = request_fault(&req);
+        let declared_actual_size = req
+            .headers
+            .get("x-rustfs-replication-part-actual-size")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok());
         let _body_permit = timeout(MAX_FAULT_DURATION, Arc::clone(&self.body_limit).acquire_owned())
             .await
             .map_err(|_| s3s::s3_error!(RequestTimeout, "fake target body limiter wait exceeded 30 seconds"))?
@@ -2665,6 +2674,7 @@ impl S3 for FakeBackend {
                 body,
                 e_tag: e_tag.clone(),
                 digest,
+                actual_size: declared_actual_size,
             },
         );
         Ok(apply_response_fault(
@@ -2734,7 +2744,9 @@ impl S3 for FakeBackend {
                 if requested_etag != &stored.e_tag {
                     return Err(s3s::s3_error!(InvalidPart, "part ETag does not match"));
                 }
-                if index + 1 != requested_parts.len() && stored.body.len() < MIN_MULTIPART_PART_BYTES {
+                if index + 1 != requested_parts.len()
+                    && stored.actual_size.unwrap_or(stored.body.len()) < MIN_MULTIPART_PART_BYTES
+                {
                     return Err(s3s::s3_error!(EntityTooSmall, "non-final multipart part is smaller than 5 MiB"));
                 }
                 selected.push((*number, stored.clone()));

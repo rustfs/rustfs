@@ -4815,6 +4815,17 @@ async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
         };
         header_size = 0;
 
+        // Passthrough parts are the stored bytes; the replica learns each
+        // part's plaintext length from this header (backlog#2363).
+        let mut part_options = PutObjectPartOptions::default();
+        if obj_opts.raw_data_movement_read && part_info.actual_size > 0 {
+            rustfs_utils::http::insert_header(
+                &mut part_options.custom_header,
+                rustfs_utils::http::SUFFIX_REPLICATION_PART_ACTUAL_SIZE,
+                part_info.actual_size.to_string(),
+            );
+        }
+
         let object_part = cli
             .put_object_part(
                 dst_bucket,
@@ -4823,7 +4834,7 @@ async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
                 part_plan.part_number,
                 part_plan.part_size,
                 byte_stream,
-                &PutObjectPartOptions { ..Default::default() },
+                &part_options,
             )
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -6871,47 +6882,77 @@ mod tests {
 
         #[tokio::test]
         async fn multipart_transport_preserves_legacy_zero_actual_sizes() {
-            run_transport(4096, None).await;
+            run_transport(4096, None, false).await;
         }
 
         #[tokio::test]
         async fn multipart_transport_uploads_an_empty_last_part_without_reading_a_range() {
-            run_transport(0, None).await;
+            run_transport(0, None, false).await;
         }
 
         #[tokio::test]
         async fn multipart_transport_preserves_transformed_unknown_nonempty_parts() {
             for unknown_part in [(0, 0), (1, 0), (0, -1), (1, -1)] {
-                run_transport(4096, Some(unknown_part)).await;
+                run_transport(4096, Some(unknown_part), false).await;
             }
         }
 
         #[tokio::test]
         async fn multipart_transport_preserves_transformed_empty_tail() {
-            run_transport(0, Some((1, 0))).await;
+            run_transport(0, Some((1, 0)), false).await;
         }
 
-        async fn run_transport(tail_size: usize, unknown_part: Option<(usize, i64)>) {
+        /// SSE-C passthrough of a compressed object: the stored bytes go out
+        /// as-is and every UploadPart declares the part's plaintext length
+        /// (backlog#2363).
+        #[tokio::test]
+        async fn multipart_transport_declares_passthrough_part_lengths() {
+            run_transport(4096, None, true).await;
+        }
+
+        async fn run_transport(tail_size: usize, unknown_part: Option<(usize, i64)>, passthrough: bool) {
             const FIRST_SIZE: usize = 5 * 1024 * 1024;
+            // The stored (compressed ciphertext) bytes of a passthrough part
+            // are shorter than the plaintext they represent.
+            const PASSTHROUGH_PLAINTEXT_FACTOR: usize = 4;
             let body = Bytes::from([vec![0x35; FIRST_SIZE], vec![0xa7; tail_size]].concat());
             let etag = faster_hex::hex_string(rustfs_utils::hash::HashAlgorithm::Md5.hash_encode(&body).as_ref());
+            let mut user_defined = if unknown_part.is_some() {
+                HashMap::from([("x-amz-server-side-encryption".to_string(), "AES256".to_string())])
+            } else {
+                HashMap::new()
+            };
+            if passthrough {
+                user_defined.insert(rustfs_utils::http::SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string());
+                rustfs_utils::http::insert_str(
+                    &mut user_defined,
+                    rustfs_utils::http::SUFFIX_COMPRESSION,
+                    "klauspost/compress/s2".to_string(),
+                );
+            }
+            let plaintext_len = |stored: usize| {
+                i64::try_from(if passthrough {
+                    stored * PASSTHROUGH_PLAINTEXT_FACTOR
+                } else {
+                    stored
+                })
+                .expect("plaintext size")
+            };
             let source = Arc::new(Source {
                 info: ObjectInfo {
                     size: i64::try_from(body.len() + if unknown_part.is_some() { 16 } else { 0 }).expect("stored size"),
-                    actual_size: i64::try_from(body.len()).expect("body size"),
+                    actual_size: plaintext_len(body.len()),
                     etag: Some(etag.clone()),
                     version_id: Some(Uuid::new_v4()),
-                    user_defined: Arc::new(if unknown_part.is_some() {
-                        HashMap::from([("x-amz-server-side-encryption".to_string(), "AES256".to_string())])
-                    } else {
-                        HashMap::new()
-                    }),
+                    user_defined: Arc::new(user_defined),
                     parts: Arc::new(vec![
                         ObjectPartInfo {
                             number: 1,
                             size: FIRST_SIZE + if unknown_part.is_some() { 8 } else { 0 },
                             actual_size: if let Some((0, size)) = unknown_part {
                                 size
+                            } else if passthrough {
+                                plaintext_len(FIRST_SIZE)
                             } else if unknown_part.is_some() || tail_size == 0 {
                                 i64::try_from(FIRST_SIZE).expect("first part size")
                             } else {
@@ -6924,6 +6965,8 @@ mod tests {
                             size: tail_size + if unknown_part.is_some() { 8 } else { 0 },
                             actual_size: if let Some((1, size)) = unknown_part {
                                 size
+                            } else if passthrough {
+                                plaintext_len(tail_size)
                             } else if unknown_part.is_some() {
                                 i64::try_from(tail_size).expect("tail logical size")
                             } else {
@@ -7002,6 +7045,7 @@ mod tests {
             let (put_opts, is_multipart) = replication_put_object_options("STANDARD", &source.info).expect("replication options");
             let opts = ObjectOptions {
                 version_id: source.info.version_id.map(|id| id.to_string()),
+                raw_data_movement_read: passthrough,
                 ..Default::default()
             };
             let reader = source
@@ -7083,6 +7127,36 @@ mod tests {
                 assert_eq!(
                     requests[index].headers.get("content-length").expect("part content length"),
                     expected.len().to_string().as_str()
+                );
+                let declared = rustfs_utils::http::get_header(
+                    &requests[index].headers,
+                    rustfs_utils::http::SUFFIX_REPLICATION_PART_ACTUAL_SIZE,
+                );
+                if passthrough {
+                    assert_eq!(
+                        declared.as_deref(),
+                        Some(plaintext_len(expected.len()).to_string().as_str()),
+                        "passthrough parts declare their plaintext length"
+                    );
+                } else {
+                    assert!(declared.is_none(), "decrypted transport carries no passthrough part length");
+                }
+            }
+            if passthrough {
+                let create = &requests[0];
+                assert_eq!(
+                    rustfs_utils::http::get_header(&create.headers, rustfs_utils::http::SUFFIX_REPLICATION_COMPRESSION)
+                        .as_deref(),
+                    Some("klauspost/compress/s2"),
+                    "the session carries the source's compression scheme"
+                );
+                assert_eq!(
+                    rustfs_utils::http::get_header(
+                        &create.headers,
+                        rustfs_utils::http::SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE
+                    )
+                    .as_deref(),
+                    Some(plaintext_len(body.len()).to_string().as_str())
                 );
             }
             let complete = &requests[3];

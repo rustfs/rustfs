@@ -1681,7 +1681,16 @@ impl DefaultObjectUsecase {
         };
         rustfs_io_metrics::record_put_object_stage_duration_from("app_prelookup", prelookup_stage_start);
 
-        let actual_size = size;
+        // A compressed SSE-C passthrough body is the source's stored bytes:
+        // its logical length is the plaintext size restored from the
+        // transport headers (backlog#2363). The body itself is still read
+        // at its wire size.
+        let body_size = size;
+        let actual_size = if ciphertext_passthrough {
+            passthrough_compressed_actual_size(&opts.user_defined).unwrap_or(size)
+        } else {
+            size
+        };
         if !ciphertext_passthrough && let Some(quota_check) = quota_check.as_ref() {
             ensure_object_size_within_quota(
                 quota_check,
@@ -1733,17 +1742,17 @@ impl DefaultObjectUsecase {
         } else {
             if use_zero_copy_eager_put_path {
                 let zero_copy_start = std::time::Instant::now();
-                let eager_body = read_zero_copy_put_body_exact(body, actual_size as usize).await?;
-                rustfs_io_metrics::record_zero_copy_write(actual_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
+                let eager_body = read_zero_copy_put_body_exact(body, body_size as usize).await?;
+                rustfs_io_metrics::record_zero_copy_write(body_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
                 HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
             } else if use_empty_or_small_eager_put_path {
-                if (actual_size as usize) <= POOL_BYPASS_MAX_SIZE {
+                if (body_size as usize) <= POOL_BYPASS_MAX_SIZE {
                     // Bypass BytesPool for very small objects to avoid Small-tier
                     // Mutex contention under high concurrency. Direct allocation
                     // for ≤4KiB is negligible cost.
                     let eager_body = read_small_put_body_exact_direct(
                         StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
-                        actual_size as usize,
+                        body_size as usize,
                     )
                     .await?;
                     HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
@@ -1751,11 +1760,11 @@ impl DefaultObjectUsecase {
                     let pool = get_concurrency_manager().bytes_pool();
                     let eager_body = read_small_put_body_exact_pooled(
                         StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
-                        actual_size as usize,
+                        body_size as usize,
                         pool.as_ref(),
                     )
                     .await?;
-                    let eager_reader = PooledBufferReader::new(eager_body, actual_size as usize);
+                    let eager_reader = PooledBufferReader::new(eager_body, body_size as usize);
                     HashReader::from_stream(eager_reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
                 }
             } else {
@@ -2103,6 +2112,18 @@ pub(super) fn previous_current_size_from_backfill(backfill: Option<OldCurrentSiz
         OldCurrentSize::Present(size) => Some(size.max(0) as u64),
         OldCurrentSize::Absent => None,
     })
+}
+
+/// Plaintext size of a compressed SSE-C passthrough body, restored from the
+/// replication transport headers into the object metadata (backlog#2363).
+fn passthrough_compressed_actual_size(user_defined: &HashMap<String, String>) -> Option<i64> {
+    if !rustfs_utils::http::contains_key_str(user_defined, SUFFIX_COMPRESSION) {
+        return None;
+    }
+    rustfs_utils::http::get_str(user_defined, SUFFIX_ACTUAL_SIZE)?
+        .parse::<i64>()
+        .ok()
+        .filter(|size| *size >= 0)
 }
 
 #[cfg(test)]
