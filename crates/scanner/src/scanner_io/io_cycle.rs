@@ -245,6 +245,7 @@ where
         dirty_buckets,
         (!distributed).then_some(resolution.dirty_usage_snapshot.scopes.as_ref()),
         true,
+        scanner_segment_reuse_activated(),
         resolution.all_buckets,
         resolution.baseline_proof,
     ))

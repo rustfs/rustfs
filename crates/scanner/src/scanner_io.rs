@@ -250,7 +250,8 @@ fn resolve_remote_dirty_usage_scope(
     // Peer snapshots contribute bucket names only; the local prefix scopes
     // would narrow a bucket a peer dirtied elsewhere, so the merged scope
     // stays at bucket granularity (same rule as the local fallthrough).
-    let scope = scoped_scan_scope_from_dirty_buckets(requested_scope, dirty_buckets, None, true, all_buckets, baseline_proof);
+    let scope =
+        scoped_scan_scope_from_dirty_buckets(requested_scope, dirty_buckets, None, true, false, all_buckets, baseline_proof);
     if scope.is_default() {
         return default_result(scope);
     }
@@ -362,6 +363,7 @@ fn scoped_scan_scope_from_dirty_buckets(
     dirty_buckets: HashSet<String>,
     dirty_scopes: Option<&DirtyUsageBucketScopes>,
     dirty_snapshot_complete: bool,
+    segment_reuse_activated: bool,
     all_buckets: &[BucketInfo],
     baseline_proof: ScannerCacheBaselineProof<'_>,
 ) -> ScannerBucketScanScope {
@@ -382,22 +384,32 @@ fn scoped_scan_scope_from_dirty_buckets(
         return requested_scope;
     };
 
-    let selected_bucket_prefixes = dirty_scopes
-        .into_iter()
-        .flat_map(|dirty_scopes| {
-            selected_buckets
-                .iter()
-                .filter_map(|bucket| dirty_scopes.get(bucket).map(|scope| (bucket.clone(), scope)))
-        })
-        .filter_map(|(bucket, scope)| match scope {
-            DirtyUsageBucketScope::WholeBucket => None,
-            DirtyUsageBucketScope::TopLevelEntries(entries) => {
-                ScannerBucketPrefixScanScope::from_dirty_top_level_entries(entries.clone()).map(|scope| (bucket, scope))
-            }
-        })
-        .collect();
+    let selected_bucket_prefixes = if segment_reuse_activated {
+        dirty_scopes
+            .into_iter()
+            .flat_map(|dirty_scopes| {
+                selected_buckets
+                    .iter()
+                    .filter_map(|bucket| dirty_scopes.get(bucket).map(|scope| (bucket.clone(), scope)))
+            })
+            .filter_map(|(bucket, scope)| match scope {
+                DirtyUsageBucketScope::WholeBucket => None,
+                DirtyUsageBucketScope::TopLevelEntries(entries) => {
+                    ScannerBucketPrefixScanScope::from_dirty_top_level_entries(entries.clone()).map(|scope| (bucket, scope))
+                }
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
 
     ScannerBucketScanScope::from_dirty_buckets(selected_buckets, selected_bucket_prefixes, baseline_scan_plan_digest)
+}
+
+fn scanner_segment_reuse_activated() -> bool {
+    // Production segment reuse stays disabled until a durable mutation-stream
+    // proof satisfies the segment invalidation contract.
+    false
 }
 
 pub(crate) fn is_scanner_metadata_corrupt_error(err: &StorageError) -> bool {
