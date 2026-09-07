@@ -10183,3 +10183,199 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
     target.shutdown().await;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// backlog#2363
+// ---------------------------------------------------------------------------
+
+/// Wait until the source reports a terminal replication status for `key`.
+async fn wait_terminal_replication_status(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    ssec: bool,
+    timeout: Duration,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let request = client.head_object().bucket(bucket).key(key);
+        let head = if ssec {
+            request
+                .sse_customer_algorithm("AES256")
+                .sse_customer_key(&customer_key)
+                .sse_customer_key_md5(&customer_key_md5)
+                .send()
+                .await?
+        } else {
+            request.send().await?
+        };
+        let status = head.replication_status().map(|status| status.as_str().to_string());
+        if matches!(status.as_deref(), Some("COMPLETED") | Some("FAILED")) {
+            return Ok(status.unwrap_or_default());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("{bucket}/{key}: replication never reached a terminal status; last {status:?}").into());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// backlog#2363: SSE-C ciphertext passthrough of objects the source stored
+/// compressed. The replica on a RustFS target must decrypt to the original
+/// bytes for a single PUT and for a multipart upload.
+#[tokio::test]
+async fn test_bucket_replication_sse_c_compressed_passthrough() -> TestResult {
+    init_logging();
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    let mut source_process_env = replication_fast_env();
+    source_process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_process_env.extend_from_slice(FAST_SCANNER_ENV);
+    source_process_env.extend_from_slice(&[
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("HTTP_PROXY", ""),
+        ("HTTPS_PROXY", ""),
+        ("RUSTFS_COMPRESSION_ENABLED", "true"),
+        ("RUSTFS_COMPRESSION_MULTIPART_ENABLED", "true"),
+    ]);
+    source_env.start_rustfs_server_with_env(vec![], &source_process_env).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(&[
+            ("NO_PROXY", "127.0.0.1,localhost"),
+            ("HTTP_PROXY", ""),
+            ("HTTPS_PROXY", ""),
+        ])
+        .await?;
+
+    let source_bucket = "ssec-compressed-src";
+    let target_bucket = "ssec-compressed-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+    let text = |len: usize, seed: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 64);
+        let mut line = 0u64;
+        while out.len() < len {
+            out.extend_from_slice(format!("ssec compressed passthrough seed={seed} line={line} lorem ipsum dolor\n").as_bytes());
+            line += 1;
+        }
+        out.truncate(len);
+        out
+    };
+
+    let single_key = "ssec-compressed-single.txt";
+    let single_body = text(1024 * 1024 + 17, 1);
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(single_key)
+        .content_type("text/plain")
+        .body(ByteStream::from(single_body.clone()))
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+
+    let multipart_key = "ssec-compressed-multipart.txt";
+    let multipart_parts = [text(PART_SIZE, 2), text(1024 * 1024 + 4096, 3)];
+    let multipart_body: Vec<u8> = multipart_parts.concat();
+    let created = source_client
+        .create_multipart_upload()
+        .bucket(source_bucket)
+        .key(multipart_key)
+        .content_type("text/plain")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    let upload_id = created.upload_id().ok_or("missing multipart upload id")?.to_string();
+    let mut completed = Vec::new();
+    for (index, part) in multipart_parts.iter().enumerate() {
+        let part_number = i32::try_from(index + 1)?;
+        let uploaded = source_client
+            .upload_part()
+            .bucket(source_bucket)
+            .key(multipart_key)
+            .upload_id(&upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(part.clone()))
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(&customer_key)
+            .sse_customer_key_md5(&customer_key_md5)
+            .send()
+            .await?;
+        completed.push(
+            CompletedPart::builder()
+                .part_number(part_number)
+                .set_e_tag(uploaded.e_tag().map(str::to_string))
+                .build(),
+        );
+    }
+    source_client
+        .complete_multipart_upload()
+        .bucket(source_bucket)
+        .key(multipart_key)
+        .upload_id(&upload_id)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed)).build())
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+
+    let mut failures = Vec::new();
+    for (key, body) in [(single_key, &single_body), (multipart_key, &multipart_body)] {
+        let status = wait_terminal_replication_status(&source_client, source_bucket, key, true, Duration::from_secs(120)).await?;
+        if status != "COMPLETED" {
+            failures.push(format!("{key}: source reports {status}"));
+            continue;
+        }
+        let replica = target_client
+            .get_object()
+            .bucket(target_bucket)
+            .key(key)
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(&customer_key)
+            .sse_customer_key_md5(&customer_key_md5)
+            .send()
+            .await;
+        match replica {
+            Ok(replica) => {
+                let content_length = replica.content_length();
+                match replica.body.collect().await {
+                    Ok(collected) => {
+                        let bytes = collected.into_bytes();
+                        if bytes.as_ref() != body.as_slice() {
+                            failures.push(format!(
+                                "{key}: replica bytes differ (content_length={content_length:?}, got {} bytes, want {})",
+                                bytes.len(),
+                                body.len()
+                            ));
+                        }
+                    }
+                    Err(err) => failures.push(format!("{key}: replica body read failed: {err}")),
+                }
+            }
+            Err(err) => failures.push(format!("{key}: replica GET failed: {err}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "SSE-C compressed passthrough replicas must decrypt to the source bytes: {failures:?}"
+    );
+    Ok(())
+}

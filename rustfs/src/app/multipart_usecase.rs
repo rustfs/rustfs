@@ -1247,9 +1247,19 @@ impl DefaultMultipartUsecase {
             StreamReader::new(body_stream.map(|f| f.map_err(s3s_body_error_to_io))),
         );
 
-        let is_disk_compressed = rustfs_utils::http::contains_key_str(&fi.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
+        // An SSE-C passthrough session stores ciphertext parts verbatim: a
+        // compression key restored on the session describes those stored
+        // bytes and must not add a second compression layer, and each part's
+        // plaintext length comes from the sender (backlog#2363).
+        let preserve_ciphertext = contains_key_str(&fi.user_defined, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT);
+        let is_disk_compressed = !preserve_ciphertext
+            && rustfs_utils::http::contains_key_str(&fi.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
-        let actual_size = size;
+        let actual_size = if preserve_ciphertext {
+            passthrough_part_actual_size(&req.headers).unwrap_or(size)
+        } else {
+            size
+        };
 
         let mut md5hex = if let Some(base64_md5) = input.content_md5 {
             let md5 = base64_simd::STANDARD
@@ -1286,7 +1296,6 @@ impl DefaultMultipartUsecase {
 
         // An SSE-C passthrough session stores ciphertext parts verbatim: no
         // material recovery, no validation against the (absent) customer key.
-        let preserve_ciphertext = contains_key_str(&fi.user_defined, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT);
         let has_ssec = !preserve_ciphertext
             && fi
                 .user_defined
@@ -1901,6 +1910,15 @@ impl DefaultMultipartUsecase {
 
         Ok(S3Response::new(output))
     }
+}
+
+/// Plaintext length of one SSE-C passthrough part, declared by the sender on
+/// UploadPart (backlog#2363).
+fn passthrough_part_actual_size(headers: &HeaderMap) -> Option<i64> {
+    get_header(headers, rustfs_utils::http::SUFFIX_REPLICATION_PART_ACTUAL_SIZE)?
+        .parse::<i64>()
+        .ok()
+        .filter(|size| *size > 0)
 }
 
 #[cfg(test)]

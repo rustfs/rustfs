@@ -247,6 +247,23 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
         meta.insert(key.to_string(), value.to_string());
     }
 
+    // A compressed SSE-C object passes through as its stored bytes. The target
+    // cannot infer the compression layout from ciphertext, so the scheme and
+    // the plaintext size travel as transport headers; each UploadPart carries
+    // its own plaintext length (backlog#2363).
+    if is_ssec && let Some(scheme) = get_str(&object_info.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION) {
+        insert_header_map(&mut meta, rustfs_utils::http::SUFFIX_REPLICATION_COMPRESSION, scheme);
+        if let Ok(actual_size) = object_info.get_actual_size()
+            && actual_size >= 0
+        {
+            insert_header_map(
+                &mut meta,
+                rustfs_utils::http::SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE,
+                actual_size.to_string(),
+            );
+        }
+    }
+
     // Managed SSE replicates as plaintext (the replication reader decrypts via
     // the object-encryption resolver) and re-encrypts on the target with the
     // target's own KMS. Send only the encryption intent — never the source
@@ -624,6 +641,59 @@ mod tests {
             ),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn compressed_ssec_objects_declare_their_compression_layout_on_the_wire() {
+        use rustfs_utils::http::{
+            SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_REPLICATION_COMPRESSION, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE,
+            insert_str,
+        };
+
+        let mut ssec_compressed = HashMap::from([(SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string())]);
+        insert_str(&mut ssec_compressed, SUFFIX_COMPRESSION, "klauspost/compress/s2".to_string());
+        insert_str(&mut ssec_compressed, SUFFIX_ACTUAL_SIZE, "6295552".to_string());
+        let object_info = ObjectInfo {
+            etag: Some("0123456789abcdef0123456789abcdef-2".to_string()),
+            size: 4321,
+            actual_size: 6295552,
+            user_defined: Arc::new(ssec_compressed),
+            ..Default::default()
+        };
+
+        // SSE-C passthrough sends stored bytes: the scheme and the plaintext
+        // size travel as transport headers, never as the internal key
+        // (backlog#2363).
+        let (options, _) = replication_put_object_options("STANDARD", &object_info).expect("ssec put options");
+        assert_eq!(
+            get_header_map(&options.user_metadata, SUFFIX_REPLICATION_COMPRESSION).as_deref(),
+            Some("klauspost/compress/s2")
+        );
+        assert_eq!(
+            get_header_map(&options.user_metadata, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE).as_deref(),
+            Some("6295552")
+        );
+        assert!(
+            !options
+                .user_metadata
+                .keys()
+                .any(|key| rustfs_utils::http::is_internal_key(key)),
+            "internal metadata never leaves the source as plain metadata: {:?}",
+            options.user_metadata
+        );
+
+        // A compressed object that is not SSE-C is decompressed by the
+        // replication reader and travels as plaintext: no layout headers.
+        let mut plain_compressed = HashMap::new();
+        insert_str(&mut plain_compressed, SUFFIX_COMPRESSION, "klauspost/compress/s2".to_string());
+        insert_str(&mut plain_compressed, SUFFIX_ACTUAL_SIZE, "6295552".to_string());
+        let plain = ObjectInfo {
+            user_defined: Arc::new(plain_compressed),
+            ..object_info
+        };
+        let (options, _) = replication_put_object_options("STANDARD", &plain).expect("plain put options");
+        assert!(get_header_map(&options.user_metadata, SUFFIX_REPLICATION_COMPRESSION).is_none());
+        assert!(get_header_map(&options.user_metadata, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE).is_none());
     }
 
     #[test]
