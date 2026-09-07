@@ -24,7 +24,7 @@ use super::super::{
 };
 use crate::disk::DataDirDeleteStatus;
 use crate::disk::DiskAPI;
-use crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX;
+use crate::disk::local::{DELETE_DATA_DIR_MARKER_PREFIX, metadata_less_part_file};
 use crate::io_support::bitrot::object_mmap_read_enabled;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
@@ -299,12 +299,6 @@ struct MetadataLessDataDirCleanup {
     first_error: Option<DiskError>,
     delete_errs: Vec<Option<DiskError>>,
     touched_disks: Vec<bool>,
-}
-
-fn metadata_less_part_file(entry: &str) -> bool {
-    entry
-        .strip_prefix("part.")
-        .is_some_and(|part_number| part_number.parse::<usize>().is_ok_and(|part_number| part_number > 0))
 }
 
 #[cfg(test)]
