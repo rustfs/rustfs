@@ -356,3 +356,238 @@ async fn tampered_presigned_put_returns_signature_does_not_match() -> Result<(),
     );
     Ok(())
 }
+
+/// GHSA-g8w9-qw9q-fghr: a presigned PUT signed with `SignedHeaders=host` must
+/// not honour `x-amz-*` headers the uploader adds afterwards. The presign
+/// authorised one plain upload; the extra headers would set tags, storage
+/// class and a website redirect the presigner never covered. AWS S3 rejects
+/// this with 403 `AccessDenied`, and so must RustFS — and the object must not
+/// be stored at all, not merely stored without the properties.
+#[tokio::test]
+async fn ghsa_g8w9_presigned_put_rejects_unsigned_x_amz_headers() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+
+    let key = "presigned-put-unsigned-amz-headers.txt";
+    let pr = env
+        .create_s3_client()
+        .put_object()
+        .bucket(BUCKET)
+        .key(key)
+        .presigned(valid_config())
+        .await?;
+    assert!(
+        !pr.headers().any(|(name, _)| name.eq_ignore_ascii_case("x-amz-tagging")),
+        "fixture must presign a plain PutObject without tagging so the header below is unsigned"
+    );
+
+    let unsigned: Vec<(&str, &str)> = vec![
+        ("x-amz-tagging", "owner=attacker&classification=public"),
+        ("x-amz-website-redirect-location", "https://attacker.example/phish"),
+        ("x-amz-storage-class", "REDUCED_REDUNDANCY"),
+    ];
+    let headers = pr.headers().chain(unsigned.iter().copied());
+    let resp = send_raw(pr.method(), pr.uri(), headers, Some(b"should-not-be-stored".to_vec())).await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    assert_eq!(
+        status.as_u16(),
+        403,
+        "presigned PUT with unsigned x-amz-* headers must be 403, body:\n{body}"
+    );
+    assert_error_code(&body, "AccessDenied");
+    assert!(
+        body.contains("were not signed"),
+        "rejection must name unsigned headers as the cause, got:\n{body}"
+    );
+
+    let error = env
+        .create_s3_client()
+        .head_object()
+        .bucket(BUCKET)
+        .key(key)
+        .send()
+        .await
+        .expect_err("presigned PUT with unsigned x-amz-* headers must not store the object");
+    assert_eq!(
+        error.raw_response().map(|response| response.status().as_u16()),
+        Some(404),
+        "absence probe after the rejected upload must return HTTP 404, got {error:?}"
+    );
+    Ok(())
+}
+
+/// GHSA-g8w9-qw9q-fghr positive control: when the presigner itself sets the
+/// property, the SDK lists `x-amz-tagging` in `SignedHeaders`, the uploader
+/// replays it, and the upload succeeds with the tags applied. Without this the
+/// negative test above could pass because the server rejects every tagged
+/// presigned upload.
+#[tokio::test]
+async fn ghsa_g8w9_presigned_put_accepts_signed_x_amz_headers() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+
+    let key = "presigned-put-signed-tagging.txt";
+    let pr = env
+        .create_s3_client()
+        .put_object()
+        .bucket(BUCKET)
+        .key(key)
+        .tagging("owner=app")
+        .presigned(valid_config())
+        .await?;
+    assert!(
+        pr.headers().any(|(name, _)| name.eq_ignore_ascii_case("x-amz-tagging")),
+        "fixture must carry x-amz-tagging as a signed header"
+    );
+    assert!(
+        pr.uri().contains("x-amz-tagging"),
+        "X-Amz-SignedHeaders must list x-amz-tagging, uri: {}",
+        pr.uri()
+    );
+
+    let resp = send_presigned(&pr, Some(b"stored-with-signed-tagging".to_vec())).await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    assert!(
+        status.is_success(),
+        "presigned PUT with signed x-amz-tagging must succeed, got {status}, body:\n{body}"
+    );
+
+    let tags = env
+        .create_s3_client()
+        .get_object_tagging()
+        .bucket(BUCKET)
+        .key(key)
+        .send()
+        .await?;
+    let tag_set: Vec<(String, String)> = tags
+        .tag_set()
+        .iter()
+        .map(|tag| (tag.key().to_string(), tag.value().to_string()))
+        .collect();
+    assert_eq!(tag_set, vec![("owner".to_string(), "app".to_string())], "signed tagging must be applied");
+    info!("signed presigned tagging control passed");
+    Ok(())
+}
+
+/// GHSA-g8w9-qw9q-fghr on the read side: a presigned GET signed with
+/// `SignedHeaders=host` must not accept an unsigned SSE-C header. The header
+/// would otherwise select a decryption path the presigner never authorised.
+#[tokio::test]
+async fn ghsa_g8w9_presigned_get_rejects_unsigned_x_amz_headers() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+
+    let pr = env
+        .create_s3_client()
+        .get_object()
+        .bucket(BUCKET)
+        .key(CANONICAL_KEY)
+        .presigned(valid_config())
+        .await?;
+
+    let unsigned: Vec<(&str, &str)> = vec![("x-amz-server-side-encryption-customer-algorithm", "AES256")];
+    let headers = pr.headers().chain(unsigned.iter().copied());
+    let resp = send_raw(pr.method(), pr.uri(), headers, None).await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    assert_eq!(
+        status.as_u16(),
+        403,
+        "presigned GET with an unsigned x-amz-* header must be 403, body:\n{body}"
+    );
+    assert_error_code(&body, "AccessDenied");
+    assert!(
+        !body.contains(std::str::from_utf8(CANONICAL_BODY)?),
+        "rejected GET must not leak the object body"
+    );
+    Ok(())
+}
+
+/// GHSA-g8w9-qw9q-fghr: an unsigned `x-amz-copy-source` would turn a presigned
+/// PutObject into a CopyObject of an arbitrary readable key, since operation
+/// routing happens before authorization. The presigned upload must fail and
+/// leave nothing behind.
+#[tokio::test]
+async fn ghsa_g8w9_presigned_put_rejects_unsigned_copy_source() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+
+    let key = "presigned-put-unsigned-copy-source.txt";
+    let pr = env
+        .create_s3_client()
+        .put_object()
+        .bucket(BUCKET)
+        .key(key)
+        .presigned(valid_config())
+        .await?;
+
+    let copy_source = format!("/{BUCKET}/{CANONICAL_KEY}");
+    let unsigned: Vec<(&str, &str)> = vec![("x-amz-copy-source", copy_source.as_str())];
+    let headers = pr.headers().chain(unsigned.iter().copied());
+    let resp = send_raw(pr.method(), pr.uri(), headers, None).await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    assert_eq!(
+        status.as_u16(),
+        403,
+        "presigned PUT with an unsigned copy source must be 403, body:\n{body}"
+    );
+    assert_error_code(&body, "AccessDenied");
+
+    let error = env
+        .create_s3_client()
+        .head_object()
+        .bucket(BUCKET)
+        .key(key)
+        .send()
+        .await
+        .expect_err("rejected copy must not create the destination object");
+    assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(404));
+    Ok(())
+}
+
+/// GHSA-g8w9-qw9q-fghr boundary control: the rule covers `x-amz-*` only. A
+/// plain `Content-Type` on a `SignedHeaders=host` presigned PUT is outside
+/// SigV4's signed-header requirement (AWS S3 accepts it too) and must keep
+/// working, so the negative tests above cannot pass by rejecting every
+/// unsigned header.
+#[tokio::test]
+async fn ghsa_g8w9_presigned_put_still_accepts_unsigned_non_amz_headers() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+
+    let key = "presigned-put-unsigned-content-type.txt";
+    let pr = env
+        .create_s3_client()
+        .put_object()
+        .bucket(BUCKET)
+        .key(key)
+        .presigned(valid_config())
+        .await?;
+
+    let unsigned: Vec<(&str, &str)> = vec![("content-type", "text/x-rustfs-test")];
+    let headers = pr.headers().chain(unsigned.iter().copied());
+    let resp = send_raw(pr.method(), pr.uri(), headers, Some(b"plain-header-upload".to_vec())).await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    assert!(
+        status.is_success(),
+        "presigned PUT with an unsigned Content-Type must succeed, got {status}, body:\n{body}"
+    );
+
+    let head = env.create_s3_client().head_object().bucket(BUCKET).key(key).send().await?;
+    assert_eq!(
+        head.content_type(),
+        Some("text/x-rustfs-test"),
+        "unsigned Content-Type must still be applied"
+    );
+    Ok(())
+}

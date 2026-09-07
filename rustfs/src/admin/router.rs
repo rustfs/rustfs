@@ -34,7 +34,7 @@ use crate::admin::runtime_sources::{
 };
 use crate::admin::storage_api::access::{ReqInfo, authorize_request, spawn_traced};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
-use crate::auth::{check_key_valid, constant_time_eq, get_session_token};
+use crate::auth::{check_key_valid, constant_time_eq, get_session_token, reject_unsigned_amz_headers_on_presigned_request};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{
@@ -3269,6 +3269,11 @@ where
 
     // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
+        // GHSA-g8w9-qw9q-fghr: custom routes bypass `S3Access::check`, so the
+        // presigned signed-header rule is enforced here as well. A request
+        // without a presigned signature passes through untouched.
+        reject_unsigned_amz_headers_on_presigned_request(&req.headers, req.uri.query())?;
+
         if let Some(server_ctx) = &self.server_ctx {
             req.extensions.insert(server_ctx.clone());
             if !is_public_health_path(req.uri.path()) && server_ctx.installed_app_context().is_none() {
@@ -5609,6 +5614,38 @@ mod tests {
             .await
             .expect_err("anonymous extension request must be denied");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    /// GHSA-g8w9-qw9q-fghr: custom routes must apply the presigned
+    /// signed-header rule too, since they never reach `S3Access::check`.
+    #[tokio::test]
+    async fn ghsa_g8w9_check_access_rejects_unsigned_amz_header_on_presigned_custom_route() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-tagging", HeaderValue::from_static("owner=attacker"));
+        let mut req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: "/demo-bucket?replication-metrics&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test%2F20260827%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=signature"
+                .parse()
+                .expect("uri should parse"),
+            headers,
+            extensions: http::Extensions::new(),
+            credentials: Some(s3s::auth::Credentials {
+                access_key: "test".into(),
+                secret_key: s3s::auth::SecretKey::from("secret".to_string()),
+            }),
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = router
+            .check_access(&mut req)
+            .await
+            .expect_err("presigned custom-route request with an unsigned x-amz header must be denied");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some(crate::auth::UNSIGNED_HEADERS_MESSAGE));
     }
 
     // backlog#1052 S2: the router hands its server's context slot to every
