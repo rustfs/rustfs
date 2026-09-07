@@ -159,6 +159,24 @@ pub const DEFAULT_HTTP1_HEADER_READ_TIMEOUT: u64 = 75;
 pub const ENV_HTTP1_MAX_BUF_SIZE: &str = "RUSTFS_HTTP1_MAX_BUF_SIZE";
 pub const DEFAULT_HTTP1_MAX_BUF_SIZE: usize = 64 * 1024; // 64 KB
 
+/// Environment variable for a fixed kernel receive buffer (`SO_RCVBUF`, bytes)
+/// on the API listener. Default: 0, which leaves the buffer to kernel
+/// autotuning.
+///
+/// A fixed `SO_RCVBUF` is inherited by every accepted socket and disables
+/// receive-buffer autotuning, so a connection whose request body is not being
+/// read yet (a multipart part queued for a foreground write permit) lets up to
+/// the fixed size of unread body accumulate in kernel memory — Linux doubles
+/// the requested value, so the former hard-coded 4 MiB held up to 8 MiB per
+/// queued connection (issue #7385). Autotuning keeps an unread connection at
+/// the kernel's initial size and grows only connections that are being
+/// drained. Set this only on kernels without receive-buffer autotuning
+/// (illumos/Solaris) or on very high-bandwidth-delay links where the kernel's
+/// autotuning ceiling (`net.ipv4.tcp_rmem` on Linux) is too low and cannot be
+/// raised.
+pub const ENV_HTTP_SOCKET_RECV_BUFFER_BYTES: &str = "RUSTFS_HTTP_SOCKET_RECV_BUFFER_BYTES";
+pub const DEFAULT_HTTP_SOCKET_RECV_BUFFER_BYTES: usize = 0;
+
 /// Environment variable for the S3 request-body inter-chunk read timeout
 /// (seconds). Default: 300. Set to 0 to disable.
 ///

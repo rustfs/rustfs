@@ -18,6 +18,7 @@ use super::*;
 
 use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, parse_presigned_put_max_content_length};
 use crate::error::UploadLimitExceeded;
+static PUT_FAILURE_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
 
 const DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES: i64 = 32 * 1024 * 1024;
 
@@ -1976,21 +1977,29 @@ impl DefaultObjectUsecase {
                     Err(err) => {
                         store_put_watchdog.cancel();
                         rustfs_io_metrics::record_put_object_stage_duration_from("app_store_put", store_put_stage_start);
-                        warn!(
-                            target: "rustfs::app::object_usecase",
-                            event = EVENT_PUT_OBJECT_STORE_RETURNED,
-                            component = LOG_COMPONENT_APP,
-                            subsystem = LOG_SUBSYSTEM_OBJECT,
-                            request_id = %request_id,
-                            bucket = %bucket,
-                            key = %key,
-                            put_path = %put_path,
-                            object_size = actual_size,
-                            duration_ms = start_time.elapsed().as_millis() as u64,
-                            result = "error",
-                            error = %err,
-                            "PutObject store write returned"
-                        );
+                        if let Some(suppressed_errors) = PUT_FAILURE_LOGS.claim() {
+                            let diagnostic = err.diagnostic();
+                            warn!(
+                                target: "rustfs::app::object_usecase",
+                                event = EVENT_PUT_OBJECT_STORE_RETURNED,
+                                component = LOG_COMPONENT_APP,
+                                subsystem = LOG_SUBSYSTEM_OBJECT,
+                                request_id = %request_id,
+                                bucket = %bucket,
+                                key = %key,
+                                put_path = %put_path,
+                                object_size = actual_size,
+                                duration_ms = start_time.elapsed().as_millis() as u64,
+                                result = "error",
+                                error_code = %err.code.as_str(),
+                                storage_error_code = ?diagnostic.storage_code,
+                                io_error_kind = ?diagnostic.io_kind,
+                                rpc_error_code = ?diagnostic.rpc_code,
+                                source_chain_truncated = diagnostic.truncated,
+                                suppressed_errors,
+                                "PutObject store write returned"
+                            );
+                        }
                         return Err(err.into());
                     }
                 };

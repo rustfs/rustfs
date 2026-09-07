@@ -360,6 +360,7 @@ mod tests {
                 ..Default::default()
             },
             disks,
+            ..Default::default()
         }
     }
 
@@ -534,6 +535,7 @@ mod tests {
                 ..Default::default()
             },
             disks: vec![first, second],
+            ..Default::default()
         };
         let captured = CapturedLog::default();
         let subscriber = tracing_subscriber::fmt()
@@ -593,6 +595,7 @@ mod tests {
                 ..Default::default()
             },
             disks: vec![pool_zero, pool_one],
+            ..Default::default()
         };
         assert_eq!(inventory_capacity(&incomplete_widths).expect("numeric fallback"), (300, 120));
     }
@@ -614,6 +617,7 @@ mod tests {
                 ..Default::default()
             },
             disks: vec![pool_zero_set_zero, pool_zero_set_one, pool_one],
+            ..Default::default()
         };
 
         assert_eq!(inventory_capacity(&info).expect("configured topology"), (400, 160));

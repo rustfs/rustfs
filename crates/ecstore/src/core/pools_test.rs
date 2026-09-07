@@ -39,6 +39,7 @@ mod capacity_dedup_tests {
                 ..Default::default()
             },
             disks: disks.clone(),
+            ..Default::default()
         };
 
         let total = get_total_usable_capacity(&disks, &info);
@@ -73,6 +74,7 @@ mod capacity_dedup_tests {
                 ..Default::default()
             },
             disks: disks.clone(),
+            ..Default::default()
         };
 
         let total = get_total_usable_capacity(&disks, &info);
@@ -150,6 +152,7 @@ mod capacity_dedup_tests {
                 ..Default::default()
             },
             disks: disks.clone(),
+            ..Default::default()
         };
 
         let total = get_total_usable_capacity(&disks, &info);

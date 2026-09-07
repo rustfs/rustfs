@@ -36,9 +36,12 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::debug;
 
 const DERIVED_LARGE_PUT_ADMISSION_LIMIT_MAX: usize = 32;
-// A queued multipart part holds a connection but no body, so the queue can be
-// several times deeper than the permit pool. Sixteen uploads sending sixteen
-// parts each through one node fits inside the derived depth of 32 * 16.
+// A queued multipart part holds a connection but no user-space body buffer on
+// HTTP/1 (only whatever unread body the client already pushed into the kernel
+// receive buffer); on HTTP/2 it holds up to the per-stream flow-control window
+// in process memory. Either way the queue can be several times deeper than the
+// permit pool. Sixteen uploads sending sixteen parts each through one node
+// fits inside the derived depth of 32 * 16.
 const DERIVED_MULTIPART_ADMISSION_MAX_PENDING_FACTOR: usize = 16;
 // Framed S2 alone can retain one encoded and one decoded block of roughly
 // 4 MiB each, while other codecs have their own larger windows. Four keeps
@@ -329,6 +332,16 @@ impl ForegroundWriteAdmissionPolicy {
             multipart_part_min_size_bytes,
             multipart_wait_timeout,
             multipart_max_pending,
+        }
+    }
+
+    #[cfg(test)]
+    fn multipart_wait_timeout_for_test(&self) -> Option<Duration> {
+        match self {
+            Self::Large {
+                multipart_wait_timeout, ..
+            } => Some(*multipart_wait_timeout),
+            _ => None,
         }
     }
 
@@ -1228,8 +1241,9 @@ mod integration_tests {
     use super::super::io_schedule::{IoLoadLevel, IoPriority};
     use super::super::request_guard::GetObjectGuard;
     use super::{
-        ConcurrencyManager, ForegroundWriteAdmission, SNOWBALL_ARCHIVE_DECODER_LIMIT, SNOWBALL_MEMBER_COMMIT_LIMIT,
-        SNOWBALL_STAGING_BYTES_LIMIT, derive_large_put_admission_limit, derive_multipart_admission_max_pending,
+        ConcurrencyManager, ForegroundWriteAdmission, ForegroundWriteAdmissionPolicy, SNOWBALL_ARCHIVE_DECODER_LIMIT,
+        SNOWBALL_MEMBER_COMMIT_LIMIT, SNOWBALL_STAGING_BYTES_LIMIT, derive_large_put_admission_limit,
+        derive_multipart_admission_max_pending,
     };
     use crate::storage::storage_api::concurrency_consumer::PutObjectGuard;
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
@@ -1740,6 +1754,51 @@ mod integration_tests {
 
         assert_eq!(manager.put_object_admission_snapshot().queued, Some(0));
         drop(held);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_multipart_part_zero_wait_rejects_without_queueing() {
+        let manager = ConcurrencyManager::with_multipart_admission_queue_for_test(1, Duration::ZERO, 4);
+        let held = manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("first multipart part admission should acquire");
+
+        let rejected = manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("zero multipart wait should reject, not close");
+        assert!(matches!(rejected, ForegroundWriteAdmission::Rejected));
+        assert_eq!(manager.put_object_admission_snapshot().queued, Some(0));
+        drop(held);
+    }
+
+    #[test]
+    #[serial]
+    fn test_concurrency_manager_multipart_wait_default_stays_below_sdk_write_timeouts() {
+        let unset = [
+            (rustfs_config::ENV_PUT_FOREGROUND_ADMISSION_ENABLE, None::<&str>),
+            (rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE, None),
+            (rustfs_config::ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS, None),
+        ];
+        temp_env::with_vars(unset, || {
+            let policy = ForegroundWriteAdmissionPolicy::from_env(64);
+            // A queued part stalls the client's socket write for the whole wait, so the
+            // default must answer with `SlowDown` before mainstream SDK write timeouts.
+            assert_eq!(policy.multipart_wait_timeout_for_test(), Some(Duration::from_secs(10)));
+        });
+
+        let overridden = [
+            (rustfs_config::ENV_PUT_FOREGROUND_ADMISSION_ENABLE, None::<&str>),
+            (rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE, None),
+            (rustfs_config::ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS, Some("60000")),
+        ];
+        temp_env::with_vars(overridden, || {
+            let policy = ForegroundWriteAdmissionPolicy::from_env(64);
+            // The bound applies to the default only; operators may still raise the wait.
+            assert_eq!(policy.multipart_wait_timeout_for_test(), Some(Duration::from_secs(60)));
+        });
     }
 
     #[test]

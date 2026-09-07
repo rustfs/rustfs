@@ -54,6 +54,9 @@ pub type BucketConfigPublishHook = Box<dyn Fn(&str, &str, Option<(&[u8], OffsetD
 pub static BUCKET_CONFIG_PUBLISH_HOOK: std::sync::OnceLock<BucketConfigPublishHook> = std::sync::OnceLock::new();
 
 const BUCKET_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_BUCKET_METADATA: &str = "bucket_metadata";
+const EVENT_BUCKET_METADATA_LOAD_FAILED: &str = "bucket_metadata_load_failed";
 
 #[cfg(any(test, feature = "test-util"))]
 struct ConfigWriteLockProbeState {
@@ -1614,13 +1617,20 @@ impl BucketMetadataSys {
 
         let results = join_all(futures).await;
 
-        for (idx, res) in results.into_iter().enumerate() {
+        for (bucket, res) in buckets.iter().zip(results) {
             match res {
                 Ok(()) => {}
                 Err(e) => {
-                    error!("Unable to load bucket metadata, will be retried: {:?}", e);
-                    if let Some(bucket) = buckets.get(idx) {
-                        failed_buckets.insert(bucket.clone());
+                    if failed_buckets.insert(bucket.clone()) {
+                        error!(
+                            event = EVENT_BUCKET_METADATA_LOAD_FAILED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_BUCKET_METADATA,
+                            result = "retry_pending",
+                            bucket = %bucket,
+                            error_code = ?e.code(),
+                            "Unable to load bucket metadata; retry scheduled"
+                        );
                     }
                 }
             }
@@ -1647,12 +1657,19 @@ impl BucketMetadataSys {
             });
         }
         let results = join_all(futures).await;
-        for (idx, result) in results.into_iter().enumerate() {
-            if let Err(err) = result {
-                error!("Unable to load bucket metadata, will be retried: {:?}", err);
-                if let Some(bucket) = buckets.get(idx) {
-                    failed_buckets.insert(bucket.clone());
-                }
+        for (bucket, result) in buckets.iter().zip(results) {
+            if let Err(err) = result
+                && failed_buckets.insert(bucket.clone())
+            {
+                error!(
+                    event = EVENT_BUCKET_METADATA_LOAD_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_BUCKET_METADATA,
+                    result = "retry_pending",
+                    bucket = %bucket,
+                    error_code = ?err.code(),
+                    "Unable to load bucket metadata; retry scheduled"
+                );
             }
         }
     }

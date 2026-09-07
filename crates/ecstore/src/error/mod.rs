@@ -759,7 +759,8 @@ impl Clone for StorageError {
 }
 
 impl StorageError {
-    fn code(&self) -> StorageErrorCode {
+    /// Stable classification without error payloads or storage paths.
+    pub fn code(&self) -> StorageErrorCode {
         match self {
             StorageError::Io(_) => StorageErrorCode::Io,
             StorageError::FaultyDisk => StorageErrorCode::FaultyDisk,
