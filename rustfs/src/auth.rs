@@ -50,6 +50,7 @@ const EVENT_KEYSTONE_CREDENTIALS_DETECTED: &str = "keystone_credentials_detected
 const EVENT_KEYSTONE_CREDENTIALS_VALIDATED: &str = "keystone_credentials_validated";
 const EVENT_KEYSTONE_CONTEXT_MISSING: &str = "keystone_context_missing";
 const EVENT_SESSION_TOKEN_EXTRACTION: &str = "session_token_extraction";
+const EVENT_PRESIGNED_UNSIGNED_AMZ_HEADER: &str = "presigned_unsigned_amz_header";
 
 /// RustFS-specific query capability for a single presigned PutObject request.
 pub(crate) const RUSTFS_MAX_CONTENT_LENGTH_QUERY: &str = "x-rustfs-max-content-length";
@@ -1064,26 +1065,39 @@ pub(crate) const UNSIGNED_HEADERS_MESSAGE: &str = "There were headers present in
 /// Detection keys on the query, not on the derived [`AuthType`], because the
 /// upstream verifier dispatches to the presigned path whenever the query
 /// carries `X-Amz-Signature`, even if an `Authorization` header is present too.
+/// The rule relies on the verifier signing every query parameter except the
+/// signature itself, so neither `X-Amz-SignedHeaders` nor a property-carrying
+/// query parameter can be added after presigning.
 pub(crate) fn reject_unsigned_amz_headers_on_presigned_request(header: &HeaderMap, query: Option<&str>) -> S3Result<()> {
     let Some(query) = query else {
         return Ok(());
     };
 
+    // Presence detection is case-insensitive so a query the upstream verifier
+    // would not treat as presigned still fails closed here; the signed list is
+    // read with the exact key the verifier uses (`X-Amz-SignedHeaders`, unique),
+    // so both sides always see the same list. A duplicate or missing key
+    // yields an empty list, which signs nothing.
     let mut is_presigned_v4 = false;
     let mut signed_headers: Option<String> = None;
+    let mut duplicate_signed_headers = false;
     for (name, value) in form_urlencoded::parse(query.as_bytes()) {
         if name.eq_ignore_ascii_case("x-amz-signature") {
             is_presigned_v4 = true;
-        } else if name.eq_ignore_ascii_case("x-amz-signedheaders") && signed_headers.is_none() {
+        } else if name == "X-Amz-SignedHeaders" {
+            if signed_headers.is_some() {
+                duplicate_signed_headers = true;
+            }
             signed_headers = Some(value.into_owned());
         }
     }
     if !is_presigned_v4 {
         return Ok(());
     }
+    if duplicate_signed_headers {
+        signed_headers = None;
+    }
 
-    // A missing or empty list signs nothing, so every `x-amz-*` header is
-    // unsigned; the upstream verifier rejects the malformed query anyway.
     let signed: Vec<String> = signed_headers
         .as_deref()
         .unwrap_or_default()
@@ -1099,11 +1113,12 @@ pub(crate) fn reject_unsigned_amz_headers_on_presigned_request(header: &HeaderMa
             continue;
         }
         if !signed.iter().any(|signed_name| signed_name == name) {
-            debug!(
+            warn!(
+                event = EVENT_PRESIGNED_UNSIGNED_AMZ_HEADER,
                 component = LOG_COMPONENT_AUTH,
                 subsystem = LOG_SUBSYSTEM_REQUEST,
-                header = name,
                 reason = "unsigned_amz_header",
+                header = name,
                 "Presigned request rejected"
             );
             return Err(S3Error::with_message(S3ErrorCode::AccessDenied, UNSIGNED_HEADERS_MESSAGE.to_string()));
@@ -2041,6 +2056,24 @@ mod tests {
         let lowercase_query = presigned_host_only.to_ascii_lowercase();
         assert_eq!(
             reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&lowercase_query))
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::AccessDenied
+        );
+
+        // Only the exact key the upstream verifier reads counts; a second
+        // (or differently cased) list must not widen the signed set, and a
+        // duplicate exact key signs nothing at all.
+        let widened_by_case = format!("{presigned_host_only}&x-amz-signedheaders=host%3Bx-amz-tagging");
+        assert_eq!(
+            reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&widened_by_case))
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::AccessDenied
+        );
+        let duplicated = format!("{presigned_host_only}&X-Amz-SignedHeaders=host%3Bx-amz-tagging");
+        assert_eq!(
+            reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&duplicated))
                 .unwrap_err()
                 .code(),
             &S3ErrorCode::AccessDenied

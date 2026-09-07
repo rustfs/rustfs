@@ -1793,6 +1793,11 @@ fn validate_post_object_success_controls(input: &PostObjectInput) -> S3Result<()
 #[async_trait::async_trait]
 impl S3Access for FS {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
+        // GHSA-g8w9-qw9q-fghr: a presigned URL only authorises the headers it
+        // signed. Reject unsigned `x-amz-*` headers first, before the session
+        // token lookup below or any handler reads a request header.
+        reject_unsigned_amz_headers_on_presigned_request(cx.headers(), cx.uri().query())?;
+
         // Upper layer has verified ak/sk
         // info!(
         //     "s3 check uri: {:?}, method: {:?} path: {:?}, s3_op: {:?}, cred: {:?}, headers:{:?}",
@@ -1837,16 +1842,11 @@ impl S3Access for FS {
             ..Default::default()
         };
 
-        // Publish this server's context slot so downstream data-plane handlers
-        // resolve the same store (backlog#1052 S6).
-        // GHSA-g8w9-qw9q-fghr: a presigned URL only authorises the headers it
-        // signed. Reject unsigned `x-amz-*` headers before any operation-level
-        // authorization or handler can read them.
-        reject_unsigned_amz_headers_on_presigned_request(cx.headers(), cx.uri().query())?;
-
         let auth_type = get_request_auth_type_with_query(cx.headers(), cx.uri().query());
         let verified_presigned = matches!(auth_type, AuthType::Presigned);
         let verified_sigv4 = matches!(auth_type, AuthType::Presigned | AuthType::Signed);
+        // Publish this server's context slot so downstream data-plane handlers
+        // resolve the same store (backlog#1052 S6).
         {
             let ext = cx.extensions_mut();
             ext.insert(self.server_ctx().clone());
