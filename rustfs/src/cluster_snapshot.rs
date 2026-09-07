@@ -24,7 +24,6 @@ use crate::storage_api::cluster::control_plane::{
 };
 use crate::workload_admission::workload_admission_registry_snapshot;
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot};
-use rustfs_ecstore::PoolMetaWriteGateStatus;
 use rustfs_io_metrics::internode_metrics::{InternodeMetricsSnapshot, global_internode_metrics};
 use rustfs_scanner_metrics::metrics::{ScannerMetricsReport, global_metrics};
 
@@ -131,20 +130,6 @@ impl Default for ClusterPoolMetaWriteGateSnapshot {
     }
 }
 
-impl From<PoolMetaWriteGateStatus> for ClusterPoolMetaWriteGateSnapshot {
-    fn from(status: PoolMetaWriteGateStatus) -> Self {
-        Self {
-            writes_ready: status.writes_ready,
-            write_blocked: status.write_blocked,
-            transaction_aborted: status.transaction_aborted,
-            pool_meta_absent: status.pool_meta_absent,
-            identity_initialized: status.identity_initialized,
-            identity_needs_repair: status.identity_needs_repair,
-            cluster_epoch: status.cluster_epoch,
-        }
-    }
-}
-
 impl From<InternodeMetricsSnapshot> for ClusterListingDiagnosticsSnapshot {
     fn from(snapshot: InternodeMetricsSnapshot) -> Self {
         Self {
@@ -233,7 +218,18 @@ fn current_listing_diagnostics_snapshot() -> ClusterListingDiagnosticsSnapshot {
 
 async fn current_pool_meta_write_gate_snapshot() -> ClusterPoolMetaWriteGateSnapshot {
     match crate::runtime_sources::current_object_store_handle() {
-        Some(store) => ClusterPoolMetaWriteGateSnapshot::from(store.pool_meta_write_gate_status().await),
+        Some(store) => {
+            let status = store.pool_meta_write_gate_status().await;
+            ClusterPoolMetaWriteGateSnapshot {
+                writes_ready: status.writes_ready,
+                write_blocked: status.write_blocked,
+                transaction_aborted: status.transaction_aborted,
+                pool_meta_absent: status.pool_meta_absent,
+                identity_initialized: status.identity_initialized,
+                identity_needs_repair: status.identity_needs_repair,
+                cluster_epoch: status.cluster_epoch,
+            }
+        }
         None => ClusterPoolMetaWriteGateSnapshot::default(),
     }
 }
