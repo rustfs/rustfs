@@ -103,7 +103,10 @@ const REBALANCE_INITIAL_RESUME_DELAY: Duration = Duration::from_secs(10);
 const REBALANCE_RESUME_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 fn should_retry_format_load(err: &Error) -> bool {
-    !matches!(err, Error::CorruptedFormat)
+    !matches!(
+        err,
+        Error::CorruptedFormat | Error::UnsupportedSnsdExpansion { .. } | Error::PoolTopologyMismatch { .. }
+    )
 }
 
 fn should_auto_start_rebalance_after_init(decommission_running: bool, rebalance_resume_required: bool) -> bool {
@@ -1782,6 +1785,33 @@ mod tests {
         assert!(!should_retry_format_load(&StorageError::CorruptedFormat));
         assert!(should_retry_format_load(&StorageError::ErasureReadQuorum));
         assert!(should_retry_format_load(&StorageError::FirstDiskWait));
+    }
+
+    #[test]
+    fn test_should_retry_format_load_rejects_permanent_topology_errors() {
+        for error in [
+            StorageError::UnsupportedSnsdExpansion { configured_drives: 4 },
+            StorageError::PoolTopologyMismatch {
+                stored_drives: 4,
+                stored_set_drive_count: 4,
+                configured_drives: 8,
+                configured_set_drive_count: 8,
+            },
+        ] {
+            assert!(!should_retry_format_load(&error), "topology errors require operator action: {error}");
+        }
+        for error in [
+            StorageError::DiskNotFound,
+            StorageError::Timeout,
+            StorageError::RemoteNotInitialized,
+            StorageError::NotFirstDisk,
+            StorageError::other(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+        ] {
+            assert!(
+                should_retry_format_load(&error),
+                "transient failures retain their existing retry path: {error}"
+            );
+        }
     }
 
     #[test]

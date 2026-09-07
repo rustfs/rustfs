@@ -25,6 +25,8 @@ The [scanner checkpoint fixture](scanner-checkpoint-fixture.md) diagnoses retain
 
 The [scanner cache cost profile](scanner-cache-cost.md) separates clone, subtree copy, encoding, and counted save costs without changing production cache behavior.
 
+The [Pool layout compatibility reference](pool-layout-compatibility.md) defines the topology and EC regression matrix for single-drive, single-node multi-drive, and multi-node expansion pools.
+
 ## Naming conventions
 
 ### Reserved test-name substrings (migration gate)
