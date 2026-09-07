@@ -122,6 +122,10 @@ pub trait ReplicationConfigurationExt {
     fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool;
     fn filter_target_arns(&self, obj: &ObjectOpts) -> Vec<String>;
     fn filter_force_delete_target_arns(&self, prefix: &str) -> Vec<String>;
+    /// Every target ARN the configuration still names, whatever the rule's
+    /// status, prefix or filter: the set a pending replication delete may
+    /// still be owed to. A target outside it was removed by the operator.
+    fn configured_target_arns(&self) -> HashSet<String>;
     fn filter_target_replication_decisions(&self, obj: &ObjectOpts) -> Vec<(String, bool)> {
         self.filter_target_arns(obj)
             .into_iter()
@@ -772,6 +776,19 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
     }
 
     /// Filter target ARNs and return a slice of the distinct values in the config
+    fn configured_target_arns(&self) -> HashSet<String> {
+        let role = self.role.trim();
+        if !role.is_empty() {
+            return HashSet::from([role.to_string()]);
+        }
+        self.rules
+            .iter()
+            .map(|rule| rule.destination.bucket.trim())
+            .filter(|arn| !arn.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
     fn filter_target_arns(&self, obj: &ObjectOpts) -> Vec<String> {
         let role = self.role.trim();
         if !role.is_empty() {

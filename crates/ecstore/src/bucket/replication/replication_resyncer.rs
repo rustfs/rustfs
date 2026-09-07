@@ -22,7 +22,8 @@ use super::replication_filemeta_boundary::ReplicationGenerationSnapshot;
 use super::replication_filemeta_boundary::{
     REPLICATE_EXISTING, ReplicateDecision, ReplicateObjectInfo, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction,
     ReplicationState, ReplicationStatusType, ReplicationType, VersionPurgeStatusType, get_replication_state,
-    parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
+    parse_replicate_decision, replicate_decision_for_admitted_targets, replication_statuses_map, target_reset_header,
+    version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_logging::{EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION_RESYNC};
@@ -130,6 +131,8 @@ const EVENT_REPLICATION_DRIFTED_REPLICA_LOCATED: &str = "replication_drifted_rep
 const EVENT_REPLICATION_OBJECT_FAILED: &str = "replication_object_failed";
 const EVENT_REPLICATION_PURGE_OBJECT_LOCK_DENIED: &str = "replication_purge_object_lock_denied";
 const EVENT_REPLICATION_PURGE_REPLICA_UNRESOLVED: &str = "replication_purge_replica_unresolved";
+const EVENT_REPLICATION_PURGE_ABANDONED: &str = "replication_purge_abandoned";
+const METRIC_VERSION_PURGE_ABANDONED_TOTAL: &str = "rustfs_replication_version_purge_abandoned_total";
 const EVENT_REPLICATION_DRIFTED_REPLICA_METADATA_SYNCED: &str = "replication_drifted_replica_metadata_synced";
 const METRIC_VERSION_PURGE_REPLICA_TOTAL: &str = "rustfs_replication_version_purge_replica_total";
 
@@ -2052,6 +2055,26 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
 
     let target_statuses = replication_statuses_map(&oi.replication_status_internal.clone().unwrap_or_default());
     let target_purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal.clone().unwrap_or_default());
+    // A version purge is owed to the targets its purge state names, whatever
+    // the configuration says now: the decision string is not persisted, so a
+    // heal after restart (or after the configuration was removed or edited)
+    // would otherwise never revisit the purge and the hidden version would
+    // block DeleteBucket forever (rustfs/backlog#2340). The delete worker
+    // settles a target the configuration no longer names as abandoned.
+    let dsc = if delete_path && !dsc.replicate_any() {
+        let owed: Vec<String> = target_purge_statuses
+            .iter()
+            .filter(|(_, status)| matches!(status, VersionPurgeStatusType::Pending | VersionPurgeStatusType::Failed))
+            .map(|(arn, _)| arn.clone())
+            .collect();
+        if owed.is_empty() {
+            dsc
+        } else {
+            replicate_decision_for_admitted_targets(&owed)
+        }
+    } else {
+        dsc
+    };
     let existing_obj_resync = if delete_path && !has_stored_delete_decision && !delete_state.0 && !delete_state.1 {
         Default::default()
     } else {
@@ -2408,6 +2431,11 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
     };
 
     let purge_source = version_purge_source(&storage, &bucket, &dobj, &dsc).await.map(Arc::new);
+    let configured_arns = if is_version_delete_replication(&dobj.delete_object) {
+        configured_replication_arns(&bucket).await
+    } else {
+        None
+    };
 
     let mut join_set = JoinSet::new();
 
@@ -2426,6 +2454,17 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
 
         // If dobj.TargetArn is not empty string, this is a case of specific target being re-synced.
         if !target_arns.is_empty() && !target_arns.iter().any(|arn| arn == &tgt_entry.arn) {
+            continue;
+        }
+
+        // The bucket no longer replicates to this target: nothing can ever
+        // confirm the purge remotely, so finish it locally as abandoned.
+        if let Some(configured) = configured_arns.as_ref()
+            && !configured.contains(&tgt_entry.arn)
+        {
+            rinfos
+                .targets
+                .push(abandoned_purge_target_info(&bucket, &dobj, &tgt_entry.arn));
             continue;
         }
 
@@ -3196,6 +3235,56 @@ fn unavailable_delete_target_info(dobj: &DeletedObjectReplicationInfo, arn: &str
         rinfo.replication_status = ReplicationStatusType::Failed;
         rinfo.error = Some(TARGET_CLIENT_UNAVAILABLE_ERROR.to_string());
     }
+    rinfo
+}
+
+/// The target ARNs the bucket's replication configuration still names, or
+/// `None` when that cannot be decided right now (unreadable/invalid
+/// configuration): a purge is only abandoned on positive evidence. No
+/// configuration at all names no target.
+async fn configured_replication_arns(bucket: &str) -> Option<HashSet<String>> {
+    match get_replication_config(bucket).await {
+        Ok(Some(config)) => Some(config.configured_target_arns()),
+        Ok(None) => Some(HashSet::new()),
+        Err(_) => None,
+    }
+}
+
+/// Finish a version purge locally for a target the bucket no longer
+/// replicates to (the rule or the whole configuration was removed).
+///
+/// The source keeps a purged version in xl.meta, hidden from listings, until
+/// every target confirms the purge — and once the operator removed the
+/// target nothing ever will: the version stayed PENDING forever, blocking
+/// `DeleteBucket` with a residue the client could neither see nor remove
+/// (rustfs/backlog#2340). Reporting the purge as complete lets the normal
+/// writeback drop the version. The replica, if any, stays on the former
+/// target: that is the operator's data now, and this event is the record.
+fn abandoned_purge_target_info(bucket: &str, dobj: &DeletedObjectReplicationInfo, arn: &str) -> ReplicatedTargetInfo {
+    let mut rinfo = dobj
+        .delete_object
+        .replication_state
+        .clone()
+        .unwrap_or_default()
+        .target_state(arn);
+    rinfo.op_type = dobj.op_type;
+    if rinfo.version_purge_status == VersionPurgeStatusType::Complete {
+        return rinfo;
+    }
+    warn!(
+        event = EVENT_REPLICATION_PURGE_ABANDONED,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+        bucket,
+        object = dobj.delete_object.object_name,
+        version_id = ?dobj.delete_object.version_id.or(dobj.delete_object.delete_marker_version_id),
+        arn,
+        reason = "target_not_configured",
+        "Replicated version purge abandoned: the bucket no longer replicates to this target, so the version is purged locally"
+    );
+    counter!(METRIC_VERSION_PURGE_ABANDONED_TOTAL).increment(1);
+    rinfo.version_purge_status = VersionPurgeStatusType::Complete;
+    rinfo.error = None;
     rinfo
 }
 
@@ -6719,6 +6808,27 @@ mod tests {
         assert_eq!(server.join().expect("test HTTP server should finish").len(), 2);
     }
 
+    #[test]
+    fn abandoned_purge_completes_locally_and_keeps_a_finished_target_untouched() {
+        let arn = "arn:rustfs:replication::removed-target";
+        let dobj = version_purge_dobj(arn);
+        let rinfo = abandoned_purge_target_info("source", &dobj, arn);
+        assert_eq!(rinfo.version_purge_status, VersionPurgeStatusType::Complete);
+        assert_eq!(rinfo.arn, arn);
+        assert!(rinfo.error.is_none());
+
+        let mut finished = version_purge_dobj(arn);
+        finished
+            .delete_object
+            .replication_state
+            .as_mut()
+            .expect("purge state")
+            .purge_targets
+            .insert(arn.to_string(), VersionPurgeStatusType::Complete);
+        let rinfo = abandoned_purge_target_info("source", &finished, arn);
+        assert_eq!(rinfo.version_purge_status, VersionPurgeStatusType::Complete);
+    }
+
     #[tokio::test]
     async fn version_purge_refuses_a_corrupt_ledger() {
         let target = test_target_client("http://127.0.0.1:1".to_string());
@@ -7390,6 +7500,42 @@ mod tests {
         assert_eq!(roi.replication_status_internal, None);
         assert_eq!(roi.version_purge_status_internal.as_deref(), Some(format!("{role}=PENDING;").as_str()));
         assert_eq!(roi.target_purge_statuses.get(role), Some(&VersionPurgeStatusType::Pending));
+    }
+
+    /// The decision string is not persisted: after a restart, or once the
+    /// configuration is gone, a heal of a failed purge must still name the
+    /// targets the purge state records — that is what lets the delete worker
+    /// settle a removed target as abandoned instead of skipping forever.
+    #[tokio::test]
+    async fn heal_owes_a_failed_purge_to_the_targets_its_purge_state_names_without_a_configuration() {
+        let bucket = format!("heal-orphaned-purge-{}", Uuid::new_v4());
+        let arn = "arn:rustfs:replication:us-east-1:removed:bucket";
+        ReplicationVersioningStore::install_prefix_state_test_config(
+            &bucket,
+            VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                ..Default::default()
+            },
+        );
+        let oi = ObjectInfo {
+            bucket,
+            name: "purge/orphaned.bin".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            version_purge_status: VersionPurgeStatusType::Failed,
+            version_purge_status_internal: Some(format!("{arn}=FAILED;")),
+            ..Default::default()
+        };
+
+        let mut roi = get_heal_replicate_object_info(&oi, &ReplicationConfig::new(None, None))
+            .await
+            .expect("a purge without a configuration must still classify");
+
+        assert!(roi.dsc.targets_map.get(arn).is_some_and(|target| target.replicate), "{:?}", roi.dsc);
+        assert!(matches!(
+            super::super::replication_queue_boundary::replication_heal_queue_action(&mut roi),
+            super::super::replication_queue_boundary::ReplicationHealQueueAction::QueueDelete(_)
+        ));
     }
 
     #[tokio::test]
