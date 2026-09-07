@@ -3123,6 +3123,9 @@ impl ECStore {
         Fut: std::future::Future<Output = Result<T>>,
     {
         let (lock_object, target_object) = objects;
+        if self.single_pool() {
+            return operation(opts).await;
+        }
         let (capacity_guard, has_active_decommission) = if capacity_releasing {
             self.acquire_decommission_capacity_release_fence_with_active_source().await?
         } else {
@@ -3220,6 +3223,9 @@ impl ECStore {
         F: FnOnce(HealOpts) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        if self.single_pool() {
+            return operation(opts).await;
+        }
         let (capacity_guard, has_active_decommission) = self
             .acquire_external_decommission_capacity_fence_with_active_source(&[target_pool_idx], "heal")
             .await?;
@@ -4162,7 +4168,9 @@ impl ECStore {
             .select_put_object_pool_idx(bucket, object.as_str(), data.size(), &opts)
             .await?;
         let mut opts = opts;
-        opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+        if !self.single_pool() {
+            opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+        }
         self.pools[idx]
             .put_object_with_old_current_size(bucket, object.as_str(), data, &opts)
             .await
@@ -4340,8 +4348,10 @@ impl ECStore {
                     object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
                     ..Default::default()
                 };
-                put_opts.decommission_capacity_admission =
-                    crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+                if !self.single_pool() {
+                    put_opts.decommission_capacity_admission =
+                        crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+                }
                 return if let Some(reader) = src_info.put_object_reader.as_mut() {
                     self.pools[pool_idx]
                         .put_object(dst_bucket, &dst_object, reader, &put_opts)
@@ -4376,8 +4386,10 @@ impl ECStore {
                         object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
                         ..Default::default()
                     };
-                    put_opts.decommission_capacity_admission =
-                        crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+                    if !self.single_pool() {
+                        put_opts.decommission_capacity_admission =
+                            crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+                    }
                     return self.pools[pool_idx]
                         .put_object(dst_bucket, &dst_object, reader, &put_opts)
                         .await;
@@ -4422,7 +4434,10 @@ impl ECStore {
             object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
             ..Default::default()
         };
-        put_opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+        if !self.single_pool() {
+            put_opts.decommission_capacity_admission =
+                crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+        }
 
         if let Some(put_object_reader) = src_info.put_object_reader.as_mut() {
             return self.pools[pool_idx]
@@ -5057,7 +5072,7 @@ impl ECStore {
             }
         }
 
-        let _capacity_fence = if latest_marker_objects.iter().any(|creates_marker| *creates_marker) {
+        let _capacity_fence = if !self.single_pool() && latest_marker_objects.iter().any(|creates_marker| *creates_marker) {
             let target_pool_indices = (0..self.pools.len()).collect::<Vec<_>>();
             match self
                 .acquire_external_decommission_capacity_fence(&target_pool_indices, "batch_delete")
@@ -5375,7 +5390,6 @@ impl ECStore {
         // self-deadlocked on the inner commits.
         let object_name = object.as_str();
         if self.single_pool() {
-            opts.decommission_capacity_admission = Some(Arc::clone(&self));
             return self.pools[0]
                 .clone()
                 .restore_transitioned_object(bucket, object_name, &opts)
