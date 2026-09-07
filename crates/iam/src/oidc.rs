@@ -3048,6 +3048,138 @@ mod tests {
         handle.join().expect("rotating JWKS mock server should exit cleanly");
     }
 
+    #[tokio::test]
+    async fn complete_provider_console_login_preserves_hidden_and_issuer_modes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for hidden in [false, true] {
+            for explicit in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let issuer = if explicit {
+                    "https://issuer.example.com".to_string()
+                } else {
+                    base.clone()
+                };
+                let mut config =
+                    build_mocked_oidc_provider_config("console", &format!("{base}/.well-known/openid-configuration"));
+                config.hide_from_ui = hidden;
+                config.issuer = explicit.then(|| issuer.clone());
+                config.client_secret = Some(Nonce::new_random().secret().clone());
+                let server_config = config.clone();
+                let server_base = base.clone();
+                let redirect = "https://console.example.com/oauth_callback";
+                let (key, jwk) = oidc_es256_key_and_jwk("console");
+                let (auth_tx, auth_rx) = tokio::sync::oneshot::channel::<HashMap<String, String>>();
+                let server = tokio::spawn(async move {
+                    let mut auth_rx = Some(auth_rx);
+                    for expected_path in ["/.well-known/openid-configuration", "/jwks", "/token"] {
+                        let (mut stream, _) = tokio::time::timeout(StdDuration::from_secs(10), listener.accept())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        let mut bytes = Vec::new();
+                        let header_end = loop {
+                            bytes.push(stream.read_u8().await.unwrap());
+                            assert!(bytes.len() < 8192);
+                            if bytes.ends_with(b"\r\n\r\n") {
+                                break bytes.len();
+                            }
+                        };
+                        let headers = String::from_utf8(bytes).unwrap();
+                        let request_line = headers.lines().next().unwrap();
+                        assert_eq!(request_line.split_whitespace().nth(1), Some(expected_path));
+                        let headers_map: HashMap<_, _> = headers
+                            .lines()
+                            .skip(1)
+                            .filter_map(|line| line.split_once(':'))
+                            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+                            .collect();
+                        let body = match expected_path {
+                            "/.well-known/openid-configuration" => {
+                                assert!(request_line.starts_with("GET "));
+                                assert_eq!(headers_map["accept"], "application/json");
+                                serde_json::json!({
+                                    "issuer": issuer, "authorization_endpoint": format!("{server_base}/authorize"),
+                                    "token_endpoint": format!("{server_base}/token"), "jwks_uri": format!("{server_base}/jwks"),
+                                    "response_types_supported": ["code"], "subject_types_supported": ["public"],
+                                    "id_token_signing_alg_values_supported": ["ES256"]
+                                })
+                            }
+                            "/jwks" => {
+                                assert!(request_line.starts_with("GET "));
+                                assert!(headers_map["accept"].contains("application/json"));
+                                serde_json::json!({"keys": [jwk]})
+                            }
+                            "/token" => {
+                                assert!(request_line.starts_with("POST "));
+                                assert_eq!(headers_map["accept"], "application/json");
+                                assert!(headers_map["content-type"].starts_with("application/x-www-form-urlencoded"));
+                                let length: usize = headers_map["content-length"].parse().unwrap();
+                                assert!(header_end + length < 16384);
+                                let mut body = vec![0; length];
+                                stream.read_exact(&mut body).await.unwrap();
+                                let form: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+                                assert_eq!(form["grant_type"], "authorization_code");
+                                assert_eq!(form["code"], "test-authorization-code");
+                                assert_eq!(form["client_id"], server_config.client_id);
+                                assert_eq!(Some(&form["client_secret"]), server_config.client_secret.as_ref());
+                                assert_eq!(form["redirect_uri"], redirect);
+                                let auth = auth_rx.take().unwrap().await.unwrap();
+                                let challenge = PkceCodeChallenge::from_code_verifier_sha256(&PkceCodeVerifier::new(form["code_verifier"].clone()));
+                                assert_eq!(challenge.as_str(), auth["code_challenge"]);
+                                let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                                let mut header = Header::new(Algorithm::ES256);
+                                header.kid = Some("console".into());
+                                let token = jsonwebtoken::encode(&header, &serde_json::json!({
+                                    "iss": issuer, "sub": "existing-user", "aud": server_config.client_id,
+                                    "iat": now, "exp": now + 300, "nonce": auth["nonce"],
+                                    "email": "user@example.com", "groups": ["readwrite"]
+                                }), &key).unwrap();
+                                serde_json::json!({"access_token": "test-access-token", "token_type": "Bearer", "id_token": token})
+                            }
+                            _ => unreachable!(),
+                        }.to_string();
+                        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    }
+                });
+                let http_client = ReqwestHttpClient::with_policy(OutboundPolicy::from_allowed_origins(&base).unwrap());
+                let discovered = OidcSys::discover_provider(&config, &http_client).await.unwrap();
+                let sys = OidcSys {
+                    configs: HashMap::from([(config.id.clone(), config)]),
+                    provider_states: RwLock::new(HashMap::from([("console".into(), discovered)])),
+                    state_store: OidcStateStore::new(),
+                    http_client,
+                };
+                let auth_url = sys.authorize_url("console", redirect, Some("/buckets".into())).await.unwrap();
+                let auth_url = Url::parse(&auth_url).unwrap();
+                assert_eq!(auth_url.as_str().split('?').next(), Some(format!("{base}/authorize").as_str()));
+                let auth: HashMap<String, String> = auth_url.query_pairs().into_owned().collect();
+                assert_eq!(auth["response_type"], "code");
+                assert_eq!(auth["client_id"], "rustfs-oidc-test");
+                assert!(!auth["nonce"].is_empty());
+                assert!(!auth["state"].is_empty());
+                assert_eq!(auth["redirect_uri"], redirect);
+                assert_eq!(auth["code_challenge_method"], "S256");
+                assert!(auth["scope"].split_whitespace().any(|scope| scope == "openid"));
+                let state = auth["state"].clone();
+                auth_tx.send(auth).unwrap();
+                let (claims, provider, session, _) = sys
+                    .exchange_code(&state, "test-authorization-code", redirect)
+                    .await
+                    .unwrap_or_else(|err| panic!("hidden={hidden}, explicit={explicit}: {err}"));
+                assert_eq!(provider, "console");
+                assert_eq!(claims.sub, "existing-user");
+                assert_eq!(claims.email, "user@example.com");
+                assert_eq!(claims.groups, vec!["readwrite"]);
+                assert_eq!(session.redirect_after.as_deref(), Some("/buckets"));
+                assert!(matches!(sys.exchange_code(&state, "test-authorization-code", redirect).await,
+                    Err(error) if error == "invalid or expired OIDC state"));
+                server.await.unwrap();
+            }
+        }
+    }
+
     #[test]
     fn workload_metadata_requires_hidden_provider_and_valid_verification_fields() {
         let document = serde_json::json!({
