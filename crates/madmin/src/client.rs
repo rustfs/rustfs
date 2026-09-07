@@ -254,6 +254,19 @@ pub struct ScannerUsageStateResetResponse {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Durable scanner usage-state recovery intent response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScannerUsageRecoveryIntentResponse {
+    /// `accepted`, `replayed`, or `found`.
+    pub status: String,
+    pub action: String,
+    pub mode: String,
+    pub intent_id: String,
+    pub state: String,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
 #[derive(Debug, Serialize)]
 struct ScannerCycleResetRequest<'a> {
     mode: &'a str,
@@ -262,6 +275,14 @@ struct ScannerCycleResetRequest<'a> {
 #[derive(Debug, Serialize)]
 struct ScannerUsageStateResetRequest<'a> {
     mode: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct ScannerUsageStateAsyncResetRequest<'a> {
+    mode: &'a str,
+    #[serde(rename = "async")]
+    async_intent: bool,
+    idempotency_key: &'a str,
 }
 
 /// Freshness block of the scanner status response.
@@ -472,6 +493,38 @@ impl AdminClient {
         self.post_json("/v3/scanner/usage-state/reset", &[], body).await
     }
 
+    /// Accept a durable asynchronous scanner usage-state full-rebuild intent.
+    ///
+    /// The caller owns `idempotency_key`; replaying the same key on the same
+    /// server-side actor returns the same accepted intent instead of starting
+    /// the legacy synchronous reset path.
+    pub async fn scanner_usage_state_accept_full_rebuild_intent(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<ScannerUsageRecoveryIntentResponse, AdminClientError> {
+        let body = serde_json::to_vec(&ScannerUsageStateAsyncResetRequest {
+            mode: "full-rebuild",
+            async_intent: true,
+            idempotency_key,
+        })
+        .map_err(|err| AdminClientError::Decode {
+            message: err.to_string(),
+        })?;
+        self.post_json("/v3/scanner/usage-state/reset", &[], body).await
+    }
+
+    /// Query a durable asynchronous scanner usage-state recovery intent.
+    pub async fn scanner_usage_state_recovery_intent_status(
+        &self,
+        intent_id: &str,
+    ) -> Result<ScannerUsageRecoveryIntentResponse, AdminClientError> {
+        self.get_json(&format!(
+            "/v3/scanner/usage-state/recovery-intents/{}",
+            percent_encode_path_segment(intent_id)
+        ))
+        .await
+    }
+
     /// ILM expiry worker status. The payload is owned by the expiry
     /// subsystem and still evolving; returned verbatim.
     pub async fn ilm_expiry_status(&self) -> Result<serde_json::Value, AdminClientError> {
@@ -640,7 +693,8 @@ pub(crate) fn percent_encode_path_segment(segment: &str) -> String {
 mod tests {
     use super::{
         AdminClient, AdminClientError, BackgroundHealStatus, HealOpts, HealScanMode, HealStartSuccess, HealTaskStatus,
-        ScannerCycleResetResponse, ScannerStatus, ScannerUsageStateResetResponse, heal_path, percent_encode_path_segment,
+        ScannerCycleResetResponse, ScannerStatus, ScannerUsageRecoveryIntentResponse, ScannerUsageStateResetResponse, heal_path,
+        percent_encode_path_segment,
     };
     use crate::test_support::TestServer;
     use serde_json::json;
@@ -808,6 +862,22 @@ mod tests {
         assert_eq!(usage.next_cycle, 42);
         assert_eq!(usage.reset_paths, [".usage.json"]);
         assert_eq!(usage.extra["future"]["accepted"], false);
+
+        let intent: ScannerUsageRecoveryIntentResponse = serde_json::from_value(json!({
+            "status": "accepted",
+            "action": "usage-full-rebuild",
+            "mode": "full-rebuild",
+            "intent_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "state": "accepted",
+            "future": {"worker": "pending"}
+        }))
+        .unwrap();
+        assert_eq!(intent.status, "accepted");
+        assert_eq!(intent.action, "usage-full-rebuild");
+        assert_eq!(intent.mode, "full-rebuild");
+        assert_eq!(intent.intent_id, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        assert_eq!(intent.state, "accepted");
+        assert_eq!(intent.extra["future"]["worker"], "pending");
     }
 
     #[test]
@@ -896,6 +966,55 @@ mod tests {
         assert_eq!(request.path, "/rustfs/admin/v3/scanner/usage-state/reset");
         assert_eq!(request.query, "");
         assert!(request.body.contains("\"mode\":\"full-rebuild\""));
+    }
+
+    #[tokio::test]
+    async fn scanner_usage_async_reset_posts_explicit_intent_contract() {
+        let server = TestServer::spawn(
+            r#"{"status":"accepted","action":"usage-full-rebuild","mode":"full-rebuild","intent_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"accepted"}"#,
+            202,
+        )
+        .await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+
+        let accepted = client
+            .scanner_usage_state_accept_full_rebuild_intent("intent-key-1")
+            .await
+            .expect("async recovery intent response decodes");
+
+        assert_eq!(accepted.status, "accepted");
+        assert_eq!(accepted.mode, "full-rebuild");
+        assert_eq!(accepted.state, "accepted");
+        let request = server.recorded();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/rustfs/admin/v3/scanner/usage-state/reset");
+        assert_eq!(request.query, "");
+        assert!(request.body.contains("\"mode\":\"full-rebuild\""));
+        assert!(request.body.contains("\"async\":true"));
+        assert!(request.body.contains("\"idempotency_key\":\"intent-key-1\""));
+    }
+
+    #[tokio::test]
+    async fn scanner_usage_recovery_intent_status_gets_encoded_intent_id() {
+        let server = TestServer::spawn(
+            r#"{"status":"found","action":"usage-full-rebuild","mode":"full-rebuild","intent_id":"id%2Fwith%20space","state":"accepted"}"#,
+            200,
+        )
+        .await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+
+        let status = client
+            .scanner_usage_state_recovery_intent_status("id/with space")
+            .await
+            .expect("recovery intent status response decodes");
+
+        assert_eq!(status.status, "found");
+        assert_eq!(status.action, "usage-full-rebuild");
+        let request = server.recorded();
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/rustfs/admin/v3/scanner/usage-state/recovery-intents/id%2Fwith%20space");
+        assert_eq!(request.query, "");
+        assert_eq!(request.body, "");
     }
 
     #[tokio::test]
