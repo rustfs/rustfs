@@ -3083,7 +3083,7 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
         // A bucket without a configuration still owes its pending purges an
         // answer: the delete worker finishes them locally as abandoned, which
         // is what makes the bucket deletable again (rustfs/backlog#2340).
-        Ok(None) if !oi.version_purge_status.is_empty() => None,
+        Ok(None) if owes_version_purge(&oi) => None,
         Ok(None) => return ReplicationQueueAdmission::Skipped,
         Err(err) => {
             debug!(
@@ -3161,6 +3161,17 @@ pub async fn queue_replication_metadata(bucket: &str, oi: ObjectInfo, retry_coun
     }
 }
 
+/// A version purge the persisted state still owes to named targets. Without
+/// the target list nothing can be settled, so such a version keeps the
+/// ordinary "no configuration, nothing to heal" skip.
+fn owes_version_purge(oi: &ObjectInfo) -> bool {
+    !oi.version_purge_status.is_empty()
+        && oi
+            .version_purge_status_internal
+            .as_deref()
+            .is_some_and(|statuses| !statuses.trim().is_empty())
+}
+
 /// queue_replication_heal_internal enqueues objects that failed replication OR eligible for resyncing through
 /// an ongoing resync operation or via existing objects replication configuration setting.
 pub(crate) async fn queue_replication_heal_internal(
@@ -3183,7 +3194,7 @@ pub(crate) async fn queue_replication_heal_internal(
     // except a version purge the bucket still owes: its stored decision names
     // the targets, and the delete worker settles the ones no longer
     // configured as abandoned (rustfs/backlog#2340).
-    if (rcfg.config.is_none() || rcfg.remotes.is_none()) && oi.version_purge_status.is_empty() {
+    if (rcfg.config.is_none() || rcfg.remotes.is_none()) && !owes_version_purge(&oi) {
         return ReplicationHealQueueResult {
             object_info: roi,
             admission: ReplicationQueueAdmission::Skipped,

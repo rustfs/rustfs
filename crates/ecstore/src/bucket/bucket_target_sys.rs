@@ -1425,7 +1425,12 @@ fn build_remove_object_headers(version_id: Option<&str>, opts: &RemoveObjectOpti
 /// and silently creates a delete marker instead of removing the version, while
 /// the source stamps `VersionPurgeStatus=Complete` (backlog#799 B8 / #857).
 /// Non-replication callers always pass the version through unchanged.
-fn resolve_delete_api_version_id(version_id: Option<String>, opts: &RemoveObjectOptions) -> Option<String> {
+/// The `versionId` a replicated DELETE puts on the wire: none for a
+/// delete-marker creation (the target mints the marker; the source version
+/// travels in the internal headers for RustFS peers), the addressed version
+/// otherwise. A generic S3 target given the version id on a marker-creation
+/// DELETE would permanently delete that version instead.
+pub fn resolve_delete_api_version_id(version_id: Option<String>, opts: &RemoveObjectOptions) -> Option<String> {
     if opts.replication_request && opts.replication_delete_marker {
         None
     } else {

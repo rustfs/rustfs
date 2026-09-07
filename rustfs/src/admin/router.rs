@@ -18,7 +18,7 @@ use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatu
 use super::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
 use super::storage_api::bucket::target_sys::{
     BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, SsecPassthroughCapability, TargetClient,
-    VersionIdentityCapability, append_version_id_query,
+    VersionIdentityCapability, append_version_id_query, resolve_delete_api_version_id,
 };
 use super::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use super::storage_api::bucket::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
@@ -2745,12 +2745,22 @@ async fn delete_replication_probe_object(
         insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_CHECK, "true");
     }
 
+    if let Some(version_id) = version_id {
+        insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, version_id);
+    }
+
+    // Same wire shape as live delete replication: a marker creation carries
+    // no `versionId` (the target mints the marker), a version delete does. A
+    // generic S3 target handed the version id on the marker step would
+    // permanently delete the probe version instead, and the VersionDelete
+    // phase would then find nothing (seen on Wasabi).
+    let api_version_id = resolve_delete_api_version_id(version_id.map(ToOwned::to_owned), &options);
     target_client
         .client
         .delete_object()
         .bucket(target_bucket)
         .key(probe_key)
-        .set_version_id(version_id.map(ToOwned::to_owned))
+        .set_version_id(api_version_id)
         .customize()
         .map_request(move |mut req| {
             for (key, value) in headers.clone() {
@@ -2782,6 +2792,14 @@ async fn delete_replication_probe_version(
         .map_err(S3ClientError::from)
 }
 
+/// The VersionDelete phase already removed the probe version the cleanup is
+/// handed, and a strict S3 target (Wasabi) answers a second DELETE of that
+/// id with `NoSuchVersion` where RustFS/MinIO answer 204: the goal is met
+/// either way.
+fn probe_version_already_gone(err: &S3ClientError) -> bool {
+    matches!(err.code.as_deref(), Some("NoSuchKey" | "NoSuchVersion"))
+}
+
 async fn cleanup_replication_probe<'a>(
     target_client: &TargetClient,
     target_bucket: &str,
@@ -2793,6 +2811,7 @@ async fn cleanup_replication_probe<'a>(
     for version_id in known_version_ids.into_iter().flatten() {
         if deleted_ids.insert(version_id.to_string())
             && let Err(err) = delete_replication_probe_version(target_client, target_bucket, probe_key, version_id).await
+            && !probe_version_already_gone(&err)
         {
             errors.push(format_replication_check_client_error(
                 &err,
@@ -2838,6 +2857,7 @@ async fn cleanup_replication_probe<'a>(
         for version_id in discovered_ids {
             if deleted_ids.insert(version_id.clone())
                 && let Err(err) = delete_replication_probe_version(target_client, target_bucket, probe_key, &version_id).await
+                && !probe_version_already_gone(&err)
             {
                 errors.push(format_replication_check_client_error(
                     &err,
