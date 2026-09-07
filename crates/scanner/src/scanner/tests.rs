@@ -7609,6 +7609,81 @@ async fn scanner_cycle_confirms_lost_remote_ack_from_activity_snapshot() {
     );
 }
 
+#[tokio::test]
+async fn scanner_cycle_confirms_lost_scoped_ack_only_after_same_instance_clean_activity() {
+    let acknowledgement = ScannerDirtyUsageAcknowledgement {
+        host: "node-2".to_string(),
+        instance_id: "epoch-a".to_string(),
+        kind: ScannerDirtyUsageAcknowledgementKind::Scoped {
+            owner_id: Uuid::from_u128(0x11111111111111111111111111111111).to_string(),
+            entries: vec![crate::storage_api::EcstoreScannerScopedDirtyUsageAckEntry {
+                bucket: "photos".to_string(),
+                bucket_incarnation: Uuid::from_u128(0x22222222222222222222222222222222),
+                generation: 5,
+            }],
+        },
+    };
+    let attempted_send = Arc::new(AtomicBool::new(false));
+    let attempted_send_for_ack = Arc::clone(&attempted_send);
+    let cleared_activity = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+    let response_lost = remote_dirty_usage_acknowledgement_pending(
+        8,
+        1,
+        std::slice::from_ref(&acknowledgement),
+        async move {
+            attempted_send_for_ack.store(true, Ordering::SeqCst);
+            Err::<bool, _>(std::io::Error::other("scoped ACK transport failed after peer send"))
+        },
+        || async { Ok(cleared_activity) },
+    )
+    .await;
+    assert!(
+        attempted_send.load(Ordering::SeqCst),
+        "the confirmation oracle must run only after the scoped ACK send was attempted"
+    );
+    assert_eq!(
+        scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, response_lost),
+        ScannerCycleOutcome::Completed,
+        "a same-instance clean activity snapshot confirms a lost scoped ACK response"
+    );
+
+    let restarted_activity = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-b", 7, 3))]);
+    let peer_restarted = remote_dirty_usage_acknowledgement_pending(
+        8,
+        1,
+        std::slice::from_ref(&acknowledgement),
+        std::future::ready(Err::<bool, _>(std::io::Error::other(
+            "scoped ACK transport failed before peer restart was observed",
+        ))),
+        || async { Ok(restarted_activity) },
+    )
+    .await;
+    assert_eq!(
+        scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, peer_restarted),
+        ScannerCycleOutcome::CompletedWithPendingMaintenance,
+        "a restarted peer cannot prove the scoped ACK reached the old scanner instance"
+    );
+
+    let mut written_activity = scanner_node_activity("epoch-a", 7, 3);
+    written_activity.dirty_usage_generation = 6;
+    written_activity.dirty_usage_pending = true;
+    let concurrent_write = remote_dirty_usage_acknowledgement_pending(
+        8,
+        1,
+        &[acknowledgement],
+        std::future::ready(Err::<bool, _>(std::io::Error::other(
+            "scoped ACK transport failed before a concurrent write was observed",
+        ))),
+        || async { Ok(BTreeMap::from([("node-2".to_string(), written_activity)])) },
+    )
+    .await;
+    assert_eq!(
+        scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, concurrent_write),
+        ScannerCycleOutcome::CompletedWithPendingMaintenance,
+        "a same-instance concurrent write after scoped ACK send keeps maintenance pending"
+    );
+}
+
 #[test]
 #[serial]
 fn finalizing_an_already_durable_enum_without_proof_keeps_dirty_pending() {
