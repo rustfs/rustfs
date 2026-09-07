@@ -5228,7 +5228,7 @@ where
     R: Into<PoolMetaReplicaRead>,
 {
     let replicas = replicas.into_iter().map(Into::into).collect::<Vec<_>>();
-    if let Some(err) = pool_meta_replica_read_failure(&replicas) {
+    if let Some(err) = pool_meta_replica_read_failure(&replicas, "pool_read") {
         return Err(err);
     }
     match select_pool_meta_replica_reads(replicas) {
@@ -5248,13 +5248,14 @@ fn block_pool_meta_validation(write_state: &mut PoolMetaWriteState, err: Error, 
     Error::other(context)
 }
 
-fn pool_meta_replica_read_failure(replicas: &[PoolMetaReplicaRead]) -> Option<Error> {
+fn pool_meta_replica_read_failure(replicas: &[PoolMetaReplicaRead], operation: &str) -> Option<Error> {
     replicas.iter().find_map(|read| match &read.replica {
-        PoolMetaReplica::Unreadable(source) => Some(Error::other(pool_metadata_error(
-            crate::error::PoolMetadataFailure::ReadUnavailable,
-            "pool_read",
-            Some(Arc::clone(source)),
-        ))),
+        PoolMetaReplica::Unreadable(source) => {
+            let mut context =
+                pool_metadata_error(crate::error::PoolMetadataFailure::ReadUnavailable, "pool_read", Some(Arc::clone(source)));
+            context.operation = operation.to_owned();
+            Some(Error::other(context))
+        }
         _ => None,
     })
 }
@@ -5268,7 +5269,7 @@ where
     R: Into<PoolMetaReplicaRead>,
 {
     let replicas = replicas.into_iter().map(Into::into).collect::<Vec<_>>();
-    if let Some(err) = pool_meta_replica_read_failure(&replicas) {
+    if let Some(err) = pool_meta_replica_read_failure(&replicas, operation) {
         return Err(err);
     }
     let selection = select_pool_meta_replica_reads(replicas)?;
@@ -6349,7 +6350,7 @@ where
             write_state.observe_identity(&identity)?;
         }
         let reads = read_pool_meta_replicas(pools, true).await;
-        if let Some(err) = pool_meta_replica_read_failure(&reads) {
+        if let Some(err) = pool_meta_replica_read_failure(&reads, "pool metadata transaction recovery") {
             return Err(err);
         }
         if reads
@@ -6771,7 +6772,7 @@ impl PoolMeta {
             write_state.observe_identity(&identity)?;
         }
         let reads = read_pool_meta_replicas(pools, true).await;
-        if let Some(err) = pool_meta_replica_read_failure(&reads) {
+        if let Some(err) = pool_meta_replica_read_failure(&reads, "pool metadata load") {
             write_state.block_with_context(pool_metadata_error(
                 crate::error::PoolMetadataFailure::RecoveryRequired,
                 "startup_read",
