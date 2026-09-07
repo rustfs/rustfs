@@ -29,7 +29,12 @@ use rustfs_heal::heal::{
     storage::{ECStoreHealStorage, HealStorageAPI},
 };
 use serial_test::serial;
-use std::{path::Path, process::Command, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::Arc,
+    time::Duration,
+};
 
 mod storage_api;
 
@@ -110,6 +115,48 @@ fn journal_record(kind: u8, bucket: &str, object: &str, version: Option<[u8; 16]
     body
 }
 
+fn scoped_journal_record(
+    kind: u8,
+    bucket: &str,
+    object: &str,
+    version: Option<[u8; 16]>,
+    attempts: u8,
+    pool_index: u32,
+    set_index: u32,
+) -> Vec<u8> {
+    let mut body = vec![1u8, 2, kind, attempts];
+    body.extend_from_slice(&1_700_000_000_000u64.to_le_bytes());
+    match version {
+        Some(bytes) => {
+            body.push(1);
+            body.extend_from_slice(&bytes);
+        }
+        None => body.push(0),
+    }
+    body.extend_from_slice(&pool_index.to_le_bytes());
+    body.extend_from_slice(&set_index.to_le_bytes());
+    body.extend_from_slice(
+        &u32::try_from(bucket.len())
+            .expect("fixture bucket length must fit journal format")
+            .to_le_bytes(),
+    );
+    body.extend_from_slice(
+        &u32::try_from(object.len())
+            .expect("fixture object length must fit journal format")
+            .to_le_bytes(),
+    );
+    body.extend_from_slice(bucket.as_bytes());
+    body.extend_from_slice(object.as_bytes());
+    let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+    hasher.update(&body);
+    body.extend_from_slice(
+        &u32::try_from(hasher.finalize())
+            .expect("CRC32 must fit the journal checksum field")
+            .to_le_bytes(),
+    );
+    body
+}
+
 fn write_journal_path_to_disks(disk_paths: &[std::path::PathBuf], relative_path: &str, data: &[u8]) {
     for path in disk_paths {
         let journal = path.join(META_BUCKET).join(relative_path);
@@ -126,6 +173,12 @@ fn journal_exists_on_all_disks(disk_paths: &[std::path::PathBuf], relative_path:
     disk_paths
         .iter()
         .all(|path| Path::new(path).join(META_BUCKET).join(relative_path).exists())
+}
+
+fn journal_matches_on_all_disks(disk_paths: &[PathBuf], relative_path: &str, expected: &[u8]) -> bool {
+    disk_paths
+        .iter()
+        .all(|path| std::fs::read(path.join(META_BUCKET).join(relative_path)).is_ok_and(|actual| actual == expected))
 }
 
 async fn wait_until<F, Fut>(deadline: Duration, mut probe: F) -> bool
@@ -259,6 +312,25 @@ async fn authoritative_journal_is_not_merged_with_legacy_mirror() {
         !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
             && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
     }));
+
+    let scoped_v2 = scoped_journal_record(1, "scoped-v2-bucket", "scoped-v2-object", None, 0, 3, 7);
+    let stale_legacy = journal_record(1, "stale-legacy-bucket", "stale-legacy-object", None, 0);
+    write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &scoped_v2);
+    write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &stale_legacy);
+    assert_eq!(
+        mrf_queue::replay_journal_once(&manager).await,
+        1,
+        "a scoped v2 authoritative epoch must not be merged with a stale v1 legacy mirror"
+    );
+    assert_eq!(
+        manager.operations_snapshot().await.queued_by_source.mrf,
+        3,
+        "only the three authoritative/scoped-only epochs should have reached the manager"
+    );
+    assert!(disk_paths.iter().all(|path| {
+        !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+            && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+    }));
 }
 
 /// If replay reaches a full heal-manager queue, the old journal remains the
@@ -348,6 +420,99 @@ fn mrf_journal_child_process_fixture() {
     std::process::exit(77);
 }
 
+#[test]
+fn mrf_successor_flush_child_process_fixture() {
+    let Ok(root) = std::env::var("RUSTFS_MRF_SUCCESSOR_FLUSH_CHILD_ROOT") else {
+        return;
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("child runtime should build");
+    runtime.block_on(async {
+        let (disk_paths, storage) = heal_env_at(Some(Path::new(&root))).await;
+        register_local_disks(&disk_paths, "mrf-successor-flush-child").await;
+
+        let mut startup = journal_record(1, "successor-bucket", "first-object", None, 0);
+        startup.extend(journal_record(1, "successor-bucket", "second-object", None, 0));
+        write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &startup);
+        write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &startup);
+
+        let manager = Arc::new(HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                heal_interval: Duration::from_secs(3600),
+                enable_auto_heal: false,
+                ..Default::default()
+            }),
+        ));
+        mrf_queue::spawn_mrf_consumer(manager.clone());
+        let expected_successor = journal_record(1, "successor-bucket", "second-object", None, 2);
+        let flushed = wait_until(Duration::from_secs(10), || async {
+            manager.operations_snapshot().await.queued_by_source.mrf == 1
+                && journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &expected_successor)
+                && journal_matches_on_all_disks(&disk_paths, JOURNAL_REL, &expected_successor)
+        })
+        .await;
+        assert!(
+            flushed,
+            "child process must publish the pending successor snapshot before the delete phase"
+        );
+    });
+    std::process::exit(78);
+}
+
+#[test]
+#[cfg(unix)]
+fn mrf_successor_flush_waiting_child_process_fixture() {
+    let Ok(root) = std::env::var("RUSTFS_MRF_SUCCESSOR_KILL_CHILD_ROOT") else {
+        return;
+    };
+    let ready_path = std::env::var("RUSTFS_MRF_SUCCESSOR_KILL_READY")
+        .map(PathBuf::from)
+        .expect("ready marker path should be provided");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("child runtime should build");
+    runtime.block_on(async {
+        let (disk_paths, storage) = heal_env_at(Some(Path::new(&root))).await;
+        register_local_disks(&disk_paths, "mrf-successor-kill-child").await;
+
+        let mut startup = journal_record(1, "service-kill-bucket", "first-object", None, 0);
+        startup.extend(journal_record(1, "service-kill-bucket", "second-object", None, 0));
+        write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &startup);
+        write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &startup);
+
+        let manager = Arc::new(HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                heal_interval: Duration::from_secs(3600),
+                enable_auto_heal: false,
+                ..Default::default()
+            }),
+        ));
+        mrf_queue::spawn_mrf_consumer(manager.clone());
+        let expected_successor = journal_record(1, "service-kill-bucket", "second-object", None, 2);
+        let flushed = wait_until(Duration::from_secs(10), || async {
+            manager.operations_snapshot().await.queued_by_source.mrf == 1
+                && journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &expected_successor)
+                && journal_matches_on_all_disks(&disk_paths, JOURNAL_REL, &expected_successor)
+        })
+        .await;
+        assert!(
+            flushed,
+            "child process must publish the pending successor snapshot before it can be killed"
+        );
+        std::fs::write(&ready_path, b"ready").expect("write ready marker");
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+}
+
 /// A journal published by a different OS process must remain a durable anchor
 /// when the restarted process can only admit a prefix of the replayed intents.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -388,5 +553,98 @@ async fn journal_replay_retains_child_process_anchor_when_manager_is_full() {
     assert!(
         journal_exists_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL),
         "replay must retain the child-published journal until a successor snapshot can replace it"
+    );
+}
+
+/// If a process crashes after flushing a smaller successor snapshot but before
+/// deleting the startup anchor, the restarted process must replay the
+/// successor tail rather than losing it or merging it with stale records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn journal_replay_survives_successor_flush_before_delete() {
+    let temp_dir = tempfile::tempdir().expect("successor-flush MRF root");
+    let status = Command::new(std::env::current_exe().expect("test binary path"))
+        .arg("mrf_successor_flush_child_process_fixture")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("RUSTFS_MRF_SUCCESSOR_FLUSH_CHILD_ROOT", temp_dir.path())
+        .status()
+        .expect("child MRF successor fixture should start");
+    assert_eq!(status.code(), Some(78), "child process did not reach the successor flush boundary");
+
+    let (disk_paths, storage) = heal_env_at(Some(temp_dir.path())).await;
+    let expected_successor = journal_record(1, "successor-bucket", "second-object", None, 2);
+    assert!(
+        journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &expected_successor),
+        "restarted process must see the pending successor snapshot"
+    );
+
+    let restarted = make_manager(storage);
+    let replayed = mrf_queue::replay_journal_once(&restarted).await;
+    assert_eq!(replayed, 1, "restart after successor flush must replay only the still-pending tail");
+    assert_eq!(
+        restarted.operations_snapshot().await.queued_by_source.mrf,
+        1,
+        "the successor tail must be accepted after restart"
+    );
+    assert!(
+        disk_paths.iter().all(|path| {
+            !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+                && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+        }),
+        "a fully consumed successor snapshot may be deleted after restart replay"
+    );
+}
+
+/// A service-style hard kill after successor flush must be equivalent to a
+/// crash at the flush-before-delete boundary: restart may replay the smaller
+/// successor snapshot, but must not lose or merge stale startup records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[cfg(unix)]
+async fn journal_replay_survives_service_kill_after_successor_flush() {
+    let temp_dir = tempfile::tempdir().expect("successor-kill MRF root");
+    let ready = temp_dir.path().join("successor-flushed.ready");
+    let mut child = Command::new(std::env::current_exe().expect("test binary path"))
+        .arg("mrf_successor_flush_waiting_child_process_fixture")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("RUSTFS_MRF_SUCCESSOR_KILL_CHILD_ROOT", temp_dir.path())
+        .env("RUSTFS_MRF_SUCCESSOR_KILL_READY", &ready)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("child MRF successor fixture should start");
+    let ready_seen = wait_until(Duration::from_secs(10), || {
+        let ready = ready.clone();
+        async move { ready.exists() }
+    })
+    .await;
+    assert!(ready_seen, "child process did not reach the successor flush boundary");
+    child.kill().expect("kill child fixture");
+    let status = child.wait().expect("wait for killed child fixture");
+    assert!(!status.success(), "child fixture must be terminated instead of exiting cleanly");
+
+    let (disk_paths, storage) = heal_env_at(Some(temp_dir.path())).await;
+    let expected_successor = journal_record(1, "service-kill-bucket", "second-object", None, 2);
+    assert!(
+        journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &expected_successor),
+        "restarted process must see the successor snapshot produced before the kill"
+    );
+
+    let restarted = make_manager(storage);
+    let replayed = mrf_queue::replay_journal_once(&restarted).await;
+    assert_eq!(replayed, 1, "restart after service kill must replay only the still-pending tail");
+    assert_eq!(
+        restarted.operations_snapshot().await.queued_by_source.mrf,
+        1,
+        "the successor tail must be accepted after service kill restart"
+    );
+    assert!(
+        disk_paths.iter().all(|path| {
+            !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+                && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+        }),
+        "a fully consumed successor snapshot may be deleted after service-kill restart replay"
     );
 }
