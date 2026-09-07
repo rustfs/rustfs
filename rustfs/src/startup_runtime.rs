@@ -17,7 +17,7 @@ use crate::{
     startup_runtime_hooks::{init_profiling_runtime, install_default_crypto_provider, log_startup_runtime_diagnostics},
     startup_tls_material::init_outbound_tls_material,
 };
-use rustfs_config::ENV_API_OBJECT_MAX_VERSIONS;
+use rustfs_config::{DEFAULT_API_OBJECT_MAX_VERSIONS, ENV_API_OBJECT_MAX_VERSIONS};
 use rustfs_utils::EnvParseOutcome;
 use std::io::{Error, Result};
 
@@ -32,13 +32,8 @@ pub(crate) async fn init_startup_runtime_foundation(config: &Config) -> Result<(
 
 fn init_object_max_versions_config() -> Result<()> {
     let limit = match rustfs_utils::get_env_parse_outcome::<u64>(ENV_API_OBJECT_MAX_VERSIONS) {
-        EnvParseOutcome::Absent => rustfs_filemeta::DEFAULT_OBJECT_MAX_VERSIONS,
-        EnvParseOutcome::Invalid => {
-            return Err(Error::other(format!(
-                "{ENV_API_OBJECT_MAX_VERSIONS} must be a positive integer no greater than {}",
-                usize::MAX
-            )));
-        }
+        EnvParseOutcome::Absent => DEFAULT_API_OBJECT_MAX_VERSIONS,
+        EnvParseOutcome::Invalid => return Err(object_max_versions_config_error()),
         EnvParseOutcome::Parsed(value) => object_max_versions_limit_from_u64(value)?,
     };
 
@@ -47,18 +42,20 @@ fn init_object_max_versions_config() -> Result<()> {
 
 fn object_max_versions_limit_from_u64(value: u64) -> Result<usize> {
     if value == 0 {
-        return Err(Error::other(format!(
-            "{ENV_API_OBJECT_MAX_VERSIONS} must be a positive integer no greater than {}",
-            usize::MAX
-        )));
+        return Err(object_max_versions_config_error());
     }
 
-    usize::try_from(value).map_err(|_| {
-        Error::other(format!(
-            "{ENV_API_OBJECT_MAX_VERSIONS} must be a positive integer no greater than {}",
-            usize::MAX
-        ))
-    })
+    let limit = usize::try_from(value).map_err(|_| object_max_versions_config_error())?;
+    if limit > DEFAULT_API_OBJECT_MAX_VERSIONS {
+        return Err(object_max_versions_config_error());
+    }
+    Ok(limit)
+}
+
+fn object_max_versions_config_error() -> Error {
+    Error::other(format!(
+        "{ENV_API_OBJECT_MAX_VERSIONS} must be a positive integer no greater than {DEFAULT_API_OBJECT_MAX_VERSIONS}"
+    ))
 }
 
 #[cfg(test)]

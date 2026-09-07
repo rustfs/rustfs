@@ -100,5 +100,10 @@ pub const DEFAULT_API_MAX_CONNECTIONS: usize = 0;
 /// Example: RUSTFS_API_OBJECT_MAX_VERSIONS=50000
 pub const ENV_API_OBJECT_MAX_VERSIONS: &str = "RUSTFS_API_OBJECT_MAX_VERSIONS";
 
-/// Default for `RUSTFS_API_OBJECT_MAX_VERSIONS`.
-pub const DEFAULT_API_OBJECT_MAX_VERSIONS: u64 = 9_223_372_036_854_775_807;
+/// Default and maximum accepted value for `RUSTFS_API_OBJECT_MAX_VERSIONS`.
+#[cfg(target_pointer_width = "64")]
+pub const DEFAULT_API_OBJECT_MAX_VERSIONS: usize = 9_223_372_036_854_775_807;
+
+/// Default and maximum accepted value for `RUSTFS_API_OBJECT_MAX_VERSIONS`.
+#[cfg(not(target_pointer_width = "64"))]
+pub const DEFAULT_API_OBJECT_MAX_VERSIONS: usize = usize::MAX;
