@@ -755,6 +755,7 @@ struct RawEnumerationProgress {
     entries_seen: u64,
     digest: Sha256,
     observed_entries: Vec<String>,
+    revalidate_after_entries: usize,
     page_index: Option<RawEnumerationPageIndex>,
 }
 
@@ -762,9 +763,15 @@ impl RawEnumerationProgress {
     fn new(parent: &str, page_index: Option<RawEnumerationPageIndex>) -> Self {
         let mut digest = Sha256::new();
         update_raw_enumeration_digest(&mut digest, b"parent", parent.as_bytes());
+        let mut revalidate_after_entries = 0;
         let page_index = match page_index {
-            Some(index) if index.indexed_entries().is_ok() => Some(index),
-            Some(_) => None,
+            Some(index) => match index.indexed_entries() {
+                Ok(entries) => {
+                    revalidate_after_entries = entries.len();
+                    Some(index)
+                }
+                Err(_) => None,
+            },
             None => RawEnumerationPageIndex::new(parent, SCANNER_RAW_ENUMERATION_PAGE_ENTRY_LIMIT).ok(),
         };
         Self {
@@ -773,6 +780,7 @@ impl RawEnumerationProgress {
             entries_seen: 0,
             digest,
             observed_entries: Vec::new(),
+            revalidate_after_entries,
             page_index,
         }
     }
@@ -783,6 +791,9 @@ impl RawEnumerationProgress {
         self.entries_seen = self.entries_seen.saturating_add(1);
         self.observed_entries.push(entry.to_string());
         if let Some(index) = &mut self.page_index {
+            if self.observed_entries.len() < self.revalidate_after_entries {
+                return;
+            }
             let result = index
                 .generation()
                 .ok_or(RawEnumerationPageIndexError::Unsupported)
