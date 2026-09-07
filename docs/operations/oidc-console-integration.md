@@ -39,7 +39,7 @@ Every provider key can be set as `RUSTFS_IDENTITY_OPENID_<KEY>` in the process e
 | `email_claim`, `username_claim` | `RUSTFS_IDENTITY_OPENID_EMAIL_CLAIM`, `RUSTFS_IDENTITY_OPENID_USERNAME_CLAIM` | Identity claims shown in the Console. |
 | `role_policy` | `RUSTFS_IDENTITY_OPENID_ROLE_POLICY` | One fixed policy for every login from this provider. Connectivity testing only. |
 | `display_name` | `RUSTFS_IDENTITY_OPENID_DISPLAY_NAME` | Login button label. |
-| `hide_from_ui` | `RUSTFS_IDENTITY_OPENID_HIDE_FROM_UI` | Hides the provider from `/oidc/providers`. |
+| `hide_from_ui` | `RUSTFS_IDENTITY_OPENID_HIDE_FROM_UI` | Hides the provider from `/oidc/providers`. Required (`on`) for STS workload issuers whose discovery document omits `authorization_endpoint`; see [workload provider requirements](oidc-provider-requirements.md#sts-workload-providers). Complete hidden providers still support direct Console login. |
 
 Process-level settings (environment only, never suffixed per provider):
 
