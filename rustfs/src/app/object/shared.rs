@@ -808,56 +808,7 @@ pub(super) async fn resolve_put_object_expiration(bucket: &str, obj_info: &Objec
     build_put_object_expiration_header(&event)
 }
 
-/// Cadence for the "I/O queue congestion detected" WARN. Under sustained
-/// overload (client concurrency at or above the disk-read permit pool) every
-/// GET observes >=80% utilization, so an unthrottled WARN floods the log
-/// from the already saturated hot path; congestion metrics stay per-request.
-const IO_QUEUE_CONGESTION_WARN_INTERVAL_MS: u64 = 5_000;
-
-/// At-most-one-WARN-per-interval limiter for the I/O queue congestion log.
-/// Callers supply monotonic milliseconds so tests can drive the clock.
-pub(super) struct IoQueueCongestionWarnThrottle {
-    /// Timestamp of the last emitted WARN; `u64::MAX` until the first one.
-    last_warn_ms: AtomicU64,
-    /// Congested requests left unlogged since the last emitted WARN.
-    suppressed: AtomicU64,
-}
-
-impl IoQueueCongestionWarnThrottle {
-    const fn new() -> Self {
-        Self {
-            last_warn_ms: AtomicU64::new(u64::MAX),
-            suppressed: AtomicU64::new(0),
-        }
-    }
-
-    /// Claim the right to emit one WARN. Returns the number of events
-    /// suppressed since the previous emission, or `None` while the interval
-    /// window is still closed (the event is counted, not logged).
-    pub(super) fn claim(&self, now_ms: u64) -> Option<u64> {
-        let last = self.last_warn_ms.load(Ordering::Relaxed);
-        let window_open = last == u64::MAX || now_ms.saturating_sub(last) >= IO_QUEUE_CONGESTION_WARN_INTERVAL_MS;
-        if window_open
-            && self
-                .last_warn_ms
-                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            Some(self.suppressed.swap(0, Ordering::Relaxed))
-        } else {
-            self.suppressed.fetch_add(1, Ordering::Relaxed);
-            None
-        }
-    }
-
-    /// Monotonic milliseconds since the first call, for production callers.
-    pub(super) fn now_ms() -> u64 {
-        static ANCHOR: OnceLock<std::time::Instant> = OnceLock::new();
-        ANCHOR.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
-    }
-}
-
-pub(super) static IO_QUEUE_CONGESTION_WARN_THROTTLE: IoQueueCongestionWarnThrottle = IoQueueCongestionWarnThrottle::new();
+pub(super) static IO_QUEUE_CONGESTION_WARN_THROTTLE: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
 
 pub(super) async fn track_object_read_setup<F>(health: Option<&ObjectTrafficHealth>, future: F) -> F::Output
 where
@@ -1062,19 +1013,6 @@ mod tests {
         ServerSideEncryptionRule,
     };
     use std::sync::Arc;
-
-    #[test]
-    fn io_queue_congestion_warn_throttle_emits_once_per_interval() {
-        let throttle = IoQueueCongestionWarnThrottle::new();
-        // The first congested request logs immediately.
-        assert_eq!(throttle.claim(0), Some(0));
-        // Requests inside the window are counted, not logged.
-        assert_eq!(throttle.claim(1), None);
-        assert_eq!(throttle.claim(IO_QUEUE_CONGESTION_WARN_INTERVAL_MS - 1), None);
-        // The next emission reports how many stayed silent.
-        assert_eq!(throttle.claim(IO_QUEUE_CONGESTION_WARN_INTERVAL_MS), Some(2));
-        assert_eq!(throttle.claim(IO_QUEUE_CONGESTION_WARN_INTERVAL_MS + 1), None);
-    }
 
     #[test]
     fn parse_expires_header_accepts_http_date() {

@@ -2285,7 +2285,7 @@ impl DefaultObjectUsecase {
             // threshold and per-request WARNs flood the log.
             rustfs_io_metrics::record_io_queue_congestion();
 
-            if let Some(suppressed_warns) = IO_QUEUE_CONGESTION_WARN_THROTTLE.claim(IoQueueCongestionWarnThrottle::now_ms()) {
+            if let Some(suppressed_warns) = IO_QUEUE_CONGESTION_WARN_THROTTLE.claim() {
                 warn!(
                     bucket = %bucket,
                     key = %key,
