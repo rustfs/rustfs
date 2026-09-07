@@ -15,6 +15,7 @@
 use super::*;
 use crate::storage_api::ScannerStorage;
 use crate::storage_api::scan::SCANNER_ACTIVITY_V6_PROTOCOL_VERSION;
+use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ScannerCycleWakeReason {
@@ -51,18 +52,25 @@ pub(crate) fn scanner_cycle_outcome_with_pending_maintenance(
     }
 }
 
-pub(super) async fn remote_dirty_usage_acknowledgement_pending<F, E>(
+pub(super) async fn remote_dirty_usage_acknowledgement_pending<F, E, C, CF>(
     cycle: u64,
     acknowledgement_count: usize,
+    acknowledgements: &[ScannerDirtyUsageAcknowledgement],
     acknowledgement: F,
+    confirm_after_error: C,
 ) -> bool
 where
     F: Future<Output = Result<bool, E>>,
     E: std::fmt::Display,
+    C: FnOnce() -> CF,
+    CF: Future<Output = Result<ScannerActivitySnapshot, String>>,
 {
     match acknowledgement.await {
         Ok(dirty_usage_pending) => dirty_usage_pending,
         Err(err) => {
+            if remote_dirty_usage_acknowledgement_loss_reconciled(acknowledgements, confirm_after_error().await) {
+                return false;
+            }
             warn!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_PERSIST_STATE,
@@ -77,6 +85,29 @@ where
             true
         }
     }
+}
+
+pub(super) fn remote_dirty_usage_acknowledgement_loss_reconciled(
+    acknowledgements: &[ScannerDirtyUsageAcknowledgement],
+    activity_after_error: Result<ScannerActivitySnapshot, String>,
+) -> bool {
+    if acknowledgements.is_empty() {
+        return false;
+    }
+    let Ok(activity_after_error) = activity_after_error else {
+        return false;
+    };
+    if !scanner_activity_allows_usage_publication(&activity_after_error) {
+        return false;
+    }
+    let mut acknowledged_hosts = HashSet::with_capacity(acknowledgements.len());
+    acknowledgements.iter().all(|acknowledgement| {
+        if !acknowledged_hosts.insert(acknowledgement.host.as_str()) {
+            return false;
+        }
+        scanner_activity_dirty_usage_state_for_host(&activity_after_error, &acknowledgement.host)
+            .is_some_and(|(instance_id, _generation, pending)| instance_id == acknowledgement.instance_id && !pending)
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

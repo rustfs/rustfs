@@ -353,6 +353,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         coverage_frontier: None,
         resume_frontier: None,
         coverage_gap: false,
+        raw_enumeration_progress: Vec::new(),
         pending_heal_sync_deferred: false,
         pending_heal_batch_dirty: false,
         pending_heal_sync_count: 0,
@@ -2635,6 +2636,93 @@ async fn test_scan_data_folder_returns_partial_cache_on_budget_cancel() {
     assert!(partial_cache.root().is_some(), "partial cache should keep completed scan progress");
     assert!(budget.budget_elapsed());
     assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_scan_data_folder_returns_raw_cursor_on_enumeration_cancel_without_root_progress() {
+    let (scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(temp_dir.clone()),
+    };
+
+    let bucket_dir = temp_dir.join("bucket");
+    tokio::fs::create_dir_all(&bucket_dir)
+        .await
+        .expect("failed to create bucket directory");
+    for entry in ["entry-a", "entry-b", "entry-c"] {
+        tokio::fs::write(bucket_dir.join(entry), b"data")
+            .await
+            .expect("failed to create raw directory entry");
+    }
+
+    let plan = crate::data_usage_define::DataUsageScanPlanDigest([11; 32]);
+    let source = crate::data_usage_define::DataUsageCacheSource::new(1, 0);
+    let identity = crate::data_usage_define::DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation: Uuid::from_u128(7),
+        set_layout: crate::data_usage_define::DataUsageScanPlanDigest([12; 32]),
+        publication_epoch: 3,
+        tier_registry_generation: 0,
+        scan_mode: HealScanMode::Normal,
+    };
+    let mut cache = DataUsageCache {
+        info: crate::data_usage_define::DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 7, 3, source, plan, identity),
+        crate::data_usage_define::DataUsageCachePrepareOutcome::Reset
+    );
+
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
+    let _raw_entry_budget = enumeration_restart::install_raw_entry_budget(scanner.local_disk.path(), 1);
+
+    let result = scan_data_folder(
+        budget.token(),
+        budget.clone(),
+        vec![scanner.local_disk.clone()],
+        scanner.local_disk.clone(),
+        cache,
+        None,
+        HealScanMode::Normal,
+        SCANNER_SLEEPER.clone(),
+    )
+    .await;
+
+    let partial_cache = match result {
+        Err(ScannerError::PartialCache(partial_cache)) => partial_cache,
+        other => panic!("expected raw enumeration partial cache after cancellation, got {other:?}"),
+    };
+
+    assert!(
+        partial_cache
+            .root()
+            .is_none_or(|root| root.objects == 0 && root.versions == 0 && root.size == 0),
+        "raw cursor writer must not invent object progress"
+    );
+    assert!(partial_cache.info.last_update.is_some());
+    assert_eq!(partial_cache.info.next_cycle, 7);
+    assert!(!partial_cache.info.snapshot_complete);
+    assert!(partial_cache.info.scan_checkpoint.is_none());
+    assert!(partial_cache.info.scan_resume_after.is_none());
+
+    let raw_cursor = partial_cache
+        .info
+        .scan_raw_enumeration_cursor
+        .as_ref()
+        .expect("raw enumeration cancellation should persist a cursor");
+    assert_eq!(raw_cursor.parent, "bucket");
+    assert_eq!(raw_cursor.entries_seen, 1);
+    assert!(raw_cursor.last_entry.is_some());
+    assert_ne!(raw_cursor.page_digest, [0; 32]);
+    assert_eq!(partial_cache.validated_raw_enumeration_cursor(), Some(raw_cursor));
+    assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Runtime));
 }
 
 #[tokio::test]

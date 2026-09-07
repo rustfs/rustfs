@@ -2255,11 +2255,14 @@ where
         false
     } else if let Some(notification_system) = storeapi.scanner_notification_system() {
         let acknowledgement_count = remote_dirty_usage_acknowledgements.len();
+        let acknowledgement_proof = remote_dirty_usage_acknowledgements.clone();
         let acknowledgements = remote_dirty_usage_acknowledgements.into_iter().map(Into::into).collect();
         remote_dirty_usage_acknowledgement_pending(
             cycle_info.current,
             acknowledgement_count,
+            &acknowledgement_proof,
             notification_system.acknowledge_scanner_dirty_usage(acknowledgements),
+            || probe_scanner_activity(storeapi.as_ref(), true),
         )
         .await
     } else {
