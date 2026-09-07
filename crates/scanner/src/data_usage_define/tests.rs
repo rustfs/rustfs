@@ -1179,6 +1179,7 @@ fn test_new_data_usage_cache_msgpack_round_trips_and_supports_old_reader() {
                 7,
                 [7; 32],
             )),
+            scan_raw_enumeration_page_index: Some(raw_page_index_fixture("bucket/prefix", &["entry-a"], false)),
             snapshot_complete: true,
             scan_plan_digest: Some(TEST_PLAN_DIGEST),
             scan_execution_digest: Some(DataUsageScanPlanDigest([42; 32])),
@@ -1207,6 +1208,7 @@ fn test_new_data_usage_cache_msgpack_round_trips_and_supports_old_reader() {
             .map(|cursor| cursor.last_entry.as_deref()),
         Some(Some("last-object"))
     );
+    assert!(current.info.scan_raw_enumeration_page_index.is_some());
     assert!(current.info.snapshot_complete);
     assert_eq!(current.info.scan_plan_digest, Some(TEST_PLAN_DIGEST));
     assert_eq!(current.info.scan_execution_digest, Some(DataUsageScanPlanDigest([42; 32])));
@@ -1258,6 +1260,24 @@ fn cache_with_raw_cursor(cursor: DataUsageRawEnumerationCursor) -> DataUsageCach
         },
         ..Default::default()
     }
+}
+
+fn raw_page_index_fixture(parent: &str, entries: &[&str], complete: bool) -> RawEnumerationPageIndex {
+    let mut index = RawEnumerationPageIndex::new(parent, 2).expect("raw page index should initialize");
+    let generation = index.generation().expect("raw page index should expose generation");
+    let outcome = if complete {
+        index.ingest_owner_entries(entries.iter().map(|entry| (*entry).to_string()), entries.len().max(1), generation)
+    } else {
+        index.ingest_partial_owner_entries(entries.iter().map(|entry| (*entry).to_string()), entries.len().max(1), generation)
+    }
+    .expect("raw page index fixture should ingest entries");
+    if outcome.ready_to_commit {
+        let generation = index.generation().expect("raw page index should expose commit generation");
+        index
+            .commit_building_page(generation)
+            .expect("raw page index fixture should commit ready page");
+    }
+    index
 }
 
 #[test]
@@ -1343,6 +1363,44 @@ fn prepare_bucket_checkpoint_preserves_only_valid_raw_enumeration_cursor() {
         DataUsageCachePrepareOutcome::Reused
     );
     assert!(cache.info.scan_raw_enumeration_cursor.is_none());
+    assert!(cache.info.scan_progress.is_some());
+}
+
+#[test]
+fn prepare_bucket_checkpoint_preserves_only_valid_raw_page_index() {
+    let identity = valid_scan_identity();
+    let source = DataUsageCacheSource::new(1, 2);
+    let page_index = raw_page_index_fixture("bucket/raw", &["entry-001"], false);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            leader_epoch: 1,
+            source: Some(source),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            scan_identity: Some(identity),
+            tier_registry_generation: Some(9),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_raw_enumeration_page_index: Some(page_index.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert_eq!(cache.info.scan_raw_enumeration_page_index, Some(page_index));
+
+    let invalid = raw_page_index_fixture("other/raw", &["entry-001"], false);
+    cache.info.scan_raw_enumeration_page_index = Some(invalid);
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert!(cache.info.scan_raw_enumeration_page_index.is_none());
     assert!(cache.info.scan_progress.is_some());
 }
 
