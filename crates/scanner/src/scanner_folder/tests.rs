@@ -2722,6 +2722,20 @@ async fn test_scan_data_folder_returns_raw_cursor_on_enumeration_cancel_without_
     assert!(raw_cursor.last_entry.is_some());
     assert_ne!(raw_cursor.page_digest, [0; 32]);
     assert_eq!(partial_cache.validated_raw_enumeration_cursor(), Some(raw_cursor));
+    let page_index = partial_cache
+        .validated_raw_enumeration_page_index()
+        .expect("raw enumeration cancellation should persist a validated page index");
+    assert_eq!(
+        page_index
+            .indexed_entries()
+            .expect("persisted raw page index entries should validate")
+            .len(),
+        1
+    );
+    assert_eq!(
+        page_index.committed_entries().expect("uncommitted raw page should validate"),
+        Vec::<String>::new()
+    );
     assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Runtime));
 }
 
@@ -3369,4 +3383,49 @@ fn test_should_log_failed_object_samples_after_initial_limit() {
     assert!(should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_EVERY));
     assert!(!should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_EVERY + 1));
     assert!(should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_EVERY * 2));
+}
+
+#[test]
+fn raw_enumeration_progress_waits_for_resume_index_floor_before_revalidation() {
+    let mut index = RawEnumerationPageIndex::new("bucket", 2).expect("raw page index should initialize");
+    let generation = index.generation().expect("raw page index should expose generation");
+    index
+        .ingest_partial_owner_entries(["entry-a".to_string(), "entry-b".to_string()], 2, generation)
+        .expect("initial entries should build a page");
+    let generation = index.generation().expect("raw page index should expose next generation");
+    index.commit_building_page(generation).expect("initial page should commit");
+
+    let mut progress = RawEnumerationProgress::new("bucket", Some(index));
+    progress.record_entry("entry-b");
+    assert!(
+        progress.page_index.is_some(),
+        "resume index must not be dropped before the current run observes the old index floor"
+    );
+
+    progress.record_entry("entry-a");
+    assert!(
+        progress.page_index.is_some(),
+        "same entry identity after the observation floor should keep the resume index"
+    );
+}
+
+#[test]
+fn raw_enumeration_progress_rejects_resume_index_after_floor_mismatch() {
+    let mut index = RawEnumerationPageIndex::new("bucket", 2).expect("raw page index should initialize");
+    let generation = index.generation().expect("raw page index should expose generation");
+    index
+        .ingest_partial_owner_entries(["entry-a".to_string(), "entry-b".to_string()], 2, generation)
+        .expect("initial entries should build a page");
+    let generation = index.generation().expect("raw page index should expose next generation");
+    index.commit_building_page(generation).expect("initial page should commit");
+
+    let mut progress = RawEnumerationProgress::new("bucket", Some(index));
+    progress.record_entry("entry-a");
+    assert!(progress.page_index.is_some());
+
+    progress.record_entry("entry-c");
+    assert!(
+        progress.page_index.is_none(),
+        "resume index must be discarded once enough current observations prove source drift"
+    );
 }
