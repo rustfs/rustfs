@@ -401,6 +401,115 @@ async fn scanner_recovery_intent_query_rejects_oversized_records() {
 
 #[tokio::test]
 #[serial]
+async fn scanner_recovery_intent_replay_runs_only_non_terminal_records() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let accepted = match accept_scanner_usage_recovery_intent(
+        store.clone(),
+        recovery_intent_request("intent-key-0004-accepted", "operator-a"),
+    )
+    .await
+    .expect("accepted intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("first accepted intent must create a durable record: {other:?}"),
+    };
+    let mut running = match accept_scanner_usage_recovery_intent(
+        store.clone(),
+        recovery_intent_request("intent-key-0004-running", "operator-a"),
+    )
+    .await
+    .expect("running fixture intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("running fixture must create a durable record: {other:?}"),
+    };
+    running.state = "running".to_string();
+    save_config(
+        store.clone(),
+        &format!(".usage.v2.recovery-intents/{}.json", running.intent_id),
+        serde_json::to_vec(&running).expect("running intent should encode"),
+    )
+    .await
+    .expect("running intent fixture should persist");
+    let mut completed = match accept_scanner_usage_recovery_intent(
+        store.clone(),
+        recovery_intent_request("intent-key-0004-completed", "operator-a"),
+    )
+    .await
+    .expect("completed fixture intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("completed fixture must create a durable record: {other:?}"),
+    };
+    completed.state = "completed".to_string();
+    save_config(
+        store.clone(),
+        &format!(".usage.v2.recovery-intents/{}.json", completed.intent_id),
+        serde_json::to_vec(&completed).expect("completed intent should encode"),
+    )
+    .await
+    .expect("completed intent fixture should persist");
+    let corrupt_id = scanner_recovery_actor_sha256("corrupt-replay-intent");
+    save_config(
+        store.clone(),
+        &format!(".usage.v2.recovery-intents/{corrupt_id}.json"),
+        b"{corrupt".to_vec(),
+    )
+    .await
+    .expect("corrupt intent fixture should persist");
+    save_config(store.clone(), ".usage.v2.recovery-intents/not-a-canonical-intent-id.json", b"{}".to_vec())
+        .await
+        .expect("invalid intent filename fixture should persist");
+
+    let replayed = replay_pending_scanner_usage_recovery_intents(CancellationToken::new(), store.clone())
+        .await
+        .expect("pending intent replay should skip invalid records and continue");
+    assert_eq!(replayed, 2);
+
+    let accepted_after = get_scanner_usage_recovery_intent(store.clone(), &accepted.intent_id)
+        .await
+        .expect("accepted replay record should read")
+        .expect("accepted replay record should remain durable");
+    assert_eq!(accepted_after.state, "completed");
+    let running_after = get_scanner_usage_recovery_intent(store.clone(), &running.intent_id)
+        .await
+        .expect("running replay record should read")
+        .expect("running replay record should remain durable");
+    assert_eq!(running_after.state, "completed");
+    let completed_after = get_scanner_usage_recovery_intent(store, &completed.intent_id)
+        .await
+        .expect("completed replay record should read")
+        .expect("completed replay record should remain durable");
+    assert_eq!(completed_after, completed);
+}
+
+#[tokio::test]
+#[serial]
+async fn disabled_startup_replays_persisted_recovery_intent_without_starting_scanner() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let record = match accept_scanner_usage_recovery_intent(
+        store.clone(),
+        recovery_intent_request("intent-key-0005-disabled-startup", "operator-a"),
+    )
+    .await
+    .expect("disabled startup fixture intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("disabled startup fixture must create a durable record: {other:?}"),
+    };
+
+    let restarted = restart_scanner_cycle_store_from(&store).await;
+    run_disabled_startup(CancellationToken::new(), restarted.clone()).await;
+
+    let replayed = get_scanner_usage_recovery_intent(restarted, &record.intent_id)
+        .await
+        .expect("disabled startup replay record should read")
+        .expect("disabled startup replay record should remain durable");
+    assert_eq!(replayed.state, "completed");
+}
+
+#[tokio::test]
+#[serial]
 async fn disabled_cleanup_reopens_persisted_intent_without_starting_scanner() {
     let (_dir, store) = setup_scanner_cycle_store().await;
     seed_cleanup(&store, "cleanup-pending").await;

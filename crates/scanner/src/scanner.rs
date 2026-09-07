@@ -956,22 +956,48 @@ pub async fn init_scanner_with_recovery(
     enabled: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if enabled {
-        init_data_scanner(ctx, storeapi).await;
-        return None;
-    }
-    Some(tokio::spawn(async move {
-        if let Err(error) = resume_scanner_cycle_cleanup(ctx, storeapi).await {
+        if let Err(error) = replay_pending_scanner_usage_recovery_intents(ctx.clone(), storeapi.clone()).await {
             warn!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_PERSIST_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_RUNTIME,
-                state = "disabled_cleanup_deferred",
+                state = "recovery_intent_replay_deferred",
                 error = %error,
-                "Disabled scanner cleanup remains pending for an operator retry"
+                "Scanner recovery intent replay remains pending"
             );
         }
+        init_data_scanner(ctx, storeapi).await;
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        run_disabled_scanner_recovery(ctx, storeapi).await;
     }))
+}
+
+async fn run_disabled_scanner_recovery(ctx: CancellationToken, storeapi: Arc<ECStore>) {
+    if let Err(error) = resume_scanner_cycle_cleanup(ctx.clone(), storeapi.clone()).await {
+        warn!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "disabled_cleanup_deferred",
+            error = %error,
+            "Disabled scanner cleanup remains pending for an operator retry"
+        );
+    }
+    if let Err(error) = replay_pending_scanner_usage_recovery_intents(ctx, storeapi).await {
+        warn!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "disabled_recovery_intent_replay_deferred",
+            error = %error,
+            "Disabled scanner recovery intent replay remains pending for an operator retry"
+        );
+    }
 }
 
 async fn init_data_scanner_with_storage<S>(ctx: CancellationToken, storeapi: Arc<S>)
@@ -3593,8 +3619,8 @@ pub use cycle_state::{
     SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD, ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus,
     ScannerRecoveryIntentAcceptResult, ScannerRecoveryIntentConflict, ScannerRecoveryIntentRecord, ScannerRecoveryIntentRequest,
     ScannerUsageStateResetResult, accept_scanner_usage_recovery_intent, get_scanner_usage_recovery_intent,
-    reset_scanner_cycle_recovery, reset_scanner_usage_state_for_full_rebuild, run_scanner_usage_recovery_intent,
-    scanner_cycle_recovery_status, scanner_recovery_actor_sha256,
+    replay_pending_scanner_usage_recovery_intents, reset_scanner_cycle_recovery, reset_scanner_usage_state_for_full_rebuild,
+    run_scanner_usage_recovery_intent, scanner_cycle_recovery_status, scanner_recovery_actor_sha256,
 };
 pub(crate) use cycle_state::{
     current_scanner_leader_epoch, decode_persisted_scanner_cycle_fence, load_scanner_cycle_state_for_startup,

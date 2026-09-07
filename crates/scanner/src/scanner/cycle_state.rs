@@ -17,7 +17,7 @@ use crate::ScannerGetObjectReader;
 use crate::data_usage_define::{
     DATA_USAGE_BLOOM_RECOVERY_PATH, DATA_USAGE_RECOVERY_PATH, usage_floor_primary_read_error_allows_backup,
 };
-use crate::storage_api::owner::ObjectIO as _;
+use crate::storage_api::owner::{ListOperations as _, ObjectIO as _};
 use std::sync::atomic::AtomicU64;
 use tokio::io::AsyncReadExt as _;
 
@@ -37,6 +37,8 @@ const SCANNER_USAGE_STATE_RESET_MODE_FULL_REBUILD: &str = "full-rebuild";
 const SCANNER_RECOVERY_INTENT_SCHEMA_VERSION: u16 = 1;
 const SCANNER_RECOVERY_INTENT_PREFIX: &str = ".usage.v2.recovery-intents";
 const MAX_SCANNER_RECOVERY_INTENT_BYTES: u64 = 16 * 1024;
+const MAX_SCANNER_RECOVERY_INTENT_REPLAY_KEYS: i32 = 100;
+const MAX_SCANNER_RECOVERY_INTENT_REPLAY_PAGES: usize = 1024;
 const SCANNER_RECOVERY_INTENT_STATE_ACCEPTED: &str = "accepted";
 const SCANNER_RECOVERY_INTENT_STATE_RUNNING: &str = "running";
 const SCANNER_RECOVERY_INTENT_STATE_COMPLETED: &str = "completed";
@@ -723,6 +725,108 @@ pub async fn run_scanner_usage_recovery_intent(
             Err(err)
         }
     }
+}
+
+pub async fn replay_pending_scanner_usage_recovery_intents(
+    ctx: CancellationToken,
+    storeapi: Arc<ECStore>,
+) -> Result<usize, ScannerError> {
+    let prefix = format!("{SCANNER_RECOVERY_INTENT_PREFIX}/");
+    let mut continuation = None;
+    let mut replayed = 0_usize;
+
+    for _ in 0..MAX_SCANNER_RECOVERY_INTENT_REPLAY_PAGES {
+        if ctx.is_cancelled() {
+            return Ok(replayed);
+        }
+        let page = storeapi
+            .clone()
+            .list_objects_v2(
+                RUSTFS_META_BUCKET,
+                &prefix,
+                continuation,
+                None,
+                MAX_SCANNER_RECOVERY_INTENT_REPLAY_KEYS,
+                false,
+                None,
+                false,
+            )
+            .await
+            .map_err(|err| ScannerError::Other(format!("failed to list scanner recovery intents: {err}")))?;
+
+        for object in page.objects {
+            if ctx.is_cancelled() {
+                return Ok(replayed);
+            }
+            let Some(intent_id) = object
+                .name
+                .strip_prefix(&prefix)
+                .and_then(|name| name.strip_suffix(".json"))
+                .filter(|name| !name.contains('/'))
+            else {
+                continue;
+            };
+            let path = match scanner_recovery_intent_path(intent_id) {
+                Ok(path) => path,
+                Err(error) => {
+                    warn!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        state = "recovery_intent_replay_skipped",
+                        intent_id = %intent_id,
+                        error = %error,
+                        "Scanner recovery intent replay skipped one invalid record"
+                    );
+                    continue;
+                }
+            };
+            let record = match read_recovery_intent_record(storeapi.clone(), &path).await {
+                Ok(Some(record)) => record,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        state = "recovery_intent_replay_skipped",
+                        intent_id = %intent_id,
+                        error = %error,
+                        "Scanner recovery intent replay skipped one invalid record"
+                    );
+                    continue;
+                }
+            };
+            if !matches!(
+                record.state.as_str(),
+                SCANNER_RECOVERY_INTENT_STATE_ACCEPTED | SCANNER_RECOVERY_INTENT_STATE_RUNNING
+            ) {
+                continue;
+            }
+            if run_scanner_usage_recovery_intent(ctx.clone(), storeapi.clone(), record.intent_id)
+                .await?
+                .is_some()
+            {
+                replayed = replayed.saturating_add(1);
+            }
+        }
+
+        if !page.is_truncated {
+            return Ok(replayed);
+        }
+        continuation = page.next_continuation_token;
+        if continuation.is_none() {
+            return Err(ScannerError::Other(
+                "scanner recovery intent listing was truncated without a continuation token".to_string(),
+            ));
+        }
+    }
+
+    Err(ScannerError::Other(
+        "scanner recovery intent replay exceeded the bounded page limit".to_string(),
+    ))
 }
 
 fn recovery_status(state: &str, reason: Option<&str>, retryable: bool) -> ScannerCycleRecoveryStatus {

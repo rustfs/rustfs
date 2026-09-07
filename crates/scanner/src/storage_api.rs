@@ -139,7 +139,7 @@ pub(crate) mod owner {
     pub(crate) use rustfs_ecstore::api::set_disk::test_util::hold_namespace_commit as ecstore_hold_namespace_commit;
 
     pub(crate) use super::storage_contracts::{
-        HTTPPreconditions, HTTPRangeSpec, NS_SCANNER_PROTOCOL_VERSION, ObjectIO, ObjectOperations, ObjectToDelete,
+        HTTPPreconditions, HTTPRangeSpec, ListOperations, NS_SCANNER_PROTOCOL_VERSION, ObjectIO, ObjectOperations, ObjectToDelete,
     };
 
     pub(crate) use super::{
