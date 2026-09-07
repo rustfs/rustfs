@@ -16899,6 +16899,87 @@ mod tests {
         assert!(err.to_string().contains("requires 60 bytes, but 59 bytes are available"));
     }
 
+    async fn single_pool_capacity_admission_test_store() -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
+        let (temp_dirs, store) =
+            crate::services::rebalance::test_store_with_persisted_rebalance_meta(RebalanceMeta::default()).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        (temp_dirs, store)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn single_pool_public_writes_skip_decommission_capacity_admission() {
+        let (_temp_dirs, store) = single_pool_capacity_admission_test_store().await;
+        let bucket = format!("single-pool-capacity-skip-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create single-pool bucket before blocking pool metadata writes");
+        let incarnation = store.bucket_incarnation_id(&bucket).await.expect("load bucket incarnation");
+        store.pool_meta_save_gate.lock().await.block_writes_after_fence_loss();
+
+        let object = "ordinary-put.bin";
+        let mut put_data = crate::object_api::PutObjReader::from_vec(b"ordinary single-pool body".to_vec());
+        store
+            .put_object(&bucket, object, &mut put_data, &ObjectOptions::default())
+            .await
+            .expect("single-pool ordinary PUT must not enter decommission capacity admission");
+        store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("single-pool ordinary PUT must remain readable");
+
+        let multipart_object = "ordinary-multipart.bin";
+        let upload = store
+            .new_multipart_upload(
+                &bucket,
+                multipart_object,
+                &ObjectOptions {
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("single-pool MPU creation must not enter decommission capacity admission");
+        let mut part_data = crate::object_api::PutObjReader::from_vec(b"single-pool multipart body".to_vec());
+        let part = store
+            .put_object_part(
+                &bucket,
+                multipart_object,
+                &upload.upload_id,
+                1,
+                &mut part_data,
+                &ObjectOptions {
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("single-pool UploadPart must not enter decommission capacity admission");
+        store
+            .clone()
+            .complete_multipart_upload(
+                &bucket,
+                multipart_object,
+                &upload.upload_id,
+                vec![crate::storage_api_contracts::multipart::CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions {
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("single-pool CompleteMultipartUpload must not enter decommission capacity admission");
+        store
+            .get_object_info(&bucket, multipart_object, &ObjectOptions::default())
+            .await
+            .expect("single-pool completed MPU must remain readable");
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn multipart_mutations_locate_later_upload_before_reserved_pool_admission() {
