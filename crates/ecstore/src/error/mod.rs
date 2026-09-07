@@ -203,6 +203,19 @@ pub enum StorageError {
     NotFirstDisk,
     #[error("first disk wait")]
     FirstDiskWait,
+    #[error(
+        "unsupported pool expansion: an existing single-node single-drive (SNSD) deployment cannot be expanded in place (configured {configured_drives} drive endpoints); restart with the original single local path, or create a new multi-drive deployment and migrate data through S3"
+    )]
+    UnsupportedSnsdExpansion { configured_drives: usize },
+    #[error(
+        "pool topology mismatch: stored {stored_drives} drives with {stored_set_drive_count} drives per erasure set, configured {configured_drives} drives with {configured_set_drive_count} drives per erasure set; an existing pool's drive count and erasure set width cannot be changed in place; restore its original endpoints and RUSTFS_ERASURE_SET_DRIVE_COUNT setting; to expand a multi-drive deployment, append a new pool with at least 2 drive endpoints"
+    )]
+    PoolTopologyMismatch {
+        stored_drives: usize,
+        stored_set_drive_count: usize,
+        configured_drives: usize,
+        configured_set_drive_count: usize,
+    },
 
     // ── Operational ──────────────────────────────────────────────────
     #[error("Storage reached its minimum free drive threshold.")]
@@ -629,6 +642,20 @@ impl Clone for StorageError {
             StorageError::ErasureWriteQuorum => StorageError::ErasureWriteQuorum,
             StorageError::NotFirstDisk => StorageError::NotFirstDisk,
             StorageError::FirstDiskWait => StorageError::FirstDiskWait,
+            StorageError::UnsupportedSnsdExpansion { configured_drives } => StorageError::UnsupportedSnsdExpansion {
+                configured_drives: *configured_drives,
+            },
+            StorageError::PoolTopologyMismatch {
+                stored_drives,
+                stored_set_drive_count,
+                configured_drives,
+                configured_set_drive_count,
+            } => StorageError::PoolTopologyMismatch {
+                stored_drives: *stored_drives,
+                stored_set_drive_count: *stored_set_drive_count,
+                configured_drives: *configured_drives,
+                configured_set_drive_count: *configured_set_drive_count,
+            },
             StorageError::TooManyOpenFiles => StorageError::TooManyOpenFiles,
             StorageError::NoHealRequired => StorageError::NoHealRequired,
             StorageError::Lock(e) => StorageError::Lock(e.clone()),
@@ -735,6 +762,11 @@ impl StorageError {
             StorageError::ErasureWriteQuorum => StorageErrorCode::ErasureWriteQuorum,
             StorageError::NotFirstDisk => StorageErrorCode::NotFirstDisk,
             StorageError::FirstDiskWait => StorageErrorCode::FirstDiskWait,
+            // Topology diagnostics reuse the existing wire code; they are
+            // not disk errors and must retain their local identity for retry classification.
+            StorageError::UnsupportedSnsdExpansion { .. } | StorageError::PoolTopologyMismatch { .. } => {
+                StorageErrorCode::InvalidArgument
+            }
             StorageError::ConfigNotFound => StorageErrorCode::ConfigNotFound,
             StorageError::TooManyOpenFiles => StorageErrorCode::TooManyOpenFiles,
             StorageError::NoHealRequired => StorageErrorCode::NoHealRequired,
@@ -1214,6 +1246,29 @@ mod conversion_roundtrip_tests;
 mod tests {
     use super::*;
     use std::io::{Error as IoError, ErrorKind};
+
+    #[test]
+    fn startup_topology_errors_preserve_identity_and_guidance() {
+        for error in [
+            StorageError::UnsupportedSnsdExpansion { configured_drives: 4 },
+            StorageError::PoolTopologyMismatch {
+                stored_drives: 4,
+                stored_set_drive_count: 4,
+                configured_drives: 8,
+                configured_set_drive_count: 8,
+            },
+        ] {
+            let io_error: IoError = error.clone().into();
+            let restored = StorageError::from(io_error);
+            assert_eq!(std::mem::discriminant(&restored), std::mem::discriminant(&error));
+            assert_eq!(restored.to_string(), error.to_string());
+            assert_eq!(restored.code(), StorageErrorCode::InvalidArgument);
+            assert!(
+                restored.narrow_to_disk().is_err(),
+                "startup diagnostics must not become disk/quorum errors"
+            );
+        }
+    }
 
     #[test]
     fn other_preserves_erasure_construction_source_chain() {

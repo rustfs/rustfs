@@ -2433,6 +2433,41 @@ mod test {
     }
 
     #[tokio::test]
+    async fn pool_expansion_resolves_single_node_multi_drive_and_multi_node_single_drive_pools() {
+        for (additional_pool, expected_nodes) in [
+            ("http://rustfs-5.example.invalid:9000/data{1...4}", 5),
+            ("http://rustfs-{5...8}.example.invalid:9000/data", 8),
+        ] {
+            let layout = temp_env::with_var("RUSTFS_ERASURE_SET_DRIVE_COUNT", Some("0"), || {
+                DisksLayout::from_volumes(&["http://rustfs-{1...4}.example.invalid:9000/data", additional_pool])
+            })
+            .expect("both single-node multi-drive and multi-node single-drive pools should parse");
+
+            let (pools, setup_type) = EndpointServerPools::create_server_endpoints_with(
+                "0.0.0.0:9000",
+                &layout,
+                Some(orchestrated_test_policy()),
+                Some("rustfs-1.example.invalid"),
+            )
+            .await
+            .expect("pool admission must not impose a minimum node count or drives per node");
+
+            assert_eq!(setup_type, SetupType::DistErasure);
+            assert_eq!(pools.0.len(), 2);
+            assert_eq!(pools.get_nodes().len(), expected_nodes);
+            for (pool_index, pool) in (0_i32..).zip(&pools.0) {
+                assert_eq!((pool.set_count, pool.drives_per_set), (1, 4));
+                assert_eq!(pool.endpoints.as_ref().len(), 4);
+                for (disk_index, endpoint) in (0_i32..).zip(pool.endpoints.as_ref()) {
+                    assert_eq!(endpoint.pool_idx, pool_index);
+                    assert_eq!(endpoint.set_idx, 0);
+                    assert_eq!(endpoint.disk_idx, disk_index);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn explicit_local_endpoint_host_fails_closed_for_invalid_context_or_zero_match() {
         let args = vec![
             "http://192.0.2.10:9000/data0",

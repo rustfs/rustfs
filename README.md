@@ -109,6 +109,15 @@ Star RustFS on GitHub and be instantly notified of new releases.
 
 ## Quickstart
 
+> [!IMPORTANT]
+> **Pool expansion notice:**
+>
+> - A single-node single-drive (SNSD) deployment is supported only as a standalone local path. It cannot expand in place or be added as a Pool. To move to a multi-drive topology, create a new deployment and migrate data through S3.
+> - Keep an existing multi-drive Pool's endpoints and Erasure Set width unchanged; expand by appending a new Pool. With ellipsis-based expansion, every Pool argument must contain an ellipsis expression and expand to at least two drive endpoints.
+> - Single-node multi-drive Pools and multi-node Pools with one drive per node are allowed, subject to valid Erasure Set geometry and EC settings; acceptance does not guarantee host-failure tolerance.
+>
+> These topology rules follow MinIO, but automatic parity selection differs between the projects. See the [Pool layout compatibility and regression tests](docs/testing/pool-layout-compatibility.md) before expanding a deployment.
+
 To get started with RustFS, follow these steps:
 
 ### 1. One-click Installation (Option 1)

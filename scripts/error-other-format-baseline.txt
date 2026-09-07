@@ -35,7 +35,7 @@
 1|crates/ecstore/src/erasure/coding/decode_reader.rs
 10|crates/ecstore/src/erasure/coding/encode.rs
 25|crates/ecstore/src/erasure/coding/erasure.rs
-4|crates/ecstore/src/layout/disks_layout.rs
+3|crates/ecstore/src/layout/disks_layout.rs
 2|crates/ecstore/src/layout/endpoint.rs
 17|crates/ecstore/src/layout/endpoints.rs
 1|crates/ecstore/src/layout/format.rs
@@ -67,7 +67,6 @@
 5|crates/ecstore/src/store/bucket.rs
 1|crates/ecstore/src/store/heal_walk.rs
 12|crates/ecstore/src/store/init.rs
-2|crates/ecstore/src/store/init_format.rs
 3|crates/ecstore/src/store/multipart.rs
 6|crates/ecstore/src/store/object.rs
 5|crates/ecstore/src/store/rebalance/support.rs

@@ -747,18 +747,27 @@ mod tests {
         let mut kvs = KVS::new();
         kvs.insert(CLASS_STANDARD.to_string(), "EC:2".to_string());
 
-        let err = lookup_config_for_pools_with_env(&kvs, &[4, 2], no_env_overrides())
-            .expect_err("EC:2 must be rejected by the two-drive pool");
-        assert!(
-            err.to_string().contains("pool 1") && err.to_string().contains("2 drives"),
-            "error must identify the rejecting pool: {err}"
-        );
+        for drives in [2, 3] {
+            let err = lookup_config_for_pools_with_env(&kvs, &[4, drives], no_env_overrides())
+                .expect_err("EC:2 must be rejected by a pool with fewer than four drives per set");
+            assert!(
+                err.to_string().contains("pool 1") && err.to_string().contains(&format!("{drives} drives")),
+                "error must identify the rejecting pool: {err}"
+            );
+        }
+
+        let cfg =
+            lookup_config_for_pools_with_env(&kvs, &[4, 4], no_env_overrides()).expect("EC:2 is valid for both four-drive pools");
+        assert_eq!(cfg.parities_for_sc(STANDARD), Some(vec![2, 2]));
 
         kvs.insert(CLASS_STANDARD.to_string(), "EC:1".to_string());
-        let cfg = lookup_config_for_pools_with_env(&kvs, &[4, 2], no_env_overrides()).expect("EC:1 is valid for both pools");
-        assert_eq!(cfg.parity_for_sc(STANDARD, 4), Some(1));
-        assert_eq!(cfg.parity_for_sc(STANDARD, 2), Some(1));
-        assert_eq!(cfg.get_parity_for_sc(STANDARD), Some(1));
+        for drives in [2, 3, 4] {
+            let cfg =
+                lookup_config_for_pools_with_env(&kvs, &[4, drives], no_env_overrides()).expect("EC:1 is valid for both pools");
+            assert_eq!(cfg.parity_for_sc(STANDARD, 4), Some(1));
+            assert_eq!(cfg.parity_for_sc(STANDARD, drives), Some(1));
+            assert_eq!(cfg.get_parity_for_sc(STANDARD), Some(1));
+        }
     }
 
     #[test]
