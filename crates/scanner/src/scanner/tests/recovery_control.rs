@@ -106,6 +106,20 @@ fn recovery_intent_request(key: &str, actor: &str) -> ScannerRecoveryIntentReque
     }
 }
 
+fn synthetic_recovery_intent_record(intent_id: String, state: &str) -> ScannerRecoveryIntentRecord {
+    ScannerRecoveryIntentRecord {
+        schema_version: 1,
+        intent_id,
+        action: SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD.to_string(),
+        mode: "full-rebuild".to_string(),
+        state: state.to_string(),
+        actor_sha256: "a".repeat(64),
+        idempotency_key_sha256: "b".repeat(64),
+        request_sha256: "c".repeat(64),
+        accepted_at_unix_secs: 1,
+    }
+}
+
 async fn assert_reset_fences(store: &Arc<ECStore>) {
     let data = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
         .await
@@ -309,6 +323,162 @@ async fn scanner_recovery_intent_executor_persists_failed_progress() {
         .expect("failed intent should remain durable");
     assert_eq!(failed.state, "failed");
     assert_eq!(failed.intent_id, record.intent_id);
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_recovery_intent_startup_discovers_only_non_terminal_records() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let accepted = match accept_scanner_usage_recovery_intent(
+        store.clone(),
+        recovery_intent_request("intent-key-0001-startup-accepted", "operator-a"),
+    )
+    .await
+    .expect("accepted startup intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("first request must create accepted startup intent: {other:?}"),
+    };
+    let mut running = match accept_scanner_usage_recovery_intent(
+        store.clone(),
+        recovery_intent_request("intent-key-0001-startup-running", "operator-a"),
+    )
+    .await
+    .expect("running startup intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("first request must create running startup intent: {other:?}"),
+    };
+    running.state = "running".to_string();
+    let running_path = format!(".usage.v2.recovery-intents/{}.json", running.intent_id);
+    save_config(
+        store.clone(),
+        &running_path,
+        serde_json::to_vec(&running).expect("running intent should encode"),
+    )
+    .await
+    .expect("running intent override should persist");
+
+    for (key, state) in [
+        ("intent-key-0001-startup-completed", "completed"),
+        ("intent-key-0001-startup-failed", "failed"),
+    ] {
+        let mut terminal = match accept_scanner_usage_recovery_intent(store.clone(), recovery_intent_request(key, "operator-a"))
+            .await
+            .expect("terminal startup intent should persist")
+        {
+            ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+            other => panic!("first request must create terminal startup intent: {other:?}"),
+        };
+        terminal.state = state.to_string();
+        let path = format!(".usage.v2.recovery-intents/{}.json", terminal.intent_id);
+        save_config(
+            store.clone(),
+            &path,
+            serde_json::to_vec(&terminal).expect("terminal intent should encode"),
+        )
+        .await
+        .expect("terminal intent override should persist");
+    }
+    save_config(store.clone(), ".usage.v2.recovery-intents/not-a-sha.json", b"{}".to_vec())
+        .await
+        .expect("foreign startup key should persist");
+
+    let restarted = restart_scanner_cycle_store_from(&store).await;
+    let replayable = scanner_usage_recovery_intents_for_startup(&CancellationToken::new(), restarted)
+        .await
+        .expect("startup discovery should tolerate terminal and foreign records");
+    let replayable = replayable.into_iter().collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        replayable,
+        [accepted.intent_id, running.intent_id].into_iter().collect(),
+        "startup discovery must only re-drive accepted/running durable intents"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_recovery_intent_startup_pages_past_terminal_records() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    for index in 0..70 {
+        let intent_id = format!("{index:064x}");
+        let path = format!(".usage.v2.recovery-intents/{intent_id}.json");
+        let terminal = synthetic_recovery_intent_record(intent_id, "completed");
+        save_config(
+            store.clone(),
+            &path,
+            serde_json::to_vec(&terminal).expect("terminal paging fixture should encode"),
+        )
+        .await
+        .expect("terminal paging fixture should persist");
+    }
+    let pending_id = "f".repeat(64);
+    let pending = synthetic_recovery_intent_record(pending_id.clone(), "accepted");
+    save_config(
+        store.clone(),
+        &format!(".usage.v2.recovery-intents/{pending_id}.json"),
+        serde_json::to_vec(&pending).expect("pending paging fixture should encode"),
+    )
+    .await
+    .expect("pending paging fixture should persist");
+
+    let restarted = restart_scanner_cycle_store_from(&store).await;
+    let replayable = scanner_usage_recovery_intents_for_startup(&CancellationToken::new(), restarted)
+        .await
+        .expect("startup discovery should page past terminal records");
+    assert_eq!(replayable, vec![pending_id]);
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_recovery_intent_startup_rejects_corrupt_pending_record() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let record = match accept_scanner_usage_recovery_intent(
+        store.clone(),
+        recovery_intent_request("intent-key-0001-startup-corrupt", "operator-a"),
+    )
+    .await
+    .expect("corrupt startup fixture intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("first request must create corrupt startup fixture: {other:?}"),
+    };
+    let path = format!(".usage.v2.recovery-intents/{}.json", record.intent_id);
+    save_config(store.clone(), &path, b"{corrupt".to_vec())
+        .await
+        .expect("corrupt intent payload should persist");
+
+    let restarted = restart_scanner_cycle_store_from(&store).await;
+    let error = scanner_usage_recovery_intents_for_startup(&CancellationToken::new(), restarted)
+        .await
+        .expect_err("startup discovery must not silently drop corrupt pending intent records");
+    assert!(error.to_string().contains("scanner recovery intent is invalid"), "{error}");
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_recovery_intent_disabled_startup_executes_persisted_non_terminal_intent() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let record = match accept_scanner_usage_recovery_intent(
+        store.clone(),
+        recovery_intent_request("intent-key-0001-startup-exec", "operator-a"),
+    )
+    .await
+    .expect("startup execution intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("first request must create startup execution intent: {other:?}"),
+    };
+
+    let restarted = restart_scanner_cycle_store_from(&store).await;
+    run_disabled_startup(CancellationToken::new(), restarted.clone()).await;
+
+    let completed = get_scanner_usage_recovery_intent(restarted, &record.intent_id)
+        .await
+        .expect("startup-executed intent should read")
+        .expect("startup-executed intent should remain durable");
+    assert_eq!(completed.state, "completed");
+    assert_eq!(completed.intent_id, record.intent_id);
 }
 
 #[tokio::test]
