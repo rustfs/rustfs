@@ -2451,6 +2451,82 @@ async fn scoped_root_scan_reuses_clean_top_level_entries_and_rescans_dirty_entri
     assert_eq!((bucket.size, bucket.objects), (17, 3));
 }
 
+async fn scan_hot_cold_segment_fixture(scoped: bool) -> (DataUsageEntry, Vec<String>) {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    write_test_object_metadata(&temp_dir, "bucket", "cold/object").await;
+    write_test_object_metadata(&temp_dir, "bucket", "hot/object").await;
+
+    scanner.old_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.update_cache.info.name = "bucket".to_string();
+    if scoped {
+        scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
+        scanner.old_cache.replace(
+            "bucket/cold",
+            "bucket",
+            DataUsageEntry {
+                size: 0,
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        scanner.prefix_scan_scope =
+            ScannerBucketPrefixScanScope::from_dirty_top_level_entries(HashSet::from(["hot".to_string()]));
+    }
+
+    let walked = Arc::new(Mutex::new(Vec::<String>::new()));
+    scanner.update_current_path = Arc::new({
+        let walked = walked.clone();
+        move |path: &str| {
+            walked.lock().expect("lock observed scanner paths").push(path.to_string());
+            Box::pin(async {})
+        }
+    });
+
+    let folder = CachedFolder {
+        name: "bucket".to_string(),
+        parent: None,
+        object_heal_prob_div: 1,
+    };
+    let mut root = DataUsageEntry::default();
+    scanner
+        .scan_folder(CancellationToken::new(), folder, &mut root)
+        .await
+        .expect("segment fixture scan should finish");
+    let root = scanner
+        .new_cache
+        .size_recursive("bucket")
+        .expect("segment fixture should produce a bucket cache root");
+    let walked = walked.lock().expect("read observed scanner paths").clone();
+    (root, walked)
+}
+
+fn walked_path_in(paths: &[String], subtree: &str) -> bool {
+    paths
+        .iter()
+        .any(|path| path == subtree || path.strip_prefix(subtree).is_some_and(|rest| rest.starts_with('/')))
+}
+
+#[tokio::test]
+#[serial]
+async fn scoped_root_scan_zero_walks_clean_cold_segment_with_full_oracle_equivalence() {
+    let (full, full_walked) = scan_hot_cold_segment_fixture(false).await;
+    let (scoped, scoped_walked) = scan_hot_cold_segment_fixture(true).await;
+
+    assert_eq!((scoped.size, scoped.objects), (full.size, full.objects));
+    assert_eq!((scoped.size, scoped.objects), (0, 2));
+    assert!(
+        walked_path_in(&full_walked, "bucket/cold"),
+        "the full oracle must prove the cold segment would be walked without scoped reuse"
+    );
+    assert!(walked_path_in(&scoped_walked, "bucket/hot"), "the dirty hot segment must still be walked");
+    assert!(
+        !walked_path_in(&scoped_walked, "bucket/cold"),
+        "a clean cold segment must be copied from the durable baseline without walker callbacks"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn scoped_root_scan_preserves_erasure_health_walks() {

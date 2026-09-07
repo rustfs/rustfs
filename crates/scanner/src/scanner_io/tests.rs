@@ -1651,6 +1651,82 @@ fn scoped_scan_uses_only_locally_verified_prefix_hints() {
     assert!(distributed_scope.prefix_scope_for("photos").is_none());
 }
 
+#[test]
+fn remote_dirty_usage_invalidates_local_prefix_hints_until_distributed_proof_exists() {
+    let source = DataUsageCacheSource::new(1, 2);
+    let expected_sources = HashSet::from([source]);
+    let scan_plan_digest = DataUsageScanPlanDigest([6; 32]);
+    let baseline = complete_usage_baseline(source, scan_plan_digest, 7, 11);
+    let expected_peers = HashMap::from([(
+        "node-a:9000".to_string(),
+        ScannerPeerDirtyUsageExpectation {
+            instance_id: "instance-a".to_string(),
+            generation: 7,
+            pending: true,
+        },
+    )]);
+    let remote_dirty_usage = verified_remote_dirty_usage(
+        &expected_peers,
+        vec![(
+            "node-a:9000".to_string(),
+            peer_dirty_usage_snapshot("instance-a", 7, true, &[("photos", 7)]),
+        )],
+    )
+    .expect("fixture remote dirty usage should verify at bucket granularity");
+    let dirty_scopes = HashMap::from([(
+        "photos".to_string(),
+        DirtyUsageBucketScope::TopLevelEntries(HashSet::from(["2026".to_string()])),
+    )]);
+    let locally_scoped = scoped_scan_scope_from_dirty_buckets(
+        ScannerBucketScanScope::default(),
+        HashSet::from(["photos".to_string()]),
+        Some(&dirty_scopes),
+        true,
+        &[bucket_info("photos")],
+        ScannerCacheBaselineProof {
+            authoritative_data: Some(&baseline),
+            observed_candidate_data: None,
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest,
+        },
+    );
+    assert!(
+        locally_scoped.prefix_scope_for("photos").is_some(),
+        "local-only evidence may narrow to a direct child segment"
+    );
+
+    let distributed = resolve_remote_dirty_usage_scope(
+        ScannerBucketScanScope::default(),
+        HashSet::from(["photos".to_string()]),
+        remote_dirty_usage,
+        &[bucket_info("photos")],
+        ScannerCacheBaselineProof {
+            authoritative_data: Some(&baseline),
+            observed_candidate_data: None,
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest,
+        },
+    );
+
+    assert_eq!(
+        distributed
+            .scope
+            .selected_buckets
+            .as_deref()
+            .expect("distributed invalidation still selects the dirty bucket"),
+        &HashSet::from(["photos".to_string()])
+    );
+    assert!(
+        distributed.scope.prefix_scope_for("photos").is_none(),
+        "peer dirty state is not a distributed segment invalidation proof"
+    );
+    assert_eq!(distributed.remote_dirty_usage_acknowledgements.len(), 1);
+}
+
 fn peer_dirty_usage_snapshot(
     instance_id: &str,
     generation: u64,
