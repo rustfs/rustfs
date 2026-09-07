@@ -1016,12 +1016,14 @@ fn map_transition_operator_error(err: TransitionOperatorError) -> S3Error {
         TransitionOperatorError::CandidateVersionMismatch { .. } => {
             s3_error!(OperationAborted, "remote candidate version does not match requested exact version")
         }
-        TransitionOperatorError::StaleRecoveryControl => {
-            s3_error!(OperationAborted, "transition recovery control or source generation changed")
-        }
-        TransitionOperatorError::RetryNotAllowed => {
-            s3_error!(OperationAborted, "transition recovery control is not eligible for operator retry")
-        }
+        TransitionOperatorError::StaleRecoveryControl => admin_s3_error(
+            AdminS3ErrorCode::OperationAborted,
+            "transition recovery control or source generation changed",
+        ),
+        TransitionOperatorError::RetryNotAllowed => admin_s3_error(
+            AdminS3ErrorCode::OperationAborted,
+            "transition recovery control is not eligible for operator retry",
+        ),
         TransitionOperatorError::Store(_) | TransitionOperatorError::Remote(_) => {
             s3_error!(InternalError, "transition reconciliation failed")
         }
