@@ -40,12 +40,24 @@ pub(in crate::scanner_folder) fn observe_raw_entry(dir: &str, name: &std::ffi::O
     }
 }
 
-struct ObservationGuard;
+pub(in crate::scanner_folder) struct ObservationGuard;
 
 impl Drop for ObservationGuard {
     fn drop(&mut self) {
         *OBSERVATION.lock().expect("enumeration observation cleanup") = None;
     }
+}
+
+pub(in crate::scanner_folder) fn install_raw_entry_budget(root: PathBuf, limit: u64) -> ObservationGuard {
+    *OBSERVATION.lock().expect("install raw-entry observation") = Some(Observation {
+        root,
+        limit,
+        entries: 0,
+        name_bytes: 0,
+        first_entry: None,
+        last_entry: None,
+    });
+    ObservationGuard
 }
 
 #[derive(serde::Deserialize)]
@@ -84,8 +96,21 @@ async fn round(request: &Request) -> serde_json::Value {
         }
         let mut initial = DataUsageCache::default();
         initial.info.name = "bucket".to_string();
+        let source = crate::data_usage_define::DataUsageCacheSource::new(0, 0);
+        let plan = crate::data_usage_define::DataUsageScanPlanDigest([31; 32]);
+        let identity = crate::data_usage_define::DataUsageScanIdentity {
+            version: 1,
+            bucket_incarnation: Uuid::from_u128(31),
+            set_layout: crate::data_usage_define::DataUsageScanPlanDigest([32; 32]),
+            publication_epoch: 1,
+            tier_registry_generation: 0,
+            scan_mode: HealScanMode::Normal,
+        };
+        assert_eq!(
+            initial.prepare_bucket_checkpoint("bucket", 1, 0, source, plan, identity),
+            crate::data_usage_define::DataUsageCachePrepareOutcome::Reset
+        );
         initial.info.skip_healing = true;
-        initial.info.snapshot_complete = false;
         initial.replace("bucket", "", DataUsageEntry::default());
         tokio::fs::write(&cache_path, initial.marshal_msg().expect("initial cache codec"))
             .await
@@ -106,15 +131,7 @@ async fn round(request: &Request) -> serde_json::Value {
     .expect("open synthetic disk in this process");
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
-    *OBSERVATION.lock().expect("install observation") = Some(Observation {
-        root: disk.path(),
-        limit: request.raw_entry_budget,
-        entries: 0,
-        name_bytes: 0,
-        first_entry: None,
-        last_entry: None,
-    });
-    let _observation_guard = ObservationGuard;
+    let _observation_guard = install_raw_entry_budget(disk.path(), request.raw_entry_budget);
     let result = scan_data_folder(
         budget.token(),
         budget.clone(),
