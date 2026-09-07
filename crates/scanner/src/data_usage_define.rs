@@ -536,6 +536,10 @@ pub struct DataUsageEntryInfo {
     pub name: String,
     pub parent: String,
     pub entry: DataUsageEntry,
+    /// Durable bucket incarnation that produced this bucket root. Missing
+    /// values are legacy/unproven and must not authorize cold-bucket reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_incarnation: Option<uuid::Uuid>,
     /// Registry generation used to classify this root entry. Older remote
     /// workers omit it; callers must reject that result when a frozen cycle
     /// requires generation fencing.
@@ -653,6 +657,11 @@ pub struct DataUsageCacheInfo {
     /// structural plan remains reusable across ordinary bucket writes.
     #[serde(default)]
     pub scan_execution_digest: Option<DataUsageScanPlanDigest>,
+    /// Durable bucket incarnations captured for a complete set aggregate.
+    /// Missing or nil entries are legacy/unproven and cannot authorize
+    /// skipping an unselected bucket in a later scoped set scan.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub scan_bucket_incarnations: HashMap<String, uuid::Uuid>,
 }
 
 impl Serialize for DataUsageCacheInfo {
@@ -676,7 +685,8 @@ impl Serialize for DataUsageCacheInfo {
             + usize::from(self.lkg_last_update.is_some())
             + usize::from(self.lkg_leader_epoch.is_some())
             + usize::from(self.lkg_scan_plan_digest.is_some())
-            + usize::from(self.scan_execution_digest.is_some());
+            + usize::from(self.scan_execution_digest.is_some())
+            + usize::from(!self.scan_bucket_incarnations.is_empty());
         let mut state = serializer.serialize_map(Some(field_count))?;
         state.serialize_entry("name", &self.name)?;
         state.serialize_entry("next_cycle", &self.next_cycle)?;
@@ -735,6 +745,9 @@ impl Serialize for DataUsageCacheInfo {
         }
         if let Some(scan_execution_digest) = self.scan_execution_digest {
             state.serialize_entry("scan_execution_digest", &scan_execution_digest)?;
+        }
+        if !self.scan_bucket_incarnations.is_empty() {
+            state.serialize_entry("scan_bucket_incarnations", &self.scan_bucket_incarnations)?;
         }
         state.end()
     }
