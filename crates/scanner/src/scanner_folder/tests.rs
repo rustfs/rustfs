@@ -2722,6 +2722,20 @@ async fn test_scan_data_folder_returns_raw_cursor_on_enumeration_cancel_without_
     assert!(raw_cursor.last_entry.is_some());
     assert_ne!(raw_cursor.page_digest, [0; 32]);
     assert_eq!(partial_cache.validated_raw_enumeration_cursor(), Some(raw_cursor));
+    let page_index = partial_cache
+        .validated_raw_enumeration_page_index()
+        .expect("raw enumeration cancellation should persist a validated page index");
+    assert_eq!(
+        page_index
+            .indexed_entries()
+            .expect("persisted raw page index entries should validate")
+            .len(),
+        1
+    );
+    assert_eq!(
+        page_index.committed_entries().expect("uncommitted raw page should validate"),
+        Vec::<String>::new()
+    );
     assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Runtime));
 }
 
