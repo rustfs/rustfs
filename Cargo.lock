@@ -9999,6 +9999,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "serde_with",
  "serial_test",
  "sha1 0.11.0",
  "sha2 0.11.0",

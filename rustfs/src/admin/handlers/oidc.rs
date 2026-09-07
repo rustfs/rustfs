@@ -465,7 +465,7 @@ impl Operation for ValidateOidcConfigHandler {
                 valid: true,
                 message: "OIDC configuration is valid".to_string(),
                 issuer: Some(validation.issuer),
-                authorization_endpoint: Some(validation.authorization_endpoint),
+                authorization_endpoint: validation.authorization_endpoint,
                 token_endpoint: validation.token_endpoint,
             },
         )

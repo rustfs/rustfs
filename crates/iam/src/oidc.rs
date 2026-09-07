@@ -19,11 +19,13 @@
 //! and ID token verification.
 
 use crate::oidc_state::{OidcAuthSession, OidcLogoutSession, OidcStateStore};
-use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreJsonWebKeySet};
+use openidconnect::core::{
+    CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreIdTokenVerifier, CoreJsonWebKeySet, CoreJwsSigningAlgorithm,
+};
 use openidconnect::{
     AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, DiscoveryError, IssuerUrl,
     JsonWebKeySetUrl, LogoutRequest, Nonce, PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl,
-    ProviderMetadataWithLogout, RedirectUrl, RequestTokenError, Scope,
+    ProviderMetadataWithLogout, RedirectUrl, RequestTokenError, Scope, TokenUrl,
 };
 use reqwest::{Certificate, Client};
 use rustfs_config::oidc::*;
@@ -52,6 +54,7 @@ const EVENT_OIDC_HTTP: &str = "oidc_http";
 const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const OIDC_DISCOVERY_TRANSPORT_RETRIES: usize = 3;
 const OIDC_DISCOVERY_TRANSPORT_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
+const OIDC_JWKS_BLOCKED_BY_OUTBOUND_POLICY: &str = "JWKS request blocked by outbound policy";
 const OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY: &str = "OIDC provider discovery blocked by outbound policy";
 const OIDC_HTTP_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const OIDC_HTTP_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(3);
@@ -753,7 +756,7 @@ pub struct SourcedOidcProviderConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OidcProviderValidationResult {
     pub issuer: String,
-    pub authorization_endpoint: String,
+    pub authorization_endpoint: Option<String>,
     pub token_endpoint: Option<String>,
 }
 
@@ -783,8 +786,140 @@ pub struct OidcClaims {
 /// on-the-fly from metadata when needed.
 #[derive(Clone)]
 struct ProviderState {
-    metadata: ProviderMetadataWithLogout,
+    metadata: DiscoveredProviderMetadata,
     discovered_at: Instant,
+}
+
+// Workload issuers do not implement the browser authorization flow. Keep their
+// verification metadata separate rather than inventing an authorization URL.
+#[serde_with::serde_as]
+#[derive(Clone, Deserialize)]
+struct WorkloadProviderMetadata {
+    issuer: IssuerUrl,
+    jwks_uri: JsonWebKeySetUrl,
+    token_endpoint: Option<TokenUrl>,
+    #[serde_as(as = "serde_with::VecSkipError<_>")]
+    id_token_signing_alg_values_supported: Vec<CoreJwsSigningAlgorithm>,
+    #[serde(skip)]
+    jwks: CoreJsonWebKeySet,
+    // Discovery is extensible; report unsupported fields without logging values.
+    #[serde(flatten)]
+    additional_fields: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Clone)]
+enum DiscoveredProviderMetadata {
+    Console(Box<ProviderMetadataWithLogout>),
+    Workload(Box<WorkloadProviderMetadata>),
+}
+
+impl DiscoveredProviderMetadata {
+    fn parse(body: &[u8], hide_from_ui: bool) -> Result<Self, String> {
+        let document: serde_json::Value = serde_json::from_slice(body).map_err(|err| err.to_string())?;
+        if hide_from_ui
+            && document
+                .as_object()
+                .is_some_and(|fields| !fields.contains_key("authorization_endpoint"))
+        {
+            let mut metadata: WorkloadProviderMetadata = serde_json::from_slice(body).map_err(|err| err.to_string())?;
+            if !metadata.additional_fields.is_empty() {
+                warn!(
+                    event = EVENT_OIDC_DIAGNOSTICS,
+                    component = LOG_COMPONENT_IAM,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "workload_discovery_additional_fields",
+                    field_count = metadata.additional_fields.len(),
+                    "workload discovery contains additional fields"
+                );
+                metadata.additional_fields.clear();
+            }
+            Ok(Self::Workload(Box::new(metadata)))
+        } else {
+            serde_json::from_slice(body)
+                .map(|metadata| Self::Console(Box::new(metadata)))
+                .map_err(|err| err.to_string())
+        }
+    }
+
+    fn console(&self) -> Result<&ProviderMetadataWithLogout, String> {
+        match self {
+            Self::Console(metadata) => Ok(metadata),
+            Self::Workload(_) => Err("OIDC provider has no authorization endpoint; only web identity is supported".into()),
+        }
+    }
+
+    fn issuer(&self) -> &IssuerUrl {
+        match self {
+            Self::Console(metadata) => metadata.issuer(),
+            Self::Workload(metadata) => &metadata.issuer,
+        }
+    }
+
+    fn jwks_uri(&self) -> &JsonWebKeySetUrl {
+        match self {
+            Self::Console(metadata) => metadata.jwks_uri(),
+            Self::Workload(metadata) => &metadata.jwks_uri,
+        }
+    }
+
+    fn set_jwks(self, jwks: CoreJsonWebKeySet) -> Self {
+        match self {
+            Self::Console(metadata) => Self::Console(Box::new(metadata.set_jwks(jwks))),
+            Self::Workload(mut metadata) => {
+                metadata.jwks = jwks;
+                Self::Workload(metadata)
+            }
+        }
+    }
+
+    fn authorization_endpoint(&self) -> Option<String> {
+        match self {
+            Self::Console(metadata) => Some(metadata.authorization_endpoint().to_string()),
+            Self::Workload(_) => None,
+        }
+    }
+
+    fn token_endpoint(&self) -> Option<&TokenUrl> {
+        match self {
+            Self::Console(metadata) => metadata.token_endpoint(),
+            Self::Workload(metadata) => metadata.token_endpoint.as_ref(),
+        }
+    }
+
+    fn verifier(&self, config: &OidcProviderConfig) -> CoreIdTokenVerifier<'static> {
+        let client_id = ClientId::new(config.client_id.clone());
+        let secret = config.client_secret.as_ref().map(|secret| ClientSecret::new(secret.clone()));
+        let (issuer, jwks, algorithms) = match self {
+            Self::Console(metadata) => (metadata.issuer(), metadata.jwks(), metadata.id_token_signing_alg_values_supported()),
+            Self::Workload(metadata) => (&metadata.issuer, &metadata.jwks, &metadata.id_token_signing_alg_values_supported),
+        };
+        let verifier = match secret {
+            Some(secret) => CoreIdTokenVerifier::new_confidential_client(client_id, secret, issuer.clone(), jwks.clone()),
+            None => CoreIdTokenVerifier::new_public_client(client_id, issuer.clone(), jwks.clone()),
+        };
+        verifier.set_allowed_algs(algorithms.clone())
+    }
+}
+
+// This adapter is used only for discovery/JWKS fetches, never token exchange.
+struct JwksAcceptClient<'a> {
+    inner: &'a ReqwestHttpClient,
+    discovery_url: Option<Url>,
+}
+
+impl<'c> AsyncHttpClient<'c> for JwksAcceptClient<'_> {
+    type Error = OidcHttpError;
+    type Future = <ReqwestHttpClient as AsyncHttpClient<'c>>::Future;
+
+    fn call(&'c self, mut request: http::Request<Vec<u8>>) -> Self::Future {
+        if !self.discovery_url.as_ref().is_some_and(|url| request.uri() == url.as_str()) {
+            request.headers_mut().insert(
+                http::header::ACCEPT,
+                http::HeaderValue::from_static("application/json, application/jwk-set+json"),
+            );
+        }
+        self.inner.call(request)
+    }
 }
 
 impl ProviderState {
@@ -932,7 +1067,7 @@ impl OidcSys {
         let redirect = RedirectUrl::new(redirect_uri.to_string()).map_err(|e| format!("invalid redirect URI: {e}"))?;
 
         let client = CoreClient::from_provider_metadata(
-            state.metadata.clone(),
+            state.metadata.console()?.clone(),
             ClientId::new(config.client_id.clone()),
             config.client_secret.as_ref().map(|s| ClientSecret::new(s.clone())),
         )
@@ -994,7 +1129,7 @@ impl OidcSys {
 
         // Construct CoreClient on-the-fly with JWKS from discovery
         let client = CoreClient::from_provider_metadata(
-            provider_state.metadata.clone(),
+            provider_state.metadata.console()?.clone(),
             ClientId::new(config.client_id.clone()),
             config.client_secret.as_ref().map(|s| ClientSecret::new(s.clone())),
         )
@@ -1230,7 +1365,7 @@ impl OidcSys {
             );
 
             let client = CoreClient::from_provider_metadata(
-                refreshed_state.metadata,
+                refreshed_state.metadata.console()?.clone(),
                 ClientId::new(config.client_id.clone()),
                 config.client_secret.as_ref().map(|s| ClientSecret::new(s.clone())),
             )
@@ -1320,7 +1455,7 @@ impl OidcSys {
             .get(&session.provider_id)
             .ok_or_else(|| format!("unknown OIDC provider: {}", session.provider_id))?;
         let state = self.ensure_provider_state(&session.provider_id, config).await?;
-        let Some(end_session_endpoint) = state.metadata.additional_metadata().end_session_endpoint.clone() else {
+        let Some(end_session_endpoint) = state.metadata.console()?.additional_metadata().end_session_endpoint.clone() else {
             return Ok(None);
         };
 
@@ -1460,14 +1595,6 @@ impl OidcSys {
 
         state = self.ensure_provider_state_if_stale(&provider_id, &config, &state).await?;
 
-        // Reconstruct CoreClient from provider metadata
-        let client = CoreClient::from_provider_metadata(
-            state.metadata.clone(),
-            ClientId::new(config.client_id.clone()),
-            config.client_secret.as_ref().map(|s| ClientSecret::new(s.clone())),
-        )
-        .set_auth_type(AuthType::RequestBody);
-
         // Parse raw JWT string into CoreIdToken
         let id_token: CoreIdToken = jwt
             .parse()
@@ -1475,8 +1602,9 @@ impl OidcSys {
 
         // Verify the token (signature, issuer, audience, expiry) — skip nonce
         // (nonce is only required for the authorization code flow)
-        let verifier = client
-            .id_token_verifier()
+        let verifier = state
+            .metadata
+            .verifier(&config)
             .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
         if let Err(e) = id_token.claims(&verifier, |_: Option<&Nonce>| Ok(())) {
             state = self
@@ -1486,14 +1614,9 @@ impl OidcSys {
                     format!("ID token verification failed: {e}; failed to refresh provider metadata: {refresh_err}")
                 })?;
 
-            let client = CoreClient::from_provider_metadata(
-                state.metadata,
-                ClientId::new(config.client_id.clone()),
-                config.client_secret.as_ref().map(|s| ClientSecret::new(s.clone())),
-            )
-            .set_auth_type(AuthType::RequestBody);
-            let verifier = client
-                .id_token_verifier()
+            let verifier = state
+                .metadata
+                .verifier(&config)
                 .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
             id_token
                 .claims(&verifier, |_: Option<&Nonce>| Ok(()))
@@ -1868,18 +1991,39 @@ impl OidcSys {
             let issuer_url = IssuerUrl::new(candidate_issuer.clone()).map_err(|e| format!("invalid issuer URL: {e}"))?;
 
             for attempt in 0..OIDC_DISCOVERY_TRANSPORT_RETRIES {
-                match ProviderMetadataWithLogout::discover_async(issuer_url.clone(), http_client).await {
-                    Ok(metadata) => {
-                        return Ok(ProviderState {
-                            metadata,
+                let discovered = if config.hide_from_ui {
+                    Self::discover_provider_from_config_url(config, candidate_issuer, http_client).await
+                } else {
+                    let client = JwksAcceptClient {
+                        inner: http_client,
+                        discovery_url: Some(
+                            issuer_url
+                                .join(".well-known/openid-configuration")
+                                .map_err(|err| err.to_string())?,
+                        ),
+                    };
+                    ProviderMetadataWithLogout::discover_async(issuer_url.clone(), &client)
+                        .await
+                        .map(|metadata| ProviderState {
+                            metadata: DiscoveredProviderMetadata::Console(Box::new(metadata)),
                             discovered_at: Instant::now(),
-                        });
-                    }
-                    Err(DiscoveryError::Request(OidcHttpError::ForbiddenOutbound(reason))) => {
-                        return Err(format!("{OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY}: {reason}"));
+                        })
+                        .map_err(|err| match err {
+                            DiscoveryError::Request(OidcHttpError::ForbiddenOutbound(reason)) => {
+                                format!("{OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY}: {reason}")
+                            }
+                            err => format!("discovery failed: {err}"),
+                        })
+                };
+                match discovered {
+                    Ok(state) => return Ok(state),
+                    Err(error)
+                        if error.starts_with(OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY)
+                            || error.starts_with(OIDC_JWKS_BLOCKED_BY_OUTBOUND_POLICY) =>
+                    {
+                        return Err(error);
                     }
                     Err(error) => {
-                        let error = format!("discovery failed: {error}");
                         let is_transient_transport = error.contains("Request failed");
                         let should_retry = is_transient_transport && attempt + 1 < OIDC_DISCOVERY_TRANSPORT_RETRIES;
                         if should_retry {
@@ -1933,7 +2077,14 @@ impl OidcSys {
         http_client: &ReqwestHttpClient,
     ) -> Result<ProviderState, String> {
         let issuer_url = IssuerUrl::new(issuer.trim().to_string()).map_err(|e| format!("invalid issuer URL: {e}"))?;
-        let discovery_url = discovery_url_from_config_url(&config.config_url)?;
+        let explicit_issuer = config.issuer.as_deref().is_some_and(|issuer| !issuer.trim().is_empty());
+        let discovery_url = if explicit_issuer {
+            discovery_url_from_config_url(&config.config_url)?
+        } else {
+            issuer_url
+                .join(".well-known/openid-configuration")
+                .map_err(|err| err.to_string())?
+        };
         let request = http::Request::builder()
             .uri(discovery_url.to_string())
             .method(http::Method::GET)
@@ -1946,13 +2097,25 @@ impl OidcSys {
             Err(OidcHttpError::ForbiddenOutbound(reason)) => {
                 return Err(format!("{OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY}: {reason}"));
             }
-            Err(err) => return Err(format!("discovery request failed: {err}")),
+            Err(err) => return Err(format!("discovery request failed: Request failed: {err}")),
         };
         if response.status() != http::StatusCode::OK {
             return Err(format!("discovery failed: HTTP status code {} at {}", response.status(), discovery_url));
         }
 
-        let provider_metadata = serde_json::from_slice::<ProviderMetadataWithLogout>(response.body())
+        if !explicit_issuer
+            && let Some(content_type) = response.headers().get(http::header::CONTENT_TYPE)
+            && !content_type.to_str().ok().is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|essence| essence.eq_ignore_ascii_case("application/json"))
+            })
+        {
+            return Err("Unexpected response Content-Type: expected application/json".into());
+        }
+
+        let provider_metadata = DiscoveredProviderMetadata::parse(response.body(), config.hide_from_ui)
             .map_err(|err| format!("failed to parse discovery response: {err}"))?;
         if provider_metadata.issuer() != &issuer_url {
             return Err(format!(
@@ -1962,11 +2125,23 @@ impl OidcSys {
             ));
         }
 
-        let jwks_url = jwks_url_from_config_url(&config.config_url, &issuer_url, provider_metadata.jwks_uri())?;
-        let jwks = match CoreJsonWebKeySet::fetch_async(&jwks_url, http_client).await {
+        let jwks_url = if explicit_issuer {
+            jwks_url_from_config_url(&config.config_url, &issuer_url, provider_metadata.jwks_uri())?
+        } else {
+            provider_metadata.jwks_uri().clone()
+        };
+        let jwks = match CoreJsonWebKeySet::fetch_async(
+            &jwks_url,
+            &JwksAcceptClient {
+                inner: http_client,
+                discovery_url: None,
+            },
+        )
+        .await
+        {
             Ok(jwks) => jwks,
             Err(DiscoveryError::Request(OidcHttpError::ForbiddenOutbound(reason))) => {
-                return Err(format!("JWKS request blocked by outbound policy: {reason}"));
+                return Err(format!("{OIDC_JWKS_BLOCKED_BY_OUTBOUND_POLICY}: {reason}"));
             }
             Err(err) => return Err(format!("failed to fetch JWKS: {err}")),
         };
@@ -2038,7 +2213,7 @@ pub async fn validate_oidc_provider_config_with_extra_root_ca(
 
     Ok(OidcProviderValidationResult {
         issuer: state.metadata.issuer().to_string(),
-        authorization_endpoint: state.metadata.authorization_endpoint().to_string(),
+        authorization_endpoint: state.metadata.authorization_endpoint(),
         token_endpoint: state.metadata.token_endpoint().map(ToString::to_string),
     })
 }
@@ -2598,7 +2773,7 @@ mod tests {
         }
     }
 
-    fn read_mock_oidc_request_path(stream: &mut impl std::io::Read) -> String {
+    fn read_mock_oidc_request(stream: &mut impl std::io::Read) -> String {
         let mut request_bytes = Vec::new();
         let mut buffer = [0u8; 4096];
         loop {
@@ -2615,8 +2790,11 @@ mod tests {
                 break;
             }
         }
-        let request = String::from_utf8_lossy(&request_bytes);
-        request
+        String::from_utf8_lossy(&request_bytes).into_owned()
+    }
+
+    fn read_mock_oidc_request_path(stream: &mut impl std::io::Read) -> String {
+        read_mock_oidc_request(stream)
             .lines()
             .next()
             .unwrap_or("")
@@ -2627,7 +2805,7 @@ mod tests {
     }
 
     fn mock_oidc_response(path: &str, discovery_body: &str, expected_jwks_path: &str, jwks_body: &str) -> String {
-        let (status, body) = if path.contains("/.well-known/openid-configuration") {
+        let (status, body) = if path.ends_with("/.well-known/openid-configuration") {
             (200, discovery_body)
         } else if path == expected_jwks_path {
             (200, jwks_body)
@@ -2646,6 +2824,7 @@ mod tests {
         build_discovery_issuer: F,
         max_requests: usize,
         signing_alg: &'static str,
+        workload: bool,
         jwks_response: J,
     ) -> Option<(String, std::thread::JoinHandle<()>)>
     where
@@ -2670,7 +2849,7 @@ mod tests {
         };
         let base = format!("http://{}", listener.local_addr().expect("listener local address should be available"));
         let (discovery_issuer, discovery_jwks_uri, expected_jwks_path) = build_discovery_issuer(&base);
-        let discovery_body = serde_json::json!({
+        let mut discovery_document = serde_json::json!({
             "issuer": discovery_issuer,
             "authorization_endpoint": format!("{base}/authorize"),
             "token_endpoint": format!("{base}/token"),
@@ -2679,8 +2858,14 @@ mod tests {
             "response_modes_supported": ["query"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": [signing_alg],
-        })
-        .to_string();
+        });
+        if workload {
+            let fields = discovery_document.as_object_mut().expect("mock metadata is an object");
+            fields.remove("authorization_endpoint");
+            fields.remove("token_endpoint");
+            fields.insert("response_types_supported".into(), serde_json::json!(["id_token"]));
+        }
+        let discovery_body = discovery_document.to_string();
         let (ready_tx, ready_rx) = mpsc::channel();
 
         let handle = std::thread::spawn(move || {
@@ -2722,12 +2907,41 @@ mod tests {
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .expect("failed to set discovery mock read timeout");
 
-                let path = read_mock_oidc_request_path(&mut stream);
+                let request = read_mock_oidc_request(&mut stream);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("");
                 let jwks_body = jwks_response(jwks_fetches);
                 if path == expected_jwks_path {
                     jwks_fetches += 1;
                 }
-                let response = mock_oidc_response(&path, &discovery_body, &expected_jwks_path, &jwks_body);
+                let mut response = mock_oidc_response(path, &discovery_body, &expected_jwks_path, &jwks_body);
+                if path.contains("/.well-known/openid-configuration") {
+                    assert!(
+                        request
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .any(|(name, value)| { name.eq_ignore_ascii_case("accept") && value.trim() == "application/json" }),
+                        "discovery Accept must remain unchanged"
+                    );
+                }
+                if path == expected_jwks_path {
+                    let expected_type = if workload {
+                        "application/jwk-set+json"
+                    } else {
+                        "application/json"
+                    };
+                    let accepts_type = request.lines().filter_map(|line| line.split_once(':')).any(|(name, value)| {
+                        name.eq_ignore_ascii_case("accept") && value.split(',').any(|item| item.trim() == expected_type)
+                    });
+                    if !accepts_type {
+                        response = "HTTP/1.1 406 Not Acceptable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into();
+                    } else if workload {
+                        response = response.replace("Content-Type: application/json", "Content-Type: application/jwk-set+json");
+                    }
+                }
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
                 let _ = stream.shutdown(Shutdown::Both);
@@ -2752,7 +2966,7 @@ mod tests {
     where
         F: Fn(&str) -> (String, String, String) + Send + 'static,
     {
-        start_mock_oidc_discovery_server_with_jwks(build_discovery_issuer, max_requests, "RS256", |_| {
+        start_mock_oidc_discovery_server_with_jwks(build_discovery_issuer, max_requests, "RS256", false, |_| {
             r#"{"keys":[]}"#.to_string()
         })
     }
@@ -2779,6 +2993,7 @@ mod tests {
             |base| (base.to_string(), format!("{base}/jwks"), "/jwks".to_string()),
             4,
             "ES256",
+            false,
             move |fetch| {
                 if fetch == 0 {
                     initial_jwks.clone()
@@ -2831,6 +3046,259 @@ mod tests {
         assert_eq!(claims.sub, "rotated-user");
         assert_eq!(claims.groups, vec!["readwrite"]);
         handle.join().expect("rotating JWKS mock server should exit cleanly");
+    }
+
+    #[test]
+    fn workload_metadata_requires_hidden_provider_and_valid_verification_fields() {
+        let document = serde_json::json!({
+            "issuer": "https://issuer.example.com",
+            "jwks_uri": "https://issuer.example.com/jwks",
+            "response_types_supported": ["id_token"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["ES256"],
+        });
+        let parse =
+            |value: &serde_json::Value, hidden| DiscoveredProviderMetadata::parse(&serde_json::to_vec(value).unwrap(), hidden);
+        let metadata = parse(&document, true).expect("hidden workload metadata should parse");
+        assert!(metadata.authorization_endpoint().is_none());
+        assert!(metadata.console().err().unwrap().contains("only web identity"));
+        assert!(parse(&document, false).err().unwrap().contains("authorization_endpoint"));
+        for field in ["issuer", "jwks_uri", "id_token_signing_alg_values_supported"] {
+            let mut invalid = document.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(parse(&invalid, true).err().unwrap().contains(field), "missing {field}");
+        }
+        for endpoint in [serde_json::Value::Null, serde_json::json!(""), serde_json::json!("not a URL")] {
+            let mut invalid = document.clone();
+            invalid["authorization_endpoint"] = endpoint;
+            assert!(parse(&invalid, true).is_err(), "invalid endpoint must not select workload metadata");
+        }
+        let mut complete = document;
+        complete["authorization_endpoint"] = serde_json::json!("https://issuer.example.com/authorize");
+        for hidden in [true, false] {
+            let metadata = parse(&complete, hidden).expect("full providers keep the existing parser");
+            assert!(metadata.console().is_ok());
+            assert!(metadata.token_endpoint().is_none(), "token endpoint remains optional");
+        }
+    }
+
+    #[test]
+    fn workload_metadata_rejects_duplicate_fields() {
+        for hidden in [false, true] {
+            let document = format!(
+                r#"{{"issuer":"https://wrong.example.com","issuer":"https://issuer.example.com",{}"jwks_uri":"https://issuer.example.com/jwks","response_types_supported":["id_token"],"subject_types_supported":["public"],"id_token_signing_alg_values_supported":["ES256"]}}"#,
+                if hidden {
+                    ""
+                } else {
+                    r#""authorization_endpoint":"https://issuer.example.com/authorize","#
+                },
+            );
+            let error = DiscoveredProviderMetadata::parse(document.as_bytes(), hidden)
+                .err()
+                .expect("duplicate issuer must fail");
+            assert!(error.contains("duplicate field"), "{error}");
+        }
+    }
+
+    #[test]
+    fn workload_verifier_preserves_algorithm_secret_and_audience_policy() {
+        let secret = Nonce::new_random().secret().to_string();
+        let mut config = build_mocked_oidc_provider_config("workload", "https://issuer.example.com");
+        config.client_secret = Some(secret.clone());
+        config.other_audiences = vec!["additional-audience".into()];
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let payload = serde_json::json!({
+            "iss": config.config_url, "sub": "repo:example/project:ref:refs/heads/main",
+            "aud": [config.client_id, "additional-audience"], "iat": now, "exp": now + 300,
+        });
+        let signed =
+            jsonwebtoken::encode(&Header::new(Algorithm::HS256), &payload, &EncodingKey::from_secret(secret.as_bytes())).unwrap();
+        let token: CoreIdToken = signed.parse().unwrap();
+        for workload in [false, true] {
+            for (algorithms, accepted) in [
+                (serde_json::json!(["HS256", "unsupported-future-algorithm"]), true),
+                (serde_json::json!(["ES256"]), false),
+                (serde_json::json!(["unsupported-future-algorithm"]), false),
+            ] {
+                let mut document = serde_json::json!({
+                    "issuer": config.config_url, "jwks_uri": "https://issuer.example.com/jwks",
+                    "response_types_supported": ["id_token"], "subject_types_supported": ["public"],
+                    "id_token_signing_alg_values_supported": algorithms,
+                });
+                if !workload {
+                    document["authorization_endpoint"] = serde_json::json!("https://issuer.example.com/authorize");
+                }
+                let metadata = DiscoveredProviderMetadata::parse(&serde_json::to_vec(&document).unwrap(), true).unwrap();
+                let verifier = metadata
+                    .verifier(&config)
+                    .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
+                assert_eq!(
+                    token.claims(&verifier, |_: Option<&Nonce>| Ok(())).is_ok(),
+                    accepted,
+                    "workload={workload}, algorithms={algorithms}"
+                );
+                if accepted {
+                    assert!(
+                        token.claims(&metadata.verifier(&config), |_: Option<&Nonce>| Ok(())).is_err(),
+                        "additional audiences require explicit trust"
+                    );
+                    let mut wrong_secret = config.clone();
+                    wrong_secret.client_secret = Some(Nonce::new_random().secret().to_string());
+                    let verifier = metadata
+                        .verifier(&wrong_secret)
+                        .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
+                    assert!(
+                        token.claims(&verifier, |_: Option<&Nonce>| Ok(())).is_err(),
+                        "incorrect client secret must fail"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workload_discovery_stops_after_forbidden_jwks() {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        let (base, handle) = start_mock_oidc_discovery_server_with_jwks(
+            |base| (base.to_string(), "http://192.168.65.254:8080/jwks".into(), "/jwks".into()),
+            2,
+            "ES256",
+            true,
+            move |_| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                serde_json::json!({"keys": []}).to_string()
+            },
+        )
+        .expect("workload discovery mock must bind");
+        let mut config = build_mocked_oidc_provider_config("workload", &base);
+        config.hide_from_ui = true;
+        let client = ReqwestHttpClient::with_policy(OutboundPolicy::from_allowed_origins(&base).unwrap());
+        let error = OidcSys::discover_provider(&config, &client)
+            .await
+            .err()
+            .expect("private JWKS must be blocked");
+        assert!(error.starts_with(OIDC_JWKS_BLOCKED_BY_OUTBOUND_POLICY), "{error}");
+        handle.join().unwrap();
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a policy denial must not retry discovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn workload_config_validation_reports_absent_console_endpoints() {
+        let (base, handle) = start_mock_oidc_discovery_server_with_jwks(
+            |base| (base.to_string(), format!("{base}/jwks"), "/jwks".into()),
+            2,
+            "ES256",
+            true,
+            |_| serde_json::json!({"keys": []}).to_string(),
+        )
+        .expect("workload discovery mock must bind");
+        let mut config = build_mocked_oidc_provider_config("workload", &base);
+        config.hide_from_ui = true;
+        // Inferred issuers keep the library's discovery URL construction.
+        config.config_url = format!("{base}/.well-known/openid-configuration?ignored=1#ignored");
+        let result = validate_mocked_oidc_provider_config(&config)
+            .await
+            .expect("hidden workload configuration should validate");
+        assert_eq!(result.issuer, base);
+        assert!(result.authorization_endpoint.is_none());
+        assert!(result.token_endpoint.is_none());
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn workload_discovery_verification_and_rotation() {
+        for explicit_issuer in [false, true] {
+            let (_, initial_jwk) = oidc_es256_key_and_jwk("initial");
+            let (key, rotated_jwk) = oidc_es256_key_and_jwk("rotated");
+            let initial_jwks = serde_json::json!({"keys": [initial_jwk]}).to_string();
+            let rotated_jwks = serde_json::json!({"keys": [rotated_jwk]}).to_string();
+            let (base, handle) = start_mock_oidc_discovery_server_with_jwks(
+                |base| (base.to_string(), format!("{base}/jwks"), "/jwks".into()),
+                4,
+                "ES256",
+                true,
+                move |fetch| {
+                    if fetch == 0 {
+                        initial_jwks.clone()
+                    } else {
+                        rotated_jwks.clone()
+                    }
+                },
+            )
+            .expect("workload discovery mock must bind");
+            let mut config = build_mocked_oidc_provider_config("workload", &base);
+            config.hide_from_ui = true;
+            if explicit_issuer {
+                config.issuer = Some(base.clone());
+            }
+            let http_client = ReqwestHttpClient::with_policy(OutboundPolicy::from_allowed_origins(&base).unwrap());
+            let state = OidcSys::discover_provider(&config, &http_client)
+                .await
+                .expect("workload discovery must succeed");
+            assert!(state.metadata.authorization_endpoint().is_none());
+            let sys = OidcSys {
+                configs: HashMap::from([(config.id.clone(), config.clone())]),
+                provider_states: RwLock::new(HashMap::from([(config.id.clone(), state)])),
+                state_store: OidcStateStore::new(),
+                http_client,
+            };
+            assert!(sys.has_providers());
+            assert!(sys.list_visible_providers().is_empty());
+            let error = sys
+                .authorize_url(&config.id, "https://console.example.com/callback", None)
+                .await
+                .unwrap_err();
+            assert!(error.contains("only web identity"));
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            let payload = serde_json::json!({
+                "iss": base, "sub": "system:serviceaccount:default:reader", "aud": [config.client_id],
+                "iat": now, "exp": now + 300, "groups": ["readonly"],
+                "kubernetes.io": {"namespace": "default", "serviceaccount": {"name": "reader"}},
+            });
+            let mut header = Header::new(Algorithm::ES256);
+            header.kid = Some("rotated".into());
+            let token = jsonwebtoken::encode(&header, &payload, &key).unwrap();
+            let (claims, provider) = sys
+                .verify_web_identity_token(&token)
+                .await
+                .expect("rotation must retain workload discovery support");
+            assert_eq!(provider, config.id);
+            assert_eq!(claims.sub, "system:serviceaccount:default:reader");
+            assert_eq!(claims.groups, ["readonly"]);
+            // Repeat after the mock exits: the verified snapshot must be cached.
+            handle.join().unwrap();
+            assert!(sys.verify_web_identity_token(&token).await.is_ok());
+            for (field, value, expected) in [
+                ("iss", serde_json::json!("https://wrong.example.com"), "issuer"),
+                ("aud", serde_json::json!("wrong-audience"), "audience"),
+                ("exp", serde_json::json!(now - 60), "expired"),
+            ] {
+                let mut invalid = payload.clone();
+                invalid[field] = value;
+                let token = jsonwebtoken::encode(&header, &invalid, &key).unwrap();
+                let error = sys
+                    .verify_web_identity_token(&token)
+                    .await
+                    .expect_err("invalid workload token must fail");
+                assert!(error.to_lowercase().contains(expected), "{field}: {error}");
+            }
+            let (wrong_key, _) = oidc_es256_key_and_jwk("wrong");
+            let invalid = jsonwebtoken::encode(&header, &payload, &wrong_key).unwrap();
+            let error = sys
+                .verify_web_identity_token(&invalid)
+                .await
+                .expect_err("wrong signature must fail");
+            assert!(error.to_lowercase().contains("signature"), "{error}");
+            assert!(
+                sys.verify_web_identity_token(&token).await.is_ok(),
+                "failed refresh must preserve the cached keys"
+            );
+        }
     }
 
     fn start_mock_oidc_tls_discovery_server<F>(
@@ -2958,7 +3426,7 @@ mod tests {
 
         Ok(OidcProviderValidationResult {
             issuer: state.metadata.issuer().to_string(),
-            authorization_endpoint: state.metadata.authorization_endpoint().to_string(),
+            authorization_endpoint: state.metadata.authorization_endpoint(),
             token_endpoint: state.metadata.token_endpoint().map(ToString::to_string),
         })
     }
@@ -3558,7 +4026,7 @@ mod tests {
             provider_states: RwLock::new(HashMap::from([(
                 provider_id.to_string(),
                 ProviderState {
-                    metadata,
+                    metadata: DiscoveredProviderMetadata::Console(Box::new(metadata)),
                     discovered_at: Instant::now(),
                 },
             )])),
