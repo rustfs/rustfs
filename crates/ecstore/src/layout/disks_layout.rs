@@ -25,6 +25,20 @@ pub(crate) const MAX_ERASURE_SET_DRIVE_COUNT: usize = 16;
 const SET_SIZES: [usize; 15] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, MAX_ERASURE_SET_DRIVE_COUNT];
 const ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT: &str = "RUSTFS_ERASURE_SET_DRIVE_COUNT";
 
+#[derive(Debug, thiserror::Error)]
+enum PoolDriveCountError {
+    #[error(
+        "Incorrect number of endpoints provided, size {size}; an erasure pool requires at least {} drive endpoints on one or more nodes; for a standalone single-drive deployment, use a single local path without ellipses",
+        SET_SIZES[0]
+    )]
+    BelowMinimum { size: usize },
+    #[error(
+        "Incorrect number of endpoints provided, size {size}; {}={set_drive_count} requires at least {set_drive_count} drive endpoints per pool",
+        ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT
+    )]
+    BelowSetWidth { size: usize, set_drive_count: usize },
+}
+
 #[derive(Deserialize, Debug, Default)]
 pub struct PoolDisksLayout {
     cmd_line: String,
@@ -397,15 +411,10 @@ fn get_set_indexes<T: AsRef<str>>(
 
     for &size in total_sizes {
         if size < SET_SIZES[0] {
-            return Err(Error::other(format!(
-                "Incorrect number of endpoints provided, size {size}; an erasure pool requires at least {} drive endpoints on one or more nodes; for a standalone single-drive deployment, use a single local path without ellipses",
-                SET_SIZES[0]
-            )));
+            return Err(Error::other(PoolDriveCountError::BelowMinimum { size }));
         }
         if size < set_drive_count {
-            return Err(Error::other(format!(
-                "Incorrect number of endpoints provided, size {size}; {ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT}={set_drive_count} requires at least {set_drive_count} drive endpoints per pool"
-            )));
+            return Err(Error::other(PoolDriveCountError::BelowSetWidth { size, set_drive_count }));
         }
     }
 
@@ -1028,6 +1037,11 @@ mod test {
                     let err = DisksLayout::from_volumes(&volumes).expect_err("a singleton range still contains one drive");
                     let message = err.to_string();
 
+                    assert_eq!(err.kind(), std::io::ErrorKind::Other);
+                    assert!(matches!(
+                        err.get_ref().and_then(|source| source.downcast_ref::<PoolDriveCountError>()),
+                        Some(PoolDriveCountError::BelowMinimum { size: 1 })
+                    ));
                     assert!(message.contains("at least 2 drive endpoints"), "{message}");
                     assert!(message.contains("single local path without ellipses"), "{message}");
                 }
@@ -1049,6 +1063,14 @@ mod test {
             get_all_sets(4, true, &["http://node{1...2}:9000/data"]).expect_err("two endpoints cannot fill a four-drive set");
         let message = err.to_string();
 
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(matches!(
+            err.get_ref().and_then(|source| source.downcast_ref::<PoolDriveCountError>()),
+            Some(PoolDriveCountError::BelowSetWidth {
+                size: 2,
+                set_drive_count: 4
+            })
+        ));
         assert!(message.contains("size 2"), "{message}");
         assert!(message.contains("RUSTFS_ERASURE_SET_DRIVE_COUNT=4"), "{message}");
     }
