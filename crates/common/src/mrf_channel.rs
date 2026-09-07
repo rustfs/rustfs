@@ -441,6 +441,27 @@ pub fn try_send_mrf_intent_typed(
     }
 }
 
+/// Acquire a fresh process-local lease for one durable replay record.
+///
+/// Journal records deliberately do not persist leases. A replay consumer must
+/// call this before submitting the record so a later verified repair event can
+/// identify the exact replay admission. Replay does not reserve the live
+/// producer coalescer key: the replay queue first deduplicates legacy records,
+/// then manager admission owns task-level deduplication with live producers.
+pub fn try_rearm_mrf_replay_intent(intent: &mut MrfIntent) -> MrfIngressResult {
+    if intent.lease.is_some() {
+        return MrfIngressResult::Enqueued;
+    }
+    if intent.bucket.len() > MRF_MAX_IDENTITY_COMPONENT || intent.object.len() > MRF_MAX_IDENTITY_COMPONENT {
+        return MrfIngressResult::Dropped(MrfDropReason::OversizedIdentity);
+    }
+    let (version_id, scope) = canonical_identity(intent.kind, intent.version_id, intent.scope);
+    intent.version_id = version_id;
+    intent.scope = scope;
+    intent.lease = Some(MrfIngressLease::new(NEXT_MRF_LEASE.fetch_add(1, Ordering::Relaxed)));
+    MrfIngressResult::Enqueued
+}
+
 /// Release the ingress key once the consumer owns the intent.
 pub fn release_mrf_intent(intent: &MrfIntent) {
     release_mrf_identity(intent.kind, &intent.bucket, &intent.object, intent.version_id, intent.scope, intent.lease);
@@ -695,6 +716,33 @@ mod tests {
                 set_index: 2
             })
         );
+    }
+
+    #[test]
+    fn durable_replay_rearm_assigns_a_fresh_dischargeable_lease() {
+        let unique = Uuid::new_v4();
+        let mut intent = MrfIntent {
+            bucket: Arc::from(format!("replay-{unique}")),
+            object: Arc::from("object"),
+            version_id: Some([0; 16]),
+            kind: MrfKind::PartialWrite,
+            scope: Some(MrfScope {
+                pool_index: 2,
+                set_index: 3,
+            }),
+            lease: None,
+            enqueued_at_ms: 1,
+            attempts: 0,
+        };
+
+        assert_eq!(try_rearm_mrf_replay_intent(&mut intent), MrfIngressResult::Enqueued);
+        assert_eq!(intent.version_id, None, "nil versions remain canonical during replay");
+        assert!(intent.lease.is_some(), "replay admission must carry a fresh lease");
+        assert!(
+            MrfDurableRepairAnchor::from_intent(&intent, Uuid::new_v4()).is_some(),
+            "a rearmed replay record can participate in exact durable proof matching"
+        );
+        release_mrf_intent(&intent);
     }
 
     #[test]

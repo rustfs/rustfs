@@ -36,7 +36,7 @@
 use super::{DiskStore, HealDiskExt as _, local_disk_map_read};
 use crate::heal::manager::{HealManager, MrfRepairNoticeTarget};
 use metrics::{counter, gauge};
-use rustfs_common::mrf_channel::{MRF_MAX_ATTEMPTS, MrfIntent};
+use rustfs_common::mrf_channel::{MRF_MAX_ATTEMPTS, MrfIngressResult, MrfIntent};
 use rustfs_heal_contracts::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -705,9 +705,9 @@ async fn replay_into(
             }
         },
     };
-    let mut intents = Vec::new();
     let (decoded, truncated) = decode_journal(&data);
-    intents.extend(decoded);
+    let replayed = decoded.len();
+    let intents = decoded;
     if truncated > 0 {
         tracing::warn!(
             target: "rustfs::heal::mrf",
@@ -715,8 +715,7 @@ async fn replay_into(
             "MRF journal had a torn tail; truncated records were discarded"
         );
     }
-    counter!("rustfs_heal_mrf_replayed_total").increment(u64::try_from(intents.len()).unwrap_or(u64::MAX));
-    let replayed = intents.len();
+    counter!("rustfs_heal_mrf_replayed_total").increment(u64::try_from(replayed).unwrap_or(u64::MAX));
     let replay_bytes = intents
         .iter()
         .fold(0usize, |total, intent| total.saturating_add(intent.estimated_bytes()));
@@ -743,6 +742,15 @@ async fn replay_into(
     let mut retained_replay_intents = Vec::new();
     if backoff_until.is_none() {
         while let Some(mut intent) = queue.pop_front() {
+            if !matches!(
+                rustfs_common::mrf_channel::try_rearm_mrf_replay_intent(&mut intent),
+                MrfIngressResult::Enqueued
+            ) {
+                queue.push_back(intent);
+                rearm_incomplete = true;
+                *backoff_until = Some(tokio::time::Instant::now());
+                break;
+            }
             match submit_mrf_heal_request(manager, &intent).await {
                 Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {
                     retained_replay_intents.push(intent);
@@ -759,7 +767,9 @@ async fn replay_into(
                     }
                     break;
                 }
-                Ok(HealAdmissionResult::Dropped(_)) => {}
+                Ok(HealAdmissionResult::Dropped(_)) => {
+                    rustfs_common::mrf_channel::release_mrf_intent(&intent);
+                }
                 Err(_) => {
                     intent.attempts = intent.attempts.saturating_add(1);
                     if intent.attempts < MRF_MAX_ATTEMPTS {
@@ -973,6 +983,40 @@ mod tests {
             !replay_must_retain_journal(false, 0, 0),
             "only a fully consumed replay snapshot with no retained anchors may be deleted"
         );
+    }
+
+    #[test]
+    fn durable_replay_acquires_a_fresh_lease_before_manager_admission() {
+        let unique = uuid::Uuid::new_v4();
+        let original = intent(&format!("replay-{unique}"), "object", 0);
+        assert!(original.lease.is_none(), "legacy journal records do not persist process leases");
+        let mut queue = MrfQueue::new(2, usize::MAX);
+        assert_eq!(queue.try_push_typed(original.clone()), MrfQueuePushResult::Enqueued);
+        assert_eq!(
+            queue.try_push_typed(original),
+            MrfQueuePushResult::Coalesced,
+            "legacy duplicates are one durable responsibility before a lease is assigned"
+        );
+        let mut replay = queue.pop_front().expect("one deduplicated replay record");
+        assert_eq!(
+            rustfs_common::mrf_channel::try_rearm_mrf_replay_intent(&mut replay),
+            MrfIngressResult::Enqueued
+        );
+        assert!(replay.lease.is_some(), "manager admission must receive the replay lease");
+        assert!(
+            rustfs_common::mrf_channel::MrfDurableRepairAnchor::from_intent(&replay, uuid::Uuid::new_v4()).is_some(),
+            "the replay identity must be usable by the durable proof consumer"
+        );
+        let mut encoded = Vec::new();
+        assert!(encode_intent(&replay, &mut encoded));
+        let (decoded, truncated) = decode_journal(&encoded);
+        assert_eq!(truncated, 0);
+        assert_eq!(decoded.len(), 1);
+        assert!(
+            decoded[0].lease.is_none(),
+            "process-local leases must not enter the durable journal format"
+        );
+        rustfs_common::mrf_channel::release_mrf_intent(&replay);
     }
 
     #[test]
