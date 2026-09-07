@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: overtrue/repo-visuals-action@fd79cba437ecfac933d00a69add17eb95d3939c3 # v1.3.1
+      - uses: overtrue/repo-visuals-action@ee2c632f6ce617e851fb46ea935ee8af762ebb93 # v1.4.0
         with:
           github-token: ${{ github.token }}
           output-branch: star-history
