@@ -6650,6 +6650,7 @@ async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> rust
             total_sets,
             ..Default::default()
         },
+        ..Default::default()
     }
 }
 pub async fn stat_all_dirs(disks: &[Option<DiskStore>], bucket: &str, prefix: &str) -> Vec<Option<DiskError>> {

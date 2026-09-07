@@ -1381,6 +1381,7 @@ mod tests {
                 ..Default::default()
             },
             disks: Vec::new(),
+            ..Default::default()
         };
 
         assert_eq!(pool_erasure_layout(&info, 0, 4), Some((2, 2)));
@@ -1401,6 +1402,7 @@ mod tests {
                 ..Default::default()
             },
             disks: Vec::new(),
+            ..Default::default()
         };
 
         assert_eq!(pool_write_quorum(&info, 0, 8), Some(6));
@@ -1419,6 +1421,7 @@ mod tests {
                 ..Default::default()
             },
             disks: online_readiness_disks(0, 8),
+            ..Default::default()
         };
 
         assert_eq!(pool_erasure_layout(&info, 0, 8), Some((6, 2)));
@@ -1437,6 +1440,7 @@ mod tests {
                 ..Default::default()
             },
             disks: online_readiness_disks(0, 8),
+            ..Default::default()
         };
 
         assert_eq!(pool_erasure_layout(&info, 0, 8), None);
@@ -1453,6 +1457,7 @@ mod tests {
                 ..Default::default()
             },
             disks: Vec::new(),
+            ..Default::default()
         };
 
         assert_eq!(pool_erasure_layout(&info, 0, 4), Some((3, 1)));
@@ -1468,6 +1473,7 @@ mod tests {
                 ..Default::default()
             },
             disks: online_readiness_disks(0, 3),
+            ..Default::default()
         };
 
         assert_eq!(pool_erasure_layout(&info, 0, 3), Some((2, 1)));
@@ -1487,10 +1493,12 @@ mod tests {
         let three_online = StorageInfo {
             backend: backend.clone(),
             disks: online_readiness_disks(0, 3),
+            ..Default::default()
         };
         let two_online = StorageInfo {
             backend,
             disks: online_readiness_disks(0, 2),
+            ..Default::default()
         };
 
         assert!(storage_read_ready_from_runtime_state(&three_online));
@@ -1510,6 +1518,7 @@ mod tests {
                 ..Default::default()
             },
             disks: online_readiness_disks(0, 3),
+            ..Default::default()
         };
 
         assert!(!storage_read_ready_from_runtime_state(&info));
@@ -1525,6 +1534,7 @@ mod tests {
                 ..Default::default()
             },
             disks: online_readiness_disks(0, 3),
+            ..Default::default()
         };
 
         assert!(!storage_read_ready_from_runtime_state(&info));
@@ -1540,6 +1550,7 @@ mod tests {
                 ..Default::default()
             },
             disks: online_readiness_disks(0, 3),
+            ..Default::default()
         };
 
         assert!(!storage_read_ready_from_runtime_state(&info));
@@ -1566,6 +1577,7 @@ mod tests {
                 ..Default::default()
             },
             disks,
+            ..Default::default()
         };
 
         assert!(!storage_ready_from_runtime_state(&info));
@@ -1588,6 +1600,7 @@ mod tests {
                 runtime_state: Some("offline".to_string()),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         assert!(!storage_ready_from_runtime_state(&info));
@@ -1609,6 +1622,7 @@ mod tests {
                 runtime_state: Some("online".to_string()),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         assert!(storage_ready_from_runtime_state(&info));
@@ -1637,10 +1651,45 @@ mod tests {
                 ..Default::default()
             },
             disks,
+            ..Default::default()
         };
 
         assert!(storage_read_ready_from_runtime_state(&info));
         assert!(!storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn unknown_inventory_does_not_supply_quorum_evidence() {
+        let mut info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![2],
+                total_sets: vec![1],
+                drives_per_set: vec![4],
+                ..Default::default()
+            },
+            disks: (0..4)
+                .map(|disk_index| Disk {
+                    endpoint: format!("node-{disk_index}"),
+                    pool_index: 0,
+                    set_index: 0,
+                    disk_index,
+                    state: "ok".to_string(),
+                    runtime_state: Some("online".to_string()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(storage_ready_from_runtime_state(&info));
+        for disk in &mut info.disks[2..] {
+            disk.state = rustfs_madmin::ITEM_UNKNOWN.to_string();
+            disk.runtime_state = Some(rustfs_madmin::ITEM_UNKNOWN.to_string());
+        }
+        assert!(storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
+        assert_eq!(pool_read_quorum(&info, 0, 4), Some(2));
+        assert_eq!(pool_write_quorum(&info, 0, 4), Some(3));
+        assert!(info.disks.iter().all(|disk| disk.state != rustfs_madmin::ITEM_OFFLINE));
     }
 
     #[test]
@@ -1663,6 +1712,7 @@ mod tests {
                 ..Default::default()
             },
             disks: vec![duplicate_disk.clone(), duplicate_disk],
+            ..Default::default()
         };
 
         assert!(!storage_ready_from_runtime_state(&info), "duplicate rows must not satisfy write quorum");
@@ -1719,6 +1769,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
 
         assert!(

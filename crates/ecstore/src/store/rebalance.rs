@@ -1146,7 +1146,11 @@ impl ECStore {
         }
 
         let backend = StorageAdminApi::backend_info(self).await;
-        rustfs_madmin::StorageInfo { backend, disks }
+        rustfs_madmin::StorageInfo {
+            backend,
+            disks,
+            ..Default::default()
+        }
     }
 
     #[instrument(skip(self))]
