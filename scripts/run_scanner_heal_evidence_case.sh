@@ -197,6 +197,11 @@ fi
 printf '%s' "$BUILD_FEATURES" >"$ROOT/target/debug/rustfs.features"
 
 LISTING_TMP="$TMP_DIR/listing.json"
+NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}" \
+HTTP_PROXY= \
+HTTPS_PROXY= \
+RUSTFS_SCANNER_HEAL_RUN_DIR="$RUN_DIR" \
+cargo nextest run --profile "$PROFILE" -p e2e_test -E "$TEST_FILTER" --no-run --no-tests=fail
 cargo nextest list --profile "$PROFILE" -p e2e_test -E "$TEST_FILTER" --message-format json >"$LISTING_TMP"
 TEST_BINARY="$(test_binary_from_listing "$LISTING_TMP" "$CASE_ID")"
 
