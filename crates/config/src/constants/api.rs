@@ -90,3 +90,15 @@ pub const ENV_API_MAX_CONNECTIONS: &str = "RUSTFS_API_MAX_CONNECTIONS";
 
 /// Default for `RUSTFS_API_MAX_CONNECTIONS` (`0` = unlimited).
 pub const DEFAULT_API_MAX_CONNECTIONS: usize = 0;
+
+/// Maximum retained versions per object.
+///
+/// The default follows MinIO and is effectively unlimited for practical
+/// deployments. Operators can lower it to bound per-object metadata growth.
+/// Environment variable: RUSTFS_API_OBJECT_MAX_VERSIONS
+/// MinIO-compatible alias: MINIO_API_OBJECT_MAX_VERSIONS
+/// Example: RUSTFS_API_OBJECT_MAX_VERSIONS=50000
+pub const ENV_API_OBJECT_MAX_VERSIONS: &str = "RUSTFS_API_OBJECT_MAX_VERSIONS";
+
+/// Default for `RUSTFS_API_OBJECT_MAX_VERSIONS`.
+pub const DEFAULT_API_OBJECT_MAX_VERSIONS: u64 = 9_223_372_036_854_775_807;
