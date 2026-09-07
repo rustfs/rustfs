@@ -1473,20 +1473,17 @@ fn layout_cases() -> Vec<LayoutCase> {
             true,
         ),
         // SSE-C passthrough replicates the stored ciphertext part by part; a
-        // compressible first part is stored well below 5 MiB and a standard
-        // target rejects it with EntityTooSmall. rc.5 fails the same way (see
-        // `rc5_baseline_replicates_multipart_layouts`), so the outcome is
-        // recorded rather than asserted here; tracked as rustfs/backlog#2363.
-        LayoutCase {
-            assert_replication: false,
-            ..case(
-                LAYOUT_PLAIN_BUCKET,
-                "plain/ssec-compressed-multipart-2.txt",
-                two.clone(),
-                layout_text(total(&two), 7),
-                true,
-            )
-        },
+        // compressible first part is stored well below 5 MiB, so the sender
+        // declares each part's plaintext length and the target validates the
+        // 5 MiB minimum against it (rustfs/backlog#2363). rc.5 as the sender
+        // still fails this layout (see `rc5_baseline_replicates_multipart_layouts`).
+        case(
+            LAYOUT_PLAIN_BUCKET,
+            "plain/ssec-compressed-multipart-2.txt",
+            two.clone(),
+            layout_text(total(&two), 7),
+            true,
+        ),
         case(
             LAYOUT_ENCRYPTED_BUCKET,
             "encrypted/single.bin",
@@ -1838,27 +1835,20 @@ async fn direct_upgrade_from_rc5_preserves_multipart_layouts() -> TestResult {
                 transport.uploaded_parts, expected,
                 "{label}: stored parts must replicate as the same multipart layout"
             );
-            // The current build can drive an existing object twice (two
-            // full CreateMultipartUpload/UploadPart/Complete rounds with
-            // distinct upload ids) while its status is still PENDING; the
-            // rc.5 baseline drives once. That is a scheduling difference,
-            // not a layout one, tracked as rustfs/backlog#2362.
-            assert!(transport.completes >= 1, "{label}: at least one CompleteMultipartUpload");
-            if transport.completes > 1 {
-                tracing::warn!(
-                    target: "e2e_test::upgrade_compatibility_test",
-                    object = %label,
-                    completes = transport.completes,
-                    journal = ?transport.journal,
-                    "existing-object replication drove the same object more than once (rustfs/backlog#2362)"
-                );
-            }
+            // An object still PENDING when the next scanner cycle arrives is
+            // not driven a second time (rustfs/backlog#2362); the journal is
+            // logged so a duplicate round is visible if this ever regresses.
+            assert_eq!(
+                transport.completes, 1,
+                "{label}: exactly one CompleteMultipartUpload; journal {:?}",
+                transport.journal
+            );
             assert_eq!(
                 transport.single_puts, 0,
                 "{label}: a multipart layout must not go out as a single PutObject"
             );
         } else {
-            assert!(transport.single_puts >= 1, "{label}: a single PUT replicates as PutObject");
+            assert_eq!(transport.single_puts, 1, "{label}: a single PUT replicates as exactly one PutObject");
             assert!(transport.uploaded_parts.is_empty(), "{label}: a single PUT must not go out as multipart");
         }
         if !case.ssec {
@@ -1926,5 +1916,61 @@ async fn rc5_baseline_replicates_multipart_layouts() -> TestResult {
         })
         .collect();
     tracing::info!(target: "e2e_test::upgrade_compatibility_test", ?summary, "rc.5 baseline replication outcomes");
+    Ok(())
+}
+
+/// backlog#2362 under the same conditions that reproduced it with the rc.5
+/// writer, but with the workspace build on both sides so it runs in the
+/// ordinary lane: every pre-existing layout is driven through exactly one
+/// upload round even though the scanner re-scans it every second while the
+/// first round is still in flight.
+#[tokio::test]
+async fn existing_object_replication_drives_each_layout_once() -> TestResult {
+    init_logging();
+    let server_env = layout_server_env();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(vec![], &server_env).await?;
+    let writer = env.create_s3_client();
+    env.create_test_bucket(LAYOUT_PLAIN_BUCKET).await?;
+    env.create_test_bucket(LAYOUT_ENCRYPTED_BUCKET).await?;
+    enable_versioning(&writer, LAYOUT_PLAIN_BUCKET).await?;
+    enable_versioning(&writer, LAYOUT_ENCRYPTED_BUCKET).await?;
+    put_default_sse_s3_encryption(&writer, LAYOUT_ENCRYPTED_BUCKET).await?;
+
+    let mut cases = layout_cases();
+    for case in cases.iter_mut() {
+        layout_write(&writer, case).await?;
+        let head = layout_head(&writer, case).await?;
+        case.rc5_etag = head
+            .e_tag()
+            .ok_or_else(|| format!("{}: HEAD omitted the ETag", case.label()))?
+            .trim_matches('"')
+            .to_string();
+    }
+
+    // The objects come from an earlier process lifetime: the scanner starts
+    // cold and every object is a candidate at once.
+    env.restart_server_preserving_data(vec![], &server_env).await?;
+    let client = env.create_s3_client();
+    let (_target, transports) = replicate_layouts(&env, &client, &cases).await?;
+    let mut duplicates = Vec::new();
+    for (case, transport) in cases.iter().zip(&transports) {
+        assert_eq!(
+            transport.status,
+            "COMPLETED",
+            "{}: existing-object replication must complete",
+            case.label()
+        );
+        let rounds = if case.is_multipart_layout() {
+            transport.completes
+        } else {
+            transport.single_puts
+        };
+        if rounds != 1 {
+            duplicates.push(format!("{}: {rounds} upload rounds; journal {:?}", case.label(), transport.journal));
+        }
+    }
+    assert!(duplicates.is_empty(), "each existing object must be driven exactly once: {duplicates:?}");
     Ok(())
 }

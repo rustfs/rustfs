@@ -75,6 +75,7 @@ use tracing::{debug, info, instrument, warn};
 const EVENT_REPLICATION_WORKER_RESIZE_SKIPPED: &str = "replication_worker_resize_skipped";
 const EVENT_REPLICATION_WORKER_RESIZED: &str = "replication_worker_resized";
 const EVENT_REPLICATION_BACKPRESSURE: &str = "replication_backpressure";
+const EVENT_REPLICATION_IN_FLIGHT_SKIPPED: &str = "replication_in_flight_skipped";
 const EVENT_REPLICATION_RESYNC_LOAD_SKIPPED: &str = "replication_resync_load_skipped";
 const EVENT_REPLICATION_RESYNC_RECOVERED: &str = "replication_resync_recovered";
 const EVENT_REPLICATION_MRF_QUEUE_UNAVAILABLE: &str = "replication_mrf_queue_unavailable";
@@ -1089,6 +1090,9 @@ pub struct ReplicationPool<S: ReplicationStorage> {
     workers: RwLock<Vec<Sender<ReplicationOperation>>>,
     lrg_workers: RwLock<Vec<Sender<ReplicationOperation>>>,
 
+    /// Object versions queued or being replicated right now (backlog#2362).
+    in_flight: Arc<ReplicationInFlight>,
+
     // MRF (Most Recent Failures) channels
     mrf_replica_tx: Sender<ReplicationOperation>,
     // Shared among N MRF workers; Arc allows spawning more than one worker.
@@ -1147,6 +1151,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             storage,
             workers: RwLock::new(Vec::new()),
             lrg_workers: RwLock::new(Vec::new()),
+            in_flight: Arc::new(ReplicationInFlight::default()),
             mrf_replica_tx,
             mrf_replica_rx: Arc::new(Mutex::new(mrf_replica_rx)),
             mrf_save_tx,
@@ -1202,12 +1207,13 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             let active_counter = self.active_lrg_workers.clone();
             let storage = self.storage.clone();
             let stats = self.stats.clone();
+            let in_flight = self.in_flight.clone();
 
             let handle = tokio::spawn(async move {
                 let mut rx = rx;
                 while let Some(operation) = rx.recv().await {
                     let _active = ActiveWorkerGuard::new(active_counter.clone());
-                    process_replication_operation(operation, stats.clone(), storage.clone()).await;
+                    process_replication_operation(operation, stats.clone(), storage.clone(), in_flight.clone()).await;
                 }
             });
 
@@ -1261,12 +1267,13 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             let active_counter = self.active_workers.clone();
             let stats = self.stats.clone();
             let storage = self.storage.clone();
+            let in_flight = self.in_flight.clone();
 
             let handle = tokio::spawn(async move {
                 let mut rx = rx;
                 while let Some(operation) = rx.recv().await {
                     let _active = ActiveWorkerGuard::new(active_counter.clone());
-                    process_replication_operation(operation, stats.clone(), storage.clone()).await;
+                    process_replication_operation(operation, stats.clone(), storage.clone(), in_flight.clone()).await;
                 }
             });
 
@@ -1305,6 +1312,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             let active_counter = self.active_mrf_workers.clone();
             let stats = self.stats.clone();
             let storage = self.storage.clone();
+            let in_flight = self.in_flight.clone();
             let mrf_rx = Arc::clone(&self.mrf_replica_rx);
 
             let handle = tokio::spawn(async move {
@@ -1324,7 +1332,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     let Some(operation) = operation else { break };
 
                     let _active = ActiveWorkerGuard::new(active_counter.clone());
-                    process_replication_operation(operation, stats.clone(), storage.clone()).await;
+                    process_replication_operation(operation, stats.clone(), storage.clone(), in_flight.clone()).await;
                 }
             });
             self.task_handles.lock().await.push(handle);
@@ -1454,6 +1462,24 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
     /// Queues a replica task
     pub async fn queue_replica_task(&self, ri: ReplicateObjectInfo) -> ReplicationQueueAdmission {
+        // A version that is already queued or being uploaded is not driven a
+        // second time: the scanner heal pass sees it as PENDING until the
+        // first upload lands and would otherwise re-queue it every cycle
+        // (backlog#2362). The key is released when the worker finishes, or
+        // below when no worker accepts the task.
+        if !self.in_flight.try_begin(&ri) {
+            debug!(
+                event = EVENT_REPLICATION_IN_FLIGHT_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket = %ri.bucket,
+                object = %ri.name,
+                version_id = ?ri.version_id,
+                op_type = ?ri.op_type,
+                "Replication task already in flight; not queued again"
+            );
+            return ReplicationQueueAdmission::Skipped;
+        }
         let target_arns = ri.dsc.replicate_target_arns();
         // If object is large, queue it to a static set of large workers
         if should_queue_large_object(ri.size) {
@@ -1484,7 +1510,9 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     let resize = large_worker_backpressure_resize(existing, self.active_lrg_workers(), max_l_workers);
                     drop(lrg_workers);
 
-                    // Queue to MRF if worker is busy.
+                    // Queue to MRF if worker is busy. The MRF replay re-enters
+                    // this function, so the version is no longer in flight.
+                    self.in_flight.finish(&ri);
                     let admission = self.queue_mrf_save_admission(ri.to_mrf_entry(), "large_object").await;
 
                     if let Some(resize) = resize {
@@ -1493,6 +1521,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     return admission;
                 }
             }
+            self.in_flight.finish(&ri);
             return ReplicationQueueAdmission::Missed;
         }
 
@@ -1501,6 +1530,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         let ch = self.worker_queue_channel(&ri.op_type, &ri.bucket, &ri.name, ri.size).await;
 
         let Some(channel) = ch else {
+            self.in_flight.finish(&ri);
             return ReplicationQueueAdmission::Missed;
         };
 
@@ -1512,7 +1542,9 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         self.stats.dec_q(&ri.bucket, ri.size, ri.delete_marker, ri.op_type);
         self.stats.dec_target_q(&ri.bucket, &target_arns, ri.size);
 
-        // Queue to MRF if all workers are busy.
+        // Queue to MRF if all workers are busy. The MRF replay re-enters this
+        // function, so the version is no longer in flight.
+        self.in_flight.finish(&ri);
         let admission = self.queue_mrf_save_admission(ri.to_mrf_entry(), "object").await;
 
         // Try to scale up workers based on priority
@@ -1811,7 +1843,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     ) {
         while let Some(operation) = rx.recv().await {
             let _active = ActiveWorkerGuard::new(active_counter.clone());
-            process_replication_operation(operation, stats.clone(), self.storage.clone()).await;
+            process_replication_operation(operation, stats.clone(), self.storage.clone(), self.in_flight.clone()).await;
         }
     }
 
@@ -1829,7 +1861,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     ) {
         while let Some(operation) = rx.recv().await {
             let _active = ActiveWorkerGuard::new(active_counter.clone());
-            process_replication_operation(operation, stats.clone(), storage.clone()).await;
+            process_replication_operation(operation, stats.clone(), storage.clone(), self.in_flight.clone()).await;
         }
     }
 
@@ -1846,7 +1878,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     ) {
         while let Some(operation) = rx.recv().await {
             let _active = ActiveWorkerGuard::new(active_counter.clone());
-            process_replication_operation(operation, stats.clone(), self.storage.clone()).await;
+            process_replication_operation(operation, stats.clone(), self.storage.clone(), self.in_flight.clone()).await;
         }
     }
 
@@ -2281,6 +2313,64 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 }
 
+/// Object versions currently queued or being uploaded, keyed by bucket,
+/// object name and version. `queue_replica_task` admits a version only once
+/// while it is in flight; the scanner heal pass and MRF replays that arrive
+/// in the meantime are `Skipped` instead of driving a second complete upload
+/// (backlog#2362). Entries are removed when the worker finishes the task or
+/// when no worker accepted it.
+#[derive(Debug, Default)]
+pub(crate) struct ReplicationInFlight {
+    keys: std::sync::Mutex<std::collections::HashSet<(String, String, Option<uuid::Uuid>)>>,
+}
+
+impl ReplicationInFlight {
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<(String, String, Option<uuid::Uuid>)>> {
+        self.keys.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Claim `ri`; `false` when the same version is already in flight.
+    fn try_begin(&self, ri: &ReplicateObjectInfo) -> bool {
+        self.lock().insert((ri.bucket.clone(), ri.name.clone(), ri.version_id))
+    }
+
+    fn finish(&self, ri: &ReplicateObjectInfo) {
+        self.lock().remove(&(ri.bucket.clone(), ri.name.clone(), ri.version_id));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().len()
+    }
+}
+
+/// Releases the in-flight claim when the worker is done with the task,
+/// including when replication panics.
+struct ReplicationInFlightGuard {
+    in_flight: Arc<ReplicationInFlight>,
+    key: ReplicateObjectInfo,
+}
+
+impl ReplicationInFlightGuard {
+    fn new(in_flight: Arc<ReplicationInFlight>, ri: &ReplicateObjectInfo) -> Self {
+        Self {
+            in_flight,
+            key: ReplicateObjectInfo {
+                bucket: ri.bucket.clone(),
+                name: ri.name.clone(),
+                version_id: ri.version_id,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+impl Drop for ReplicationInFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight.finish(&self.key);
+    }
+}
+
 struct ActiveWorkerGuard {
     counter: Arc<AtomicI32>,
 }
@@ -2342,10 +2432,12 @@ async fn process_replication_operation<S: ReplicationStorage>(
     operation: ReplicationOperation,
     stats: Arc<ReplicationStats>,
     storage: Arc<S>,
+    in_flight: Arc<ReplicationInFlight>,
 ) {
     match operation {
         ReplicationOperation::Object(obj_info) => {
             let _backlog = ReplicationBacklogGuard::for_object(stats, obj_info.as_ref());
+            let _in_flight = ReplicationInFlightGuard::new(in_flight, obj_info.as_ref());
             replicate_object(*obj_info, storage).await;
         }
         ReplicationOperation::Delete(del_info) => {
@@ -3707,6 +3799,7 @@ mod tests {
             stats: Arc::new(ReplicationStats::new()),
             workers: RwLock::new(Vec::new()),
             lrg_workers: RwLock::new(Vec::new()),
+            in_flight: Arc::new(ReplicationInFlight::default()),
             mrf_replica_tx,
             mrf_replica_rx: Arc::new(Mutex::new(mrf_replica_rx)),
             mrf_save_tx,
@@ -3771,6 +3864,90 @@ mod tests {
 
         assert_eq!(admission, ReplicationQueueAdmission::Queued);
         assert_eq!(current_queue(&pool, "admission-bucket").await, (1, 4096));
+    }
+
+    #[tokio::test]
+    async fn queue_replica_task_admits_a_version_once_while_it_is_in_flight() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let (tx, _rx) = mpsc::channel(4);
+        pool.workers.write().await.push(tx);
+        let ri = ReplicateObjectInfo {
+            bucket: "in-flight-bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(uuid::Uuid::new_v4()),
+            size: 4096,
+            op_type: ReplicationType::Object,
+            ..Default::default()
+        };
+
+        assert_eq!(pool.queue_replica_task(ri.clone()).await, ReplicationQueueAdmission::Queued);
+        // backlog#2362: the scanner heal pass sees the version as PENDING
+        // until the worker lands it; a second request must not drive it again.
+        assert_eq!(pool.queue_replica_task(ri.clone()).await, ReplicationQueueAdmission::Skipped);
+        assert_eq!(current_queue(&pool, "in-flight-bucket").await, (1, 4096));
+
+        // Another version of the same key is independent work.
+        let newer = ReplicateObjectInfo {
+            version_id: Some(uuid::Uuid::new_v4()),
+            ..ri.clone()
+        };
+        assert_eq!(pool.queue_replica_task(newer).await, ReplicationQueueAdmission::Queued);
+        assert_eq!(pool.in_flight.len(), 2);
+
+        // Once the worker finishes, the same version may be queued again
+        // (for example after a FAILED status).
+        pool.in_flight.finish(&ri);
+        assert_eq!(pool.queue_replica_task(ri).await, ReplicationQueueAdmission::Queued);
+        assert_eq!(current_queue(&pool, "in-flight-bucket").await, (3, 3 * 4096));
+    }
+
+    #[tokio::test]
+    async fn queue_replica_task_releases_the_version_when_no_worker_accepts_it() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let ri = ReplicateObjectInfo {
+            bucket: "no-worker-bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(uuid::Uuid::new_v4()),
+            size: 4096,
+            op_type: ReplicationType::Object,
+            ..Default::default()
+        };
+
+        // No worker channel: the task is missed and must not stay claimed.
+        assert_eq!(pool.queue_replica_task(ri.clone()).await, ReplicationQueueAdmission::Missed);
+        assert_eq!(pool.in_flight.len(), 0);
+        assert_eq!(pool.queue_replica_task(ri.clone()).await, ReplicationQueueAdmission::Missed);
+
+        // A full worker channel hands the task to the MRF save path; the MRF
+        // replay re-enters the queue, so the claim is released here too.
+        let (tx, _rx) = mpsc::channel(1);
+        pool.workers.write().await.push(tx);
+        assert_eq!(pool.queue_replica_task(ri.clone()).await, ReplicationQueueAdmission::Queued);
+        let overflow = ReplicateObjectInfo {
+            version_id: Some(uuid::Uuid::new_v4()),
+            ..ri
+        };
+        assert_eq!(pool.queue_replica_task(overflow).await, ReplicationQueueAdmission::Queued);
+        assert_eq!(pool.in_flight.len(), 1, "only the version held by the worker channel stays in flight");
+    }
+
+    #[test]
+    fn in_flight_guard_releases_the_version_on_drop() {
+        let in_flight = Arc::new(ReplicationInFlight::default());
+        let ri = ReplicateObjectInfo {
+            bucket: "guard-bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(in_flight.try_begin(&ri));
+        assert!(!in_flight.try_begin(&ri));
+        {
+            let _guard = ReplicationInFlightGuard::new(in_flight.clone(), &ri);
+            assert_eq!(in_flight.len(), 1);
+        }
+        assert_eq!(in_flight.len(), 0);
+        assert!(in_flight.try_begin(&ri));
     }
 
     #[tokio::test]
