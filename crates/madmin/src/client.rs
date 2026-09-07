@@ -230,6 +230,40 @@ pub struct ScannerStatus {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// `POST /v3/scanner/cycle-state/reset` response for the legacy synchronous
+/// full-rescan reset path.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScannerCycleResetResponse {
+    pub status: String,
+    pub mode: String,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `POST /v3/scanner/usage-state/reset` response for the legacy synchronous
+/// full-rebuild reset path.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScannerUsageStateResetResponse {
+    pub status: String,
+    pub mode: String,
+    pub usage_state: String,
+    pub leader_epoch: u64,
+    pub next_cycle: u64,
+    pub reset_paths: Vec<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScannerCycleResetRequest<'a> {
+    mode: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct ScannerUsageStateResetRequest<'a> {
+    mode: &'a str,
+}
+
 /// Freshness block of the scanner status response.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -419,6 +453,25 @@ impl AdminClient {
         self.get_json("/v3/scanner/status").await
     }
 
+    /// Request a legacy synchronous scanner cycle reset (`full-rescan`).
+    pub async fn scanner_cycle_state_reset_full_rescan(&self) -> Result<ScannerCycleResetResponse, AdminClientError> {
+        let body =
+            serde_json::to_vec(&ScannerCycleResetRequest { mode: "full-rescan" }).map_err(|err| AdminClientError::Decode {
+                message: err.to_string(),
+            })?;
+        self.post_json("/v3/scanner/cycle-state/reset", &[], body).await
+    }
+
+    /// Request a legacy synchronous scanner usage reset (`full-rebuild`).
+    pub async fn scanner_usage_state_reset_full_rebuild(&self) -> Result<ScannerUsageStateResetResponse, AdminClientError> {
+        let body = serde_json::to_vec(&ScannerUsageStateResetRequest { mode: "full-rebuild" }).map_err(|err| {
+            AdminClientError::Decode {
+                message: err.to_string(),
+            }
+        })?;
+        self.post_json("/v3/scanner/usage-state/reset", &[], body).await
+    }
+
     /// ILM expiry worker status. The payload is owned by the expiry
     /// subsystem and still evolving; returned verbatim.
     pub async fn ilm_expiry_status(&self) -> Result<serde_json::Value, AdminClientError> {
@@ -587,7 +640,7 @@ pub(crate) fn percent_encode_path_segment(segment: &str) -> String {
 mod tests {
     use super::{
         AdminClient, AdminClientError, BackgroundHealStatus, HealOpts, HealScanMode, HealStartSuccess, HealTaskStatus,
-        ScannerStatus, heal_path, percent_encode_path_segment,
+        ScannerCycleResetResponse, ScannerStatus, ScannerUsageStateResetResponse, heal_path, percent_encode_path_segment,
     };
     use crate::test_support::TestServer;
     use serde_json::json;
@@ -731,6 +784,33 @@ mod tests {
     }
 
     #[test]
+    fn scanner_reset_responses_preserve_future_fields() {
+        let cycle: ScannerCycleResetResponse =
+            serde_json::from_value(json!({"status": "reset", "mode": "full-rescan", "future": true})).unwrap();
+        assert_eq!(cycle.status, "reset");
+        assert_eq!(cycle.mode, "full-rescan");
+        assert_eq!(cycle.extra["future"], true);
+
+        let usage: ScannerUsageStateResetResponse = serde_json::from_value(json!({
+            "status": "reset",
+            "mode": "full-rebuild",
+            "usage_state": "bootstrap-pending",
+            "leader_epoch": 11,
+            "next_cycle": 42,
+            "reset_paths": [".usage.json"],
+            "future": {"accepted": false}
+        }))
+        .unwrap();
+        assert_eq!(usage.status, "reset");
+        assert_eq!(usage.mode, "full-rebuild");
+        assert_eq!(usage.usage_state, "bootstrap-pending");
+        assert_eq!(usage.leader_epoch, 11);
+        assert_eq!(usage.next_cycle, 42);
+        assert_eq!(usage.reset_paths, [".usage.json"]);
+        assert_eq!(usage.extra["future"]["accepted"], false);
+    }
+
+    #[test]
     fn invalid_endpoint_is_rejected_without_io() {
         let err = AdminClient::new("not a url", "ak", "sk").unwrap_err();
         assert!(matches!(err, AdminClientError::InvalidEndpoint(_)));
@@ -770,6 +850,52 @@ mod tests {
         );
         assert_eq!(request.header("content-type").as_deref(), Some("application/json"));
         assert!(request.body.contains("\"recursive\":true"));
+    }
+
+    #[tokio::test]
+    async fn scanner_cycle_reset_posts_legacy_full_rescan_request() {
+        let server = TestServer::spawn(r#"{"status":"reset","mode":"full-rescan"}"#, 200).await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+
+        let reset = client
+            .scanner_cycle_state_reset_full_rescan()
+            .await
+            .expect("cycle reset response decodes");
+
+        assert_eq!(reset.status, "reset");
+        assert_eq!(reset.mode, "full-rescan");
+        let request = server.recorded();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/rustfs/admin/v3/scanner/cycle-state/reset");
+        assert_eq!(request.query, "");
+        assert!(request.body.contains("\"mode\":\"full-rescan\""));
+    }
+
+    #[tokio::test]
+    async fn scanner_usage_reset_posts_legacy_full_rebuild_request() {
+        let server = TestServer::spawn(
+            r#"{"status":"reset","mode":"full-rebuild","usage_state":"bootstrap-pending","leader_epoch":11,"next_cycle":42,"reset_paths":[".usage.json"]}"#,
+            200,
+        )
+        .await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+
+        let reset = client
+            .scanner_usage_state_reset_full_rebuild()
+            .await
+            .expect("usage reset response decodes");
+
+        assert_eq!(reset.status, "reset");
+        assert_eq!(reset.mode, "full-rebuild");
+        assert_eq!(reset.usage_state, "bootstrap-pending");
+        assert_eq!(reset.leader_epoch, 11);
+        assert_eq!(reset.next_cycle, 42);
+        assert_eq!(reset.reset_paths, [".usage.json"]);
+        let request = server.recorded();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/rustfs/admin/v3/scanner/usage-state/reset");
+        assert_eq!(request.query, "");
+        assert!(request.body.contains("\"mode\":\"full-rebuild\""));
     }
 
     #[tokio::test]
