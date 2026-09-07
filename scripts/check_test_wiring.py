@@ -10,7 +10,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import tomllib
 import unittest
 import uuid
 import xml.etree.ElementTree as ET
@@ -18,6 +17,11 @@ from datetime import datetime, timezone
 from unittest import mock
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 from scanner_abba import MAX_JSON_BYTES, digest, number, read_json, require, sha, write_json
 
