@@ -14,9 +14,10 @@
 
 use crate::common::{
     RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request, init_logging, replication_fast_env, rustfs_binary_path,
+    signed_request,
 };
-use crate::fake_s3_target::{BucketMode, FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target};
-use crate::on_demand_migration::common::{ODM_SERVER_ENV, OdmTestEnv, SeedObject};
+use crate::fake_s3_target::{BucketMode, FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, Operation as FakeTargetOperation};
+use crate::on_demand_migration::common::{ODM_SERVER_ENV, OdmTestEnv, SeedObject, fake_source_client};
 use crate::replication_extension_test::{
     LOOPBACK_REPLICATION_TARGET_ENV, ReplicationTargetOptions, put_bucket_replication, set_replication_target_with_options,
 };
@@ -25,9 +26,10 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketLifecycleConfiguration, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, DefaultRetention,
-    ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, ObjectLockConfiguration, ObjectLockEnabled,
-    ObjectLockRetentionMode, ObjectLockRule, PublicAccessBlockConfiguration, ServerSideEncryption, ServerSideEncryptionByDefault,
-    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging, VersioningConfiguration,
+    ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, ObjectAttributes, ObjectLockConfiguration,
+    ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, PublicAccessBlockConfiguration, ServerSideEncryption,
+    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging,
+    VersioningConfiguration,
 };
 use http::{Method, StatusCode};
 use std::path::{Path, PathBuf};
@@ -1203,5 +1205,726 @@ async fn rollback_to_previous_release_reads_current_bucket_metadata() -> TestRes
     assert_eq!(body, post_rollback_bytes);
 
     replication_target.shutdown().await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// rc.5 multipart layouts under the current build (backlog#2147 follow-up to
+// rustfs#7305)
+// ---------------------------------------------------------------------------
+//
+// rustfs#7305 changed `ObjectInfo::is_multipart` to consult the stored part
+// list before the ETag shape. Every earlier check of that change used
+// synthetic metadata; this scenario writes the layouts with the published
+// rc.5 binary and then reads, describes, and replicates them with the
+// current build on the same data directory.
+
+const LAYOUT_PLAIN_BUCKET: &str = "upgrade-layout-plain";
+const LAYOUT_ENCRYPTED_BUCKET: &str = "upgrade-layout-encrypted";
+const LAYOUT_REPLICA_BUCKET: &str = "upgrade-layout-replica";
+const LAYOUT_PART_SIZE: usize = 5 * 1024 * 1024;
+const LAYOUT_TAIL_SIZE: usize = 1024 * 1024 + 4096;
+const LAYOUT_SSEC_KEY: &str = "0123456789abcdef0123456789abcdef";
+const LAYOUT_REPLICATION_TIMEOUT: Duration = Duration::from_secs(180);
+
+struct LayoutCase {
+    bucket: &'static str,
+    key: &'static str,
+    /// Empty for a single PUT.
+    part_sizes: Vec<usize>,
+    body: Vec<u8>,
+    ssec: bool,
+    /// `false` for layouts whose replication is a known pre-existing failure;
+    /// their outcome is logged, not asserted.
+    assert_replication: bool,
+    /// Recorded from the rc.5 writer.
+    rc5_etag: String,
+    /// Whether rc.5 reported `ObjectParts` for the object.
+    rc5_reported_parts: Option<usize>,
+}
+
+impl LayoutCase {
+    fn is_multipart_layout(&self) -> bool {
+        self.part_sizes.len() > 1
+    }
+
+    fn label(&self) -> String {
+        format!("{}/{}", self.bucket, self.key)
+    }
+}
+
+fn layout_noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+fn layout_text(len: usize, seed: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + 64);
+    let mut line = 0u64;
+    while out.len() < len {
+        out.extend_from_slice(format!("rc5 legacy layout seed={seed} line={line} lorem ipsum dolor sit amet\n").as_bytes());
+        line += 1;
+    }
+    out.truncate(len);
+    out
+}
+
+fn layout_ssec_key_md5() -> String {
+    use md5::{Digest as _, Md5};
+    let mut hasher = Md5::new();
+    hasher.update(LAYOUT_SSEC_KEY.as_bytes());
+    base64_simd::STANDARD.encode_to_string(hasher.finalize())
+}
+
+fn layout_ssec_key() -> String {
+    base64_simd::STANDARD.encode_to_string(LAYOUT_SSEC_KEY)
+}
+
+async fn layout_head(
+    client: &Client,
+    case: &LayoutCase,
+) -> Result<aws_sdk_s3::operation::head_object::HeadObjectOutput, BoxError> {
+    let request = client.head_object().bucket(case.bucket).key(case.key);
+    let request = if case.ssec {
+        request
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(layout_ssec_key())
+            .sse_customer_key_md5(layout_ssec_key_md5())
+    } else {
+        request
+    };
+    Ok(request.send().await?)
+}
+
+async fn layout_get(
+    client: &Client,
+    case: &LayoutCase,
+    range: Option<String>,
+    part_number: Option<i32>,
+) -> Result<aws_sdk_s3::operation::get_object::GetObjectOutput, BoxError> {
+    let request = client.get_object().bucket(case.bucket).key(case.key);
+    let request = if case.ssec {
+        request
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(layout_ssec_key())
+            .sse_customer_key_md5(layout_ssec_key_md5())
+    } else {
+        request
+    };
+    let request = request.set_range(range).set_part_number(part_number);
+    Ok(request.send().await?)
+}
+
+async fn layout_attributes(
+    client: &Client,
+    case: &LayoutCase,
+) -> Result<aws_sdk_s3::operation::get_object_attributes::GetObjectAttributesOutput, BoxError> {
+    let request = client
+        .get_object_attributes()
+        .bucket(case.bucket)
+        .key(case.key)
+        .object_attributes(ObjectAttributes::Etag)
+        .object_attributes(ObjectAttributes::ObjectParts)
+        .object_attributes(ObjectAttributes::ObjectSize)
+        .max_parts(100);
+    let request = if case.ssec {
+        request
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(layout_ssec_key())
+            .sse_customer_key_md5(layout_ssec_key_md5())
+    } else {
+        request
+    };
+    Ok(request.send().await?)
+}
+
+/// Write `case` with the rc.5 client; single PUT when `part_sizes` is empty.
+async fn layout_write(client: &Client, case: &LayoutCase) -> Result<(), BoxError> {
+    let content_type = "text/plain";
+    if case.part_sizes.is_empty() {
+        let request = client
+            .put_object()
+            .bucket(case.bucket)
+            .key(case.key)
+            .content_type(content_type)
+            .body(ByteStream::from(case.body.clone()));
+        let request = if case.ssec {
+            request
+                .sse_customer_algorithm("AES256")
+                .sse_customer_key(layout_ssec_key())
+                .sse_customer_key_md5(layout_ssec_key_md5())
+        } else {
+            request
+        };
+        request.send().await?;
+        return Ok(());
+    }
+    let create = client
+        .create_multipart_upload()
+        .bucket(case.bucket)
+        .key(case.key)
+        .content_type(content_type);
+    let create = if case.ssec {
+        create
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(layout_ssec_key())
+            .sse_customer_key_md5(layout_ssec_key_md5())
+    } else {
+        create
+    };
+    let created = create.send().await?;
+    let upload_id = created.upload_id().ok_or("CreateMultipartUpload omitted upload ID")?;
+    let mut completed = Vec::with_capacity(case.part_sizes.len());
+    let mut offset = 0usize;
+    for (index, size) in case.part_sizes.iter().enumerate() {
+        let part_number = i32::try_from(index + 1)?;
+        let chunk = case.body[offset..offset + size].to_vec();
+        offset += size;
+        let upload = client
+            .upload_part()
+            .bucket(case.bucket)
+            .key(case.key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(chunk));
+        let upload = if case.ssec {
+            upload
+                .sse_customer_algorithm("AES256")
+                .sse_customer_key(layout_ssec_key())
+                .sse_customer_key_md5(layout_ssec_key_md5())
+        } else {
+            upload
+        };
+        let uploaded = upload.send().await?;
+        completed.push(
+            CompletedPart::builder()
+                .part_number(part_number)
+                .e_tag(uploaded.e_tag().ok_or("UploadPart omitted ETag")?)
+                .build(),
+        );
+    }
+    client
+        .complete_multipart_upload()
+        .bucket(case.bucket)
+        .key(case.key)
+        .upload_id(upload_id)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed)).build())
+        .send()
+        .await?;
+    Ok(())
+}
+
+fn layout_cases() -> Vec<LayoutCase> {
+    let two = vec![LAYOUT_PART_SIZE, LAYOUT_TAIL_SIZE];
+    let three = vec![LAYOUT_PART_SIZE, LAYOUT_PART_SIZE, 4096];
+    let total = |sizes: &[usize]| sizes.iter().sum::<usize>();
+    let case = |bucket, key, part_sizes: Vec<usize>, body: Vec<u8>, ssec| LayoutCase {
+        bucket,
+        key,
+        part_sizes,
+        body,
+        ssec,
+        assert_replication: true,
+        rc5_etag: String::new(),
+        rc5_reported_parts: None,
+    };
+    vec![
+        case(LAYOUT_PLAIN_BUCKET, "plain/single.bin", vec![], layout_noise(1024 * 1024 + 17, 1), false),
+        case(
+            LAYOUT_PLAIN_BUCKET,
+            "plain/multipart-2.bin",
+            two.clone(),
+            layout_noise(total(&two), 2),
+            false,
+        ),
+        case(
+            LAYOUT_PLAIN_BUCKET,
+            "plain/multipart-3.bin",
+            three.clone(),
+            layout_noise(total(&three), 3),
+            false,
+        ),
+        case(
+            LAYOUT_PLAIN_BUCKET,
+            "plain/compressed-single.txt",
+            vec![],
+            layout_text(1024 * 1024 + 17, 4),
+            false,
+        ),
+        case(
+            LAYOUT_PLAIN_BUCKET,
+            "plain/compressed-multipart-2.txt",
+            two.clone(),
+            layout_text(total(&two), 5),
+            false,
+        ),
+        case(
+            LAYOUT_PLAIN_BUCKET,
+            "plain/ssec-multipart-2.bin",
+            two.clone(),
+            layout_noise(total(&two), 6),
+            true,
+        ),
+        // SSE-C passthrough replicates the stored ciphertext part by part; a
+        // compressible first part is stored well below 5 MiB and a standard
+        // target rejects it with EntityTooSmall. rc.5 fails the same way (see
+        // `rc5_baseline_replicates_multipart_layouts`), so the outcome is
+        // recorded rather than asserted here; tracked as rustfs/backlog#2363.
+        LayoutCase {
+            assert_replication: false,
+            ..case(
+                LAYOUT_PLAIN_BUCKET,
+                "plain/ssec-compressed-multipart-2.txt",
+                two.clone(),
+                layout_text(total(&two), 7),
+                true,
+            )
+        },
+        case(
+            LAYOUT_ENCRYPTED_BUCKET,
+            "encrypted/single.bin",
+            vec![],
+            layout_noise(1024 * 1024 + 17, 8),
+            false,
+        ),
+        case(
+            LAYOUT_ENCRYPTED_BUCKET,
+            "encrypted/multipart-2.bin",
+            two.clone(),
+            layout_noise(total(&two), 9),
+            false,
+        ),
+        case(
+            LAYOUT_ENCRYPTED_BUCKET,
+            "encrypted/multipart-3.bin",
+            three.clone(),
+            layout_noise(total(&three), 10),
+            false,
+        ),
+        case(
+            LAYOUT_ENCRYPTED_BUCKET,
+            "encrypted/compressed-multipart-2.txt",
+            two.clone(),
+            layout_text(total(&two), 11),
+            false,
+        ),
+    ]
+}
+
+fn layout_server_env() -> Vec<(&'static str, &'static str)> {
+    let mut env = bucket_config_server_env();
+    env.push(("RUSTFS_COMPRESSION_ENABLED", "true"));
+    env.push(("RUSTFS_COMPRESSION_MULTIPART_ENABLED", "true"));
+    env
+}
+
+fn layout_reported_parts(attributes: &aws_sdk_s3::operation::get_object_attributes::GetObjectAttributesOutput) -> Option<usize> {
+    attributes.object_parts().map(|parts| parts.parts().len())
+}
+
+async fn assert_layout_readable(client: &Client, case: &LayoutCase, context: &str) -> TestResult {
+    let label = case.label();
+    let head = layout_head(client, case).await?;
+    assert_eq!(
+        head.e_tag().map(|etag| etag.trim_matches('"')),
+        Some(case.rc5_etag.as_str()),
+        "{context}: {label}: the ETag written by rc.5 must be reported unchanged"
+    );
+    assert_eq!(
+        head.content_length(),
+        Some(i64::try_from(case.body.len())?),
+        "{context}: {label}: HEAD content length"
+    );
+
+    let full = layout_get(client, case, None, None).await?.body.collect().await?.into_bytes();
+    assert_eq!(full.len(), case.body.len(), "{context}: {label}: full GET length");
+    assert!(full == case.body, "{context}: {label}: full GET body must equal the rc.5 upload");
+
+    if case.is_multipart_layout() {
+        let first = case.part_sizes[0];
+        let range = format!("bytes={}-{}", first - 32, first + 31);
+        let crossing = layout_get(client, case, Some(range), None)
+            .await?
+            .body
+            .collect()
+            .await?
+            .into_bytes();
+        assert!(
+            crossing == case.body[first - 32..first + 32],
+            "{context}: {label}: range across the first part boundary"
+        );
+        let tail_start: usize = case.part_sizes[..case.part_sizes.len() - 1].iter().sum();
+        let last_number = i32::try_from(case.part_sizes.len())?;
+        let last = layout_get(client, case, None, Some(last_number)).await?;
+        assert_eq!(
+            last.content_length(),
+            Some(i64::try_from(case.part_sizes[case.part_sizes.len() - 1])?),
+            "{context}: {label}: partNumber={last_number} length"
+        );
+        let last_body = last.body.collect().await?.into_bytes();
+        assert!(
+            last_body == case.body[tail_start..],
+            "{context}: {label}: partNumber={last_number} body must be the stored last part"
+        );
+    }
+    Ok(())
+}
+
+async fn assert_layout_attributes(client: &Client, case: &LayoutCase, context: &str) -> TestResult {
+    let label = case.label();
+    let attributes = layout_attributes(client, case).await?;
+    assert_eq!(
+        attributes.e_tag().map(|etag| etag.trim_matches('"')),
+        Some(case.rc5_etag.as_str()),
+        "{context}: {label}: attributes ETag"
+    );
+    assert_eq!(
+        attributes.object_size(),
+        Some(i64::try_from(case.body.len())?),
+        "{context}: {label}: attributes ObjectSize"
+    );
+    if case.is_multipart_layout() {
+        let parts = attributes
+            .object_parts()
+            .ok_or_else(|| format!("{context}: {label}: multipart layout must expose ObjectParts"))?;
+        assert_eq!(
+            parts.total_parts_count(),
+            Some(i32::try_from(case.part_sizes.len())?),
+            "{context}: {label}: TotalPartsCount"
+        );
+        let observed: Vec<(Option<i32>, Option<i64>)> =
+            parts.parts().iter().map(|part| (part.part_number(), part.size())).collect();
+        let expected: Vec<(Option<i32>, Option<i64>)> = case
+            .part_sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| (Some(index as i32 + 1), Some(*size as i64)))
+            .collect();
+        assert_eq!(
+            observed, expected,
+            "{context}: {label}: ObjectParts must report the plaintext part layout"
+        );
+    } else {
+        assert!(
+            attributes.object_parts().is_none_or(|parts| parts.parts().is_empty()),
+            "{context}: {label}: a single PUT must not report stored parts"
+        );
+    }
+    Ok(())
+}
+
+async fn put_layout_replication_rule(env: &RustFSTestEnvironment, bucket: &str, arn: &str) -> TestResult {
+    let body = format!(
+        r#"<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Role></Role>
+  <Rule>
+    <ID>legacy-layouts</ID>
+    <Priority>1</Priority>
+    <Status>Enabled</Status>
+    <Filter><Prefix></Prefix></Filter>
+    <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
+    <DeleteReplication><Status>Enabled</Status></DeleteReplication>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <Destination><Bucket>{arn}</Bucket></Destination>
+  </Rule>
+</ReplicationConfiguration>"#
+    );
+    let url = format!("{}/{bucket}?replication", env.url);
+    let response = signed_request(
+        Method::PUT,
+        &url,
+        &env.access_key,
+        &env.secret_key,
+        Some(body.into_bytes()),
+        Some("application/xml"),
+    )
+    .await?;
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("put replication rule on {bucket} failed: {status} {body}").into());
+    }
+    Ok(())
+}
+
+/// Wait for the existing-object replication of `case` to reach a terminal
+/// status and return it (`COMPLETED` or `FAILED`).
+async fn wait_layout_replication_terminal(client: &Client, case: &LayoutCase) -> Result<String, BoxError> {
+    let deadline = Instant::now() + LAYOUT_REPLICATION_TIMEOUT;
+    loop {
+        let head = layout_head(client, case).await?;
+        let status = head.replication_status().map(|status| status.as_str().to_string());
+        if matches!(status.as_deref(), Some("COMPLETED") | Some("FAILED")) {
+            return Ok(status.unwrap_or_default());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{}: existing-object replication never reached a terminal status; last {status:?}",
+                case.label()
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[derive(Debug)]
+struct LayoutTransport {
+    status: String,
+    uploaded_parts: Vec<i32>,
+    single_puts: usize,
+    completes: usize,
+    /// Raw per-key journal in target order: (sequence, operation, part number,
+    /// upload id), so duplicate drives can be told apart from retries.
+    journal: Vec<(u64, String, Option<i32>, Option<String>)>,
+}
+
+/// Configure every layout bucket to replicate its existing objects to a fresh
+/// fake target, wait for each case to settle, and report the transport the
+/// target observed per case.
+async fn replicate_layouts(
+    env: &RustFSTestEnvironment,
+    client: &Client,
+    cases: &[LayoutCase],
+) -> Result<(FakeS3Target, Vec<LayoutTransport>), BoxError> {
+    let target = FakeS3Target::start().await?;
+    target.create_bucket(LAYOUT_REPLICA_BUCKET);
+    for bucket in [LAYOUT_PLAIN_BUCKET, LAYOUT_ENCRYPTED_BUCKET] {
+        let arn = set_replication_target_with_options(
+            env,
+            bucket,
+            ReplicationTargetOptions {
+                endpoint: &target.address(),
+                access_key: FAKE_ACCESS_KEY,
+                secret_key: FAKE_SECRET_KEY,
+                target_bucket: LAYOUT_REPLICA_BUCKET,
+                secure: false,
+                skip_tls_verify: false,
+                ca_cert_pem: None,
+            },
+        )
+        .await?;
+        put_layout_replication_rule(env, bucket, &arn).await?;
+    }
+    let mut statuses = Vec::with_capacity(cases.len());
+    for case in cases {
+        statuses.push(wait_layout_replication_terminal(client, case).await?);
+    }
+    let journal = target.requests();
+    let mut transports = Vec::with_capacity(cases.len());
+    for (case, status) in cases.iter().zip(statuses) {
+        let key_requests: Vec<_> = journal
+            .iter()
+            .filter(|record| record.key.as_deref() == Some(case.key))
+            .collect();
+        let mut uploaded_parts: Vec<i32> = key_requests
+            .iter()
+            .filter(|record| record.operation == FakeTargetOperation::UploadPart)
+            .filter_map(|record| record.part_number)
+            .collect();
+        uploaded_parts.sort_unstable();
+        uploaded_parts.dedup();
+        let transport = LayoutTransport {
+            status,
+            uploaded_parts,
+            single_puts: key_requests
+                .iter()
+                .filter(|record| record.operation == FakeTargetOperation::PutObject)
+                .count(),
+            completes: key_requests
+                .iter()
+                .filter(|record| record.operation == FakeTargetOperation::CompleteMultipartUpload)
+                .count(),
+            journal: key_requests
+                .iter()
+                .map(|record| {
+                    (
+                        record.sequence,
+                        format!("{:?}", record.operation),
+                        record.part_number,
+                        record.upload_id.as_ref().map(|id| id.chars().take(12).collect()),
+                    )
+                })
+                .collect(),
+        };
+        tracing::info!(
+            target: "e2e_test::upgrade_compatibility_test",
+            object = %case.label(),
+            ?transport,
+            "replication transport observed on the target"
+        );
+        transports.push(transport);
+    }
+    Ok((target, transports))
+}
+
+/// rc.5 writes single-PUT, multipart, compressed, SSE-C and SSE-S3 layouts;
+/// the current build must read every byte, expose the stored part layout
+/// through GetObjectAttributes and partNumber reads, and replicate the objects
+/// with the transport that matches their stored parts.
+#[tokio::test]
+#[ignore = "requires the pinned 1.0.0-rc.5 release binary"]
+async fn direct_upgrade_from_rc5_preserves_multipart_layouts() -> TestResult {
+    init_logging();
+    let previous_binary = source_binary()?;
+    let server_env = layout_server_env();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_from_binary(&previous_binary, vec![], &server_env)
+        .await?;
+    let old_client = env.create_s3_client();
+    env.create_test_bucket(LAYOUT_PLAIN_BUCKET).await?;
+    env.create_test_bucket(LAYOUT_ENCRYPTED_BUCKET).await?;
+    enable_versioning(&old_client, LAYOUT_PLAIN_BUCKET).await?;
+    enable_versioning(&old_client, LAYOUT_ENCRYPTED_BUCKET).await?;
+    put_default_sse_s3_encryption(&old_client, LAYOUT_ENCRYPTED_BUCKET).await?;
+    assert_default_sse_s3_encryption(&old_client, LAYOUT_ENCRYPTED_BUCKET, "rc.5").await?;
+
+    let mut cases = layout_cases();
+    for case in cases.iter_mut() {
+        layout_write(&old_client, case).await?;
+        let head = layout_head(&old_client, case).await?;
+        case.rc5_etag = head
+            .e_tag()
+            .ok_or_else(|| format!("{}: rc.5 HEAD omitted the ETag", case.label()))?
+            .trim_matches('"')
+            .to_string();
+        case.rc5_reported_parts = layout_attributes(&old_client, case)
+            .await
+            .ok()
+            .and_then(|a| layout_reported_parts(&a));
+        tracing::info!(
+            target: "e2e_test::upgrade_compatibility_test",
+            object = %case.label(),
+            parts = case.part_sizes.len(),
+            etag = %case.rc5_etag,
+            rc5_reported_parts = ?case.rc5_reported_parts,
+            "rc.5 wrote a legacy layout"
+        );
+    }
+    // The rc.5 writer must itself still read what it wrote, so a later
+    // failure is attributable to the upgrade rather than to the fixture.
+    for case in &cases {
+        assert_layout_readable(&old_client, case, "rc.5").await?;
+    }
+
+    // Upgrade in place.
+    env.restart_server_preserving_data(vec![], &server_env).await?;
+    let client = env.create_s3_client();
+    for case in &cases {
+        assert_layout_readable(&client, case, "upgraded").await?;
+        assert_layout_attributes(&client, case, "upgraded").await?;
+    }
+
+    // Replicate the pre-existing objects with the current build.
+    let (target, transports) = replicate_layouts(&env, &client, &cases).await?;
+    let replica_client = fake_source_client(&target);
+    for (case, transport) in cases.iter().zip(&transports) {
+        let label = case.label();
+        if !case.assert_replication {
+            continue;
+        }
+        assert_eq!(transport.status, "COMPLETED", "{label}: existing-object replication must complete");
+        if case.is_multipart_layout() {
+            let expected: Vec<i32> = (1..=i32::try_from(case.part_sizes.len())?).collect();
+            assert_eq!(
+                transport.uploaded_parts, expected,
+                "{label}: stored parts must replicate as the same multipart layout"
+            );
+            // The current build can drive an existing object twice (two
+            // full CreateMultipartUpload/UploadPart/Complete rounds with
+            // distinct upload ids) while its status is still PENDING; the
+            // rc.5 baseline drives once. That is a scheduling difference,
+            // not a layout one, tracked as rustfs/backlog#2362.
+            assert!(transport.completes >= 1, "{label}: at least one CompleteMultipartUpload");
+            if transport.completes > 1 {
+                tracing::warn!(
+                    target: "e2e_test::upgrade_compatibility_test",
+                    object = %label,
+                    completes = transport.completes,
+                    journal = ?transport.journal,
+                    "existing-object replication drove the same object more than once (rustfs/backlog#2362)"
+                );
+            }
+            assert_eq!(
+                transport.single_puts, 0,
+                "{label}: a multipart layout must not go out as a single PutObject"
+            );
+        } else {
+            assert!(transport.single_puts >= 1, "{label}: a single PUT replicates as PutObject");
+            assert!(transport.uploaded_parts.is_empty(), "{label}: a single PUT must not go out as multipart");
+        }
+        if !case.ssec {
+            let replica = replica_client
+                .get_object()
+                .bucket(LAYOUT_REPLICA_BUCKET)
+                .key(case.key)
+                .send()
+                .await
+                .map_err(|err| format!("{label}: replica missing on the target: {err}"))?
+                .body
+                .collect()
+                .await?
+                .into_bytes();
+            assert_eq!(replica.len(), case.body.len(), "{label}: replica length");
+            assert!(replica == case.body, "{label}: replica body must equal the rc.5 upload");
+        }
+    }
+    Ok(())
+}
+
+/// The same layouts replicated by rc.5 itself, without an upgrade. This is the
+/// baseline that tells a pre-existing transport failure apart from one the
+/// current build introduced; it records the outcome per layout and only fails
+/// when the fixture cannot run.
+#[tokio::test]
+#[ignore = "requires the pinned 1.0.0-rc.5 release binary"]
+async fn rc5_baseline_replicates_multipart_layouts() -> TestResult {
+    init_logging();
+    let previous_binary = source_binary()?;
+    let server_env = layout_server_env();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_from_binary(&previous_binary, vec![], &server_env)
+        .await?;
+    let client = env.create_s3_client();
+    env.create_test_bucket(LAYOUT_PLAIN_BUCKET).await?;
+    env.create_test_bucket(LAYOUT_ENCRYPTED_BUCKET).await?;
+    enable_versioning(&client, LAYOUT_PLAIN_BUCKET).await?;
+    enable_versioning(&client, LAYOUT_ENCRYPTED_BUCKET).await?;
+    put_default_sse_s3_encryption(&client, LAYOUT_ENCRYPTED_BUCKET).await?;
+
+    let mut cases = layout_cases();
+    for case in cases.iter_mut() {
+        layout_write(&client, case).await?;
+        let head = layout_head(&client, case).await?;
+        case.rc5_etag = head
+            .e_tag()
+            .ok_or_else(|| format!("{}: rc.5 HEAD omitted the ETag", case.label()))?
+            .trim_matches('"')
+            .to_string();
+    }
+    let (_target, transports) = replicate_layouts(&env, &client, &cases).await?;
+    let summary: Vec<String> = cases
+        .iter()
+        .zip(&transports)
+        .map(|(case, transport)| {
+            format!(
+                "{}: {} parts={:?} puts={}",
+                case.label(),
+                transport.status,
+                transport.uploaded_parts,
+                transport.single_puts
+            )
+        })
+        .collect();
+    tracing::info!(target: "e2e_test::upgrade_compatibility_test", ?summary, "rc.5 baseline replication outcomes");
     Ok(())
 }
