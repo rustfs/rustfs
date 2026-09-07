@@ -8,19 +8,11 @@ description: Review a commit, PR, or merged patch when the user requests ordinar
 Use this skill for an ordinary requested review. If the root policy or user calls
 for adversarial validation, use `adversarial-validation` instead of running both.
 
-## Quick Start
-
-1. Read the scope: commit, PR, patch, or file list.
-2. Map each changed area by risk and user impact.
-3. Inspect each risky change in context.
-4. Report findings first, ordered by severity.
-5. Close with residual risks and verification recommendations.
-
 ## Core Workflow
 
 ### 1) Scope and assumptions
-- Confirm change source (diff, commit, PR, files), target branch, language/runtime, and version.
-- If context is missing, state assumptions before deeper analysis.
+- Derive the change source, target branch, and relevant runtime/version from the
+  supplied diff and metadata. Ask only when missing context could change the verdict.
 - Focus only on requested scope; avoid reviewing unrelated files.
 
 ### 2) Risk map
@@ -40,43 +32,20 @@ for adversarial validation, use `adversarial-validation` instead of running both
   - unchecked assumptions and null/empty/error-path handling
   - stale tests, fixtures, and configs
   - hidden coupling to shared helpers/constants/features
-- If a point is uncertain, mark it as an open question instead of guessing.
+- Apply root `AGENTS.md`'s finding standard: try to disprove a candidate before
+  reporting it. Mention an unresolved question only when it could materially
+  change the verdict; do not fill the report with speculative possibilities.
 
-#### Rust-specific checks (apply to all Rust changes)
+#### Rust-specific checks
 
-Run the full checklist in [rust-code-quality](../rust-code-quality/SKILL.md) — the canonical Rust review checklist for the unwrap/casting/cloning/locking/recursion/error-type/serde/test rules and the reuse-and-necessity checks (duplicated helpers, defensive branches without a nameable trigger, redundant error wrapping). Do not restate those rules here; carry its P0–P3 ratings over unchanged and use this skill's output format.
+For changed Rust behavior, use the matching sections of [rust-code-quality](../rust-code-quality/SKILL.md). Reuse checks already performed by the selected review workflow. Comment-only or formatting-only Rust diffs do not require the full Rust checklist. Carry its P0–P3 ratings over unchanged and use this skill's output format.
 
 ### 4) Findings-first output
-- Order findings by severity:
-  - P0: critical failure, security breach, or data loss risk
-  - P1: high-impact regression
-  - P2: medium risk correctness gap
-  - P3: low risk/quality debt
-- For each finding include:
-  - Severity
-  - `path:line` reference
-  - concise issue statement
-  - impact and likely failure mode
-  - specific fix or mitigation
-  - validation step to confirm
-- If no issues exist, explicitly state `No findings` and why.
+- Order supported findings by P0–P3 severity; preserve the Rust ratings above.
+  Include `path:line`, the failure and impact, a focused fix, and its validation.
+- If no supported issues remain, state `No findings` with the reviewed scope and
+  any material verification limitation. Do not append optional improvements to
+  make a clean review look productive.
 
-### 5) Close
-- Report assumptions and unknowns.
-- Suggest targeted checks (tests, canary checks, logs/metrics, migration validation).
-
-## Output Template
-
-1. Findings
-2. No findings (if applicable)
-3. Assumptions / Unknowns
-4. Recommended verification steps
-
-## Finding Template
-
-- `[P1] Missing timeout for downstream call`
-  - Location: `path/to/file.rs:123`
-  - Issue: ...
-  - Impact: ...
-  - Fix suggestion: ...
-  - Validation: ...
+Close after the required review. Recommend additional verification only for an
+identified unresolved risk or required gate; reuse evidence for unchanged code.

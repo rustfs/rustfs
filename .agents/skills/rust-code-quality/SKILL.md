@@ -1,6 +1,6 @@
 ---
 name: rust-code-quality
-description: Run a focused Rust quality review when the user requests one, when reviewing a Rust PR/commit, or when another selected review workflow delegates Rust-specific checks. Do not auto-load for every implementation edit.
+description: Run a focused Rust quality review when the user requests one or a selected review workflow needs Rust-specific checks for changed behavior. Do not auto-load for every implementation edit, comment-only or formatting-only Rust diff, or repeat an already completed review.
 ---
 
 # Rust Code Quality Gate
@@ -8,12 +8,18 @@ description: Run a focused Rust quality review when the user requests one, when 
 Use this skill for a dedicated Rust review to cover rules that `cargo clippy`
 does not catch.
 
+Search matches and checklist items are candidates, not findings. Apply the root
+finding standard; distinguish a demonstrated bug, an explicit rule violation,
+and an optional preference. P2/P3 suggestions do not need to be invented or
+included in an otherwise clean correctness review.
+
 ## Quick Start
 
 1. Identify changed `.rs` files.
-2. Run automated checks on changed files.
-3. Run manual review checklist on the diff.
-4. Resolve or rebut every finding with evidence; P0/P1 findings cannot be deferred.
+2. Run the matching candidate searches on changed files.
+3. Apply the manual checklist sections whose behavior the diff touches.
+4. Report or rebut every finding with evidence; P0/P1 findings block approval.
+   Fix them when implementation is authorized; a read-only review reports them.
 
 ## Automated Checks
 
@@ -35,7 +41,7 @@ rg -n 'Result<.*String>' <changed-files>
 rg -n 'Box<dyn.*Error' <changed-files>
 
 # 5. println/eprintln in production
-rg -n 'println!\|eprintln!' <changed-files>
+rg -n 'println!|eprintln!' <changed-files>
 
 # 6. Ordering::Relaxed usage (verify each is intentional)
 rg -n 'Ordering::Relaxed' <changed-files>
@@ -80,7 +86,7 @@ For the Rust diff under review, verify:
 - [ ] Test volume and line count are never treated as production-code growth
 
 ### Serde
-- [ ] Structs from untrusted input have `#[serde(deny_unknown_fields)]`
+- [ ] Structs from untrusted input reject unknown fields where the compatibility contract permits; otherwise validate security-critical fields explicitly and test the supported input shape
 - [ ] `#[serde(default)]` not used on security-critical fields without validation
 
 ### Code Hygiene
@@ -104,20 +110,7 @@ For the Rust diff under review, verify:
 
 ## Output Template
 
-```
-## Rust Code Quality Report
-
-### Automated Scan
-- unwrap/expect candidates inspected: N
-- numeric-cast candidates inspected: N
-- error-type candidates inspected: N
-- output-macro candidates inspected: N
-
-### Findings
-- [P1] `path:line` — description
-  - Fix: ...
-  - Validation: ...
-
-### Verdict
-PASS / BLOCKED (list blocking findings)
-```
+Use the calling review's output format. For a standalone review, report supported
+findings with severity, location, impact, fix, and validation, or `No findings`.
+Include only material unverified checks. Candidate counts are not a quality
+metric and do not need a separate scan report.
