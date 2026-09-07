@@ -17,7 +17,7 @@ use crate::heal::{
     erasure_healer::target_outcomes_complete,
     outcome::{
         HealAbortReason, HealDeferredReason, HealFailureClass, HealObjectDisposition, HealObjectIdentity, HealObjectKind,
-        HealObjectOutcome, HealTaskOutcome,
+        HealObjectOutcome, HealObjectReceipt, HealTaskOutcome,
     },
     progress::HealProgress,
     resume::{
@@ -590,6 +590,26 @@ impl HealTask {
             _ => return None,
         };
         Some(self.outcome_identity(bucket, object, version, self.options.pool_index, self.options.set_index))
+    }
+
+    pub(super) async fn record_verified_storage_receipt(
+        &self,
+        expected: HealObjectIdentity,
+        receipt: Option<HealObjectReceipt>,
+    ) -> bool {
+        let Some(receipt) = receipt else {
+            return false;
+        };
+        if !receipt.verified_for(&expected) {
+            return false;
+        }
+        let mut outcome = self.outcome.write().await;
+        outcome.record(HealObjectOutcome {
+            identity: receipt.identity,
+            disposition: receipt.disposition,
+            detail: None,
+        });
+        true
     }
 
     async fn record_deferred_object(&self, reason: HealDeferredReason) {

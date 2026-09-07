@@ -14,6 +14,7 @@
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk};
 use super::*;
+use crate::heal::storage::HealStorageObjectResult;
 
 mod deferred_retry;
 
@@ -1048,6 +1049,7 @@ struct MockStorage {
     object_exists_by_name: Mutex<HashMap<String, MockObjectExists>>,
     heal_object_outcome: Mutex<Option<MockHealObjectOutcome>>,
     heal_object_outcomes: Mutex<HashMap<String, VecDeque<MockHealObjectOutcome>>>,
+    heal_object_receipts: Mutex<HashMap<String, VecDeque<HealObjectReceipt>>>,
     format_no_heal_required: Mutex<bool>,
     format_error: Mutex<Option<Error>>,
     global_format_calls: Mutex<u32>,
@@ -1149,6 +1151,90 @@ async fn execute_emits_heal_trace_task_state() {
     assert_eq!(completed.kind, TraceKind::Heal);
     assert_eq!(completed.func, TraceFunc::HealTask);
     assert_eq!(trace_attr_string(&completed, "state").as_deref(), Some("completed"));
+}
+
+fn object_receipt(object: &str, version_id: Option<&str>, disposition: HealObjectDisposition) -> HealObjectReceipt {
+    HealObjectReceipt {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: "bucket-a".to_string(),
+            object: object.to_string(),
+            version_id: version_id.map(ToOwned::to_owned),
+            bucket_incarnation_id: Some(Uuid::new_v4()),
+            pool_index: None,
+            set_index: None,
+        },
+        disposition,
+    }
+}
+
+#[tokio::test]
+async fn object_heal_records_matching_positive_storage_receipt() {
+    let storage = Arc::new(MockStorage {
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            VecDeque::from([object_receipt("object-a", Some("version-a"), HealObjectDisposition::Repaired)]),
+        )])),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), Some("version-a".to_string())),
+        storage,
+    );
+
+    task.execute().await.expect("mock object heal should complete");
+
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.counters.healed, 1);
+    assert_eq!(outcome.counters.unknown, 0);
+    let object = outcome.objects.front().expect("positive receipt should be recorded");
+    assert_eq!(object.identity.object, "object-a");
+    assert_eq!(object.identity.version_id.as_deref(), Some("version-a"));
+    assert!(object.identity.bucket_incarnation_id.is_some());
+    assert_eq!(object.disposition, HealObjectDisposition::Repaired);
+}
+
+#[tokio::test]
+async fn object_heal_rejects_mismatched_or_legacy_storage_receipts() {
+    let storage = Arc::new(MockStorage {
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            VecDeque::from([object_receipt(
+                "object-a",
+                Some("old-version"),
+                HealObjectDisposition::Repaired,
+            )]),
+        )])),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), Some("version-a".to_string())),
+        storage,
+    );
+
+    task.execute()
+        .await
+        .expect("a mismatched receipt must not fail the legacy heal result");
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.counters.healed, 0);
+    assert_eq!(outcome.counters.unknown, 1);
+    assert_eq!(
+        outcome
+            .objects
+            .front()
+            .expect("legacy fallback should be recorded")
+            .disposition,
+        HealObjectDisposition::Unknown
+    );
+
+    let legacy = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-b".to_string(), None),
+        Arc::new(MockStorage::default()),
+    );
+    legacy.execute().await.expect("legacy mock object heal should complete");
+    let legacy_outcome = legacy.get_outcome().await;
+    assert_eq!(legacy_outcome.counters.healed, 0);
+    assert_eq!(legacy_outcome.counters.unknown, 1);
 }
 
 async fn recv_trace_task_state(trace: &mut TraceSubscription, task_id: &str, state: &str) -> TraceEvent {
@@ -1406,6 +1492,23 @@ impl HealStorageAPI for MockStorage {
             },
             None,
         ))
+    }
+
+    async fn heal_object_with_receipt(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        let (item, error) = self.heal_object(bucket, object, version_id, opts).await?;
+        let receipt = self
+            .heal_object_receipts
+            .lock()
+            .unwrap()
+            .get_mut(object)
+            .and_then(VecDeque::pop_front);
+        Ok(HealStorageObjectResult { item, error, receipt })
     }
 
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {

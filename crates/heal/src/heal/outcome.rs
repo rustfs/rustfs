@@ -91,6 +91,29 @@ pub struct HealObjectOutcome {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealObjectReceipt {
+    pub identity: HealObjectIdentity,
+    pub disposition: HealObjectDisposition,
+}
+
+impl HealObjectReceipt {
+    pub(crate) fn verified_for(&self, expected: &HealObjectIdentity) -> bool {
+        matches!(
+            self.disposition,
+            HealObjectDisposition::Repaired
+                | HealObjectDisposition::VerifiedHealthy
+                | HealObjectDisposition::AuthoritativelyAbsent
+        ) && self.identity.kind == expected.kind
+            && self.identity.bucket == expected.bucket
+            && self.identity.object == expected.object
+            && self.identity.version_id == expected.version_id
+            && self.identity.pool_index == expected.pool_index
+            && self.identity.set_index == expected.set_index
+            && self.identity.bucket_incarnation_id.is_some()
+    }
+}
+
 impl HealObjectOutcome {
     fn retained_bytes(&self) -> usize {
         size_of::<Self>()
@@ -469,5 +492,49 @@ mod canonical_outcome_tests {
         assert!(outcome.counters.overflowed);
         assert_eq!(outcome.counters.processed, u64::MAX);
         assert_eq!(outcome.coverage, HealTraversalCoverage::Partial);
+    }
+
+    #[test]
+    fn positive_receipt_requires_exact_identity_and_bucket_incarnation() {
+        let expected = item(HealObjectDisposition::Unknown).identity;
+        let mut receipt = HealObjectReceipt {
+            identity: expected.clone(),
+            disposition: HealObjectDisposition::Repaired,
+        };
+
+        assert!(
+            !receipt.verified_for(&expected),
+            "a positive storage receipt without bucket incarnation must remain untrusted"
+        );
+
+        let incarnation = Uuid::new_v4();
+        receipt.identity.bucket_incarnation_id = Some(incarnation);
+        assert!(receipt.verified_for(&expected));
+
+        receipt.identity.version_id = Some("older-version".to_string());
+        assert!(
+            !receipt.verified_for(&expected),
+            "a storage receipt for a different object/version tuple must not clear the requested responsibility"
+        );
+
+        receipt.identity = HealObjectIdentity {
+            bucket_incarnation_id: Some(incarnation),
+            pool_index: Some(1),
+            ..expected.clone()
+        };
+        assert!(
+            !receipt.verified_for(&expected),
+            "a storage receipt for a different erasure location must not clear the requested responsibility"
+        );
+
+        receipt.identity = HealObjectIdentity {
+            bucket_incarnation_id: Some(incarnation),
+            ..expected
+        };
+        receipt.disposition = HealObjectDisposition::Unknown;
+        assert!(
+            !receipt.verified_for(&receipt.identity),
+            "legacy success without a positive disposition remains unknown"
+        );
     }
 }
