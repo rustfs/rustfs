@@ -1094,6 +1094,38 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
         return [f"scanner/heal evidence rejected: {error}"]
 
 
+def scanner_heal_release_status(root: Path, directory: Path) -> dict[str, object]:
+    """Return a compact release decision without weakening case validation."""
+    registry = read_json(root / ".config/scanner-heal-required-tests.json")
+    evidence_integer(registry.get("schema"), "registry schema", 1, 1)
+    cases = registry.get("cases")
+    require(isinstance(cases, dict) and cases, "invalid scanner/heal registry")
+    pending = registry.get("release_pending")
+    require(isinstance(pending, dict), "invalid scanner/heal release requirements")
+    for gate, reason in pending.items():
+        require(isinstance(gate, str) and re.fullmatch(r"[A-Z][A-Z0-9-]*", gate) is not None,
+                "invalid scanner/heal release gate")
+        require(isinstance(reason, str) and reason.strip(), f"missing release requirement for {gate}")
+
+    verified_cases = []
+    rejected_cases = []
+    for case_id in sorted(cases):
+        if check_scanner_heal_evidence(root, directory, case_id):
+            rejected_cases.append(case_id)
+        else:
+            verified_cases.append(case_id)
+
+    return {
+        "schema": 1,
+        "decision": "blocked",
+        "release_approved": False,
+        "release_schema_capable": False,
+        "verified_cases": verified_cases,
+        "rejected_cases": rejected_cases,
+        "pending_gates": sorted(pending),
+    }
+
+
 def validate(root: Path) -> list[str]:
     errors: list[str] = []
     errors.extend(check_core_fixtures(root))
@@ -1310,6 +1342,61 @@ class SelfTests(unittest.TestCase):
             self.assertTrue(any(error.startswith("pending R-E:") for error in errors))
             self.assertTrue(any(error.startswith("pending R-D:") for error in errors))
             self.assertTrue(any(error.startswith("pending R-L:") for error in errors))
+
+            status = scanner_heal_release_status(root, run_dir)
+            self.assertEqual(status["decision"], "blocked")
+            self.assertFalse(status["release_approved"])
+            self.assertEqual(status["rejected_cases"], [])
+            self.assertEqual(len(status["pending_gates"]), 21)
+
+    def test_scanner_heal_case_only_schema_cannot_approve_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["release_pending"] = {}
+            write_json(root / ".config/scanner-heal-required-tests.json", registry)
+
+            status = scanner_heal_release_status(root, run_dir)
+            self.assertEqual(status["decision"], "blocked")
+            self.assertFalse(status["release_approved"])
+            self.assertFalse(status["release_schema_capable"])
+            self.assertEqual(status["rejected_cases"], [])
+            self.assertEqual(status["pending_gates"], [])
+
+    def test_scanner_heal_release_status_rejects_synthetic_case(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["release_pending"] = {}
+            write_json(root / ".config/scanner-heal-required-tests.json", registry)
+            path = run_dir / "background-target-crash.json"
+            oracle = read_json(path)
+            oracle["evidence"] = "synthetic"
+            write_json(path, oracle)
+            (run_dir / "execution.json").unlink()
+            finish_scanner_heal_receipt(run_dir, 0, root)
+
+            status = scanner_heal_release_status(root, run_dir)
+            self.assertEqual(status["decision"], "blocked")
+            self.assertFalse(status["release_approved"])
+            self.assertEqual(status["rejected_cases"], ["background-target-crash"])
+            self.assertEqual(status["pending_gates"], [])
+
+    def test_scanner_heal_release_status_rejects_focused_case_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["release_pending"] = {}
+            write_json(root / ".config/scanner-heal-required-tests.json", registry)
+            (run_dir / "background-target-crash.json").unlink()
+            (run_dir / "execution.json").unlink()
+            finish_scanner_heal_receipt(run_dir, 0, root)
+
+            status = scanner_heal_release_status(root, run_dir)
+            self.assertEqual(status["decision"], "blocked")
+            self.assertFalse(status["release_approved"])
+            self.assertEqual(status["verified_cases"], ["background-target-restart"])
+            self.assertEqual(status["rejected_cases"], ["background-target-crash"])
 
     def test_scanner_heal_finish_collects_oracles_from_registry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2158,7 +2245,8 @@ def main() -> int:
     if sys.argv[1:] == ["--self-test"]:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTests)
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
-    if sys.argv[1:2] in (["--begin-scanner-heal"], ["--finish-scanner-heal"], ["--check-scanner-heal"]):
+    if sys.argv[1:2] in (["--begin-scanner-heal"], ["--finish-scanner-heal"], ["--check-scanner-heal"],
+                         ["--check-scanner-heal-release"]):
         try:
             if len(sys.argv) == 5 and sys.argv[1] == "--begin-scanner-heal":
                 begin_scanner_heal_receipt(ROOT, Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]))
@@ -2173,7 +2261,16 @@ def main() -> int:
                 if not errors:
                     print(f"Case evidence verified: {sys.argv[3]}; this does not approve release")
                 return 1 if errors else 0
-            raise ValueError("expected --begin-scanner-heal DIR BINARY TEST_BINARY, --finish-scanner-heal DIR EXIT, or --check-scanner-heal DIR CASE|release")
+            if len(sys.argv) == 3 and sys.argv[1] == "--check-scanner-heal-release":
+                try:
+                    status = scanner_heal_release_status(ROOT, Path(sys.argv[2]))
+                except (OSError, KeyError, TypeError, ValueError, ET.ParseError) as error:
+                    print(json.dumps({"schema": 1, "decision": "invalid", "release_approved": False,
+                                      "error": str(error)}, sort_keys=True, separators=(",", ":")))
+                    return 2
+                print(json.dumps(status, sort_keys=True, separators=(",", ":")))
+                return 0 if status["release_approved"] else 1
+            raise ValueError("expected --begin-scanner-heal DIR BINARY TEST_BINARY, --finish-scanner-heal DIR EXIT, --check-scanner-heal DIR CASE|release, or --check-scanner-heal-release DIR")
         except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
             print(f"ERROR: {error}", file=sys.stderr)
             return 1
