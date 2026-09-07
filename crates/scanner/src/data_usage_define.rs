@@ -38,6 +38,7 @@ use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
 use tracing::{debug, warn};
 
+use crate::raw_page_index::{RawEnumerationPageIndex, RawEnumerationPageOwnerStatus};
 use crate::storage_api::owner::HTTPPreconditions;
 use crate::{
     BUCKET_META_PREFIX, EcstoreError as Error, EcstoreResult as StorageResult, RUSTFS_META_BUCKET, ReplicationConfig,
@@ -601,6 +602,8 @@ pub struct DataUsageCacheInfo {
     pub scan_checkpoint: Option<DataUsageScanCheckpoint>,
     #[serde(default)]
     pub scan_raw_enumeration_cursor: Option<DataUsageRawEnumerationCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_raw_enumeration_page_index: Option<RawEnumerationPageIndex>,
     #[serde(default)]
     pub scan_identity: Option<DataUsageScanIdentity>,
     #[serde(default)]
@@ -661,6 +664,7 @@ impl Serialize for DataUsageCacheInfo {
         // appended by newer scanner versions during rolling upgrades.
         let field_count = 16
             + usize::from(self.scan_raw_enumeration_cursor.is_some())
+            + usize::from(self.scan_raw_enumeration_page_index.is_some())
             + usize::from(self.scan_identity.is_some())
             + usize::from(self.scan_progress.is_some())
             + usize::from(self.scan_coverage_receipt.is_some())
@@ -686,6 +690,9 @@ impl Serialize for DataUsageCacheInfo {
         state.serialize_entry("scan_checkpoint", &self.scan_checkpoint)?;
         if let Some(cursor) = &self.scan_raw_enumeration_cursor {
             state.serialize_entry("scan_raw_enumeration_cursor", cursor)?;
+        }
+        if let Some(index) = &self.scan_raw_enumeration_page_index {
+            state.serialize_entry("scan_raw_enumeration_page_index", index)?;
         }
         if let Some(identity) = self.scan_identity {
             state.serialize_entry("scan_identity", &identity)?;
@@ -895,6 +902,7 @@ impl DataUsageCache {
             && self.info.scan_progress.is_none()
             && self.info.scan_checkpoint.is_none()
             && self.info.scan_raw_enumeration_cursor.is_none()
+            && self.info.scan_raw_enumeration_page_index.is_none()
             && self.info.scan_resume_after.is_none()
             && self.info.scan_coverage_receipt.is_none()
             && self.info.scan_plan_digest == Some(scan_plan_digest)
@@ -922,12 +930,17 @@ impl DataUsageCache {
         if self.validated_raw_enumeration_cursor().is_none() {
             self.info.scan_raw_enumeration_cursor = None;
         }
+        if self.validated_raw_enumeration_page_index().is_none() {
+            self.info.scan_raw_enumeration_page_index = None;
+        }
         let cursor_is_valid = (self.info.scan_checkpoint.is_none()
             && self.info.scan_raw_enumeration_cursor.is_none()
+            && self.info.scan_raw_enumeration_page_index.is_none()
             && self.info.scan_resume_after.is_none()
             && self.info.scan_coverage_receipt.is_none())
             || self.validated_scan_frontier().is_some()
-            || self.info.scan_raw_enumeration_cursor.is_some();
+            || self.info.scan_raw_enumeration_cursor.is_some()
+            || self.info.scan_raw_enumeration_page_index.is_some();
         if !cursor_is_valid {
             self.info.scan_progress = None;
         }
@@ -949,6 +962,7 @@ impl DataUsageCache {
             self.info.scan_resume_after = None;
             self.info.scan_checkpoint = None;
             self.info.scan_raw_enumeration_cursor = None;
+            self.info.scan_raw_enumeration_page_index = None;
             self.info.scan_coverage_receipt = None;
         }
         // Old readers do not understand coverage sweeps. An absent plan makes
@@ -1024,6 +1038,25 @@ impl DataUsageCache {
             && self.info.source.is_some()
             && cursor.is_valid_for_bucket(&self.info.name))
         .then_some(cursor)
+    }
+
+    pub(crate) fn validated_raw_enumeration_page_index(&self) -> Option<&RawEnumerationPageIndex> {
+        let index = self.info.scan_raw_enumeration_page_index.as_ref()?;
+        if self.info.scan_progress.is_none()
+            || !self.info.scan_identity.is_some_and(|identity| identity.is_valid())
+            || self.info.source.is_none()
+            || index.committed_entries().is_err()
+            || index.indexed_entries().is_err()
+        {
+            return None;
+        }
+        let parent = match index.status() {
+            RawEnumerationPageOwnerStatus::Unsupported => return None,
+            RawEnumerationPageOwnerStatus::Building { parent, .. } | RawEnumerationPageOwnerStatus::Ready { parent, .. } => {
+                parent
+            }
+        };
+        path_is_in_bucket_scope(&self.info.name, &parent).then_some(index)
     }
 
     /// Seal only the frontier supplied by completed traversal, never a restored cursor.

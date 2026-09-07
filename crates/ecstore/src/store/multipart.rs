@@ -526,12 +526,8 @@ impl ECStore {
         if self.single_pool() {
             self.apply_decommission_target_mutation_fence(0, object, &mut opts, mutation_fence)
                 .await;
-            return self
-                .run_decommission_capacity_admitted_mutation(0, None, None, || async {
-                    self.pools[0].new_multipart_upload(bucket, object, &opts).await
-                })
-                .await
-                .map(|res| (res, 0, opts.expected_bucket_incarnation_id));
+            let result = self.pools[0].new_multipart_upload(bucket, object, &opts).await?;
+            return Ok((result, 0, opts.expected_bucket_incarnation_id));
         }
 
         if opts.data_movement && opts.version_id.is_some() {
@@ -658,7 +654,9 @@ impl ECStore {
     ) -> Result<PartInfo> {
         check_put_object_part_args(bucket, object, upload_id)?;
         let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
-        opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+        if !self.single_pool() {
+            opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+        }
         let opts = &opts;
 
         if self.single_pool() {
@@ -982,7 +980,9 @@ impl ECStore {
     ) -> Result<ObjectInfo> {
         check_complete_multipart_args(bucket, object, upload_id)?;
         let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
-        opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+        if !self.single_pool() {
+            opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+        }
         let opts = &opts;
 
         if self.single_pool() {
