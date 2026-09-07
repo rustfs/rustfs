@@ -14,8 +14,12 @@
 
 use crate::storage_api::error::contract::{StorageErrorCode, range::HTTPRangeError};
 use crate::storage_api::error::{QuotaError, StorageError};
+use http::StatusCode;
 use rustfs_kms::KmsUnavailableError;
 use s3s::{S3Error, S3ErrorCode};
+
+const MAX_VERSIONS_EXCEEDED_CODE: &str = "MaxVersionsExceeded";
+const MAX_VERSIONS_EXCEEDED_MESSAGE: &str = "You've exceeded the limit on the number of versions you can create on this object";
 
 /// Marks a request body that exceeded a presigned upload size capability.
 ///
@@ -284,6 +288,9 @@ impl ApiError {
             S3ErrorCode::EvaluatorBindingDoesNotExist => "A column name or a path provided does not exist in the SQL expression".to_string(),
             S3ErrorCode::InvalidColumnIndex => "The column index is invalid. Please check the service documentation and try again.".to_string(),
             S3ErrorCode::UnsupportedFunction => "Encountered an unsupported SQL function.".to_string(),
+            S3ErrorCode::Custom(code) if &**code == MAX_VERSIONS_EXCEEDED_CODE => {
+                MAX_VERSIONS_EXCEEDED_MESSAGE.to_string()
+            }
             _ => code.as_str().to_string(),
         }
     }
@@ -362,6 +369,9 @@ fn error_chain_s3s_body_stream_error(err: &(dyn std::error::Error + 'static)) ->
 impl From<ApiError> for S3Error {
     fn from(err: ApiError) -> Self {
         let mut s3e = S3Error::with_message(err.code, err.message);
+        if matches!(s3e.code(), S3ErrorCode::Custom(code) if &**code == MAX_VERSIONS_EXCEEDED_CODE) {
+            s3e.set_status_code(StatusCode::BAD_REQUEST);
+        }
         if let Some(source) = err.source {
             s3e.set_source(source);
         }
@@ -455,6 +465,7 @@ impl From<StorageError> for ApiError {
             | StorageError::InsufficientWriteQuorum(_, _) => S3ErrorCode::ServiceUnavailable,
             StorageError::NamespaceLockQuorumUnavailable { .. } => S3ErrorCode::ServiceUnavailable,
             StorageError::QuotaExceeded { .. } => S3ErrorCode::InvalidRequest,
+            StorageError::MaxVersionsExceeded => S3ErrorCode::Custom(MAX_VERSIONS_EXCEEDED_CODE.into()),
             StorageError::Lock(_) => S3ErrorCode::ServiceUnavailable,
             StorageError::DecommissionNotStarted => S3ErrorCode::InvalidRequest,
             StorageError::DecommissionAlreadyRunning => S3ErrorCode::InvalidRequest,
@@ -485,6 +496,8 @@ impl From<StorageError> for ApiError {
 
         let message = if matches!(&err, StorageError::QuotaExceeded { .. }) {
             err.to_string()
+        } else if matches!(&err, StorageError::MaxVersionsExceeded) {
+            ApiError::error_code_to_message(&code)
         } else if code == S3ErrorCode::InternalError && matches!(&err, StorageError::Io(_)) {
             ApiError::error_code_to_message(&code)
         } else if code == S3ErrorCode::InternalError {
@@ -1187,6 +1200,19 @@ mod tests {
 
         assert_eq!(api_error.code, S3ErrorCode::InvalidRequest);
         assert_eq!(api_error.message, "Bucket quota exceeded. Current usage: 5 bytes, limit: 10 bytes");
+    }
+
+    #[test]
+    fn max_versions_exceeded_maps_to_minio_compatible_s3_error() {
+        let api_error: ApiError = StorageError::MaxVersionsExceeded.into();
+
+        assert_eq!(api_error.code, S3ErrorCode::Custom(MAX_VERSIONS_EXCEEDED_CODE.into()));
+        assert_eq!(api_error.message, MAX_VERSIONS_EXCEEDED_MESSAGE);
+
+        let s3_error: S3Error = api_error.into();
+        assert_eq!(s3_error.code(), &S3ErrorCode::Custom(MAX_VERSIONS_EXCEEDED_CODE.into()));
+        assert_eq!(s3_error.message(), Some(MAX_VERSIONS_EXCEEDED_MESSAGE));
+        assert_eq!(s3_error.status_code(), Some(StatusCode::BAD_REQUEST));
     }
 
     #[test]
