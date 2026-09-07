@@ -77,6 +77,8 @@ pub struct SegmentInvalidationProof {
     pub key_format: u16,
     pub baseline_scan_plan_digest: DataUsageScanPlanDigest,
     pub process_epoch: String,
+    pub generation_start: u64,
+    pub generation_end: u64,
     pub durable_producer_identity: bool,
     pub invalidation_domain: SegmentInvalidationDomain,
     pub distributed_ec_invalidation: bool,
@@ -108,11 +110,15 @@ fn validate_segment_invalidation_proof(
         || envelope.baseline_scan_plan_digest != proof.baseline_scan_plan_digest
         || envelope.process_epoch.is_empty()
         || envelope.process_epoch != proof.process_epoch
+        || envelope.generation_start != proof.generation_start
+        || envelope.generation_end != proof.generation_end
         || !proof.durable_producer_identity
         || !proof.cold_zero_walk_oracle
         || (proof.invalidation_domain == SegmentInvalidationDomain::DistributedEc && !proof.distributed_ec_invalidation)
         || envelope.generation_start == 0
         || envelope.generation_end < envelope.generation_start
+        || proof.generation_start == 0
+        || proof.generation_end < proof.generation_start
         || envelope.restart_gap
         || envelope.overflow
         || !SegmentInvalidationProducer::REQUIRED
@@ -190,6 +196,8 @@ mod tests {
             key_format: envelope.key_format,
             baseline_scan_plan_digest: envelope.baseline_scan_plan_digest,
             process_epoch: envelope.process_epoch,
+            generation_start: envelope.generation_start,
+            generation_end: envelope.generation_end,
             durable_producer_identity: true,
             invalidation_domain: SegmentInvalidationDomain::LocalSingleSet,
             distributed_ec_invalidation: false,
@@ -238,6 +246,20 @@ mod tests {
         wrong_epoch.process_epoch = "epoch-b".to_string();
         assert_eq!(
             admit_segment_invalidation(&wrong_epoch, &proof, ["hot/one"]),
+            Err(SegmentInvalidationError::InvalidProof)
+        );
+
+        let mut wrong_generation_start = proof.clone();
+        wrong_generation_start.generation_start = wrong_generation_start.generation_start.saturating_sub(1);
+        assert_eq!(
+            admit_segment_invalidation(&envelope, &wrong_generation_start, ["hot/one"]),
+            Err(SegmentInvalidationError::InvalidProof)
+        );
+
+        let mut wrong_generation_end = proof.clone();
+        wrong_generation_end.generation_end = wrong_generation_end.generation_end.saturating_add(1);
+        assert_eq!(
+            admit_segment_invalidation(&envelope, &wrong_generation_end, ["hot/one"]),
             Err(SegmentInvalidationError::InvalidProof)
         );
 
