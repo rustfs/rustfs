@@ -767,6 +767,147 @@ mod tests {
 
     #[cfg(not(windows))]
     #[tokio::test]
+    async fn target_user_source_to_internal_destination_retains_owner_after_cancellation() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        use futures::FutureExt;
+        use std::time::Duration;
+
+        let ctx = Arc::new(InstanceContext::new());
+        let root = tempfile::tempdir().expect("source-volume root");
+        let disk = target_disk(&ctx, root.path(), Uuid::new_v4()).await;
+        let store = super::super::tests::build_store_with_ctx(ctx.clone());
+        let version = Uuid::new_v4();
+        let fi = target_file_info("object", version, b"user-source-inline-body");
+        fi.validate_for_metadata_read().expect("valid real inline metadata");
+        let source_before = seed_target(&disk, "photos", "object", fi.clone()).await;
+        assert!(!source_before.is_empty());
+        tokio::fs::create_dir_all(root.path().join(crate::disk::RUSTFS_META_TMP_BUCKET))
+            .await
+            .expect("internal staging volume");
+        let destination = disk
+            .get_object_path_for_io_if_local(crate::disk::RUSTFS_META_TMP_BUCKET, "object")
+            .expect("local disk")
+            .expect("actual destination object key");
+        let destination_metadata = destination.join(crate::disk::STORAGE_FORMAT_FILE);
+        assert!(!destination_metadata.exists());
+        assert!(!ctx.namespace_commits_pending());
+        let generation = ctx.namespace_commit_generation();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install(&destination_metadata, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let disk_ref = disk.endpoint().to_string();
+        let rename_fi = fi.clone();
+        let mut rename = tokio::spawn(async move {
+            store
+                .rename_local_data(
+                    &disk_ref,
+                    ("photos", "object"),
+                    &rename_fi,
+                    (crate::disk::RUSTFS_META_TMP_BUCKET, "object"),
+                    None,
+                )
+                .await
+        });
+        let mut entered = false;
+        let mut joined = false;
+        let observations = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    result = &mut rename => {
+                        joined = true;
+                        panic!("rename completed before prepared publication: {result:?}");
+                    }
+                    result = entered_rx => {
+                        result.expect("real prepared rename must enter");
+                        entered = true;
+                    }
+                }
+            })
+            .await
+            .expect("bounded physical entry");
+            let at_entry = (ctx.namespace_commits_pending(), ctx.namespace_commit_generation());
+            assert!(!rename.is_finished(), "caller must still await the paused physical rename");
+            rename.abort();
+            let cancelled = tokio::time::timeout(Duration::from_secs(5), &mut rename)
+                .await
+                .expect("caller cancellation must finish while physical publication is paused");
+            joined = true;
+            let after_cancel = (ctx.namespace_commits_pending(), ctx.namespace_commit_generation());
+            (at_entry, after_cancel, cancelled)
+        })
+        .catch_unwind()
+        .await;
+
+        // Release on every observation failure. Pending alone is not a drain
+        // oracle: the implementation under test can fail to create the owner.
+        drop(release_tx);
+        if !joined {
+            rename.abort();
+            joined = tokio::time::timeout(Duration::from_secs(5), &mut rename).await.is_ok();
+        }
+        let physical_drained = tokio::time::timeout(Duration::from_secs(10), hooks::drain_namespace_key(&destination)).await;
+        let owner_drained = tokio::time::timeout(Duration::from_secs(10), async {
+            while ctx.namespace_commits_pending() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if !entered || !joined || physical_drained.is_err() || owner_drained.is_err() {
+            // Without proven physical entry/drain, keep the root instead of
+            // deleting files that a detached local executor may still use.
+            let retained = root.keep();
+            eprintln!("source-volume cleanup incomplete: entered={entered}, joined={joined}, retained={retained:?}");
+            if let Err(panic) = observations {
+                std::panic::resume_unwind(panic);
+            }
+            panic!("source-volume physical cleanup did not finish: retained={retained:?}");
+        }
+        let (at_entry, after_cancel, cancelled) = match observations {
+            Ok(observations) => observations,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        let latest = tokio::time::timeout(
+            Duration::from_secs(5),
+            disk.read_version(
+                crate::disk::RUSTFS_META_TMP_BUCKET,
+                crate::disk::RUSTFS_META_TMP_BUCKET,
+                "object",
+                "",
+                &crate::disk::ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+        let source =
+            tokio::time::timeout(Duration::from_secs(5), tokio::fs::read(root.path().join("photos/object/xl.meta"))).await;
+        let after_drain = (ctx.namespace_commits_pending(), ctx.namespace_commit_generation());
+        assert!(cancelled.expect_err("caller must return cancellation").is_cancelled());
+        let latest = latest
+            .expect("latest read must finish")
+            .expect("late physical commit must be readable");
+        assert_eq!(latest.data, fi.data);
+        assert_eq!(latest.version_id, Some(version));
+        assert_eq!(
+            source
+                .expect("source observation must finish")
+                .expect_err("user source metadata must have moved")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            (at_entry, after_cancel, after_drain),
+            ((true, generation + 1), (true, generation + 1), (false, generation + 2)),
+            "a real user source mutation must remain counted through its cancelled caller and physical drain"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
     async fn target_rename_cancellation_retains_real_namespace_and_scanner_owners() {
         use crate::disk::os::prepared_publication_test_hooks as hooks;
         let ctx = Arc::new(InstanceContext::new());
