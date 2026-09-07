@@ -166,16 +166,22 @@ async fn round(request: &Request) -> serde_json::Value {
     let reloaded = DataUsageCache::unmarshal(&read_bounded(&cache_path).await).expect("reload returned cache codec");
     let retained = reloaded.checked_flatten("bucket").expect("reloaded bucket root");
     let scanned = returned.checked_flatten("bucket").expect("returned bucket root");
-    let raw_page_index_committed_entries = reloaded
-        .validated_raw_enumeration_page_index()
+    let raw_page_index = reloaded.validated_raw_enumeration_page_index();
+    let raw_page_index_committed_entries = raw_page_index
         .and_then(|index| index.committed_entries().ok())
         .map(|entries| entries.len())
         .unwrap_or(0);
-    let raw_page_index_indexed_entries = reloaded
-        .validated_raw_enumeration_page_index()
+    let raw_page_index_indexed_entries = raw_page_index
         .and_then(|index| index.indexed_entries().ok())
         .map(|entries| entries.len())
         .unwrap_or(0);
+    let (raw_page_index_parent, raw_page_index_complete) = raw_page_index
+        .map(|index| match index.status() {
+            crate::raw_page_index::RawEnumerationPageOwnerStatus::Building { parent, .. } => (Some(parent), false),
+            crate::raw_page_index::RawEnumerationPageOwnerStatus::Ready { parent, complete, .. } => (Some(parent), complete),
+            crate::raw_page_index::RawEnumerationPageOwnerStatus::Unsupported => (None, false),
+        })
+        .unwrap_or((None, false));
     assert_eq!(
         (retained.objects, retained.versions, retained.size),
         (scanned.objects, scanned.versions, scanned.size)
@@ -188,6 +194,8 @@ async fn round(request: &Request) -> serde_json::Value {
         "objects_expected": request.objects, "raw_entry_budget": request.raw_entry_budget,
         "raw_entries": observation.entries, "raw_name_bytes": observation.name_bytes,
         "raw_first_entry": observation.first_entry, "raw_last_entry": observation.last_entry,
+        "raw_page_index_parent": raw_page_index_parent,
+        "raw_page_index_complete": raw_page_index_complete,
         "raw_page_index_committed_entries": raw_page_index_committed_entries,
         "raw_page_index_indexed_entries": raw_page_index_indexed_entries,
         "objects_processed": budget.progress().0,

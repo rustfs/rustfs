@@ -125,6 +125,7 @@ const EXTERNAL_COMPATIBLE_SUFFIXES: &[&str] = &[
     "ACCESS_KEY",
     "ACCESS_KEY_FILE",
     "ADDRESS",
+    "API_OBJECT_MAX_VERSIONS",
     "API_XFF_HEADER",
     "AUDIT_WEBHOOK_AUTH_TOKEN",
     "AUDIT_WEBHOOK_CLIENT_CERT",
@@ -899,5 +900,16 @@ mod tests {
                 assert_eq!(std::env::var("RUSTFS_ROOT_USER").as_deref(), Ok("compat-admin"));
             });
         });
+    }
+
+    #[test]
+    fn external_env_compat_includes_api_object_max_versions() {
+        let report =
+            build_external_env_compat_report_from_entries([("MINIO_API_OBJECT_MAX_VERSIONS".to_string(), "50000".to_string())]);
+
+        assert_eq!(
+            report.mapped_pairs,
+            vec![("MINIO_API_OBJECT_MAX_VERSIONS".to_string(), "RUSTFS_API_OBJECT_MAX_VERSIONS".to_string())]
+        );
     }
 }

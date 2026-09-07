@@ -524,9 +524,8 @@ struct MrfRuntime {
     /// waiting out an admission backoff must not re-fsync every local disk
     /// twice a second.
     dirty: bool,
-    /// True while a journal snapshot exists on disk that no longer reflects
-    /// an all-consumed pending set; the next idle tick removes it (MinIO
-    /// deletes its `list.bin` after replay for the same reason).
+    /// True while a journal snapshot exists on disk that may still be needed
+    /// for replay or cleanup.
     journal_on_disk: bool,
     /// Earliest instant a full-admission retry may proceed.
     backoff_until: Option<tokio::time::Instant>,
@@ -747,10 +746,26 @@ async fn replay_into(
                     if intent.attempts < MRF_MAX_ATTEMPTS {
                         queue.push_back(intent);
                         *backoff_until = Some(tokio::time::Instant::now());
+                    } else {
+                        rearm_incomplete = true;
+                        counter!("rustfs_heal_mrf_dropped_total", "reason" => "attempts_exhausted").increment(1);
+                        rustfs_common::mrf_channel::release_mrf_intent(&intent);
                     }
                     break;
                 }
-                Ok(HealAdmissionResult::Dropped(_)) | Err(_) => {}
+                Ok(HealAdmissionResult::Dropped(_)) => {}
+                Err(_) => {
+                    intent.attempts = intent.attempts.saturating_add(1);
+                    if intent.attempts < MRF_MAX_ATTEMPTS {
+                        queue.push_back(intent);
+                        *backoff_until = Some(tokio::time::Instant::now());
+                    } else {
+                        rearm_incomplete = true;
+                        counter!("rustfs_heal_mrf_dropped_total", "reason" => "attempts_exhausted").increment(1);
+                        rustfs_common::mrf_channel::release_mrf_intent(&intent);
+                    }
+                    break;
+                }
             }
         }
     }
@@ -825,7 +840,11 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
                 }
             }
             _ = flush_tick.tick() => {
-                match tick_action(runtime.dirty, runtime.queue.depth(), runtime.journal_on_disk) {
+                match tick_action(
+                    runtime.dirty,
+                    runtime.queue.depth(),
+                    runtime.journal_on_disk,
+                ) {
                     TickAction::Flush => {
                         runtime.flush().await;
                         runtime.dispatch(manager.as_ref()).await;
@@ -838,8 +857,8 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
                         runtime.dispatch(manager.as_ref()).await;
                     }
                     TickAction::DeleteJournal => {
-                        // All intents consumed: remove the journal so a restart
-                        // replays nothing (mirrors MinIO's post-replay unlink).
+                        // All replayed intents have either been accepted,
+                        // merged, or replaced by a pending successor snapshot.
                         if delete_journals().await {
                             runtime.journal_on_disk = false;
                             gauge!("rustfs_heal_mrf_journal_bytes").set(0.0);
