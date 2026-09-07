@@ -153,13 +153,23 @@ concurrently. Small direct PUTs stay on the legacy path.
   - default is `0`.
 - `RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS`
   - how long an `UploadPart` waits in the bounded queue for a permit before returning S3 `SlowDown`; `0` rejects immediately when the pool is full.
-  - default is `30000`. Parts wait before body ingest, so SDK-default clients that send every part of an upload concurrently drain through the pool instead of failing.
+  - default is `10000`. Parts wait before body ingest, so SDK-default clients that send every part of an upload concurrently drain through the pool instead of failing on a full pool.
+  - RustFS does not read the request body while a part is queued, so the client's socket write stalls for the whole wait and whatever timeout the client or an intermediary has configured competes with this value. Keep it with margin below the shortest such timeout in use (botocore applies its 60 s `connect_timeout` to the body write; the AWS SDK for Java v2 has a 30 s socket write timeout; reverse proxies add their own body timeouts); a wait that outlives the client timeout surfaces as a dropped connection instead of `SlowDown`.
 - `RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING`
   - maximum `UploadPart` requests waiting for a permit at once; parts beyond it return `SlowDown` without waiting.
   - default is `0`, which derives 16 times the permit limit (512 at stock settings).
+  - each queued HTTP/1 part holds whatever unread body the client already pushed into the connection's kernel receive buffer (an HTTP/2 part holds up to its flow-control window in process memory), so this depth also bounds that memory. RustFS leaves the receive buffer to kernel autotuning (see `RUSTFS_HTTP_SOCKET_RECV_BUFFER_BYTES` below), which keeps an unread connection at the kernel's initial size (128 KiB on current Linux).
 - `RUSTFS_PUT_FOREGROUND_ADMISSION_ENABLE`, `RUSTFS_PUT_FOREGROUND_ADMISSION_LIMIT`, `RUSTFS_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS`
   - experimental strict gate that applies to every foreground write regardless of size and replaces the pool above when enabled.
   - default is disabled; enabling it with limit `0` disables foreground write admission entirely.
+
+## HTTP listener socket environment variables
+
+- `RUSTFS_HTTP_SOCKET_RECV_BUFFER_BYTES`
+  - fixed `SO_RCVBUF` for the API listener, inherited by every accepted socket; `0` leaves the receive buffer to kernel autotuning.
+  - default is `0`. Earlier releases hard-coded 4 MiB, which Linux doubles to 8 MiB and which disables autotuning, so every connection whose body was not being read yet (a multipart part queued for a foreground write permit) could accumulate up to 8 MiB of unread body in kernel memory; at SDK-default multipart concurrency that was enough to push a node into TCP memory pressure.
+  - with autotuning the per-connection receive ceiling is the kernel's (`net.ipv4.tcp_rmem` max, 6 MiB on stock Linux) instead of the former fixed 8 MiB, so a single very high-bandwidth-delay connection may see a somewhat lower ceiling; raise `net.ipv4.tcp_rmem` first, and set this variable only on kernels without receive-buffer autotuning (illumos/Solaris) or where the sysctl cannot be changed.
+  - the send buffer stays fixed at 4 MiB because the stock Linux send autotuning ceiling (`net.ipv4.tcp_wmem` max, 4 MiB) is lower than a GB-level response stream needs.
 
 ## Remote tier timeout environment variables
 
