@@ -171,6 +171,22 @@ performance acceptance gate. Run the fake-adapter self-tests with:
 scripts/test_scanner_validation_harness.sh
 ```
 
+For CI summaries, PR evidence tables, and operator handoff, collapse the raw
+matrix into a quiet one-line verdict plus durable JSON/Markdown artifacts:
+
+```bash
+scripts/summarize_scanner_heal_perf.py \
+  --abba-dir /path/to/new-artifacts \
+  --cache-cost-log /path/to/cache-cost-profile.log \
+  --json-out /path/to/new-artifacts/perf-summary.json \
+  --markdown-out /path/to/new-artifacts/perf-summary.md
+```
+
+The command prints only `PASS scanner_heal_perf ...` for measured passing ABBA
+evidence, otherwise `FAIL scanner_heal_perf ...`. The JSON and Markdown outputs
+carry the key p99/throughput/P1/P2/cache-cost fields and artifact provenance
+hashes; raw per-cell logs remain in the original artifact tree for audit.
+
 They cover the complete 120-cell schedule, data isolation, missing builds and
 oracles, zero samples/requests, swallowed request errors, offered-load drift,
 incomplete repairs, missing metrics, noise, and P1/P2/p99 regressions. A real
