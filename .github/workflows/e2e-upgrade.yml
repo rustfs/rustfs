@@ -82,6 +82,14 @@ jobs:
             cache_key: e2e-odm-config-rollback
             test: rc5_rollback_requires_restoring_odm_configuration
             artifact: odm-config-rollback
+          - name: Multipart layouts survive the rc.5 upgrade
+            cache_key: e2e-multipart-layout-upgrade
+            test: direct_upgrade_from_rc5_preserves_multipart_layouts
+            artifact: multipart-layout-upgrade
+          - name: rc.5 multipart replication baseline
+            cache_key: e2e-multipart-layout-baseline
+            test: rc5_baseline_replicates_multipart_layouts
+            artifact: multipart-layout-baseline
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
