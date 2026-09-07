@@ -36,11 +36,12 @@ use crate::fake_s3_target::{BucketMode, FAKE_ACCESS_KEY, FAKE_SECRET_KEY};
 use crate::fake_s3_target::{FakeS3Target, FaultAction as FakeTargetFault, Operation as FakeTargetOperation, RequestRecord};
 use crate::on_demand_migration::common::{OdmEnvOptions, OdmTestEnv, fake_source_client};
 use crate::replication_extension_test::{
-    LOOPBACK_REPLICATION_TARGET_ENV, ReplicationTargetOptions, enable_bucket_versioning, get_replication_reset_status,
-    put_bucket_replication, put_bucket_replication_with_delete_statuses, set_replication_target_with_options,
-    start_bucket_replication_reset,
+    LOOPBACK_REPLICATION_TARGET_ENV, ReplicationTargetOptions, delete_bucket_replication, enable_bucket_versioning,
+    get_replication_reset_status, put_bucket_replication, put_bucket_replication_with_delete_statuses,
+    set_replication_target_with_options, start_bucket_replication_reset,
 };
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::{ByteStream, DateTime};
 use aws_sdk_s3::types::{
     Checksum, ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, ObjectAttributes, ObjectLockLegalHold,
@@ -635,6 +636,141 @@ async fn matrix_mint_own_version_ids_addresses_mutations_through_the_ledger() ->
             "{key}: a metadata update must not re-PUT the object on a target that mints its own ids"
         );
     }
+
+    target.shutdown().await;
+    Ok(())
+}
+
+/// rustfs/backlog#2340 (pending purge lifecycle): a permanent delete whose
+/// replication keeps failing leaves the version in xl.meta as a PENDING purge,
+/// hidden from listings. Once the bucket's replication configuration is
+/// removed nothing can ever confirm that purge remotely, so the delete worker
+/// must settle it locally (abandoned, with the replica left on the former
+/// target) — otherwise the bucket stays `BucketNotEmpty` forever with a
+/// residue the client cannot see.
+#[tokio::test]
+async fn matrix_removed_replication_config_abandons_pending_purge() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "matrix-abandoned-purge-dst".to_string();
+    target.create_bucket_with_object_lock(target_bucket.clone());
+    TargetMode::MintOwnVersionIds.apply(&target);
+
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("HTTP_PROXY", ""),
+        ("HTTPS_PROXY", ""),
+        // The scanner heal pass is what revisits a pending purge.
+        ("RUSTFS_SCANNER_CYCLE", "1"),
+        ("RUSTFS_SCANNER_START_DELAY_SECS", "1"),
+    ]);
+    let env = OdmTestEnv::start_with(OdmEnvOptions {
+        env: env_vars,
+        ..OdmEnvOptions::default()
+    })
+    .await?;
+    let source_env = &env.rustfs;
+
+    let source_bucket = "matrix-abandoned-purge-src";
+    let source_client = source_env.create_s3_client();
+    source_client
+        .create_bucket()
+        .bucket(source_bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await?;
+    enable_bucket_versioning(source_env, source_bucket).await?;
+    let target_arn = set_replication_target_with_options(
+        source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket: &target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication_with_delete_statuses(source_env, source_bucket, &target_arn, "Enabled", Some("Enabled")).await?;
+
+    let key = "purge/orphaned.bin";
+    let put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(key)
+        .body(ByteStream::from(payload(4 * 1024, 0x07)))
+        .send()
+        .await?;
+    let source_version = put.version_id().ok_or("source PUT returned no version id")?.to_string();
+    assert_eq!(
+        wait_for_terminal_replication_status(&source_client, source_bucket, key).await?,
+        "COMPLETED"
+    );
+    let replica = single_target_version(&target, &target_bucket, key)?;
+
+    // The target refuses every purge: the version stays a pending purge.
+    // More refusals than any scanner cycle can consume within the test.
+    target.inject_for_key(FakeTargetOperation::DeleteObject, key, FakeTargetFault::ResponseStatus(503), 4_000);
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(key)
+        .version_id(&source_version)
+        .send()
+        .await?;
+    wait_until("the refused purge to reach the target at least once", || async {
+        Ok(target.count_requests(FakeTargetOperation::DeleteObject, key) >= 1)
+    })
+    .await?;
+    let listed = source_client.list_object_versions().bucket(source_bucket).send().await?;
+    assert!(
+        listed.versions().is_empty() && listed.delete_markers().is_empty(),
+        "a pending purge is hidden from listings: {listed:?}"
+    );
+    let blocked = source_client.delete_bucket().bucket(source_bucket).send().await;
+    assert!(
+        blocked
+            .as_ref()
+            .err()
+            .and_then(|err| err.as_service_error())
+            .is_some_and(|err| err.code() == Some("BucketNotEmpty")),
+        "the hidden pending purge must block DeleteBucket while the target is still configured: {blocked:?}"
+    );
+
+    // Removing the replication configuration orphans the purge; the scanner
+    // heal pass must settle it locally so the bucket becomes deletable.
+    let response = delete_bucket_replication(source_env, source_bucket).await?;
+    assert!(response.status().is_success(), "DeleteBucketReplication: {}", response.status());
+    wait_until("DeleteBucket to succeed once the orphaned purge is abandoned", || async {
+        match source_client.delete_bucket().bucket(source_bucket).send().await {
+            Ok(_) => Ok(true),
+            Err(err) if err.as_service_error().is_some_and(|err| err.code() == Some("BucketNotEmpty")) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    })
+    .await?;
+    // Abandoned means abandoned: the replica stays on the former target and,
+    // once the attempts in flight at removal time have drained, no further
+    // purge attempts are sent to it.
+    assert_eq!(
+        single_target_version(&target, &target_bucket, key)?,
+        replica,
+        "an abandoned purge must not touch the replica on the former target"
+    );
+    sleep(Duration::from_secs(3)).await;
+    let settled = target.count_requests(FakeTargetOperation::DeleteObject, key);
+    sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        target.count_requests(FakeTargetOperation::DeleteObject, key),
+        settled,
+        "purge attempts must stop once the target is no longer configured"
+    );
 
     target.shutdown().await;
     Ok(())

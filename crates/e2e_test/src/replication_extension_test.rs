@@ -627,7 +627,7 @@ async fn put_bucket_replication_rules(
     Ok(())
 }
 
-async fn delete_bucket_replication(
+pub(crate) async fn delete_bucket_replication(
     env: &RustFSTestEnvironment,
     bucket: &str,
 ) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
@@ -9289,11 +9289,13 @@ async fn test_replication_check_flags_version_minting_target() -> TestResult {
         fidelity["Code"], "BucketRemoteTargetVersionMismatch",
         "the failure must carry a machine-readable code: {payload}"
     );
-    // The probe PUT itself succeeded (fidelity is judged from its response);
-    // the later mutation phases are pointless against a drifting target and
-    // must be skipped, but cleanup still runs.
+    // The probe PUT itself succeeded (fidelity is judged from its response).
+    // The mutation phases address the id the target assigned — the ledger
+    // the worker records per object (rustfs/backlog#2340) — so they run and
+    // pass on a drifting target, and cleanup uses the same id.
     assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
-    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionDelete"]["Status"], "OK", "{payload}");
     assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
 
     // The probe PUT must carry the source version as `?versionId=` — the

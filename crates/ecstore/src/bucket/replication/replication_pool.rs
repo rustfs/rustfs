@@ -3079,7 +3079,11 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
     }
 
     let rcfg = match ReplicationMetadataStore::optional_replication_config(bucket).await {
-        Ok(Some(config)) => config,
+        Ok(Some(config)) => Some(config),
+        // A bucket without a configuration still owes its pending purges an
+        // answer: the delete worker finishes them locally as abandoned, which
+        // is what makes the bucket deletable again (rustfs/backlog#2340).
+        Ok(None) if !oi.version_purge_status.is_empty() => None,
         Ok(None) => return ReplicationQueueAdmission::Skipped,
         Err(err) => {
             debug!(
@@ -3129,7 +3133,7 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
         }
     };
 
-    let rcfg_wrapper = ReplicationConfig::new(Some(rcfg), tgts);
+    let rcfg_wrapper = ReplicationConfig::new(rcfg, tgts);
     queue_replication_heal_internal(bucket, oi, rcfg_wrapper, retry_count)
         .await
         .admission
@@ -3175,7 +3179,11 @@ pub(crate) async fn queue_replication_heal_internal(
         };
     }
 
-    if rcfg.config.is_none() || rcfg.remotes.is_none() {
+    // Without a configuration or targets there is nothing to replicate —
+    // except a version purge the bucket still owes: its stored decision names
+    // the targets, and the delete worker settles the ones no longer
+    // configured as abandoned (rustfs/backlog#2340).
+    if (rcfg.config.is_none() || rcfg.remotes.is_none()) && oi.version_purge_status.is_empty() {
         return ReplicationHealQueueResult {
             object_info: roi,
             admission: ReplicationQueueAdmission::Skipped,
