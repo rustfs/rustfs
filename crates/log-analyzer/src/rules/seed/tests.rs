@@ -110,7 +110,7 @@ fn every_rule_has_a_positive_sample() {
         ("remote-peer-faulty", msg("Remote peer health check failed for node2: marking as faulty")),
         (
             "peer-disks-offline",
-            msg("reporting peer disks offline after consecutive storage_info failures"),
+            msg("Storage inventory probe failed; current drive health is unknown"),
         ),
         ("drive-faulty-error", msg("remote drive is faulty")),
         (
@@ -318,6 +318,10 @@ fn smoke_samples_hit_exact_rule_sets() {
         &["disk-marked-faulty"],
     );
     exact(&msg("erasure write quorum (required=8, achieved=5)"), &["ec-write-quorum"]);
+    exact(
+        &msg("reporting peer disks offline after consecutive storage_info failures"),
+        &["peer-disks-offline"],
+    );
     exact(
         &Sample {
             message: "Metacache listing quorum failed",
