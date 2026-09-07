@@ -37,6 +37,10 @@ def validate_report(report, *, round_number, pid, objects, budget):
         raise ValueError("nonempty fixture must observe raw entries; budget hook may not have run")
     if report["raw_entries"] > budget:
         raise ValueError("raw-entry budget exceeded; no unbudgeted tail is permitted")
+    for key in ("raw_first_entry", "raw_last_entry"):
+        value = report.get(key)
+        if type(value) is not str or not 0 < len(value.encode("utf-8")) <= 512:
+            raise ValueError(f"invalid raw entry marker: {key}")
     if type(report.get("snapshot_complete")) is not bool:
         raise ValueError("missing explicit completeness")
     if report.get("outcome") not in ("complete", "partial", "cancelled_without_cache"):
@@ -49,6 +53,13 @@ def converged(report, objects):
                     ("objects_retained", "versions_retained", "bytes_retained")))
 
 
+def replays_raw_window(previous, current):
+    return (previous["raw_first_entry"] == current["raw_first_entry"]
+            and previous["raw_last_entry"] == current["raw_last_entry"]
+            and previous["objects_retained"] == current["objects_before"]
+            and current["objects_retained"] == previous["objects_retained"])
+
+
 def run(args):
     binary = args.test_binary.resolve(strict=True)
     listed = subprocess.run([str(binary), WORKER, "--exact", "--list"],
@@ -58,6 +69,7 @@ def run(args):
     workspace = args.output.resolve()
     workspace.mkdir()  # Refuse reuse/overwrite of previous evidence or customer data.
     reports = []
+    replayed_raw_window = False
     for round_number in range(args.rounds):
         request = {"workspace": str(workspace), "objects": args.objects,
                    "raw_entry_budget": args.raw_entry_budget, "round": round_number}
@@ -87,12 +99,15 @@ def run(args):
                             objects=args.objects, budget=args.raw_entry_budget)
         if reports and report["objects_before"] != reports[-1]["objects_retained"]:
             raise ValueError("cache coverage did not survive the process boundary")
+        if reports and replays_raw_window(reports[-1], report):
+            replayed_raw_window = True
         reports.append(report)
         print(json.dumps(report, sort_keys=True), flush=True)
         if converged(report, args.objects):
             print("PASS: bounded scanner-worker restart convergence for this fixture only")
             return 0
-    print("FAIL: fixed-budget restart convergence not established; R-E gate remains unmet",
+    reason = "replayed raw enumeration window" if replayed_raw_window else "no bounded restart convergence"
+    print(f"FAIL: fixed-budget restart convergence not established ({reason}); R-E gate remains unmet",
           file=sys.stderr)
     return 1
 

@@ -2,7 +2,7 @@
 
 import unittest
 
-from diagnose_scanner_enumeration_restart import converged, validate_report
+from diagnose_scanner_enumeration_restart import converged, replays_raw_window, validate_report
 
 
 class ReportTests(unittest.TestCase):
@@ -10,6 +10,8 @@ class ReportTests(unittest.TestCase):
         return dict(schema=1, round=0, pid=123, objects_expected=4, raw_entry_budget=16,
                     raw_entries=8, raw_name_bytes=64, objects_before=0, objects_retained=4,
                     versions_retained=4, bytes_retained=4, objects_processed=4,
+                    raw_first_entry="bucket/object-0000",
+                    raw_last_entry="bucket/object-0003/xl.meta",
                     snapshot_complete=True, outcome="complete")
 
     def validate(self, report):
@@ -42,6 +44,14 @@ class ReportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.validate(report)
 
+    def test_missing_or_oversized_raw_marker_rejected(self):
+        for value in (None, True, "", "x" * 513):
+            with self.subTest(value=value):
+                report = self.report()
+                report["raw_first_entry"] = value
+                with self.assertRaises(ValueError):
+                    self.validate(report)
+
     def test_complete_coverage_without_entry_observation_rejected(self):
         report = self.report()
         report["raw_entries"] = 0
@@ -67,6 +77,20 @@ class ReportTests(unittest.TestCase):
         for report in (None, [], "report"):
             with self.assertRaises(ValueError):
                 self.validate(report)
+
+    def test_repeated_raw_window_without_retained_progress_is_diagnosed(self):
+        previous = self.report()
+        previous["objects_retained"] = 0
+        previous["versions_retained"] = 0
+        previous["bytes_retained"] = 0
+        previous["objects_processed"] = 0
+        previous["snapshot_complete"] = False
+        previous["outcome"] = "cancelled_without_cache"
+        current = dict(previous, round=1, pid=124, objects_before=0)
+        self.assertTrue(replays_raw_window(previous, current))
+
+        advanced = dict(current, objects_retained=1)
+        self.assertFalse(replays_raw_window(previous, advanced))
 
 
 if __name__ == "__main__":

@@ -13,6 +13,8 @@ struct Observation {
     limit: u64,
     entries: u64,
     name_bytes: u64,
+    first_entry: Option<String>,
+    last_entry: Option<String>,
 }
 
 static OBSERVATION: Mutex<Option<Observation>> = Mutex::new(None);
@@ -24,6 +26,12 @@ pub(in crate::scanner_folder) fn observe_raw_entry(dir: &str, name: &std::ffi::O
     if let Some(observation) = guard.as_mut()
         && Path::new(dir).starts_with(&observation.root)
     {
+        let relative_dir = Path::new(dir)
+            .strip_prefix(&observation.root)
+            .unwrap_or_else(|_| Path::new(""));
+        let entry_marker = relative_dir.join(name).to_string_lossy().to_string();
+        observation.first_entry.get_or_insert_with(|| entry_marker.clone());
+        observation.last_entry = Some(entry_marker);
         observation.entries += 1;
         observation.name_bytes += u64::try_from(name.as_encoded_bytes().len()).expect("bounded entry name");
         if observation.entries >= observation.limit {
@@ -103,6 +111,8 @@ async fn round(request: &Request) -> serde_json::Value {
         limit: request.raw_entry_budget,
         entries: 0,
         name_bytes: 0,
+        first_entry: None,
+        last_entry: None,
     });
     let _observation_guard = ObservationGuard;
     let result = scan_data_folder(
@@ -141,6 +151,7 @@ async fn round(request: &Request) -> serde_json::Value {
         "schema": 1, "pid": std::process::id(), "round": request.round,
         "objects_expected": request.objects, "raw_entry_budget": request.raw_entry_budget,
         "raw_entries": observation.entries, "raw_name_bytes": observation.name_bytes,
+        "raw_first_entry": observation.first_entry, "raw_last_entry": observation.last_entry,
         "objects_processed": budget.progress().0,
         "objects_before": before, "objects_retained": retained.objects,
         "versions_retained": retained.versions, "bytes_retained": retained.size,
