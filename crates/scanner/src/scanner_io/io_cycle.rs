@@ -172,9 +172,13 @@ where
             return default_result(resolution.requested_scope);
         };
         dirty_buckets.extend(remote_dirty_usage.dirty_buckets);
+        // Peer snapshots contribute bucket names only; the local prefix scopes
+        // would narrow a bucket a peer dirtied elsewhere, so the merged scope
+        // stays at bucket granularity (same rule as the local fallthrough).
         let scope = scoped_scan_scope_from_dirty_buckets(
             resolution.requested_scope,
             dirty_buckets,
+            None,
             true,
             resolution.all_buckets,
             resolution.baseline_proof,
