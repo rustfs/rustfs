@@ -26,6 +26,8 @@ Options:
 
 The script intentionally runs a single case, not the release pseudo-case. After
 a successful case run it verifies that the release gate still remains blocked.
+Set RUSTFS_E2E_TEST_PORT_MIN and RUSTFS_E2E_TEST_PORT_RANGE to move the e2e
+port allocator when the default 20000..30000 test range is unavailable.
 USAGE
 }
 
