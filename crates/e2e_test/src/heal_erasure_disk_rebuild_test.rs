@@ -58,11 +58,22 @@ mod tests {
     struct ScannerHealEvidenceCase {
         id: &'static str,
         oracle: &'static str,
+        evidence: &'static str,
+        unclean_shutdown_marker: bool,
     }
 
     const BACKGROUND_TARGET_RESTART_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
         id: "background-target-restart",
         oracle: "background-target-restart.json",
+        evidence: "process-restart",
+        unclean_shutdown_marker: false,
+    };
+
+    const BACKGROUND_TARGET_CRASH_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
+        id: "background-target-crash",
+        oracle: "background-target-crash.json",
+        evidence: "process-crash-restart",
+        unclean_shutdown_marker: true,
     };
 
     struct RestartEvidenceContext {
@@ -98,6 +109,8 @@ mod tests {
             || case.oracle.contains('/')
             || case.oracle.contains('\\')
             || case.oracle.contains("..")
+            || !matches!(case.evidence, "process-restart" | "process-crash-restart")
+            || (case.evidence == "process-crash-restart") != case.unclean_shutdown_marker
         {
             return Err("invalid scanner/heal evidence case".into());
         }
@@ -951,6 +964,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_cluster_root_heal_recovers_remote_shards_after_background_target_crash()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        timeout(
+            Duration::from_secs(420),
+            run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetCrash),
+        )
+        .await?
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_cluster_root_heal_recovers_remote_shards_after_coordinator_restart() -> Result<(), Box<dyn Error + Send + Sync>>
     {
         timeout(
@@ -986,21 +1009,27 @@ mod tests {
     enum InterruptionScenario {
         IsolatedTargetRestart,
         BackgroundTargetRestart,
+        BackgroundTargetCrash,
         BackgroundCoordinatorRestart,
         TargetEndpointBlackhole,
     }
 
     async fn run_cluster_root_heal_interruption(scenario: InterruptionScenario) -> Result<(), Box<dyn Error + Send + Sync>> {
         let server_binary = rustfs_binary_path();
-        let evidence_run = if scenario == InterruptionScenario::BackgroundTargetRestart {
-            restart_evidence_run(&server_binary, BACKGROUND_TARGET_RESTART_EVIDENCE)?
-        } else {
-            None
+        let evidence_run = match scenario {
+            InterruptionScenario::BackgroundTargetRestart => {
+                restart_evidence_run(&server_binary, BACKGROUND_TARGET_RESTART_EVIDENCE)?
+            }
+            InterruptionScenario::BackgroundTargetCrash => {
+                restart_evidence_run(&server_binary, BACKGROUND_TARGET_CRASH_EVIDENCE)?
+            }
+            _ => None,
         };
         let mut evidence_objects = Vec::new();
         let (background_enabled, interruption_node, interruption_kind) = match scenario {
             InterruptionScenario::IsolatedTargetRestart => (false, 1, "target_restart"),
             InterruptionScenario::BackgroundTargetRestart => (true, 1, "background_target_restart"),
+            InterruptionScenario::BackgroundTargetCrash => (true, 1, "background_target_crash"),
             InterruptionScenario::BackgroundCoordinatorRestart => (true, 0, "coordinator_restart"),
             InterruptionScenario::TargetEndpointBlackhole => (false, 1, "target_endpoint_blackhole"),
         };
@@ -1067,6 +1096,7 @@ mod tests {
             .unwrap_or(4 * 1024 * 1024)
             .clamp(1024 * 1024, 16 * 1024 * 1024);
         let mut expected_manifests = Vec::with_capacity(online_object_count);
+        let mut unclean_shutdown_marker_observed = None;
         for index in 0..online_object_count {
             let key = format!("cluster/online/object-{index:04}.bin");
             let payload_seed = u8::try_from(index + 1).expect("clamped object count must fit in u8");
@@ -1433,7 +1463,11 @@ mod tests {
                 "Restored target endpoint forwarding"
             );
         } else {
-            cluster.stop_node(interruption_node)?;
+            if scenario == InterruptionScenario::BackgroundTargetRestart {
+                cluster.stop_node_gracefully(interruption_node).await?;
+            } else {
+                cluster.stop_node(interruption_node)?;
+            }
             let stopped_count = metadata_count(&replaced_disk, bucket, &expected_manifests);
             assert!(
                 stopped_count > 0 && stopped_count < expected_manifests.len(),
@@ -1449,9 +1483,12 @@ mod tests {
                 .join(".rustfs.sys")
                 .join("unclean-shutdown");
             if background_enabled {
+                let marker_exists = unclean_shutdown_marker.is_file();
+                unclean_shutdown_marker_observed = Some(marker_exists);
+                let expected_marker = !matches!(scenario, InterruptionScenario::BackgroundTargetRestart);
                 assert!(
-                    unclean_shutdown_marker.is_file(),
-                    "background restart must retain the real unclean-shutdown marker"
+                    marker_exists == expected_marker,
+                    "background restart/crash lane observed unexpected unclean-shutdown marker state"
                 );
             } else {
                 match std::fs::remove_file(&unclean_shutdown_marker) {
@@ -1651,13 +1688,14 @@ mod tests {
                 "server build changed during restart"
             );
             let evidence = serde_json::json!({
-                "schema": 1, "case": evidence_context.case.id, "evidence": "process-restart",
+                "schema": 1, "case": evidence_context.case.id, "evidence": evidence_context.case.evidence,
                 "run_id": evidence_context.run.run_id, "source_revision": evidence_context.run.source_revision,
                 "test_build": compiled_test_identity(),
                 "binary_sha256": evidence_context.run.binary.sha256,
                 "test_binary_sha256": evidence_context.run.test_binary.sha256,
                 "topology": {"nodes": cluster.nodes.len(), "drives_per_node": cluster.nodes[0].data_dirs.len()},
                 "pid_before": target_pid, "pid_after": restarted_pid,
+                "unclean_shutdown_marker": unclean_shutdown_marker_observed.unwrap_or(false),
                 "objects": evidence_objects, "node_listings": node_listings,
             });
             let data = serde_json::to_vec(&evidence)?;

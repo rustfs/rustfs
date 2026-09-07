@@ -8,10 +8,26 @@
       "suite": "e2e_test",
       "name": "heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_remote_shards_after_background_target_restart",
       "oracle": "background-target-restart.json",
+      "evidence": "process-restart",
+      "unclean_shutdown_marker": false,
       "min_objects": 9,
       "max_objects": 65,
       "topology": {"nodes": 4, "drives_per_node": 1},
       "scope": "Target process restart, exact unversioned S3 bodies and replacement-disk shards; not power loss or EC8+4."
+    },
+    "background-target-crash": {
+      "gate": "G14",
+      "task": "W21",
+      "lane": "e2e-nightly",
+      "suite": "e2e_test",
+      "name": "heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_remote_shards_after_background_target_crash",
+      "oracle": "background-target-crash.json",
+      "evidence": "process-crash-restart",
+      "unclean_shutdown_marker": true,
+      "min_objects": 9,
+      "max_objects": 65,
+      "topology": {"nodes": 4, "drives_per_node": 1},
+      "scope": "Target process killed during partial background rebuild, real unclean-shutdown marker, exact unversioned S3 bodies and replacement-disk shards; not power loss or EC8+4."
     }
   },
   "release_pending": {

@@ -894,6 +894,10 @@ def scanner_heal_oracle_names(root: Path) -> tuple[str, ...]:
         require(isinstance(oracle, str) and oracle.endswith(".json"), f"invalid oracle for {case_id}")
         path = Path(oracle)
         require(not path.is_absolute() and ".." not in path.parts, f"oracle path escapes run directory for {case_id}")
+        require(requirement.get("evidence") in ("process-restart", "process-crash-restart"),
+                f"invalid evidence for {case_id}")
+        require(type(requirement.get("unclean_shutdown_marker")) is bool,
+                f"invalid unclean-shutdown marker expectation for {case_id}")
         names.add(oracle)
     return tuple(sorted(names))
 
@@ -1024,9 +1028,11 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
             require(digest(path) == execution["artifacts"][requirement["oracle"]], "oracle hash mismatch")
             oracle = read_json(path)
             evidence_integer(oracle.get("schema"), "oracle schema", 1, 1)
-            require(oracle.get("evidence") == "process-restart", "not real process-restart evidence")
+            require(oracle.get("evidence") == requirement["evidence"], f"not real {requirement['evidence']} evidence")
             require(oracle.get("case") == name and oracle.get("run_id") == run["run_id"], "oracle belongs to another case/run")
             require(oracle.get("source_revision") == run["source_revision"], "oracle source mismatch")
+            require(oracle.get("unclean_shutdown_marker") is requirement["unclean_shutdown_marker"],
+                    "unclean-shutdown marker evidence mismatch")
             built = oracle["test_build"]
             for key in ("source_revision", "dirty", "lock_blob", "features"):
                 require(built[key] == expected_build[key], f"compiled test {key} mismatch")
@@ -1240,7 +1246,7 @@ class SelfTests(unittest.TestCase):
         run_dir.mkdir()
         registry = read_json(ROOT / ".config/scanner-heal-required-tests.json")
         write_json(root / ".config/scanner-heal-required-tests.json", registry)
-        requirement = registry["cases"]["background-target-restart"]
+        requirements = registry["cases"]
         binary = directory / "fake-binary"
         binary.write_bytes(b"parser fixture, not a real build")
         binary.chmod(0o700)
@@ -1251,14 +1257,23 @@ class SelfTests(unittest.TestCase):
                                                         "lock_blob": "c" * 40, "features": "default"},
                                          "started_at": datetime.now(timezone.utc).timestamp() - 1,
                                          "binary": build, "test_binary": build})
-        write_json(run_dir / "listing.json", {"rust-suites": {requirement["suite"]: {
-            "binary-id": requirement["suite"], "binary-path": str(binary), "package-name": "e2e_test", "build-platform": "target",
+        suite = "e2e_test"
+        write_json(run_dir / "listing.json", {"rust-suites": {suite: {
+            "binary-id": suite, "binary-path": str(binary), "package-name": "e2e_test", "build-platform": "target",
             "testcases": {
-            requirement["name"]: {"ignored": False, "filter-match": {"status": "matches"}}
-        }}}})
+                requirement["name"]: {"ignored": False, "filter-match": {"status": "matches"}}
+                for requirement in requirements.values()
+            }
+        }}})
         (run_dir / "junit.xml").write_text(
-            f'<testsuites><testsuite><testcase name="{requirement["name"]}" classname="{requirement["suite"]}" '
-            f'timestamp="{datetime.now(timezone.utc).isoformat(timespec="milliseconds")}"/></testsuite></testsuites>')
+            "<testsuites><testsuite>"
+            + "".join(
+                f'<testcase name="{requirement["name"]}" classname="{requirement["suite"]}" '
+                f'timestamp="{datetime.now(timezone.utc).isoformat(timespec="milliseconds")}"/>'
+                for requirement in requirements.values()
+            )
+            + "</testsuite></testsuites>"
+        )
         physical = {"has_xl_meta": True, "version_id": None, "data_dir": "data-generation",
                     "erasure_index": 1, "data_blocks": 2, "parity_blocks": 2, "expected_part_numbers": [1],
                     "present_part_fingerprints": {"1": {"size": 12, "sha256": "c" * 64}},
@@ -1268,15 +1283,17 @@ class SelfTests(unittest.TestCase):
                "expected_physical": physical, "physical": physical}
         objects = [dict(obj, key=f"object-{index}") for index in range(9)]
         objects[-1] = dict(objects[-1], expected_physical=None)
-        write_json(run_dir / "background-target-restart.json", {
-            "schema": 1, "evidence": "process-restart", "case": "background-target-restart",
-            "run_id": "a" * 32, "source_revision": "b" * 40,
-            "test_build": {"source_revision": "b" * 40, "dirty": False, "lock_blob": "c" * 40,
-                           "features": "default", "target": "aarch64-apple-darwin", "profile": "debug", "rustflags_hex": ""},
-            "binary_sha256": build["sha256"], "test_binary_sha256": build["sha256"],
-            "topology": {"nodes": 4, "drives_per_node": 1}, "pid_before": 10, "pid_after": 11,
-            "objects": objects, "node_listings": [[item["key"] for item in objects]] * 4,
-        })
+        for case_id, requirement in requirements.items():
+            write_json(run_dir / requirement["oracle"], {
+                "schema": 1, "evidence": requirement["evidence"], "case": case_id,
+                "run_id": "a" * 32, "source_revision": "b" * 40,
+                "test_build": {"source_revision": "b" * 40, "dirty": False, "lock_blob": "c" * 40,
+                               "features": "default", "target": "aarch64-apple-darwin", "profile": "debug", "rustflags_hex": ""},
+                "binary_sha256": build["sha256"], "test_binary_sha256": build["sha256"],
+                "topology": requirement["topology"], "pid_before": 10, "pid_after": 11,
+                "unclean_shutdown_marker": requirement["unclean_shutdown_marker"],
+                "objects": objects, "node_listings": [[item["key"] for item in objects]] * 4,
+            })
         finish_scanner_heal_receipt(run_dir, 0, root)
         return root, run_dir
 
@@ -1331,6 +1348,19 @@ class SelfTests(unittest.TestCase):
             errors = check_scanner_heal_evidence(root, run_dir, "release")
             self.assertEqual(len(errors), 21)
             self.assertTrue(all(error.startswith("pending ") for error in errors))
+
+    def test_scanner_heal_crash_case_rejects_restart_oracle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            path = run_dir / "background-target-crash.json"
+            oracle = read_json(path)
+            oracle["evidence"] = "process-restart"
+            oracle["unclean_shutdown_marker"] = False
+            write_json(path, oracle)
+            (run_dir / "execution.json").unlink()
+            finish_scanner_heal_receipt(run_dir, 0, root)
+
+            self.assertTrue(check_scanner_heal_evidence(root, run_dir, "background-target-crash"))
 
     def test_scanner_heal_rejects_broken_execution_and_artifacts(self) -> None:
         for fault in ("exit", "missing", "zero", "skipped", "failed", "retry", "filtered", "ignored", "stale",
