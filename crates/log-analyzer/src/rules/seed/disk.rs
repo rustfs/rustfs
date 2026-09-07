@@ -68,14 +68,17 @@ pub(super) fn rules() -> Vec<Rule> {
             )
         },
         Rule {
-            anchors: strings(["reporting peer disks offline after consecutive storage_info failures"]),
+            anchors: strings(["Storage inventory probe failed; current drive health is unknown"]),
             ..base(
                 "peer-disks-offline",
                 P2Degraded,
                 "disk",
-                "peer 磁盘被整体判定离线",
-                contains("reporting peer disks offline after consecutive storage_info failures"),
-                "对某 peer 连续 storage_info 失败,判定其磁盘整体离线。",
+                "peer 存储清单探测失败",
+                any([
+                    contains("Storage inventory probe failed; current drive health is unknown"),
+                    contains("reporting peer disks offline after consecutive storage_info failures"),
+                ]),
+                "某 peer 的 storage_info 探测失败,当前磁盘健康状态未知。",
                 "检查该 peer 节点存活与 RPC 端口可达。",
             )
         },
