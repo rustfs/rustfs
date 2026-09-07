@@ -19,11 +19,11 @@ use super::meta::{
 use super::migration::{RebalanceMigrationBackend, migrate_entry_version};
 use super::worker::{
     RebalanceEntryCleanupResult, RebalanceEntryTask, load_rebalance_bucket_configs, rebalance_max_attempts,
-    resolve_rebalance_bucket_error, resolve_rebalance_entry_cleanup_delete_result, resolve_rebalance_file_info_versions_result,
-    resolve_rebalance_migrate_result_error, resolve_rebalance_stats_update_result, resolve_rebalance_worker_result,
-    run_rebalance_listing_with_retry, should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete,
-    should_defer_rebalance_entry_failure, should_skip_rebalance_delete_marker, wait_rebalance_entry_tasks,
-    with_rebalance_entry_context,
+    record_rebalance_error, resolve_rebalance_bucket_error, resolve_rebalance_entry_cleanup_delete_result,
+    resolve_rebalance_file_info_versions_result, resolve_rebalance_migrate_result_error, resolve_rebalance_stats_update_result,
+    resolve_rebalance_worker_result, run_rebalance_listing_with_retry, should_cleanup_rebalance_source_entry,
+    should_count_rebalance_version_complete, should_defer_rebalance_entry_failure, should_skip_rebalance_delete_marker,
+    wait_rebalance_entry_tasks, with_rebalance_entry_context,
 };
 use super::{
     EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_ENTRY, EVENT_REBALANCE_STATE, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE,
@@ -676,10 +676,8 @@ impl ECStore {
                             }
                             error!("rebalance_entry: data movement admission failed: {err}");
                             let mut first_err = entry_error.lock().await;
-                            if first_err.is_none() {
-                                *first_err = Some(err);
-                                callback_rx.cancel();
-                            }
+                            record_rebalance_error(&mut first_err, err);
+                            callback_rx.cancel();
                             return;
                         }
 
@@ -721,10 +719,8 @@ impl ECStore {
                             if let Err(err) = &result {
                                 error!("rebalance_entry: rebalance entry failed: {err}");
                                 let mut first_err = entry_error.lock().await;
-                                if first_err.is_none() {
-                                    *first_err = Some(err.clone());
-                                    callback_rx.cancel();
-                                }
+                                record_rebalance_error(&mut first_err, err.clone());
+                                callback_rx.cancel();
                             }
                             debug!(
                                 event = EVENT_REBALANCE_ENTRY,
@@ -793,10 +789,7 @@ impl ECStore {
                     deferred_error = Some(last_error);
                 }
                 Ok(_) => {}
-                Err(err) if worker_error.is_none() => {
-                    worker_error = Some(err);
-                }
-                Err(_) => {}
+                Err(err) => record_rebalance_error(&mut worker_error, err),
             }
         }
         let entry_error = entry_error.lock().await.clone();

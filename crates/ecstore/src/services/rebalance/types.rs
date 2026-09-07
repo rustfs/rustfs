@@ -143,6 +143,10 @@ pub struct DiskStat {
 pub struct RebalanceMeta {
     #[serde(skip)]
     pub cancel: Option<CancellationToken>, // To be invoked on rebalance-stop
+    /// Local operator intent, scoped to this run ID; a worker failure also cancels
+    /// `cancel`, so the token alone cannot identify an administrative stop.
+    #[serde(skip)]
+    pub stop_requested: bool,
     #[serde(skip)]
     pub activation_gate: std::sync::Arc<tokio::sync::RwLock<()>>,
     #[serde(skip)]

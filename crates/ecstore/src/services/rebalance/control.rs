@@ -300,11 +300,13 @@ pub(super) fn ensure_rebalance_worker_active(meta: Option<&RebalanceMeta>, expec
     let Some(meta) = meta else {
         return Err(rebalance_metadata_not_initialized_error(stage));
     };
-    if meta.stopped_at.is_some()
-        || meta
-            .cancel
-            .as_ref()
-            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    if meta.stopped_at.is_some() || meta.stop_requested {
+        return Err(Error::OperationCanceled);
+    }
+    if meta
+        .cancel
+        .as_ref()
+        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
         || !is_rebalance_conflicting_with_decommission(meta)
     {
         return Err(Error::other(format!("inactive rebalance worker rejected during {stage}: {expected_id}")));
@@ -629,6 +631,7 @@ impl ECStore {
             if let Some(meta) = rebalance_meta.as_mut()
                 && is_rebalance_conflicting_with_decommission(meta)
             {
+                meta.stop_requested = true;
                 meta.cancel
                     .get_or_insert_with(tokio_util::sync::CancellationToken::new)
                     .cancel();
@@ -643,12 +646,13 @@ impl ECStore {
         let Some(meta) = rebalance_meta.as_mut() else {
             return Ok(None);
         };
-        if !is_rebalance_conflicting_with_decommission(meta) {
+        if meta.stopped_at.is_some() || (!is_rebalance_conflicting_with_decommission(meta) && !meta.stop_requested) {
             return Ok(None);
         }
         if meta.id.is_empty() {
             return Err(Error::other("active rebalance metadata has no activation id"));
         }
+        meta.stop_requested = true;
         meta.cancel
             .get_or_insert_with(tokio_util::sync::CancellationToken::new)
             .cancel();
@@ -673,7 +677,13 @@ impl ECStore {
             let movement_changed = rebalance_movement_snapshot_changed(self.rebalance_meta.read().await.as_ref(), &meta);
             {
                 let mut rebalance_meta = self.rebalance_meta.write().await;
-
+                if let Some(current) = rebalance_meta.as_ref()
+                    && current.id == meta.id
+                {
+                    meta.cancel = current.cancel.clone();
+                    meta.activation_gate = Arc::clone(&current.activation_gate);
+                    meta.stop_requested = current.stop_requested;
+                }
                 *rebalance_meta = Some(meta);
 
                 drop(rebalance_meta);
@@ -1188,11 +1198,12 @@ impl ECStore {
         let meta = rebalance_meta
             .as_mut()
             .ok_or_else(|| rebalance_metadata_not_initialized_error("cancel rebalance admission"))?;
-        if meta.stopped_at.is_some() || !is_rebalance_conflicting_with_decommission(meta) {
+        if meta.stopped_at.is_some() || (!is_rebalance_conflicting_with_decommission(meta) && !meta.stop_requested) {
             return Err(Error::other(format!(
                 "inactive rebalance rejected while cancelling admission: {expected_id}"
             )));
         }
+        meta.stop_requested = true;
         meta.cancel
             .get_or_insert_with(tokio_util::sync::CancellationToken::new)
             .cancel();
@@ -1213,6 +1224,7 @@ impl ECStore {
                 ensure_rebalance_run_id(rebalance_meta.as_ref(), expected_id, "stop rebalance")?;
             }
             rebalance_meta.as_mut().map(|meta| {
+                meta.stop_requested |= is_rebalance_conflicting_with_decommission(meta);
                 let cancel = meta.cancel.get_or_insert_with(tokio_util::sync::CancellationToken::new);
                 cancel.cancel();
                 Arc::clone(&meta.activation_gate)
@@ -1377,6 +1389,79 @@ mod tests {
         probe.wait_until_attempted().await;
     }
 
+    #[test]
+    fn rebalance_stop_classification_checks_identity_and_explicit_intent() {
+        let mut meta = RebalanceMeta {
+            id: "current".to_string(),
+            cancel: Some(tokio_util::sync::CancellationToken::new()),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        ensure_rebalance_worker_active(Some(&meta), "current", "test").expect("active worker");
+        meta.cancel.as_ref().unwrap().cancel();
+        assert!(
+            !matches!(
+                ensure_rebalance_worker_active(Some(&meta), "current", "test"),
+                Err(Error::OperationCanceled)
+            ),
+            "a sibling failure is not an operator stop"
+        );
+        meta.stop_requested = true;
+        assert!(matches!(
+            ensure_rebalance_worker_active(Some(&meta), "current", "test"),
+            Err(Error::OperationCanceled)
+        ));
+        assert!(
+            !matches!(ensure_rebalance_worker_active(Some(&meta), "old", "test"), Err(Error::OperationCanceled)),
+            "stale identity remains a failure even during stop"
+        );
+        assert!(!matches!(
+            ensure_rebalance_worker_active(None, "current", "test"),
+            Err(Error::OperationCanceled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rebalance_stop_intent_does_not_survive_replacement_run_reload() {
+        let (_temp_dirs, store) = crate::services::rebalance::test_store_with_persisted_rebalance_meta(RebalanceMeta {
+            id: "replacement".to_string(),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Completed,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await;
+        let previous_gate = {
+            let mut meta = store.rebalance_meta.write().await;
+            let meta = meta.as_mut().unwrap();
+            meta.id = "previous".to_string();
+            meta.stop_requested = true;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            cancel.cancel();
+            meta.cancel = Some(cancel);
+            Arc::clone(&meta.activation_gate)
+        };
+        store.load_rebalance_meta().await.expect("reload replacement run");
+        let meta = store.rebalance_meta.read().await;
+        let meta = meta.as_ref().unwrap();
+        assert_eq!(meta.id, "replacement");
+        assert!(!meta.stop_requested);
+        assert!(meta.cancel.is_none());
+        assert!(!Arc::ptr_eq(&previous_gate, &meta.activation_gate));
+    }
+
     #[tokio::test]
     async fn cancel_rebalance_admission_is_id_checked_and_idempotent() {
         let rebalance_id = "rebalance-admission-current";
@@ -1415,6 +1500,59 @@ mod tests {
             .await
             .expect("retrying admission cancellation should be idempotent");
         assert!(cancel.is_cancelled());
+        let err = store
+            .update_pool_stats_batch_for_rebalance(0, "bucket".to_string(), &[&FileInfo::default()], rebalance_id)
+            .await
+            .expect_err("stop racing with a final stats update must cancel that update");
+        assert!(matches!(err, Error::OperationCanceled), "operator stop lost its cancellation type: {err}");
+    }
+
+    #[tokio::test]
+    async fn prepare_rebalance_stop_preserves_intent_when_worker_stops_before_reload() {
+        let id = "stop-worker-before-reload";
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_temp_dirs, store) = crate::services::rebalance::test_store_with_persisted_rebalance_meta(RebalanceMeta {
+            id: id.to_string(),
+            cancel: Some(cancel.clone()),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Stopped,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await;
+        let gate = {
+            let mut meta = store.rebalance_meta.write().await;
+            let meta = meta.as_mut().expect("local rebalance metadata");
+            meta.pool_stats[0].info.status = RebalStatus::Started;
+            Arc::clone(&meta.activation_gate)
+        };
+        assert_eq!(
+            store.prepare_rebalance_stop().await.expect("prepare the same run stop"),
+            Some(id.to_string())
+        );
+        {
+            let meta = store.rebalance_meta.read().await;
+            let meta = meta.as_ref().expect("reloaded stop target");
+            assert!(Arc::ptr_eq(&gate, &meta.activation_gate), "reload must retain the drained run's gate");
+            assert!(meta.cancel.as_ref().is_some_and(|token| token.is_cancelled()));
+        }
+        store
+            .stop_rebalance_for_id(Some(id))
+            .await
+            .expect("finish the stop after the worker's terminal event");
+        store
+            .load_rebalance_meta()
+            .await
+            .expect("reload the acknowledged durable stop");
+        let meta = store.rebalance_meta.read().await;
+        let meta = meta.as_ref().expect("durable stopped metadata");
+        assert!(meta.stopped_at.is_some(), "a successful stop must retain its durable timestamp");
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Stopped);
     }
 
     #[tokio::test]
@@ -2031,7 +2169,10 @@ mod tests {
         let err = acquire_persisted_rebalance_run_guard(set_disks, active.id.as_str(), "cross-node stale snapshot")
             .await
             .expect_err("persisted stop must fence a node that missed stop propagation");
-        assert!(err.to_string().contains("inactive rebalance worker rejected"));
+        assert!(
+            matches!(err, Error::OperationCanceled),
+            "a durable remote stop cancels the same run: {err}"
+        );
     }
 
     #[test]

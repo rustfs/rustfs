@@ -57,7 +57,7 @@ pub(super) fn commit_local_rebalance_worker_activation(
             meta.id
         )));
     }
-    if meta.stopped_at.is_some() || !is_rebalance_in_progress(meta) {
+    if meta.stopped_at.is_some() || meta.stop_requested || !is_rebalance_in_progress(meta) {
         return Ok(RebalanceLocalActivationOutcome::NotStartedTerminal);
     }
     meta.cancel = Some(cancel);
