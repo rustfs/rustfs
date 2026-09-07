@@ -23,6 +23,7 @@ METRICS = (
     "cache_clone_bytes", "encode_bytes", "save_bytes", "oldest_age_seconds",
     "walk_objects", "cold_walk_objects", "healed_objects", "errors", "requests",
     "foreground_pressure_samples", "foreground_pressure_high_samples",
+    "heal_mainline_throttle_delayed",
     "heal_lock_wait_p99_ms", "heal_attempts", "heal_attempt_failures",
     "heal_retry_attempts",
 )
@@ -57,6 +58,12 @@ def ratio(numerator, denominator, name):
 
 def relative_change(current, baseline, name):
     return ratio(current, baseline, name) - Decimal("1")
+
+
+def relative_change_or_none(current, baseline, name):
+    if decimal_number(baseline, f"{name} baseline") == 0:
+        return None
+    return relative_change(current, baseline, name)
 
 
 def repeatability_change(first, second, name):
@@ -283,6 +290,62 @@ def pressure_high_ratio(metrics):
                  metrics["foreground_pressure_samples"], "foreground pressure high samples")
 
 
+def scanner_cache_cost(metrics):
+    walked = decimal_number(metrics["walk_objects"], "walk_objects")
+    encoded = decimal_number(metrics["encode_bytes"], "encode_bytes")
+    return {
+        "clone_bytes_per_walk_object": None if walked == 0 else float(ratio(metrics["cache_clone_bytes"], walked, "clone bytes per walk object")),
+        "encode_bytes_per_walk_object": None if walked == 0 else float(ratio(encoded, walked, "encode bytes per walk object")),
+        "save_bytes_per_walk_object": None if walked == 0 else float(ratio(metrics["save_bytes"], walked, "save bytes per walk object")),
+        "clone_to_encode_byte_ratio": None if encoded == 0 else float(ratio(metrics["cache_clone_bytes"], encoded, "clone to encode bytes")),
+        "save_to_encode_byte_amplification": None if encoded == 0 else float(ratio(metrics["save_bytes"], encoded, "save to encode bytes")),
+    }
+
+
+def scanner_cache_cost_change(candidate, baseline):
+    changes = {}
+    for key in ("cache_clone_bytes", "encode_bytes", "save_bytes"):
+        change = relative_change_or_none(candidate[key], baseline[key], key)
+        changes[f"{key}_change"] = None if change is None else float(change)
+    return changes
+
+
+def running_heal_pacing(group, baseline, candidate, p99, throughput, noisy):
+    if group[0]["scenario"] != "running-heal" or group[0]["comparison"] != "build":
+        return None
+    baseline_seconds = sum(decimal_number(cell["result"]["elapsed_seconds"], "elapsed_seconds") for cell in (group[0], group[3])) / 2
+    candidate_seconds = sum(decimal_number(cell["result"]["elapsed_seconds"], "elapsed_seconds") for cell in (group[1], group[2])) / 2
+    baseline_rate = ratio(baseline["heal_attempts"], baseline_seconds, "baseline heal attempt rate")
+    candidate_rate = ratio(candidate["heal_attempts"], candidate_seconds, "candidate heal attempt rate")
+    rate_change = relative_change_or_none(candidate_rate, baseline_rate, "heal attempt rate")
+    candidate_high_ratio = pressure_high_ratio(candidate)
+    baseline_delayed = decimal_number(baseline["heal_mainline_throttle_delayed"], "baseline pacing delays")
+    delayed = decimal_number(candidate["heal_mainline_throttle_delayed"], "candidate pacing delays")
+    pacing_observed = candidate_high_ratio > 0 and delayed > 0
+    foreground_improved = p99 < 0 or throughput > 0
+    status = (
+        "inconclusive"
+        if noisy
+        else "observed"
+        if pacing_observed and foreground_improved
+        else "no_measured_benefit"
+        if pacing_observed
+        else "pending"
+    )
+    return {
+        "status": status,
+        "pacing_observed": pacing_observed,
+        "candidate_pressure_high_ratio": float(candidate_high_ratio),
+        "baseline_delay_events": float(baseline_delayed),
+        "candidate_delay_events": float(delayed),
+        "baseline_heal_attempts_per_second": float(baseline_rate),
+        "candidate_heal_attempts_per_second": float(candidate_rate),
+        "heal_attempt_rate_change": None if rate_change is None else float(rate_change),
+        "foreground_p99_change": float(p99),
+        "foreground_throughput_change": float(throughput),
+    }
+
+
 def convergence(result):
     window = result.get("convergence")
     if not window or window.get("writes_stopped") is not True or window.get("last_mutation_observed") is not True or window.get("first_complete_publication") is not True:
@@ -342,6 +405,7 @@ def evaluate(cells):
         candidate_attempt_costs = [
             value for cell, value in zip(group, attempt_costs) if cell["leg"].startswith("B") and value is not None
         ]
+        w10 = running_heal_pacing(group, a, b, p99, throughput, noise)
         inconclusive |= noise or p2_pending
         if not noise and not passed:
             failed = True
@@ -352,6 +416,12 @@ def evaluate(cells):
                             "thresholds": {key: float(value) for key, value in thresholds.items()},
                             "p1": p1, "p2_max_work_multiple": float(P2_WORK_MULTIPLE_LIMIT),
                             "p2_post_stop_work_multiples": p2_report,
+                            "w22": {
+                                "baseline": scanner_cache_cost(a),
+                                "candidate": scanner_cache_cost(b),
+                                "candidate_vs_baseline": scanner_cache_cost_change(b, a),
+                            },
+                            "w10": w10,
                             "w10_w11": {
                                 "foreground_pressure_high_sample_ratios": [
                                     float(pressure_high_ratio(cell["result"]["metrics"])) for cell in group
