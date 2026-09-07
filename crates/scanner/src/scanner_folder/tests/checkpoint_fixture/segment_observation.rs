@@ -1,253 +1,184 @@
 //! Fixture-only range diagnostics. No result is supplied to a scan selector.
 
 use super::*;
-use crate::DATA_USAGE_CACHE_KEY_FORMAT;
+use crate::segment_invalidation::{
+    MAX_SEGMENT_INVALIDATION_BYTES, MAX_SEGMENT_INVALIDATION_ENTRIES, SegmentInvalidationDomain, SegmentInvalidationEnvelope,
+    SegmentInvalidationError, SegmentInvalidationProducer, SegmentInvalidationProof, admit_segment_invalidation,
+};
 use std::collections::BTreeSet;
 
-const MAX_SEGMENTS: usize = 4;
-const MAX_SEGMENT_BYTES: usize = 128;
 const MAX_WALK_SAMPLES: usize = 32;
 const MAX_WALK_BYTES: usize = 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProposalError {
-    EntryLimit,
-    ByteLimit,
-    InvalidKey,
+fn segment_producers() -> BTreeSet<SegmentInvalidationProducer> {
+    SegmentInvalidationProducer::REQUIRED.into_iter().collect()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProducerKind {
-    Put,
-    Delete,
-    DeleteMarker,
-    Multipart,
-    Replication,
-    Tier,
-    DirectoryObject,
-}
-
-impl ProducerKind {
-    const REQUIRED: [Self; 7] = [
-        Self::Put,
-        Self::Delete,
-        Self::DeleteMarker,
-        Self::Multipart,
-        Self::Replication,
-        Self::Tier,
-        Self::DirectoryObject,
-    ];
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SegmentInvalidationDomain {
-    LocalSingleSet,
-    DistributedEc,
-}
-
-#[derive(Clone, Debug)]
-struct SegmentObservationEnvelope<'a> {
-    source: DataUsageCacheSource,
-    bucket_incarnation: uuid::Uuid,
-    key_format: u16,
-    baseline_scan_plan_digest: DataUsageScanPlanDigest,
-    process_epoch: &'a str,
-    generation_start: u64,
-    generation_end: u64,
-    restart_gap: bool,
-    overflow: bool,
-    producers: BTreeSet<&'a str>,
-    keys: &'a [&'a str],
-}
-
-#[derive(Clone, Debug)]
-struct SegmentObservationProof<'a> {
-    source: DataUsageCacheSource,
-    bucket_incarnation: uuid::Uuid,
-    key_format: u16,
-    baseline_scan_plan_digest: DataUsageScanPlanDigest,
-    process_epoch: &'a str,
-    durable_producer_identity: bool,
-    invalidation_domain: SegmentInvalidationDomain,
-    distributed_ec_invalidation: bool,
-    cold_zero_walk_oracle: bool,
-}
-
-fn producer_name(kind: ProducerKind) -> &'static str {
-    match kind {
-        ProducerKind::Put => "put",
-        ProducerKind::Delete => "delete",
-        ProducerKind::DeleteMarker => "delete_marker",
-        ProducerKind::Multipart => "multipart",
-        ProducerKind::Replication => "replication",
-        ProducerKind::Tier => "tier",
-        ProducerKind::DirectoryObject => "directory_object",
+fn segment_envelope() -> SegmentInvalidationEnvelope {
+    SegmentInvalidationEnvelope {
+        source: DataUsageCacheSource::new(2, 3),
+        bucket_incarnation: uuid::Uuid::from_u128(0x12345678123456781234567812345678),
+        key_format: crate::DATA_USAGE_CACHE_KEY_FORMAT,
+        baseline_scan_plan_digest: DataUsageScanPlanDigest([9; 32]),
+        process_epoch: "epoch-a".to_string(),
+        generation_start: 11,
+        generation_end: 13,
+        restart_gap: false,
+        overflow: false,
+        producers: segment_producers(),
     }
 }
 
-fn trusted_fixture_proposal(
-    envelope: &SegmentObservationEnvelope<'_>,
-    proof: &SegmentObservationProof<'_>,
-) -> Result<BTreeSet<String>, ProposalError> {
-    if envelope.source != proof.source
-        || envelope.bucket_incarnation.is_nil()
-        || envelope.bucket_incarnation != proof.bucket_incarnation
-        || envelope.key_format != proof.key_format
-        || envelope.baseline_scan_plan_digest != proof.baseline_scan_plan_digest
-        || envelope.process_epoch != proof.process_epoch
-        || !proof.durable_producer_identity
-        || !proof.cold_zero_walk_oracle
-        || (proof.invalidation_domain == SegmentInvalidationDomain::DistributedEc && !proof.distributed_ec_invalidation)
-        || envelope.generation_start == 0
-        || envelope.generation_end < envelope.generation_start
-        || envelope.restart_gap
-        || envelope.overflow
-        || !ProducerKind::REQUIRED
-            .iter()
-            .all(|producer| envelope.producers.contains(producer_name(*producer)))
-    {
-        return Err(ProposalError::InvalidKey);
+fn segment_proof() -> SegmentInvalidationProof {
+    let envelope = segment_envelope();
+    SegmentInvalidationProof {
+        source: envelope.source,
+        bucket_incarnation: envelope.bucket_incarnation,
+        key_format: envelope.key_format,
+        baseline_scan_plan_digest: envelope.baseline_scan_plan_digest,
+        process_epoch: envelope.process_epoch,
+        durable_producer_identity: true,
+        invalidation_domain: SegmentInvalidationDomain::LocalSingleSet,
+        distributed_ec_invalidation: false,
+        cold_zero_walk_oracle: true,
     }
-
-    fixture_proposal(envelope.keys)
-}
-
-// Keys come from successful fixture writes, not a production mutation stream.
-fn fixture_proposal(keys: &[&str]) -> Result<BTreeSet<String>, ProposalError> {
-    let mut segments = BTreeSet::new();
-    let mut bytes = 0;
-    for key in keys {
-        if key.is_empty() || key.contains(['\\', '\0']) || key.split('/').any(|part| matches!(part, "" | "." | "..")) {
-            return Err(ProposalError::InvalidKey);
-        }
-        let segment = key.split('/').next().expect("validated nonempty key");
-        if segments.contains(segment) {
-            continue;
-        }
-        if segments.len() == MAX_SEGMENTS {
-            return Err(ProposalError::EntryLimit);
-        }
-        if segment.len() > MAX_SEGMENT_BYTES - bytes {
-            return Err(ProposalError::ByteLimit);
-        }
-        bytes += segment.len();
-        segments.insert(segment.to_string());
-    }
-    Ok(segments)
 }
 
 #[test]
 fn segment_observation_fixture_proposal_bounds() {
-    assert_eq!(fixture_proposal(&["hot/one", "hot/two"]), Ok(BTreeSet::from(["hot".to_string()])));
-    assert_eq!(fixture_proposal(&["a", "b", "c", "d"]).expect("entry boundary").len(), MAX_SEGMENTS);
-    assert_eq!(fixture_proposal(&["a", "b", "c", "d", "e"]), Err(ProposalError::EntryLimit));
-    let exact = "x".repeat(MAX_SEGMENT_BYTES);
-    assert!(fixture_proposal(&[&exact]).is_ok());
-    assert_eq!(fixture_proposal(&[&exact, "y"]), Err(ProposalError::ByteLimit));
-    let oversized = "x".repeat(MAX_SEGMENT_BYTES + 1);
-    assert_eq!(fixture_proposal(&[&oversized]), Err(ProposalError::ByteLimit));
+    let envelope = segment_envelope();
+    let proof = segment_proof();
+    assert_eq!(
+        admit_segment_invalidation(&envelope, &proof, ["hot/one", "hot/two"]),
+        Ok(BTreeSet::from(["hot".to_string()]))
+    );
+    assert_eq!(
+        admit_segment_invalidation(&envelope, &proof, ["a", "b", "c", "d"])
+            .expect("entry boundary")
+            .len(),
+        MAX_SEGMENT_INVALIDATION_ENTRIES
+    );
+    assert_eq!(
+        admit_segment_invalidation(&envelope, &proof, ["a", "b", "c", "d", "e"]),
+        Err(SegmentInvalidationError::EntryLimit)
+    );
+    let exact = "x".repeat(MAX_SEGMENT_INVALIDATION_BYTES);
+    assert!(admit_segment_invalidation(&envelope, &proof, [&exact]).is_ok());
+    assert_eq!(
+        admit_segment_invalidation(&envelope, &proof, [&exact, "y"]),
+        Err(SegmentInvalidationError::ByteLimit)
+    );
+    let oversized = "x".repeat(MAX_SEGMENT_INVALIDATION_BYTES + 1);
+    assert_eq!(
+        admit_segment_invalidation(&envelope, &proof, [&oversized]),
+        Err(SegmentInvalidationError::ByteLimit)
+    );
     for key in ["", "/hot", "hot/../cold", "hot//one", "hot\\one", "hot/\0"] {
-        assert_eq!(fixture_proposal(&[key]), Err(ProposalError::InvalidKey));
+        assert_eq!(
+            admit_segment_invalidation(&envelope, &proof, [key]),
+            Err(SegmentInvalidationError::InvalidKey)
+        );
     }
 }
 
 #[test]
 fn segment_observation_trusted_proposal_requires_identity_and_complete_producer_coverage() {
-    let source = DataUsageCacheSource::new(2, 3);
-    let incarnation = uuid::Uuid::from_u128(0x12345678123456781234567812345678);
-    let baseline = DataUsageScanPlanDigest([9; 32]);
-    let producers = ProducerKind::REQUIRED
-        .iter()
-        .map(|producer| producer_name(*producer))
-        .collect::<BTreeSet<_>>();
-    let envelope = SegmentObservationEnvelope {
-        source,
-        bucket_incarnation: incarnation,
-        key_format: DATA_USAGE_CACHE_KEY_FORMAT,
-        baseline_scan_plan_digest: baseline,
-        process_epoch: "epoch-a",
-        generation_start: 11,
-        generation_end: 13,
-        restart_gap: false,
-        overflow: false,
-        producers,
-        keys: &["hot/one", "hot/two", "archive/delete-marker"],
-    };
-    let proof = SegmentObservationProof {
-        source,
-        bucket_incarnation: incarnation,
-        key_format: DATA_USAGE_CACHE_KEY_FORMAT,
-        baseline_scan_plan_digest: baseline,
-        process_epoch: "epoch-a",
-        durable_producer_identity: true,
-        invalidation_domain: SegmentInvalidationDomain::LocalSingleSet,
-        distributed_ec_invalidation: false,
-        cold_zero_walk_oracle: true,
-    };
+    let envelope = segment_envelope();
+    let proof = segment_proof();
 
     assert_eq!(
-        trusted_fixture_proposal(&envelope, &proof),
+        admit_segment_invalidation(&envelope, &proof, ["hot/one", "hot/two", "archive/delete-marker"]),
         Ok(BTreeSet::from(["archive".to_string(), "hot".to_string()]))
     );
 
     let mut wrong_source = envelope.clone();
     wrong_source.source = DataUsageCacheSource::new(2, 4);
-    assert_eq!(trusted_fixture_proposal(&wrong_source, &proof), Err(ProposalError::InvalidKey));
+    assert_eq!(
+        admit_segment_invalidation(&wrong_source, &proof, ["hot/one"]),
+        Err(SegmentInvalidationError::InvalidProof)
+    );
 
     let mut missing_incarnation = envelope.clone();
     missing_incarnation.bucket_incarnation = uuid::Uuid::nil();
-    assert_eq!(trusted_fixture_proposal(&missing_incarnation, &proof), Err(ProposalError::InvalidKey));
+    assert_eq!(
+        admit_segment_invalidation(&missing_incarnation, &proof, ["hot/one"]),
+        Err(SegmentInvalidationError::InvalidProof)
+    );
 
     let mut wrong_key_format = envelope.clone();
-    wrong_key_format.key_format = DATA_USAGE_CACHE_KEY_FORMAT.saturating_add(1);
-    assert_eq!(trusted_fixture_proposal(&wrong_key_format, &proof), Err(ProposalError::InvalidKey));
+    wrong_key_format.key_format = crate::DATA_USAGE_CACHE_KEY_FORMAT.saturating_add(1);
+    assert_eq!(
+        admit_segment_invalidation(&wrong_key_format, &proof, ["hot/one"]),
+        Err(SegmentInvalidationError::InvalidProof)
+    );
 
     let mut wrong_baseline = envelope.clone();
     wrong_baseline.baseline_scan_plan_digest = DataUsageScanPlanDigest([8; 32]);
-    assert_eq!(trusted_fixture_proposal(&wrong_baseline, &proof), Err(ProposalError::InvalidKey));
+    assert_eq!(
+        admit_segment_invalidation(&wrong_baseline, &proof, ["hot/one"]),
+        Err(SegmentInvalidationError::InvalidProof)
+    );
 
     let mut wrong_epoch = envelope.clone();
-    wrong_epoch.process_epoch = "epoch-b";
-    assert_eq!(trusted_fixture_proposal(&wrong_epoch, &proof), Err(ProposalError::InvalidKey));
+    wrong_epoch.process_epoch = "epoch-b".to_string();
+    assert_eq!(
+        admit_segment_invalidation(&wrong_epoch, &proof, ["hot/one"]),
+        Err(SegmentInvalidationError::InvalidProof)
+    );
 
     let mut no_durable_identity = proof.clone();
     no_durable_identity.durable_producer_identity = false;
-    assert_eq!(trusted_fixture_proposal(&envelope, &no_durable_identity), Err(ProposalError::InvalidKey));
+    assert_eq!(
+        admit_segment_invalidation(&envelope, &no_durable_identity, ["hot/one"]),
+        Err(SegmentInvalidationError::InvalidProof)
+    );
 
     let mut restart_gap = envelope.clone();
     restart_gap.restart_gap = true;
-    assert_eq!(trusted_fixture_proposal(&restart_gap, &proof), Err(ProposalError::InvalidKey));
+    assert_eq!(
+        admit_segment_invalidation(&restart_gap, &proof, ["hot/one"]),
+        Err(SegmentInvalidationError::InvalidProof)
+    );
 
     let mut overflow = envelope.clone();
     overflow.overflow = true;
-    assert_eq!(trusted_fixture_proposal(&overflow, &proof), Err(ProposalError::InvalidKey));
+    assert_eq!(
+        admit_segment_invalidation(&overflow, &proof, ["hot/one"]),
+        Err(SegmentInvalidationError::InvalidProof)
+    );
 
     let mut generation_gap = envelope.clone();
     generation_gap.generation_end = generation_gap.generation_start - 1;
-    assert_eq!(trusted_fixture_proposal(&generation_gap, &proof), Err(ProposalError::InvalidKey));
+    assert_eq!(
+        admit_segment_invalidation(&generation_gap, &proof, ["hot/one"]),
+        Err(SegmentInvalidationError::InvalidProof)
+    );
 
     let mut missing_producer = envelope.clone();
-    missing_producer.producers.remove(producer_name(ProducerKind::Replication));
-    assert_eq!(trusted_fixture_proposal(&missing_producer, &proof), Err(ProposalError::InvalidKey));
+    missing_producer.producers.remove(&SegmentInvalidationProducer::Replication);
+    assert_eq!(
+        admit_segment_invalidation(&missing_producer, &proof, ["hot/one"]),
+        Err(SegmentInvalidationError::InvalidProof)
+    );
 
     let mut missing_zero_walk_oracle = proof.clone();
     missing_zero_walk_oracle.cold_zero_walk_oracle = false;
     assert_eq!(
-        trusted_fixture_proposal(&envelope, &missing_zero_walk_oracle),
-        Err(ProposalError::InvalidKey)
+        admit_segment_invalidation(&envelope, &missing_zero_walk_oracle, ["hot/one"]),
+        Err(SegmentInvalidationError::InvalidProof)
     );
 
-    let mut distributed_without_invalidation = proof.clone();
+    let mut distributed_without_invalidation = proof;
     distributed_without_invalidation.invalidation_domain = SegmentInvalidationDomain::DistributedEc;
     assert_eq!(
-        trusted_fixture_proposal(&envelope, &distributed_without_invalidation),
-        Err(ProposalError::InvalidKey)
+        admit_segment_invalidation(&envelope, &distributed_without_invalidation, ["hot/one"]),
+        Err(SegmentInvalidationError::InvalidProof)
     );
 
     let mut distributed_with_invalidation = distributed_without_invalidation;
     distributed_with_invalidation.distributed_ec_invalidation = true;
     assert_eq!(
-        trusted_fixture_proposal(&envelope, &distributed_with_invalidation),
+        admit_segment_invalidation(&envelope, &distributed_with_invalidation, ["hot/one", "hot/two", "archive/delete-marker"]),
         Ok(BTreeSet::from(["archive".to_string(), "hot".to_string()]))
     );
 }
@@ -314,7 +245,8 @@ async fn walk_and_save(observe: bool) -> (Vec<String>, serde_json::Value) {
             assert!(path.len() <= MAX_WALK_BYTES - bytes, "fixture walk exceeded its byte budget");
             paths.push(path.to_string());
             if observe {
-                let proposed = fixture_proposal(&[changed_key]).expect("bounded successful fixture mutation");
+                let proposed = admit_segment_invalidation(&segment_envelope(), &segment_proof(), [changed_key])
+                    .expect("bounded successful fixture mutation");
                 if let Some(segment) = path.strip_prefix("bucket/").and_then(|path| path.split('/').next())
                     && proposed.contains(segment)
                 {
