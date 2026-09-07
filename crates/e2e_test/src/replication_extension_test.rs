@@ -512,7 +512,7 @@ pub(crate) async fn put_bucket_replication(
     put_bucket_replication_with_delete_statuses(env, bucket, target_arn, "Enabled", None).await
 }
 
-async fn put_bucket_replication_with_delete_statuses(
+pub(crate) async fn put_bucket_replication_with_delete_statuses(
     env: &RustFSTestEnvironment,
     bucket: &str,
     target_arn: &str,
@@ -627,7 +627,7 @@ async fn put_bucket_replication_rules(
     Ok(())
 }
 
-async fn delete_bucket_replication(
+pub(crate) async fn delete_bucket_replication(
     env: &RustFSTestEnvironment,
     bucket: &str,
 ) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
@@ -9055,9 +9055,11 @@ async fn test_replication_check_flags_multipart_only_version_minting_target() ->
             .is_some_and(|error| error.contains("CreateMultipartUpload")),
         "the failure must name the multipart path: {payload}"
     );
-    // The PutObject leg mirrored, so it is the multipart probe that failed.
+    // The PutObject leg mirrored, so it is the multipart probe that failed;
+    // the mutation phases address the id the PUT reported and still run.
     assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
-    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionDelete"]["Status"], "OK", "{payload}");
     assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
 
     let probe_key = target
@@ -9245,6 +9247,9 @@ async fn test_replication_check_flags_version_minting_target() -> TestResult {
     let target_bucket = "version-fidelity-dst";
     target.create_bucket(target_bucket);
     target.assign_own_version_ids(true);
+    // Wasabi shape: the probe version the VersionDelete phase removed answers
+    // NoSuchVersion to cleanup's second DELETE, which must count as clean.
+    target.reject_unknown_version_deletes(true);
 
     let mut source_env = RustFSTestEnvironment::new().await?;
     let mut env_vars = replication_fast_env();
@@ -9289,11 +9294,13 @@ async fn test_replication_check_flags_version_minting_target() -> TestResult {
         fidelity["Code"], "BucketRemoteTargetVersionMismatch",
         "the failure must carry a machine-readable code: {payload}"
     );
-    // The probe PUT itself succeeded (fidelity is judged from its response);
-    // the later mutation phases are pointless against a drifting target and
-    // must be skipped, but cleanup still runs.
+    // The probe PUT itself succeeded (fidelity is judged from its response).
+    // The mutation phases address the id the target assigned — the ledger
+    // the worker records per object (rustfs/backlog#2340) — so they run and
+    // pass on a drifting target, and cleanup uses the same id.
     assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
-    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionDelete"]["Status"], "OK", "{payload}");
     assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
 
     // The probe PUT must carry the source version as `?versionId=` — the

@@ -36,14 +36,16 @@ use crate::fake_s3_target::{BucketMode, FAKE_ACCESS_KEY, FAKE_SECRET_KEY};
 use crate::fake_s3_target::{FakeS3Target, FaultAction as FakeTargetFault, Operation as FakeTargetOperation, RequestRecord};
 use crate::on_demand_migration::common::{OdmEnvOptions, OdmTestEnv, fake_source_client};
 use crate::replication_extension_test::{
-    LOOPBACK_REPLICATION_TARGET_ENV, ReplicationTargetOptions, enable_bucket_versioning, get_replication_reset_status,
-    put_bucket_replication, set_replication_target_with_options, start_bucket_replication_reset,
+    LOOPBACK_REPLICATION_TARGET_ENV, ReplicationTargetOptions, delete_bucket_replication, enable_bucket_versioning,
+    get_replication_reset_status, put_bucket_replication, put_bucket_replication_with_delete_statuses,
+    set_replication_target_with_options, start_bucket_replication_reset,
 };
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::{ByteStream, DateTime};
 use aws_sdk_s3::types::{
-    Checksum, ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, ObjectAttributes, ObjectLockLegalHoldStatus,
-    ObjectLockMode,
+    Checksum, ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, ObjectAttributes, ObjectLockLegalHold,
+    ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, Tag, Tagging,
 };
 use bytes::Bytes;
 use std::error::Error;
@@ -66,7 +68,10 @@ enum TargetMode {
     /// Object Lock parameters must carry `Content-MD5` or `x-amz-checksum-*`.
     RequireChecksumWithObjectLock,
     /// AWS S3 / Wasabi / Impossible Cloud: mints its own version ids
-    /// (rustfs/backlog#2085). Data must still land.
+    /// (rustfs/backlog#2085) and, like Wasabi, answers NoSuchVersion to a
+    /// DELETE of an id it never had (rustfs/backlog#2340). Data must still
+    /// land, and every version-addressed mutation must resolve the replica
+    /// through the target-version ledger.
     MintOwnVersionIds,
 }
 
@@ -83,7 +88,10 @@ impl TargetMode {
             TargetMode::Baseline => {}
             TargetMode::RejectAwsChunked => target.reject_aws_chunked_uploads(true),
             TargetMode::RequireChecksumWithObjectLock => target.require_checksum_for_object_lock(true),
-            TargetMode::MintOwnVersionIds => target.assign_own_version_ids(true),
+            TargetMode::MintOwnVersionIds => {
+                target.assign_own_version_ids(true);
+                target.reject_unknown_version_deletes(true);
+            }
         }
     }
 
@@ -382,6 +390,431 @@ async fn matrix_mint_own_version_ids_redrive_does_not_duplicate() -> TestResult 
 
     target.shutdown().await;
     Ok(())
+}
+
+/// rustfs/backlog#2340 (target-version ledger): on a target that mints its own
+/// version ids and answers NoSuchVersion to an unknown id (the Wasabi shape),
+/// every version-addressed mutation must land on the version the target
+/// assigned, which the replication PUT recorded on the source:
+/// - a tag update changes the existing target version, no new version;
+/// - a retention extension and legal hold ON/OFF change that version too;
+/// - a permanent delete of the older of two same-content generations removes
+///   exactly that replica and keeps the live one (content identity alone
+///   could not tell them apart).
+#[tokio::test]
+async fn matrix_mint_own_version_ids_addresses_mutations_through_the_ledger() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "matrix-mint-own-ledger-dst".to_string();
+    target.create_bucket_with_object_lock(target_bucket.clone());
+    TargetMode::MintOwnVersionIds.apply(&target);
+
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("HTTP_PROXY", ""),
+        ("HTTPS_PROXY", ""),
+        // The scanner heal pass retries a purge the first attempt lost.
+        ("RUSTFS_SCANNER_CYCLE", "1"),
+        ("RUSTFS_SCANNER_START_DELAY_SECS", "1"),
+    ]);
+    let env = OdmTestEnv::start_with(OdmEnvOptions {
+        env: env_vars,
+        ..OdmEnvOptions::default()
+    })
+    .await?;
+    let source_env = &env.rustfs;
+
+    let source_bucket = "matrix-mint-own-ledger-src";
+    let source_client = source_env.create_s3_client();
+    source_client
+        .create_bucket()
+        .bucket(source_bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await?;
+    enable_bucket_versioning(source_env, source_bucket).await?;
+    let target_arn = set_replication_target_with_options(
+        source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket: &target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication_with_delete_statuses(source_env, source_bucket, &target_arn, "Enabled", Some("Enabled")).await?;
+    let target_client = fake_source_client(&target);
+
+    // Tag update on an existing version.
+    let tag_key = "ledger/tags.bin";
+    let tagged = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(tag_key)
+        .body(ByteStream::from(payload(4 * 1024, 0x01)))
+        .send()
+        .await?;
+    let tag_source_version = tagged.version_id().ok_or("source PUT returned no version id")?.to_string();
+    assert_eq!(
+        wait_for_terminal_replication_status(&source_client, source_bucket, tag_key).await?,
+        "COMPLETED"
+    );
+    let tag_target_version = single_target_version(&target, &target_bucket, tag_key)?;
+    source_client
+        .put_object_tagging()
+        .bucket(source_bucket)
+        .key(tag_key)
+        .version_id(&tag_source_version)
+        .tagging(
+            Tagging::builder()
+                .tag_set(Tag::builder().key("phase").value("after").build()?)
+                .build()?,
+        )
+        .send()
+        .await?;
+    wait_until("tag update on the existing target version", || async {
+        let tags = target_client
+            .get_object_tagging()
+            .bucket(&target_bucket)
+            .key(tag_key)
+            .version_id(&tag_target_version)
+            .send()
+            .await?;
+        Ok(tags
+            .tag_set()
+            .iter()
+            .any(|tag| tag.key() == "phase" && tag.value() == "after"))
+    })
+    .await?;
+    assert_stable_single_version(&target, &target_bucket, tag_key, &tag_target_version).await?;
+
+    // Retention extension and legal hold on an existing version.
+    let lock_key = "ledger/lock.bin";
+    let locked = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(lock_key)
+        .body(ByteStream::from(payload(4 * 1024, 0x02)))
+        .object_lock_mode(ObjectLockMode::Governance)
+        .object_lock_retain_until_date(retain_until())
+        .send()
+        .await?;
+    let lock_source_version = locked.version_id().ok_or("source PUT returned no version id")?.to_string();
+    assert_eq!(
+        wait_for_terminal_replication_status(&source_client, source_bucket, lock_key).await?,
+        "COMPLETED"
+    );
+    let lock_target_version = single_target_version(&target, &target_bucket, lock_key)?;
+    let extended = DateTime::from_secs(retain_until().secs() + 86_400);
+    source_client
+        .put_object_retention()
+        .bucket(source_bucket)
+        .key(lock_key)
+        .version_id(&lock_source_version)
+        .retention(
+            ObjectLockRetention::builder()
+                .mode(ObjectLockRetentionMode::Governance)
+                .retain_until_date(extended)
+                .build(),
+        )
+        .send()
+        .await?;
+    source_client
+        .put_object_legal_hold()
+        .bucket(source_bucket)
+        .key(lock_key)
+        .version_id(&lock_source_version)
+        .legal_hold(ObjectLockLegalHold::builder().status(ObjectLockLegalHoldStatus::On).build())
+        .send()
+        .await?;
+    wait_until("retention extension and legal hold on the existing target version", || async {
+        let head = target_client
+            .head_object()
+            .bucket(&target_bucket)
+            .key(lock_key)
+            .version_id(&lock_target_version)
+            .send()
+            .await?;
+        Ok(head.object_lock_retain_until_date().map(|date| date.secs()) == Some(extended.secs())
+            && head.object_lock_legal_hold_status() == Some(&ObjectLockLegalHoldStatus::On))
+    })
+    .await?;
+    source_client
+        .put_object_legal_hold()
+        .bucket(source_bucket)
+        .key(lock_key)
+        .version_id(&lock_source_version)
+        .legal_hold(ObjectLockLegalHold::builder().status(ObjectLockLegalHoldStatus::Off).build())
+        .send()
+        .await?;
+    wait_until("legal hold removal on the existing target version", || async {
+        let head = target_client
+            .head_object()
+            .bucket(&target_bucket)
+            .key(lock_key)
+            .version_id(&lock_target_version)
+            .send()
+            .await?;
+        Ok(head.object_lock_legal_hold_status() == Some(&ObjectLockLegalHoldStatus::Off))
+    })
+    .await?;
+    assert_stable_single_version(&target, &target_bucket, lock_key, &lock_target_version).await?;
+
+    // Permanent delete of the older of two same-content generations.
+    let generations_key = "ledger/generations.bin";
+    let body = payload(4 * 1024, 0x03);
+    let older = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(generations_key)
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await?;
+    let older_version = older.version_id().ok_or("source PUT returned no version id")?.to_string();
+    assert_eq!(
+        wait_for_terminal_replication_status(&source_client, source_bucket, generations_key).await?,
+        "COMPLETED"
+    );
+    let older_replica = single_target_version(&target, &target_bucket, generations_key)?;
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(generations_key)
+        .body(ByteStream::from(body))
+        .send()
+        .await?;
+    assert_eq!(
+        wait_for_terminal_replication_status(&source_client, source_bucket, generations_key).await?,
+        "COMPLETED"
+    );
+    wait_until("both generations replicated", || async {
+        Ok(target.stored_versions(&target_bucket, generations_key).len() == 2)
+    })
+    .await?;
+    let newer_replica = target
+        .stored_versions(&target_bucket, generations_key)
+        .into_iter()
+        .map(|(version_id, _)| version_id)
+        .find(|version_id| version_id != &older_replica)
+        .ok_or("the second generation must have its own target version")?;
+
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(generations_key)
+        .version_id(&older_version)
+        .send()
+        .await?;
+    wait_until("permanent delete of the older generation's replica", || async {
+        let versions: Vec<String> = target
+            .stored_versions(&target_bucket, generations_key)
+            .into_iter()
+            .map(|(version_id, _)| version_id)
+            .collect();
+        Ok(versions == [newer_replica.clone()])
+    })
+    .await?;
+    assert_stable_single_version(&target, &target_bucket, generations_key, &newer_replica).await?;
+
+    // No mutation above may have gone out as a re-PUT: one upload per key.
+    for key in [tag_key, lock_key] {
+        let puts = target
+            .requests()
+            .iter()
+            .filter(|record| record.key.as_deref() == Some(key) && record.operation == FakeTargetOperation::PutObject)
+            .count();
+        assert_eq!(
+            puts, 1,
+            "{key}: a metadata update must not re-PUT the object on a target that mints its own ids"
+        );
+    }
+
+    target.shutdown().await;
+    Ok(())
+}
+
+/// rustfs/backlog#2340 (pending purge lifecycle): a permanent delete whose
+/// replication keeps failing leaves the version in xl.meta as a PENDING purge,
+/// hidden from listings. Once the bucket's replication configuration is
+/// removed nothing can ever confirm that purge remotely, so the delete worker
+/// must settle it locally (abandoned, with the replica left on the former
+/// target) — otherwise the bucket stays `BucketNotEmpty` forever with a
+/// residue the client cannot see.
+#[tokio::test]
+async fn matrix_removed_replication_config_abandons_pending_purge() -> TestResult {
+    init_logging();
+
+    let target = FakeS3Target::start().await?;
+    let target_bucket = "matrix-abandoned-purge-dst".to_string();
+    target.create_bucket_with_object_lock(target_bucket.clone());
+    TargetMode::MintOwnVersionIds.apply(&target);
+
+    let mut env_vars = replication_fast_env();
+    env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    env_vars.extend_from_slice(&[
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("HTTP_PROXY", ""),
+        ("HTTPS_PROXY", ""),
+        // The scanner heal pass is what revisits a pending purge.
+        ("RUSTFS_SCANNER_CYCLE", "1"),
+        ("RUSTFS_SCANNER_START_DELAY_SECS", "1"),
+    ]);
+    let env = OdmTestEnv::start_with(OdmEnvOptions {
+        env: env_vars,
+        ..OdmEnvOptions::default()
+    })
+    .await?;
+    let source_env = &env.rustfs;
+
+    let source_bucket = "matrix-abandoned-purge-src";
+    let source_client = source_env.create_s3_client();
+    source_client
+        .create_bucket()
+        .bucket(source_bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await?;
+    enable_bucket_versioning(source_env, source_bucket).await?;
+    let target_arn = set_replication_target_with_options(
+        source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target.address(),
+            access_key: FAKE_ACCESS_KEY,
+            secret_key: FAKE_SECRET_KEY,
+            target_bucket: &target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication_with_delete_statuses(source_env, source_bucket, &target_arn, "Enabled", Some("Enabled")).await?;
+
+    let key = "purge/orphaned.bin";
+    let put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(key)
+        .body(ByteStream::from(payload(4 * 1024, 0x07)))
+        .send()
+        .await?;
+    let source_version = put.version_id().ok_or("source PUT returned no version id")?.to_string();
+    assert_eq!(
+        wait_for_terminal_replication_status(&source_client, source_bucket, key).await?,
+        "COMPLETED"
+    );
+    let replica = single_target_version(&target, &target_bucket, key)?;
+
+    // The target refuses every purge: the version stays a pending purge.
+    // More refusals than any scanner cycle can consume within the test.
+    target.inject_for_key(FakeTargetOperation::DeleteObject, key, FakeTargetFault::ResponseStatus(503), 4_000);
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(key)
+        .version_id(&source_version)
+        .send()
+        .await?;
+    wait_until("the refused purge to reach the target at least once", || async {
+        Ok(target.count_requests(FakeTargetOperation::DeleteObject, key) >= 1)
+    })
+    .await?;
+    let listed = source_client.list_object_versions().bucket(source_bucket).send().await?;
+    assert!(
+        listed.versions().is_empty() && listed.delete_markers().is_empty(),
+        "a pending purge is hidden from listings: {listed:?}"
+    );
+    let blocked = source_client.delete_bucket().bucket(source_bucket).send().await;
+    assert!(
+        blocked
+            .as_ref()
+            .err()
+            .and_then(|err| err.as_service_error())
+            .is_some_and(|err| err.code() == Some("BucketNotEmpty")),
+        "the hidden pending purge must block DeleteBucket while the target is still configured: {blocked:?}"
+    );
+
+    // Removing the replication configuration orphans the purge; the scanner
+    // heal pass must settle it locally so the bucket becomes deletable.
+    let response = delete_bucket_replication(source_env, source_bucket).await?;
+    assert!(response.status().is_success(), "DeleteBucketReplication: {}", response.status());
+    wait_until("DeleteBucket to succeed once the orphaned purge is abandoned", || async {
+        match source_client.delete_bucket().bucket(source_bucket).send().await {
+            Ok(_) => Ok(true),
+            Err(err) if err.as_service_error().is_some_and(|err| err.code() == Some("BucketNotEmpty")) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    })
+    .await?;
+    // Abandoned means abandoned: the replica stays on the former target and,
+    // once the attempts in flight at removal time have drained, no further
+    // purge attempts are sent to it.
+    assert_eq!(
+        single_target_version(&target, &target_bucket, key)?,
+        replica,
+        "an abandoned purge must not touch the replica on the former target"
+    );
+    sleep(Duration::from_secs(3)).await;
+    let settled = target.count_requests(FakeTargetOperation::DeleteObject, key);
+    sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        target.count_requests(FakeTargetOperation::DeleteObject, key),
+        settled,
+        "purge attempts must stop once the target is no longer configured"
+    );
+
+    target.shutdown().await;
+    Ok(())
+}
+
+fn single_target_version(target: &FakeS3Target, target_bucket: &str, key: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let versions = target.stored_versions(target_bucket, key);
+    match versions.as_slice() {
+        [(version_id, false)] => Ok(version_id.clone()),
+        other => Err(format!("{key}: expected exactly one live target version, got {other:?}").into()),
+    }
+}
+
+/// The target keeps holding exactly `version_id` for a few scanner cycles: a
+/// re-driven PUT or a wrong delete would show up here.
+async fn assert_stable_single_version(target: &FakeS3Target, target_bucket: &str, key: &str, version_id: &str) -> TestResult {
+    for _ in 0..8 {
+        let versions = target.stored_versions(target_bucket, key);
+        if versions.len() != 1 || versions[0].0 != version_id {
+            return Err(
+                format!("{key}: target versions drifted from the single expected replica {version_id}: {versions:?}").into(),
+            );
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    Ok(())
+}
+
+async fn wait_until<F, Fut>(what: &str, mut probe: F) -> TestResult
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool, Box<dyn Error + Send + Sync>>>,
+{
+    let wait = async {
+        loop {
+            if probe().await? {
+                return Ok::<_, Box<dyn Error + Send + Sync>>(());
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+    };
+    timeout(Duration::from_secs(90), wait)
+        .await
+        .map_err(|_| format!("{what} did not happen within 90 seconds"))?
 }
 
 /// Wait until `key` is COMPLETED on the source and, for the observation

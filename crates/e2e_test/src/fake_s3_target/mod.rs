@@ -34,12 +34,14 @@ use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, CommonPrefix, CompleteMultipartUploadInput,
     CompleteMultipartUploadOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteMarkerEntry, DeleteObjectInput,
     DeleteObjectOutput, DeleteObjectTaggingInput, DeleteObjectTaggingOutput, ETag, GetBucketVersioningInput,
-    GetBucketVersioningOutput, GetObjectInput, GetObjectLockConfigurationInput, GetObjectLockConfigurationOutput,
-    GetObjectOutput, GetObjectTaggingInput, GetObjectTaggingOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
+    GetBucketVersioningOutput, GetObjectInput, GetObjectLegalHoldInput, GetObjectLegalHoldOutput,
+    GetObjectLockConfigurationInput, GetObjectLockConfigurationOutput, GetObjectOutput, GetObjectRetentionInput,
+    GetObjectRetentionOutput, GetObjectTaggingInput, GetObjectTaggingOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
     HeadObjectOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input, ListObjectsV2Output, Object,
-    ObjectLockConfiguration, ObjectLockEnabled, ObjectStorageClass, ObjectVersionId, PutObjectInput, PutObjectOutput,
-    PutObjectTaggingInput, PutObjectTaggingOutput, Range, StreamingBlob, Tag, TagSet, Timestamp, TimestampFormat,
-    UploadPartInput, UploadPartOutput,
+    ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode,
+    ObjectLockRetention, ObjectLockRetentionMode, ObjectStorageClass, ObjectVersionId, PutObjectInput, PutObjectLegalHoldInput,
+    PutObjectLegalHoldOutput, PutObjectOutput, PutObjectRetentionInput, PutObjectRetentionOutput, PutObjectTaggingInput,
+    PutObjectTaggingOutput, Range, StreamingBlob, Tag, TagSet, Timestamp, TimestampFormat, UploadPartInput, UploadPartOutput,
 };
 use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s::validation::{AwsNameValidation, NameValidation};
@@ -127,6 +129,10 @@ pub enum Operation {
     GetObjectTagging,
     PutObjectTagging,
     DeleteObjectTagging,
+    GetObjectRetention,
+    PutObjectRetention,
+    GetObjectLegalHold,
+    PutObjectLegalHold,
     ListObjectVersions,
     ListObjectsV2,
     CreateMultipartUpload,
@@ -501,6 +507,10 @@ struct StoreState {
     /// PutObject carrying any `x-amz-object-lock-*` header must also carry
     /// `Content-MD5` or an `x-amz-checksum-*` header.
     require_checksum_for_object_lock: bool,
+    /// Models Wasabi (rustfs/backlog#2340): a version-addressed DELETE of a
+    /// version id the target never had answers 404 `NoSuchVersion` instead of
+    /// the idempotent 204 RustFS/MinIO give.
+    reject_unknown_version_deletes: bool,
     limits: StoreLimits,
     buckets: HashMap<String, BucketState>,
     uploads: HashMap<String, MultipartState>,
@@ -565,6 +575,41 @@ struct ObjectVersion {
     /// SSE-C passthrough transport headers stored with the version (RustFS
     /// target behavior); empty when the drop mode discarded them.
     replication_sse_headers: Vec<(String, String)>,
+    /// Object Lock state of the version: retention (mode, retain-until) from
+    /// the PUT / CreateMultipartUpload headers or PutObjectRetention, and the
+    /// legal hold flag; replayed on HEAD.
+    lock: VersionLock,
+}
+
+#[derive(Clone, Default)]
+struct VersionLock {
+    retention: Option<(String, Timestamp)>,
+    /// `None` until a legal hold status was ever set; like S3, HEAD then
+    /// reports nothing, while an explicit OFF is reported as `OFF`.
+    legal_hold: Option<bool>,
+}
+
+impl VersionLock {
+    fn from_headers(
+        mode: Option<ObjectLockMode>,
+        retain_until: Option<Timestamp>,
+        legal_hold: Option<ObjectLockLegalHoldStatus>,
+    ) -> Self {
+        Self {
+            retention: mode.zip(retain_until).map(|(mode, until)| (mode.as_str().to_string(), until)),
+            legal_hold: legal_hold.map(|status| status.as_str().eq_ignore_ascii_case("ON")),
+        }
+    }
+
+    fn legal_hold_status(&self) -> Option<ObjectLockLegalHoldStatus> {
+        self.legal_hold.map(|on| {
+            ObjectLockLegalHoldStatus::from_static(if on {
+                ObjectLockLegalHoldStatus::ON
+            } else {
+                ObjectLockLegalHoldStatus::OFF
+            })
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -576,6 +621,7 @@ struct MultipartState {
     metadata: Option<HashMap<String, String>>,
     standard_headers: StandardHeaders,
     replication_sse_headers: Vec<(String, String)>,
+    lock: VersionLock,
     parts: BTreeMap<i32, MultipartPart>,
 }
 
@@ -849,6 +895,7 @@ impl FakeS3Target {
             standard_headers: seed.standard_headers.clone(),
             tags: Vec::new(),
             replication_sse_headers: Vec::new(),
+            lock: VersionLock::default(),
         };
         upsert_version(&mut state, bucket, key.into(), version).expect("seed object must fit the storage budget");
         e_tag
@@ -922,6 +969,12 @@ impl FakeS3Target {
     /// PutObject that carries Object Lock parameters (AWS S3 / MinIO rule,
     /// rustfs#7082). `Content-MD5`, when present, is always verified against
     /// the body regardless of this mode.
+    /// Wasabi-like mode: DELETE of an unknown version id answers 404
+    /// `NoSuchVersion` (the default 204 models RustFS/MinIO).
+    pub fn reject_unknown_version_deletes(&self, enabled: bool) {
+        lock(&self.backend.store).reject_unknown_version_deletes = enabled;
+    }
+
     pub fn require_checksum_for_object_lock(&self, enabled: bool) {
         lock(&self.backend.store).require_checksum_for_object_lock = enabled;
     }
@@ -1156,6 +1209,10 @@ fn operation_from_s3_name(name: &str) -> Operation {
         "GetObjectTagging" => Operation::GetObjectTagging,
         "PutObjectTagging" => Operation::PutObjectTagging,
         "DeleteObjectTagging" => Operation::DeleteObjectTagging,
+        "GetObjectRetention" => Operation::GetObjectRetention,
+        "PutObjectRetention" => Operation::PutObjectRetention,
+        "GetObjectLegalHold" => Operation::GetObjectLegalHold,
+        "PutObjectLegalHold" => Operation::PutObjectLegalHold,
         "ListObjectsV2" => Operation::ListObjectsV2,
         "CreateMultipartUpload" => Operation::CreateMultipartUpload,
         "UploadPart" => Operation::UploadPart,
@@ -1292,6 +1349,18 @@ fn parse_request(method: &Method, uri: &Uri) -> ParsedRequest {
         }
         (&Method::DELETE, true) if query.contains_key("tagging") && only_query_keys(&["tagging", "versionId"]) => {
             Operation::DeleteObjectTagging
+        }
+        (&Method::GET, true) if query.contains_key("retention") && only_query_keys(&["retention", "versionId"]) => {
+            Operation::GetObjectRetention
+        }
+        (&Method::PUT, true) if query.contains_key("retention") && only_query_keys(&["retention", "versionId"]) => {
+            Operation::PutObjectRetention
+        }
+        (&Method::GET, true) if query.contains_key("legal-hold") && only_query_keys(&["legal-hold", "versionId"]) => {
+            Operation::GetObjectLegalHold
+        }
+        (&Method::PUT, true) if query.contains_key("legal-hold") && only_query_keys(&["legal-hold", "versionId"]) => {
+            Operation::PutObjectLegalHold
         }
         // A replication PUT addresses the source version via `?versionId=`.
         (&Method::PUT, true) if only_query_keys(&["versionId"]) => Operation::PutObject,
@@ -1846,6 +1915,28 @@ fn set_version_tags(
     Ok(resolved)
 }
 
+fn update_version_lock(
+    state: &mut StoreState,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    update: impl FnOnce(&mut VersionLock),
+) -> S3Result<String> {
+    let resolved = find_version(state, bucket, key, version_id)?.version_id;
+    let version = state
+        .buckets
+        .get_mut(bucket)
+        .expect("bucket existence checked by find_version")
+        .objects
+        .get_mut(key)
+        .expect("key existence checked by find_version")
+        .iter_mut()
+        .find(|version| version.version_id == resolved)
+        .expect("version existence checked by find_version");
+    update(&mut version.lock);
+    Ok(resolved)
+}
+
 /// Whether version ids are surfaced for this bucket. Unknown buckets report
 /// `true`; the caller's lookup raises `NoSuchBucket` first.
 fn bucket_versioned(state: &StoreState, bucket: &str) -> bool {
@@ -2285,6 +2376,11 @@ impl S3 for FakeBackend {
             standard_headers,
             tags: Vec::new(),
             replication_sse_headers: captured_replication_sse_headers(&headers, drop_unlisted),
+            lock: VersionLock::from_headers(
+                input.object_lock_mode,
+                input.object_lock_retain_until_date,
+                input.object_lock_legal_hold_status,
+            ),
         };
         upsert_version(&mut lock(&self.store), &input.bucket, input.key, version)?;
         Ok(apply_response_fault(
@@ -2343,6 +2439,13 @@ impl S3 for FakeBackend {
             last_modified: Some(version.last_modified.clone()),
             version_id: versioned.then_some(version.version_id),
             sse_customer_algorithm,
+            object_lock_mode: version
+                .lock
+                .retention
+                .as_ref()
+                .map(|(mode, _)| ObjectLockMode::from(mode.clone())),
+            object_lock_retain_until_date: version.lock.retention.as_ref().map(|(_, until)| until.clone()),
+            object_lock_legal_hold_status: version.lock.legal_hold_status(),
             ..Default::default()
         });
         response.status = served.status;
@@ -2377,6 +2480,13 @@ impl S3 for FakeBackend {
             last_modified: Some(version.last_modified.clone()),
             version_id: versioned.then_some(version.version_id),
             sse_customer_algorithm,
+            object_lock_mode: version
+                .lock
+                .retention
+                .as_ref()
+                .map(|(mode, _)| ObjectLockMode::from(mode.clone())),
+            object_lock_retain_until_date: version.lock.retention.as_ref().map(|(_, until)| until.clone()),
+            object_lock_legal_hold_status: version.lock.legal_hold_status(),
             ..Default::default()
         });
         response.status = served.status;
@@ -2436,6 +2546,82 @@ impl S3 for FakeBackend {
         ))
     }
 
+    async fn get_object_retention(
+        &self,
+        req: S3Request<GetObjectRetentionInput>,
+    ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
+        let fault = request_fault(&req);
+        apply_non_body_fault(fault.as_ref(), &self.control).await?;
+        let input = req.input;
+        let version = find_version(&lock(&self.store), &input.bucket, &input.key, input.version_id.as_deref())?;
+        Ok(apply_response_fault(
+            S3Response::new(GetObjectRetentionOutput {
+                retention: version.lock.retention.map(|(mode, until)| ObjectLockRetention {
+                    mode: Some(ObjectLockRetentionMode::from(mode)),
+                    retain_until_date: Some(until),
+                }),
+            }),
+            fault.as_ref(),
+        ))
+    }
+
+    async fn put_object_retention(
+        &self,
+        req: S3Request<PutObjectRetentionInput>,
+    ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
+        let fault = request_fault(&req);
+        apply_non_body_fault(fault.as_ref(), &self.control).await?;
+        let input = req.input;
+        let retention = input
+            .retention
+            .and_then(|retention| retention.mode.zip(retention.retain_until_date))
+            .map(|(mode, until)| (mode.as_str().to_string(), until));
+        update_version_lock(&mut lock(&self.store), &input.bucket, &input.key, input.version_id.as_deref(), |lock| {
+            lock.retention = retention;
+        })?;
+        Ok(apply_response_fault(S3Response::new(PutObjectRetentionOutput::default()), fault.as_ref()))
+    }
+
+    async fn get_object_legal_hold(
+        &self,
+        req: S3Request<GetObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
+        let fault = request_fault(&req);
+        apply_non_body_fault(fault.as_ref(), &self.control).await?;
+        let input = req.input;
+        let version = find_version(&lock(&self.store), &input.bucket, &input.key, input.version_id.as_deref())?;
+        Ok(apply_response_fault(
+            S3Response::new(GetObjectLegalHoldOutput {
+                legal_hold: Some(ObjectLockLegalHold {
+                    status: Some(
+                        version
+                            .lock
+                            .legal_hold_status()
+                            .unwrap_or_else(|| ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
+                    ),
+                }),
+            }),
+            fault.as_ref(),
+        ))
+    }
+
+    async fn put_object_legal_hold(
+        &self,
+        req: S3Request<PutObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
+        let fault = request_fault(&req);
+        apply_non_body_fault(fault.as_ref(), &self.control).await?;
+        let input = req.input;
+        let legal_hold_on = input
+            .legal_hold
+            .and_then(|hold| hold.status)
+            .is_some_and(|status| status.as_str().eq_ignore_ascii_case("ON"));
+        update_version_lock(&mut lock(&self.store), &input.bucket, &input.key, input.version_id.as_deref(), |lock| {
+            lock.legal_hold = Some(legal_hold_on);
+        })?;
+        Ok(apply_response_fault(S3Response::new(PutObjectLegalHoldOutput::default()), fault.as_ref()))
+    }
+
     async fn delete_object_tagging(
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
@@ -2489,6 +2675,7 @@ impl S3 for FakeBackend {
             return Ok(apply_response_fault(S3Response::new(DeleteObjectOutput::default()), fault.as_ref()));
         }
         if let Some(version_id) = input.version_id {
+            let reject_unknown = state.reject_unknown_version_deletes;
             let (removed_bytes, removed_versions, delete_marker, remove_key) = {
                 let Some(versions) = state
                     .buckets
@@ -2497,6 +2684,9 @@ impl S3 for FakeBackend {
                     .objects
                     .get_mut(&input.key)
                 else {
+                    if reject_unknown {
+                        return Err(s3s::s3_error!(NoSuchVersion, "The specified version does not exist."));
+                    }
                     return Ok(apply_response_fault(
                         S3Response::new(DeleteObjectOutput {
                             version_id: Some(version_id),
@@ -2505,6 +2695,9 @@ impl S3 for FakeBackend {
                         fault.as_ref(),
                     ));
                 };
+                if reject_unknown && !versions.iter().any(|version| version.version_id == version_id) {
+                    return Err(s3s::s3_error!(NoSuchVersion, "The specified version does not exist."));
+                }
                 let mut removed_bytes = 0usize;
                 let mut removed_versions = 0usize;
                 let mut delete_marker = None;
@@ -2558,6 +2751,7 @@ impl S3 for FakeBackend {
                 standard_headers: StandardHeaders::default(),
                 tags: Vec::new(),
                 replication_sse_headers: Vec::new(),
+                lock: VersionLock::default(),
             },
         )?;
         Ok(apply_response_fault(
@@ -2612,6 +2806,11 @@ impl S3 for FakeBackend {
                 metadata: input.metadata,
                 standard_headers,
                 replication_sse_headers: captured_replication_sse_headers(&headers, drop_unlisted),
+                lock: VersionLock::from_headers(
+                    input.object_lock_mode,
+                    input.object_lock_retain_until_date,
+                    input.object_lock_legal_hold_status,
+                ),
                 parts: BTreeMap::new(),
             },
         );
@@ -2760,6 +2959,7 @@ impl S3 for FakeBackend {
                     metadata: upload.metadata.clone(),
                     standard_headers: upload.standard_headers.clone(),
                     replication_sse_headers: upload.replication_sse_headers.clone(),
+                    lock: upload.lock.clone(),
                     parts: BTreeMap::new(),
                 },
                 selected,
@@ -2790,6 +2990,7 @@ impl S3 for FakeBackend {
             standard_headers: upload.standard_headers,
             tags: Vec::new(),
             replication_sse_headers: upload.replication_sse_headers,
+            lock: upload.lock,
         };
         let mut state = lock(&self.store);
         let versioned = bucket_versioned(&state, &input.bucket);
@@ -4621,6 +4822,7 @@ mod tests {
                         metadata: None,
                         standard_headers: StandardHeaders::default(),
                         replication_sse_headers: Vec::new(),
+                        lock: VersionLock::default(),
                         parts: BTreeMap::new(),
                     },
                 );

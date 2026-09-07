@@ -3171,7 +3171,11 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
     }
 
     let rcfg = match ReplicationMetadataStore::optional_replication_config(bucket).await {
-        Ok(Some(config)) => config,
+        Ok(Some(config)) => Some(config),
+        // A bucket without a configuration still owes its pending purges an
+        // answer: the delete worker finishes them locally as abandoned, which
+        // is what makes the bucket deletable again (rustfs/backlog#2340).
+        Ok(None) if owes_version_purge(&oi) => None,
         Ok(None) => return ReplicationQueueAdmission::Skipped,
         Err(err) => {
             debug!(
@@ -3221,7 +3225,7 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
         }
     };
 
-    let rcfg_wrapper = ReplicationConfig::new(Some(rcfg), tgts);
+    let rcfg_wrapper = ReplicationConfig::new(rcfg, tgts);
     queue_replication_heal_internal(bucket, oi, rcfg_wrapper, retry_count)
         .await
         .admission
@@ -3249,6 +3253,17 @@ pub async fn queue_replication_metadata(bucket: &str, oi: ObjectInfo, retry_coun
     }
 }
 
+/// A version purge the persisted state still owes to named targets. Without
+/// the target list nothing can be settled, so such a version keeps the
+/// ordinary "no configuration, nothing to heal" skip.
+fn owes_version_purge(oi: &ObjectInfo) -> bool {
+    !oi.version_purge_status.is_empty()
+        && oi
+            .version_purge_status_internal
+            .as_deref()
+            .is_some_and(|statuses| !statuses.trim().is_empty())
+}
+
 /// queue_replication_heal_internal enqueues objects that failed replication OR eligible for resyncing through
 /// an ongoing resync operation or via existing objects replication configuration setting.
 pub(crate) async fn queue_replication_heal_internal(
@@ -3267,7 +3282,11 @@ pub(crate) async fn queue_replication_heal_internal(
         };
     }
 
-    if rcfg.config.is_none() || rcfg.remotes.is_none() {
+    // Without a configuration or targets there is nothing to replicate —
+    // except a version purge the bucket still owes: its stored decision names
+    // the targets, and the delete worker settles the ones no longer
+    // configured as abandoned (rustfs/backlog#2340).
+    if (rcfg.config.is_none() || rcfg.remotes.is_none()) && !owes_version_purge(&oi) {
         return ReplicationHealQueueResult {
             object_info: roi,
             admission: ReplicationQueueAdmission::Skipped,
@@ -3312,12 +3331,15 @@ pub(crate) async fn queue_replication_heal_internal(
         }
         ReplicationHealQueueAction::QueueDelete(dv) => {
             // A purge the peer denied under object lock cannot succeed until
-            // the lock lapses (#6850); requeuing it every heal cycle only
+            // the lock lapses (#6850), and one whose replica cannot be told
+            // apart on a target that mints its own version ids cannot
+            // succeed until the ledger or an operator resolves it
+            // (rustfs/backlog#2340); requeuing either every heal cycle only
             // burns bandwidth and failure counters. The backoff expires on
             // its own, so the purge is probed again — and converges — once
-            // the retention window has a chance of being over.
+            // the condition has a chance of being over.
             if super::replication_object_decision_boundary::is_version_delete_replication(&dv.delete_object)
-                && super::replication_resyncer::object_lock_denied_purge_backoff_active(&dv)
+                && super::replication_resyncer::purge_backoff_active(&dv)
             {
                 return ReplicationHealQueueResult {
                     object_info: roi,

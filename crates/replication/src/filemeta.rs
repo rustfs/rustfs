@@ -438,6 +438,12 @@ pub struct ReplicatedTargetInfo {
     /// Version the target assigned to the delete marker it just created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_delete_marker_version_id: Option<String>,
+    /// Version the target assigned to this object version when it differs
+    /// from the source id (a target that mints its own ids). Persisted as the
+    /// per-target ledger every later version-addressed mutation resolves
+    /// through; `None` on targets that adopt the source id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_version_id: Option<String>,
 }
 
 impl ReplicatedTargetInfo {
