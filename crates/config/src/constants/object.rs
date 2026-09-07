@@ -365,12 +365,35 @@ pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: &str =
     "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES";
 pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: usize = 0;
 
-/// Time in milliseconds an automatic foreground write waits for a permit.
+/// Time in milliseconds an automatic foreground direct PutObject waits for a permit.
 ///
 /// A short wait smooths transient bursts while still returning S3
 /// `SlowDown`/503 before body ingest when the node is already saturated.
 pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS";
 pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 250;
+
+/// Time in milliseconds a multipart UploadPart waits for a foreground write permit.
+///
+/// SDK-default multipart clients send every part of an upload concurrently, so
+/// a single node routinely sees several times more parts in flight than the
+/// permit pool allows. Those parts have not ingested a body yet, so queueing
+/// them costs a connection rather than memory or internode streams; the pool
+/// still bounds the number of parts being written. The wait is long enough for
+/// an ordinary queue to drain on modest hardware, and a part that cannot get a
+/// permit within it fails with S3 `SlowDown`/503 for the client to retry.
+/// `0` rejects immediately when the pool is full.
+pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: &str =
+    "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS";
+pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 30_000;
+
+/// Maximum multipart UploadPart requests waiting for a foreground write permit per process.
+///
+/// Parts beyond this queue depth are rejected with S3 `SlowDown`/503 without
+/// waiting, so a genuinely saturated node still fails fast instead of holding
+/// an unbounded set of connections open for the whole wait timeout.
+/// `0` derives the depth from the permit limit.
+pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING: &str = "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING";
+pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING: usize = 0;
 
 const _: () = assert!(DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE);
 

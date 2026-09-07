@@ -130,6 +130,37 @@ Scanner cycle budget controls:
   - timeout returns S3 `SlowDown`, so clients should use normal SDK retry handling.
   - this is not a fdatasync or group-commit switch. Track fdatasync batching separately with `rustfs_s3_put_object_rename_fdatasync_batch_files`.
 
+## Foreground write admission environment variables
+
+Large direct `PutObject` requests and multipart `UploadPart` requests share one
+per-process permit pool that bounds how many bodies are ingested and written
+concurrently. Small direct PUTs stay on the legacy path.
+
+- `RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE`
+  - enables the default-on pool; `false` keeps only the soft request counter.
+  - default is `true`.
+- `RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT`
+  - permits in the pool; `0` derives half of `RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS`, clamped to `32`.
+  - default is `0` (32 permits at stock settings).
+- `RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES`
+  - smallest direct `PutObject` that takes a permit; unknown-size requests always do.
+  - default is `33554432` (32 MiB).
+- `RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS`
+  - how long a direct `PutObject` waits for a permit before returning S3 `SlowDown`.
+  - default is `250`.
+- `RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES`
+  - smallest `UploadPart` that takes a permit; `0` gates every part.
+  - default is `0`.
+- `RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS`
+  - how long an `UploadPart` waits in the bounded queue for a permit before returning S3 `SlowDown`; `0` rejects immediately when the pool is full.
+  - default is `30000`. Parts wait before body ingest, so SDK-default clients that send every part of an upload concurrently drain through the pool instead of failing.
+- `RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING`
+  - maximum `UploadPart` requests waiting for a permit at once; parts beyond it return `SlowDown` without waiting.
+  - default is `0`, which derives 16 times the permit limit (512 at stock settings).
+- `RUSTFS_PUT_FOREGROUND_ADMISSION_ENABLE`, `RUSTFS_PUT_FOREGROUND_ADMISSION_LIMIT`, `RUSTFS_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS`
+  - experimental strict gate that applies to every foreground write regardless of size and replaces the pool above when enabled.
+  - default is disabled; enabling it with limit `0` disables foreground write admission entirely.
+
 ## Remote tier timeout environment variables
 
 - `RUSTFS_TIER_REMOTE_CONNECT_TIMEOUT_SECS`

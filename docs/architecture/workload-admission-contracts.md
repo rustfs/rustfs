@@ -12,7 +12,7 @@
 | Class | Provider (`impl WorkloadAdmissionSnapshotProvider`) | `active` / `queued` / `limit` source | Reports `Unknown` when |
 |---|---|---|---|
 | `ForegroundRead` | `ConcurrencyManager` in `rustfs/src/storage/concurrency/manager.rs` (source of truth); re-exposed unchanged by the RustFS runtime provider | disk-read permits in use / `None` (the semaphore exposes no waiter count) / configured max concurrent disk reads | the storage registry has no entry |
-| `ForegroundWrite` | `ConcurrencyManager` in `rustfs/src/storage/concurrency/manager.rs` (source of truth); re-exposed unchanged by the RustFS runtime provider | foreground-write permits in use or legacy active-write counter / `None` / configured or derived write-admission limit | the storage registry has no entry |
+| `ForegroundWrite` | `ConcurrencyManager` in `rustfs/src/storage/concurrency/manager.rs` (source of truth); re-exposed unchanged by the RustFS runtime provider | foreground-write permits in use or legacy active-write counter / multipart parts waiting in the bounded admission queue (`None` for the strict and legacy policies) / configured or derived write-admission limit | the storage registry has no entry |
 | `Metadata` | `RustFsWorkloadAdmissionSnapshotProvider` in `rustfs/src/workload_admission.rs` | `Open` once the bucket metadata runtime handle exists; no counts | bucket metadata runtime not initialized |
 | `Scanner` | same | scanner active work-unit counter / none / configured set-scan limit when nonzero | scanner runtime not initialized |
 | `Repair` | same | heal active tasks / heal queue length / `None` (limits live behind the async heal manager state) | heal manager not initialized |
