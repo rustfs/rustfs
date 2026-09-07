@@ -10,6 +10,8 @@ class ReportTests(unittest.TestCase):
         return dict(schema=1, round=0, pid=123, objects_expected=4, raw_entry_budget=16,
                     raw_entries=8, raw_name_bytes=64, objects_before=0, objects_retained=4,
                     versions_retained=4, bytes_retained=4, objects_processed=4,
+                    raw_page_index_committed_entries=4,
+                    raw_page_index_indexed_entries=4,
                     raw_first_entry="bucket/object-0000",
                     raw_last_entry="bucket/object-0003/xl.meta",
                     snapshot_complete=True, outcome="complete")
@@ -44,6 +46,11 @@ class ReportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.validate(report)
 
+        report = self.report()
+        report["objects_processed"] = 17
+        with self.assertRaises(ValueError):
+            self.validate(report)
+
     def test_missing_or_oversized_raw_marker_rejected(self):
         for value in (None, True, "", "x" * 513):
             with self.subTest(value=value):
@@ -55,8 +62,18 @@ class ReportTests(unittest.TestCase):
     def test_complete_coverage_without_entry_observation_rejected(self):
         report = self.report()
         report["raw_entries"] = 0
+        report["objects_processed"] = 0
+        report["raw_page_index_committed_entries"] = 3
         with self.assertRaises(ValueError):
             self.validate(report)
+
+    def test_budgeted_object_progress_can_consume_all_raw_entries(self):
+        report = self.report()
+        report["raw_entries"] = 0
+        report["raw_first_entry"] = None
+        report["raw_last_entry"] = None
+        report["objects_processed"] = 1
+        self.validate(report)
 
     def test_missing_wrong_type_and_negative_counter_rejected(self):
         for value in (None, True, -1, "8", 1048577):

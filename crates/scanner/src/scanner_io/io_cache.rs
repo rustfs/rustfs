@@ -574,7 +574,6 @@ impl ScannerIOCache for SetDisks {
             let budget_clone = budget.clone();
             let store_clone_clone = self.clone();
             let bucket_result_tx_clone = bucket_result_tx.clone();
-            let disk_clone = disk.clone();
             let set_disk_inventory_clone = set_disk_inventory.clone();
             let disk_scan_semaphore_clone = disk_scan_semaphore.clone();
             let queued_disk_bucket_scans_clone = queued_disk_bucket_scans.clone();
@@ -622,10 +621,7 @@ impl ScannerIOCache for SetDisks {
                         BucketWorkGuard::new(remaining_bucket_work_clone.clone(), bucket_work_complete_clone.clone());
                     // Prefix hints are process-local. Never hand one to a
                     // remote or legacy-coordinator disk path.
-                    let prefix_scan_scope = disk_clone
-                        .is_local()
-                        .then(|| scope_clone.prefix_scope_for(&bucket.name))
-                        .flatten();
+                    let prefix_scan_scope = disk.is_local().then(|| scope_clone.prefix_scope_for(&bucket.name)).flatten();
 
                     metrics::histogram!(
                         METRIC_SCANNER_DISK_SCAN_WAIT_SECONDS,
@@ -680,7 +676,7 @@ impl ScannerIOCache for SetDisks {
                         };
                         remote_session_sequence = next_sequence;
                         let remote_outcome = crate::remote_scanner::scan_remote_bucket(
-                            &disk_clone,
+                            &disk,
                             ctx_clone.clone(),
                             budget_clone.clone(),
                             crate::remote_scanner::RemoteScannerScanSpec {
@@ -813,8 +809,8 @@ impl ScannerIOCache for SetDisks {
                         continue;
                     }
 
-                    let _local_admission = if disk_clone.is_local() {
-                        match crate::remote_scanner::try_admit_remote_scanner(&disk_clone) {
+                    let _local_admission = if disk.is_local() {
+                        match crate::remote_scanner::try_admit_remote_scanner(&disk) {
                             Ok(admission) => Some(admission),
                             Err(e) => {
                                 if requeue_bucket_work(&bucket_tx_clone, &bucket, &mut work_guard).await {
@@ -1055,7 +1051,7 @@ impl ScannerIOCache for SetDisks {
                     let before = cache.info.last_update;
 
                     let scan_ctx = ctx_clone.child_token();
-                    let scan = disk_clone.clone().nsscanner_disk(
+                    let scan = disk.clone().nsscanner_disk(
                         scan_ctx.clone(),
                         budget_clone.clone(),
                         set_disk_inventory_clone.as_ref().clone(),
