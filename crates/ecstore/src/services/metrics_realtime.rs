@@ -20,9 +20,10 @@ use chrono::Utc;
 use jiff::Timestamp;
 use rustfs_heal_contracts::heal_channel::DriveState;
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
+use rustfs_io_metrics::s3_http_metrics::s3_http_metrics_snapshot;
 use rustfs_madmin::metrics::{
-    DiskIOStats, DiskMetric, LastMinute as MadminLastMinute, NetDevLine, NetMetrics, RPCMetrics, RealtimeMetrics,
-    ScannerCheckpointReport as MadminScannerCheckpointReport,
+    DiskIOStats, DiskMetric, HttpMetrics, HttpRequestMetric, LastMinute as MadminLastMinute, NetDevLine, NetMetrics, RPCMetrics,
+    RealtimeMetrics, ScannerCheckpointReport as MadminScannerCheckpointReport,
     ScannerLifecycleExpirySnapshot as MadminScannerLifecycleExpirySnapshot,
     ScannerLifecycleTransitionSnapshot as MadminScannerLifecycleTransitionSnapshot,
     ScannerMaintenanceControlSnapshot as MadminScannerMaintenanceControlSnapshot,
@@ -61,9 +62,10 @@ impl MetricType {
     pub const MEM: MetricType = MetricType(1 << 6);
     pub const CPU: MetricType = MetricType(1 << 7);
     pub const RPC: MetricType = MetricType(1 << 8);
+    pub const HTTP: MetricType = MetricType(1 << 9);
 
     // MetricsAll must be last.
-    pub const ALL: MetricType = MetricType((1 << 9) - 1);
+    pub const ALL: MetricType = MetricType((1 << 10) - 1);
 
     pub fn new(t: u32) -> Self {
         Self(t)
@@ -410,6 +412,21 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
         by_host_name = local_node_name;
     }
 
+    if types.contains(&MetricType::HTTP) {
+        real_time_metrics.aggregated.http = Some(HttpMetrics {
+            collected_at: Timestamp::now(),
+            requests: s3_http_metrics_snapshot()
+                .into_iter()
+                .map(|series| HttpRequestMetric {
+                    method: series.method.to_string(),
+                    operation: series.operation.to_string(),
+                    outcome: series.outcome.to_string(),
+                    total: series.total,
+                })
+                .collect(),
+        });
+    }
+
     if types.contains(&MetricType::DISK) {
         debug!("start get disk metrics");
         let mut aggr = DiskMetric {
@@ -585,9 +602,45 @@ mod test {
         assert!(t.contains(&MetricType::MEM));
         assert!(t.contains(&MetricType::CPU));
         assert!(t.contains(&MetricType::RPC));
+        assert!(t.contains(&MetricType::HTTP));
 
         let disk = MetricType::new(1 << 1);
         assert!(disk.contains(&MetricType::DISK));
+    }
+
+    #[tokio::test]
+    async fn collect_local_metrics_reports_the_same_http_outcome_counters() {
+        let mut request = rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard::new("PUT");
+        request.response(503);
+        drop(request);
+        let snapshot = s3_http_metrics_snapshot();
+        let realtime = collect_local_metrics(MetricType::HTTP, &CollectMetricsOpts::default()).await;
+        let http = realtime.aggregated.http.as_ref().expect("HTTP selection must report support");
+        assert_eq!(http.requests.len(), snapshot.len());
+        for (actual, expected) in http.requests.iter().zip(&snapshot) {
+            assert_eq!(actual.method, expected.method);
+            assert_eq!(actual.operation, expected.operation);
+            assert_eq!(actual.outcome, expected.outcome);
+            assert_eq!(actual.total, expected.total);
+        }
+        assert_eq!(realtime.by_host.len(), 1);
+        assert_eq!(
+            realtime
+                .by_host
+                .values()
+                .next()
+                .expect("local host")
+                .http
+                .as_ref()
+                .expect("host HTTP")
+                .requests,
+            http.requests
+        );
+        let encoded = rmp_serde::to_vec_named(&realtime).expect("RPC metric map");
+        let decoded: RealtimeMetrics = rmp_serde::from_slice(&encoded).expect("RPC metric roundtrip");
+        assert_eq!(decoded.aggregated.http.expect("HTTP field survives RPC").requests, http.requests);
+        let excluded = collect_local_metrics(MetricType::NET, &CollectMetricsOpts::default()).await;
+        assert!(excluded.aggregated.http.is_none());
     }
 
     #[tokio::test]

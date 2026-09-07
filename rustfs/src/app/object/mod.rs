@@ -239,9 +239,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use time::{

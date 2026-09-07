@@ -119,6 +119,7 @@ mod tests {
                 drives_per_set: vec![4],
                 ..Default::default()
             },
+            ..Default::default()
         };
 
         let buf = encode_msgpack_map(&value).unwrap();

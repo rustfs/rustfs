@@ -43,6 +43,7 @@ fn s3_op_counters() -> &'static [AtomicU64] {
 /// This mirrors MinIO, which never labels its default operation counters with
 /// bucket. The `op` dimension is bounded (<= 122 variants).
 pub fn record_s3_op(op: S3Operation) {
+    crate::s3_http_metrics::observe_s3_http_operation(op);
     if let Some(counter) = s3_op_counters().get(op.metric_index()) {
         counter.fetch_add(1, Ordering::Relaxed);
     }
