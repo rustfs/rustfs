@@ -527,6 +527,31 @@ impl Default for ScannerDataMovementPauseStatus {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PoolMetaWriteGateStatus {
+    pub writes_ready: bool,
+    pub write_blocked: bool,
+    pub transaction_aborted: bool,
+    pub pool_meta_absent: bool,
+    pub identity_initialized: Option<bool>,
+    pub identity_needs_repair: bool,
+    pub cluster_epoch: Option<u64>,
+}
+
+impl Default for PoolMetaWriteGateStatus {
+    fn default() -> Self {
+        Self {
+            writes_ready: true,
+            write_blocked: false,
+            transaction_aborted: false,
+            pool_meta_absent: false,
+            identity_initialized: None,
+            identity_needs_repair: false,
+            cluster_epoch: None,
+        }
+    }
+}
+
 fn offset_unix_seconds(value: OffsetDateTime) -> u64 {
     u64::try_from(value.unix_timestamp()).unwrap_or(0)
 }

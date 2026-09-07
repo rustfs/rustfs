@@ -25,7 +25,8 @@ use crate::admin::{
     system,
 };
 use crate::cluster_snapshot::{
-    ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot, cluster_has_actionable_pressure,
+    ClusterPoolMetaWriteGateSnapshot, ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot,
+    cluster_has_actionable_pressure,
 };
 use crate::server::{ADMIN_PREFIX, ReadinessDegradedReason};
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -154,6 +155,7 @@ pub(crate) struct ClusterSnapshotView {
     pub observability: ObservabilitySnapshot,
     pub workload_admission: Vec<WorkloadAdmissionView>,
     pub runtime_status: ClusterRuntimeStatusView,
+    pub pool_meta_write_gate: ClusterPoolMetaWriteGateView,
     pub actionable_pressure: bool,
 }
 
@@ -182,7 +184,34 @@ impl ClusterSnapshotView {
             observability: snapshot.observability,
             workload_admission: workload_admission_views(snapshot.workload_admission),
             runtime_status: ClusterRuntimeStatusView::from(snapshot.runtime_status),
+            pool_meta_write_gate: ClusterPoolMetaWriteGateView::from(snapshot.pool_meta_write_gate),
             actionable_pressure,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClusterPoolMetaWriteGateView {
+    pub writes_ready: bool,
+    pub write_blocked: bool,
+    pub transaction_aborted: bool,
+    pub pool_meta_absent: bool,
+    pub identity_initialized: Option<bool>,
+    pub identity_needs_repair: bool,
+    pub cluster_epoch: Option<u64>,
+}
+
+impl From<ClusterPoolMetaWriteGateSnapshot> for ClusterPoolMetaWriteGateView {
+    fn from(snapshot: ClusterPoolMetaWriteGateSnapshot) -> Self {
+        Self {
+            writes_ready: snapshot.writes_ready,
+            write_blocked: snapshot.write_blocked,
+            transaction_aborted: snapshot.transaction_aborted,
+            pool_meta_absent: snapshot.pool_meta_absent,
+            identity_initialized: snapshot.identity_initialized,
+            identity_needs_repair: snapshot.identity_needs_repair,
+            cluster_epoch: snapshot.cluster_epoch,
         }
     }
 }
@@ -977,8 +1006,8 @@ mod tests {
         ClusterPoolStateSnapshot, ClusterRpcBoundarySnapshot, ClusterRpcChannelSnapshot, ClusterRpcPlane, ClusterRpcTransport,
     };
     use crate::cluster_snapshot::{
-        ClusterListingDiagnosticsSnapshot, ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot,
-        ClusterUsageFreshnessSnapshot,
+        ClusterListingDiagnosticsSnapshot, ClusterPoolMetaWriteGateSnapshot, ClusterReadOnlySnapshot,
+        ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot, ClusterUsageFreshnessSnapshot,
     };
     use crate::shared_types::{DependencyReadiness, ReadinessDegradedReason};
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
@@ -1124,6 +1153,15 @@ mod tests {
             listing_diagnostics: ClusterListingDiagnosticsSnapshot {
                 internode_stall_timeouts_total: 2,
             },
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot {
+                writes_ready: false,
+                write_blocked: true,
+                transaction_aborted: true,
+                identity_initialized: Some(true),
+                identity_needs_repair: true,
+                cluster_epoch: Some(7),
+                ..Default::default()
+            },
         };
 
         let value = serde_json::to_value(ClusterSnapshotView::from_snapshot(snapshot, Some(":::9000".to_string())))
@@ -1136,6 +1174,13 @@ mod tests {
         assert_eq!(value["components"]["listing"]["source"], "workload_admission+internode_metrics");
         assert_eq!(value["components"]["listing"]["condition"], "unknown");
         assert_eq!(value["components"]["listing"]["internode_stall_timeouts_total"], 2);
+        assert_eq!(value["pool_meta_write_gate"]["writesReady"], false);
+        assert_eq!(value["pool_meta_write_gate"]["writeBlocked"], true);
+        assert_eq!(value["pool_meta_write_gate"]["transactionAborted"], true);
+        assert_eq!(value["pool_meta_write_gate"]["identityInitialized"], true);
+        assert_eq!(value["pool_meta_write_gate"]["identityNeedsRepair"], true);
+        assert_eq!(value["pool_meta_write_gate"]["clusterEpoch"], 7);
+        assert_eq!(value["actionable_pressure"], true);
         assert_eq!(value["components"]["usage"]["source"], "scanner_metrics");
         assert_eq!(value["components"]["usage"]["condition"], "stale");
         assert_eq!(value["membership"]["nodes"][0]["server_info_endpoint"], ":::9000");
@@ -1193,6 +1238,7 @@ mod tests {
             },
             usage_freshness: ClusterUsageFreshnessSnapshot::default(),
             listing_diagnostics: ClusterListingDiagnosticsSnapshot::default(),
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot::default(),
         };
 
         let summary = ClusterSnapshotSummary::from(&snapshot);
@@ -1259,6 +1305,7 @@ mod tests {
             listing_diagnostics: ClusterListingDiagnosticsSnapshot {
                 internode_stall_timeouts_total: 0,
             },
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot::default(),
         };
 
         let view = ClusterSnapshotView::from(snapshot);
@@ -1306,6 +1353,11 @@ mod tests {
             },
             usage_freshness: ClusterUsageFreshnessSnapshot::default(),
             listing_diagnostics: ClusterListingDiagnosticsSnapshot::default(),
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot {
+                writes_ready: false,
+                write_blocked: true,
+                ..Default::default()
+            },
         };
 
         let view = ClusterSnapshotView::from(snapshot);
@@ -1341,6 +1393,7 @@ mod tests {
             listing_diagnostics: ClusterListingDiagnosticsSnapshot {
                 internode_stall_timeouts_total: 2,
             },
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot::default(),
         };
 
         let component = super::summarize_listing_metacache(&snapshot);
@@ -1384,6 +1437,7 @@ mod tests {
                 ..Default::default()
             },
             listing_diagnostics: ClusterListingDiagnosticsSnapshot::default(),
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot::default(),
         };
 
         let component = super::summarize_usage_freshness(&snapshot);
@@ -1421,6 +1475,7 @@ mod tests {
                 ..Default::default()
             },
             listing_diagnostics: ClusterListingDiagnosticsSnapshot::default(),
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot::default(),
         };
 
         let component = super::summarize_usage_freshness(&snapshot);
@@ -1470,6 +1525,7 @@ mod tests {
             },
             usage_freshness: ClusterUsageFreshnessSnapshot::default(),
             listing_diagnostics: ClusterListingDiagnosticsSnapshot::default(),
+            pool_meta_write_gate: ClusterPoolMetaWriteGateSnapshot::default(),
         };
 
         let summary = ClusterSnapshotSummary::from(&snapshot);
