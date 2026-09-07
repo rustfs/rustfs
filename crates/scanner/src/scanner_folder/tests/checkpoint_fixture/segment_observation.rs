@@ -39,6 +39,12 @@ impl ProducerKind {
     ];
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SegmentInvalidationDomain {
+    LocalSingleSet,
+    DistributedEc,
+}
+
 #[derive(Clone, Debug)]
 struct SegmentObservationEnvelope<'a> {
     source: DataUsageCacheSource,
@@ -61,6 +67,10 @@ struct SegmentObservationProof<'a> {
     key_format: u16,
     baseline_scan_plan_digest: DataUsageScanPlanDigest,
     process_epoch: &'a str,
+    durable_producer_identity: bool,
+    invalidation_domain: SegmentInvalidationDomain,
+    distributed_ec_invalidation: bool,
+    cold_zero_walk_oracle: bool,
 }
 
 fn producer_name(kind: ProducerKind) -> &'static str {
@@ -85,6 +95,9 @@ fn trusted_fixture_proposal(
         || envelope.key_format != proof.key_format
         || envelope.baseline_scan_plan_digest != proof.baseline_scan_plan_digest
         || envelope.process_epoch != proof.process_epoch
+        || !proof.durable_producer_identity
+        || !proof.cold_zero_walk_oracle
+        || (proof.invalidation_domain == SegmentInvalidationDomain::DistributedEc && !proof.distributed_ec_invalidation)
         || envelope.generation_start == 0
         || envelope.generation_end < envelope.generation_start
         || envelope.restart_gap
@@ -166,6 +179,10 @@ fn segment_observation_trusted_proposal_requires_identity_and_complete_producer_
         key_format: DATA_USAGE_CACHE_KEY_FORMAT,
         baseline_scan_plan_digest: baseline,
         process_epoch: "epoch-a",
+        durable_producer_identity: true,
+        invalidation_domain: SegmentInvalidationDomain::LocalSingleSet,
+        distributed_ec_invalidation: false,
+        cold_zero_walk_oracle: true,
     };
 
     assert_eq!(
@@ -193,6 +210,10 @@ fn segment_observation_trusted_proposal_requires_identity_and_complete_producer_
     wrong_epoch.process_epoch = "epoch-b";
     assert_eq!(trusted_fixture_proposal(&wrong_epoch, &proof), Err(ProposalError::InvalidKey));
 
+    let mut no_durable_identity = proof.clone();
+    no_durable_identity.durable_producer_identity = false;
+    assert_eq!(trusted_fixture_proposal(&envelope, &no_durable_identity), Err(ProposalError::InvalidKey));
+
     let mut restart_gap = envelope.clone();
     restart_gap.restart_gap = true;
     assert_eq!(trusted_fixture_proposal(&restart_gap, &proof), Err(ProposalError::InvalidKey));
@@ -208,6 +229,27 @@ fn segment_observation_trusted_proposal_requires_identity_and_complete_producer_
     let mut missing_producer = envelope.clone();
     missing_producer.producers.remove(producer_name(ProducerKind::Replication));
     assert_eq!(trusted_fixture_proposal(&missing_producer, &proof), Err(ProposalError::InvalidKey));
+
+    let mut missing_zero_walk_oracle = proof.clone();
+    missing_zero_walk_oracle.cold_zero_walk_oracle = false;
+    assert_eq!(
+        trusted_fixture_proposal(&envelope, &missing_zero_walk_oracle),
+        Err(ProposalError::InvalidKey)
+    );
+
+    let mut distributed_without_invalidation = proof.clone();
+    distributed_without_invalidation.invalidation_domain = SegmentInvalidationDomain::DistributedEc;
+    assert_eq!(
+        trusted_fixture_proposal(&envelope, &distributed_without_invalidation),
+        Err(ProposalError::InvalidKey)
+    );
+
+    let mut distributed_with_invalidation = distributed_without_invalidation;
+    distributed_with_invalidation.distributed_ec_invalidation = true;
+    assert_eq!(
+        trusted_fixture_proposal(&envelope, &distributed_with_invalidation),
+        Ok(BTreeSet::from(["archive".to_string(), "hot".to_string()]))
+    );
 }
 
 fn cache_value(cache: &DataUsageCache) -> serde_json::Value {
