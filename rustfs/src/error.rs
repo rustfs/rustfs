@@ -333,6 +333,13 @@ impl From<ApiError> for S3Error {
 
 impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
+        if err.pool_metadata_failure().is_some() {
+            return ApiError {
+                code: S3ErrorCode::ServiceUnavailable,
+                message: ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
+                source: Some(Box::new(err)),
+            };
+        }
         if let StorageError::Io(ref io_err) = err
             && let Some(inner) = io_err.get_ref()
         {
@@ -846,6 +853,35 @@ mod tests {
 
         assert_eq!(api_error.code, S3ErrorCode::ServiceUnavailable);
         assert_eq!(api_error.message, "The service is unavailable. Please retry.");
+    }
+
+    #[test]
+    fn pool_metadata_failures_map_to_503_and_preserve_typed_private_context() {
+        use crate::storage_api::error::{PoolMetadataError, PoolMetadataFailure};
+        for kind in [
+            PoolMetadataFailure::ReadUnavailable,
+            PoolMetadataFailure::RecoveryRequired,
+            PoolMetadataFailure::TransactionUnknown,
+            PoolMetadataFailure::FenceLost,
+        ] {
+            let error = StorageError::other(PoolMetadataError {
+                kind,
+                operation: "pool metadata test".to_owned(),
+                phase: "prepare_cas",
+                since: time::OffsetDateTime::now_utc(),
+                source: Some(std::sync::Arc::new(StorageError::other("private disk failure"))),
+            });
+            let error = StorageError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, error));
+            let cloned = error.clone();
+            assert_eq!(cloned, error, "cloning must preserve the outer I/O kind and message");
+            assert_eq!(cloned.pool_metadata_failure().unwrap().kind, kind);
+            let api = ApiError::from(cloned);
+            assert_eq!(api.code, S3ErrorCode::ServiceUnavailable);
+            assert_eq!(api.message, "The service is unavailable. Please retry.");
+            assert!(!api.message.contains("private"));
+            let source = api.source.as_ref().unwrap().downcast_ref::<StorageError>().unwrap();
+            assert_eq!(source.pool_metadata_failure().unwrap().kind, kind);
+        }
     }
 
     #[test]
