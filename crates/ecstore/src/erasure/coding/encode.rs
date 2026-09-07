@@ -1002,6 +1002,7 @@ impl Erasure {
 mod tests {
     use super::*;
     use crate::erasure::coding::{BitrotWriterWrapper, CustomWriter};
+    use crate::error::StorageError;
     use rustfs_rio::HardLimitReader;
     use rustfs_utils::HashAlgorithm;
     use std::future::Future;
@@ -1451,7 +1452,14 @@ mod tests {
             Ok(_) => panic!("writer quorum failure should fail the encode pipeline"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("Failed to write data"));
+        let err = StorageError::from(err);
+        assert!(matches!(
+            &err,
+            StorageError::Io(source)
+                if source.kind() == std::io::ErrorKind::Other
+                    && source.to_string() == "injected write failure after producer blocks"
+        ));
+        assert!(!err.is_quorum_error());
         tokio::time::timeout(Duration::from_secs(1), reader_dropped)
             .await
             .expect("writer failure should abort the blocked producer")
@@ -1653,38 +1661,54 @@ mod tests {
                 .expect_err("short writes must fail the shard writer")
         };
 
-        assert!(err.to_string().contains("Failed to write data"));
+        let err = StorageError::from(err);
+        assert!(matches!(&err, StorageError::Io(source) if source.kind() == std::io::ErrorKind::WriteZero));
+        assert!(!err.is_quorum_error());
         assert!(writers[0].is_none(), "short-write shard must be removed before commit");
     }
 
     #[tokio::test]
     async fn multi_writer_reports_fallback_summary_when_only_offline_writers_remain() {
         let mut writers = vec![None, None];
-        let err = {
+        let (err, summary) = {
             let mut writer = MultiWriter::new(&mut writers, 1);
-            writer
+            let err = writer
                 .write(vec![Bytes::from_static(b"offline-a"), Bytes::from_static(b"offline-b")])
                 .await
-                .expect_err("offline writers cannot satisfy write quorum")
+                .expect_err("offline writers cannot satisfy write quorum");
+            let summary = build_write_quorum_failure_summary(&writer.errs, OBJECT_OP_IGNORED_ERRS, writer.write_quorum);
+            (err, format_write_quorum_failure(&summary))
         };
 
-        let err = err.to_string();
-        assert!(err.contains("Failed to write data"));
-        assert!(err.contains("offline-disks=2/2"));
-        assert!(err.contains("required=1"));
+        assert_eq!(
+            err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let err = StorageError::from(err);
+        assert_eq!(err, StorageError::ErasureWriteQuorum);
+        assert!(err.is_quorum_error());
+        assert!(summary.contains("offline-disks=2/2"));
+        assert!(summary.contains("required=1"));
 
-        let shutdown_err = {
+        let (shutdown_err, summary) = {
             let mut writer = MultiWriter::new(&mut writers, 1);
-            writer
+            let err = writer
                 .shutdown()
                 .await
-                .expect_err("offline writers cannot satisfy shutdown quorum")
+                .expect_err("offline writers cannot satisfy shutdown quorum");
+            let summary = build_write_quorum_failure_summary(&writer.errs, OBJECT_OP_IGNORED_ERRS, writer.write_quorum);
+            (err, format_write_quorum_failure(&summary))
         };
 
-        let shutdown_err = shutdown_err.to_string();
-        assert!(shutdown_err.contains("Failed to shutdown writers"));
-        assert!(shutdown_err.contains("offline-disks=2/2"));
-        assert!(shutdown_err.contains("required=1"));
+        assert_eq!(
+            shutdown_err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let shutdown_err = StorageError::from(shutdown_err);
+        assert_eq!(shutdown_err, StorageError::ErasureWriteQuorum);
+        assert!(shutdown_err.is_quorum_error());
+        assert!(summary.contains("offline-disks=2/2"));
+        assert!(summary.contains("required=1"));
     }
 
     #[tokio::test]
@@ -1697,19 +1721,33 @@ mod tests {
             .write(vec![Bytes::from_static(b"quorum impossible")])
             .await
             .expect_err("write quorum above writer count must fail");
-        let err = err.to_string();
-        assert!(err.contains("Failed to write data"));
-        assert!(err.contains("required=2"));
-        assert!(err.contains("erasure write quorum"));
+        assert_eq!(
+            err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let err = StorageError::from(err);
+        assert_eq!(err, StorageError::ErasureWriteQuorum);
+        assert!(err.is_quorum_error());
+        let summary = build_write_quorum_failure_summary(&writer.errs, OBJECT_OP_IGNORED_ERRS, writer.write_quorum);
+        let summary = format_write_quorum_failure(&summary);
+        assert!(summary.contains("required=2"));
+        assert!(summary.contains("erasure write quorum"));
 
         let shutdown_err = writer
             .shutdown()
             .await
             .expect_err("shutdown quorum above writer count must fail");
-        let shutdown_err = shutdown_err.to_string();
-        assert!(shutdown_err.contains("Failed to shutdown writers"));
-        assert!(shutdown_err.contains("required=2"));
-        assert!(shutdown_err.contains("erasure write quorum"));
+        assert_eq!(
+            shutdown_err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let shutdown_err = StorageError::from(shutdown_err);
+        assert_eq!(shutdown_err, StorageError::ErasureWriteQuorum);
+        assert!(shutdown_err.is_quorum_error());
+        let summary = build_write_quorum_failure_summary(&writer.errs, OBJECT_OP_IGNORED_ERRS, writer.write_quorum);
+        let summary = format_write_quorum_failure(&summary);
+        assert!(summary.contains("required=2"));
+        assert!(summary.contains("erasure write quorum"));
     }
 
     // The production wiring (`MultiWriter::new`) must arm a real deadline by
@@ -1794,7 +1832,13 @@ mod tests {
             .write(four_shards())
             .await
             .expect_err("two stalled writers must fail the write quorum instead of hanging");
-        assert!(err.to_string().contains("Failed to write data"));
+        assert_eq!(
+            err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let err = StorageError::from(err);
+        assert_eq!(err, StorageError::ErasureWriteQuorum);
+        assert!(err.is_quorum_error());
     }
 
     // A small object whose bytes were fully buffered leaves `write` succeeding
@@ -1839,7 +1883,13 @@ mod tests {
             .shutdown()
             .await
             .expect_err("two shutdown stalls must fail the shutdown quorum instead of hanging");
-        assert!(err.to_string().contains("Failed to shutdown writers"));
+        assert_eq!(
+            err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let err = StorageError::from(err);
+        assert_eq!(err, StorageError::ErasureWriteQuorum);
+        assert!(err.is_quorum_error());
     }
 
     // A slow-but-honest writer that keeps completing shards (delay < stall
@@ -2121,7 +2171,13 @@ mod tests {
             .await
             .expect_err("streaming encode must fail when write quorum is unavailable");
 
-        assert!(err.to_string().contains("Failed to write data"));
+        assert_eq!(
+            err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let err = StorageError::from(err);
+        assert_eq!(err, StorageError::ErasureWriteQuorum);
+        assert!(err.is_quorum_error());
     }
 
     #[tokio::test]
@@ -2145,7 +2201,13 @@ mod tests {
             .await
             .expect_err("write quorum failure must fail the inline encode");
 
-        assert!(err.to_string().contains("Failed to write data"));
+        assert_eq!(
+            err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let err = StorageError::from(err);
+        assert_eq!(err, StorageError::ErasureWriteQuorum);
+        assert!(err.is_quorum_error());
         assert!(
             committed.lock().expect("committed buffer should be lockable").is_empty(),
             "successful writer must not be committed when write quorum fails before shutdown"
@@ -2173,7 +2235,13 @@ mod tests {
             .await
             .expect_err("shutdown quorum failure must fail the inline encode");
 
-        assert!(err.to_string().contains("Failed to shutdown writers"));
+        let err = StorageError::from(err);
+        assert!(matches!(
+            &err,
+            StorageError::Io(source)
+                if source.kind() == std::io::ErrorKind::Other && source.to_string() == "injected shutdown failure"
+        ));
+        assert!(!err.is_quorum_error());
         assert!(
             !committed.lock().expect("committed buffer should be lockable").is_empty(),
             "the successful writer should have committed before shutdown quorum failure was reported"
@@ -2395,7 +2463,13 @@ mod tests {
             .await
             .expect_err("batched encode must fail when write quorum is unavailable");
 
-        assert!(err.to_string().contains("Failed to write data"));
+        assert_eq!(
+            err.get_ref().and_then(|source| source.downcast_ref::<Error>()),
+            Some(&Error::ErasureWriteQuorum),
+        );
+        let err = StorageError::from(err);
+        assert_eq!(err, StorageError::ErasureWriteQuorum);
+        assert!(err.is_quorum_error());
     }
 
     #[tokio::test]
