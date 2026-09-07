@@ -283,6 +283,147 @@ async fn scanner_recovery_intent_executor_persists_completed_progress() {
 
 #[tokio::test]
 #[serial]
+async fn scanner_recovery_intent_startup_replays_indexed_non_terminal_records() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let completed_record = match accept_scanner_usage_recovery_intent(
+        store.clone(),
+        recovery_intent_request("intent-key-0001-startup-done", "operator-a"),
+    )
+    .await
+    .expect("completed seed intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("seed request must create a durable intent: {other:?}"),
+    };
+    run_scanner_usage_recovery_intent(CancellationToken::new(), store.clone(), completed_record.intent_id.clone())
+        .await
+        .expect("seed intent should execute")
+        .expect("seed intent should reset");
+
+    let accepted_record = match accept_scanner_usage_recovery_intent(
+        store.clone(),
+        recovery_intent_request("intent-key-0002-startup-accepted", "operator-a"),
+    )
+    .await
+    .expect("accepted startup intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("accepted request must create a durable intent: {other:?}"),
+    };
+    let mut running_record = match accept_scanner_usage_recovery_intent(
+        store.clone(),
+        recovery_intent_request("intent-key-0003-startup-running", "operator-a"),
+    )
+    .await
+    .expect("running startup intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("running request must create a durable intent: {other:?}"),
+    };
+    running_record.state = "running".to_string();
+    save_config(
+        store.clone(),
+        &format!(".usage.v2.recovery-intents/{}.json", running_record.intent_id),
+        serde_json::to_vec(&running_record).expect("running intent should encode"),
+    )
+    .await
+    .expect("persist simulated in-flight intent");
+
+    let restarted = restart_scanner_cycle_store_from(&store).await;
+    let resumed = resume_scanner_usage_recovery_intents(CancellationToken::new(), restarted.clone())
+        .await
+        .expect("startup replay should discover non-terminal intents");
+    assert_eq!(resumed, 2);
+    for intent_id in [
+        completed_record.intent_id.as_str(),
+        accepted_record.intent_id.as_str(),
+        running_record.intent_id.as_str(),
+    ] {
+        let record = get_scanner_usage_recovery_intent(restarted.clone(), intent_id)
+            .await
+            .expect("intent should remain readable")
+            .expect("intent should remain durable");
+        assert_eq!(record.state, "completed");
+    }
+    let after_first_startup = persisted_state(&restarted).await;
+    let resumed_again = resume_scanner_usage_recovery_intents(CancellationToken::new(), restarted.clone())
+        .await
+        .expect("terminal startup replay should be idempotent");
+    assert_eq!(resumed_again, 0);
+    assert_eq!(persisted_state(&restarted).await, after_first_startup);
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_recovery_intent_replay_repairs_missing_startup_index() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let request = recovery_intent_request("intent-key-0004-reindex", "operator-a");
+    let accepted = accept_scanner_usage_recovery_intent(store.clone(), request.clone())
+        .await
+        .expect("initial intent should persist");
+    let record = match accepted {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("initial request must create a durable intent: {other:?}"),
+    };
+    save_config(
+        store.clone(),
+        ".usage.v2.recovery-intents/index.json",
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "intent_ids": [],
+            "updated_at_unix_secs": 1,
+        }))
+        .expect("empty recovery index should encode"),
+    )
+    .await
+    .expect("simulate an intent persisted before its index update");
+
+    let replay = accept_scanner_usage_recovery_intent(store.clone(), request)
+        .await
+        .expect("lost response replay should repair the startup index");
+    assert_eq!(replay, ScannerRecoveryIntentAcceptResult::Replayed { record: record.clone() });
+
+    let restarted = restart_scanner_cycle_store_from(&store).await;
+    let resumed = resume_scanner_usage_recovery_intents(CancellationToken::new(), restarted.clone())
+        .await
+        .expect("repaired index should be startup-discoverable");
+    assert_eq!(resumed, 1);
+    let completed = get_scanner_usage_recovery_intent(restarted, &record.intent_id)
+        .await
+        .expect("completed intent should read")
+        .expect("completed intent should remain durable");
+    assert_eq!(completed.state, "completed");
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_recovery_intent_startup_rejects_corrupt_index_without_running_records() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let request = recovery_intent_request("intent-key-0005-corrupt-index", "operator-a");
+    let record = match accept_scanner_usage_recovery_intent(store.clone(), request)
+        .await
+        .expect("intent should persist")
+    {
+        ScannerRecoveryIntentAcceptResult::Accepted { record } => record,
+        other => panic!("initial request must create a durable intent: {other:?}"),
+    };
+    save_config(store.clone(), ".usage.v2.recovery-intents/index.json", b"{broken".to_vec())
+        .await
+        .expect("corrupt startup index");
+
+    let error = resume_scanner_usage_recovery_intents(CancellationToken::new(), store.clone())
+        .await
+        .expect_err("corrupt index must stop startup replay");
+    assert!(error.to_string().contains("scanner recovery intent index is invalid"));
+    let retained = get_scanner_usage_recovery_intent(store, &record.intent_id)
+        .await
+        .expect("intent should remain readable")
+        .expect("intent should remain durable");
+    assert_eq!(retained.state, "accepted");
+}
+
+#[tokio::test]
+#[serial]
 async fn scanner_recovery_intent_executor_persists_failed_progress() {
     let (_dir, store) = setup_scanner_cycle_store().await;
     let record = match accept_scanner_usage_recovery_intent(

@@ -956,10 +956,34 @@ pub async fn init_scanner_with_recovery(
     enabled: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if enabled {
-        init_data_scanner(ctx, storeapi).await;
+        tokio::spawn(async move {
+            if let Err(error) = resume_scanner_usage_recovery_intents(ctx.clone(), storeapi.clone()).await {
+                warn!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    state = "startup_recovery_intent_deferred",
+                    error = %error,
+                    "Scanner recovery intent replay was deferred"
+                );
+            }
+            init_data_scanner(ctx, storeapi).await;
+        });
         return None;
     }
     Some(tokio::spawn(async move {
+        if let Err(error) = resume_scanner_usage_recovery_intents(ctx.clone(), storeapi.clone()).await {
+            warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "disabled_recovery_intent_deferred",
+                error = %error,
+                "Disabled scanner recovery intent replay was deferred"
+            );
+        }
         if let Err(error) = resume_scanner_cycle_cleanup(ctx, storeapi).await {
             warn!(
                 target: "rustfs::scanner",

@@ -36,7 +36,10 @@ const CACHE_CYCLE_AHEAD: &str = "cache_cycle_ahead";
 const SCANNER_USAGE_STATE_RESET_MODE_FULL_REBUILD: &str = "full-rebuild";
 const SCANNER_RECOVERY_INTENT_SCHEMA_VERSION: u16 = 1;
 const SCANNER_RECOVERY_INTENT_PREFIX: &str = ".usage.v2.recovery-intents";
+const SCANNER_RECOVERY_INTENT_INDEX_PATH: &str = ".usage.v2.recovery-intents/index.json";
 const MAX_SCANNER_RECOVERY_INTENT_BYTES: u64 = 16 * 1024;
+const MAX_SCANNER_RECOVERY_INTENT_INDEX_BYTES: u64 = 32 * 1024;
+const MAX_SCANNER_RECOVERY_INTENT_INDEX_ENTRIES: usize = 256;
 const SCANNER_RECOVERY_INTENT_STATE_ACCEPTED: &str = "accepted";
 const SCANNER_RECOVERY_INTENT_STATE_RUNNING: &str = "running";
 const SCANNER_RECOVERY_INTENT_STATE_COMPLETED: &str = "completed";
@@ -175,6 +178,14 @@ pub struct ScannerRecoveryIntentRecord {
     pub idempotency_key_sha256: String,
     pub request_sha256: String,
     pub accepted_at_unix_secs: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ScannerRecoveryIntentIndex {
+    schema_version: u16,
+    intent_ids: Vec<String>,
+    updated_at_unix_secs: u64,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -530,6 +541,113 @@ fn decode_recovery_intent_record(data: &[u8]) -> Result<ScannerRecoveryIntentRec
     Ok(record)
 }
 
+fn empty_recovery_intent_index() -> ScannerRecoveryIntentIndex {
+    ScannerRecoveryIntentIndex {
+        schema_version: SCANNER_RECOVERY_INTENT_SCHEMA_VERSION,
+        intent_ids: Vec::new(),
+        updated_at_unix_secs: unix_now_secs(),
+    }
+}
+
+fn validate_recovery_intent_index(index: &ScannerRecoveryIntentIndex) -> Result<(), ScannerError> {
+    if index.schema_version != SCANNER_RECOVERY_INTENT_SCHEMA_VERSION {
+        return Err(ScannerError::Other("scanner recovery intent index schema is unsupported".to_string()));
+    }
+    if index.intent_ids.len() > MAX_SCANNER_RECOVERY_INTENT_INDEX_ENTRIES {
+        return Err(ScannerError::Other(
+            "scanner recovery intent index exceeds the bounded entry count".to_string(),
+        ));
+    }
+    for (position, intent_id) in index.intent_ids.iter().enumerate() {
+        if !is_canonical_sha256(intent_id) {
+            return Err(ScannerError::Other(
+                "scanner recovery intent index contains an invalid intent id".to_string(),
+            ));
+        }
+        if index.intent_ids[..position].contains(intent_id) {
+            return Err(ScannerError::Other(
+                "scanner recovery intent index contains a duplicate intent id".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn decode_recovery_intent_index(data: &[u8]) -> Result<ScannerRecoveryIntentIndex, ScannerError> {
+    let index: ScannerRecoveryIntentIndex = serde_json::from_slice(data)
+        .map_err(|err| ScannerError::Other(format!("scanner recovery intent index is invalid: {err}")))?;
+    validate_recovery_intent_index(&index)?;
+    Ok(index)
+}
+
+async fn read_recovery_intent_index_with_revision(
+    storeapi: Arc<impl ScannerObjectIO>,
+) -> Result<(ScannerRecoveryIntentIndex, DataUsageCacheRevision), ScannerError> {
+    match read_config_with_revision(storeapi, SCANNER_RECOVERY_INTENT_INDEX_PATH).await {
+        Ok((data, revision)) => {
+            let Some(data) = data else {
+                return Ok((empty_recovery_intent_index(), revision));
+            };
+            if data.is_empty() || data.len() > usize::try_from(MAX_SCANNER_RECOVERY_INTENT_INDEX_BYTES).unwrap_or(usize::MAX) {
+                return Err(ScannerError::Other(
+                    "scanner recovery intent index exceeds the bounded object size".to_string(),
+                ));
+            }
+            decode_recovery_intent_index(&data).map(|index| (index, revision))
+        }
+        Err(
+            EcstoreError::FileNotFound
+            | EcstoreError::VolumeNotFound
+            | EcstoreError::ObjectNotFound(_, _)
+            | EcstoreError::BucketNotFound(_)
+            | EcstoreError::ConfigNotFound,
+        ) => Ok((empty_recovery_intent_index(), DataUsageCacheRevision::Missing)),
+        Err(err) => Err(ScannerError::Other(format!("failed to read scanner recovery intent index: {err}"))),
+    }
+}
+
+async fn ensure_scanner_recovery_intent_indexed(
+    storeapi: Arc<impl ScannerObjectIO>,
+    intent_id: &str,
+) -> Result<(), ScannerError> {
+    if !is_canonical_sha256(intent_id) {
+        return Err(ScannerError::Other("scanner recovery intent id is invalid".to_string()));
+    }
+    for _ in 0..8 {
+        let (mut index, revision) = read_recovery_intent_index_with_revision(storeapi.clone()).await?;
+        if index.intent_ids.iter().any(|existing| existing == intent_id) {
+            return Ok(());
+        }
+        if index.intent_ids.len() >= MAX_SCANNER_RECOVERY_INTENT_INDEX_ENTRIES {
+            return Err(ScannerError::Other("scanner recovery intent index is full".to_string()));
+        }
+        index.intent_ids.push(intent_id.to_string());
+        index.updated_at_unix_secs = unix_now_secs();
+        let encoded = serde_json::to_vec(&index)
+            .map_err(|err| ScannerError::Other(format!("failed to encode scanner recovery intent index: {err}")))?;
+        if encoded.len() > usize::try_from(MAX_SCANNER_RECOVERY_INTENT_INDEX_BYTES).unwrap_or(usize::MAX) {
+            return Err(ScannerError::Other(
+                "scanner recovery intent index exceeds the bounded object size".to_string(),
+            ));
+        }
+        match save_config_with_preconditions(
+            storeapi.clone(),
+            SCANNER_RECOVERY_INTENT_INDEX_PATH,
+            encoded,
+            revision.preconditions(),
+        )
+        .await
+        {
+            Ok(_) => return Ok(()),
+            Err(EcstoreError::PreconditionFailed) => continue,
+            Err(err) => return Err(ScannerError::Other(format!("failed to persist scanner recovery intent index: {err}"))),
+        }
+    }
+    Err(ScannerError::Other(
+        "scanner recovery intent index changed repeatedly during update".to_string(),
+    ))
+}
+
 fn compare_recovery_intent(
     expected: &ScannerRecoveryIntentRecord,
     existing: ScannerRecoveryIntentRecord,
@@ -633,18 +751,54 @@ pub async fn accept_scanner_usage_recovery_intent(
         .map_err(|err| ScannerError::Other(format!("failed to encode scanner recovery intent: {err}")))?;
     match save_config_with_preconditions(storeapi.clone(), &path, encoded, DataUsageCacheRevision::Missing.preconditions()).await
     {
-        Ok(_) => Ok(ScannerRecoveryIntentAcceptResult::Accepted { record: candidate }),
+        Ok(_) => {
+            ensure_scanner_recovery_intent_indexed(storeapi, &candidate.intent_id).await?;
+            Ok(ScannerRecoveryIntentAcceptResult::Accepted { record: candidate })
+        }
         Err(EcstoreError::PreconditionFailed) => {
-            let existing = read_recovery_intent_record(storeapi, &path).await?;
+            let existing = read_recovery_intent_record(storeapi.clone(), &path).await?;
             let Some(existing) = existing else {
                 return Err(ScannerError::Other(
                     "scanner recovery intent disappeared after creation conflict".to_string(),
                 ));
             };
-            Ok(compare_recovery_intent(&candidate, existing))
+            let result = compare_recovery_intent(&candidate, existing);
+            if let ScannerRecoveryIntentAcceptResult::Replayed { record } = &result {
+                ensure_scanner_recovery_intent_indexed(storeapi, &record.intent_id).await?;
+            }
+            Ok(result)
         }
         Err(err) => Err(ScannerError::Other(format!("failed to persist scanner recovery intent: {err}"))),
     }
+}
+
+pub(crate) async fn resume_scanner_usage_recovery_intents(
+    ctx: CancellationToken,
+    storeapi: Arc<ECStore>,
+) -> Result<usize, ScannerError> {
+    let (index, _) = read_recovery_intent_index_with_revision(storeapi.clone()).await?;
+    let mut resumed = 0_usize;
+    for intent_id in index.intent_ids {
+        if ctx.is_cancelled() {
+            return Err(ScannerError::Other("scanner recovery intent startup replay was cancelled".to_string()));
+        }
+        let Some(record) = get_scanner_usage_recovery_intent(storeapi.clone(), &intent_id).await? else {
+            continue;
+        };
+        if !matches!(
+            record.state.as_str(),
+            SCANNER_RECOVERY_INTENT_STATE_ACCEPTED | SCANNER_RECOVERY_INTENT_STATE_RUNNING
+        ) {
+            continue;
+        }
+        if run_scanner_usage_recovery_intent(ctx.clone(), storeapi.clone(), intent_id)
+            .await?
+            .is_some()
+        {
+            resumed = resumed.saturating_add(1);
+        }
+    }
+    Ok(resumed)
 }
 
 async fn transition_scanner_usage_recovery_intent(
