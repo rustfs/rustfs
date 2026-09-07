@@ -527,9 +527,9 @@ impl From<StorageError> for ApiError {
 
         let message = if matches!(&err, StorageError::QuotaExceeded { .. }) {
             err.to_string()
-        } else if matches!(&err, StorageError::MaxVersionsExceeded) {
-            ApiError::error_code_to_message(&code)
-        } else if code == S3ErrorCode::InternalError && matches!(&err, StorageError::Io(_)) {
+        } else if matches!(&err, StorageError::MaxVersionsExceeded)
+            || (code == S3ErrorCode::InternalError && matches!(&err, StorageError::Io(_)))
+        {
             ApiError::error_code_to_message(&code)
         } else if code == S3ErrorCode::InternalError {
             err.to_string()
