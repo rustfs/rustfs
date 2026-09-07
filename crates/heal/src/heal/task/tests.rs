@@ -184,6 +184,72 @@ mod canonical_outcome {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn admin_cluster_lock_timeout_exhaustion_keeps_progress_and_retry_outcome() {
+        let storage = Arc::new(MockStorage::default());
+        storage.heal_object_outcomes.lock().expect("outcomes").insert(
+            "object-a".to_string(),
+            (0..4).map(|_| MockHealObjectOutcome::RetryableLockTimeout).collect(),
+        );
+        let mut request = HealRequest::new(
+            HealType::Cluster,
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Admin;
+        let task = HealTask::from_request(request, storage.clone());
+
+        let err = task
+            .execute()
+            .await
+            .expect_err("legacy adapter still returns the batch failure detail");
+        assert!(
+            err.to_string()
+                .contains("Lock error: Lock acquisition timeout for resource 'object-a' after 5s"),
+            "lock timeout must remain actionable in the retained failure detail: {err}"
+        );
+
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::CompletedWithErrors);
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+        assert_eq!(
+            (
+                outcome.counters.processed,
+                outcome.counters.failed,
+                outcome.counters.unknown,
+                outcome.counters.attempt_failures
+            ),
+            (2, 1, 1, 4)
+        );
+        let failed = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.object == "object-a")
+            .expect("lock-contended object outcome");
+        assert_eq!(failed.disposition, HealObjectDisposition::Failed(HealFailureClass::RetryExhausted));
+        assert!(
+            failed
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("Lock error: Lock acquisition timeout for resource 'object-a' after 5s")),
+            "exhausted lock detail stays observable"
+        );
+
+        let progress = task.get_progress().await;
+        assert_eq!((progress.objects_scanned, progress.objects_healed, progress.objects_failed), (2, 1, 1));
+        let (legacy_summary, legacy_detail) = outcome.legacy_status("finished", None);
+        assert_eq!(legacy_summary, "stopped");
+        assert_eq!(legacy_detail.as_deref(), Some("heal traversal completed with errors: 1 failed objects"));
+        assert_eq!(
+            storage.heal_object_calls.lock().expect("object calls").as_slice(),
+            ["object-a", "object-b", "object-a", "object-a", "object-a"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn retry_success_counts_one_terminal_outcome() {
         let storage = Arc::new(MockStorage::default());
         storage
@@ -1293,6 +1359,7 @@ fn replacement_identity(
 
 enum MockHealObjectOutcome {
     RetryableLock,
+    RetryableLockTimeout,
     OkWithOtherError(&'static str),
     ErrOther(&'static str),
     DanglingGraceDeferred,
@@ -1436,6 +1503,13 @@ impl HealStorageAPI for MockStorage {
                         owner: "competing-writer".to_string(),
                     }))),
                 )),
+                MockHealObjectOutcome::RetryableLockTimeout => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::Lock(rustfs_lock::LockError::Timeout {
+                        resource: object.to_string(),
+                        timeout: Duration::from_secs(5),
+                    }))),
+                )),
                 MockHealObjectOutcome::RetryableSlowDown => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::SlowDown))))
                 }
@@ -1466,6 +1540,13 @@ impl HealStorageAPI for MockStorage {
                     Some(Error::Storage(EcstoreError::Lock(rustfs_lock::LockError::AlreadyLocked {
                         resource: object.to_string(),
                         owner: "competing-writer".to_string(),
+                    }))),
+                )),
+                MockHealObjectOutcome::RetryableLockTimeout => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::Lock(rustfs_lock::LockError::Timeout {
+                        resource: object.to_string(),
+                        timeout: Duration::from_secs(5),
                     }))),
                 )),
                 MockHealObjectOutcome::RetryableSlowDown => {
