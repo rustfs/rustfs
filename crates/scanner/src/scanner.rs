@@ -3573,6 +3573,8 @@ use leadership::*;
 pub(crate) use usage_store::RootPublicationProof;
 use usage_store::*;
 
+#[cfg(test)]
+pub(crate) use activity::scanner_node_activity_for_tests;
 pub use activity::scanner_topology_digest;
 pub(crate) use activity::{
     ScannerActivitySnapshot, ScannerDirtyUsageAcknowledgement, ScannerDirtyUsageAcknowledgementKind, probe_scanner_activity,

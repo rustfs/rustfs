@@ -441,6 +441,27 @@ pub(crate) struct ScannerNodeActivity {
 
 pub(crate) type ScannerActivitySnapshot = BTreeMap<String, ScannerNodeActivity>;
 
+#[cfg(test)]
+pub(crate) fn scanner_node_activity_for_tests(
+    instance_id: &str,
+    namespace_generation: u64,
+    dirty_usage_generation: u64,
+    dirty_usage_pending: bool,
+) -> ScannerNodeActivity {
+    ScannerNodeActivity {
+        instance_id: instance_id.to_string(),
+        namespace_generation,
+        maintenance_generation: 0,
+        protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+        topology_digest: [0; 32],
+        data_movement_active: false,
+        dirty_usage_generation,
+        dirty_usage_pending,
+        movement_generation: 0,
+        publication_blocked: false,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScannerDirtyUsageAcknowledgement {
     pub(crate) host: String,

@@ -37,6 +37,7 @@ use rustfs_concurrency::{
 };
 use rustfs_filemeta::FileInfo;
 use serial_test::serial;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use temp_env::with_var;
 use time::OffsetDateTime;
@@ -1771,6 +1772,56 @@ fn scanner_scoped_dirty_usage_ack_cost_threshold_is_single_protocol_batch() {
 }
 
 #[test]
+fn remote_dirty_usage_scope_resolution_falls_back_when_ack_batch_exceeds_threshold() {
+    let source = DataUsageCacheSource::new(1, 2);
+    let expected_sources = HashSet::from([source]);
+    let scan_plan_digest = DataUsageScanPlanDigest([7; 32]);
+    let baseline = complete_usage_baseline(source, scan_plan_digest, 7, 11);
+    let bucket_names = (0..=crate::SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES)
+        .map(|index| format!("remote-{index:02}"))
+        .collect::<Vec<_>>();
+    let bucket_refs = bucket_names.iter().map(|bucket| (bucket.as_str(), 7)).collect::<Vec<_>>();
+    let all_buckets = bucket_names.iter().map(|bucket| bucket_info(bucket)).collect::<Vec<_>>();
+    let expected_peers = HashMap::from([(
+        "node-a:9000".to_string(),
+        ScannerPeerDirtyUsageExpectation {
+            instance_id: "instance-a".to_string(),
+            generation: 7,
+            pending: true,
+        },
+    )]);
+    let remote_dirty_usage = verified_remote_dirty_usage(
+        &expected_peers,
+        vec![("node-a:9000".to_string(), peer_dirty_usage_snapshot("instance-a", 7, true, &bucket_refs))],
+    )
+    .expect("fixture peer state should verify before the resolver cost gate");
+
+    let result = resolve_remote_dirty_usage_scope(
+        ScannerBucketScanScope::default(),
+        HashSet::new(),
+        remote_dirty_usage,
+        &all_buckets,
+        ScannerCacheBaselineProof {
+            authoritative_data: Some(&baseline),
+            observed_candidate_data: None,
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest,
+        },
+    );
+
+    assert!(
+        result.scope.is_default(),
+        "oversized scoped ACK batches must force the production resolver back to a full scan"
+    );
+    assert!(
+        result.remote_dirty_usage_acknowledgements.is_empty(),
+        "full-scan fallback must not send a scoped ACK that peers would reject or split"
+    );
+}
+
+#[test]
 fn verified_remote_dirty_usage_buckets_rejects_incomplete_or_stale_peer_state() {
     let expected_peers = HashMap::from([(
         "node-a:9000".to_string(),
@@ -1791,6 +1842,120 @@ fn verified_remote_dirty_usage_buckets_rejects_incomplete_or_stale_peer_state() 
             verified_remote_dirty_usage(&expected_peers, vec![("node-a:9000".to_string(), snapshot)]).is_none(),
             "incomplete, stale, mismatched, or empty pending peer state must fall back to a full scan"
         );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn distributed_scoped_scan_falls_back_when_remote_ack_exceeds_protocol_batch() {
+    let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+    clear_dirty_usage_buckets_for_tests();
+    record_dirty_usage_bucket("local-dirty");
+    let local_generation = dirty_usage_generation();
+    let remote_dirty_buckets = (0..=crate::SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES)
+        .map(|index| (format!("remote-{index:02}"), 7))
+        .collect::<Vec<_>>();
+    let mut all_buckets = vec![bucket_info_with_created_time("local-dirty")];
+    all_buckets.extend(
+        remote_dirty_buckets
+            .iter()
+            .map(|(bucket, _)| bucket_info_with_created_time(bucket)),
+    );
+    let snapshot_buckets = remote_dirty_buckets
+        .iter()
+        .map(|(bucket, generation)| (bucket.as_str(), *generation))
+        .collect::<Vec<_>>();
+    let baseline_digest = DataUsageScanPlanDigest([8; 32]);
+    let baseline = complete_usage_baseline(DataUsageCacheSource::new(1, 2), baseline_digest, 7, 11);
+    let expected_sources = HashSet::from([DataUsageCacheSource::new(1, 2)]);
+    let dirty_usage_snapshot = snapshot_dirty_usage_buckets(&all_buckets, local_generation);
+    let activity_before = BTreeMap::from([(
+        "node-a:9000".to_string(),
+        crate::scanner::scanner_node_activity_for_tests("instance-a", 5, 7, true),
+    )]);
+
+    let result = super::io_cycle::resolve_scanner_bucket_scan_scope_for_tests(
+        store.as_ref(),
+        true,
+        ScannerBucketScanScope::default(),
+        ScannerCacheBaselineProof {
+            authoritative_data: Some(&baseline),
+            observed_candidate_data: None,
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest: baseline_digest,
+        },
+        &activity_before,
+        &dirty_usage_snapshot,
+        &all_buckets,
+        false,
+        Some(vec![(
+            "node-a:9000".to_string(),
+            peer_dirty_usage_snapshot("instance-a", 7, true, &snapshot_buckets),
+        )]),
+        Some(true),
+    )
+    .await;
+
+    assert!(
+        result.scope.is_default(),
+        "remote scoped acknowledgements above one protocol batch must force a full scan"
+    );
+    assert!(
+        result.remote_dirty_usage_acknowledgements.is_empty(),
+        "full-scan fallback must not send scoped remote acknowledgements"
+    );
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[tokio::test]
+async fn distributed_scoped_scan_falls_back_when_remote_scoped_ack_capability_is_rejected() {
+    let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+    let source = DataUsageCacheSource::new(1, 2);
+    let expected_sources = HashSet::from([source]);
+    let scan_plan_digest = DataUsageScanPlanDigest([7; 32]);
+    let baseline = complete_usage_baseline(source, scan_plan_digest, 7, 11);
+    let dirty_usage_snapshot = DirtyUsageSnapshot {
+        buckets: Arc::new(HashMap::new()),
+        scopes: Arc::new(HashMap::new()),
+        generation: 7,
+        covers_all_pending: true,
+    };
+    let activity_before = BTreeMap::from([(
+        "node-a:9000".to_string(),
+        crate::scanner::scanner_node_activity_for_tests("instance-a", 5, 7, true),
+    )]);
+
+    for (capability, expected_buckets, expected_ack_count) in
+        [(true, Some(HashSet::from(["photos".to_string()])), 1), (false, None, 0)]
+    {
+        let result = super::io_cycle::resolve_scanner_bucket_scan_scope_for_tests(
+            store.as_ref(),
+            true,
+            ScannerBucketScanScope::default(),
+            ScannerCacheBaselineProof {
+                authoritative_data: Some(&baseline),
+                observed_candidate_data: None,
+                expected_sources: &expected_sources,
+                leader_epoch: 11,
+                want_cycle: 8,
+                scan_plan_digest,
+            },
+            &activity_before,
+            &dirty_usage_snapshot,
+            &[bucket_info_with_created_time("photos")],
+            false,
+            Some(vec![(
+                "node-a:9000".to_string(),
+                peer_dirty_usage_snapshot("instance-a", 7, true, &[("photos", 7)]),
+            )]),
+            Some(capability),
+        )
+        .await;
+
+        assert_eq!(result.scope.selected_buckets.as_deref(), expected_buckets.as_ref());
+        assert_eq!(result.remote_dirty_usage_acknowledgements.len(), expected_ack_count);
     }
 }
 

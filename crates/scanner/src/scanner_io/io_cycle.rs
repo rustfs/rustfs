@@ -105,11 +105,10 @@ struct ScannerBucketScopeResolution<'a> {
     dirty_usage_snapshot: &'a DirtyUsageSnapshot,
     all_buckets: &'a [BucketInfo],
     requires_full_scan: bool,
-}
-
-struct ScannerBucketScopeResolutionResult {
-    scope: ScannerBucketScanScope,
-    remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+    #[cfg(test)]
+    test_peer_snapshots: Option<Vec<(String, crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot)>>,
+    #[cfg(test)]
+    test_scoped_dirty_usage_capability: Option<bool>,
 }
 
 async fn resolve_scanner_bucket_scan_scope<S>(
@@ -135,18 +134,35 @@ where
         return default_result(resolution.requested_scope);
     }
 
-    let mut dirty_buckets = resolution
+    let dirty_buckets = resolution
         .dirty_usage_snapshot
         .buckets
         .keys()
         .cloned()
         .collect::<HashSet<_>>();
     if distributed {
-        let Some(notification_system) = store.scanner_notification_system() else {
-            return default_result(resolution.requested_scope);
+        let notification_system = store.scanner_notification_system();
+        #[cfg(test)]
+        let peer_snapshots = if let Some(peer_snapshots) = resolution.test_peer_snapshots.clone() {
+            peer_snapshots
+        } else {
+            let Some(notification_system) = notification_system.as_ref() else {
+                return default_result(resolution.requested_scope);
+            };
+            let Ok(peer_snapshots) = notification_system.scanner_dirty_usage_snapshots().await else {
+                return default_result(resolution.requested_scope);
+            };
+            peer_snapshots
         };
-        let Ok(peer_snapshots) = notification_system.scanner_dirty_usage_snapshots().await else {
-            return default_result(resolution.requested_scope);
+        #[cfg(not(test))]
+        let peer_snapshots = {
+            let Some(notification_system) = notification_system.as_ref() else {
+                return default_result(resolution.requested_scope);
+            };
+            let Ok(peer_snapshots) = notification_system.scanner_dirty_usage_snapshots().await else {
+                return default_result(resolution.requested_scope);
+            };
+            peer_snapshots
         };
         let mut expected_peers = HashMap::new();
         for (host, lease_instance_id, _) in crate::scanner::scanner_activity_publication_lease_targets(resolution.activity_before)
@@ -171,68 +187,57 @@ where
         let Some(remote_dirty_usage) = verified_remote_dirty_usage(&expected_peers, peer_snapshots) else {
             return default_result(resolution.requested_scope);
         };
-        dirty_buckets.extend(remote_dirty_usage.dirty_buckets);
-        // Peer snapshots contribute bucket names only; the local prefix scopes
-        // would narrow a bucket a peer dirtied elsewhere, so the merged scope
-        // stays at bucket granularity (same rule as the local fallthrough).
-        let scope = scoped_scan_scope_from_dirty_buckets(
+        let remote_resolution = resolve_remote_dirty_usage_scope(
             resolution.requested_scope,
             dirty_buckets,
-            None,
-            true,
+            remote_dirty_usage,
             resolution.all_buckets,
             resolution.baseline_proof,
         );
-        if scope.is_default() {
-            return default_result(scope);
-        }
-        let Some(selected_buckets) = scope.selected_buckets.as_ref() else {
-            return default_result(scope);
-        };
-        let mut scoped_acknowledgements = Vec::with_capacity(remote_dirty_usage.acknowledgements.len());
-        for acknowledgement in remote_dirty_usage.acknowledgements {
-            let crate::scanner::ScannerDirtyUsageAcknowledgement {
-                host,
-                instance_id,
-                kind: crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped { owner_id, entries },
-            } = acknowledgement
-            else {
-                return default_result(scope);
+        if !remote_resolution.remote_dirty_usage_acknowledgements.is_empty() {
+            #[cfg(test)]
+            let capability_supported = if let Some(capability_supported) = resolution.test_scoped_dirty_usage_capability {
+                capability_supported
+            } else {
+                let Some(notification_system) = notification_system.as_ref() else {
+                    return default_result(ScannerBucketScanScope::default());
+                };
+                let capability_acknowledgements = remote_resolution
+                    .remote_dirty_usage_acknowledgements
+                    .clone()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect::<Vec<crate::storage_api::EcstoreScannerDirtyUsageAcknowledgement>>();
+                matches!(
+                    notification_system
+                        .scanner_scoped_dirty_usage_capabilities(capability_acknowledgements)
+                        .await,
+                    Ok(true)
+                )
             };
-            let entries = entries
-                .into_iter()
-                .filter(|entry| selected_buckets.contains(&entry.bucket))
-                .collect::<Vec<_>>();
-            if !entries.is_empty() {
-                scoped_acknowledgements.push(crate::scanner::ScannerDirtyUsageAcknowledgement {
-                    host,
-                    instance_id,
-                    kind: crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped { owner_id, entries },
-                });
-            }
-        }
-        if super::scanner_scoped_dirty_usage_ack_exceeds_cost_threshold(&scoped_acknowledgements) {
-            return default_result(ScannerBucketScanScope::default());
-        }
-        if !scoped_acknowledgements.is_empty() {
-            let capability_acknowledgements = scoped_acknowledgements
-                .clone()
-                .into_iter()
-                .map(Into::into)
-                .collect::<Vec<crate::storage_api::EcstoreScannerDirtyUsageAcknowledgement>>();
-            if !matches!(
-                notification_system
-                    .scanner_scoped_dirty_usage_capabilities(capability_acknowledgements)
-                    .await,
-                Ok(true)
-            ) {
+            #[cfg(not(test))]
+            let capability_supported = {
+                let Some(notification_system) = notification_system.as_ref() else {
+                    return default_result(ScannerBucketScanScope::default());
+                };
+                let capability_acknowledgements = remote_resolution
+                    .remote_dirty_usage_acknowledgements
+                    .clone()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect::<Vec<crate::storage_api::EcstoreScannerDirtyUsageAcknowledgement>>();
+                matches!(
+                    notification_system
+                        .scanner_scoped_dirty_usage_capabilities(capability_acknowledgements)
+                        .await,
+                    Ok(true)
+                )
+            };
+            if !capability_supported {
                 return default_result(ScannerBucketScanScope::default());
             }
         }
-        return ScannerBucketScopeResolutionResult {
-            scope,
-            remote_dirty_usage_acknowledgements: scoped_acknowledgements,
-        };
+        return remote_resolution;
     }
 
     default_result(scoped_scan_scope_from_dirty_buckets(
@@ -243,6 +248,39 @@ where
         resolution.all_buckets,
         resolution.baseline_proof,
     ))
+}
+
+#[cfg(test)]
+pub(super) async fn resolve_scanner_bucket_scan_scope_for_tests<S>(
+    store: &S,
+    distributed: bool,
+    requested_scope: ScannerBucketScanScope,
+    baseline_proof: ScannerCacheBaselineProof<'_>,
+    activity_before: &crate::scanner::ScannerActivitySnapshot,
+    dirty_usage_snapshot: &DirtyUsageSnapshot,
+    all_buckets: &[BucketInfo],
+    requires_full_scan: bool,
+    test_peer_snapshots: Option<Vec<(String, crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot)>>,
+    test_scoped_dirty_usage_capability: Option<bool>,
+) -> ScannerBucketScopeResolutionResult
+where
+    S: ScannerStorage,
+{
+    resolve_scanner_bucket_scan_scope(
+        store,
+        distributed,
+        ScannerBucketScopeResolution {
+            requested_scope,
+            baseline_proof,
+            activity_before,
+            dirty_usage_snapshot,
+            all_buckets,
+            requires_full_scan,
+            test_peer_snapshots,
+            test_scoped_dirty_usage_capability,
+        },
+    )
+    .await
 }
 
 pub(crate) async fn nsscanner_with_storage_status_scoped<S>(store: &S, request: ScannerCycleRequest) -> Result<ScannerCycleResult>
@@ -382,6 +420,10 @@ where
             dirty_usage_snapshot: &dirty_usage_snapshot,
             all_buckets: &all_buckets,
             requires_full_scan: requires_full_scan || scan_mode == HealScanMode::Deep,
+            #[cfg(test)]
+            test_peer_snapshots: None,
+            #[cfg(test)]
+            test_scoped_dirty_usage_capability: None,
         },
     )
     .await;

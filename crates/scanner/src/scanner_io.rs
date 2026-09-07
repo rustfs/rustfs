@@ -165,6 +165,11 @@ struct VerifiedRemoteDirtyUsage {
     acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
 }
 
+struct ScannerBucketScopeResolutionResult {
+    scope: ScannerBucketScanScope,
+    remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+}
+
 fn verified_remote_dirty_usage(
     expected_peers: &HashMap<String, ScannerPeerDirtyUsageExpectation>,
     peer_snapshots: Vec<(String, EcstoreScannerPeerDirtyUsageSnapshot)>,
@@ -227,6 +232,61 @@ fn scanner_scoped_dirty_usage_ack_exceeds_cost_threshold(
                 if entries.len() > crate::SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES
         )
     })
+}
+
+fn resolve_remote_dirty_usage_scope(
+    requested_scope: ScannerBucketScanScope,
+    mut dirty_buckets: HashSet<String>,
+    remote_dirty_usage: VerifiedRemoteDirtyUsage,
+    all_buckets: &[BucketInfo],
+    baseline_proof: ScannerCacheBaselineProof<'_>,
+) -> ScannerBucketScopeResolutionResult {
+    let default_result = |scope: ScannerBucketScanScope| ScannerBucketScopeResolutionResult {
+        scope,
+        remote_dirty_usage_acknowledgements: Vec::new(),
+    };
+
+    dirty_buckets.extend(remote_dirty_usage.dirty_buckets);
+    // Peer snapshots contribute bucket names only; the local prefix scopes
+    // would narrow a bucket a peer dirtied elsewhere, so the merged scope
+    // stays at bucket granularity (same rule as the local fallthrough).
+    let scope = scoped_scan_scope_from_dirty_buckets(requested_scope, dirty_buckets, None, true, all_buckets, baseline_proof);
+    if scope.is_default() {
+        return default_result(scope);
+    }
+    let Some(selected_buckets) = scope.selected_buckets.as_ref() else {
+        return default_result(scope);
+    };
+    let mut scoped_acknowledgements = Vec::with_capacity(remote_dirty_usage.acknowledgements.len());
+    for acknowledgement in remote_dirty_usage.acknowledgements {
+        let crate::scanner::ScannerDirtyUsageAcknowledgement {
+            host,
+            instance_id,
+            kind: crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped { owner_id, entries },
+        } = acknowledgement
+        else {
+            return default_result(scope);
+        };
+        let entries = entries
+            .into_iter()
+            .filter(|entry| selected_buckets.contains(&entry.bucket))
+            .collect::<Vec<_>>();
+        if !entries.is_empty() {
+            scoped_acknowledgements.push(crate::scanner::ScannerDirtyUsageAcknowledgement {
+                host,
+                instance_id,
+                kind: crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped { owner_id, entries },
+            });
+        }
+    }
+    if scanner_scoped_dirty_usage_ack_exceeds_cost_threshold(&scoped_acknowledgements) {
+        return default_result(ScannerBucketScanScope::default());
+    }
+
+    ScannerBucketScopeResolutionResult {
+        scope,
+        remote_dirty_usage_acknowledgements: scoped_acknowledgements,
+    }
 }
 
 fn complete_scanner_cache_snapshot_plan_digest(
