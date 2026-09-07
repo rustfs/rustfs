@@ -186,6 +186,11 @@ impl MrfQueue {
         MrfQueuePushResult::Enqueued
     }
 
+    fn raise_limits_for_replay(&mut self, intents: usize, bytes: usize) {
+        self.capacity = self.capacity.max(self.pending.len().saturating_add(intents));
+        self.byte_budget = self.byte_budget.max(self.bytes.saturating_add(bytes));
+    }
+
     /// Bool compatibility adapter: only a newly executable queue item is
     /// reported as accepted; a coalesced duplicate is not durable admission.
     #[cfg(test)]
@@ -655,9 +660,10 @@ pub fn spawn_mrf_consumer(manager: Arc<HealManager>) {
 
 /// Replay the durable journal into a fresh pending queue and submit whatever
 /// it armed. Returns the number of intact intents replayed. Duplicates are
-/// merged by the manager's dedup key; the journal file is removed once read
-/// (torn tails truncate via the per-record CRC). Public for integration tests;
-/// the live consumer invokes this through [`replay_into`] at startup.
+/// merged by the manager's dedup key; the journal is retained whenever replay
+/// cannot fully hand off a successor in-memory snapshot (torn tails truncate
+/// via the per-record CRC). Public for integration tests; the live consumer
+/// invokes this through [`replay_into`] at startup.
 pub async fn replay_journal_once(manager: &Arc<HealManager>) -> usize {
     let config = MrfConsumerConfig::default();
     let mut queue = MrfQueue::new(config.queue_capacity, config.journal_max_bytes);
@@ -670,7 +676,13 @@ struct ReplayOutcome {
     journal_on_disk: bool,
 }
 
-/// Shared replay core: read + decode + re-arm + delete, then drain what fits.
+fn replay_must_retain_journal(rearm_incomplete: bool, pending_depth: usize) -> bool {
+    rearm_incomplete || pending_depth > 0
+}
+
+/// Shared replay core: read + decode + re-arm, then drain what fits. The
+/// startup journal is removed only after every replayed record has either
+/// reached the manager or been proven redundant inside the in-memory queue.
 async fn replay_into(
     manager: &Arc<HealManager>,
     queue: &mut MrfQueue,
@@ -703,13 +715,26 @@ async fn replay_into(
     }
     counter!("rustfs_heal_mrf_replayed_total").increment(u64::try_from(intents.len()).unwrap_or(u64::MAX));
     let replayed = intents.len();
+    let replay_bytes = intents
+        .iter()
+        .fold(0usize, |total, intent| total.saturating_add(intent.estimated_bytes()));
+    // The decoded journal is already resident in memory. Allow the startup
+    // queue to arm that full bounded snapshot so a later flush can become the
+    // successor anchor instead of overwriting the old journal with only a
+    // prefix.
+    queue.raise_limits_for_replay(intents.len(), replay_bytes);
+    let mut rearm_incomplete = false;
     for intent in intents {
         let result = queue.try_push_typed(intent.clone());
-        if !matches!(result, MrfQueuePushResult::Enqueued) {
-            rustfs_common::mrf_channel::release_mrf_intent(&intent);
+        match result {
+            MrfQueuePushResult::Enqueued => {}
+            MrfQueuePushResult::Coalesced => rustfs_common::mrf_channel::release_mrf_intent(&intent),
+            MrfQueuePushResult::Rejected => {
+                rearm_incomplete = true;
+                rustfs_common::mrf_channel::release_mrf_intent(&intent);
+            }
         }
     }
-    let journal_on_disk = !delete_journals().await;
 
     // Drain the replayed intents immediately; whatever the manager refuses
     // stays armed in `queue` for the consumer's retry loop.
@@ -729,6 +754,11 @@ async fn replay_into(
             }
         }
     }
+    let journal_on_disk = if replay_must_retain_journal(rearm_incomplete, queue.depth()) {
+        true
+    } else {
+        !delete_journals().await
+    };
     ReplayOutcome {
         replayed,
         journal_on_disk,
@@ -748,13 +778,13 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
         backoff_until: None,
     };
 
-    // Replay: read the journal, re-arm intents (duplicates are merged by the
-    // manager's dedup key), then drop the file so the next flush starts clean.
+    // Replay reads the journal and re-arms intents. The startup journal stays
+    // on disk whenever any replayed intent still needs a successor snapshot.
     let replay = replay_into(&manager, &mut runtime.queue, &mut runtime.backoff_until).await;
     runtime.journal_on_disk = replay.journal_on_disk;
-    // The replay deleted the journal file; anything still pending (e.g. the
-    // manager was full and backoff armed) must be re-persisted by the next
-    // flush or a crash before it would lose those intents.
+    // Anything still pending (e.g. the manager was full and backoff armed)
+    // must be re-persisted by the next flush before replay can delete the
+    // startup anchor.
     runtime.dirty = runtime.queue.depth() > 0;
 
     let mut flush_tick = tokio::time::interval(runtime.config.flush_interval);
@@ -888,6 +918,38 @@ mod tests {
 
         // Fully quiescent: nothing to do.
         assert!(matches!(tick_action(false, 0, false), Idle));
+    }
+
+    #[test]
+    fn replay_cleanup_retains_journal_for_unarmed_or_refused_records() {
+        assert!(
+            replay_must_retain_journal(true, 0),
+            "a rejected replay record still needs its disk anchor"
+        );
+        assert!(
+            replay_must_retain_journal(false, 1),
+            "a Full admission retry must keep the startup journal until the next snapshot"
+        );
+        assert!(
+            !replay_must_retain_journal(false, 0),
+            "only a fully consumed replay snapshot may be deleted"
+        );
+    }
+
+    #[test]
+    fn replay_can_arm_more_records_than_live_queue_budget() {
+        let mut queue = MrfQueue::new(1, intent("bucket", "object-0", 0).estimated_bytes());
+        let intents = vec![intent("bucket", "object-0", 0), intent("bucket", "object-1", 0)];
+        let bytes = intents
+            .iter()
+            .fold(0usize, |total, intent| total.saturating_add(intent.estimated_bytes()));
+
+        queue.raise_limits_for_replay(intents.len(), bytes);
+
+        for intent in intents {
+            assert_eq!(queue.try_push_typed(intent), MrfQueuePushResult::Enqueued);
+        }
+        assert_eq!(queue.depth(), 2);
     }
 
     #[test]

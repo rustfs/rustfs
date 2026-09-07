@@ -60,6 +60,29 @@ fn make_manager(storage: Arc<dyn HealStorageAPI>) -> Arc<HealManager> {
     ))
 }
 
+async fn register_local_disks(disk_paths: &[std::path::PathBuf], cmd_line: &str) {
+    let mut endpoints: Vec<Endpoint> = disk_paths
+        .iter()
+        .map(|p| Endpoint::try_from(p.to_string_lossy().as_ref()).expect("endpoint from disk path"))
+        .collect();
+    for (i, endpoint) in endpoints.iter_mut().enumerate() {
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(i);
+    }
+    let pool = PoolEndpoints {
+        legacy: false,
+        set_count: 1,
+        drives_per_set: endpoints.len(),
+        endpoints: Endpoints::from(endpoints),
+        cmd_line: cmd_line.to_string(),
+        platform: String::new(),
+    };
+    init_local_disks(EndpointServerPools::from(vec![pool]))
+        .await
+        .expect("local disks should register");
+}
+
 /// Encode one journal record independently of the implementation, so a format
 /// drift between writer and this fixture fails loudly here.
 fn journal_record(kind: u8, bucket: &str, object: &str, version: Option<[u8; 16]>, attempts: u8) -> Vec<u8> {
@@ -151,26 +174,7 @@ async fn journal_replay_arms_intents_and_deletes_the_file() {
 
     // The journal reader resolves disks through the process-local disk map;
     // register the environment's disks the same way server startup does.
-    let mut endpoints: Vec<Endpoint> = disk_paths
-        .iter()
-        .map(|p| Endpoint::try_from(p.to_string_lossy().as_ref()).expect("endpoint from disk path"))
-        .collect();
-    for (i, endpoint) in endpoints.iter_mut().enumerate() {
-        endpoint.set_pool_index(0);
-        endpoint.set_set_index(0);
-        endpoint.set_disk_index(i);
-    }
-    let pool = PoolEndpoints {
-        legacy: false,
-        set_count: 1,
-        drives_per_set: endpoints.len(),
-        endpoints: Endpoints::from(endpoints),
-        cmd_line: "mrf-test".to_string(),
-        platform: String::new(),
-    };
-    init_local_disks(EndpointServerPools::from(vec![pool]))
-        .await
-        .expect("local disks should register");
+    register_local_disks(&disk_paths, "mrf-test").await;
 
     let mut journal = journal_record(1, "replay-bucket", "replay-object", Some([9u8; 16]), 0);
     journal.extend(journal_record(3, "replay-bucket", "partial-object", None, 1));
@@ -213,26 +217,7 @@ async fn journal_replay_arms_intents_and_deletes_the_file() {
 #[serial]
 async fn authoritative_journal_is_not_merged_with_legacy_mirror() {
     let (disk_paths, storage) = heal_env().await;
-    let mut endpoints: Vec<Endpoint> = disk_paths
-        .iter()
-        .map(|p| Endpoint::try_from(p.to_string_lossy().as_ref()).expect("endpoint from disk path"))
-        .collect();
-    for (i, endpoint) in endpoints.iter_mut().enumerate() {
-        endpoint.set_pool_index(0);
-        endpoint.set_set_index(0);
-        endpoint.set_disk_index(i);
-    }
-    let pool = PoolEndpoints {
-        legacy: false,
-        set_count: 1,
-        drives_per_set: endpoints.len(),
-        endpoints: Endpoints::from(endpoints),
-        cmd_line: "mrf-authoritative-test".to_string(),
-        platform: String::new(),
-    };
-    init_local_disks(EndpointServerPools::from(vec![pool]))
-        .await
-        .expect("local disks should register");
+    register_local_disks(&disk_paths, "mrf-authoritative-test").await;
 
     let authoritative = journal_record(1, "authoritative-bucket", "authoritative-object", None, 0);
     let legacy = journal_record(1, "legacy-bucket", "legacy-object", None, 0);
@@ -263,4 +248,68 @@ async fn authoritative_journal_is_not_merged_with_legacy_mirror() {
         !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
             && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
     }));
+}
+
+/// If replay reaches a full heal-manager queue, the old journal remains the
+/// durable restart anchor until a later consumer flush publishes the pending
+/// successor snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn journal_replay_retains_file_when_manager_is_full() {
+    let (disk_paths, storage) = heal_env().await;
+    register_local_disks(&disk_paths, "mrf-full-replay-test").await;
+
+    let mut journal = journal_record(1, "full-bucket", "first-object", None, 0);
+    journal.extend(journal_record(1, "full-bucket", "second-object", None, 0));
+    write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &journal);
+    write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &journal);
+
+    let manager = Arc::new(HealManager::new(
+        storage.clone(),
+        Some(HealConfig {
+            queue_size: 1,
+            heal_interval: Duration::from_secs(3600),
+            enable_auto_heal: false,
+            ..Default::default()
+        }),
+    ));
+    let replayed = mrf_queue::replay_journal_once(&manager).await;
+    assert_eq!(replayed, 2, "both records must be decoded before manager admission");
+    assert_eq!(
+        manager.operations_snapshot().await.queued_by_source.mrf,
+        1,
+        "only the first record can enter a one-slot manager queue"
+    );
+    assert!(
+        disk_paths
+            .iter()
+            .all(|path| Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()),
+        "replay must keep the authoritative journal when a later record is pending retry"
+    );
+
+    let restarted = Arc::new(HealManager::new(
+        storage,
+        Some(HealConfig {
+            queue_size: 1,
+            heal_interval: Duration::from_secs(3600),
+            enable_auto_heal: false,
+            ..Default::default()
+        }),
+    ));
+    let replayed_after_restart = mrf_queue::replay_journal_once(&restarted).await;
+    assert_eq!(
+        replayed_after_restart, 2,
+        "retained startup journal must replay again after a process restart"
+    );
+    assert_eq!(
+        restarted.operations_snapshot().await.queued_by_source.mrf,
+        1,
+        "the restart sees the same bounded admission state instead of a lost tail"
+    );
+    assert!(
+        disk_paths
+            .iter()
+            .all(|path| Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()),
+        "the anchor remains until a successor snapshot can safely replace it"
+    );
 }
