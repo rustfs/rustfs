@@ -15,7 +15,7 @@
 use super::*;
 #[cfg(test)]
 use rustfs_filemeta::MetadataResolutionParams;
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 
 /// Cached folder information for scanning
 #[derive(Clone, Debug)]
