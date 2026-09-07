@@ -762,22 +762,17 @@ impl RawEnumerationProgress {
     fn new(parent: &str, page_index: Option<RawEnumerationPageIndex>) -> Self {
         let mut digest = Sha256::new();
         update_raw_enumeration_digest(&mut digest, b"parent", parent.as_bytes());
-        let (observed_entries, page_index) = match page_index {
-            Some(index) => match index.indexed_entries() {
-                Ok(entries) => (entries, Some(index)),
-                Err(_) => (Vec::new(), None),
-            },
-            None => (
-                Vec::new(),
-                RawEnumerationPageIndex::new(parent, SCANNER_RAW_ENUMERATION_PAGE_ENTRY_LIMIT).ok(),
-            ),
+        let page_index = match page_index {
+            Some(index) if index.indexed_entries().is_ok() => Some(index),
+            Some(_) => None,
+            None => RawEnumerationPageIndex::new(parent, SCANNER_RAW_ENUMERATION_PAGE_ENTRY_LIMIT).ok(),
         };
         Self {
             parent: parent.to_string(),
             last_entry: None,
             entries_seen: 0,
             digest,
-            observed_entries,
+            observed_entries: Vec::new(),
             page_index,
         }
     }
