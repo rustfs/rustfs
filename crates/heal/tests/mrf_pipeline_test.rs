@@ -359,6 +359,53 @@ async fn authoritative_journal_is_not_merged_with_legacy_mirror() {
     }));
 }
 
+/// The authoritative journal carries the full replay responsibility identity.
+/// A stale legacy mirror must not collapse same-object records that differ by
+/// kind or erasure-set scope after restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn authoritative_journal_replay_preserves_kind_and_scope_identity() {
+    let (disk_paths, storage) = heal_env().await;
+    register_local_disks(&disk_paths, "mrf-authoritative-identity-test").await;
+
+    let mut authoritative = scoped_journal_record(3, "identity-bucket", "same-object", None, 0, 3, 7);
+    authoritative.extend(scoped_journal_record(3, "identity-bucket", "same-object", None, 0, 3, 8));
+    authoritative.extend(journal_record(2, "identity-bucket", "same-object", None, 0));
+    authoritative.extend(journal_record(1, "identity-bucket", "same-object", Some([4u8; 16]), 0));
+    let stale_legacy = journal_record(3, "identity-bucket", "stale-legacy-object", None, 0);
+    write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &authoritative);
+    write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &stale_legacy);
+
+    let manager = make_manager(storage);
+    let replayed = mrf_queue::replay_journal_once(&manager).await;
+    assert_eq!(
+        replayed, 4,
+        "all authoritative kind/scope identities must decode before manager admission"
+    );
+
+    let snapshot = manager.operations_snapshot().await;
+    assert_eq!(
+        snapshot.queued_by_source.mrf, 4,
+        "same-object MRF replay must retain distinct kind and scope responsibilities"
+    );
+    assert_eq!(
+        snapshot.queued_by_priority.normal, 2,
+        "the two scoped partial-write records must remain independently queued"
+    );
+    assert_eq!(
+        snapshot.queued_by_priority.high, 1,
+        "metadata corruption must not merge with object repair responsibility"
+    );
+    assert_eq!(
+        snapshot.queued_by_priority.urgent, 1,
+        "decode-failure repair must not merge with object repair responsibility"
+    );
+    assert!(disk_paths.iter().all(|path| {
+        !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+            && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+    }));
+}
+
 /// If replay reaches a full heal-manager queue, the old journal remains the
 /// durable restart anchor until a later consumer flush publishes the pending
 /// successor snapshot.
