@@ -47,6 +47,7 @@ script-tests: ## Run shell script tests
 	bash -n ./scripts/validate_object_data_cache_cold_stampede.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_object_data_cache_follower_samples.py --self-test
 	./scripts/validate_object_data_cache_cold_stampede.sh --self-test
+	./scripts/run_scanner_heal_evidence_case.sh --self-test
 
 .PHONY: test
 test: core-deps script-tests ## Run all tests (needs cargo-nextest; RUSTFS_ALLOW_CARGO_TEST_FALLBACK=1 to override)
