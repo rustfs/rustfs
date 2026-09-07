@@ -2793,6 +2793,88 @@ async fn admin_force_start_cancels_overlapping_active_task_first() {
 }
 
 #[tokio::test]
+async fn admission_snapshot_tracks_start_duplicate_force_start_and_displacement() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let manager = Arc::new(HealManager::new(
+        storage,
+        Some(HealConfig {
+            queue_size: 1,
+            ..Default::default()
+        }),
+    ));
+
+    let mut paused = admin_prefix_request("bucket-a", "logs/");
+    paused.priority = HealPriority::Low;
+    let hook = Arc::new(DuplicateAdmissionTestHook {
+        request_id: paused.id.clone(),
+        active_lock_reached: Notify::new(),
+        active_lock_release: Notify::new(),
+    });
+    *DUPLICATE_ADMISSION_TEST_HOOK.lock().await = Some(hook.clone());
+
+    let submit_manager = Arc::clone(&manager);
+    let mut paused_submission = tokio::spawn(async move { submit_manager.submit_heal_request(paused).await });
+    tokio::time::timeout(Duration::from_secs(1), hook.active_lock_reached.notified())
+        .await
+        .expect("admission should reach the test-only lock phase hook");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut paused_submission)
+            .await
+            .is_err(),
+        "admission must wait while the lock-phase hook is held"
+    );
+    hook.active_lock_release.notify_one();
+    assert_eq!(
+        paused_submission
+            .await
+            .expect("paused admission task should join")
+            .expect("paused admission should succeed"),
+        HealAdmissionResult::Accepted
+    );
+    *DUPLICATE_ADMISSION_TEST_HOOK.lock().await = None;
+
+    let duplicate = admin_prefix_request("bucket-a", "logs/");
+    let duplicate_receipt = manager
+        .submit_heal_request_with_receipt(duplicate)
+        .await
+        .expect("duplicate admission should return a canonical receipt");
+    assert_eq!(duplicate_receipt.result, HealAdmissionResult::Merged);
+
+    let mut high = admin_prefix_request("bucket-b", "logs/");
+    high.priority = HealPriority::High;
+    assert_eq!(
+        manager
+            .submit_heal_request(high)
+            .await
+            .expect("higher priority admin request should displace queued low-priority work"),
+        HealAdmissionResult::Accepted
+    );
+
+    let mut forced = admin_prefix_request("bucket-c", "logs/");
+    forced.force_start = true;
+    assert_eq!(
+        manager
+            .submit_heal_request(forced)
+            .await
+            .expect("forceStart should keep explicit admission semantics"),
+        HealAdmissionResult::Accepted
+    );
+
+    let admission = manager.operations_snapshot().await.admission;
+    assert_eq!(admission.accepted, 3);
+    assert_eq!(admission.merged, 1);
+    assert_eq!(admission.full, 0);
+    assert_eq!(admission.dropped, 0);
+    assert_eq!(admission.duplicate, 1);
+    assert_eq!(admission.displaced, 1);
+    assert_eq!(admission.force_start, 1);
+    assert!(
+        admission.max_lock_phase_micros > 0,
+        "snapshot should expose a measurable queue/admission lock phase for p95-style external aggregation"
+    );
+}
+
+#[tokio::test]
 async fn test_operations_snapshot_counts_active_by_source_and_priority() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
     let manager = HealManager::new(storage, None);
