@@ -944,6 +944,84 @@ fn bucket_request(bucket: &str, priority: HealPriority, source: HealRequestSourc
     request
 }
 
+fn scoped_object_request(bucket: &str, object: &str, pool_index: usize, set_index: usize) -> HealRequest {
+    HealRequest::new(
+        HealType::Object {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            version_id: None,
+        },
+        HealOptions {
+            pool_index: Some(pool_index),
+            set_index: Some(set_index),
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    )
+}
+
+#[tokio::test]
+async fn scheduler_bulkhead_starts_other_sets_and_retains_same_set_tail() {
+    let manager = HealManager::new(Arc::new(MockStorage), None);
+    {
+        let mut config = manager.config.write().await;
+        config.max_concurrent_heals = 2;
+        config.max_concurrent_per_set = 1;
+        config.set_bulkhead_enable = true;
+        config.event_driven_scheduler_enable = false;
+        config.mainline_throttle_enable = false;
+    }
+
+    let first_set = scoped_object_request("scheduler-bulkhead-set-a-first", "object-a", 0, 1);
+    let first_set_id = first_set.id.clone();
+    let same_set_tail = scoped_object_request("scheduler-bulkhead-set-a-tail", "object-b", 0, 1);
+    let same_set_tail_id = same_set_tail.id.clone();
+    let other_set = scoped_object_request("scheduler-bulkhead-set-b", "object-c", 0, 2);
+    let other_set_id = other_set.id.clone();
+
+    let first_hook = Arc::new(CompletedRetentionHook::default());
+    let other_hook = Arc::new(CompletedRetentionHook::default());
+    {
+        let mut hooks = COMPLETED_RETENTION_HOOKS.lock().await;
+        hooks.insert("scheduler-bulkhead-set-a-first".to_string(), first_hook.clone());
+        hooks.insert("scheduler-bulkhead-set-b".to_string(), other_hook.clone());
+    }
+    {
+        let mut queue = manager.heal_queue.lock().await;
+        assert_eq!(queue.push(first_set), QueuePushOutcome::Accepted);
+        assert_eq!(queue.push(same_set_tail), QueuePushOutcome::Accepted);
+        assert_eq!(queue.push(other_set), QueuePushOutcome::Accepted);
+    }
+
+    process_manager_queue_once(&manager).await;
+    tokio::time::timeout(Duration::from_secs(5), first_hook.started.notified())
+        .await
+        .expect("first set task should start");
+    tokio::time::timeout(Duration::from_secs(5), other_hook.started.notified())
+        .await
+        .expect("other set task should start despite same-set tail");
+
+    assert_eq!(manager.get_active_task_count().await, 2);
+    assert_eq!(manager.get_queue_length().await, 1);
+    assert!(matches!(manager.get_task_status(&same_set_tail_id).await, Ok(HealTaskStatus::Pending)));
+    {
+        let active = manager.active_heals.lock().await;
+        assert!(active.contains_key(&first_set_id));
+        assert!(active.contains_key(&other_set_id));
+        assert!(!active.contains_key(&same_set_tail_id));
+        let counts = running_heal_set_counts(&active);
+        assert_eq!(counts.get("pool_0_set_1"), Some(&1));
+        assert_eq!(counts.get("pool_0_set_2"), Some(&1));
+    }
+
+    manager.cancel_task(&first_set_id).await.expect("cancel first active task");
+    manager.cancel_task(&other_set_id).await.expect("cancel other active task");
+    COMPLETED_RETENTION_HOOKS
+        .lock()
+        .await
+        .retain(|bucket, _| !bucket.starts_with("scheduler-bulkhead-"));
+}
+
 #[test]
 fn test_push_displacing_lower_priority_actually_enqueues_new_request() {
     // Regression for the release-build defect where the enqueue side effect lived inside
