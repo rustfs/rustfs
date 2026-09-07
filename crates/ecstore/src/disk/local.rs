@@ -8708,6 +8708,34 @@ impl DiskAPI for LocalDisk {
                         });
                     }
 
+                    let rollback_after_fsync_failure = |parent: &Path, current: Option<&[u8]>| -> std::io::Result<()> {
+                        match current {
+                            Some(previous) => {
+                                let rollback_temporary =
+                                    parent.join(format!(".{}.{}.rollback.tmp", path.replace('/', "_"), Uuid::new_v4()));
+                                let rollback_result = (|| -> std::io::Result<()> {
+                                    let mut staged = std::fs::OpenOptions::new()
+                                        .create_new(true)
+                                        .write(true)
+                                        .open(&rollback_temporary)?;
+                                    staged.write_all(previous)?;
+                                    staged.sync_all()?;
+                                    std::fs::rename(&rollback_temporary, &file_path)
+                                })();
+                                if let Err(err) = rollback_result {
+                                    let _ = std::fs::remove_file(&rollback_temporary);
+                                    return Err(err);
+                                }
+                            }
+                            None => match std::fs::remove_file(&file_path) {
+                                Ok(()) => {}
+                                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                                Err(err) => return Err(err),
+                            },
+                        }
+                        os::fsync_dir_std(parent)
+                    };
+
                     match replacement {
                         Some(replacement) => {
                             let parent = file_path
@@ -8727,14 +8755,19 @@ impl DiskAPI for LocalDisk {
                                 let _ = std::fs::remove_file(&temporary);
                                 return Err(err);
                             }
-                            if sync_metadata {
-                                os::fsync_dir_std(parent)?;
+                            if sync_metadata && let Err(err) = os::fsync_dir_std(parent) {
+                                rollback_after_fsync_failure(parent, current.as_deref())?;
+                                return Err(err);
                             }
                         }
                         None => {
                             std::fs::remove_file(&file_path)?;
-                            if sync_metadata && let Some(parent) = file_path.parent() {
-                                os::fsync_dir_std(parent)?;
+                            if sync_metadata
+                                && let Some(parent) = file_path.parent()
+                                && let Err(err) = os::fsync_dir_std(parent)
+                            {
+                                rollback_after_fsync_failure(parent, current.as_deref())?;
+                                return Err(err);
                             }
                         }
                     }
@@ -22164,6 +22197,110 @@ mod test {
             disk.read_all(RUSTFS_META_BUCKET, HEALING_MARKER_PATH).await,
             Err(DiskError::FileNotFound)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn conditional_file_update_dir_fsync_failure_restores_previous_bytes() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let previous = Bytes::from_static(b"previous-owner");
+        let successor = Bytes::from_static(b"successor-owner");
+
+        assert_eq!(
+            disk.compare_and_update_file(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, None, Some(previous.clone()))
+                .await
+                .expect("previous owner should commit"),
+            ConditionalFileUpdate::Updated
+        );
+
+        let marker_path = disk
+            .get_object_path(RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
+            .expect("marker path should resolve");
+        let parent = marker_path.parent().expect("marker path should have a parent");
+        os::fsync_dir_recorder::set_failure(parent, ErrorKind::Other);
+
+        let err = disk
+            .compare_and_update_file(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, Some(previous.clone()), Some(successor))
+            .await
+            .expect_err("directory fsync failure must fail the CAS update");
+        assert!(matches!(err, DiskError::Io(ref err) if err.kind() == ErrorKind::Other));
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
+                .await
+                .expect("previous bytes should remain readable after rollback"),
+            previous
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn conditional_file_update_dir_fsync_failure_removes_new_file_without_anchor() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        ensure_test_volume(&disk, RUSTFS_META_BUCKET).await;
+        let marker_path = disk
+            .get_object_path(RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
+            .expect("marker path should resolve");
+        let parent = marker_path.parent().expect("marker path should have a parent");
+        os::fsync_dir_recorder::set_failure(parent, ErrorKind::Other);
+
+        let err = disk
+            .compare_and_update_file(
+                RUSTFS_META_BUCKET,
+                HEALING_MARKER_PATH,
+                None,
+                Some(Bytes::from_static(b"successor-owner")),
+            )
+            .await
+            .expect_err("directory fsync failure must fail the CAS create");
+        assert!(matches!(err, DiskError::Io(ref err) if err.kind() == ErrorKind::Other));
+        assert!(
+            matches!(disk.read_all(RUSTFS_META_BUCKET, HEALING_MARKER_PATH).await, Err(DiskError::FileNotFound)),
+            "uncommitted successor bytes must be removed when no previous anchor exists"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn conditional_file_delete_dir_fsync_failure_restores_previous_bytes() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let previous = Bytes::from_static(b"previous-owner");
+
+        assert_eq!(
+            disk.compare_and_update_file(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, None, Some(previous.clone()))
+                .await
+                .expect("previous owner should commit"),
+            ConditionalFileUpdate::Updated
+        );
+
+        let marker_path = disk
+            .get_object_path(RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
+            .expect("marker path should resolve");
+        let parent = marker_path.parent().expect("marker path should have a parent");
+        os::fsync_dir_recorder::set_failure(parent, ErrorKind::Other);
+
+        let err = disk
+            .compare_and_update_file(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, Some(previous.clone()), None)
+            .await
+            .expect_err("directory fsync failure must fail the CAS delete");
+        assert!(matches!(err, DiskError::Io(ref err) if err.kind() == ErrorKind::Other));
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
+                .await
+                .expect("previous bytes should be restored after failed delete"),
+            previous
+        );
     }
 
     #[cfg(unix)]
