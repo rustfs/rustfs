@@ -4490,11 +4490,20 @@ impl PoolMetaWriteState {
 
     fn observe_selection(&mut self, selection: &PoolMetaSelection) -> Result<()> {
         self.pool_meta_absent = selection.absent;
+        self.validate_selection(selection)?;
+        if self.cluster_epoch.is_none()
+            && let Some((_, metadata_epoch)) = selection.generation_identity
+        {
+            self.cluster_epoch = Some(metadata_epoch);
+        }
+        Ok(())
+    }
+
+    fn validate_selection(&self, selection: &PoolMetaSelection) -> Result<()> {
         if let Some(expected_cluster_id) = self.expected_cluster_id
             && let Some((cluster_id, _)) = selection.generation_identity
             && cluster_id != expected_cluster_id
         {
-            self.block_writes();
             return Err(Error::other(format!(
                 "pool metadata incompatible: cluster identity {cluster_id} does not match deployment {expected_cluster_id}"
             )));
@@ -4503,16 +4512,10 @@ impl PoolMetaWriteState {
             && let Some((_, metadata_epoch)) = selection.generation_identity
             && metadata_epoch != identity_epoch
         {
-            self.block_writes();
             return Err(Error::other(format!(
                 "pool metadata recovery required: committed epoch {} does not match cluster identity epoch {identity_epoch}",
                 metadata_epoch
             )));
-        }
-        if self.cluster_epoch.is_none()
-            && let Some((_, metadata_epoch)) = selection.generation_identity
-        {
-            self.cluster_epoch = Some(metadata_epoch);
         }
         Ok(())
     }
@@ -4546,26 +4549,25 @@ impl PoolMetaWriteState {
         if !self.pool_meta_absent {
             return Ok(());
         }
+        let result = self.validate_missing_metadata_can_initialize();
+        if result.is_err() {
+            self.block_writes();
+        }
+        result
+    }
+
+    fn validate_missing_metadata_can_initialize(&self) -> Result<()> {
         match self.identity_initialized {
             Some(false) if self.bootstrap_identity_proven() && self.identity_fresh_bootstrap_nonce.is_some() => Ok(()),
-            Some(false) => {
-                self.block_writes();
-                Err(Error::other(
-                    "pool metadata recovery required: pending cluster identity exists but this startup has no verified fresh-bootstrap proof or legacy-adoption proof",
-                ))
-            }
-            Some(true) => {
-                self.block_writes();
-                Err(Error::other(
-                    "pool metadata recovery required: initialized cluster identity exists but every pool.bin replica is missing",
-                ))
-            }
-            None => {
-                self.block_writes();
-                Err(Error::other(
-                    "pool metadata recovery required: no durable bootstrap identity or pool.bin replica is available",
-                ))
-            }
+            Some(false) => Err(Error::other(
+                "pool metadata recovery required: pending cluster identity exists but this startup has no verified fresh-bootstrap proof or legacy-adoption proof",
+            )),
+            Some(true) => Err(Error::other(
+                "pool metadata recovery required: initialized cluster identity exists but every pool.bin replica is missing",
+            )),
+            None => Err(Error::other(
+                "pool metadata recovery required: no durable bootstrap identity or pool.bin replica is available",
+            )),
         }
     }
 
@@ -5145,12 +5147,12 @@ fn select_pool_meta_replicas_for_read_probe<R>(
 where
     R: Into<PoolMetaReplicaRead>,
 {
-    // Read-only planning probes must fail the current request on unsafe pool
-    // metadata, but they must not permanently poison the shared writer gate.
-    let mut probe_state = write_state.clone();
-    let selection = select_pool_meta_replicas_observing(&mut probe_state, replicas)?;
-    probe_state.observe_replicas(selection.replica_state);
-    probe_state.ensure_write_safe(operation)?;
+    let selection = select_pool_meta_replica_reads(replicas.into_iter().map(Into::into).collect())?;
+    write_state.validate_selection(&selection)?;
+    selection.replica_state.ensure_write_safe(operation)?;
+    if selection.absent && (write_state.expected_cluster_id.is_some() || write_state.identity_initialized.is_some()) {
+        write_state.validate_missing_metadata_can_initialize()?;
+    }
     Ok(selection)
 }
 
@@ -9014,7 +9016,7 @@ impl ECStore {
 
     async fn acquire_pool_meta_read_guard(
         &self,
-        write_state: &mut PoolMetaWriteState,
+        write_state: &PoolMetaWriteState,
         operation: &str,
     ) -> Result<(rustfs_lock::NamespaceLockGuard, PoolMeta)> {
         write_state.ensure_write_safe(operation)?;
@@ -17962,6 +17964,65 @@ mod tests {
     }
 
     #[test]
+    fn pool_meta_read_probe_does_not_latch_writer_state() {
+        let write_state = PoolMetaWriteState::default();
+        select_pool_meta_replicas_for_read_probe(
+            &write_state,
+            vec![PoolMetaReplica::Unreadable("transient read failure".to_string())],
+            "capacity probe",
+        )
+        .expect_err("an unreadable probe replica must fail the current admission");
+
+        assert!(
+            write_state.ensure_write_safe("ordinary object write").is_ok(),
+            "a read-only capacity probe must not permanently latch the pool metadata writer"
+        );
+    }
+
+    #[test]
+    fn pool_meta_read_probe_rejects_missing_runtime_metadata_without_latching() {
+        let mut write_state = PoolMetaWriteState::default();
+        write_state.expected_cluster_id = Some(uuid::Uuid::new_v4());
+        write_state.identity_initialized = Some(true);
+        select_pool_meta_replicas_for_read_probe(&write_state, vec![PoolMetaReplica::Missing], "capacity probe")
+            .expect_err("runtime metadata disappearance must reject the current probe");
+        write_state
+            .ensure_write_safe("ordinary object write")
+            .expect("a missing-metadata probe must not permanently latch the writer");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_read_guard_does_not_latch_after_unreadable_replica() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let mut saved_disks = Vec::new();
+        for set in &store.pools[1].disk_set {
+            let mut disks = set.disks.write().await;
+            let original = std::mem::take(&mut *disks);
+            let disk_count = original.len();
+            saved_disks.push((set.clone(), original));
+            *disks = vec![None; disk_count];
+        }
+
+        let mut write_state = store.pool_meta_save_gate.lock().await;
+        store
+            .acquire_pool_meta_read_guard(&mut write_state, "capacity probe")
+            .await
+            .expect_err("an unreadable metadata replica must reject this probe");
+        write_state
+            .ensure_write_safe("ordinary object write")
+            .expect("a failed read-only probe must remain retryable");
+
+        for (set, disks) in saved_disks {
+            *set.disks.write().await = disks;
+        }
+        store
+            .acquire_pool_meta_read_guard(&mut write_state, "capacity probe retry")
+            .await
+            .expect("a read-only probe must succeed after the replica recovers");
+    }
+
+    #[test]
     fn pool_meta_write_state_blocks_when_selection_has_no_valid_replica() {
         let replicas = vec![
             PoolMetaReplica::Unreadable("pool 0 read quorum unavailable".to_string()),
@@ -17978,41 +18039,6 @@ mod tests {
             err.to_string()
                 .contains("restart after all replicas are readable and consistent")
         );
-    }
-
-    #[test]
-    fn pool_meta_read_probe_does_not_latch_writer_state() {
-        let write_state = PoolMetaWriteState::default();
-        select_pool_meta_replicas_for_read_probe(
-            &write_state,
-            vec![PoolMetaReplica::Unreadable("transient read failure".to_string())],
-            "capacity probe",
-        )
-        .expect_err("an unreadable probe replica must fail the current admission");
-
-        write_state
-            .ensure_write_safe("ordinary object write")
-            .expect("a read-only capacity probe must not permanently latch the pool metadata writer");
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn pool_meta_read_guard_does_not_latch_after_unreadable_replica() {
-        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
-        for set in &store.pools[1].disk_set {
-            let mut disks = set.disks.write().await;
-            let disk_count = disks.len();
-            *disks = vec![None; disk_count];
-        }
-
-        let mut write_state = store.pool_meta_save_gate.lock().await;
-        store
-            .acquire_pool_meta_read_guard(&mut write_state, "capacity probe")
-            .await
-            .expect_err("an unreadable metadata replica must reject this probe");
-        write_state
-            .ensure_write_safe("ordinary object write")
-            .expect("a failed read-only probe must remain retryable");
     }
 
     #[test]
