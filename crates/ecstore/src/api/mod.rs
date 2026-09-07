@@ -416,8 +416,8 @@ pub mod disk {
 
 pub mod error {
     pub use crate::error::{
-        Error, Result, StorageError, classify_system_path_failure_reason, is_err_bucket_not_found, is_err_object_not_found,
-        is_err_version_not_found,
+        Error, PoolMetadataError, PoolMetadataFailure, Result, StorageError, classify_system_path_failure_reason,
+        is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
     };
 }
 

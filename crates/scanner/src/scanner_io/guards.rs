@@ -900,6 +900,54 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn service_cohort_overflow_new_lower_names_do_not_starve_cursor_tail() {
+        let source = DataUsageCacheSource::new(0, 0);
+        let mut cohort = ScannerServiceCohort {
+            max_members: 2,
+            max_name_bytes: 64,
+            ..Default::default()
+        };
+        let first = cohort_inventory(&["mm00", "zz10", "zz20", "zz30"]);
+        cohort.refresh(&first);
+        cohort.record_admitted(source, "mm00");
+        cohort.record_admitted(source, "zz10");
+
+        let with_new_lower_names = cohort_inventory(&["aa-new", "ab-new", "mm00", "zz10", "zz20", "zz30"]);
+        cohort.refresh(&with_new_lower_names);
+        assert_eq!(
+            cohort.members[&source].keys().map(AsRef::as_ref).collect::<HashSet<&str>>(),
+            HashSet::from(["zz20", "zz30"]),
+            "cursor-tail members must enter the tracked window before newly injected lower names"
+        );
+        let mut ordered = with_new_lower_names[&source].clone();
+        cohort.order_buckets(source, &mut ordered);
+        assert_eq!(
+            ordered.iter().take(2).map(|bucket| bucket.name.as_str()).collect::<Vec<_>>(),
+            vec!["zz20", "zz30"],
+            "dispatch order must keep the old overflow tail ahead of newer lower names"
+        );
+
+        cohort.record_admitted(source, "zz20");
+        let with_more_lower_names = cohort_inventory(&["a0-new", "aa-new", "ab-new", "mm00", "zz10", "zz20", "zz30"]);
+        cohort.refresh(&with_more_lower_names);
+        let mut ordered = with_more_lower_names[&source].clone();
+        cohort.order_buckets(source, &mut ordered);
+        assert_eq!(
+            ordered.first().map(|bucket| bucket.name.as_str()),
+            Some("zz30"),
+            "a still-waiting cursor-tail member must retain priority across repeated lower-name arrivals"
+        );
+
+        cohort.record_admitted(source, "zz30");
+        cohort.refresh(&with_more_lower_names);
+        assert!(
+            cohort.members[&source].keys().any(|bucket| bucket.as_ref().starts_with('a')),
+            "new lower names become eligible after the cursor tail has been serviced"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn service_cohort_bounds_names_and_does_not_reset_duplicate_dirty_age() {
         let source = DataUsageCacheSource::new(0, 0);
         let mut cohort = ScannerServiceCohort {
