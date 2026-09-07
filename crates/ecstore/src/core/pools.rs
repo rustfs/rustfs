@@ -65,6 +65,7 @@ use crate::storage_api_contracts::{
     namespace::NamespaceLocking as _,
     object::{EcstoreObjectIO, HTTPPreconditions, ObjectIO as _, ObjectOperations as _},
 };
+use crate::store::PoolMetaWriteGateStatus;
 use crate::{core::sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use futures::{
@@ -10676,6 +10677,27 @@ impl ECStore {
     }
 
     /// A health probe must not wait behind a metadata transaction's disk I/O.
+    pub async fn pool_meta_write_gate_status(&self) -> PoolMetaWriteGateStatus {
+        let Ok(write_state) = tokio::time::timeout(std::time::Duration::from_millis(100), self.pool_meta_save_gate.lock()).await
+        else {
+            return PoolMetaWriteGateStatus {
+                writes_ready: false,
+                ..PoolMetaWriteGateStatus::default()
+            };
+        };
+        let transaction_aborted = write_state.aborted_transaction.load(Ordering::SeqCst);
+        PoolMetaWriteGateStatus {
+            writes_ready: !write_state.write_blocked && !transaction_aborted,
+            write_blocked: write_state.write_blocked,
+            transaction_aborted,
+            pool_meta_absent: write_state.pool_meta_absent,
+            identity_initialized: write_state.identity_initialized,
+            identity_needs_repair: write_state.identity_needs_repair,
+            cluster_epoch: write_state.cluster_epoch,
+        }
+    }
+
+    /// A health probe must not wait behind a metadata transaction's disk I/O.
     pub async fn pool_meta_write_status(&self) -> Result<()> {
         let write_state = tokio::time::timeout(std::time::Duration::from_millis(100), self.pool_meta_save_gate.lock())
             .await
@@ -17701,6 +17723,10 @@ mod tests {
             .expect("create single-pool bucket before blocking pool metadata writes");
         let incarnation = store.bucket_incarnation_id(&bucket).await.expect("load bucket incarnation");
         store.pool_meta_save_gate.lock().await.block_writes_after_fence_loss();
+        let write_gate = store.pool_meta_write_gate_status().await;
+        assert!(!write_gate.writes_ready);
+        assert!(write_gate.write_blocked);
+        assert!(!write_gate.transaction_aborted);
 
         let object = "ordinary-put.bin";
         let mut put_data = crate::object_api::PutObjReader::from_vec(b"ordinary single-pool body".to_vec());
