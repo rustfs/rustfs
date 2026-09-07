@@ -34,6 +34,8 @@ mod tests {
     use tokio::net::TcpStream;
     use tokio::time::{Duration, Instant, sleep, timeout};
     use tracing::info;
+    #[cfg(target_os = "linux")]
+    use tracing::warn;
 
     const POOL_METADATA_OBJECT: &str = "pool.bin";
 
@@ -115,6 +117,49 @@ mod tests {
     }
 
     impl TcpPortBlackhole {
+        /// Environment flag that turns an unusable fault-injection host into a
+        /// hard failure instead of a logged skip. Lanes that provision
+        /// `CAP_NET_ADMIN` set it so a broken runner cannot pass silently.
+        #[cfg(target_os = "linux")]
+        const REQUIRE_ENV: &str = "RUSTFS_E2E_REQUIRE_NET_FAULT_INJECTION";
+
+        /// Probe whether this host can manipulate the OUTPUT chain at all.
+        ///
+        /// Returns `Ok(Some(reason))` when `iptables` is missing or lacks
+        /// `CAP_NET_ADMIN` (the nf_tables backend reports "Permission denied"
+        /// even under `sudo` inside an unprivileged container) and the lane did
+        /// not demand fault injection; returns an error when the lane demands
+        /// it; returns `Ok(None)` when the blackhole can be installed.
+        #[cfg(target_os = "linux")]
+        fn unavailable_reason() -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+            let id = Command::new("id").arg("-u").output()?;
+            if !id.status.success() {
+                return Err(format!("failed to determine the test process uid: {}", String::from_utf8_lossy(&id.stderr)).into());
+            }
+            let use_sudo = String::from_utf8_lossy(&id.stdout).trim() != "0";
+            let mut command = if use_sudo {
+                let mut command = Command::new("sudo");
+                command.args(["-n", "iptables"]);
+                command
+            } else {
+                Command::new("iptables")
+            };
+            let probe = command.args(["-w", "5", "-S", "OUTPUT"]).output();
+            let reason = match probe {
+                Ok(output) if output.status.success() => return Ok(None),
+                Ok(output) => format!(
+                    "iptables cannot read the OUTPUT chain (status {}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                Err(err) => format!("iptables is not runnable: {err}"),
+            };
+            if std::env::var_os(Self::REQUIRE_ENV).is_some() {
+                return Err(format!("{} is set but network fault injection is unavailable: {reason}", Self::REQUIRE_ENV).into());
+            }
+            Ok(Some(reason))
+        }
+
         fn install(address: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
             let address = address.parse::<SocketAddr>()?;
             if !address.ip().is_loopback() {
@@ -197,6 +242,27 @@ mod tests {
                 eprintln!("failed to remove {} firewall rule during test cleanup: {error}", self.comment);
             }
         }
+    }
+
+    /// Remove a disk directory underneath a running server. Background writers
+    /// (scanner, usage cache, heal markers) can recreate entries between the
+    /// recursive listing and the final `rmdir`, which surfaces as
+    /// `DirectoryNotEmpty` on macOS; retry briefly so the wipe reflects the
+    /// operator action rather than a listing race.
+    fn wipe_directory_while_server_runs(disk: &Path) -> std::io::Result<()> {
+        let mut last_err = None;
+        for _ in 0..20 {
+            match std::fs::remove_dir_all(disk) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                    last_err = Some(err);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_err.expect("retry loop only exits without success after recording an error"))
     }
 
     fn has_file_under(path: &Path) -> bool {
@@ -481,7 +547,7 @@ mod tests {
             );
         }
 
-        std::fs::remove_dir_all(&disk0).expect("disk0 wipe should succeed while server is running");
+        wipe_directory_while_server_runs(&disk0).expect("disk0 wipe should succeed while server is running");
         std::fs::create_dir_all(&disk0).expect("disk0 should be recreated empty while server is running");
         assert!(!has_file_under(&disk0), "disk0 must be empty immediately after runtime wipe");
 
@@ -868,6 +934,18 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_cluster_root_heal_recovers_after_target_endpoint_blackhole() -> Result<(), Box<dyn Error + Send + Sync>> {
+        if let Some(reason) = TcpPortBlackhole::unavailable_reason()? {
+            init_logging();
+            warn!(
+                event = "heal_interruption_skipped",
+                component = "e2e_test",
+                subsystem = "heal",
+                interruption_kind = "target_endpoint_blackhole",
+                reason,
+                "Skipping endpoint blackhole scenario: network fault injection is unavailable on this host"
+            );
+            return Ok(());
+        }
         timeout(
             Duration::from_secs(420),
             run_cluster_root_heal_interruption(InterruptionScenario::TargetEndpointBlackhole),

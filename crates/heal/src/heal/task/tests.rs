@@ -480,6 +480,95 @@ async fn automatic_replacement_uses_target_scoped_format() {
     );
 }
 
+fn directory_backed_replacement_request() -> HealRequest {
+    let mut request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: Vec::new(),
+            set_disk_id: "pool_0_set_0".to_string(),
+        },
+        HealOptions {
+            pool_index: Some(0),
+            set_index: Some(0),
+            ..Default::default()
+        },
+        HealPriority::Low,
+    );
+    request.source = HealRequestSource::AutoHeal;
+    request.heal_endpoints = vec!["/data/disk0".to_string()];
+    request
+}
+
+#[tokio::test]
+async fn directory_backed_replacement_falls_back_to_set_format_when_disk_checks_are_bypassed() {
+    temp_env::async_with_vars(
+        [
+            (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, Some("true")),
+            (rustfs_config::ENV_MINIO_CI, None::<&str>),
+        ],
+        async {
+            let storage = Arc::new(MockStorage {
+                replacement_target_identities_ready: Mutex::new(false),
+                global_format_ok_endpoints: Mutex::new(vec!["/data/disk0".to_string()]),
+                ..Default::default()
+            });
+            let task = HealTask::from_request(directory_backed_replacement_request(), storage.clone());
+
+            // The mock has no local disk behind "/data/disk0", so the run stops at
+            // the healing-marker step that follows the format stage, exactly like
+            // `automatic_replacement_uses_target_scoped_format`. The assertions
+            // below pin which format path ran before that point.
+            let err = task.execute().await.expect_err("the mock has no local healing marker target");
+            assert!(
+                err.to_string().contains("healing marker target is unavailable"),
+                "the fallback must reach the post-format marker step, got: {err}"
+            );
+
+            assert_eq!(
+                *storage.global_format_calls.lock().unwrap(),
+                1,
+                "the fallback must run exactly one set-wide format heal"
+            );
+            assert!(
+                storage.replacement_format_calls.lock().unwrap().is_empty(),
+                "the fallback must not run the target-scoped replacement format"
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn directory_backed_replacement_stays_fail_closed_without_disk_check_bypass() {
+    temp_env::async_with_vars(
+        [
+            (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, None::<&str>),
+            (rustfs_config::ENV_MINIO_CI, None::<&str>),
+        ],
+        async {
+            let storage = Arc::new(MockStorage {
+                replacement_target_identities_ready: Mutex::new(false),
+                ..Default::default()
+            });
+            let task = HealTask::from_request(directory_backed_replacement_request(), storage.clone());
+
+            task.execute()
+                .await
+                .expect_err("an inadmissible replacement target must keep failing closed");
+
+            assert_eq!(
+                *storage.global_format_calls.lock().unwrap(),
+                0,
+                "fail-closed admission must not format the set"
+            );
+            assert!(
+                storage.replacement_format_calls.lock().unwrap().is_empty(),
+                "fail-closed admission must not format the target"
+            );
+        },
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn automatic_replacement_persists_intent_before_format() {
     let storage = Arc::new(MockStorage {
@@ -962,6 +1051,8 @@ struct MockStorage {
     format_no_heal_required: Mutex<bool>,
     format_error: Mutex<Option<Error>>,
     global_format_calls: Mutex<u32>,
+    /// Endpoints the set-wide format mock reports as freshly formatted (`state == "ok"`).
+    global_format_ok_endpoints: Mutex<Vec<String>>,
     replacement_format_calls: Mutex<Vec<(usize, usize, Vec<String>)>>,
     replacement_target_identities_ready: Mutex<bool>,
     replacement_target_identity_sequences: Mutex<VecDeque<Vec<crate::heal::resume::ReplacementTargetIdentity>>>,
@@ -1338,10 +1429,26 @@ impl HealStorageAPI for MockStorage {
             return Err(error);
         }
         let no_heal_required = *self.format_no_heal_required.lock().unwrap();
+        let result = HealResultItem {
+            after: Infos {
+                drives: self
+                    .global_format_ok_endpoints
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|endpoint| HealDriveInfo {
+                        endpoint: endpoint.clone(),
+                        state: "ok".to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            },
+            ..Default::default()
+        };
         if no_heal_required {
-            Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::NoHealRequired))))
+            Ok((result, Some(Error::Storage(EcstoreError::NoHealRequired))))
         } else {
-            Ok((HealResultItem::default(), None))
+            Ok((result, None))
         }
     }
 

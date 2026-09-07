@@ -42,7 +42,36 @@ impl HealTask {
             progress.update_stage(0, 4);
         }
 
-        let is_auto_replacement = matches!(self.source, HealRequestSource::AutoHeal) && !self.heal_endpoints.is_empty();
+        let mut is_auto_replacement = matches!(self.source, HealRequestSource::AutoHeal) && !self.heal_endpoints.is_empty();
+        if is_auto_replacement
+            && crate::heal::replacement_readiness::directory_backed_replacement_fallback_enabled()
+            && self
+                .await_with_control(self.storage.replacement_target_identities(&self.heal_endpoints))
+                .await
+                .is_err()
+        {
+            // Directory-backed endpoints cannot pass replacement admission; the
+            // operator opted out of disk checks, so heal the set the way the
+            // pre-admission `heal_disk` path did instead of deferring forever.
+            warn!(
+                target: "rustfs::heal::task",
+                event = EVENT_HEAL_ERASURE_SET_STAGE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_TASK,
+                task_id = %self.id,
+                set_disk_id,
+                stage = "replacement_admission",
+                result = "directory_backed_fallback",
+                target_count = self.heal_endpoints.len(),
+                "Heal erasure set falls back to set-wide format heal for a replacement target that is not an independently mounted disk"
+            );
+            is_auto_replacement = false;
+        }
+        let replacement_targets = if is_auto_replacement {
+            self.heal_endpoints.clone()
+        } else {
+            Vec::new()
+        };
         let replacement_resume_disk = if is_auto_replacement {
             let mut requested_targets = self.heal_endpoints.clone();
             requested_targets.sort_unstable();
@@ -421,7 +450,7 @@ impl HealTask {
             heal_opts,
             self.source,
         )
-        .with_replacement_targets(self.heal_endpoints.clone(), is_auto_replacement.then(|| self.id.clone()))
+        .with_replacement_targets(replacement_targets, is_auto_replacement.then(|| self.id.clone()))
         .with_replacement_identity_fence(replacement_target_identities.clone())
         .with_mainline_pacer(self.mainline_pacer.clone());
 

@@ -854,6 +854,12 @@ jobs:
         run: |
           sudo apt-get install -y iptables
           sudo -n iptables --version
+          # The endpoint-blackhole heal scenario needs CAP_NET_ADMIN. Containerised
+          # runners can run iptables but not touch the rule set; the test then logs
+          # a skip instead of failing, so surface that here where it is visible.
+          if ! sudo -n iptables -w 5 -S OUTPUT >/dev/null 2>&1; then
+            echo "::warning::iptables cannot read the OUTPUT chain on this runner (no CAP_NET_ADMIN); the endpoint-blackhole heal scenario will be skipped"
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
