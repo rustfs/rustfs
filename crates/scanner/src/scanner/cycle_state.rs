@@ -34,6 +34,10 @@ const LEGACY_INCOMPLETE_USAGE_FLOOR_RECOVERY: &str = "legacy_empty_usage_floor";
 const CACHE_CYCLE_AHEAD: &str = "cache_cycle_ahead";
 
 const SCANNER_USAGE_STATE_RESET_MODE_FULL_REBUILD: &str = "full-rebuild";
+const SCANNER_RECOVERY_INTENT_SCHEMA_VERSION: u16 = 1;
+const SCANNER_RECOVERY_INTENT_PREFIX: &str = ".usage.v2.recovery-intents";
+const MAX_SCANNER_RECOVERY_INTENT_BYTES: u64 = 16 * 1024;
+pub const SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD: &str = "scanner-usage-full-rebuild";
 
 #[cfg(test)]
 pub(super) mod cleanup_io_fault {
@@ -144,6 +148,43 @@ pub struct ScannerUsageStateResetResult {
     pub leader_epoch: u64,
     pub next_cycle: u64,
     pub reset_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScannerRecoveryIntentRequest {
+    pub action: String,
+    pub mode: String,
+    pub idempotency_key: String,
+    pub actor_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScannerRecoveryIntentRecord {
+    pub schema_version: u16,
+    pub intent_id: String,
+    pub action: String,
+    pub mode: String,
+    pub state: String,
+    pub actor_sha256: String,
+    pub idempotency_key_sha256: String,
+    pub request_sha256: String,
+    pub accepted_at_unix_secs: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ScannerRecoveryIntentConflict {
+    pub intent_id: String,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ScannerRecoveryIntentAcceptResult {
+    Accepted { record: ScannerRecoveryIntentRecord },
+    Replayed { record: ScannerRecoveryIntentRecord },
+    Conflict { existing: ScannerRecoveryIntentConflict },
 }
 
 #[derive(Clone, Debug)]
@@ -358,6 +399,225 @@ pub(super) fn record_scanner_cycle_recovery_retry(attempt: u32) -> bool {
 
 fn unix_now_secs() -> u64 {
     u64::try_from(Utc::now().timestamp()).unwrap_or(0)
+}
+
+fn sha256_hex(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+        hasher.update([0]);
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn validate_idempotency_key(key: &str) -> Result<(), ScannerError> {
+    if !(8..=256).contains(&key.len()) {
+        return Err(ScannerError::Other(
+            "scanner recovery intent idempotency key length is unsupported".to_string(),
+        ));
+    }
+    if !key
+        .bytes()
+        .all(|byte| byte.is_ascii() && !byte.is_ascii_control() && !byte.is_ascii_whitespace())
+    {
+        return Err(ScannerError::Other(
+            "scanner recovery intent idempotency key must be printable ASCII without whitespace".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recovery_intent_request(request: &ScannerRecoveryIntentRequest) -> Result<(), ScannerError> {
+    if request.action != SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD {
+        return Err(ScannerError::Other("scanner recovery intent action is unsupported".to_string()));
+    }
+    if request.mode != SCANNER_USAGE_STATE_RESET_MODE_FULL_REBUILD {
+        return Err(ScannerError::Other("scanner recovery intent mode is unsupported".to_string()));
+    }
+    if !is_canonical_sha256(&request.actor_sha256) {
+        return Err(ScannerError::Other("scanner recovery intent actor identity is invalid".to_string()));
+    }
+    validate_idempotency_key(&request.idempotency_key)
+}
+
+fn scanner_recovery_intent_path(intent_id: &str) -> Result<String, ScannerError> {
+    if !is_canonical_sha256(intent_id) {
+        return Err(ScannerError::Other("scanner recovery intent id is invalid".to_string()));
+    }
+    Ok(format!("{SCANNER_RECOVERY_INTENT_PREFIX}/{intent_id}.json"))
+}
+
+pub fn scanner_recovery_actor_sha256(actor: &str) -> String {
+    sha256_hex(&[b"scanner-recovery-actor-v1", actor.as_bytes()])
+}
+
+fn scanner_recovery_intent_candidate(
+    request: &ScannerRecoveryIntentRequest,
+) -> Result<ScannerRecoveryIntentRecord, ScannerError> {
+    validate_recovery_intent_request(request)?;
+    let intent_id = sha256_hex(&[
+        b"scanner-recovery-intent-v1",
+        request.actor_sha256.as_bytes(),
+        request.idempotency_key.as_bytes(),
+    ]);
+    Ok(ScannerRecoveryIntentRecord {
+        schema_version: SCANNER_RECOVERY_INTENT_SCHEMA_VERSION,
+        intent_id,
+        action: request.action.clone(),
+        mode: request.mode.clone(),
+        state: "accepted".to_string(),
+        actor_sha256: request.actor_sha256.clone(),
+        idempotency_key_sha256: sha256_hex(&[b"scanner-recovery-idempotency-key-v1", request.idempotency_key.as_bytes()]),
+        request_sha256: sha256_hex(&[
+            b"scanner-recovery-request-v1",
+            request.actor_sha256.as_bytes(),
+            request.action.as_bytes(),
+            request.mode.as_bytes(),
+            request.idempotency_key.as_bytes(),
+        ]),
+        accepted_at_unix_secs: unix_now_secs(),
+    })
+}
+
+fn validate_recovery_intent_record(record: &ScannerRecoveryIntentRecord) -> Result<(), ScannerError> {
+    if record.schema_version != SCANNER_RECOVERY_INTENT_SCHEMA_VERSION {
+        return Err(ScannerError::Other("scanner recovery intent schema is unsupported".to_string()));
+    }
+    if !is_canonical_sha256(&record.intent_id)
+        || !is_canonical_sha256(&record.actor_sha256)
+        || !is_canonical_sha256(&record.idempotency_key_sha256)
+        || !is_canonical_sha256(&record.request_sha256)
+    {
+        return Err(ScannerError::Other("scanner recovery intent identity is invalid".to_string()));
+    }
+    if record.action != SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD
+        || record.mode != SCANNER_USAGE_STATE_RESET_MODE_FULL_REBUILD
+        || !matches!(record.state.as_str(), "accepted" | "running" | "completed" | "failed")
+    {
+        return Err(ScannerError::Other("scanner recovery intent state is invalid".to_string()));
+    }
+    Ok(())
+}
+
+fn decode_recovery_intent_record(data: &[u8]) -> Result<ScannerRecoveryIntentRecord, ScannerError> {
+    let record: ScannerRecoveryIntentRecord =
+        serde_json::from_slice(data).map_err(|err| ScannerError::Other(format!("scanner recovery intent is invalid: {err}")))?;
+    validate_recovery_intent_record(&record)?;
+    Ok(record)
+}
+
+fn compare_recovery_intent(
+    expected: &ScannerRecoveryIntentRecord,
+    existing: ScannerRecoveryIntentRecord,
+) -> ScannerRecoveryIntentAcceptResult {
+    if existing.actor_sha256 == expected.actor_sha256
+        && existing.action == expected.action
+        && existing.mode == expected.mode
+        && existing.idempotency_key_sha256 == expected.idempotency_key_sha256
+        && existing.request_sha256 == expected.request_sha256
+    {
+        ScannerRecoveryIntentAcceptResult::Replayed { record: existing }
+    } else {
+        ScannerRecoveryIntentAcceptResult::Conflict {
+            existing: ScannerRecoveryIntentConflict {
+                intent_id: existing.intent_id,
+                state: existing.state,
+            },
+        }
+    }
+}
+
+async fn read_recovery_intent_record(
+    storeapi: Arc<impl ScannerObjectIO>,
+    path: &str,
+) -> Result<Option<ScannerRecoveryIntentRecord>, ScannerError> {
+    let mut reader = match storeapi
+        .get_object_reader(
+            RUSTFS_META_BUCKET,
+            path,
+            None,
+            http::HeaderMap::new(),
+            &ScannerObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(reader) => reader,
+        Err(
+            EcstoreError::FileNotFound
+            | EcstoreError::VolumeNotFound
+            | EcstoreError::ObjectNotFound(_, _)
+            | EcstoreError::BucketNotFound(_)
+            | EcstoreError::ConfigNotFound,
+        ) => return Ok(None),
+        Err(err) => return Err(ScannerError::Other(format!("failed to read scanner recovery intent: {err}"))),
+    };
+    let max_object_size = i64::try_from(MAX_SCANNER_RECOVERY_INTENT_BYTES).unwrap_or(i64::MAX);
+    if reader.object_info.is_dir || reader.object_info.size < 0 || reader.object_info.size > max_object_size {
+        return Err(ScannerError::Other("scanner recovery intent exceeds the bounded object size".to_string()));
+    }
+    let max_len = usize::try_from(MAX_SCANNER_RECOVERY_INTENT_BYTES).unwrap_or(usize::MAX);
+    let mut data = Vec::new();
+    (&mut reader)
+        .take(MAX_SCANNER_RECOVERY_INTENT_BYTES.saturating_add(1))
+        .read_to_end(&mut data)
+        .await
+        .map_err(|err| ScannerError::Other(format!("failed to read scanner recovery intent: {err}")))?;
+    if data.is_empty() {
+        return Err(ScannerError::Other("scanner recovery intent is empty".to_string()));
+    }
+    if data.len() > max_len {
+        return Err(ScannerError::Other("scanner recovery intent exceeds the bounded object size".to_string()));
+    }
+    decode_recovery_intent_record(&data).map(Some)
+}
+
+pub async fn get_scanner_usage_recovery_intent(
+    storeapi: Arc<impl ScannerObjectIO>,
+    intent_id: &str,
+) -> Result<Option<ScannerRecoveryIntentRecord>, ScannerError> {
+    let path = scanner_recovery_intent_path(intent_id)?;
+    read_recovery_intent_record(storeapi, &path).await
+}
+
+pub async fn accept_scanner_usage_recovery_intent(
+    storeapi: Arc<impl ScannerObjectIO>,
+    request: ScannerRecoveryIntentRequest,
+) -> Result<ScannerRecoveryIntentAcceptResult, ScannerError> {
+    let candidate = scanner_recovery_intent_candidate(&request)?;
+    let path = scanner_recovery_intent_path(&candidate.intent_id)?;
+    let encoded = serde_json::to_vec(&candidate)
+        .map_err(|err| ScannerError::Other(format!("failed to encode scanner recovery intent: {err}")))?;
+    match save_config_with_preconditions(storeapi.clone(), &path, encoded, DataUsageCacheRevision::Missing.preconditions()).await
+    {
+        Ok(_) => Ok(ScannerRecoveryIntentAcceptResult::Accepted { record: candidate }),
+        Err(EcstoreError::PreconditionFailed) => {
+            let existing = read_recovery_intent_record(storeapi, &path).await?;
+            let Some(existing) = existing else {
+                return Err(ScannerError::Other(
+                    "scanner recovery intent disappeared after creation conflict".to_string(),
+                ));
+            };
+            Ok(compare_recovery_intent(&candidate, existing))
+        }
+        Err(err) => Err(ScannerError::Other(format!("failed to persist scanner recovery intent: {err}"))),
+    }
 }
 
 fn recovery_status(state: &str, reason: Option<&str>, retryable: bool) -> ScannerCycleRecoveryStatus {

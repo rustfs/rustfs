@@ -3590,8 +3590,11 @@ pub use backlog::{
 #[cfg(test)]
 pub(crate) use cycle_state::encode_scanner_cycle_fence_for_test;
 pub use cycle_state::{
-    ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus, ScannerUsageStateResetResult, reset_scanner_cycle_recovery,
-    reset_scanner_usage_state_for_full_rebuild, scanner_cycle_recovery_status,
+    SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD, ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus,
+    ScannerRecoveryIntentAcceptResult, ScannerRecoveryIntentConflict, ScannerRecoveryIntentRecord, ScannerRecoveryIntentRequest,
+    ScannerUsageStateResetResult, accept_scanner_usage_recovery_intent, get_scanner_usage_recovery_intent,
+    reset_scanner_cycle_recovery, reset_scanner_usage_state_for_full_rebuild, scanner_cycle_recovery_status,
+    scanner_recovery_actor_sha256,
 };
 pub(crate) use cycle_state::{
     current_scanner_leader_epoch, decode_persisted_scanner_cycle_fence, load_scanner_cycle_state_for_startup,
