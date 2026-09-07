@@ -161,6 +161,31 @@ impl RawEnumerationPageIndex {
     where
         I: IntoIterator<Item = String>,
     {
+        self.ingest_owner_entries_inner(entries, max_new_entries, expected_generation, true)
+    }
+
+    pub fn ingest_partial_owner_entries<I>(
+        &mut self,
+        entries: I,
+        max_new_entries: usize,
+        expected_generation: u64,
+    ) -> Result<RawEnumerationPageBuildOutcome, RawEnumerationPageIndexError>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.ingest_owner_entries_inner(entries, max_new_entries, expected_generation, false)
+    }
+
+    fn ingest_owner_entries_inner<I>(
+        &mut self,
+        entries: I,
+        max_new_entries: usize,
+        expected_generation: u64,
+        source_complete: bool,
+    ) -> Result<RawEnumerationPageBuildOutcome, RawEnumerationPageIndexError>
+    where
+        I: IntoIterator<Item = String>,
+    {
         if max_new_entries == 0 {
             return Err(RawEnumerationPageIndexError::EmptyBudget);
         }
@@ -198,7 +223,7 @@ impl RawEnumerationPageIndex {
             }
             indexed_entries = indexed_entries.saturating_add(building.entries.len());
         }
-        if indexed_entries == entries.len() && inner.building.is_none() {
+        if source_complete && indexed_entries == entries.len() && inner.building.is_none() {
             inner.complete = true;
             inner.generation = inner.generation.saturating_add(1);
             return Ok(RawEnumerationPageBuildOutcome {
@@ -224,7 +249,7 @@ impl RawEnumerationPageIndex {
                     .min(remaining_page_slots)
                     .min(entries.len().saturating_sub(indexed_entries));
                 if append_count == 0 {
-                    if !building.terminal {
+                    if source_complete && !building.terminal {
                         building.terminal = true;
                         inner.generation = inner.generation.saturating_add(1);
                     }
@@ -233,7 +258,7 @@ impl RawEnumerationPageIndex {
                     building
                         .entries
                         .extend(entries.drain(indexed_entries..indexed_entries + append_count));
-                    building.terminal = indexed_entries.saturating_add(append_count) == source_entries;
+                    building.terminal = source_complete && indexed_entries.saturating_add(append_count) == source_entries;
                     inner.generation = inner.generation.saturating_add(1);
                 }
                 !building.entries.is_empty() && (building.terminal || building.entries.len() >= inner.page_entry_limit)
@@ -298,6 +323,13 @@ impl RawEnumerationPageIndex {
             RawEnumerationPageIndexState::Supported(inner) => inner.validated_committed_entries(),
         }
     }
+
+    pub fn indexed_entries(&self) -> Result<Vec<String>, RawEnumerationPageIndexError> {
+        match &self.state {
+            RawEnumerationPageIndexState::Unsupported => Ok(Vec::new()),
+            RawEnumerationPageIndexState::Supported(inner) => inner.validated_indexed_entries(),
+        }
+    }
 }
 
 impl RawEnumerationPageIndexInner {
@@ -337,6 +369,19 @@ impl RawEnumerationPageIndexInner {
         }
         if self.complete && self.pages.last().is_some_and(|page| !page.terminal) {
             return Err(RawEnumerationPageIndexError::CorruptIndex);
+        }
+        Ok(entries)
+    }
+
+    fn validated_indexed_entries(&self) -> Result<Vec<String>, RawEnumerationPageIndexError> {
+        let mut entries = self.validated_committed_entries()?;
+        if let Some(building) = &self.building {
+            building.validate(
+                u64::try_from(self.pages.len()).unwrap_or(u64::MAX),
+                u64::try_from(entries.len()).unwrap_or(u64::MAX),
+                self.page_entry_limit,
+            )?;
+            entries.extend(building.entries.iter().cloned());
         }
         Ok(entries)
     }
@@ -666,6 +711,44 @@ mod tests {
                 .entries(),
             entries(&["entry-a", "entry-b"])
         );
+    }
+
+    #[test]
+    fn partial_owner_source_does_not_mark_terminal_before_completion() {
+        let mut owner = RawEnumerationPageIndex::new("bucket", 2).expect("page owner should initialize");
+        let generation = owner.generation().expect("supported owner should expose generation");
+        let outcome = owner
+            .ingest_partial_owner_entries(entries(&["entry-a"]), 1, generation)
+            .expect("partial source should stage one entry");
+        assert_eq!(
+            outcome.status,
+            RawEnumerationPageOwnerStatus::Building {
+                generation: 1,
+                parent: "bucket".to_string(),
+                page_index: 0,
+                indexed_entries: 1,
+                buffered_entries: 1,
+            }
+        );
+        assert!(!outcome.ready_to_commit);
+        assert_eq!(
+            owner.indexed_entries().expect("building page entries should validate"),
+            entries(&["entry-a"])
+        );
+
+        let encoded = rmp_serde::to_vec(&owner).expect("partial owner should encode");
+        let mut restarted: RawEnumerationPageIndex = rmp_serde::from_slice(&encoded).expect("partial owner should decode");
+        let generation = restarted.generation().expect("restarted owner should expose generation");
+        let outcome = restarted
+            .ingest_owner_entries(entries(&["entry-a", "entry-b"]), 1, generation)
+            .expect("complete source should finish resumed building page");
+        assert!(outcome.ready_to_commit);
+        let generation = restarted.generation().expect("finished owner should expose generation");
+        let page = restarted
+            .commit_building_page(generation)
+            .expect("terminal resumed page should commit");
+        assert!(page.terminal());
+        assert_eq!(page.entries(), entries(&["entry-a", "entry-b"]));
     }
 
     #[test]

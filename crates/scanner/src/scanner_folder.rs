@@ -25,6 +25,7 @@ use crate::data_usage_define::{
     PendingScannerHealKind, ScannerSizeSummaryExt, SizeReconciliationEntry, SizeSummary, hash_path,
 };
 use crate::error::ScannerError;
+use crate::raw_page_index::{RawEnumerationPageIndex, RawEnumerationPageIndexError};
 use crate::runtime_config::{
     scanner_alert_excess_folders, scanner_alert_excess_version_size, scanner_alert_excess_versions, scanner_yield_every_n_objects,
 };
@@ -90,6 +91,8 @@ const DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS: usize = 250_000;
 const SCANNER_LIST_PATH_RAW_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const SCANNER_ENTRY_PROGRESS_BATCH: u64 = 32;
 const SCANNER_ENTRY_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+const SCANNER_RAW_ENUMERATION_PAGE_ENTRY_LIMIT: usize = 128;
+const SCANNER_RAW_ENUMERATION_PAGE_BUILD_BUDGET: usize = 1;
 // Erasure data directories contain direct part.N files; keep namespace probes bounded.
 const ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT: usize = 64;
 const DEFAULT_HEAL_OBJECT_SELECT_PROB: u32 = 1024;
@@ -751,17 +754,31 @@ struct RawEnumerationProgress {
     last_entry: Option<String>,
     entries_seen: u64,
     digest: Sha256,
+    observed_entries: Vec<String>,
+    page_index: Option<RawEnumerationPageIndex>,
 }
 
 impl RawEnumerationProgress {
-    fn new(parent: &str) -> Self {
+    fn new(parent: &str, page_index: Option<RawEnumerationPageIndex>) -> Self {
         let mut digest = Sha256::new();
         update_raw_enumeration_digest(&mut digest, b"parent", parent.as_bytes());
+        let (observed_entries, page_index) = match page_index {
+            Some(index) => match index.indexed_entries() {
+                Ok(entries) => (entries, Some(index)),
+                Err(_) => (Vec::new(), None),
+            },
+            None => (
+                Vec::new(),
+                RawEnumerationPageIndex::new(parent, SCANNER_RAW_ENUMERATION_PAGE_ENTRY_LIMIT).ok(),
+            ),
+        };
         Self {
             parent: parent.to_string(),
             last_entry: None,
             entries_seen: 0,
             digest,
+            observed_entries,
+            page_index,
         }
     }
 
@@ -769,18 +786,51 @@ impl RawEnumerationProgress {
         update_raw_enumeration_digest(&mut self.digest, b"entry", entry.as_bytes());
         self.last_entry = Some(entry.to_string());
         self.entries_seen = self.entries_seen.saturating_add(1);
+        self.observed_entries.push(entry.to_string());
+        if let Some(index) = &mut self.page_index {
+            let result = index
+                .generation()
+                .ok_or(RawEnumerationPageIndexError::Unsupported)
+                .and_then(|generation| {
+                    index.ingest_partial_owner_entries(
+                        self.observed_entries.clone(),
+                        SCANNER_RAW_ENUMERATION_PAGE_BUILD_BUDGET,
+                        generation,
+                    )
+                });
+            match result {
+                Ok(outcome) if outcome.ready_to_commit => {
+                    if let Some(generation) = index.generation()
+                        && index.commit_building_page(generation).is_err()
+                    {
+                        self.page_index = None;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    self.page_index = None;
+                }
+            }
+        }
     }
 
-    fn into_cursor(self) -> Option<DataUsageRawEnumerationCursor> {
+    fn cursor(&self) -> Option<DataUsageRawEnumerationCursor> {
         if self.entries_seen == 0 {
             return None;
         }
         Some(DataUsageRawEnumerationCursor::new(
-            self.parent,
-            self.last_entry,
+            self.parent.clone(),
+            self.last_entry.clone(),
             self.entries_seen,
-            self.digest.finalize().into(),
+            self.digest.clone().finalize().into(),
         ))
+    }
+
+    fn page_index(&self) -> Option<RawEnumerationPageIndex> {
+        self.page_index.clone().and_then(|index| match index.indexed_entries() {
+            Ok(entries) if !entries.is_empty() => Some(index),
+            _ => None,
+        })
     }
 }
 
@@ -1049,6 +1099,19 @@ impl FolderScanner {
         if self.old_cache.info.scan_progress.is_none() {
             return;
         }
+        let page_index = self
+            .old_cache
+            .validated_raw_enumeration_page_index()
+            .filter(|index| match index.status() {
+                crate::raw_page_index::RawEnumerationPageOwnerStatus::Building {
+                    parent: index_parent, ..
+                }
+                | crate::raw_page_index::RawEnumerationPageOwnerStatus::Ready {
+                    parent: index_parent, ..
+                } => index_parent == parent,
+                crate::raw_page_index::RawEnumerationPageOwnerStatus::Unsupported => false,
+            })
+            .cloned();
         if let Some(position) = self
             .raw_enumeration_progress
             .iter()
@@ -1056,7 +1119,8 @@ impl FolderScanner {
         {
             self.raw_enumeration_progress.truncate(position + 1);
         } else {
-            self.raw_enumeration_progress.push(RawEnumerationProgress::new(parent));
+            self.raw_enumeration_progress
+                .push(RawEnumerationProgress::new(parent, page_index));
         }
         if let Some(progress) = self.raw_enumeration_progress.last_mut() {
             progress.record_entry(entry);
@@ -1073,11 +1137,11 @@ impl FolderScanner {
         });
     }
 
-    fn take_raw_enumeration_cursor(&mut self) -> Option<DataUsageRawEnumerationCursor> {
-        self.raw_enumeration_progress
-            .drain(..)
-            .next()
-            .and_then(RawEnumerationProgress::into_cursor)
+    fn take_raw_enumeration_resume_state(&mut self) -> (Option<DataUsageRawEnumerationCursor>, Option<RawEnumerationPageIndex>) {
+        match self.raw_enumeration_progress.drain(..).next() {
+            Some(progress) => (progress.cursor(), progress.page_index()),
+            None => (None, None),
+        }
     }
 
     fn carry_forward_old_children(&mut self, parent_hash: &DataUsageHash, entry: &mut DataUsageEntry) {
@@ -2686,6 +2750,7 @@ pub(crate) async fn scan_data_folder_scoped(
             new_cache.info.scan_resume_after = None;
             new_cache.info.scan_checkpoint = None;
             new_cache.info.scan_raw_enumeration_cursor = None;
+            new_cache.info.scan_raw_enumeration_page_index = None;
             new_cache.info.scan_coverage_receipt = None;
             if had_scan_checkpoint {
                 global_metrics().record_scanner_checkpoint_cleared();
@@ -2703,9 +2768,10 @@ pub(crate) async fn scan_data_folder_scoped(
                 let root_hash = hash_path(&cache.info.name);
                 let root_has_progress = data_usage_root_has_progress(&root);
                 let pending_heals_changed = scanner.pending_heals_changed;
-                let raw_enumeration_cursor = scanner.take_raw_enumeration_cursor();
-                let carry_forward_cache =
-                    (raw_enumeration_cursor.is_some() && !root_has_progress).then(|| scanner.old_cache.cache.clone());
+                let (raw_enumeration_cursor, raw_enumeration_page_index) = scanner.take_raw_enumeration_resume_state();
+                let carry_forward_cache = ((raw_enumeration_cursor.is_some() || raw_enumeration_page_index.is_some())
+                    && !root_has_progress)
+                    .then(|| scanner.old_cache.cache.clone());
                 if root_has_progress {
                     scanner.carry_forward_old_children(&root_hash, &mut root);
                 }
@@ -2722,8 +2788,15 @@ pub(crate) async fn scan_data_folder_scoped(
                     new_cache.info.scan_resume_after = None;
                     new_cache.info.scan_coverage_receipt = None;
                 }
+                if raw_enumeration_page_index.is_some() {
+                    new_cache.info.scan_raw_enumeration_page_index = raw_enumeration_page_index;
+                    new_cache.info.scan_checkpoint = None;
+                    new_cache.info.scan_resume_after = None;
+                    new_cache.info.scan_coverage_receipt = None;
+                }
                 if partial_cache_is_useful(&root, pending_heals_changed)
                     || new_cache.info.scan_raw_enumeration_cursor.is_some()
+                    || new_cache.info.scan_raw_enumeration_page_index.is_some()
                     || !new_cache.info.size_reconciliation.is_empty()
                 {
                     if new_cache.root().is_some() {
