@@ -23,17 +23,59 @@ use s3s::S3ErrorCode;
 pub type Error = StorageError;
 pub type Result<T> = core::result::Result<T, Error>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolMetadataFailure {
+    ReadUnavailable,
+    RecoveryRequired,
+    TransactionUnknown,
+    FenceLost,
+}
+
+impl PoolMetadataFailure {
+    fn recovery_hint(self) -> &'static str {
+        match self {
+            Self::ReadUnavailable => "read unavailable; retry after the replicas are readable",
+            Self::TransactionUnknown => "writes remain blocked pending fenced transaction recovery",
+            Self::RecoveryRequired | Self::FenceLost => {
+                "writes remain blocked after a recovery-required replica state; restart after all replicas are readable and consistent, with compatible formats"
+            }
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadUnavailable => "read_unavailable",
+            Self::RecoveryRequired => "recovery_required",
+            Self::TransactionUnknown => "transaction_unknown",
+            Self::FenceLost => "fence_lost",
+        }
+    }
+}
+
+/// Local control-plane context. Keep the existing storage error wire codes;
+/// the HTTP boundary recognizes this typed source, not an error-message prefix.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{operation}: pool metadata {hint} ({reason}, {phase}): {detail}", hint = kind.recovery_hint(), reason = kind.as_str(), detail = source.as_ref().map(ToString::to_string).unwrap_or_default())]
+pub struct PoolMetadataError {
+    pub kind: PoolMetadataFailure,
+    pub operation: String,
+    pub phase: &'static str,
+    pub since: time::OffsetDateTime,
+    #[source]
+    pub source: Option<std::sync::Arc<StorageError>>,
+}
+
 /// Keeps high-cardinality diagnostic detail in the error source while making
 /// the rendered `io::Error` stable for quorum aggregation.
 #[derive(Debug)]
 struct StableIoContextError {
-    message: &'static str,
+    message: std::borrow::Cow<'static, str>,
     source: Box<dyn std::error::Error + Send + Sync>,
 }
 
 impl std::fmt::Display for StableIoContextError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.message)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -48,7 +90,7 @@ where
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     std::io::Error::other(StableIoContextError {
-        message,
+        message: message.into(),
         source: source.into(),
     })
 }
@@ -300,6 +342,22 @@ impl From<crate::erasure::coding::ErasureConstructionError> for StorageError {
 }
 
 impl StorageError {
+    pub fn pool_metadata_failure(&self) -> Option<&PoolMetadataError> {
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(self);
+        while let Some(error) = current {
+            if let Some(context) = error.downcast_ref::<PoolMetadataError>() {
+                return Some(context);
+            }
+            // io::Error::source skips its boxed context itself.
+            current = if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                io.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static))
+            } else {
+                error.source()
+            };
+        }
+        None
+    }
+
     pub fn other<E>(error: E) -> Self
     where
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -548,7 +606,19 @@ impl PartialEq for StorageError {
 impl Clone for StorageError {
     fn clone(&self) -> Self {
         match self {
-            StorageError::Io(e) => StorageError::Io(std::io::Error::new(e.kind(), e.to_string())),
+            StorageError::Io(e) => {
+                if let Some(context) = self.pool_metadata_failure() {
+                    Self::Io(std::io::Error::new(
+                        e.kind(),
+                        StableIoContextError {
+                            message: e.to_string().into(),
+                            source: Box::new(context.clone()),
+                        },
+                    ))
+                } else {
+                    StorageError::Io(std::io::Error::new(e.kind(), e.to_string()))
+                }
+            }
             StorageError::FaultyDisk => StorageError::FaultyDisk,
             StorageError::DiskFull => StorageError::DiskFull,
             StorageError::VolumeNotFound => StorageError::VolumeNotFound,
@@ -689,7 +759,8 @@ impl Clone for StorageError {
 }
 
 impl StorageError {
-    fn code(&self) -> StorageErrorCode {
+    /// Stable classification without error payloads or storage paths.
+    pub fn code(&self) -> StorageErrorCode {
         match self {
             StorageError::Io(_) => StorageErrorCode::Io,
             StorageError::FaultyDisk => StorageErrorCode::FaultyDisk,

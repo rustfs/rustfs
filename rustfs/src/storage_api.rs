@@ -76,11 +76,15 @@ pub(crate) mod config_test {
 
 pub(crate) mod error {
     pub(crate) mod contract {
+        pub(crate) use super::super::storage_contracts::error::StorageErrorCode;
+
         pub(crate) mod range {
             pub(crate) use super::super::super::storage_contracts::HTTPRangeError;
         }
     }
 
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_error::{PoolMetadataError, PoolMetadataFailure};
     pub(crate) use crate::storage::storage_api::{QuotaError, StorageError};
 }
 

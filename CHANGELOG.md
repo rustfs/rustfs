@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Multipart admission queue**: an `UploadPart` waiting for a foreground write permit now waits at most 10 s by default (`RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS`, previously 30 s), so a queued part returns S3 `SlowDown` before the client's socket write timeout drops the connection. Separately, the API listener no longer forces a 4 MiB `SO_RCVBUF` on every accepted socket (kernel autotuning applies; `RUSTFS_HTTP_SOCKET_RECV_BUFFER_BYTES` restores a fixed size), so a queued part no longer lets up to 8 MiB of unread body accumulate in kernel memory per connection, which is what throttled whole nodes under SDK-default multipart concurrency. Fixes #7385.
 - **Helm Ingress**: `customAnnotations` are now merged with class-specific annotations (nginx/traefik) instead of being ignored when `ingress.className` is set.
 - **Per-pool erasure parity**: Erasure parity (STANDARD and reduced-redundancy) is now resolved independently for every pool instead of reusing the first pool's value. A heterogeneous topology — for example a 4-drive pool plus a 2-drive pool created during expansion — previously inherited the first pool's parity and could resolve to zero data shards in the smaller pool, panicking Reed-Solomon construction on write. Automatic parity now resolves per pool (for example `2+2` in the 4-drive pool and `1+1` in the 2-drive pool). Fixes #4801.
 
