@@ -96,6 +96,12 @@ def fake_adapter():
             del result["metrics"]["save_bytes"]
         elif fault == "incomplete-repair":
             result["metrics"]["healed_objects"] = 0
+        elif fault == "zero-pressure-samples":
+            result["metrics"]["foreground_pressure_samples"] = 0
+        elif fault == "pressure-sample-order":
+            result["metrics"]["foreground_pressure_high_samples"] = result["metrics"]["foreground_pressure_samples"] + 1
+        elif fault == "attempt-accounting":
+            result["metrics"]["heal_attempt_failures"] = result["metrics"]["heal_attempts"] + 1
     harness.write_json(Path(output_path), result)
     return 0
 
@@ -271,10 +277,18 @@ class ScannerAbbaTest(unittest.TestCase):
                     legs = [r for r in requests if (r["scenario"], r["comparison"], r["round"]) == (scenario, comparison, round_id)]
                     self.assertEqual({r["leg"] for r in legs}, set(harness.LEGS))
         self.assertTrue(all(c["p2_max_work_multiple"] == 1.2 for c in report["comparisons"]))
+        for comparison in report["comparisons"]:
+            w10_w11 = comparison["w10_w11"]
+            self.assertEqual(w10_w11["foreground_pressure_high_sample_ratios"], [1.0, 1.0, 1.0, 1.0])
+            self.assertEqual(w10_w11["heal_lock_wait_p99_ms"], [10, 10, 10, 10])
+            expected_attempt_cost = [None, 1.0, 1.0, None] if comparison["comparison"] == "background" else [1.0, 1.0, 1.0, 1.0]
+            self.assertEqual(w10_w11["attempt_cost_per_healed_object"], expected_attempt_cost)
+            self.assertEqual(w10_w11["candidate_attempt_cost_per_healed_object"], 1.0)
 
     def test_fail_closed_adapter_and_data_errors(self):
         for fault in ("measure-exit", "oracle-exit", "missing-oracle", "oracle-mismatch", "zero-samples",
-                      "zero-requests", "request-errors", "load-drift", "missing-metric", "incomplete-repair"):
+                      "zero-requests", "request-errors", "load-drift", "missing-metric", "incomplete-repair",
+                      "zero-pressure-samples", "pressure-sample-order", "attempt-accounting"):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
                 self.root = Path(directory)
                 with self.assertRaises((ValueError, OSError, subprocess.SubprocessError)):

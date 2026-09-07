@@ -22,6 +22,9 @@ METRICS = (
     "p99_ms", "throughput_ops", "rss_bytes", "cpu_seconds", "iops", "rpc_count",
     "cache_clone_bytes", "encode_bytes", "save_bytes", "oldest_age_seconds",
     "walk_objects", "cold_walk_objects", "healed_objects", "errors", "requests",
+    "foreground_pressure_samples", "foreground_pressure_high_samples",
+    "heal_lock_wait_p99_ms", "heal_attempts", "heal_attempt_failures",
+    "heal_retry_attempts",
 )
 REPEATABILITY_LIMIT = Decimal("0.05")
 P2_WORK_MULTIPLE_LIMIT = Decimal("1.2")
@@ -252,6 +255,11 @@ def validate_result(result, request, expected):
         number(metrics.get(key), key)
     for key in ("requests", "p99_ms", "throughput_ops"):
         require(metrics[key] > 0, f"zero {key}")
+    require(metrics["foreground_pressure_samples"] > 0, "zero foreground pressure samples")
+    require(metrics["foreground_pressure_high_samples"] <= metrics["foreground_pressure_samples"],
+            "foreground pressure high samples exceed samples")
+    require(metrics["heal_attempt_failures"] <= metrics["heal_attempts"], "heal failures exceed attempts")
+    require(metrics["heal_retry_attempts"] <= metrics["heal_attempts"], "heal retries exceed attempts")
     require(metrics["errors"] == 0, "workload request errors")
     require(metrics["cold_walk_objects"] <= metrics["walk_objects"], "cold walk exceeds total walk")
     require(result.get("oracle") == expected, "object/version/byte oracle mismatch")
@@ -261,6 +269,18 @@ def validate_result(result, request, expected):
         if request["scenario"] in ("running-heal", "mrf-replay"):
             require(metrics["healed_objects"] > 0, "zero completed repairs")
     return result
+
+
+def attempt_cost(metrics):
+    healed = decimal_number(metrics["healed_objects"], "healed_objects")
+    if healed == 0:
+        return None
+    return ratio(metrics["heal_attempts"], healed, "heal attempt cost")
+
+
+def pressure_high_ratio(metrics):
+    return ratio(metrics["foreground_pressure_high_samples"],
+                 metrics["foreground_pressure_samples"], "foreground pressure high samples")
 
 
 def convergence(result):
@@ -318,6 +338,10 @@ def evaluate(cells):
         p2_pending = any(value is None for value in candidate_p2)
         passed &= all(ratio(value, 1, "p2 work multiple") <= P2_WORK_MULTIPLE_LIMIT for value in candidate_p2 if value is not None)
         p2_report = [None if value is None else float(value) for value in p2]
+        attempt_costs = [attempt_cost(cell["result"]["metrics"]) if cell["background"] == "on" else None for cell in group]
+        candidate_attempt_costs = [
+            value for cell, value in zip(group, attempt_costs) if cell["leg"].startswith("B") and value is not None
+        ]
         inconclusive |= noise or p2_pending
         if not noise and not passed:
             failed = True
@@ -327,7 +351,21 @@ def evaluate(cells):
                             "p99_regression": float(p99), "throughput_change": float(throughput),
                             "thresholds": {key: float(value) for key, value in thresholds.items()},
                             "p1": p1, "p2_max_work_multiple": float(P2_WORK_MULTIPLE_LIMIT),
-                            "p2_post_stop_work_multiples": p2_report})
+                            "p2_post_stop_work_multiples": p2_report,
+                            "w10_w11": {
+                                "foreground_pressure_high_sample_ratios": [
+                                    float(pressure_high_ratio(cell["result"]["metrics"])) for cell in group
+                                ],
+                                "heal_lock_wait_p99_ms": [
+                                    cell["result"]["metrics"]["heal_lock_wait_p99_ms"] for cell in group
+                                ],
+                                "attempt_cost_per_healed_object": [
+                                    None if value is None else float(value) for value in attempt_costs
+                                ],
+                                "candidate_attempt_cost_per_healed_object": (
+                                    None if not candidate_attempt_costs else float(max(candidate_attempt_costs))
+                                ),
+                            }})
     return ("fail" if failed else "inconclusive" if inconclusive else "pass"), comparisons
 
 
