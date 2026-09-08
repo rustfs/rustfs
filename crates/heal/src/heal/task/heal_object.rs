@@ -162,11 +162,6 @@ impl HealTask {
             pool: self.options.pool_index,
             set: self.options.set_index,
         };
-        let expected_bucket_incarnation_id = self.storage.bucket_incarnation_id(bucket).await?;
-        let mut expected_identity =
-            self.outcome_identity(bucket, object, version_id, self.options.pool_index, self.options.set_index);
-        expected_identity.bucket_incarnation_id = expected_bucket_incarnation_id;
-
         let mut expected_identity =
             self.outcome_identity(bucket, object, version_id, self.options.pool_index, self.options.set_index);
         expected_identity.bucket_incarnation_id = self.outcome_bucket_incarnation_id(bucket, self.options.dry_run).await?;
