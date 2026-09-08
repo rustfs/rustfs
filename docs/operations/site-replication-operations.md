@@ -195,8 +195,17 @@ family, then verify users, service accounts, groups, policies, and mappings on
 both sides. Repair is the operator's explicit accountability transfer and
 clears the saved deletion bodies only after the IAM repair succeeds.
 
+A group's status converges in one direction. An explicit disable is applied
+everywhere, including through a snapshot, but a membership change never
+carries an enable - it would otherwise re-enable a group frozen on the
+receiving site. If a group ended up disabled on one site only, re-enable it
+there explicitly with `mc admin group enable`; a snapshot or repair will not
+do it.
+
 Treat IAM divergence as a security incident: a user deleted on one site can
-remain usable on an unreachable peer until replay or repair completes.
+remain usable on an unreachable peer until replay or repair completes. A peer
+whose IAM entry is escalated does not receive scheduled snapshots either -
+including the one a bulk import schedules - until the repair settles it.
 
 ## Encrypted objects
 
