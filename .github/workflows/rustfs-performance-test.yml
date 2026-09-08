@@ -82,6 +82,12 @@ jobs:
   performance-test:
     runs-on: pf-testing
     timeout-minutes: 900
+    env:
+      RUSTFS_BENCH_SCRIPT: ${{ github.workspace }}/auto-testing/rustfs_performance_testing.sh
+      RUSTFS_WARP_METHODS: ${{ inputs.test_method }}
+      RUSTFS_WARP_SIZES: ${{ inputs.object_size }}
+      RUSTFS_WARP_DURATION: ${{ inputs.warp_duration || '5m' }}
+      RUSTFS_WARP_CONCURRENCY: ${{ inputs.warp_concurrency || '64' }}
     # Run on manual dispatch, or when the nightly build completed successfully.
     # Skipped when nightly failed.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
@@ -158,19 +164,15 @@ jobs:
       - name: Run benchmark (GET/PUT/MIXED)
         id: benchmark
         run: |
-          # Empty on automatic (workflow_run) runs -> full 30 rounds.
-          # Manual dispatch can restrict method(s)/size(s).
-          export WARP_METHODS="${{ inputs.test_method }}"
-          export WARP_SIZES="${{ inputs.object_size }}"
           ./auto-testing/rustfs_performance_test.sh \
             --step 5 -y \
-            --warp-duration "${{ inputs.warp_duration || '5m' }}" \
-            --warp-concurrency "${{ inputs.warp_concurrency || '64' }}" \
             --log-file "${LOG_FILE}"
 
       - name: Analyze results
         if: ${{ steps.benchmark.conclusion == 'success' }}
         run: |
+          export WARP_METHODS="${RUSTFS_WARP_METHODS}" WARP_SIZES="${RUSTFS_WARP_SIZES}"
+          export WARP_DURATION="${RUSTFS_WARP_DURATION}" WARP_CONCURRENCY="${RUSTFS_WARP_CONCURRENCY}"
           ./auto-testing/rustfs_performance_test.sh --step 6 -y --log-file "${LOG_FILE:-/dev/null}"
 
       - name: Collect RustFS version info
