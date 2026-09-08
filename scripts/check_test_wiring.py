@@ -1388,6 +1388,16 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
         require(evidence.get("successor_snapshot_published") is True,
                 f"{gate}.{field} requires successor snapshot publication evidence")
     if gate == "G14":
+        if field == "same_window_field_evidence":
+            required_fields = set(SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS["G14"]) - {field}
+            same_window_fields = evidence.get("same_window_fields")
+            require(isinstance(same_window_fields, list) and
+                    len(set(same_window_fields)) == len(same_window_fields) and
+                    all(isinstance(item, str) and item in required_fields for item in same_window_fields),
+                    "G14.same_window_field_evidence requires named G14 field coverage")
+            missing_same_window_fields = sorted(required_fields - set(same_window_fields))
+            require(not missing_same_window_fields,
+                    "G14.same_window_field_evidence missing fields: " + ", ".join(missing_same_window_fields))
         if field == "ec8_4_evidence":
             topology = evidence.get("topology")
             require(isinstance(topology, dict), "G14.ec8_4_evidence missing topology")
@@ -1790,6 +1800,12 @@ class SelfTests(unittest.TestCase):
                     evidence["successor_snapshot_published"] = True
                 if gate == "G14" and field == "ec8_4_evidence":
                     evidence["topology"] = {"erasure": "EC8+4", "nodes": 3, "drives_per_node": 4}
+                if gate == "G14" and field == "same_window_field_evidence":
+                    evidence["same_window_fields"] = [
+                        item
+                        for item in SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS["G14"]
+                        if item != "same_window_field_evidence"
+                    ]
                 if gate == "G14" and field == "multi_set_evidence":
                     evidence["sets"] = 2
                 if gate == "G14" and field == "multi_pool_evidence":
@@ -1890,6 +1906,7 @@ class SelfTests(unittest.TestCase):
             ("mrf-records", "G07", "mrf_responsibility_oracle", lambda item: item.pop("replayed_records"), "replayed_records"),
             ("mrf-anchor", "G07", "commit_boundary_crash_matrix", lambda item: item.update({"responsibility_anchor_retained": False}), "retained MRF responsibility anchors"),
             ("mrf-successor", "P4", "retained_responsibility_evidence", lambda item: item.pop("successor_snapshot_published"), "successor snapshot"),
+            ("same-window-fields", "G14", "same_window_field_evidence", lambda item: item.update({"same_window_fields": ["ec8_4_evidence", "multi_set_evidence"]}), "missing fields"),
         ):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
                 root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
