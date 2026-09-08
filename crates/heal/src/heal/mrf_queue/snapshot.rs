@@ -555,20 +555,25 @@ pub async fn inspect_local_committed_snapshot(max_bytes: usize) -> Result<Option
     read_committed(&super::journal_disks().await, max_bytes).await
 }
 
-/// Remove committed manifests whose sequence is no newer than
+/// Remove committed manifests from `owner` whose sequence is no newer than
 /// `committed_through`.
 ///
 /// Payload files are intentionally left as orphans after their manifest is
 /// removed. Readers cannot discover a payload without its matching manifest,
 /// and deleting manifests first prevents an older retained slot from becoming
 /// visible again after the newest replay has been fully discharged.
-pub async fn delete_committed_snapshots_through(committed_through: u64, max_bytes: usize) -> Result<bool, SnapshotError> {
+pub async fn delete_committed_snapshots_through(
+    owner: Uuid,
+    committed_through: u64,
+    max_bytes: usize,
+) -> Result<bool, SnapshotError> {
     let disks = super::journal_disks().await;
-    delete_committed_snapshots_through_on(&disks, committed_through, max_bytes).await
+    delete_committed_snapshots_through_on(&disks, owner, committed_through, max_bytes).await
 }
 
 async fn delete_committed_snapshots_through_on(
     disks: &[EcstoreDiskStore],
+    owner: Uuid,
     committed_through: u64,
     max_bytes: usize,
 ) -> Result<bool, SnapshotError> {
@@ -598,7 +603,7 @@ async fn delete_committed_snapshots_through_on(
                     continue;
                 }
             };
-            if manifest.sequence > committed_through {
+            if manifest.owner != owner || manifest.sequence > committed_through {
                 continue;
             }
             match EcstoreDiskAPI::compare_and_update_file(
@@ -1360,7 +1365,7 @@ mod tests {
         commit(&disk, 1, owner, 4, &newer).await;
 
         assert!(
-            delete_committed_snapshots_through_on(std::slice::from_ref(&disk), 3, 4096)
+            delete_committed_snapshots_through_on(std::slice::from_ref(&disk), owner, 3, 4096)
                 .await
                 .expect("delete old manifest"),
             "old committed manifest should be removed"
@@ -1385,6 +1390,47 @@ mod tests {
             .expect("newer commit remains visible");
         assert_eq!(recovered.sequence(), 4);
         assert_eq!(recovered.payload(), newer);
+    }
+
+    #[tokio::test]
+    async fn committed_cleanup_preserves_other_owner_manifests_within_sequence_window() {
+        let root = TempDir::new().expect("test directory");
+        let disk = disk(&root, "disk").await;
+        let replay_owner = Uuid::new_v4();
+        let other_owner = Uuid::new_v4();
+        let replay_payload = payload("replay-owner");
+        let other_payload = payload("other-owner");
+        commit(&disk, 0, replay_owner, 9, &replay_payload).await;
+        commit(&disk, 1, other_owner, 4, &other_payload).await;
+
+        assert!(
+            delete_committed_snapshots_through_on(std::slice::from_ref(&disk), replay_owner, 9, 4096)
+                .await
+                .expect("delete replay-owner manifest"),
+            "the matched owner manifest should be removed"
+        );
+
+        assert!(
+            matches!(
+                EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[0]).await,
+                Err(EcstoreDiskError::FileNotFound | EcstoreDiskError::VolumeNotFound)
+            ),
+            "the replay owner's manifest is reclaimed"
+        );
+        assert_eq!(
+            EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[1])
+                .await
+                .expect("other owner manifest retained")
+                .as_ref(),
+            manifest(other_owner, 4, &other_payload)
+        );
+        assert_eq!(
+            EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, PAYLOAD_PATHS[1])
+                .await
+                .expect("other owner payload retained")
+                .as_ref(),
+            other_payload
+        );
     }
 
     #[tokio::test]
