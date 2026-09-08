@@ -166,7 +166,8 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_reports_cycle_inputs_wit
         all_peers_bound_to_generation_window: true,
     };
 
-    let preflight = scanner_segment_reuse_activation_preflight_for_cycle(&dirty_usage_snapshot, Some(distributed_evidence), true);
+    let preflight =
+        scanner_segment_reuse_activation_preflight_for_cycle(&dirty_usage_snapshot, true, Some(distributed_evidence), true);
 
     assert!(!preflight.production_activation);
     assert!(!preflight.scanner_segment_reuse_activated);
@@ -185,13 +186,32 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_blocks_unbounded_inputs(
         covers_all_pending: false,
     };
 
-    let preflight = scanner_segment_reuse_activation_preflight_for_cycle(&dirty_usage_snapshot, None, false);
+    let preflight = scanner_segment_reuse_activation_preflight_for_cycle(&dirty_usage_snapshot, true, None, false);
 
     assert!(!preflight.production_activation);
     assert!(!preflight.scanner_segment_reuse_activated);
     assert_eq!(
         preflight.fail_closed_blockers().collect::<Vec<_>>(),
         SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS
+    );
+}
+
+#[test]
+fn scanner_segment_reuse_activation_preflight_for_cycle_skips_distributed_blocker_for_local_scan() {
+    let dirty_usage_snapshot = DirtyUsageSnapshot {
+        buckets: Arc::new(DirtyUsageBuckets::from([("photos".to_string(), 7)])),
+        scopes: Arc::new(DirtyUsageBucketScopes::default()),
+        generation: 7,
+        covers_all_pending: true,
+    };
+
+    let preflight = scanner_segment_reuse_activation_preflight_for_cycle(&dirty_usage_snapshot, false, None, true);
+
+    assert!(!preflight.production_activation);
+    assert!(!preflight.scanner_segment_reuse_activated);
+    assert_eq!(
+        preflight.fail_closed_blockers().collect::<Vec<_>>(),
+        vec!["missing_producer_identity", "restart_gap"]
     );
 }
 
@@ -1501,6 +1521,7 @@ async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers
             bucket_failures: ScannerBucketFailureState::default(),
             pending_maintenance_work: Arc::new(AtomicBool::new(false)),
             cache_cycle_floor: Arc::new(AtomicU64::new(8)),
+            cold_zero_walk_reuse_observed: Arc::new(AtomicBool::new(false)),
         },
         tx,
         8,
