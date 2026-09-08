@@ -5290,6 +5290,11 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
         .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "object store is not initialized".to_string()))?;
     let buckets = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
 
+    // Every bucket already rewritten in this pass carries the edited peer's
+    // target. A remove accepted mid-pass must undo all of them, not just the
+    // one in flight: the remove's own cleanup may have already walked past a
+    // bucket this loop wrote afterwards.
+    let mut rewritten = Vec::new();
     for bucket in buckets {
         let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket.name)
             .await
@@ -5314,16 +5319,30 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
         )
         .await?;
 
+        rewritten.push(bucket.name.clone());
+
         // A remove accepted on another node can clear this journal while the
         // bucket rewrite is in flight. Re-check after the write: if it removed
-        // the edited peer, undo this bucket's stale target after releasing the
-        // process-local target lock. If it committed the same edit, the write
-        // is equivalent but this driver no longer owns finalization.
+        // the edited peer, undo the stale targets this pass restored, after
+        // releasing the process-local target lock. If it committed the same
+        // edit, the write is equivalent but this driver no longer owns
+        // finalization.
         let latest = load_site_replication_state().await?;
         let postwrite = endpoint_refresh_postwrite_state(&latest, pending_id, &pending.peer.deployment_id);
         drop(_targets_guard);
         if postwrite == EndpointRefreshPostwriteState::TargetRemoved {
-            cleanup_removed_site_replication_bucket(&bucket.name, &HashSet::from([pending.peer.deployment_id.clone()])).await?;
+            let removed = HashSet::from([pending.peer.deployment_id.clone()]);
+            let mut cleanup_error = None;
+            for name in &rewritten {
+                // Attempt every bucket: one failure must not leave the rest
+                // of this pass's stale targets behind.
+                if let Err(err) = cleanup_removed_site_replication_bucket(name, &removed).await {
+                    cleanup_error.get_or_insert(err);
+                }
+            }
+            if let Some(err) = cleanup_error {
+                return Err(err);
+            }
         }
         if postwrite != EndpointRefreshPostwriteState::Current {
             return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
@@ -11920,6 +11939,24 @@ mod tests {
     /// would use `edit_state` (no local-name sync) and would clear the journal
     /// under the request that owns it, whose own commit then reports the
     /// refresh as changed and denies the coordinator its acknowledgement.
+    /// Needs a live store to exercise, so pin the shape instead: the undo
+    /// must cover every bucket the pass already rewrote, not only the one
+    /// holding the lock when the removal was noticed.
+    #[test]
+    fn an_interrupted_endpoint_refresh_undoes_every_bucket_it_rewrote() {
+        let body = include_str!("site_replication.rs")
+            .split("async fn refresh_bucket_targets_after_endpoint_edit")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn site_bucket_resync_manifest_entry").next())
+            .expect("refresh body");
+
+        assert!(body.contains("rewritten.push(bucket.name.clone());"));
+        assert!(
+            body.contains("for name in "),
+            "the removal undo must walk every bucket rewritten in this pass"
+        );
+    }
+
     #[test]
     fn a_pending_endpoint_refresh_pins_its_ilm_expiry_override() {
         let (_, pending, _) = endpoint_refresh_remove_fixture();
