@@ -527,6 +527,9 @@ struct MrfRuntime {
     /// True while a journal snapshot exists on disk that may still be needed
     /// for replay or cleanup.
     journal_on_disk: bool,
+    /// True after replay admitted records into the manager and the startup
+    /// journal must stay until a durable replay proof is persisted.
+    retain_replay_journal: bool,
     /// Earliest instant a full-admission retry may proceed.
     backoff_until: Option<tokio::time::Instant>,
 }
@@ -673,10 +676,11 @@ pub async fn replay_journal_once(manager: &Arc<HealManager>) -> usize {
 struct ReplayOutcome {
     replayed: usize,
     journal_on_disk: bool,
+    retain_journal_for_replay: bool,
 }
 
-fn replay_must_retain_journal(rearm_incomplete: bool, pending_depth: usize) -> bool {
-    rearm_incomplete || pending_depth > 0
+fn replay_must_retain_journal(rearm_incomplete: bool, pending_depth: usize, accepted_or_merged: bool) -> bool {
+    rearm_incomplete || pending_depth > 0 || accepted_or_merged
 }
 
 /// Shared replay core: read + decode + re-arm, then drain what fits. The
@@ -698,6 +702,7 @@ async fn replay_into(
                 return ReplayOutcome {
                     replayed: 0,
                     journal_on_disk: false,
+                    retain_journal_for_replay: false,
                 };
             }
         },
@@ -722,6 +727,7 @@ async fn replay_into(
     // prefix.
     queue.raise_limits_for_replay(intents.len(), replay_bytes);
     let mut rearm_incomplete = false;
+    let mut accepted_or_merged = false;
     for intent in intents {
         let result = queue.try_push_typed(intent.clone());
         match result {
@@ -748,7 +754,9 @@ async fn replay_into(
                 break;
             }
             match submit_mrf_heal_request(manager, &intent).await {
-                Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {}
+                Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {
+                    accepted_or_merged = true;
+                }
                 Ok(HealAdmissionResult::Full) | Ok(HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)) => {
                     intent.attempts = intent.attempts.saturating_add(1);
                     if intent.attempts < MRF_MAX_ATTEMPTS {
@@ -779,7 +787,8 @@ async fn replay_into(
             }
         }
     }
-    let journal_on_disk = if replay_must_retain_journal(rearm_incomplete, queue.depth()) {
+    let retain_journal_for_replay = replay_must_retain_journal(rearm_incomplete, queue.depth(), accepted_or_merged);
+    let journal_on_disk = if retain_journal_for_replay {
         true
     } else {
         !delete_journals().await
@@ -787,6 +796,7 @@ async fn replay_into(
     ReplayOutcome {
         replayed,
         journal_on_disk,
+        retain_journal_for_replay,
     }
 }
 
@@ -800,6 +810,7 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
         new_since_flush: 0,
         dirty: false,
         journal_on_disk: false,
+        retain_replay_journal: false,
         backoff_until: None,
     };
 
@@ -807,6 +818,7 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
     // on disk whenever any replayed intent still needs a successor snapshot.
     let replay = replay_into(&manager, &mut runtime.queue, &mut runtime.backoff_until).await;
     runtime.journal_on_disk = replay.journal_on_disk;
+    runtime.retain_replay_journal = replay.retain_journal_for_replay;
     // Anything still pending (e.g. the manager was full and backoff armed)
     // must be re-persisted by the next flush before replay can delete the
     // startup anchor.
@@ -854,6 +866,7 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
                     runtime.dirty,
                     runtime.queue.depth(),
                     runtime.journal_on_disk,
+                    runtime.retain_replay_journal,
                 ) {
                     TickAction::Flush => {
                         runtime.flush().await;
@@ -897,12 +910,12 @@ enum TickAction {
     Idle,
 }
 
-fn tick_action(dirty: bool, depth: usize, journal_on_disk: bool) -> TickAction {
+fn tick_action(dirty: bool, depth: usize, journal_on_disk: bool, retain_replay_journal: bool) -> TickAction {
     if dirty {
         TickAction::Flush
     } else if depth > 0 {
         TickAction::Retry
-    } else if journal_on_disk {
+    } else if journal_on_disk && !retain_replay_journal {
         TickAction::DeleteJournal
     } else {
         TickAction::Idle
@@ -934,34 +947,39 @@ mod tests {
 
         // Dirty dominates: a changed pending set flushes even when idle
         // otherwise.
-        assert!(matches!(tick_action(true, 0, false), Flush));
-        assert!(matches!(tick_action(true, 3, true), Flush));
+        assert!(matches!(tick_action(true, 0, false, false), Flush));
+        assert!(matches!(tick_action(true, 3, true, false), Flush));
 
         // Clean backlog: no rewrite, but keep draining so an expired
         // admission backoff retries on time.
-        assert!(matches!(tick_action(false, 1, false), Retry));
-        assert!(matches!(tick_action(false, 2, true), Retry));
+        assert!(matches!(tick_action(false, 1, false, false), Retry));
+        assert!(matches!(tick_action(false, 2, true, false), Retry));
 
         // Quiescent with a stale journal file on disk: remove it.
-        assert!(matches!(tick_action(false, 0, true), DeleteJournal));
+        assert!(matches!(tick_action(false, 0, true, false), DeleteJournal));
+        assert!(matches!(tick_action(false, 0, true, true), Idle));
 
         // Fully quiescent: nothing to do.
-        assert!(matches!(tick_action(false, 0, false), Idle));
+        assert!(matches!(tick_action(false, 0, false, false), Idle));
     }
 
     #[test]
     fn replay_cleanup_retains_journal_for_unarmed_or_refused_records() {
         assert!(
-            replay_must_retain_journal(true, 0),
+            replay_must_retain_journal(true, 0, false),
             "a rejected replay record still needs its disk anchor"
         );
         assert!(
-            replay_must_retain_journal(false, 1),
+            replay_must_retain_journal(false, 1, false),
             "a Full admission retry must keep the startup journal until the next snapshot"
         );
         assert!(
-            !replay_must_retain_journal(false, 0),
-            "only a fully consumed replay snapshot may be deleted"
+            !replay_must_retain_journal(false, 0, false),
+            "a fully consumed replay snapshot without accepts may be deleted"
+        );
+        assert!(
+            replay_must_retain_journal(false, 0, true),
+            "accepted or merged replay records still need a durable successor"
         );
     }
 
