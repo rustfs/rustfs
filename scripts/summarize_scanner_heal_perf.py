@@ -151,6 +151,30 @@ def require_measured_comparison_evidence(comparison: dict[str, Any], index: int)
             f"comparison {index} heal_lock_hold_p95_ms must be measured")
     require(len(start_p95) == len(duplicate_tasks) == len(lock_hold),
             f"comparison {index} W09 evidence length mismatch")
+    w11 = comparison.get("w11")
+    require(isinstance(w11, dict), f"comparison {index} missing W11 evidence")
+    status = w11.get("status")
+    require(status in {"observed", "no_measured_benefit", "rss_regression", "pending", "inconclusive", "not_applicable"},
+            f"comparison {index} invalid W11 evidence status")
+    if comparison.get("scenario") == "running-heal" and comparison.get("comparison") == "build":
+        require(status == "observed", f"comparison {index} W11 bounded retry evidence was not observed")
+        for key in (
+            "rss_growth_limit",
+            "rss_growth",
+            "baseline_rss_bytes",
+            "candidate_rss_bytes",
+            "baseline_heal_lock_wait_p99_ms",
+            "candidate_heal_lock_wait_p99_ms",
+            "heal_lock_wait_p99_change",
+            "foreground_p99_change",
+            "foreground_throughput_change",
+            "candidate_attempt_cost_per_healed_object",
+        ):
+            value = maybe_number(w11.get(key), f"comparison {index} W11 {key}")
+            require(value is not None, f"comparison {index} W11 {key} is required")
+        require(w11.get("rss_within_limit") is True, f"comparison {index} W11 RSS growth is outside limit")
+        require(w11.get("healthy_page_latency_observed") is True,
+                f"comparison {index} W11 healthy-page latency benefit is required")
 
 
 def require_complete_abba_matrix(manifest: dict[str, Any], report: dict[str, Any], comparisons: list[dict[str, Any]]) -> None:
@@ -206,6 +230,7 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
     start_p95_values: list[Decimal | None] = []
     duplicate_task_values: list[Decimal | None] = []
     lock_hold_values: list[Decimal | None] = []
+    w11_rows = []
     for index, comparison in enumerate(comparisons):
         require(isinstance(comparison, dict), f"comparison {index} must be an object")
         state = comparison.get("status")
@@ -238,6 +263,18 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
                 duplicate_task_values.append(maybe_number(value, "heal_duplicate_task_count"))
             for value in w09.get("heal_lock_hold_p95_ms", []):
                 lock_hold_values.append(maybe_number(value, "heal_lock_hold_p95_ms"))
+        w11 = comparison.get("w11")
+        if isinstance(w11, dict) and comparison.get("scenario") == "running-heal" and comparison.get("comparison") == "build":
+            w11_rows.append({
+                "round": comparison.get("round"),
+                "status": w11.get("status"),
+                "rss_growth": w11.get("rss_growth"),
+                "rss_growth_limit": w11.get("rss_growth_limit"),
+                "heal_lock_wait_p99_change": w11.get("heal_lock_wait_p99_change"),
+                "foreground_p99_change": w11.get("foreground_p99_change"),
+                "foreground_throughput_change": w11.get("foreground_throughput_change"),
+                "candidate_attempt_cost_per_healed_object": w11.get("candidate_attempt_cost_per_healed_object"),
+            })
 
     measured = report.get("evidence") == "measured"
     passed = report_state in PASS_STATES and performance_state in PASS_STATES and measured
@@ -280,6 +317,7 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
         "w09_duplicate_task_count": None if max_decimal(duplicate_task_values) is None else float(max_decimal(duplicate_task_values)),
         "w09_worst_lock_hold_p95_ms": None if max_decimal(lock_hold_values) is None else float(max_decimal(lock_hold_values)),
         "p1_reductions": p1_rows,
+        "w11_running_heal_build": w11_rows,
         "provenance": {
             "abba_dir": str(abba_dir.resolve()),
             "manifest_sha256": digest(manifest_path),
@@ -383,6 +421,9 @@ def markdown(summary: dict[str, Any]) -> str:
         f"- w09_duplicate_task_count: {abba['w09_duplicate_task_count'] if abba['w09_duplicate_task_count'] is not None else 'pending'}",
         f"- w09_worst_lock_hold_p95_ms: {abba['w09_worst_lock_hold_p95_ms'] if abba['w09_worst_lock_hold_p95_ms'] is not None else 'pending'}",
     ]
+    if abba.get("w11_running_heal_build"):
+        w11_statuses = ",".join(str(row.get("status")) for row in abba["w11_running_heal_build"])
+        lines.append(f"- w11_running_heal_build_statuses: {w11_statuses}")
     if abba.get("completed_cells") is not None:
         lines.append(f"- completed_cells: {abba['completed_cells']}")
     if abba.get("error"):

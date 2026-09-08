@@ -114,6 +114,10 @@ def fake_adapter():
         elif fault == "pacing-benefit" and request["scenario"] == "running-heal" \
                 and request["comparison"] == "build" and request["leg"].startswith("B"):
             result["metrics"].update(p99_ms=9, heal_mainline_throttle_delayed=5)
+        elif fault == "w11-benefit" and request["scenario"] == "running-heal" \
+                and request["comparison"] == "build" and request["leg"].startswith("B"):
+            result["metrics"].update(p99_ms=9, throughput_ops=102, rss_bytes=10,
+                                     heal_lock_wait_p99_ms=5)
         elif fault == "pacing-pending" and request["scenario"] == "running-heal" \
                 and request["comparison"] == "build" and request["leg"].startswith("B"):
             result["metrics"]["heal_mainline_throttle_delayed"] = 0
@@ -378,6 +382,12 @@ class ScannerAbbaTest(unittest.TestCase):
                     "heal_lock_hold_p95_ms": [10, 10, 10, 10],
                 },
             )
+            if comparison["scenario"] == "running-heal" and comparison["comparison"] == "build":
+                self.assertEqual(comparison["w11"]["status"], "no_measured_benefit")
+                self.assertTrue(comparison["w11"]["rss_within_limit"])
+                self.assertFalse(comparison["w11"]["healthy_page_latency_observed"])
+            else:
+                self.assertEqual(comparison["w11"], {"status": "not_applicable"})
 
     def test_fail_closed_adapter_and_data_errors(self):
         for fault in ("measure-exit", "oracle-exit", "missing-oracle", "oracle-mismatch", "zero-samples",
@@ -426,6 +436,16 @@ class ScannerAbbaTest(unittest.TestCase):
                 comparisons = harness.read_json(self.root / "out/report.json")["comparisons"]
                 build = next(comparison for comparison in comparisons if comparison["comparison"] == "build")
                 self.assertEqual(build["w10"]["status"], expected)
+
+    def test_running_heal_w11_status_requires_latency_lock_and_bounded_rss(self):
+        with patch.object(harness, "SCENARIOS", ("running-heal",)):
+            self.assertEqual(self.run_harness("w11-benefit"), 0)
+        comparisons = harness.read_json(self.root / "out/report.json")["comparisons"]
+        build = next(comparison for comparison in comparisons if comparison["comparison"] == "build")
+        self.assertEqual(build["w11"]["status"], "observed")
+        self.assertLess(build["w11"]["foreground_p99_change"], 0)
+        self.assertLess(build["w11"]["heal_lock_wait_p99_change"], 0)
+        self.assertTrue(build["w11"]["rss_within_limit"])
 
     def test_missing_first_publication_is_inconclusive(self):
         with patch.object(harness, "SCENARIOS", ("cold-hot",)):

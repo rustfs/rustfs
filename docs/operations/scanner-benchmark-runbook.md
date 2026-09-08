@@ -159,6 +159,14 @@ delay counts are both retained so an operator can reject unrelated or
 process-lifetime counter contamination. Correct repair oracles and the existing
 regression limits still apply in every case.
 
+The `running-heal` build comparison also records a `w11` section for the bounded
+retry-window evidence. `status=observed` requires same-window healthy-page
+latency improvement, reduced heal lock-wait p99, bounded candidate RSS growth,
+and a candidate attempt-cost value. `rss_regression` means latency and lock-wait
+improved but RSS exceeded the allowed growth limit; `no_measured_benefit` means
+attempt-cost evidence exists without the full W11 benefit; `pending` means the
+attempt-cost evidence needed for the comparison is missing.
+
 For P2, `measure.convergence` contains booleans `writes_stopped`,
 `last_mutation_observed`, `first_complete_publication`; numeric
 `last_mutation_time`, `last_mutation_observed_time`, `writes_stopped_time`, `window_start`, `window_end`,
@@ -220,7 +228,10 @@ non-passing report.
 Measured passing reports must also retain the W10/W11 foreground-pressure,
 heal-lock-wait, and heal-attempt-cost fields emitted by the ABBA evaluator. If
 those fields are removed, empty, malformed, or length-mismatched, the quiet
-summary fails closed instead of treating the report as performance evidence.
+summary fails closed instead of treating the report as performance evidence. For
+`running-heal` build comparisons, the summary additionally requires the emitted
+W11 section to be `observed` and to retain the RSS-growth, lock-wait,
+healthy-page-latency, and candidate attempt-cost values.
 
 They cover the complete 120-cell schedule, data isolation, missing builds and
 oracles, zero samples/requests, swallowed request errors, offered-load drift,
