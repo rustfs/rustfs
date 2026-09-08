@@ -101,6 +101,16 @@ case_names() {
     esac
 }
 
+validate_test_selection() {
+    case "$TEST_SELECTION" in
+        all|mixed-version|rollback)
+            ;;
+        *)
+            die "unknown test selection: $TEST_SELECTION"
+            ;;
+    esac
+}
+
 artifact_for() {
     case "$1" in
         mixed-version)
@@ -518,6 +528,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+validate_test_selection
 CASES=()
 while IFS= read -r case_name; do
     CASES+=("$case_name")
