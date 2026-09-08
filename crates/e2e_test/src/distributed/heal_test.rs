@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::time::{Instant, sleep};
 
 const EC84_NODE_COUNT: usize = 3;
 const EC84_DRIVES_PER_NODE: usize = 4;
@@ -33,6 +34,8 @@ const EC84_DATA_BLOCKS: usize = 8;
 const EC84_PARITY_BLOCKS: usize = 4;
 const EC84_TARGET_DRIVE_RESTART_CASE: &str = "ec84-target-drive-restart";
 const EC84_TARGET_DRIVE_RESTART_ORACLE: &str = "ec84-target-drive-restart.json";
+const EC84_HEAL_CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(45);
+const EC84_HEAL_CONTROL_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 struct ExpectedShard {
@@ -211,6 +214,29 @@ fn assert_replaced_drive_empty(drive: &Path, bucket: &str, keys: &[String]) -> T
     Ok(())
 }
 
+fn is_cluster_heal_coordination_unavailable(error: &(dyn std::error::Error + Send + Sync)) -> bool {
+    let message = error.to_string();
+    message.contains("500 Internal Server Error") && message.contains("cluster heal coordination unavailable")
+}
+
+async fn start_ec84_root_heal_when_control_ready(
+    heal_url: &str,
+    heal_body: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> TestResult {
+    let deadline = Instant::now() + EC84_HEAL_CONTROL_READY_TIMEOUT;
+    loop {
+        match signed_admin_post(heal_url, Some(heal_body), access_key, secret_key).await {
+            Ok(_) => return Ok(()),
+            Err(error) if is_cluster_heal_coordination_unavailable(error.as_ref()) && Instant::now() < deadline => {
+                sleep(EC84_HEAL_CONTROL_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 async fn put_large_inventory(client: &Client, bucket: &str) -> TestResult<Vec<ExpectedShard>> {
     let mut expected = Vec::new();
     for index in 0..4 {
@@ -304,7 +330,7 @@ async fn three_node_four_drive_ec8_4_root_heal_rebuilds_replaced_drive_after_res
     let heal_body =
         r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
     let heal_url = format!("{}/rustfs/admin/v3/heal/{bucket}?forceStart=true", dist.cluster.nodes[0].url);
-    signed_admin_post(&heal_url, Some(heal_body), &dist.cluster.access_key, &dist.cluster.secret_key).await?;
+    start_ec84_root_heal_when_control_ready(&heal_url, heal_body, &dist.cluster.access_key, &dist.cluster.secret_key).await?;
 
     wait_until(
         Duration::from_secs(120),
@@ -364,4 +390,24 @@ async fn three_node_four_drive_ec8_4_root_heal_rebuilds_replaced_drive_after_res
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cluster_heal_coordination_retry_is_exact() {
+        let retryable: Box<dyn std::error::Error + Send + Sync> =
+            "admin POST failed: 500 Internal Server Error cluster heal coordination unavailable".into();
+        assert!(is_cluster_heal_coordination_unavailable(retryable.as_ref()));
+
+        let other_internal: Box<dyn std::error::Error + Send + Sync> =
+            "admin POST failed: 500 Internal Server Error unrelated".into();
+        assert!(!is_cluster_heal_coordination_unavailable(other_internal.as_ref()));
+
+        let wrong_status: Box<dyn std::error::Error + Send + Sync> =
+            "admin POST failed: 503 Service Unavailable cluster heal coordination unavailable".into();
+        assert!(!is_cluster_heal_coordination_unavailable(wrong_status.as_ref()));
+    }
 }
