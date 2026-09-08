@@ -188,6 +188,15 @@ fn write_next_test_port(port: u16) -> Result<(), Box<dyn std::error::Error + Sen
     Ok(())
 }
 
+fn no_available_test_port_error(config: TestPortAllocatorConfig, attempts: u16, last_error: Option<&std::io::Error>) -> String {
+    let max_inclusive = config.max_exclusive() - 1;
+    let detail = last_error.map(|err| format!("; last bind error: {err}")).unwrap_or_default();
+    format!(
+        "no available E2E test port found in {}..={} after {} attempts{}",
+        config.min, max_inclusive, attempts, detail
+    )
+}
+
 pub(crate) fn capture_command_logs(
     command: &mut Command,
     log_path: Option<&str>,
@@ -694,19 +703,23 @@ impl RustFSTestEnvironment {
         let _guard = PortAllocatorGuard::acquire().await?;
         let config = test_port_allocator_config()?;
         let mut next_port = read_next_test_port(config);
+        let mut last_error = None;
 
         for _ in 0..config.range {
             let port = next_port;
             next_port = advance_test_port(next_port, config);
             write_next_test_port(next_port)?;
 
-            if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
-                drop(listener);
-                return Ok(port);
+            match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => {
+                    drop(listener);
+                    return Ok(port);
+                }
+                Err(err) => last_error = Some(err),
             }
         }
 
-        Err("no available E2E test port found".into())
+        Err(no_available_test_port_error(config, config.range, last_error.as_ref()).into())
     }
 
     /// Kill any existing RustFS processes
@@ -2199,6 +2212,19 @@ mod tests {
         assert!(parse_test_port_allocator_config(Some("65000"), Some("1000")).is_err());
         assert!(parse_test_port_allocator_config(Some("31000"), Some("0")).is_err());
         assert!(parse_test_port_allocator_config(Some("not-a-port"), Some("128")).is_err());
+    }
+
+    #[test]
+    fn e2e_port_allocator_reports_attempt_window_and_last_bind_error() {
+        let config = TestPortAllocatorConfig { min: 41000, range: 3 };
+        let error = std::io::Error::from(ErrorKind::PermissionDenied);
+
+        let message = no_available_test_port_error(config, config.range, Some(&error));
+
+        assert!(message.contains("41000..=41002"));
+        assert!(message.contains("after 3 attempts"));
+        assert!(message.contains("last bind error"));
+        assert!(message.contains("permission denied"));
     }
 
     #[test]
