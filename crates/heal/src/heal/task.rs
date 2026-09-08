@@ -609,6 +609,9 @@ impl HealTask {
         expected: HealObjectIdentity,
         receipt: Option<HealObjectReceipt>,
     ) -> bool {
+        if self.options.dry_run {
+            return false;
+        }
         let Some(receipt) = receipt else {
             return false;
         };

@@ -386,6 +386,18 @@ mod canonical_outcome {
                     .lock()
                     .expect("existence fixture")
                     .insert("object".to_string(), MockObjectExists::TransientSkip("retry later"));
+            } else {
+                let incarnation = Uuid::new_v4();
+                *storage.bucket_incarnation_id.lock().expect("bucket incarnation") = Some(incarnation);
+                storage.heal_object_receipts.lock().expect("receipt fixture").insert(
+                    "object".to_string(),
+                    VecDeque::from([object_receipt(
+                        "object",
+                        None,
+                        HealObjectDisposition::VerifiedHealthy,
+                        incarnation,
+                    )]),
+                );
             }
             let mut request = HealRequest::object("bucket-a".to_string(), "object".to_string(), None);
             request.options.dry_run = !transient;
