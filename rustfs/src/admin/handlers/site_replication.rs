@@ -1869,6 +1869,15 @@ fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Fut
             Ok(state) => {
                 if let Some(pending_endpoint_refresh) = state.pending_endpoint_refresh.clone() {
                     resume_pending_endpoint_refresh(&state, &pending_endpoint_refresh).await;
+                    // The bucket reconciler below rewrites targets from the
+                    // topology, which is exactly what this refresh is in the
+                    // middle of changing, so it still waits for the next pass.
+                    // The retry queue does not: it replays per-peer deliveries
+                    // against the endpoints currently committed in state, and a
+                    // refresh that cannot finish - a peer that never comes back
+                    // - must not also stall replay to the healthy peers.
+                    drop(lifecycle);
+                    drain_site_replication_retry_queue().await;
                     return;
                 }
                 // A wedged rotation is worse than a wedged removal: the local
@@ -9921,6 +9930,35 @@ mod tests {
 
         let merged = merge_pending_endpoint_refresh(&state, &stale, ["peer-b".to_string()]).expect("merge ACKs");
         assert_eq!(merged.acked_deployment_ids, BTreeSet::from(["peer-a".to_string(), "peer-b".to_string()]));
+    }
+
+    /// A refresh that cannot finish used to take the whole heavyweight pass
+    /// with it, including the retry drain, so an unreachable peer froze IAM
+    /// and bucket replay to every healthy peer as well. The bucket reconciler
+    /// still waits - it rewrites the topology the refresh is changing - but
+    /// the drain must run.
+    #[test]
+    fn a_pending_endpoint_refresh_still_drains_the_retry_queue() {
+        let source = include_str!("site_replication.rs");
+        let body = source
+            .split("fn reconcile_site_replication_wiring()")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn send_site_replication_bootstrap_plan").next())
+            .expect("reconcile function body");
+        let refresh_arm = body
+            .split("resume_pending_endpoint_refresh(")
+            .nth(1)
+            .and_then(|rest| rest.split("A wedged rotation").next())
+            .expect("endpoint refresh arm");
+
+        assert!(
+            refresh_arm.contains("drain_site_replication_retry_queue().await;"),
+            "a pending endpoint refresh must not stall replay to the healthy peers"
+        );
+        assert!(
+            !refresh_arm.contains("reconcile_site_replication_buckets"),
+            "bucket wiring still waits for the refresh to settle"
+        );
     }
 
     #[test]

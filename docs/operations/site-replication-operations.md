@@ -121,6 +121,11 @@ If this marker is stuck:
 A peer removed from the topology no longer blocks completion. A remove request
 is accepted when it removes every active unacknowledged peer.
 
+While this marker is present, control-plane retry replay to the other peers
+keeps running, but bucket wiring reconciliation waits: it rewrites the same
+targets the refresh is changing. Expect bucket-level drift on this site to
+persist until the refresh settles.
+
 ## Outage recovery and convergence time
 
 Control-plane retry begins on the 30-second drain, while heavyweight snapshots,
