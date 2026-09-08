@@ -160,7 +160,7 @@ where
         .map_err(|err| Error::other_with_context("store init failed during load_pool_meta", err))?;
     write_state.observe_replicas(replica_state);
     write_state
-        .ensure_missing_metadata_can_initialize()
+        .ensure_startup_metadata_can_initialize()
         .map_err(|err| Error::other(format!("store init failed during classify_pool_meta_absence: {err}")))?;
     Ok((meta, replica_state))
 }
@@ -1480,6 +1480,212 @@ mod tests {
         follower.ensure_write_safe("original follower after elected commit").expect(
             "a follower retry must become write-ready after the elected writer commits matching identity and pool metadata",
         );
+    }
+
+    #[tokio::test]
+    async fn test_pending_identity_follower_accepts_safe_repairable_commit() {
+        let deployment_id = Uuid::new_v4();
+        let canonical = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let backup = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let pools = vec![canonical.clone(), backup.clone()];
+        let mut writer = PoolMetaWriteState::for_startup(deployment_id, true);
+        establish_pool_meta_bootstrap_identity_if_proven(pools.clone(), &mut writer, true)
+            .await
+            .expect("create pending identities through the elected writer");
+        let pending_backup = backup
+            .objects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut follower = PoolMetaWriteState::for_startup(deployment_id, false);
+        for _ in 0..2 {
+            load_pool_meta_for_startup(pools.clone(), &mut follower)
+                .await
+                .expect_err("repeated pending reads cannot authorize follower writes");
+            follower
+                .ensure_write_safe("pending follower")
+                .expect_err("pending writes stay blocked");
+        }
+        assert_eq!(canonical.pool_meta_write_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(backup.pool_meta_write_attempts.load(Ordering::SeqCst), 0);
+        let (_, replica_state) = load_pool_meta_for_startup(pools.clone(), &mut writer)
+            .await
+            .expect("load fresh metadata");
+        let mut requested = init_test_pool_meta(None);
+        let mut second = requested.pools[0].clone();
+        second.id = 1;
+        second.cmd_line = "pool-1".to_string();
+        requested.pools.push(second);
+        let committed = persist_pool_meta_for_startup_if_safe(&requested, pools.clone(), replica_state, &mut writer, true, true)
+            .await
+            .expect("commit metadata and identity through the normal startup path");
+        assert_eq!(canonical.pool_meta_write_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(backup.pool_meta_write_attempts.load(Ordering::SeqCst), 2);
+
+        // Expose the backup's actual pre-commit image: pending identity and missing pool.bin.
+        *backup.objects.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = pending_backup.clone();
+        let canonical_objects = canonical
+            .objects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(pool_meta_identity_initialized_for_test(&canonical_objects[POOL_META_IDENTITY_NAME].0).expect("decode identity"));
+        assert_eq!(
+            pool_meta_v3_commit_state_for_test(canonical_objects[POOL_META_NAME].0.clone()).expect("decode committed record"),
+            (1, true)
+        );
+        canonical
+            .objects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(POOL_META_IDENTITY_NAME.to_string(), pending_backup[POOL_META_IDENTITY_NAME].clone());
+        load_pool_meta_for_startup(pools.clone(), &mut follower)
+            .await
+            .expect("committed metadata is readable before identity promotion");
+        follower
+            .ensure_write_safe("identity still pending")
+            .expect_err("pool metadata alone cannot finish bootstrap");
+        *canonical.objects.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = canonical_objects.clone();
+        let (loaded, replica_state) = load_pool_meta_for_startup(pools.clone(), &mut follower)
+            .await
+            .expect("a validated committed canonical copy permits safe repair of the lagging backup");
+        assert!(replica_state.needs_repair);
+        assert!(replica_state.repair_write_safe);
+        assert!(follower.identity_requires_repair());
+        assert_eq!(
+            serde_json::to_value(&loaded).expect("loaded metadata"),
+            serde_json::to_value(&committed).expect("committed metadata")
+        );
+        follower
+            .ensure_write_safe("safe repairable startup")
+            .expect("repairable copies must not permanently block a follower");
+        persist_pool_meta_for_startup_if_safe(&loaded, pools, replica_state, &mut follower, false, false)
+            .await
+            .expect("a non-elected follower never repairs copies itself");
+        assert_eq!(canonical.pool_meta_write_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(backup.pool_meta_write_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *canonical.objects.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            canonical_objects
+        );
+        assert_eq!(*backup.objects.lock().unwrap_or_else(std::sync::PoisonError::into_inner), pending_backup);
+    }
+
+    #[tokio::test]
+    async fn test_pending_identity_wait_stays_blocked_after_hard_startup_failure() {
+        #[derive(Clone, Copy, Debug)]
+        enum Fault {
+            Unreadable,
+            CorruptIdentity,
+            CorruptMetadata,
+            ConflictingIdentity,
+            ConflictingEpoch,
+            InitializedMetadataMissing,
+        }
+        for fault in [
+            Fault::Unreadable,
+            Fault::CorruptIdentity,
+            Fault::CorruptMetadata,
+            Fault::ConflictingIdentity,
+            Fault::ConflictingEpoch,
+            Fault::InitializedMetadataMissing,
+        ] {
+            let deployment_id = Uuid::new_v4();
+            let storage = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+            let mut writer = PoolMetaWriteState::for_startup(deployment_id, true);
+            establish_pool_meta_bootstrap_identity_if_proven(vec![storage.clone()], &mut writer, true)
+                .await
+                .expect("create pending identity");
+            let pending_objects = storage
+                .objects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let pending = StartupPoolMetaStorage::new(Vec::new());
+            *pending.objects.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = pending_objects;
+            let pending = Arc::new(pending);
+            let mut follower = PoolMetaWriteState::for_startup(deployment_id, false);
+            load_pool_meta_for_startup(vec![storage.clone()], &mut follower)
+                .await
+                .expect_err("pending identity must reject writes");
+            let (_, replica_state) = load_pool_meta_for_startup(vec![storage.clone()], &mut writer)
+                .await
+                .expect("load fresh metadata");
+            let committed = persist_pool_meta_for_startup_if_safe(
+                &init_test_pool_meta(None),
+                vec![storage.clone()],
+                replica_state,
+                &mut writer,
+                true,
+                true,
+            )
+            .await
+            .expect("commit matching identity and metadata");
+            let committed_objects = storage
+                .objects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let mut faulty = StartupPoolMetaStorage::new(Vec::new());
+            let mut faulty_objects = committed_objects.clone();
+            match fault {
+                Fault::Unreadable => faulty.read_error = true,
+                Fault::CorruptIdentity => faulty_objects.get_mut(POOL_META_IDENTITY_NAME).expect("identity exists").0 = vec![0],
+                Fault::CorruptMetadata => faulty_objects.get_mut(POOL_META_NAME).expect("metadata exists").0 = vec![0],
+                Fault::ConflictingIdentity | Fault::ConflictingEpoch => {
+                    let (cluster_id, epoch) = match fault {
+                        Fault::ConflictingIdentity => (Uuid::new_v4(), 1),
+                        _ => (deployment_id, 2),
+                    };
+                    faulty_objects.get_mut(POOL_META_IDENTITY_NAME).expect("identity exists").0 =
+                        crate::core::pools::initialized_pool_meta_identity_for_test(cluster_id, epoch)
+                            .expect("encode valid conflicting identity");
+                }
+                Fault::InitializedMetadataMissing => {
+                    faulty_objects.remove(POOL_META_NAME);
+                }
+            }
+            *faulty.objects.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = faulty_objects.clone();
+            let faulty = Arc::new(faulty);
+            load_pool_meta_for_startup(vec![faulty.clone()], &mut follower)
+                .await
+                .expect_err("hard startup failure must reject this read");
+            let blocked = follower
+                .ensure_write_safe("after hard startup failure")
+                .expect_err("hard failure must block writes");
+            let failure = blocked.pool_metadata_failure().expect("typed hard failure");
+            assert_eq!(faulty.pool_meta_write_attempts.load(Ordering::SeqCst), 0, "{fault:?}");
+            assert_eq!(
+                *faulty.objects.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                faulty_objects,
+                "{fault:?}"
+            );
+
+            load_pool_meta_for_startup(vec![pending], &mut follower)
+                .await
+                .expect_err("a later pending identity cannot downgrade the hard block");
+            let (loaded, replicas) = load_pool_meta_for_startup(vec![storage.clone()], &mut follower)
+                .await
+                .expect("later healthy committed records remain readable");
+            assert!(replicas.repair_write_safe);
+            assert!(!replicas.needs_repair);
+            assert_eq!(
+                serde_json::to_value(&loaded).expect("loaded metadata"),
+                serde_json::to_value(&committed).expect("committed metadata")
+            );
+            let still_blocked = follower
+                .ensure_write_safe("after healthy reread")
+                .expect_err("a hard failure must never downgrade to a temporary bootstrap wait");
+            let retained = still_blocked.pool_metadata_failure().expect("retained typed failure");
+            assert_eq!(retained.phase, failure.phase, "{fault:?}");
+            assert_eq!(retained.since, failure.since, "{fault:?}");
+            assert_eq!(storage.pool_meta_write_attempts.load(Ordering::SeqCst), 2, "{fault:?}");
+            assert_eq!(
+                *storage.objects.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                committed_objects,
+                "{fault:?}"
+            );
+        }
     }
 
     #[tokio::test]

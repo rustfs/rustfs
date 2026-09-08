@@ -4449,9 +4449,15 @@ impl PoolMetaReplicaState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolMetaWriteBlock {
+    PendingBootstrapIdentity,
+    RecoveryRequired,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PoolMetaWriteState {
-    write_blocked: bool,
+    write_block: Option<PoolMetaWriteBlock>,
     aborted_transaction: Arc<AtomicBool>,
     block_context: Option<crate::error::PoolMetadataError>,
     transaction_failure: Arc<std::sync::Mutex<Option<crate::error::PoolMetadataError>>>,
@@ -4565,7 +4571,8 @@ impl PoolMetaWriteState {
     }
 
     fn block_with_context(&mut self, mut context: crate::error::PoolMetadataError) {
-        if !self.write_blocked {
+        // A later hard failure must make a bootstrap wait irreversible.
+        if self.write_block != Some(PoolMetaWriteBlock::RecoveryRequired) {
             record_pool_meta_block_once(&self.block_started_at, &mut context);
             self.block_context = Some(context);
         } else if let Some(previous) = &self.block_context
@@ -4575,7 +4582,7 @@ impl PoolMetaWriteState {
             context.since = previous.since;
             self.block_context = Some(context);
         }
-        self.write_blocked = true;
+        self.write_block = Some(PoolMetaWriteBlock::RecoveryRequired);
     }
 
     pub(crate) fn block_writes_after_fence_loss(&mut self) {
@@ -4651,6 +4658,31 @@ impl PoolMetaWriteState {
         Ok(())
     }
 
+    pub(crate) fn ensure_startup_metadata_can_initialize(&mut self) -> Result<()> {
+        if !(self.pool_meta_absent
+            && self.expected_cluster_id.is_some()
+            && self.cluster_epoch.is_some()
+            && self.identity_is_pending()
+            && self.identity_fresh_bootstrap_nonce.is_some()
+            && !self.bootstrap_identity_proven())
+        {
+            return self.ensure_missing_metadata_can_initialize();
+        }
+        self.validate_missing_metadata_can_initialize().map_err(|err| {
+            let mut context = pool_metadata_error(
+                crate::error::PoolMetadataFailure::RecoveryRequired,
+                "metadata_absence",
+                Some(Arc::new(err)),
+            );
+            if self.write_block.is_none() {
+                record_pool_meta_block_once(&self.block_started_at, &mut context);
+                self.block_context = Some(context.clone());
+                self.write_block = Some(PoolMetaWriteBlock::PendingBootstrapIdentity);
+            }
+            Error::other(context)
+        })
+    }
+
     pub(crate) fn ensure_missing_metadata_can_initialize(&mut self) -> Result<()> {
         if !self.pool_meta_absent {
             return Ok(());
@@ -4679,7 +4711,7 @@ impl PoolMetaWriteState {
     }
 
     pub(crate) fn ensure_write_safe(&self, operation: &str) -> Result<()> {
-        if !self.write_blocked && !self.aborted_transaction.load(Ordering::SeqCst) {
+        if self.write_block.is_none() && !self.aborted_transaction.load(Ordering::SeqCst) {
             return Ok(());
         }
         let mut context = self
@@ -6980,6 +7012,24 @@ impl PoolMeta {
         write_state
             .observe_selection(&selection)
             .map_err(|err| block_pool_meta_validation(write_state, err, "startup_selection"))?;
+        // A pending bootstrap identity only delays an unproven startup follower.
+        // Any intervening hard failure promotes the block and cannot be cleared here.
+        // Missing or stale copies may still need repair after a safe committed selection.
+        if write_state.write_block == Some(PoolMetaWriteBlock::PendingBootstrapIdentity)
+            && write_state.identity_initialized == Some(true)
+            && !selection.absent
+            && selection.revision.is_generation_protocol()
+            && selection.replica_state.repair_write_safe
+            && write_state.active_transactions.load(Ordering::SeqCst) == 0
+            && !write_state.aborted_transaction.load(Ordering::SeqCst)
+        {
+            write_state.write_block = None;
+            write_state.block_context = None;
+            *write_state
+                .block_started_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
         *self = selection.meta;
         Ok(selection.replica_state)
     }
@@ -10818,7 +10868,7 @@ impl ECStore {
             };
         };
         let transaction_aborted = write_state.aborted_transaction.load(Ordering::SeqCst);
-        let writes_ready = !write_state.write_blocked && !transaction_aborted;
+        let writes_ready = write_state.write_block.is_none() && !transaction_aborted;
         let failure = if writes_ready {
             None
         } else {
@@ -10828,7 +10878,7 @@ impl ECStore {
         PoolMetaWriteGateStatus {
             writes_ready,
             check_timed_out: false,
-            write_blocked: write_state.write_blocked,
+            write_blocked: write_state.write_block.is_some(),
             transaction_aborted,
             pool_meta_absent: write_state.pool_meta_absent,
             identity_initialized: write_state.identity_initialized,
@@ -10856,7 +10906,7 @@ impl ECStore {
             if state.ensure_write_safe("pool metadata recovery").is_ok() {
                 return Ok(false);
             }
-            if state.write_blocked
+            if state.write_block.is_some()
                 || state.active_transactions.load(Ordering::SeqCst) != 0
                 || state
                     .transaction_failure
@@ -10887,7 +10937,7 @@ impl ECStore {
         let mut state = self.pool_meta_save_gate.lock().await;
         // Outcomes can outlive the save-gate guard. Do not let an old Drop
         // relatch, or an older recovery clear a newly installed block.
-        if state.write_blocked || state.active_transactions.load(Ordering::SeqCst) != 0 {
+        if state.write_block.is_some() || state.active_transactions.load(Ordering::SeqCst) != 0 {
             return Ok(false);
         }
         let Some(blocked) = state
@@ -10920,7 +10970,7 @@ impl ECStore {
             active_transactions: Arc::default(),
             block_context: None,
             recovery_failure: None,
-            write_blocked: false,
+            write_block: None,
             ..state.clone()
         };
         let selection = load_pool_meta_for_transaction_recovery(self.pools.clone(), &mut candidate).await?;
@@ -20789,6 +20839,92 @@ mod pools_tests {
         revision: AtomicUsize,
         stored: StdMutex<Option<(Vec<u8>, String)>>,
         identity: StdMutex<Option<(Vec<u8>, String)>>,
+    }
+
+    #[tokio::test]
+    async fn pending_bootstrap_wait_preserves_active_and_aborted_transactions() {
+        for abort in [false, true] {
+            let pool = Arc::new(PartialPoolMetaWriteStorage::default());
+            let cluster_id = uuid::Uuid::new_v4();
+            let mut writer = super::PoolMetaWriteState::for_startup(cluster_id, true);
+            super::persist_pool_meta_identity_for_startup(vec![pool.clone()], &mut writer, false)
+                .await
+                .expect("create a real pending identity");
+            let mut follower = super::PoolMetaWriteState::for_startup(cluster_id, false);
+            let mut loaded = PoolMeta::default();
+            loaded
+                .load_for_startup_observing(vec![pool.clone()], &mut follower)
+                .await
+                .expect("read pending identity");
+            follower
+                .ensure_startup_metadata_can_initialize()
+                .expect_err("pending follower must be blocked");
+            loaded
+                .load_for_startup_observing(vec![pool.clone()], &mut writer)
+                .await
+                .expect("writer reads pending metadata");
+            writer
+                .ensure_startup_metadata_can_initialize()
+                .expect("writer owns bootstrap authority");
+            let requested = PoolMeta {
+                version: POOL_META_VERSION,
+                pools: vec![decommission_test_pool_status(0, None)],
+                ..Default::default()
+            };
+            requested
+                .save_for_startup_observing(vec![pool.clone()], &mut writer)
+                .await
+                .expect("prepare and commit pool metadata");
+            super::persist_pool_meta_identity_for_startup(vec![pool.clone()], &mut writer, true)
+                .await
+                .expect("commit the identity");
+            let committed = pool.stored.lock().expect("metadata lock").clone();
+            let identity = pool.identity.lock().expect("identity lock").clone();
+            let revision = pool.revision.load(Ordering::SeqCst);
+
+            let mut arm = follower.arm_transaction();
+            arm.phase = Some("commit_cas");
+            loaded
+                .load_for_startup_observing(vec![pool.clone()], &mut follower)
+                .await
+                .expect("committed records remain readable");
+            assert_eq!(follower.active_transactions.load(Ordering::SeqCst), 1);
+            follower
+                .ensure_write_safe("active transaction")
+                .expect_err("a startup reread cannot retire an outstanding owner");
+            if !abort {
+                arm.disarm();
+            }
+            drop(arm);
+            assert_eq!(follower.active_transactions.load(Ordering::SeqCst), 0);
+            assert_eq!(follower.aborted_transaction.load(Ordering::SeqCst), abort);
+            loaded
+                .load_for_startup_observing(vec![pool.clone()], &mut follower)
+                .await
+                .expect("reread committed records after owner drop");
+            if abort {
+                follower
+                    .ensure_write_safe("aborted transaction")
+                    .expect_err("startup must not erase an unknown transaction");
+                assert_eq!(
+                    follower
+                        .transaction_failure
+                        .lock()
+                        .expect("failure lock")
+                        .as_ref()
+                        .expect("retained failure")
+                        .phase,
+                    "commit_cas"
+                );
+            } else {
+                follower
+                    .ensure_write_safe("completed transaction")
+                    .expect("a disarmed owner permits the validated bootstrap retry");
+            }
+            assert_eq!(pool.revision.load(Ordering::SeqCst), revision);
+            assert_eq!(*pool.stored.lock().expect("metadata lock"), committed);
+            assert_eq!(*pool.identity.lock().expect("identity lock"), identity);
+        }
     }
 
     #[tokio::test]
