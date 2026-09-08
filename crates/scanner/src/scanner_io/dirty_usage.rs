@@ -226,12 +226,21 @@ mod scoped_dirty_usage_tests {
         record_dirty_usage_object_from_producer("photos", "hot/object", SegmentInvalidationProducerIdentity::PutObject);
         record_dirty_usage_object_from_producer("photos", "archive/object", SegmentInvalidationProducerIdentity::DeleteObject);
         record_dirty_usage_bucket_from_producer("photos", SegmentInvalidationProducerIdentity::Unknown);
+        record_dirty_usage_bucket_from_producers(
+            "photos",
+            [
+                SegmentInvalidationProducerIdentity::DeleteMarker,
+                SegmentInvalidationProducerIdentity::AbortMultipartUpload,
+            ],
+        );
 
         assert_eq!(
             dirty_usage_producer_identities_for_tests(),
             BTreeSet::from([
                 SegmentInvalidationProducerIdentity::PutObject,
-                SegmentInvalidationProducerIdentity::DeleteObject
+                SegmentInvalidationProducerIdentity::DeleteObject,
+                SegmentInvalidationProducerIdentity::DeleteMarker,
+                SegmentInvalidationProducerIdentity::AbortMultipartUpload
             ])
         );
         assert_eq!(
@@ -289,6 +298,18 @@ pub fn record_dirty_usage_bucket_from_producer(
     }
 
     record_segment_invalidation_producer_identity(producer);
+    record_dirty_usage_bucket_inner(bucket);
+}
+
+pub fn record_dirty_usage_bucket_from_producers<I>(bucket: &str, producers: I)
+where
+    I: IntoIterator<Item = crate::segment_invalidation::SegmentInvalidationProducerIdentity>,
+{
+    if bucket.is_empty() {
+        return;
+    }
+
+    record_segment_invalidation_producer_identities(producers);
     record_dirty_usage_bucket_inner(bucket);
 }
 
@@ -367,8 +388,18 @@ fn record_dirty_usage_object_inner(bucket: &str, object: &str) {
 }
 
 fn record_segment_invalidation_producer_identity(producer: crate::segment_invalidation::SegmentInvalidationProducerIdentity) {
-    if producer.producer().is_some() {
-        dirty_usage_producer_identities().insert(producer);
+    record_segment_invalidation_producer_identities([producer]);
+}
+
+fn record_segment_invalidation_producer_identities<I>(producers: I)
+where
+    I: IntoIterator<Item = crate::segment_invalidation::SegmentInvalidationProducerIdentity>,
+{
+    let mut identities = dirty_usage_producer_identities();
+    for producer in producers {
+        if producer.producer().is_some() {
+            identities.insert(producer);
+        }
     }
 }
 

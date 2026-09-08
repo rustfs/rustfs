@@ -274,6 +274,21 @@ record their relative paths, hashes, command provenance, timestamps, roles,
 participating revisions, and case lists before
 `--check-scanner-heal-release-bundle` can validate them.
 
+For a release-candidate or PR-head Linux x86_64 host, run the full raw G09
+artifact pass with:
+
+```bash
+scripts/run_scanner_heal_g09_upgrade_evidence.sh
+```
+
+The script mirrors the pinned previous-release asset used by the upgrade
+workflow, builds the current checkout, runs the mixed-version and rollback E2E
+lanes, and fails unless all three raw G09 artifacts are measured, revision-bound,
+and role-bound. Use `--source-binary` for a custom previous-release binary on
+another platform, or `--test mixed-version|rollback` while narrowing a failure.
+It performs a free-space preflight before building so a saturated validation
+host fails before producing partial evidence.
+
 When the real release lanes have produced their dedicated artifacts, validate
 the complete hard-gate bundle with:
 

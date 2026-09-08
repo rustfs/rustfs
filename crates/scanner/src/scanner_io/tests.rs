@@ -85,6 +85,78 @@ fn scanner_activity_preflight_defers_a_temporarily_offline_peer() {
     }
 }
 
+#[test]
+fn scanner_segment_reuse_activation_preflight_reports_release_gate_inputs() {
+    let preflight = scanner_segment_reuse_activation_preflight();
+
+    assert!(!preflight.production_activation);
+    assert!(!preflight.scanner_segment_reuse_activated);
+    assert!(!scanner_segment_reuse_activated());
+    assert_eq!(preflight.proof_inputs, SCANNER_SEGMENT_ACTIVATION_PROOF_INPUTS);
+    assert_eq!(preflight.fail_closed_checks, SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS);
+    assert_eq!(
+        preflight.fail_closed_blockers().collect::<Vec<_>>(),
+        SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS
+    );
+}
+
+#[test]
+fn scanner_segment_reuse_activation_requires_every_preflight_proof() {
+    let complete_proof = ScannerSegmentReuseActivationProof {
+        production_activation: true,
+        durable_producer_identity: true,
+        restart_gap_absent: true,
+        generation_window_bound: true,
+        overflow_absent: true,
+        cold_zero_walk_oracle: true,
+        distributed_peer_invalidation: true,
+    };
+
+    let mut production_disabled = complete_proof;
+    production_disabled.production_activation = false;
+    let preflight = scanner_segment_reuse_activation_preflight_from_proof(production_disabled);
+    assert!(!preflight.production_activation);
+    assert!(!preflight.scanner_segment_reuse_activated);
+    assert_eq!(preflight.fail_closed_blockers().collect::<Vec<_>>(), Vec::<&str>::new());
+
+    let preflight = scanner_segment_reuse_activation_preflight_from_proof(complete_proof);
+    assert!(preflight.production_activation);
+    assert!(preflight.scanner_segment_reuse_activated);
+    assert_eq!(preflight.fail_closed_blockers().collect::<Vec<_>>(), Vec::<&str>::new());
+
+    let mut missing_identity = complete_proof;
+    missing_identity.durable_producer_identity = false;
+    assert_segment_reuse_activation_blocked_by(missing_identity, "missing_producer_identity");
+
+    let mut restart_gap = complete_proof;
+    restart_gap.restart_gap_absent = false;
+    assert_segment_reuse_activation_blocked_by(restart_gap, "restart_gap");
+
+    let mut generation_gap = complete_proof;
+    generation_gap.generation_window_bound = false;
+    assert_segment_reuse_activation_blocked_by(generation_gap, "generation_gap");
+
+    let mut overflow = complete_proof;
+    overflow.overflow_absent = false;
+    assert_segment_reuse_activation_blocked_by(overflow, "overflow");
+
+    let mut missing_cold_oracle = complete_proof;
+    missing_cold_oracle.cold_zero_walk_oracle = false;
+    assert_segment_reuse_activation_blocked_by(missing_cold_oracle, "missing_cold_zero_walk_oracle");
+
+    let mut missing_distributed_invalidation = complete_proof;
+    missing_distributed_invalidation.distributed_peer_invalidation = false;
+    assert_segment_reuse_activation_blocked_by(missing_distributed_invalidation, "distributed_without_peer_invalidation");
+}
+
+fn assert_segment_reuse_activation_blocked_by(proof: ScannerSegmentReuseActivationProof, blocker: &'static str) {
+    let preflight = scanner_segment_reuse_activation_preflight_from_proof(proof);
+
+    assert!(preflight.production_activation);
+    assert!(!preflight.scanner_segment_reuse_activated);
+    assert_eq!(preflight.fail_closed_blockers().collect::<Vec<_>>(), vec![blocker]);
+}
+
 async fn setup_two_pool_scanner_store() -> (tempfile::TempDir, Arc<ECStore>) {
     init_ecstore_config_for_scanner_tests();
     let temp_dir = tempfile::tempdir().expect("multi-pool scanner test directory should be created");
@@ -1781,6 +1853,18 @@ fn remote_dirty_usage_invalidates_local_prefix_hints_until_distributed_proof_exi
         "peer dirty state is not a distributed segment invalidation proof"
     );
     assert_eq!(distributed.remote_dirty_usage_acknowledgements.len(), 1);
+    let evidence = distributed
+        .distributed_segment_invalidation_evidence
+        .expect("same-window peer snapshot and scoped ACK capability form distributed evidence");
+    assert_eq!(evidence.peer_count, 1);
+    assert_eq!(evidence.dirty_peer_count, 1);
+    assert_eq!(
+        evidence.invalidation_domain,
+        crate::segment_invalidation::SegmentInvalidationDomain::DistributedEc
+    );
+    assert!(evidence.distributed_ec_invalidation);
+    assert!(evidence.same_window_remote_proof);
+    assert!(evidence.all_peers_bound_to_generation_window);
 }
 
 fn peer_dirty_usage_snapshot(
@@ -1827,7 +1911,7 @@ fn verified_remote_dirty_usage_buckets_merges_only_complete_current_snapshots() 
             ScannerPeerDirtyUsageExpectation {
                 instance_id: "instance-b".to_string(),
                 generation: 3,
-                pending: false,
+                pending: true,
             },
         ),
     ]);
@@ -1874,7 +1958,33 @@ fn verified_remote_dirty_usage_buckets_merges_only_complete_current_snapshots() 
                     },
                 },
             ],
+            peer_count: 2,
+            dirty_peer_count: 2,
         })
+    );
+}
+
+#[test]
+fn verified_remote_dirty_usage_rejects_peer_snapshot_that_contradicts_activity_pending_state() {
+    let expected_peers = HashMap::from([(
+        "node-a:9000".to_string(),
+        ScannerPeerDirtyUsageExpectation {
+            instance_id: "instance-a".to_string(),
+            generation: 7,
+            pending: false,
+        },
+    )]);
+
+    assert!(
+        verified_remote_dirty_usage(
+            &expected_peers,
+            vec![(
+                "node-a:9000".to_string(),
+                peer_dirty_usage_snapshot("instance-a", 7, true, &[("photos", 7)]),
+            )],
+        )
+        .is_none(),
+        "a clean activity window cannot authorize a dirty peer snapshot or scoped ACK"
     );
 }
 
@@ -1951,6 +2061,7 @@ fn remote_dirty_usage_scope_resolution_falls_back_when_ack_batch_exceeds_thresho
         result.remote_dirty_usage_acknowledgements.is_empty(),
         "full-scan fallback must not send a scoped ACK that peers would reject or split"
     );
+    assert!(result.distributed_segment_invalidation_evidence.is_none());
 }
 
 #[test]
@@ -2092,6 +2203,11 @@ async fn distributed_scoped_scan_falls_back_when_remote_scoped_ack_capability_is
 
         assert_eq!(result.scope.selected_buckets.as_deref(), expected_buckets.as_ref());
         assert_eq!(result.remote_dirty_usage_acknowledgements.len(), expected_ack_count);
+        assert_eq!(
+            result.distributed_segment_invalidation_evidence.is_some(),
+            capability,
+            "distributed evidence requires an authenticated scoped ACK capability probe"
+        );
     }
 }
 

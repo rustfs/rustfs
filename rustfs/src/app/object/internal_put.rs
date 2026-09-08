@@ -733,7 +733,11 @@ impl DefaultObjectUsecase {
             )
             .await
             .map_err(ApiError::from)?;
-        rustfs_scanner::record_dirty_usage_bucket(bucket);
+        rustfs_scanner::record_dirty_usage_object_from_producer(
+            bucket,
+            key,
+            rustfs_scanner::SegmentInvalidationProducerIdentity::AbortMultipartUpload,
+        );
         Ok(())
     }
 }
