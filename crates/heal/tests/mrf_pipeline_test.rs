@@ -22,7 +22,7 @@
 //! Under `cargo nextest` each test runs in its own process, which keeps the
 //! process-global MRF channel singleton safe.
 
-use rustfs_common::mrf_channel::{self, MrfKind};
+use rustfs_common::mrf_channel::{self, MrfIngressResult, MrfKind, MrfScope};
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
     mrf_queue,
@@ -235,6 +235,33 @@ fn journal_matches_on_all_disks(disk_paths: &[PathBuf], relative_path: &str, exp
     disk_paths
         .iter()
         .all(|path| std::fs::read(path.join(META_BUCKET).join(relative_path)).is_ok_and(|actual| actual == expected))
+}
+
+fn journal_contains_on_all_disks(disk_paths: &[PathBuf], relative_path: &str, needle: &[u8]) -> bool {
+    disk_paths.iter().all(|path| {
+        std::fs::read(path.join(META_BUCKET).join(relative_path))
+            .is_ok_and(|actual| actual.windows(needle.len()).any(|window| window == needle))
+    })
+}
+
+fn journal_contains_on_any_disk(disk_paths: &[PathBuf], relative_path: &str, needle: &[u8]) -> bool {
+    disk_paths.iter().any(|path| {
+        std::fs::read(path.join(META_BUCKET).join(relative_path))
+            .is_ok_and(|actual| actual.windows(needle.len()).any(|window| window == needle))
+    })
+}
+
+fn committed_payload_contains_on_all_disks(disk_paths: &[PathBuf], needles: &[&[u8]]) -> bool {
+    disk_paths.iter().all(|path| {
+        let root = path.join(META_BUCKET);
+        COMMITTED_PAYLOAD_RELS.into_iter().any(|payload_rel| {
+            std::fs::read(root.join(payload_rel)).is_ok_and(|payload| {
+                needles
+                    .iter()
+                    .all(|needle| payload.windows(needle.len()).any(|window| window == *needle))
+            })
+        })
+    })
 }
 
 fn committed_checkpoint_matches_on_all_disks(disk_paths: &[PathBuf], sequence: u64, expected_payload: &[u8]) -> bool {
@@ -612,6 +639,73 @@ async fn journal_replay_retains_file_when_manager_is_full() {
             .iter()
             .all(|path| Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()),
         "the anchor remains until a successor snapshot can safely replace it"
+    );
+}
+
+/// Rollback mirrors are for v1 readers only: the committed and scoped
+/// snapshots remain authoritative, while the legacy journal omits scoped-only
+/// records that an older binary cannot represent safely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn rollback_legacy_mirror_persists_only_v1_compatible_records() {
+    let (disk_paths, storage) = heal_env().await;
+    register_local_disks(&disk_paths, "mrf-rollback-mirror-test").await;
+
+    let manager = Arc::new(HealManager::new(
+        storage,
+        Some(HealConfig {
+            queue_size: 0,
+            heal_interval: Duration::from_secs(3600),
+            enable_auto_heal: false,
+            ..Default::default()
+        }),
+    ));
+    mrf_queue::spawn_mrf_consumer(manager.clone());
+
+    let scoped_only = b"rollback-scoped-only-object";
+    let v1_compatible = b"rollback-v1-compatible-object";
+    assert_eq!(
+        mrf_channel::try_send_mrf_intent_typed(
+            MrfKind::PartialWrite,
+            "rollback-bucket",
+            std::str::from_utf8(scoped_only).expect("fixture object is UTF-8"),
+            None,
+            Some(MrfScope {
+                pool_index: 3,
+                set_index: 7,
+            }),
+        ),
+        MrfIngressResult::Enqueued,
+        "scoped-only intent should be accepted by the live consumer"
+    );
+    assert_eq!(
+        mrf_channel::try_send_mrf_intent_typed(
+            MrfKind::PartialWrite,
+            "rollback-bucket",
+            std::str::from_utf8(v1_compatible).expect("fixture object is UTF-8"),
+            None,
+            None,
+        ),
+        MrfIngressResult::Enqueued,
+        "v1-compatible intent should be accepted by the live consumer"
+    );
+
+    let flushed = wait_until(Duration::from_secs(10), || async {
+        committed_payload_contains_on_all_disks(&disk_paths, &[scoped_only, v1_compatible])
+            && journal_contains_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, scoped_only)
+            && journal_contains_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, v1_compatible)
+            && journal_contains_on_all_disks(&disk_paths, JOURNAL_REL, v1_compatible)
+            && !journal_contains_on_any_disk(&disk_paths, JOURNAL_REL, scoped_only)
+    })
+    .await;
+    assert!(
+        flushed,
+        "runtime flush must persist rollback-safe mirrors without leaking scoped-only records into the legacy journal"
+    );
+    assert_eq!(
+        manager.operations_snapshot().await.queued_by_source.mrf,
+        0,
+        "zero-capacity manager keeps both intents in the MRF runtime so the persisted snapshot is observable"
     );
 }
 
