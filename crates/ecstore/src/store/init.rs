@@ -3859,13 +3859,60 @@ mod tests {
             .await
             .expect("suspended source versions should be readable")
             .expect("suspended source must exist before worker convergence");
+        assert_eq!(versions.versions.len(), 1, "DELETE must not add a marker to the retiring source");
+        let source = &versions.versions[0];
         assert!(
-            versions
-                .versions
-                .iter()
-                .any(|version| !version.deleted && version.version_id.is_none_or(|version_id| version_id.is_nil())),
-            "the source pool must retain its null data version while DELETE owns the fixed fence"
+            !source.deleted && source.version_id.is_none_or(|version_id| version_id.is_nil()),
+            "the source pool must retain its null data version until worker convergence"
         );
+        assert_eq!(source.mod_time, Some(OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND));
+
+        let mut reader = store.pools[0]
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the retiring source must remain directly readable before worker convergence");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("read retained source bytes");
+        assert_eq!(body, b"suspended source generation");
+    }
+
+    async fn assert_suspended_null_delete_marker_visible(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        marker_mod_time: OffsetDateTime,
+    ) {
+        let versions = store.pools[1]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("healthy target versions should be readable")
+            .expect("the healthy target must retain the DELETE marker");
+        assert_eq!(versions.versions.len(), 1, "the target must contain only the null delete marker");
+        let marker = &versions.versions[0];
+        assert!(marker.deleted, "migration must not replace the DELETE marker with source data");
+        assert!(marker.version_id.is_none_or(|version_id| version_id.is_nil()));
+        assert_eq!(marker.size, 0);
+        assert_eq!(marker.mod_time, Some(marker_mod_time), "migration must preserve the marker generation");
+        assert!(marker_mod_time > OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND);
+
+        let head_err = store
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("HEAD must observe the DELETE marker instead of the old null source");
+        assert!(matches!(head_err, Error::ObjectNotFound(_, _)), "unexpected HEAD result: {head_err:?}");
+        let get_err = match store
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+        {
+            Ok(_) => panic!("GET must not resurrect the deleted null source"),
+            Err(err) => err,
+        };
+        assert!(matches!(get_err, Error::ObjectNotFound(_, _)), "unexpected GET result: {get_err:?}");
     }
 
     #[tokio::test]
@@ -7703,7 +7750,7 @@ mod tests {
         write_suspended_decommission_source(&store, &bucket, object).await;
         mark_test_pool_decommissioning(&store, 0).await;
 
-        let delete_err = store
+        let deleted = store
             .delete_object(
                 &bucket,
                 object,
@@ -7713,12 +7760,12 @@ mod tests {
                 },
             )
             .await
-            .expect_err("capacity-reserved target must reject a concurrent suspended DELETE");
-        assert!(
-            matches!(delete_err, Error::SlowDown),
-            "unexpected suspended DELETE result: {delete_err:?}"
-        );
+            .expect("a healthy reserved target must accept suspended DELETE");
+        assert!(deleted.delete_marker);
+        assert_eq!(deleted.version_id, Some(uuid::Uuid::nil()));
+        let marker_mod_time = deleted.mod_time.expect("DELETE must return the marker generation");
         assert_suspended_null_source_present(&store, &bucket, object).await;
+        assert_suspended_null_delete_marker_visible(&store, &bucket, object, marker_mod_time).await;
 
         let source_set = store.pools[0].get_disks_by_key(object);
         let worker_store = Arc::clone(&store);
@@ -7738,7 +7785,7 @@ mod tests {
         })
         .await
         .expect("suspended decommission worker should join")
-        .expect("worker must migrate the fenced suspended source");
+        .expect("worker must converge the old null source behind the newer DELETE marker");
 
         assert_decommission_source_absent(
             &store,
@@ -7750,10 +7797,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(
-            read_decommission_target_body(&store, &bucket, object, &ObjectOptions::default()).await,
-            b"suspended source generation"
-        );
+        assert_suspended_null_delete_marker_visible(&store, &bucket, object, marker_mod_time).await;
         shutdown.cancel();
     }
 
@@ -7786,7 +7830,7 @@ mod tests {
                 },
                 None,
             ));
-        let (_deleted, errors) = store
+        let (deleted, errors) = store
             .delete_objects(
                 &bucket,
                 vec![ObjectToDelete {
@@ -7800,10 +7844,23 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(errors.as_slice(), [Some(Error::SlowDown)]),
+            matches!(errors.as_slice(), [None]),
             "unexpected suspended batch DELETE result: {errors:?}"
         );
+        assert_eq!(deleted.len(), 1);
+        assert!(deleted[0].delete_marker);
+        assert_eq!(deleted[0].object_name, object);
+        assert!(
+            deleted[0]
+                .delete_marker_version_id
+                .is_none_or(|version_id| version_id.is_nil()),
+            "batch DELETE must retain the native null version identity"
+        );
+        let marker_mod_time = deleted[0]
+            .delete_marker_mtime
+            .expect("batch DELETE must return the marker generation");
         assert_suspended_null_source_present(&store, &bucket, object).await;
+        assert_suspended_null_delete_marker_visible(&store, &bucket, object, marker_mod_time).await;
 
         let source_set = store.pools[0].get_disks_by_key(object);
         let worker_store = Arc::clone(&store);
@@ -7823,7 +7880,7 @@ mod tests {
         })
         .await
         .expect("suspended batch decommission worker should join")
-        .expect("worker must migrate the batch-fenced suspended source");
+        .expect("worker must converge the old null source behind the newer batch DELETE marker");
 
         assert_decommission_source_absent(
             &store,
@@ -7835,10 +7892,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(
-            read_decommission_target_body(&store, &bucket, object, &ObjectOptions::default()).await,
-            b"suspended source generation"
-        );
+        assert_suspended_null_delete_marker_visible(&store, &bucket, object, marker_mod_time).await;
         shutdown.cancel();
     }
 
