@@ -22,8 +22,9 @@
 //! responsibility through a newer durable snapshot or a verified repair proof.
 //! An unreadable commit path cannot prove that only legacy data exists. This
 //! explicit inspection API fails closed and never mutates recovery anchors.
-//! It is wired into the replay reader before writer activation, but the writer
-//! remains gated on ownership-aware handoff.
+//! The live consumer writes committed checkpoints alongside the scoped and
+//! legacy journal mirrors; cleanup remains gated by replay ownership and exact
+//! verified repair proof handoff.
 //! One surviving committed replica supports process restart recovery only;
 //! this reader does not establish a replication quorum or a power-loss policy.
 
@@ -356,8 +357,8 @@ fn validate_reusable_manifest_slot(existing: Option<&[u8]>, sequence: u64, paylo
 /// The writer is a narrow production primitive for the ownership-aware MRF
 /// handoff: it validates the whole journal payload, preserves the previous
 /// committed slot, and publishes the manifest only after the successor payload
-/// reaches the same disk. It does not delete legacy journals, tombstone older
-/// anchors, or activate the live consumer.
+/// reaches the same disk. It does not delete legacy journals or tombstone older
+/// anchors by itself; the consumer decides cleanup after replay handoff.
 pub async fn publish_committed_snapshot(
     disks: &[EcstoreDiskStore],
     owner: Uuid,
@@ -371,7 +372,10 @@ pub async fn publish_committed_snapshot(
     if owner.is_nil() || sequence == 0 || sequence == u64::MAX {
         return Err(SnapshotError::Corrupt);
     }
-    if payload.len() > limit || decode_journal(payload).1 != 0 {
+    if payload.len() > limit {
+        return Err(SnapshotError::TooLarge);
+    }
+    if decode_journal(payload).1 != 0 {
         return Err(SnapshotError::Corrupt);
     }
     let current = read_committed(disks, limit).await?;
@@ -555,13 +559,13 @@ pub async fn inspect_local_committed_snapshot(max_bytes: usize) -> Result<Option
     read_committed(&super::journal_disks().await, max_bytes).await
 }
 
-/// Remove committed manifests from `owner` whose sequence is no newer than
+/// Remove committed checkpoints from `owner` whose sequence is no newer than
 /// `committed_through`.
 ///
-/// Payload files are intentionally left as orphans after their manifest is
-/// removed. Readers cannot discover a payload without its matching manifest,
-/// and deleting manifests first prevents an older retained slot from becoming
-/// visible again after the newest replay has been fully discharged.
+/// Cleanup is manifest-first so readers cannot rediscover an older payload
+/// after the newest replay has been fully discharged. The payload is removed
+/// only after the manifest and body were revalidated as one complete committed
+/// checkpoint; damaged, future, mismatched, or foreign-owner slots are retained.
 pub async fn delete_committed_snapshots_through(
     owner: Uuid,
     committed_through: u64,
@@ -580,11 +584,10 @@ async fn delete_committed_snapshots_through_on(
     if disks.is_empty() {
         return Err(SnapshotError::NoWritableReplica);
     }
-    let mut any_changed = false;
     let mut first_error = None;
     for disk in disks {
-        for path in MANIFEST_PATHS {
-            let existing = match read_bounded(disk, path, MANIFEST_LEN).await {
+        for (manifest_path, payload_path) in MANIFEST_PATHS.into_iter().zip(PAYLOAD_PATHS) {
+            let manifest_bytes = match read_bounded(disk, manifest_path, MANIFEST_LEN).await {
                 Ok(Some(existing)) => existing,
                 Ok(None) => continue,
                 Err(error) => {
@@ -594,7 +597,7 @@ async fn delete_committed_snapshots_through_on(
                     continue;
                 }
             };
-            let manifest = match Manifest::decode(&existing, max_bytes) {
+            let manifest = match Manifest::decode(&manifest_bytes, max_bytes) {
                 Ok(manifest) => manifest,
                 Err(error) => {
                     if first_error.is_none() {
@@ -606,16 +609,58 @@ async fn delete_committed_snapshots_through_on(
             if manifest.owner != owner || manifest.sequence > committed_through {
                 continue;
             }
+            let payload_bytes = match read_bounded(disk, payload_path, manifest.payload_len).await {
+                Ok(Some(payload)) => payload,
+                Ok(None) => {
+                    if first_error.is_none() {
+                        first_error = Some(SnapshotError::Corrupt);
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            };
+            if let Err(error) = CommittedSnapshot::decode(0, &manifest_bytes, payload_bytes.clone(), max_bytes) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
             match EcstoreDiskAPI::compare_and_update_file(
                 disk.as_ref(),
                 RUSTFS_META_BUCKET,
-                path,
-                Some(EcstoreDiskBytes::from(existing)),
+                manifest_path,
+                Some(EcstoreDiskBytes::copy_from_slice(&manifest_bytes)),
                 None,
             )
             .await
             {
-                Ok(EcstoreConditionalFileUpdate::Updated) => any_changed = true,
+                Ok(EcstoreConditionalFileUpdate::Updated) => {
+                    match EcstoreDiskAPI::compare_and_update_file(
+                        disk.as_ref(),
+                        RUSTFS_META_BUCKET,
+                        payload_path,
+                        Some(EcstoreDiskBytes::copy_from_slice(&payload_bytes)),
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(
+                            EcstoreConditionalFileUpdate::Updated
+                            | EcstoreConditionalFileUpdate::Missing
+                            | EcstoreConditionalFileUpdate::Mismatch,
+                        ) => {}
+                        Err(error) => {
+                            if first_error.is_none() {
+                                first_error = Some(SnapshotError::Disk(error));
+                            }
+                        }
+                    }
+                }
                 Ok(EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch) => {}
                 Err(error) => {
                     if first_error.is_none() {
@@ -625,13 +670,7 @@ async fn delete_committed_snapshots_through_on(
             }
         }
     }
-    if any_changed {
-        Ok(true)
-    } else if let Some(error) = first_error {
-        Err(error)
-    } else {
-        Ok(true)
-    }
+    if let Some(error) = first_error { Err(error) } else { Ok(true) }
 }
 
 async fn read_recovery_snapshot(disks: &[EcstoreDiskStore], limit: usize) -> Result<Option<RecoverySnapshot>, SnapshotError> {
@@ -1102,6 +1141,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_snapshot_writer_capacity_failure_preserves_previous_anchor() {
+        let root = TempDir::new().expect("test directory");
+        let store = disk(&root, "disk").await;
+        let owner = Uuid::new_v4();
+        let old = payload("old");
+        let next = payload("next");
+        commit(&store, 0, owner, 1, &old).await;
+
+        let result = publish_committed_snapshot(std::slice::from_ref(&store), owner, 2, &next, next.len() - 1).await;
+
+        assert!(
+            matches!(result, Err(SnapshotError::TooLarge)),
+            "capacity failure must be reported separately from corruption: {result:?}"
+        );
+        let reopened = disk(&root, "disk").await;
+        let recovered = read_committed(std::slice::from_ref(&reopened), 4096)
+            .await
+            .expect("read previous committed snapshot")
+            .expect("old anchor remains committed");
+        assert_eq!(recovered.sequence(), 1);
+        assert_eq!(recovered.slot(), 0);
+        assert_eq!(recovered.payload(), old.as_slice());
+        assert_eq!(
+            EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[0])
+                .await
+                .expect("old manifest retained")
+                .as_ref(),
+            manifest(owner, 1, &old).as_slice()
+        );
+        assert!(
+            matches!(
+                EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, PAYLOAD_PATHS[1]).await,
+                Err(EcstoreDiskError::FileNotFound | EcstoreDiskError::VolumeNotFound)
+            ),
+            "oversized successor payload must not be staged"
+        );
+    }
+
+    #[tokio::test]
     async fn committed_snapshot_writer_does_not_overwrite_damaged_inactive_manifest() {
         let root = TempDir::new().expect("test directory");
         let store = disk(&root, "disk").await;
@@ -1355,7 +1433,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_cleanup_removes_only_manifests_at_or_below_sequence() {
+    async fn committed_cleanup_removes_complete_checkpoint_at_or_below_sequence() {
         let root = TempDir::new().expect("test directory");
         let disk = disk(&root, "disk").await;
         let owner = Uuid::new_v4();
@@ -1377,12 +1455,19 @@ mod tests {
             ),
             "old manifest is gone, so the old payload cannot become visible again"
         );
+        assert!(
+            matches!(
+                EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, PAYLOAD_PATHS[0]).await,
+                Err(EcstoreDiskError::FileNotFound | EcstoreDiskError::VolumeNotFound)
+            ),
+            "old payload should be reclaimed after its manifest is removed"
+        );
         assert_eq!(
-            EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, PAYLOAD_PATHS[0])
+            EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, PAYLOAD_PATHS[1])
                 .await
-                .expect("old payload orphan may remain")
+                .expect("newer payload retained")
                 .as_ref(),
-            older
+            newer
         );
         let recovered = read_committed(std::slice::from_ref(&disk), 4096)
             .await
@@ -1390,6 +1475,40 @@ mod tests {
             .expect("newer commit remains visible");
         assert_eq!(recovered.sequence(), 4);
         assert_eq!(recovered.payload(), newer);
+    }
+
+    #[tokio::test]
+    async fn committed_cleanup_retains_manifest_when_payload_identity_mismatches() {
+        let root = TempDir::new().expect("test directory");
+        let disk = disk(&root, "disk").await;
+        let owner = Uuid::new_v4();
+        let declared = payload("declared");
+        let actual = payload("actual");
+        install(&disk, MANIFEST_PATHS[0], &manifest(owner, 3, &declared)).await;
+        install(&disk, PAYLOAD_PATHS[0], &actual).await;
+
+        assert!(
+            matches!(
+                delete_committed_snapshots_through_on(std::slice::from_ref(&disk), owner, 3, 4096).await,
+                Err(SnapshotError::Corrupt)
+            ),
+            "cleanup must fail closed when the committed body no longer matches its manifest"
+        );
+
+        assert_eq!(
+            EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[0])
+                .await
+                .expect("mismatched manifest retained")
+                .as_ref(),
+            manifest(owner, 3, &declared)
+        );
+        assert_eq!(
+            EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, PAYLOAD_PATHS[0])
+                .await
+                .expect("mismatched payload retained")
+                .as_ref(),
+            actual
+        );
     }
 
     #[tokio::test]
@@ -1416,6 +1535,13 @@ mod tests {
                 Err(EcstoreDiskError::FileNotFound | EcstoreDiskError::VolumeNotFound)
             ),
             "the replay owner's manifest is reclaimed"
+        );
+        assert!(
+            matches!(
+                EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, PAYLOAD_PATHS[0]).await,
+                Err(EcstoreDiskError::FileNotFound | EcstoreDiskError::VolumeNotFound)
+            ),
+            "the replay owner's payload is reclaimed"
         );
         assert_eq!(
             EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[1])
