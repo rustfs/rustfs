@@ -262,6 +262,18 @@ mixed-peer fallback oracles; G09 keeps mixed-version reader, writer, and rollbac
 payload evidence explicit. These fields are part of the release contract, not
 evidence by themselves.
 
+The upgrade compatibility E2E can emit raw G09 JSON artifacts when
+`RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR` points at a fresh, task-owned directory.
+The rolling mixed-version test writes `G09-mixed_version_reader_evidence.json`
+and `G09-mixed_version_writer_evidence.json` after the old/new reader and writer
+assertions pass. The bucket-metadata rollback test writes
+`G09-rollback_payload_evidence.json` after the current -> previous -> current
+round trip has read back the known bucket configuration and objects. These
+artifacts are measured inputs for a later release bundle; the bundle must still
+record their relative paths, hashes, command provenance, timestamps, roles,
+participating revisions, and case lists before
+`--check-scanner-heal-release-bundle` can validate them.
+
 When the real release lanes have produced their dedicated artifacts, validate
 the complete hard-gate bundle with:
 
