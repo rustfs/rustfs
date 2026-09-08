@@ -13,7 +13,7 @@ import tempfile
 import unittest
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -927,6 +927,23 @@ def evidence_integer(value: object, name: str, minimum: int, maximum: int) -> in
     return value
 
 
+def evidence_string(value: object, name: str, pattern: str | None = None) -> str:
+    require(isinstance(value, str) and value.strip(), f"invalid string {name}")
+    if pattern is not None:
+        require(re.fullmatch(pattern, value) is not None, f"invalid string {name}")
+    return value
+
+
+def evidence_timestamp(value: object, name: str) -> datetime:
+    text = evidence_string(value, name)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"invalid timestamp {name}") from error
+    require(parsed.tzinfo is not None, f"{name} must include timezone")
+    return parsed
+
+
 def scanner_heal_registry_schema(registry: dict[str, object]) -> int:
     return evidence_integer(registry.get("schema"), "registry schema", 1, SCANNER_HEAL_REGISTRY_SCHEMA_MAX)
 
@@ -1260,14 +1277,30 @@ def release_bundle_artifact_path(bundle_path: Path, raw_path: object, gate: str,
     return resolved
 
 
-def validate_release_bundle_artifact(bundle_path: Path, gate: str, field: str, evidence: dict[str, object]) -> None:
+def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, gate: str, field: str,
+                                     evidence: dict[str, object]) -> str:
     require(evidence.get("evidence_type") == "measured", f"{gate}.{field} must be measured evidence")
+    require(evidence.get("source_revision") == source_revision, f"{gate}.{field} source revision mismatch")
+    run_id = evidence_string(evidence.get("run_id"), f"{gate}.{field}.run_id", r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}")
+    window_id = evidence_string(evidence.get("measurement_window_id"), f"{gate}.{field}.measurement_window_id",
+                                r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}")
+    require(window_id != run_id, f"{gate}.{field} must separate run and measurement-window identities")
+    started = evidence_timestamp(evidence.get("started_at"), f"{gate}.{field}.started_at")
+    finished = evidence_timestamp(evidence.get("finished_at"), f"{gate}.{field}.finished_at")
+    require(started <= finished, f"{gate}.{field} evidence timestamps are inverted")
+    command = evidence.get("command")
+    require(isinstance(command, list) and command and
+            all(isinstance(part, str) and part.strip() for part in command),
+            f"{gate}.{field} missing command provenance")
+    evidence_string(evidence.get("artifact_format"), f"{gate}.{field}.artifact_format",
+                    r"[A-Za-z0-9][A-Za-z0-9._+:-]{1,63}")
     artifact = release_bundle_artifact_path(bundle_path, evidence.get("artifact"), gate, field)
     require(sha(evidence.get("sha256")) and digest(artifact) == evidence["sha256"], f"{gate}.{field} artifact hash mismatch")
     summary = evidence.get("summary")
     require(isinstance(summary, str) and summary.strip(), f"{gate}.{field} missing human summary")
     if gate.startswith("P"):
         duration = evidence_integer(evidence.get("duration_seconds"), f"{gate}.{field}.duration_seconds", 1, 86400)
+        require((finished - started).total_seconds() + 1 >= duration, f"{gate}.{field} duration exceeds run window")
         require(duration >= 900, f"{gate}.{field} requires at least 900 seconds")
         if gate == "P3" and field == "two_hour_pressure_measurement":
             require(duration >= 7200, f"{gate}.{field} requires at least two hours")
@@ -1297,6 +1330,13 @@ def validate_release_bundle_artifact(bundle_path: Path, gate: str, field: str, e
             evidence_integer(evidence.get("pools"), "G14 multi_pool_evidence.pools", 2, 1024)
     if field == "profile_evidence":
         evidence_integer(evidence.get("resolved_samples"), f"{gate}.{field}.resolved_samples", 1, 2**63 - 1)
+    return window_id
+
+
+def validate_release_bundle_gate_windows(gate: str, field_windows: dict[str, str]) -> None:
+    if gate == "G14" or gate.startswith("P"):
+        windows = sorted(set(field_windows.values()))
+        require(len(windows) == 1, f"{gate} evidence fields must share one measurement window")
 
 
 def scanner_heal_release_bundle_status(root: Path, bundle_path: Path) -> dict[str, object]:
@@ -1309,7 +1349,10 @@ def scanner_heal_release_bundle_status(root: Path, bundle_path: Path) -> dict[st
     require(bundle.get("schema") == 1, "unsupported scanner/heal release evidence bundle schema")
     require(bundle.get("evidence") == "measured", "scanner/heal release evidence bundle must be measured")
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
-    require(bundle.get("source_revision") == revision, "scanner/heal release evidence source revision mismatch")
+    source_revision = bundle.get("source_revision")
+    require(isinstance(source_revision, str) and re.fullmatch(r"[0-9a-f]{40}", source_revision) is not None and
+            source_revision == revision,
+            "scanner/heal release evidence source revision mismatch")
     raw_gates = bundle.get("gates")
     require(isinstance(raw_gates, dict), "scanner/heal release evidence bundle missing gates")
 
@@ -1335,6 +1378,7 @@ def scanner_heal_release_bundle_status(root: Path, bundle_path: Path) -> dict[st
         missing_fields = [field for field in required_fields if field not in fields]
         if missing_fields:
             gate_errors.append(f"missing required fields: {', '.join(missing_fields)}")
+        field_windows: dict[str, str] = {}
         for field in required_fields:
             if field not in fields:
                 continue
@@ -1343,8 +1387,13 @@ def scanner_heal_release_bundle_status(root: Path, bundle_path: Path) -> dict[st
                 gate_errors.append(f"{field} must be an object")
                 continue
             try:
-                validate_release_bundle_artifact(bundle_path, gate, field, evidence)
+                field_windows[field] = validate_release_bundle_artifact(bundle_path, source_revision, gate, field, evidence)
             except (OSError, KeyError, TypeError, ValueError) as error:
+                gate_errors.append(str(error))
+        if not gate_errors:
+            try:
+                validate_release_bundle_gate_windows(gate, field_windows)
+            except ValueError as error:
                 gate_errors.append(str(error))
         if gate_errors:
             rejected[gate] = gate_errors
@@ -1593,21 +1642,33 @@ class SelfTests(unittest.TestCase):
         registry = read_json(root / ".config/scanner-heal-required-tests.json")
         requirements, _, _ = scanner_heal_release_requirements(registry)
         gates = {}
+        source_revision = "b" * 40
+        started = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
         for gate, requirement in requirements.items():
             fields = {}
             for field in SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate]:
                 artifact = artifact_dir / f"{gate}-{field}.json"
                 write_json(artifact, {"gate": gate, "field": field, "fixture": True})
+                duration = 60
                 evidence = {
                     "artifact": artifact.relative_to(bundle_dir).as_posix(),
                     "sha256": digest(artifact),
                     "evidence_type": "measured",
+                    "source_revision": source_revision,
+                    "run_id": f"{gate.lower()}-{field.replace('_', '-')}-run",
+                    "measurement_window_id": f"{gate.lower()}-window",
+                    "started_at": started.isoformat().replace("+00:00", "Z"),
+                    "command": ["cargo", "nextest", "run", requirement["description"]],
+                    "artifact_format": "json",
                     "summary": f"parser fixture for {gate}.{field}",
                 }
                 if gate.startswith("P"):
-                    evidence["duration_seconds"] = 900
+                    duration = 900
+                    evidence["duration_seconds"] = duration
                 if gate == "P3" and field == "two_hour_pressure_measurement":
-                    evidence["duration_seconds"] = 7200
+                    duration = 7200
+                    evidence["duration_seconds"] = duration
+                evidence["finished_at"] = (started + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z")
                 if gate in ("G03", "G09", "R-L"):
                     evidence["versions"] = ["previous", "candidate"]
                 if gate in ("G04", "G07", "R-E", "R-L"):
@@ -1628,7 +1689,7 @@ class SelfTests(unittest.TestCase):
                 "evidence_fields": fields,
             }
         bundle = bundle_dir / "release-evidence.json"
-        write_json(bundle, {"schema": 1, "evidence": "measured", "source_revision": "b" * 40, "gates": gates})
+        write_json(bundle, {"schema": 1, "evidence": "measured", "source_revision": source_revision, "gates": gates})
         return root, bundle
 
     def test_scanner_heal_release_bundle_accepts_complete_measured_evidence(self) -> None:
@@ -1686,6 +1747,43 @@ class SelfTests(unittest.TestCase):
                 self.assertEqual(status["decision"], "blocked")
                 self.assertFalse(status["release_approved"])
                 self.assertTrue(any(expected in error for error in status["rejected_gates"][gate]))
+
+    def test_scanner_heal_release_bundle_requires_field_provenance(self) -> None:
+        for fault, mutation, expected in (
+            ("source", lambda item: item.update({"source_revision": "c" * 40}), "source revision mismatch"),
+            ("run-id", lambda item: item.pop("run_id"), "run_id"),
+            ("window-id", lambda item: item.update({"measurement_window_id": item["run_id"]}), "separate run"),
+            ("started-at", lambda item: item.update({"started_at": "not-a-time"}), "timestamp"),
+            ("finished-at", lambda item: item.update({"finished_at": "2026-09-07T00:00:00Z"}), "timestamps are inverted"),
+            ("command", lambda item: item.update({"command": []}), "command provenance"),
+            ("artifact-format", lambda item: item.pop("artifact_format"), "artifact_format"),
+        ):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+                data = read_json(bundle)
+                mutation(data["gates"]["G01"]["evidence_fields"]["root_authority_evidence"])
+                write_json(bundle, data)
+
+                with mock.patch("subprocess.check_output", return_value="b" * 40):
+                    status = scanner_heal_release_bundle_status(root, bundle)
+                self.assertEqual(status["decision"], "blocked")
+                self.assertFalse(status["release_approved"])
+                self.assertTrue(any(expected in error for error in status["rejected_gates"]["G01"]), fault)
+
+    def test_scanner_heal_release_bundle_requires_same_gate_measurement_window(self) -> None:
+        for gate, field in (("G14", "multi_pool_evidence"), ("P1", "profile_evidence"), ("P3", "heal_capacity_measurement")):
+            with self.subTest(gate=gate), tempfile.TemporaryDirectory() as tmp:
+                root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+                data = read_json(bundle)
+                data["gates"][gate]["evidence_fields"][field]["measurement_window_id"] = f"{gate.lower()}-different-window"
+                write_json(bundle, data)
+
+                with mock.patch("subprocess.check_output", return_value="b" * 40):
+                    status = scanner_heal_release_bundle_status(root, bundle)
+                self.assertEqual(status["decision"], "blocked")
+                self.assertFalse(status["release_approved"])
+                self.assertTrue(any("must share one measurement window" in error
+                                    for error in status["rejected_gates"][gate]))
 
     def test_scanner_heal_case_does_not_approve_pending_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
