@@ -127,6 +127,18 @@ Decryption loads exactly the version recorded in the envelope and fails closed w
 
 Do not rotate any key until **every** RustFS node runs a build that understands the `master_key_version` envelope field. Older binaries ignore the field and always decrypt with the current material: harmless while nothing has been rotated, but after a rotation they fail to decrypt every object wrapped by an earlier key version. Complete the rolling upgrade of the entire cluster first, then rotate. The rest of this constraint class is collected in [Mixed-version clusters during a rolling upgrade](#mixed-version-clusters-during-a-rolling-upgrade).
 
+## SSE-C requires a secure transport
+
+An SSE-C request carries the customer's AES key in a request header, so AWS S3 and MinIO both refuse one that did not arrive over TLS. A plaintext hop hands that key to anyone on the path, and because the object cannot be read without the same key, the exposure lasts as long as the object does.
+
+This release reports rather than refuses, because flipping straight to a rejection would break every plaintext staging and test deployment inside a release window:
+
+- Every SSE-C request on a plaintext transport increments `rustfs_ssec_plaintext_requests_total` and logs one `ssec_request_without_tls` warning per process.
+- `RUSTFS_SSE_C_REQUIRE_TLS=true` (default `false`) refuses those requests now, with the same `400 InvalidRequest` wording AWS uses. Confirm the counter reads zero before enabling it.
+- The default is expected to flip in a later release.
+
+The verdict is per connection: a listener that terminates TLS satisfies it, and so does an `https` protocol forwarded by a proxy the trusted-proxy configuration accepts. A direct plaintext client asserts nothing, and a forwarded protocol from an untrusted peer is not consulted.
+
 ## Object ciphertext format: what the v1 frame layout does and does not authenticate
 
 Every object RustFS writes today uses the **v1** frame layout (the v2 layout exists and is read automatically, but its write switch `RUSTFS_ENCRYPTION_FRAME_V2` is off by default). Each frame is authenticated with AES-256-GCM under a nonce derived from the object's base nonce and the frame's index. Three properties do **not** follow from that, and an operator's threat model has to account for them:
@@ -266,6 +278,7 @@ The Local backend stores one JSON record per key (`<key_id>.key`) plus an Argon2
 - `Local` is the default backend (`kms_backend` defaults to `local`) and is a development, testing and demo backend; it is not supported for production. Activating a backend whose capabilities report `production_supported: false` logs a `kms_backend_positioning` warning on every start, restart and reconfigure, and the `kms/status` capability matrix carries the same flag. The positioning is a warning, not a gate.
 - Configuration validation enforces stricter rules outside explicit development mode: a master key is required and `key_dir` must not live under the process temp directory.
 - The RustFS Kubernetes operator places the key directory on a PersistentVolumeClaim, so keys survive pod rescheduling.
+- **A multi-node deployment cannot share it.** Key material lives on each node's own disk and the Argon2id salt is generated per node, so two nodes derive different keys from the same `master_key`. An object encrypted on node A cannot be decrypted on node B; behind a load balancer that appears as intermittent 500s on reads that succeeded a moment earlier. Configuring `Local` while the deployment is distributed logs `kms_node_local_backend_in_distributed_deployment` and appends the same warning to the `kms/configure` response. This stays a warning, not a gate.
 - Production multi-node deployments should use the Vault Transit backend.
 
 ### Deployment support matrix
