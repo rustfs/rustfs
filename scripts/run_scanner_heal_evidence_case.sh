@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${RUSTFS_PYTHON_BIN:-python3}"
-PROFILE="e2e-nightly"
+PROFILE=""
 CASE_ID="background-target-crash"
 RUN_DIR=""
 PLAN_ONLY=0
@@ -18,7 +18,7 @@ then validate the produced receipt, nextest listing, JUnit, and case oracle.
 
 Options:
   --case CASE          Registry case to run (default: background-target-crash)
-  --profile PROFILE   Nextest profile to use (default: e2e-nightly)
+  --profile PROFILE   Nextest profile to use (default: registry lane)
   --run-dir DIR       New evidence directory (default: target/scanner-heal-evidence/CASE-TIMESTAMP)
   --plan-only         Validate registry selection and print the exact filter without running cargo
   --self-test         Run lightweight CLI/registry checks without building Rust
@@ -29,6 +29,18 @@ a successful case run it verifies that the release gate still remains blocked.
 Set RUSTFS_E2E_TEST_PORT_MIN and RUSTFS_E2E_TEST_PORT_RANGE to move the e2e
 port allocator when the default 20000..30000 test range is unavailable.
 USAGE
+}
+
+case_ids() {
+    "$PYTHON_BIN" - "$ROOT/.config/scanner-heal-required-tests.json" <<'PY'
+import json
+import pathlib
+import sys
+
+registry = json.loads(pathlib.Path(sys.argv[1]).read_text())
+for case_id in sorted(registry["cases"]):
+    print(case_id)
+PY
 }
 
 case_field() {
@@ -109,20 +121,24 @@ PY
 }
 
 run_self_test() {
-    local filter
-    filter="$(test_filter_for background-target-crash)"
-    case "$filter" in
-        *background_target_crash*) ;;
-        *)
-            echo "self-test failed: crash case filter missing" >&2
-            return 1
-            ;;
-    esac
     if "$0" --case release --plan-only >/dev/null 2>&1; then
         echo "self-test failed: release pseudo-case must not be runnable" >&2
         return 1
     fi
-    "$0" --case background-target-crash --plan-only >/dev/null
+    local case_id
+    while IFS= read -r case_id; do
+        local expected_filter expected_profile plan
+        expected_filter="$(test_filter_for "$case_id")"
+        expected_profile="$(case_field "$case_id" lane)"
+        plan="$("$0" --case "$case_id" --plan-only)"
+        if [[ "$plan" != *"case=$case_id"* ]] ||
+            [[ "$plan" != *"profile=$expected_profile"* ]] ||
+            [[ "$plan" != *"filter=$expected_filter"* ]] ||
+            [[ "$plan" != *"run_dir=$ROOT/target/scanner-heal-evidence/$case_id-"* ]]; then
+            echo "self-test failed: registry case plan mismatch for $case_id" >&2
+            return 1
+        fi
+    done < <(case_ids)
 }
 
 while [[ $# -gt 0 ]]; do
@@ -166,6 +182,9 @@ fi
 
 case_field "$CASE_ID" name >/dev/null
 TEST_FILTER="$(test_filter_for "$CASE_ID")"
+if [[ -z "$PROFILE" ]]; then
+    PROFILE="$(case_field "$CASE_ID" lane)"
+fi
 case "$CASE_ID" in
   background-target-crash|background-target-restart)
     export RUSTFS_HEAL_CHAOS_OBJECT_COUNT="${RUSTFS_HEAL_CHAOS_OBJECT_COUNT:-64}"

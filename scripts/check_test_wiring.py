@@ -956,6 +956,9 @@ def scanner_heal_oracle_names(root: Path) -> tuple[str, ...]:
     names = set()
     for case_id, requirement in cases.items():
         require(isinstance(case_id, str) and case_id, "invalid scanner/heal case identity")
+        lane = requirement.get("lane")
+        require(isinstance(lane, str) and re.fullmatch(r"[a-z0-9-]+", lane) is not None,
+                f"invalid nextest profile lane for {case_id}")
         oracle = requirement.get("oracle")
         require(isinstance(oracle, str) and oracle.endswith(".json"), f"invalid oracle for {case_id}")
         path = Path(oracle)
@@ -1666,6 +1669,16 @@ class SelfTests(unittest.TestCase):
             })
         finish_scanner_heal_receipt(run_dir, 0, root)
         return root, run_dir
+
+    def test_scanner_heal_case_lane_is_required_for_runner_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self.scanner_heal_fixture(Path(tmp))
+            registry_path = root / ".config/scanner-heal-required-tests.json"
+            registry = read_json(registry_path)
+            del registry["cases"]["ec84-target-drive-restart"]["lane"]
+            write_json(registry_path, registry)
+            with self.assertRaisesRegex(ValueError, "invalid nextest profile lane for ec84-target-drive-restart"):
+                scanner_heal_oracle_names(root)
 
     def scanner_heal_release_bundle_fixture(self, directory: Path) -> tuple[Path, Path]:
         """Parser fixtures only; the bundle is not runtime evidence."""
