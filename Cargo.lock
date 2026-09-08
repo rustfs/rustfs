@@ -10578,6 +10578,7 @@ dependencies = [
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
+ "temp-env",
  "thiserror 2.0.20",
  "tokio",
  "tokio-test",
