@@ -4537,6 +4537,48 @@ async fn test_force_start_marks_dedup_key_for_future_duplicates() {
     );
 }
 
+#[tokio::test]
+async fn same_request_id_replay_reuses_existing_task_without_force_start_duplication() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let manager = HealManager::new(storage, None);
+
+    let mut original = admin_prefix_request("bucket", "logs/");
+    original.force_start = true;
+    let original_id = original.id.clone();
+    let accepted = manager
+        .submit_heal_request_with_receipt(original.clone())
+        .await
+        .expect("original forceStart request should queue");
+    assert_eq!(accepted.result, HealAdmissionResult::Accepted);
+    assert_eq!(accepted.task_id, original_id);
+
+    let replayed = manager
+        .submit_heal_request_with_receipt(original.clone())
+        .await
+        .expect("same request id and payload should reuse the existing task");
+    assert_eq!(replayed.result, HealAdmissionResult::Accepted);
+    assert_eq!(replayed.task_id, original_id);
+    assert_eq!(
+        manager.get_queue_length().await,
+        1,
+        "exact forceStart replay must not create a second queued task"
+    );
+
+    let mut changed = original;
+    changed.options.remove_corrupted = true;
+    let changed = manager
+        .submit_heal_request_with_receipt(changed)
+        .await
+        .expect("same request id with a changed payload should fail closed");
+    assert_eq!(changed.result, HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning));
+    assert_eq!(changed.task_id, original_id);
+    assert_eq!(
+        manager.get_queue_length().await,
+        1,
+        "same-id conflict must not displace or duplicate the original task"
+    );
+}
+
 #[test]
 fn test_running_heal_set_counts_groups_set_scoped_tasks() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);

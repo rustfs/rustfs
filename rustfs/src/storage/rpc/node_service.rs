@@ -3475,6 +3475,9 @@ mod tests {
             1,
             "post-admission response loss must leave exactly one canonical task"
         );
+        if let Some(cache) = super::HEAL_CONTROL_REPLAY_CACHE.get() {
+            cache.lock().await.clear();
+        }
 
         let mut retry = connect_faulty_heal_control_client(
             Arc::clone(&manager),

@@ -106,7 +106,7 @@ const EVENT_HEAL_ERASURE_SET_STAGE: &str = "heal_erasure_set_stage";
 const EVENT_HEAL_ERASURE_SET_RESULT: &str = "heal_erasure_set_result";
 
 /// Heal type
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HealType {
     /// Cluster heal
     Cluster,
@@ -209,7 +209,7 @@ impl HealPriority {
 }
 
 /// Heal options
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealOptions {
     /// Scan mode
     pub scan_mode: HealScanMode,

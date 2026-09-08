@@ -506,6 +506,25 @@ fn active_heal_for_dedup_key(active_heals: &HashMap<String, Arc<HealTask>>, key:
         .map(|(task_id, task)| (task_id.clone(), task.heal_type.clone()))
 }
 
+fn request_matches_task(request: &HealRequest, task: &HealTask) -> bool {
+    request.heal_type == task.heal_type
+        && request.options == task.options
+        && request.priority == task.priority
+        && request.source == task.source
+        && request.retry_attempts == task.retry_attempts
+        && request.heal_endpoints == task.heal_endpoints
+}
+
+fn request_matches_request(request: &HealRequest, existing: &HealRequest) -> bool {
+    request.heal_type == existing.heal_type
+        && request.options == existing.options
+        && request.priority == existing.priority
+        && request.source == existing.source
+        && request.force_start == existing.force_start
+        && request.retry_attempts == existing.retry_attempts
+        && request.heal_endpoints == existing.heal_endpoints
+}
+
 fn retrying_heal_for_dedup_key(retrying_heals: &HashMap<String, RetryingHeal>, key: &str) -> Option<(String, HealType)> {
     retrying_heals
         .iter()
@@ -1613,6 +1632,64 @@ impl HealManager {
         pause_duplicate_admission_after_active_lock(&request.id).await;
         let mut queue = self.heal_queue.lock().await;
         let retrying_heals = self.retrying_heals.lock().await;
+
+        let request_id_admission = active_heals
+            .get(&request.id)
+            .map(|task| (request_matches_task(&request, task), "active"))
+            .or_else(|| {
+                queue
+                    .requests()
+                    .find(|queued| queued.id == request.id)
+                    .map(|queued| (request_matches_request(&request, queued), "queued"))
+            })
+            .or_else(|| {
+                retrying_heals
+                    .get(&request.id)
+                    .map(|retrying| (request_matches_request(&request, &retrying.request), "retrying"))
+            });
+        if let Some((matches_existing, duplicate_state)) = request_id_admission {
+            let admission = if matches_existing {
+                HealAdmissionResult::Accepted
+            } else {
+                HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+            };
+            if matches!(admission, HealAdmissionResult::Accepted | HealAdmissionResult::Merged)
+                && let Some(target) = mrf_notice_target
+            {
+                let mut targets = lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets);
+                Self::insert_mrf_repair_notice_target(&mut targets, &request.id, target);
+            }
+            drop(retrying_heals);
+            drop(queue);
+            drop(active_heals);
+            let lock_phase = lock_phase_start.elapsed();
+            Self::record_admission_metric(request.source, admission, "duplicate");
+            self.record_admission_observation(HealAdmissionObservation {
+                source,
+                result: admission,
+                context: "duplicate",
+                force_start,
+                displaced: false,
+                start_duration: admission_start.elapsed(),
+                lock_phase,
+            });
+            debug!(
+                target: "rustfs::heal::manager",
+                event = EVENT_HEAL_QUEUE_ADMISSION,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
+                request_id = %request.id,
+                duplicate_state,
+                result = admission.result_label(),
+                reason = admission.reason_label(),
+                "Heal queue admission reused an existing request id"
+            );
+            return Ok(HealAdmissionReceipt {
+                result: admission,
+                task_id: request.id,
+            });
+        }
+
         let duplicate = (!request.force_start).then(|| {
             active_heal_for_dedup_key(&active_heals, &dedup_key)
                 .map(|(task_id, _)| (task_id, "active"))
