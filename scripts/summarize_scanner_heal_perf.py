@@ -12,6 +12,8 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from scanner_abba import validate_release_evidence_manifest
+
 MAX_JSON_BYTES = 1024 * 1024
 CACHE_COST_PREFIX = "CACHE_COST "
 PASS_STATES = {"pass"}
@@ -168,6 +170,7 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
     measured = report.get("evidence") == "measured"
     passed = report_state in PASS_STATES and performance_state in PASS_STATES and measured
     if passed:
+        validate_release_evidence_manifest({**manifest, "evidence": "measured"})
         for index, comparison in enumerate(comparisons):
             require_measured_comparison_evidence(comparison, index)
     gate_state = "pass" if passed else "fail"
@@ -217,6 +220,7 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
             "durability": fixed.get("durability"),
             "topology": fixed.get("topology"),
             "offered_load_ops": fixed.get("offered_load_ops"),
+            "release_evidence": manifest.get("release_evidence"),
         },
     }
 

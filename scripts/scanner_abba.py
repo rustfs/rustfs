@@ -29,6 +29,16 @@ METRICS = (
 )
 REPEATABILITY_LIMIT = Decimal("0.05")
 P2_WORK_MULTIPLE_LIMIT = Decimal("1.2")
+RELEASE_PROFILE_ARTIFACTS = (
+    "allocation-profile",
+    "flamegraph",
+    "rss-samples",
+    "save-frequency",
+)
+RELEASE_FAULT_MODES = (
+    "process-restart",
+    "process-crash-restart",
+)
 
 
 def require(condition, message):
@@ -140,6 +150,95 @@ def validate_manifest(manifest):
         number(manifest["expected_healed_objects"].get(scenario), f"{scenario} expected repairs")
         if scenario in ("running-heal", "mrf-replay"):
             require(manifest["expected_healed_objects"][scenario] > 0, f"{scenario} requires repairs")
+    validate_release_evidence_manifest(manifest)
+
+
+def release_evidence_integer(value, name, minimum=1, maximum=1024):
+    require(type(value) is int and minimum <= value <= maximum, f"invalid release_evidence.{name}")
+    return value
+
+
+def release_evidence_string(value, name):
+    require(isinstance(value, str) and value.strip(), f"missing release_evidence.{name}")
+    return value
+
+
+def release_evidence_bool(value, name):
+    require(type(value) is bool, f"invalid release_evidence.{name}")
+    return value
+
+
+def release_evidence_true(value, name):
+    release_evidence_bool(value, name)
+    require(value is True, f"missing release_evidence.{name}")
+
+
+def validate_release_evidence_manifest(manifest):
+    if manifest["evidence"] != "measured":
+        return
+
+    evidence = manifest.get("release_evidence")
+    require(isinstance(evidence, dict), "missing release_evidence for measured ABBA")
+
+    topology = evidence.get("topology")
+    require(isinstance(topology, dict), "missing release_evidence.topology")
+    nodes = release_evidence_integer(topology.get("nodes"), "topology.nodes", 3, 3)
+    drives = release_evidence_integer(topology.get("drives_per_node"), "topology.drives_per_node", 4, 4)
+    data = release_evidence_integer(topology.get("erasure_data_blocks"), "topology.erasure_data_blocks", 8, 8)
+    parity = release_evidence_integer(topology.get("erasure_parity_blocks"), "topology.erasure_parity_blocks", 4, 4)
+    require(data + parity == nodes * drives, "release_evidence.topology must be 3x4 EC8+4")
+    release_evidence_integer(topology.get("pools"), "topology.pools", 2)
+    release_evidence_integer(topology.get("sets_total"), "topology.sets_total", 2)
+
+    distributed = evidence.get("distributed")
+    require(isinstance(distributed, dict), "missing release_evidence.distributed")
+    endpoints = distributed.get("metrics_endpoints")
+    require(isinstance(endpoints, list) and len(endpoints) >= nodes, "missing release_evidence.distributed.metrics_endpoints")
+    require(
+        all(isinstance(endpoint, str) and endpoint.strip() for endpoint in endpoints)
+        and len(set(endpoints)) == len(endpoints),
+        "invalid release_evidence.distributed.metrics_endpoints",
+    )
+    release_evidence_string(distributed.get("failure_domain"), "distributed.failure_domain")
+    release_evidence_true(distributed.get("same_window_sampling"), "distributed.same_window_sampling")
+
+    crash = evidence.get("crash_restart")
+    require(isinstance(crash, dict), "missing release_evidence.crash_restart")
+    fault_modes = crash.get("fault_modes")
+    require(
+        isinstance(fault_modes, list)
+        and all(mode in fault_modes for mode in RELEASE_FAULT_MODES)
+        and all(isinstance(mode, str) and mode.strip() for mode in fault_modes),
+        "missing release_evidence.crash_restart.fault_modes",
+    )
+    release_evidence_true(crash.get("unclean_shutdown_marker"), "crash_restart.unclean_shutdown_marker")
+
+    mixed = evidence.get("mixed_version")
+    require(isinstance(mixed, dict), "missing release_evidence.mixed_version")
+    revisions = mixed.get("participating_revisions")
+    require(
+        isinstance(revisions, list)
+        and len(set(revisions)) >= 2
+        and all(isinstance(revision, str) and len(revision) == 40 and all(c in "0123456789abcdef" for c in revision)
+                for revision in revisions),
+        "invalid release_evidence.mixed_version.participating_revisions",
+    )
+    for revision in (manifest["baseline"]["revision"], manifest["candidate"]["revision"]):
+        require(revision in revisions, "release_evidence.mixed_version omits tested build revision")
+    for key in ("reader", "writer", "rollback_payload"):
+        require(mixed.get(key) is True, f"missing release_evidence.mixed_version.{key}")
+
+    profile = evidence.get("profile")
+    require(isinstance(profile, dict), "missing release_evidence.profile")
+    artifacts = profile.get("required_artifacts")
+    require(
+        isinstance(artifacts, list)
+        and all(item in artifacts for item in RELEASE_PROFILE_ARTIFACTS)
+        and all(isinstance(item, str) and item.strip() for item in artifacts),
+        "missing release_evidence.profile.required_artifacts",
+    )
+    for key in ("collector_config_sha256", "profiler_config_sha256"):
+        require(sha(profile.get(key)), f"invalid release_evidence.profile.{key}")
 
 
 class OwnedCommand:
@@ -254,6 +353,8 @@ def validate_result(result, request, expected):
     require(result.get("build") == request["build"], "deployed build provenance mismatch")
     require(result.get("data_dir") == request["data_dir"], "adapter data isolation mismatch")
     require(result.get("background") == request["background"], "background mode mismatch")
+    if request["evidence"] == "measured":
+        require(result.get("release_evidence") == request["release_evidence"], "release evidence provenance mismatch")
     require(type(result.get("sample_count")) is int and 1 <= result["sample_count"] <= 3600,
             "sample_count must be 1..3600")
     number(result.get("elapsed_seconds"), "elapsed_seconds", request["duration_seconds"])
@@ -445,6 +546,9 @@ def collect_live(prepared, request, request_path, adapter):
     connection = prepared["collector"]
     require(set(connection) == {"alias", "endpoint", "metrics_endpoints"}, "invalid collector connection")
     require(all(isinstance(value, str) and value for value in connection.values()), "missing collector endpoint")
+    expected_metrics_endpoints = None
+    if request.get("evidence") == "measured":
+        expected_metrics_endpoints = request["release_evidence"]["distributed"]["metrics_endpoints"]
     output = request_path.parent / "telemetry"
     args = ["bash", str(collector), "--alias", connection["alias"], "--endpoint", connection["endpoint"],
             "--metrics-endpoints", connection["metrics_endpoints"], "--deployment", "distributed",
@@ -470,6 +574,9 @@ def collect_live(prepared, request, request_path, adapter):
                 require(isinstance(status.get("healOperations"), dict) and status["healOperations"], "invalid heal status response")
             metrics = list((output / "metrics").glob("admin-metrics.*.ndjson"))
             endpoints = [endpoint for endpoint in connection["metrics_endpoints"].split(",") if endpoint]
+            if expected_metrics_endpoints is not None:
+                require(endpoints == expected_metrics_endpoints,
+                        "collector metrics endpoints do not match release evidence")
             require(metrics and len(metrics) == len(endpoints) * len(samples), "missing distributed metrics samples")
             for sample in metrics:
                 # The collector requests n=1, so each file contains one final JSON record.
@@ -518,6 +625,8 @@ def run(manifest, adapter, output, data_root):
                                    "duration_seconds": manifest["duration_seconds"], "data_dir": str(data_dir),
                                    "expected_healed_objects": manifest["expected_healed_objects"][scenario],
                                    "expected_oracle": manifest["oracles"][scenario]}
+                        if manifest["evidence"] == "measured":
+                            request["release_evidence"] = manifest["release_evidence"]
                         require(digest(Path(request["build"]["binary"])) == request["build"]["sha256"], "binary changed during run")
                         require(digest(adapter) == manifest["adapter_sha256"], "adapter changed during run")
                         require(shutil.disk_usage(data_root).free >= manifest["min_free_bytes"], "insufficient free disk space")

@@ -45,6 +45,36 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
             "candidate": {"revision": "b" * 40, "sha256": "4" * 64},
             "adapter_sha256": "5" * 64,
             "collector_sha256": "6" * 64,
+            "release_evidence": {
+                "topology": {
+                    "nodes": 3,
+                    "drives_per_node": 4,
+                    "pools": 2,
+                    "sets_total": 2,
+                    "erasure_data_blocks": 8,
+                    "erasure_parity_blocks": 4,
+                },
+                "distributed": {
+                    "metrics_endpoints": ["https://node-1:9000", "https://node-2:9000", "https://node-3:9000"],
+                    "failure_domain": "three-node-localhost-lab",
+                    "same_window_sampling": True,
+                },
+                "crash_restart": {
+                    "fault_modes": ["process-restart", "process-crash-restart"],
+                    "unclean_shutdown_marker": True,
+                },
+                "mixed_version": {
+                    "participating_revisions": ["a" * 40, "b" * 40],
+                    "reader": True,
+                    "writer": True,
+                    "rollback_payload": True,
+                },
+                "profile": {
+                    "required_artifacts": ["allocation-profile", "flamegraph", "rss-samples", "save-frequency"],
+                    "collector_config_sha256": "7" * 64,
+                    "profiler_config_sha256": "8" * 64,
+                },
+            },
         }
         self.comparison = {
             "scenario": "cold-hot",
@@ -180,6 +210,19 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
                 })
                 with self.assertRaisesRegex(ValueError, "W10/W11|performance evidence|length mismatch|above maximum"):
                     summary.build_summary(args)
+
+    def test_passing_measured_report_requires_release_evidence_manifest(self):
+        del self.manifest["release_evidence"]
+        self.write_inputs()
+        args = type("Args", (), {
+            "abba_dir": self.abba,
+            "cache_cost_log": None,
+            "require_cache_cost": False,
+            "json_out": None,
+            "markdown_out": None,
+        })
+        with self.assertRaisesRegex(ValueError, "release_evidence"):
+            summary.build_summary(args)
 
     def test_requires_cache_profile_when_requested(self):
         args = type("Args", (), {
