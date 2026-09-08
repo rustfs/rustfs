@@ -434,6 +434,54 @@ mod canonical_outcome {
     }
 
     #[tokio::test]
+    async fn mixed_grace_and_repaired_receipt_transfer_only_repaired_responsibility() {
+        let incarnation = Uuid::new_v4();
+        let storage = Arc::new(MockStorage {
+            heal_object_outcomes: Mutex::new(HashMap::from([(
+                "object-a".to_string(),
+                VecDeque::from([MockHealObjectOutcome::DanglingGraceDeferred]),
+            )])),
+            heal_object_receipts: Mutex::new(HashMap::from([(
+                "object-b".to_string(),
+                VecDeque::from([object_receipt("object-b", None, HealObjectDisposition::Repaired, incarnation)]),
+            )])),
+            bucket_incarnation_id: Mutex::new(Some(incarnation)),
+            ..Default::default()
+        });
+        let task = bucket_task(storage);
+
+        task.execute()
+            .await
+            .expect("mixed grace and repaired receipt should complete");
+
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+        assert_eq!(outcome.counters.processed, 2);
+        assert_eq!(outcome.counters.healed, 1);
+        assert_eq!(outcome.counters.skipped, 1);
+        let deferred = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.object == "object-a")
+            .expect("grace object should remain recorded");
+        assert!(matches!(
+            deferred.disposition,
+            HealObjectDisposition::Deferred {
+                reason: HealDeferredReason::DanglingDeleteGrace,
+                ..
+            }
+        ));
+        assert_ne!(deferred.disposition, HealObjectDisposition::Repaired);
+        let repaired = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.object == "object-b")
+            .expect("receipt-backed object should be recorded");
+        assert_eq!(repaired.identity.bucket_incarnation_id, Some(incarnation));
+        assert_eq!(repaired.disposition, HealObjectDisposition::Repaired);
+    }
+
+    #[tokio::test]
     async fn bucket_heal_records_matching_positive_storage_receipt() {
         let incarnation = Uuid::new_v4();
         let storage = Arc::new(MockStorage {
@@ -1525,6 +1573,44 @@ async fn failed_object_heal_rejects_matching_positive_storage_receipt() {
 }
 
 #[tokio::test]
+async fn transient_quorum_object_heal_rejects_matching_positive_storage_receipt() {
+    let incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::OkWithReadQuorum)),
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            VecDeque::from([object_receipt(
+                "object-a",
+                Some("version-a"),
+                HealObjectDisposition::Repaired,
+                incarnation,
+            )]),
+        )])),
+        bucket_incarnation_id: Mutex::new(Some(incarnation)),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), Some("version-a".to_string())),
+        storage,
+    );
+
+    let result = task.execute().await;
+
+    let outcome = task.get_outcome().await;
+    assert!(result.is_err());
+    assert_eq!(outcome.counters.healed, 0);
+    assert_eq!(outcome.counters.unchanged, 0);
+    assert!(outcome.objects.iter().all(|object| {
+        !matches!(
+            object.disposition,
+            HealObjectDisposition::Repaired
+                | HealObjectDisposition::VerifiedHealthy
+                | HealObjectDisposition::AuthoritativelyAbsent
+        )
+    }));
+}
+
+#[tokio::test]
 async fn object_heal_latches_expected_incarnation_before_repair() {
     let original_incarnation = Uuid::new_v4();
     let successor_incarnation = Uuid::new_v4();
@@ -1661,6 +1747,7 @@ enum MockHealObjectOutcome {
     RetryableLock,
     RetryableLockTimeout,
     OkWithOtherError(&'static str),
+    OkWithReadQuorum,
     ErrOther(&'static str),
     DanglingGraceDeferred,
     UnavailableDrive(DriveState),
@@ -1820,6 +1907,13 @@ impl HealStorageAPI for MockStorage {
                 MockHealObjectOutcome::RetryableSlowDown => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::SlowDown))))
                 }
+                MockHealObjectOutcome::OkWithReadQuorum => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::InsufficientReadQuorum(
+                        bucket.to_string(),
+                        object.to_string(),
+                    ))),
+                )),
                 MockHealObjectOutcome::PermanentOther(message) => Err(Error::other(message)),
                 MockHealObjectOutcome::OkWithOtherError(message) => Ok((HealResultItem::default(), Some(Error::other(message)))),
                 MockHealObjectOutcome::ErrOther(message) => Err(Error::other(message)),
@@ -1859,6 +1953,13 @@ impl HealStorageAPI for MockStorage {
                 MockHealObjectOutcome::RetryableSlowDown => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::SlowDown))))
                 }
+                MockHealObjectOutcome::OkWithReadQuorum => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Storage(EcstoreError::InsufficientReadQuorum(
+                        bucket.to_string(),
+                        object.to_string(),
+                    ))),
+                )),
             };
         }
         if bucket == RUSTFS_META_BUCKET && object == format!("{BUCKET_META_PREFIX}/{DATA_USAGE_CACHE_NAME}") {
