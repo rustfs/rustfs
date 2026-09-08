@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Replication
+
+- Object Lock replication PUTs now carry a required integrity header, fixing target rejection introduced by the plain-payload default ([#7097](https://github.com/rustfs/rustfs/pull/7097)). This changes the default outbound request for locked objects but adds no persisted format.
+- Multipart source objects stay on the multipart transport even when their checksum record is a whole-object checksum, so objects above the single-PUT limit remain replicable ([#7047](https://github.com/rustfs/rustfs/pull/7047)).
+- Targets that mint their own version IDs now use a per-target version ledger for tag, retention, legal-hold, and permanent-delete mutations; ambiguous pre-ledger matches fail with backoff instead of guessing ([#7368](https://github.com/rustfs/rustfs/pull/7368)). This adds dual-prefixed internal metadata keys that older readers ignore.
+- Single-part source checksums are forwarded as `x-amz-checksum-*` headers instead of user metadata, so the replica preserves checksum responses ([#7313](https://github.com/rustfs/rustfs/pull/7313)). This changes the default outbound headers for checksummed objects.
+- Site-replication outage recovery now uses a bounded 30-second retry drain plus the 600-second full reconciliation pass, persists destructive liabilities before local deletion, and fences replay settlement and peer edits ([#7148](https://github.com/rustfs/rustfs/pull/7148)). Persisted additions are optional and ignored by older readers.
+- IAM snapshot/deletion replay, target-assigned delete-marker purges, timestamp ordering, and best-effort peer broadcast now close the control-plane gaps found by the R6 review ([#7195](https://github.com/rustfs/rustfs/pull/7195)).
+- Upgrade and rollback: upgrade every node in one site consecutively and verify reconciliation before moving to the next site; do not intentionally run a site mixed-version. Target-version ledger keys are harmless on rollback, although old code cannot use their routing. Before rolling back past [#7307](https://github.com/rustfs/rustfs/pull/7307), drain or repair every pending version purge: older code can free a retained version's data directory before its remote purge is acknowledged. See `docs/operations/site-replication-operations.md`.
+
 ### Security
 - **Presigned URLs honour only signed headers** (GHSA-g8w9-qw9q-fghr): a SigV4 presigned request that carries an `x-amz-*` request header not listed in `X-Amz-SignedHeaders` is now rejected with `403 AccessDenied` ("There were headers present in the request which were not signed"), matching AWS S3. Previously the holder of a presigned `PutObject` URL could add unsigned `x-amz-tagging`, `x-amz-storage-class`, `x-amz-website-redirect-location`, ACL, metadata, Object Lock or SSE headers and have them applied. Presigners that intend a property must set it before signing so the SDK lists the header in `SignedHeaders`; `x-amz-cf-id` (CloudFront) remains tolerated unsigned. Header-signed SigV4 and SigV2 requests are unchanged.
 
