@@ -1137,7 +1137,12 @@ async fn test_odm_admin_config_is_redacted_and_status_counts_match_the_source() 
         let miss = env.raw_get(bucket, miss_key).await?;
         assert_eq!(miss.status, 404, "{}", String::from_utf8_lossy(&miss.body));
     }
-    assert!(env.wait_local_listed(bucket, hit_key, SETTLE).await?);
+    let (listed, _, _) = tokio::try_join!(
+        env.wait_local_listed(bucket, hit_key, SETTLE),
+        env.wait_for_status_counter(bucket, "/counters/pulled_objects_total/inline", 1, SETTLE),
+        env.wait_for_status_counter(bucket, "/counters/pulled_bytes_total", body.len() as u64, SETTLE),
+    )?;
+    assert!(listed);
 
     let status = env.status_json(bucket).await?;
     assert_eq!(status.pointer("/configured").and_then(Value::as_bool), Some(true), "{status}");
