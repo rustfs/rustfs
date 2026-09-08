@@ -995,6 +995,11 @@ jobs:
           cargo nextest list --profile e2e-full -p e2e_test --message-format json > "${NEXTEST_LISTING}"
           python3 ./scripts/check_test_wiring.py --check-profile e2e-full "${NEXTEST_LISTING}"
 
+      - name: Prepare Heal logs
+        run: |
+          heal_log_root=$(mktemp -d "${RUNNER_TEMP}/rustfs-heal-logs.XXXXXX")
+          echo "RUSTFS_HEAL_CHAOS_LOG_DIR=$heal_log_root" >> "$GITHUB_ENV"
+
       # Full single-node e2e lane (backlog#1149 ci-5). The e2e-full
       # default-filter in .config/nextest.toml is the single wiring mechanism —
       # extend that filter, never add ad-hoc e2e jobs here. Reuses the downloaded
@@ -1004,7 +1009,17 @@ jobs:
           RUSTFS_E2E_STARTUP_CAS_BINARY: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs
           RUSTFS_E2E_STARTUP_CAS_BUILD_MANIFEST: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs.e2e-startup-cas-build.json
           RUSTFS_E2E_STARTUP_CAS_ARTIFACT_DIR: ${{ runner.temp }}/rustfs-startup-cas-evidence
+          RUSTFS_HEAL_CHAOS_SERVER_RUST_LOG: error,rustfs::heal::task=info,rustfs::app::object_usecase=warn,rustfs_ecstore::set_disk::ops::object=warn,rustfs_lock::distributed_lock=debug,rustfs_ecstore::cluster::rpc::remote_locker=warn
         run: cargo nextest run --profile e2e-full -p e2e_test
+
+      - name: Upload coordinator restart logs
+        if: always() && env.RUSTFS_HEAL_CHAOS_LOG_DIR != ''
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: heal-coordinator-restart-logs-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ env.RUSTFS_HEAL_CHAOS_LOG_DIR }}/coordinator_restart/**/node*.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload junit
         if: always()
