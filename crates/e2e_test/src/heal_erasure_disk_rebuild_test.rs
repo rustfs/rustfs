@@ -923,7 +923,7 @@ mod tests {
                 latest_cycle_end = latest_cycle_end.max(cycle_end);
                 versions_observed |= versions_scanned > 0;
                 observations.push(format!(
-                    "node{node_index}: end={cycle_end}, versions={versions_scanned}, cycle={}, active={}, leader={}, result={}",
+                    "node{node_index}: end={cycle_end}, versions={versions_scanned}, cycle={}, active={}, leader={}, result={}, status={status}",
                     metrics["current_cycle"],
                     metrics["current_cycle_active"],
                     metrics["leader_lock_state"],
