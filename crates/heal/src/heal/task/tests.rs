@@ -1366,6 +1366,44 @@ async fn cancelled_object_heal_rejects_matching_positive_storage_receipt() {
 }
 
 #[tokio::test]
+async fn failed_object_heal_rejects_matching_positive_storage_receipt() {
+    let incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::OkWithOtherError("commit failed"))),
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            VecDeque::from([object_receipt(
+                "object-a",
+                Some("version-a"),
+                HealObjectDisposition::Repaired,
+                incarnation,
+            )]),
+        )])),
+        bucket_incarnation_id: Mutex::new(Some(incarnation)),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), Some("version-a".to_string())),
+        storage,
+    );
+
+    let result = task.execute().await;
+
+    let outcome = task.get_outcome().await;
+    assert!(result.is_err());
+    assert_eq!(outcome.counters.healed, 0);
+    assert_eq!(outcome.counters.unchanged, 0);
+    assert!(outcome.objects.iter().all(|object| {
+        !matches!(
+            object.disposition,
+            HealObjectDisposition::Repaired
+                | HealObjectDisposition::VerifiedHealthy
+                | HealObjectDisposition::AuthoritativelyAbsent
+        )
+    }));
+}
+
+#[tokio::test]
 async fn object_heal_latches_expected_incarnation_before_repair() {
     let original_incarnation = Uuid::new_v4();
     let successor_incarnation = Uuid::new_v4();
