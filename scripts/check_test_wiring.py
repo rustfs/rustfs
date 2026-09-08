@@ -42,6 +42,10 @@ SCANNER_HEAL_RELEASE_REQUIRED_GATES = (
     "P1", "P2", "P3", "P4", "R-E", "R-D", "R-L",
 )
 SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
+    "G07": (
+        "mrf_responsibility_oracle",
+        "commit_boundary_crash_matrix",
+    ),
     "G08": (
         "mrf_capacity_evidence",
         "disk_full_matrix",
@@ -133,6 +137,19 @@ SCANNER_HEAL_SEGMENT_ACTIVATION_PROOF_INPUTS = (
     "generation_window",
     "producer_identities",
 )
+SCANNER_HEAL_RELEASE_G07_REQUIRED_CASES = {
+    "mrf_responsibility_oracle": (
+        "legacy-journal-replay",
+        "scoped-journal-replay",
+        "committed-checkpoint-replay",
+    ),
+    "commit_boundary_crash_matrix": (
+        "before-committed-payload",
+        "after-payload-before-manifest",
+        "after-manifest-before-cleanup",
+        "restart-replay-before-successor",
+    ),
+}
 SCANNER_HEAL_RELEASE_G08_REQUIRED_CASES = {
     "mrf_capacity_evidence": (
         "queue-count-limit",
@@ -1501,6 +1518,14 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
                 f"{gate}.{field} requires full-walk oracle equivalence")
         require(evidence.get("published_root_equivalent") is True,
                 f"{gate}.{field} requires published-root equivalence")
+    if gate == "G07":
+        case_field = {
+            "mrf_responsibility_oracle": "mrf_responsibility_cases",
+            "commit_boundary_crash_matrix": "commit_crash_cases",
+        }[field]
+        cases = evidence_string_list(evidence.get(case_field), f"{gate}.{field}.{case_field}")
+        missing_cases = sorted(set(SCANNER_HEAL_RELEASE_G07_REQUIRED_CASES[field]) - set(cases))
+        require(not missing_cases, f"{gate}.{field} missing cases: {', '.join(missing_cases)}")
     if gate == "G08":
         case_field = {
             "mrf_capacity_evidence": "capacity_cases",
@@ -1952,6 +1977,12 @@ class SelfTests(unittest.TestCase):
                     evidence["replayed_records"] = 2
                     evidence["responsibility_anchor_retained"] = True
                     evidence["successor_snapshot_published"] = True
+                if gate == "G07":
+                    case_field = {
+                        "mrf_responsibility_oracle": "mrf_responsibility_cases",
+                        "commit_boundary_crash_matrix": "commit_crash_cases",
+                    }[field]
+                    evidence[case_field] = list(SCANNER_HEAL_RELEASE_G07_REQUIRED_CASES[field])
                 if gate == "G08":
                     case_field = {
                         "mrf_capacity_evidence": "capacity_cases",
@@ -2093,6 +2124,8 @@ class SelfTests(unittest.TestCase):
             ("g08-capacity-cases", "G08", "mrf_capacity_evidence", lambda item: item.update({"capacity_cases": ["queue-count-limit"]}), "missing cases"),
             ("g08-disk-full-cases", "G08", "disk_full_matrix", lambda item: item.pop("disk_full_cases"), "non-empty string list"),
             ("g08-replica-loss-cases", "G08", "replica_loss_matrix", lambda item: item.update({"replica_loss_cases": ["single-replica-loss"]}), "missing cases"),
+            ("g07-responsibility-cases", "G07", "mrf_responsibility_oracle", lambda item: item.update({"mrf_responsibility_cases": ["legacy-journal-replay"]}), "missing cases"),
+            ("g07-crash-cases", "G07", "commit_boundary_crash_matrix", lambda item: item.pop("commit_crash_cases"), "non-empty string list"),
             ("mrf-records", "G07", "mrf_responsibility_oracle", lambda item: item.pop("replayed_records"), "replayed_records"),
             ("mrf-anchor", "G07", "commit_boundary_crash_matrix", lambda item: item.update({"responsibility_anchor_retained": False}), "retained MRF responsibility anchors"),
             ("mrf-successor", "P4", "retained_responsibility_evidence", lambda item: item.pop("successor_snapshot_published"), "successor snapshot"),
@@ -2347,7 +2380,7 @@ class SelfTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, run_dir = self.scanner_heal_fixture(Path(tmp))
             registry = read_json(root / ".config/scanner-heal-required-tests.json")
-            for gate in ("G03", "G08", "G09", "G11", "G14", "P2"):
+            for gate in ("G03", "G07", "G08", "G09", "G11", "G14", "P2"):
                 for requirement in registry["release_requirements"]:
                     if requirement["gate"] == gate:
                         requirement["evidence_fields"] = []

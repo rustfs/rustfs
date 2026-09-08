@@ -188,7 +188,11 @@
       "lane": "mrf-responsibility",
       "status": "pending",
       "description": "Durable MRF responsibility at every commit boundary",
-      "requires": ["MRF responsibility oracle", "commit-boundary crash matrix"]
+      "requires": ["MRF responsibility oracle", "commit-boundary crash matrix"],
+      "evidence_fields": [
+        "mrf_responsibility_oracle",
+        "commit_boundary_crash_matrix"
+      ]
     },
     {
       "gate": "G08",
