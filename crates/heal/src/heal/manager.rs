@@ -1527,7 +1527,7 @@ impl HealManager {
         request: HealRequest,
         preserve_alias: bool,
     ) -> Result<HealAdmissionReceipt> {
-        self.submit_heal_request_with_receipt_alias_and_mrf_notice(request, preserve_alias, None)
+        self.submit_heal_request_with_receipt_alias_and_mrf_notice(request, preserve_alias, true, None)
             .await
     }
 
@@ -1563,7 +1563,7 @@ impl HealManager {
         request: HealRequest,
         mrf_notice_target: MrfRepairNoticeTarget,
     ) -> Result<HealAdmissionReceipt> {
-        self.submit_heal_request_with_receipt_alias_and_mrf_notice(request, true, Some(mrf_notice_target))
+        self.submit_heal_request_with_receipt_alias_and_mrf_notice(request, true, true, Some(mrf_notice_target))
             .await
     }
 
@@ -1583,6 +1583,7 @@ impl HealManager {
         &self,
         request: HealRequest,
         preserve_alias: bool,
+        accept_same_request_id_replay: bool,
         mrf_notice_target: Option<MrfRepairNoticeTarget>,
     ) -> Result<HealAdmissionReceipt> {
         let admission_start = Instant::now();
@@ -1661,7 +1662,11 @@ impl HealManager {
             });
         if let Some((matches_existing, duplicate_state)) = request_id_admission {
             let admission = if matches_existing {
-                HealAdmissionResult::Accepted
+                if accept_same_request_id_replay {
+                    HealAdmissionResult::Accepted
+                } else {
+                    Self::duplicate_admission_for_request(&request, &config)
+                }
             } else {
                 HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
             };
@@ -1908,7 +1913,10 @@ impl HealManager {
 
     /// Submit heal request.
     pub async fn submit_heal_request(&self, request: HealRequest) -> Result<HealAdmissionResult> {
-        Ok(self.submit_heal_request_with_receipt_and_alias(request, true).await?.result)
+        Ok(self
+            .submit_heal_request_with_receipt_alias_and_mrf_notice(request, true, false, None)
+            .await?
+            .result)
     }
 
     /// Get task status
