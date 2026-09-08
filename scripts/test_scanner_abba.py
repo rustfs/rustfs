@@ -49,6 +49,8 @@ def fake_adapter():
         if fault == "measure-exit":
             return 42
         result = {key: request[key] for key in ("evidence", "fixed", "build", "data_dir", "background")}
+        if request["evidence"] == "measured":
+            result["release_evidence"] = copy.deepcopy(request["release_evidence"])
         result.update({"sample_count": 10, "elapsed_seconds": request["duration_seconds"],
                        "metrics": dict.fromkeys(harness.METRICS, 10)})
         baseline = request["comparison"] == "build" and request["leg"].startswith("A")
