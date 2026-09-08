@@ -2053,6 +2053,13 @@ class SelfTests(unittest.TestCase):
                 "missing G11.segment_activation_preflight.fail_closed_checks",
             ),
             (
+                "activation-missing-proof-input",
+                "G11",
+                "segment_activation_preflight",
+                lambda item: item["proof_inputs"].remove("process_epoch"),
+                "missing G11.segment_activation_preflight.proof_inputs",
+            ),
+            (
                 "distributed-invalidation",
                 "G14",
                 "distributed_segment_invalidation_evidence",
