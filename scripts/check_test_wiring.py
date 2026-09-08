@@ -89,6 +89,12 @@ SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES = {
     ("R-L", "migration_gap_evidence"): "migration-gap",
     ("R-L", "crash_safe_source_retirement_evidence"): "crash-safe-source-retirement",
 }
+SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS = {
+    ("G07", "mrf_responsibility_oracle"),
+    ("G07", "commit_boundary_crash_matrix"),
+    ("P4", "mrf_replay_cost_measurement"),
+    ("P4", "retained_responsibility_evidence"),
+}
 SCHEDULED_ALERT_WORKFLOWS = tuple(
     item["workflow"]
     for item in json.loads((ROOT / ".github/scheduled-validations.json").read_text())
@@ -1374,6 +1380,12 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
         crash_points = evidence.get("crash_points")
         require(isinstance(crash_points, list) and crash_points,
                 f"{gate}.{field} requires crash-boundary evidence")
+    if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
+        evidence_integer(evidence.get("replayed_records"), f"{gate}.{field}.replayed_records", 1, 2**63 - 1)
+        require(evidence.get("responsibility_anchor_retained") is True,
+                f"{gate}.{field} requires retained MRF responsibility anchors")
+        require(evidence.get("successor_snapshot_published") is True,
+                f"{gate}.{field} requires successor snapshot publication evidence")
     if gate == "G14":
         if field == "ec8_4_evidence":
             topology = evidence.get("topology")
@@ -1772,6 +1784,10 @@ class SelfTests(unittest.TestCase):
                     evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
                 if gate in ("G04", "G07", "R-E", "R-L"):
                     evidence["crash_points"] = ["before-commit"]
+                if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
+                    evidence["replayed_records"] = 2
+                    evidence["responsibility_anchor_retained"] = True
+                    evidence["successor_snapshot_published"] = True
                 if gate == "G14" and field == "ec8_4_evidence":
                     evidence["topology"] = {"erasure": "EC8+4", "nodes": 3, "drives_per_node": 4}
                 if gate == "G14" and field == "multi_set_evidence":
@@ -1868,6 +1884,9 @@ class SelfTests(unittest.TestCase):
             ),
             ("versions", "G09", "mixed_version_reader_evidence", lambda item: item.update({"versions": [1, 2]}), "mixed-version"),
             ("stale-versions", "G09", "mixed_version_writer_evidence", lambda item: item.update({"versions": ["a" * 40, "c" * 40]}), "tested source revision"),
+            ("mrf-records", "G07", "mrf_responsibility_oracle", lambda item: item.pop("replayed_records"), "replayed_records"),
+            ("mrf-anchor", "G07", "commit_boundary_crash_matrix", lambda item: item.update({"responsibility_anchor_retained": False}), "retained MRF responsibility anchors"),
+            ("mrf-successor", "P4", "retained_responsibility_evidence", lambda item: item.pop("successor_snapshot_published"), "successor snapshot"),
         ):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
                 root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
