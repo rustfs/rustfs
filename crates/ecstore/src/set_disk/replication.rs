@@ -17,6 +17,7 @@ use super::{
     UpdateMetadataOpts, Uuid, X_AMZ_RESTORE, get_raw_etag, restore_operation_id_from_metadata,
 };
 use crate::bucket::lifecycle::lifecycle;
+use crate::core::pools::DecommissionCapacityAdmission;
 use rustfs_filemeta::RestoreStatusOps;
 use rustfs_utils::http::headers::{AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE};
 use s3s::dto::{RestoreStatus, Timestamp};
@@ -178,7 +179,7 @@ impl SetDisks {
         {
             decommission_capacity_guard = Some(
                 store
-                    .acquire_external_decommission_capacity_fence(&[self.pool_index], "mutation")
+                    .acquire_external_decommission_capacity_fence(&[self.pool_index], DecommissionCapacityAdmission::Mutation)
                     .await?,
             );
         }
@@ -282,7 +283,7 @@ impl SetDisks {
         {
             decommission_capacity_guard = Some(
                 store
-                    .acquire_external_decommission_capacity_fence(&[self.pool_index], "mutation")
+                    .acquire_external_decommission_capacity_fence(&[self.pool_index], DecommissionCapacityAdmission::Mutation)
                     .await?,
             );
         }

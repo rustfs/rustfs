@@ -671,9 +671,9 @@ mod tests {
     use crate::cluster::rpc::PeerS3Client;
     use crate::config::com::{delete_config, read_config_no_lock_preserve_empty_with_metadata, save_config};
     use crate::core::pools::{
-        DecommissionCapacityLockOrderBarrier, DecommissionErasureLayout, DecommissionPoolCapacityInfo, POOL_META_IDENTITY_NAME,
-        PoolDecommissionInfo, PoolMetaReplicaState, PoolStatus, initialized_pool_meta_identity_for_test,
-        set_decommission_capacity_info_overrides_for_test,
+        DecommissionCapacityAdmission, DecommissionCapacityLockOrderBarrier, DecommissionErasureLayout,
+        DecommissionPoolCapacityInfo, POOL_META_IDENTITY_NAME, PoolDecommissionInfo, PoolMetaReplicaState, PoolStatus,
+        initialized_pool_meta_identity_for_test, set_decommission_capacity_info_overrides_for_test,
     };
     use crate::core::sets::HealFormatAfterSaveBarrier;
     use crate::disk::error::Result as DiskResult;
@@ -1149,7 +1149,7 @@ mod tests {
         let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
         let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
         let capacity_guard = store
-            .acquire_external_decommission_capacity_fence(&[0], "heal")
+            .acquire_external_decommission_capacity_fence(&[0], DecommissionCapacityAdmission::Heal)
             .await
             .expect("ordinary heal capacity fence should be acquired");
 

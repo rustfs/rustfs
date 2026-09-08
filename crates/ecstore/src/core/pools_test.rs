@@ -570,6 +570,184 @@ mod decommission_lock_order_tests {
             .expect("decommission activation should commit after the probe release");
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn staged_external_put_rechecks_retiring_source_on_another_node() {
+        run_large_stack_current_thread_async_test("staged-retiring-source", || async {
+            let (_temp_dirs, store, other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("staged-source");
+            let object = "selected-before-retirement.bin";
+            let original = b"original source object";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create staged source bucket");
+            store.pools[0]
+                .put_object(&bucket, object, &mut PutObjReader::from_vec(original.to_vec()), &ObjectOptions::default())
+                .await
+                .expect("seed the source selected before retirement");
+
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            set_decommission_capacity_info_overrides_for_test(
+                other_store.id,
+                vec![vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, 1024, 1024),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 4096, 4096, 0),
+                    DecommissionPoolCapacityInfo::for_test(2, layout, 0, 4096, 4096),
+                ]],
+            );
+            let barrier = DecommissionCapacityLockOrderBarrier::install(store.id, store.id);
+            barrier.pause_external_object_commit_phase();
+            let put_store = Arc::clone(&store);
+            let put_bucket = bucket.clone();
+            let put = tokio::spawn(async move {
+                put_store
+                    .put_object(
+                        &put_bucket,
+                        object,
+                        &mut PutObjReader::from_vec(b"must not replace a retiring source".to_vec()),
+                        &ObjectOptions::default(),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_external_object_commit_phase_started())
+                .await
+                .expect("public PUT must stage before its decommission commit probe");
+            assert!(!store.pool_meta.read().await.is_suspended(0));
+            other_store
+                .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+                .await
+                .expect("the other node should activate retirement before the staged PUT commits");
+            assert!(other_store.pool_meta.read().await.is_suspended(0));
+            assert!(
+                !store.pool_meta.read().await.is_suspended(0),
+                "the writer's local snapshot must remain stale to exercise the durable admission probe"
+            );
+            barrier.release_external_object_commit_phase();
+            let result = tokio::time::timeout(Duration::from_secs(30), put)
+                .await
+                .expect("staged PUT must finish after the commit probe is released")
+                .expect("staged PUT must not panic");
+            assert!(
+                matches!(result, Err(crate::error::Error::SlowDown)),
+                "a staged PUT must retry pool selection instead of committing to a newly retiring source: {result:?}"
+            );
+            let mut reader = store.pools[0]
+                .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the original source must remain readable after admission rejects the replacement");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("read the full retained source body");
+            assert_eq!(body, original);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mixed_batch_delete_admits_only_marker_destinations_during_retirement() {
+        run_large_stack_current_thread_async_test("batch-marker-admission", || async {
+            use crate::storage_api_contracts::object::ObjectToDelete;
+
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("batch-marker");
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create a versioned batch-delete bucket");
+            let source_version = uuid::Uuid::new_v4();
+            for (pool, object, version) in [(0, "purge-source", source_version), (2, "mark-active", uuid::Uuid::new_v4())] {
+                store.pools[pool]
+                    .put_object(
+                        &bucket,
+                        object,
+                        &mut PutObjReader::from_vec(b"version to delete".to_vec()),
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(version.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("seed each exact batch-delete destination");
+            }
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            set_decommission_capacity_info_overrides_for_test(
+                store.id,
+                vec![vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, 1024, 1024),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 4096, 4096, 0),
+                    DecommissionPoolCapacityInfo::for_test(2, layout, 0, 4096, 4096),
+                ]],
+            );
+            store
+                .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+                .await
+                .expect("reserve pool 1 while pool 0 retires and pool 2 remains unreserved");
+            let (deleted, errors) = store
+                .delete_objects(
+                    &bucket,
+                    vec![
+                        ObjectToDelete {
+                            object_name: "mark-active".to_string(),
+                            ..Default::default()
+                        },
+                        ObjectToDelete {
+                            object_name: "purge-source".to_string(),
+                            version_id: Some(source_version),
+                            ..Default::default()
+                        },
+                    ],
+                    ObjectOptions::default(),
+                )
+                .await;
+            assert_eq!(errors.len(), 2);
+            assert!(
+                errors.iter().all(Option::is_none),
+                "the unrelated retiring/reserved pools must not reject marker admission: {errors:?}"
+            );
+            assert_eq!(deleted.len(), 2);
+            assert_eq!(deleted[0].object_name, "mark-active");
+            assert!(deleted[0].delete_marker);
+            assert!(
+                deleted[0].version_id.is_none(),
+                "a latest-version delete does not request an explicit version"
+            );
+            assert!(
+                deleted[0].delete_marker_version_id.is_some(),
+                "the newly created marker must have its own version identity"
+            );
+            assert_eq!(deleted[1].object_name, "purge-source");
+            assert!(!deleted[1].delete_marker);
+            assert_eq!(deleted[1].version_id, Some(source_version));
+            assert!(
+                matches!(
+                    store.pools[0]
+                        .get_object_info(
+                            &bucket,
+                            "purge-source",
+                            &ObjectOptions {
+                                version_id: Some(source_version.to_string()),
+                                ..Default::default()
+                            },
+                        )
+                        .await,
+                    Err(crate::error::Error::ObjectNotFound(..) | crate::error::Error::VersionNotFound(..))
+                ),
+                "an exact source deletion must retain its capacity-release path"
+            );
+        });
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn public_upload_part_holds_decommission_capacity_until_rename() {

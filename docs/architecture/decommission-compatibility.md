@@ -66,6 +66,14 @@ stability instead of requiring the historical inventory to be empty. A normal
 canceled entry remains blocked until clear; unresolved listing entries instead
 retain the explicit retry path that can re-observe or resolve those entries.
 
+### Publication On Retiring Pools
+
+Ordinary publication rechecks the selected pool against the durable pool metadata under its existing read fence. Selection may have happened before retirement, or on a node whose local pool state has not been refreshed. A staged PUT or multipart commit must return `SlowDown` instead of publishing into a pool that has since become suspended. The staged input is not automatically replayed into another pool.
+
+Running, queued, failed, canceled, and completed decommission states all exclude the source from ordinary publication. Failed and canceled entries become writable only after an allowed clear operation removes that state. This check does not change repair admission or the separate fence for operations that only release capacity.
+
+For mixed batch deletes, only the pools selected to receive new delete markers are publication targets. Exact-version deletions on other pools remain protected by the same pool metadata read fence, without treating the retiring source or an unrelated reserved target as a destination for those markers.
+
 ### Status Response Shape
 
 `GET /v3/pools/list` and `GET /v3/pools/status?pool=...` expose per-pool machine-readable decommission state. The `status` field can report `active`, `running`, `queued`, `complete`, `failed`, or `canceled`.

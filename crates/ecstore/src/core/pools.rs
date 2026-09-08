@@ -1757,7 +1757,35 @@ fn ensure_decommission_capacity_reservations_available(
     Ok(())
 }
 
-fn ensure_external_decommission_target_admission(meta: &PoolMeta, target_pool_index: usize, phase: &'static str) -> Result<()> {
+#[derive(Clone, Copy)]
+pub(crate) enum DecommissionCapacityAdmission {
+    Mutation,
+    BatchDelete,
+    Heal,
+}
+
+impl DecommissionCapacityAdmission {
+    fn phase(self) -> &'static str {
+        match self {
+            Self::Mutation => "mutation",
+            Self::BatchDelete => "batch_delete",
+            Self::Heal => "heal",
+        }
+    }
+}
+
+fn ensure_external_decommission_target_admission(
+    meta: &PoolMeta,
+    target_pool_index: usize,
+    admission: DecommissionCapacityAdmission,
+) -> Result<()> {
+    let phase = admission.phase();
+    // Pool selection may predate retirement or use a stale node-local snapshot.
+    // Recheck publication against the fenced durable state. Repair and pure
+    // capacity release retain their separate admission contracts.
+    if !matches!(admission, DecommissionCapacityAdmission::Heal) && meta.is_suspended(target_pool_index) {
+        return Err(Error::SlowDown);
+    }
     if active_decommission_source_indices(meta).into_iter().any(|source_pool_index| {
         meta.pools
             .get(source_pool_index)
@@ -9768,10 +9796,10 @@ impl ECStore {
     pub(crate) async fn acquire_external_decommission_capacity_fence(
         &self,
         target_pool_indices: &[usize],
-        phase: &'static str,
+        admission: DecommissionCapacityAdmission,
     ) -> Result<rustfs_lock::NamespaceLockGuard> {
         Ok(self
-            .acquire_external_decommission_capacity_fence_with_active_source(target_pool_indices, phase)
+            .acquire_external_decommission_capacity_fence_with_active_source(target_pool_indices, admission)
             .await?
             .0)
     }
@@ -9779,14 +9807,14 @@ impl ECStore {
     pub(crate) async fn acquire_external_decommission_capacity_fence_with_active_source(
         &self,
         target_pool_indices: &[usize],
-        phase: &'static str,
+        admission: DecommissionCapacityAdmission,
     ) -> Result<(rustfs_lock::NamespaceLockGuard, bool)> {
         let save_guard = self.pool_meta_save_gate.lock().await;
         let (pool_meta_guard, snapshot) = self
             .acquire_pool_meta_read_guard(&save_guard, "target capacity admission failed")
             .await?;
         for target_pool_index in target_pool_indices.iter().copied() {
-            ensure_external_decommission_target_admission(&snapshot, target_pool_index, phase)?;
+            ensure_external_decommission_target_admission(&snapshot, target_pool_index, admission)?;
         }
         let has_active_source = pool_meta_has_active_decommission(&snapshot);
         drop(save_guard);
@@ -9808,7 +9836,9 @@ impl ECStore {
         let admissions = target_pool_indices
             .iter()
             .copied()
-            .map(|target_pool_index| ensure_external_decommission_target_admission(&snapshot, target_pool_index, "heal"))
+            .map(|target_pool_index| {
+                ensure_external_decommission_target_admission(&snapshot, target_pool_index, DecommissionCapacityAdmission::Heal)
+            })
             .collect();
         drop(save_guard);
         Ok((pool_meta_guard, admissions))
@@ -10482,7 +10512,7 @@ impl ECStore {
             ));
         }
         let Some((owner, model_version)) = admitted_owner else {
-            ensure_external_decommission_target_admission(&snapshot, target_pool_index, "mutation")?;
+            ensure_external_decommission_target_admission(&snapshot, target_pool_index, DecommissionCapacityAdmission::Mutation)?;
             drop(save_guard);
             let capacity_lease = read_guard.lock_lost_signal();
             return operation.take().expect("capacity-admitted operation should run once")(capacity_lease).await;
@@ -20692,12 +20722,13 @@ mod pools_tests {
         with_decommission_entry_context,
     };
     use super::{
-        DecommissionCapacityOwner, DecommissionCapacityReleaseProof, DecommissionCapacityReservation,
-        DecommissionCapacityTemporaryMutation, decommission_capacity_mutation_id, ensure_decommission_target_owner_admission,
-        ensure_exact_delete_capacity_namespace_fences, ensure_external_decommission_target_admission,
-        is_decommission_capacity_blocked_error, plan_exact_delete_capacity_reconciliations,
-        record_decommission_target_consumption, release_decommission_target_inflight, reserve_decommission_target_pending,
-        resolve_decommission_target_pending, set_decommission_capacity_info_overrides_for_test,
+        DecommissionCapacityAdmission, DecommissionCapacityOwner, DecommissionCapacityReleaseProof,
+        DecommissionCapacityReservation, DecommissionCapacityTemporaryMutation, decommission_capacity_mutation_id,
+        ensure_decommission_target_owner_admission, ensure_exact_delete_capacity_namespace_fences,
+        ensure_external_decommission_target_admission, is_decommission_capacity_blocked_error,
+        plan_exact_delete_capacity_reconciliations, record_decommission_target_consumption, release_decommission_target_inflight,
+        reserve_decommission_target_pending, resolve_decommission_target_pending,
+        set_decommission_capacity_info_overrides_for_test,
     };
     use crate::bucket::lifecycle::{
         DurableIlmRecordCheckpoint,
@@ -25598,7 +25629,7 @@ mod pools_tests {
 
         assert!(
             matches!(
-                ensure_external_decommission_target_admission(&meta, 1, "ordinary_put"),
+                ensure_external_decommission_target_admission(&meta, 1, DecommissionCapacityAdmission::Mutation),
                 Err(Error::SlowDown)
             ),
             "an ordinary write must not consume a target reservation"
@@ -25629,6 +25660,66 @@ mod pools_tests {
         let mut decommission_opts = rebalance_opts;
         expected_owner.apply_to(&mut decommission_opts);
         assert_eq!(DecommissionCapacityOwner::from_options(&decommission_opts), Some(expected_owner));
+    }
+
+    #[test]
+    fn external_decommission_admission_fences_suspended_sources_but_preserves_repair() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::minutes(2);
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacity_infos = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 30, 30),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 100, 100, 0),
+        ];
+        let mut active = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(0, None), decommission_test_pool_status(1, None)],
+            ..Default::default()
+        };
+        active
+            .decommission(0, capacity_infos[0].space)
+            .expect("start the source admission fixture");
+        reserve_decommission_start_target_capacity(
+            &mut active,
+            &[0],
+            &capacity_infos,
+            uuid::Uuid::new_v4(),
+            1,
+            now,
+            DECOMMISSION_CAPACITY_MODEL_VERSION,
+        )
+        .expect("the active source must have a valid reservation to isolate its write fence");
+
+        for (state, queued, failed, canceled, complete) in [
+            ("running", false, false, false, false),
+            ("queued", true, false, false, false),
+            ("failed", false, true, false, false),
+            ("canceled", false, false, true, false),
+            ("completed", false, false, false, true),
+        ] {
+            let mut meta = active.clone();
+            let info = meta.pools[0].decommission.as_mut().expect("the source fixture must exist");
+            info.queued = queued;
+            info.failed = failed;
+            info.canceled = canceled;
+            info.complete = complete;
+            if queued || failed || canceled || complete {
+                info.start_time = None;
+            }
+            for admission in [
+                DecommissionCapacityAdmission::Mutation,
+                DecommissionCapacityAdmission::BatchDelete,
+            ] {
+                assert!(
+                    matches!(ensure_external_decommission_target_admission(&meta, 0, admission), Err(Error::SlowDown)),
+                    "{state} source must reject new publication until its decommission metadata is cleared"
+                );
+            }
+            ensure_external_decommission_target_admission(&meta, 0, DecommissionCapacityAdmission::Heal)
+                .unwrap_or_else(|err| panic!("{state} source repair must retain its capacity-only admission: {err}"));
+            meta.pools[0].decommission = None;
+            ensure_external_decommission_target_admission(&meta, 0, DecommissionCapacityAdmission::Mutation)
+                .unwrap_or_else(|err| panic!("cleared {state} source must become writable again: {err}"));
+        }
     }
 
     #[test]
