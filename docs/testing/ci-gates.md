@@ -279,6 +279,12 @@ also binds each evidence field to its own run provenance: `source_revision`,
 `finished_at`, command arguments, and artifact format. The field
 `source_revision` must match the bundle revision, and measured performance
 duration cannot exceed the recorded run window.
+When an evidence or profile artifact declares a JSON format, the checker also
+opens that artifact and requires its payload to repeat the same measured
+`source_revision`, `run_id`, `measurement_window_id`, gate and field identity;
+profile sub-artifacts must additionally name their artifact kind. Updating only
+the outer bundle hash cannot turn a stale JSON summary into current release
+evidence.
 
 The hard evidence shape remains claim-specific: mixed-version gates must name at
 least two participating versions, crash/durable replay gates must include
