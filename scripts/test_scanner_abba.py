@@ -167,7 +167,7 @@ class ScannerAbbaTest(unittest.TestCase):
 
     def measured_manifest(self):
         manifest = copy.deepcopy(self.manifest)
-        manifest.update(evidence="measured", duration_seconds=900)
+        manifest.update(evidence="measured", duration_seconds=harness.MIN_MEASURED_RELEASE_DURATION_SECONDS)
         manifest["candidate"]["revision"] = "b" * 40
         manifest["release_evidence"] = {
             "topology": {
@@ -527,7 +527,7 @@ class ScannerAbbaTest(unittest.TestCase):
         self.manifest["evidence"] = "measured"
         with self.assertRaisesRegex(ValueError, "duration_seconds"):
             harness.validate_manifest(self.manifest)
-        self.manifest["duration_seconds"] = 900
+        self.manifest["duration_seconds"] = harness.MIN_MEASURED_RELEASE_DURATION_SECONDS
         self.manifest["rounds"] = 2
         with self.assertRaisesRegex(ValueError, "rounds"):
             harness.validate_manifest(self.manifest)

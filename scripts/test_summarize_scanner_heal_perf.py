@@ -37,6 +37,7 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
             "schema": 1,
             "evidence": "measured",
             "rounds": 3,
+            "duration_seconds": summary.MIN_MEASURED_RELEASE_DURATION_SECONDS,
             "fixed": {
                 "config_sha256": "1" * 64,
                 "dataset_sha256": "2" * 64,
@@ -224,6 +225,19 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
                 })
                 with self.assertRaisesRegex(ValueError, "ABBA matrix|manifest/report evidence|comparison"):
                     summary.build_summary(args)
+
+    def test_passing_measured_report_requires_two_hour_window(self):
+        self.manifest["duration_seconds"] = summary.MIN_MEASURED_RELEASE_DURATION_SECONDS - 1
+        self.write_inputs()
+        args = type("Args", (), {
+            "abba_dir": self.abba,
+            "cache_cost_log": None,
+            "require_cache_cost": False,
+            "json_out": None,
+            "markdown_out": None,
+        })
+        with self.assertRaisesRegex(ValueError, "two hours"):
+            summary.build_summary(args)
 
     def test_passing_abba_report_requires_w10_w11_evidence(self):
         for fault in ("missing", "pressure", "lock", "attempt", "length", "range"):
