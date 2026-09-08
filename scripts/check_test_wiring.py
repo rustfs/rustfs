@@ -32,6 +32,19 @@ SCANNER_HEAL_RELEASE_REQUIRED_GATES = (
     "G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08", "G09", "G10", "G11", "G12", "G13", "G14",
     "P1", "P2", "P3", "P4", "R-E", "R-D", "R-L",
 )
+SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
+    "G03": (
+        "durable_root_publication_proof",
+        "scoped_ack_request_identity",
+        "participating_peer_capability_snapshot",
+        "mixed_peer_ack_fallback_oracle",
+    ),
+    "G09": (
+        "mixed_version_reader_evidence",
+        "mixed_version_writer_evidence",
+        "rollback_payload_evidence",
+    ),
+}
 SCHEDULED_ALERT_WORKFLOWS = tuple(
     item["workflow"]
     for item in json.loads((ROOT / ".github/scheduled-validations.json").read_text())
@@ -973,6 +986,15 @@ def scanner_heal_release_requirements(registry: dict[str, object]) -> tuple[dict
         require(isinstance(requires, list) and requires and
                 all(isinstance(requirement, str) and requirement.strip() for requirement in requires),
                 f"missing concrete evidence requirements for {gate}")
+        evidence_fields = item.get("evidence_fields", [])
+        require(isinstance(evidence_fields, list) and
+                all(isinstance(field, str) and re.fullmatch(r"[a-z0-9][a-z0-9_]*", field) is not None
+                    for field in evidence_fields),
+                f"invalid evidence fields for release gate {gate}")
+        required_fields = set(SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS.get(gate, ()))
+        missing_fields = sorted(required_fields - set(evidence_fields))
+        require(not missing_fields,
+                f"release gate {gate} missing required evidence fields: {', '.join(missing_fields)}")
         requirements[gate] = item
 
     missing = sorted(set(SCANNER_HEAL_RELEASE_REQUIRED_GATES) - set(requirements))
@@ -1465,6 +1487,7 @@ class SelfTests(unittest.TestCase):
 
             errors = check_scanner_heal_evidence(root, run_dir, "release")
             for gate, text in (
+                ("G03", "Exact scoped ACK"),
                 ("G09", "mixed-version reader/writer"),
                 ("G14", "3x4 EC8+4"),
                 ("P3", "two-hour pressure/heal capacity"),
@@ -1477,6 +1500,30 @@ class SelfTests(unittest.TestCase):
             self.assertIn("mixed-version-rollback", status["pending_lanes"])
             self.assertIn("ec8-4-multiset", status["pending_lanes"])
             self.assertIn("scheduler-pressure", status["pending_lanes"])
+            requirements, _, _ = scanner_heal_release_requirements(read_json(root / ".config/scanner-heal-required-tests.json"))
+            self.assertIn("durable_root_publication_proof", requirements["G03"]["evidence_fields"])
+            self.assertIn("mixed_version_writer_evidence", requirements["G09"]["evidence_fields"])
+
+    def test_scanner_heal_required_evidence_fields_cannot_be_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            for gate in ("G03", "G09"):
+                for requirement in registry["release_requirements"]:
+                    if requirement["gate"] == gate:
+                        requirement["evidence_fields"] = []
+                        break
+                write_json(root / ".config/scanner-heal-required-tests.json", registry)
+
+                with self.subTest(gate=gate):
+                    with self.assertRaisesRegex(ValueError, f"release gate {gate} missing required evidence fields"):
+                        scanner_heal_release_status(root, run_dir)
+
+                registry = read_json(root / ".config/scanner-heal-required-tests.json")
+                for requirement in registry["release_requirements"]:
+                    if requirement["gate"] == gate:
+                        requirement["evidence_fields"] = list(SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS[gate])
+                        break
 
     def test_scanner_heal_pending_gate_cannot_map_to_implemented_lane(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

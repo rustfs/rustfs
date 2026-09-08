@@ -248,6 +248,13 @@ pending gates mapped to an implemented lane, so clearing pending text cannot
 become approval. A focused run, synthetic harness, compile-only result,
 skipped/retried test, ordinary CI success, or unregistered mixed-version,
 rollback, EC8+4 or performance claim therefore cannot become a release approval.
+For high-risk rollback gates, `evidence_fields` records the specific proof
+fields that a future real-evidence checker must bind before a pending gate can
+move out of the blocked set. G03 keeps scoped ACK tied to durable root
+publication, ACK request identity, participating peer capability snapshots, and
+mixed-peer fallback oracles; G09 keeps mixed-version reader, writer, and rollback
+payload evidence explicit. These fields are part of the release contract, not
+evidence by themselves.
 
 Run parser/receipt regressions with
 `scripts/python_bin.sh scripts/check_test_wiring.py --self-test`. Those fixtures
