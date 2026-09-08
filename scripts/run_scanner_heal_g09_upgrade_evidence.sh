@@ -97,6 +97,21 @@ normalize_path() {
     fi
 }
 
+cargo_target_dir() {
+    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        normalize_path "$CARGO_TARGET_DIR"
+    else
+        echo "$ROOT/target"
+    fi
+}
+
+write_rustfs_features_stamp() {
+    local target_dir
+    target_dir="$(cargo_target_dir)"
+    mkdir -p "$target_dir/debug"
+    : > "$target_dir/debug/rustfs.features"
+}
+
 ensure_default_asset_platform() {
     if [[ -n "$SOURCE_BINARY" ]]; then
         return
@@ -239,6 +254,7 @@ run_self_test() {
     plan="$("$0" --plan-only --run-dir "$tmp/run" --source-binary "$tmp/rustfs-prev" --test all)"
     [[ "$plan" == *"tests=mixed-version rollback"* ]]
     [[ "$plan" == *"run_dir=$tmp/run"* ]]
+    [[ "$(CARGO_TARGET_DIR=relative-target "$0" --plan-only --run-dir "$tmp/run" --source-binary "$tmp/rustfs-prev")" == *"target_dir=$ROOT/relative-target"* ]]
 
     if "$0" --plan-only --test not-a-case >/dev/null 2>&1; then
         echo "self-test failed: invalid test selection was accepted" >&2
@@ -336,6 +352,7 @@ if [[ "$PLAN_ONLY" == 1 ]]; then
         fi
         echo "source_asset=$SOURCE_ASSET"
     fi
+    echo "target_dir=$(cargo_target_dir)"
     exit 0
 fi
 
@@ -357,7 +374,7 @@ mkdir -p "$RUSTFS_E2E_LOG_DIR"
 
 if [[ "$SKIP_BUILD" != 1 ]]; then
     run_logged build-current cargo build --locked -p rustfs --bin rustfs
-    : > "$ROOT/target/debug/rustfs.features"
+    write_rustfs_features_stamp
 fi
 
 SOURCE_REVISION="$(git rev-parse HEAD)"
