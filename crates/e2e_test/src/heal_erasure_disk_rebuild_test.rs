@@ -1567,7 +1567,10 @@ mod tests {
                 "Restored target endpoint forwarding"
             );
         } else {
-            if scenario == InterruptionScenario::BackgroundTargetRestart {
+            if matches!(
+                scenario,
+                InterruptionScenario::BackgroundTargetRestart | InterruptionScenario::BackgroundTargetRestartEc84
+            ) {
                 cluster.stop_node_gracefully(interruption_node).await?;
             } else {
                 cluster.stop_node(interruption_node)?;
@@ -1589,7 +1592,10 @@ mod tests {
             if background_enabled {
                 let marker_exists = unclean_shutdown_marker.is_file();
                 unclean_shutdown_marker_observed = Some(marker_exists);
-                let expected_marker = !matches!(scenario, InterruptionScenario::BackgroundTargetRestart);
+                let expected_marker = matches!(
+                    scenario,
+                    InterruptionScenario::BackgroundTargetCrash | InterruptionScenario::BackgroundTargetCrashEc84
+                );
                 assert!(
                     marker_exists == expected_marker,
                     "background restart/crash lane observed unexpected unclean-shutdown marker state"
