@@ -6315,12 +6315,21 @@ async fn apply_iam_group_info_item(
         return Ok(IamItemVerdict::Apply);
     }
 
-    let status_only = update.members.is_empty();
+    // A membership change carries the sender's client payload verbatim, and
+    // the madmin wire maps an unset `groupStatus` to Enabled
+    // (`crates/madmin/src/group.rs`), so writing the status alongside members
+    // would re-enable a group this site has disabled. Disabled can only come
+    // from an explicit "disabled", so it is never that default: honouring it
+    // keeps the full-IAM snapshot (`site_replication::hooks`), which always
+    // carries members and the real status, able to propagate a disabled group
+    // to a peer that does not have it yet — `GroupInfo::new` would otherwise
+    // create it enabled and hand its members live access.
+    let status_is_explicit = update.members.is_empty() || matches!(update.status, GroupStatus::Disabled);
     iam_sys
         .add_users_to_group_at(&update.group, update.members, stamp)
         .await
         .map_err(ApiError::from)?;
-    if status_only {
+    if status_is_explicit {
         iam_sys
             .set_group_status_at(&update.group, matches!(update.status, GroupStatus::Enabled), stamp)
             .await
@@ -8659,12 +8668,22 @@ mod tests {
     }
 
     fn sr_group_item(group: &str, members: &[&str], is_remove: bool, updated_at: OffsetDateTime) -> SRIAMItem {
+        sr_group_item_with_status(group, members, is_remove, rustfs_madmin::GroupStatus::Enabled, updated_at)
+    }
+
+    fn sr_group_item_with_status(
+        group: &str,
+        members: &[&str],
+        is_remove: bool,
+        status: rustfs_madmin::GroupStatus,
+        updated_at: OffsetDateTime,
+    ) -> SRIAMItem {
         let mut item = sr_item("group-info", updated_at);
         item.group_info = Some(SRGroupInfo {
             update_req: rustfs_madmin::GroupAddRemove {
                 group: group.to_string(),
                 members: members.iter().map(|member| member.to_string()).collect(),
-                status: rustfs_madmin::GroupStatus::Enabled,
+                status,
                 is_remove,
             },
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
@@ -8833,6 +8852,43 @@ mod tests {
 
         let info = iam.get_group_info(group).await.expect("group after replicated member add");
         assert_eq!(info.status, "disabled", "a membership-only update must not enable the group");
+        assert!(info.members.iter().any(|current| current == member));
+        clear_seeded_state().await;
+    }
+
+    /// A full-IAM snapshot always carries members and the sender's real group
+    /// status (`site_replication::hooks`). A peer that does not have the group
+    /// yet creates it through `GroupInfo::new`, which is enabled — so dropping
+    /// an explicit Disabled here would hand every member of a frozen group
+    /// live access on the peer, which is the same escalation the
+    /// membership-only guard above exists to prevent.
+    #[tokio::test]
+    #[serial]
+    async fn apply_group_snapshot_propagates_a_disabled_status_with_members() {
+        publish_ready_iam_context().await;
+        seed_two_peer_state_for_iam_apply().await;
+        let iam = current_iam_handle().expect("test IAM");
+        let member = "sr-snapshot-group-member";
+        let group = "sr-snapshot-disabled-group";
+        iam.create_user(member, &user_req("member-secret-key-123", rustfs_madmin::AccountStatus::Enabled))
+            .await
+            .expect("member");
+
+        apply_iam_item(sr_group_item_with_status(
+            group,
+            &[member],
+            false,
+            rustfs_madmin::GroupStatus::Disabled,
+            OffsetDateTime::now_utc() + time::Duration::seconds(1),
+        ))
+        .await
+        .expect("replicated group snapshot");
+
+        let info = iam.get_group_info(group).await.expect("group after replicated snapshot");
+        assert_eq!(
+            info.status, "disabled",
+            "a snapshot carrying an explicit disabled status must not create an enabled group"
+        );
         assert!(info.members.iter().any(|current| current == member));
         clear_seeded_state().await;
     }
