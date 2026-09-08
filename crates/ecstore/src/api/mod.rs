@@ -563,7 +563,7 @@ pub mod store_list {
 }
 
 pub mod storage {
-    pub use crate::core::pools::HealLifecycleExpiryContext;
+    pub use crate::core::pools::{HealLifecycleExpiryContext, POOL_META_NAME};
     pub use crate::store::HealWalkVersion;
     pub use crate::store::{
         BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
