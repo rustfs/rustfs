@@ -23,7 +23,16 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 
-from scanner_abba import MAX_JSON_BYTES, digest, number, read_json, require, sha, write_json
+from scanner_abba import (
+    MAX_JSON_BYTES,
+    RELEASE_PROFILE_ARTIFACTS,
+    digest,
+    number,
+    read_json,
+    require,
+    sha,
+    write_json,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,12 +89,6 @@ SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES = {
     ("R-L", "migration_gap_evidence"): "migration-gap",
     ("R-L", "crash_safe_source_retirement_evidence"): "crash-safe-source-retirement",
 }
-SCANNER_HEAL_RELEASE_PROFILE_ARTIFACTS = (
-    "allocation-profile",
-    "flamegraph",
-    "rss-samples",
-    "save-frequency",
-)
 SCHEDULED_ALERT_WORKFLOWS = tuple(
     item["workflow"]
     for item in json.loads((ROOT / ".github/scheduled-validations.json").read_text())
@@ -1387,14 +1390,29 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
     if field == "profile_evidence":
         evidence_integer(evidence.get("resolved_samples"), f"{gate}.{field}.resolved_samples", 1, 2**63 - 1)
         profile_artifacts = evidence.get("profile_artifacts")
-        require(isinstance(profile_artifacts, list) and
-                len(set(profile_artifacts)) == len(profile_artifacts) and
-                all(isinstance(artifact, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{1,63}", artifact) is not None
-                    for artifact in profile_artifacts),
-                f"{gate}.{field} requires named profile artifacts")
-        missing_profile_artifacts = sorted(set(SCANNER_HEAL_RELEASE_PROFILE_ARTIFACTS) - set(profile_artifacts))
-        require(not missing_profile_artifacts,
-                f"{gate}.{field} missing profile artifacts: {', '.join(missing_profile_artifacts)}")
+        require(isinstance(profile_artifacts, dict), f"{gate}.{field} missing profile artifacts")
+        missing_artifacts = sorted(set(RELEASE_PROFILE_ARTIFACTS) - set(profile_artifacts))
+        require(not missing_artifacts,
+                f"{gate}.{field} missing profile artifacts: {', '.join(missing_artifacts)}")
+        unknown_artifacts = sorted(set(profile_artifacts) - set(RELEASE_PROFILE_ARTIFACTS))
+        require(not unknown_artifacts,
+                f"{gate}.{field} unknown profile artifacts: {', '.join(unknown_artifacts)}")
+        for artifact_kind in RELEASE_PROFILE_ARTIFACTS:
+            item = profile_artifacts[artifact_kind]
+            require(isinstance(item, dict), f"{gate}.{field}.{artifact_kind} must be an object")
+            artifact_field = f"{field}.{artifact_kind}"
+            artifact_path = release_bundle_artifact_path(bundle_path, item.get("artifact"), gate, artifact_field)
+            require(artifact_path.stat().st_size > 0, f"{gate}.{artifact_field} artifact is empty")
+            require(sha(item.get("sha256")) and digest(artifact_path) == item["sha256"],
+                    f"{gate}.{artifact_field} artifact hash mismatch")
+            evidence_string(item.get("artifact_format"), f"{gate}.{artifact_field}.artifact_format",
+                            r"[A-Za-z0-9][A-Za-z0-9._+:-]{1,63}")
+            if "measurement_window_id" in item:
+                require(item["measurement_window_id"] == window_id,
+                        f"{gate}.{artifact_field} measurement window mismatch")
+            if "resolved_samples" in item:
+                evidence_integer(item.get("resolved_samples"), f"{gate}.{artifact_field}.resolved_samples",
+                                 0, 2**63 - 1)
     return window_id
 
 
@@ -1762,7 +1780,16 @@ class SelfTests(unittest.TestCase):
                     evidence["pools"] = 2
                 if field == "profile_evidence":
                     evidence["resolved_samples"] = 1
-                    evidence["profile_artifacts"] = list(SCANNER_HEAL_RELEASE_PROFILE_ARTIFACTS)
+                    artifacts = {}
+                    for artifact_kind in RELEASE_PROFILE_ARTIFACTS:
+                        artifact = artifact_dir / f"{gate}-{field}-{artifact_kind}.json"
+                        write_json(artifact, {"gate": gate, "field": field, "artifact": artifact_kind})
+                        artifacts[artifact_kind] = {
+                            "artifact": artifact.relative_to(bundle_dir).as_posix(),
+                            "sha256": digest(artifact),
+                            "artifact_format": "json",
+                        }
+                    evidence["profile_artifacts"] = artifacts
                 fields[field] = evidence
             gates[gate] = {
                 "status": "pass",
@@ -1816,8 +1843,29 @@ class SelfTests(unittest.TestCase):
             ("missing-duration", "P1", "cold_walk_share_measurement", lambda item: item.pop("duration_seconds"), "duration_seconds"),
             ("duration", "P3", "two_hour_pressure_measurement", lambda item: item.update({"duration_seconds": 7199}), "two hours"),
             ("profile", "P1", "profile_evidence", lambda item: item.pop("resolved_samples"), "resolved_samples"),
-            ("profile-artifact", "P1", "profile_evidence", lambda item: item.update({"profile_artifacts": ["allocation-profile", "rss-samples", "save-frequency"]}), "profile artifacts"),
-            ("duplicate-profile-artifact", "P1", "profile_evidence", lambda item: item.update({"profile_artifacts": ["allocation-profile", "allocation-profile", "flamegraph", "rss-samples", "save-frequency"]}), "named profile artifacts"),
+            (
+                "profile-artifact",
+                "P1",
+                "profile_evidence",
+                lambda item: item["profile_artifacts"].pop("flamegraph"),
+                "missing profile artifacts",
+            ),
+            (
+                "profile-artifact-hash",
+                "P1",
+                "profile_evidence",
+                lambda item: item["profile_artifacts"]["rss-samples"].update({"sha256": "0" * 64}),
+                "artifact hash mismatch",
+            ),
+            (
+                "profile-artifact-window",
+                "P1",
+                "profile_evidence",
+                lambda item: item["profile_artifacts"]["save-frequency"].update(
+                    {"measurement_window_id": "p1-different-window"}
+                ),
+                "measurement window mismatch",
+            ),
             ("versions", "G09", "mixed_version_reader_evidence", lambda item: item.update({"versions": [1, 2]}), "mixed-version"),
             ("stale-versions", "G09", "mixed_version_writer_evidence", lambda item: item.update({"versions": ["a" * 40, "c" * 40]}), "tested source revision"),
         ):
