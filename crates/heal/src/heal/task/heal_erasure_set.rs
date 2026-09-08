@@ -451,6 +451,11 @@ impl HealTask {
             self.source,
         )
         .with_replacement_targets(replacement_targets, is_auto_replacement.then(|| self.id.clone()))
+        .with_pool_metadata_targets(if self.options.recreate_missing && !self.options.dry_run {
+            self.heal_endpoints.clone()
+        } else {
+            Vec::new()
+        })
         .with_replacement_identity_fence(replacement_target_identities.clone())
         .with_mainline_pacer(self.mainline_pacer.clone());
 

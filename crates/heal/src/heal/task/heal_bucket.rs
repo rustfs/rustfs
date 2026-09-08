@@ -340,7 +340,86 @@ impl HealTask {
             return Err(self.record_batch_failure(failure).await);
         }
 
+        if self.options.recreate_missing && !self.options.dry_run {
+            self.heal_cluster_pool_metadata().await?;
+        }
+
         Ok(())
+    }
+
+    async fn heal_cluster_pool_metadata(&self) -> Result<()> {
+        let heal_opts = HealOpts {
+            recursive: false,
+            dry_run: self.options.dry_run,
+            remove: false,
+            recreate: self.options.recreate_missing,
+            scan_mode: self.options.scan_mode,
+            update_parity: self.options.update_parity,
+            no_lock: self.options.no_lock,
+            read_repair: false,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
+        };
+
+        let heal_result = self
+            .await_with_control(self.storage.heal_object(RUSTFS_META_BUCKET, POOL_META_NAME, None, &heal_opts))
+            .await;
+        match heal_result {
+            Ok((result, None)) => {
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_BUCKET_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    bucket = RUSTFS_META_BUCKET,
+                    object = POOL_META_NAME,
+                    drives_healed = result.drives_healed(),
+                    drives_total = result.drives_reported(),
+                    result = "pool_metadata_ok",
+                    "Heal cluster pool metadata repaired"
+                );
+                self.record_result_item(result).await;
+                Ok(())
+            }
+            Ok((result, Some(err))) => {
+                self.record_result_item(result).await;
+                warn!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_BUCKET_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    bucket = RUSTFS_META_BUCKET,
+                    object = POOL_META_NAME,
+                    result = "pool_metadata_failed",
+                    error = %err,
+                    "Heal cluster pool metadata failed"
+                );
+                Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to heal cluster pool metadata: {err}"),
+                })
+            }
+            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
+            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
+            Err(err) => {
+                warn!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_BUCKET_RESULT,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    task_id = %self.id,
+                    bucket = RUSTFS_META_BUCKET,
+                    object = POOL_META_NAME,
+                    result = "pool_metadata_failed",
+                    error = %err,
+                    "Heal cluster pool metadata failed"
+                );
+                Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to heal cluster pool metadata: {err}"),
+                })
+            }
+        }
     }
 
     pub(super) async fn heal_prefix(&self, bucket: &str, prefix: &str) -> Result<()> {

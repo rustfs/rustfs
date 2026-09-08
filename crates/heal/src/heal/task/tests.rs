@@ -66,7 +66,7 @@ mod canonical_outcome {
         assert_eq!(task.get_progress().await.objects_scanned, 2);
         assert_eq!(
             storage.heal_object_calls.lock().expect("object calls").as_slice(),
-            ["object-a", "object-b"]
+            ["object-a", "object-b", POOL_META_NAME]
         );
         assert_eq!(
             storage.listing_tokens.lock().expect("listing tokens").as_slice(),
@@ -2582,9 +2582,93 @@ async fn test_cluster_heal_visits_bucket_objects() {
 
     assert_eq!(
         storage.healed_objects.lock().unwrap().as_slice(),
-        ["object-a".to_string(), "object-b".to_string()]
+        ["object-a".to_string(), "object-b".to_string(), POOL_META_NAME.to_string()]
     );
     assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+}
+
+#[tokio::test]
+async fn cluster_recreate_heals_pool_metadata_after_user_buckets() {
+    let storage = Arc::new(MockStorage::default());
+    let request = HealRequest::new(
+        HealType::Cluster,
+        HealOptions {
+            recursive: true,
+            recreate_missing: true,
+            timeout: None,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    let task = HealTask::from_request(request, storage.clone());
+
+    task.execute()
+        .await
+        .expect("cluster recreate heal should include pool metadata");
+
+    assert_eq!(
+        storage.heal_object_calls.lock().expect("object calls").as_slice(),
+        ["object-a".to_string(), "object-b".to_string(), POOL_META_NAME.to_string()]
+    );
+    let opts = storage.object_heal_opts.lock().expect("object opts");
+    assert!(opts.last().expect("pool metadata opts").recreate);
+}
+
+#[tokio::test]
+async fn cluster_recreate_fails_when_pool_metadata_heal_fails() {
+    let storage = Arc::new(MockStorage::default());
+    storage.heal_object_outcomes.lock().expect("object outcomes").insert(
+        POOL_META_NAME.to_string(),
+        VecDeque::from([MockHealObjectOutcome::ErrOther("pool metadata missing")]),
+    );
+    let request = HealRequest::new(
+        HealType::Cluster,
+        HealOptions {
+            recursive: true,
+            recreate_missing: true,
+            timeout: None,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    let task = HealTask::from_request(request, storage.clone());
+
+    let err = task
+        .execute()
+        .await
+        .expect_err("cluster recreate heal must not hide pool metadata failure");
+
+    assert!(matches!(err, Error::TaskExecutionFailed { .. }));
+    assert_eq!(
+        storage.heal_object_calls.lock().expect("object calls").as_slice(),
+        ["object-a".to_string(), "object-b".to_string(), POOL_META_NAME.to_string()]
+    );
+}
+
+#[tokio::test]
+async fn cluster_dry_run_does_not_heal_pool_metadata() {
+    let storage = Arc::new(MockStorage::default());
+    let request = HealRequest::new(
+        HealType::Cluster,
+        HealOptions {
+            recursive: true,
+            dry_run: true,
+            recreate_missing: true,
+            timeout: None,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    let task = HealTask::from_request(request, storage.clone());
+
+    task.execute()
+        .await
+        .expect("dry-run cluster heal should preserve existing coverage");
+
+    assert_eq!(
+        storage.heal_object_calls.lock().expect("object calls").as_slice(),
+        ["object-a".to_string(), "object-b".to_string()]
+    );
 }
 
 #[tokio::test]

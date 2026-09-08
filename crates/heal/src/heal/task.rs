@@ -45,7 +45,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::{BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME, RUSTFS_META_BUCKET};
+use super::{BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME, POOL_META_NAME, RUSTFS_META_BUCKET};
 
 #[cfg(test)]
 pub(crate) struct OutcomeFinishTestHook {
