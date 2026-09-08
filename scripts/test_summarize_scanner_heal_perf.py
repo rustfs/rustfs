@@ -112,6 +112,42 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         self.assertEqual(result["verdict"], "FAIL")
         self.assertIn("synthetic evidence", result["reason"])
 
+    def test_failed_abba_report_without_comparisons_writes_fail_closed_summary(self):
+        self.report = {
+            "status": "failed",
+            "performance": "pending",
+            "completed_cells": 7,
+            "error": "collector failed",
+        }
+        self.write_inputs()
+        args = type("Args", (), {
+            "abba_dir": self.abba,
+            "cache_cost_log": None,
+            "require_cache_cost": False,
+            "json_out": None,
+            "markdown_out": None,
+        })
+        result = summary.build_summary(args)
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertEqual(result["abba"]["completed_cells"], 7)
+        self.assertEqual(result["abba"]["comparisons_total"], 0)
+        self.assertIn("collector failed", result["reason"])
+        self.assertIn("- completed_cells: 7", summary.markdown(result))
+        self.assertIn("- error: collector failed", summary.markdown(result))
+
+    def test_passing_abba_report_requires_comparisons(self):
+        del self.report["comparisons"]
+        self.write_inputs()
+        args = type("Args", (), {
+            "abba_dir": self.abba,
+            "cache_cost_log": None,
+            "require_cache_cost": False,
+            "json_out": None,
+            "markdown_out": None,
+        })
+        with self.assertRaisesRegex(ValueError, "passing report requires comparisons"):
+            summary.build_summary(args)
+
     def test_requires_cache_profile_when_requested(self):
         args = type("Args", (), {
             "abba_dir": self.abba,
