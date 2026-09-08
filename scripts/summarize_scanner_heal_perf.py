@@ -12,7 +12,12 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from scanner_abba import LEGS, SCENARIOS, validate_release_evidence_manifest
+from scanner_abba import (
+    LEGS,
+    MIN_MEASURED_RELEASE_DURATION_SECONDS,
+    SCENARIOS,
+    validate_release_evidence_manifest,
+)
 
 MAX_JSON_BYTES = 1024 * 1024
 CACHE_COST_PREFIX = "CACHE_COST "
@@ -124,6 +129,9 @@ def require_measured_comparison_evidence(comparison: dict[str, Any], index: int)
 
 def require_complete_abba_matrix(manifest: dict[str, Any], report: dict[str, Any], comparisons: list[dict[str, Any]]) -> None:
     require(report.get("evidence") == manifest.get("evidence"), "manifest/report evidence mismatch")
+    require(type(manifest.get("duration_seconds")) is int and
+            manifest["duration_seconds"] >= MIN_MEASURED_RELEASE_DURATION_SECONDS,
+            "measured ABBA duration_seconds requires at least two hours")
     rounds = manifest.get("rounds")
     require(type(rounds) is int and 3 <= rounds <= 10, "invalid manifest.rounds")
     expected_cells = len(SCENARIOS) * 2 * rounds * len(LEGS)

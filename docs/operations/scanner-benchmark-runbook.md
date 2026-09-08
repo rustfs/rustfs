@@ -39,8 +39,8 @@ The `scanner` and `heal` subsystems are served by `GetConfigKVHandler` (`rustfs/
 The `--abba` mode runs five independent scenario cells: `cold-hot`, `fresh-hot`,
 `multi-hot-new`, `running-heal`, and `mrf-replay`. Each scenario runs at least
 three A1/B1/B2/A2 groups for both baseline/candidate with background work on,
-and candidate-only background off/on. A measured leg lasts at least 900
-seconds; the minimum matrix contains 120 legs (30 hours before setup/oracles).
+and candidate-only background off/on. A measured release leg lasts at least 7200
+seconds; the minimum matrix contains 120 legs (240 hours before setup/oracles).
 The existing `performance-ab.yml` supplies the pattern for immutable build
 provenance and failure propagation, but its short Warp workload is not this
 scanner gate. No scheduled workflow starts this matrix automatically.
@@ -63,7 +63,7 @@ The manifest has the following JSON contract (all fields are required):
 | Field | Value |
 |---|---|
 | `schema`, `evidence` | `1`, and `measured` or `synthetic`. |
-| `rounds`, `duration_seconds`, `min_free_bytes` | 3..10 groups, 900..86400 seconds for measured runs, and the independently estimated free-space reservation in bytes. Synthetic runs may use 1 second. |
+| `rounds`, `duration_seconds`, `min_free_bytes` | 3..10 groups, 7200..86400 seconds for measured release runs, and the independently estimated free-space reservation in bytes. Synthetic runs may use 1 second. |
 | `baseline`, `candidate` | Each contains executable `binary`, full 40-character `revision`, and verified `sha256`. The runner rehashes binaries before every leg. |
 | `fixed` | `config_sha256`, `dataset_sha256`, `release_flags`, `durability`, `disk_type`, `cache_state`, `load_command`, `resource_isolation`, `topology` (`EC8+4`), and positive `offered_load_ops`. Hashes use 64 lowercase hexadecimal characters. |
 | `release_evidence` | Required for `measured` runs. It binds the 3x4 EC8+4 topology, multi-pool/multi-set coverage, per-node metrics endpoints, same-window distributed sampling, process restart and crash-restart fault modes, mixed-version reader/writer/rollback participation, and allocation/flamegraph/RSS/save-frequency profile artifact requirements. Synthetic runs do not need this field and still cannot approve release evidence. |

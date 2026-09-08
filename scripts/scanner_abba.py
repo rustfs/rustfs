@@ -35,6 +35,7 @@ RELEASE_PROFILE_ARTIFACTS = (
     "rss-samples",
     "save-frequency",
 )
+MIN_MEASURED_RELEASE_DURATION_SECONDS = 7200
 RELEASE_FAULT_MODES = (
     "process-restart",
     "process-crash-restart",
@@ -130,7 +131,7 @@ def validate_manifest(manifest):
     number(fixed.get("offered_load_ops"), "offered load", 1)
     require(type(manifest.get("rounds")) is int and 3 <= manifest["rounds"] <= 10,
             "rounds must be 3..10")
-    minimum = 900 if manifest["evidence"] == "measured" else 1
+    minimum = MIN_MEASURED_RELEASE_DURATION_SECONDS if manifest["evidence"] == "measured" else 1
     require(type(manifest.get("duration_seconds")) is int and
             minimum <= manifest["duration_seconds"] <= 86400, "invalid duration_seconds")
     number(manifest.get("min_free_bytes"), "min_free_bytes", 1)
