@@ -43,6 +43,8 @@
       "min_objects": 5,
       "max_objects": 5,
       "topology": {"nodes": 3, "drives_per_node": 4},
+      "erasure": {"data_blocks": 8, "parity_blocks": 4},
+      "erasure_set_drive_count": 12,
       "scope": "3-node x 4-drive single-set EC8+4, graceful target restart, preformatted replacement drive, exact unversioned S3 bodies and physical target shards; not mixed-version, multi-pool or long-window ABBA."
     },
     "background-target-restart-ec8-4": {
