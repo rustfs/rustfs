@@ -564,6 +564,18 @@ impl DataUsageCacheSource {
 #[serde(transparent)]
 pub struct DataUsageScanPlanDigest(pub [u8; 32]);
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataUsageSegmentInvalidationProof {
+    #[serde(default)]
+    pub process_epoch: String,
+    #[serde(default)]
+    pub generation_start: u64,
+    #[serde(default)]
+    pub generation_end: u64,
+    #[serde(default)]
+    pub producer_identity_coverage_complete: bool,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PendingScannerHealKind {
@@ -657,6 +669,11 @@ pub struct DataUsageCacheInfo {
     /// structural plan remains reusable across ordinary bucket writes.
     #[serde(default)]
     pub scan_execution_digest: Option<DataUsageScanPlanDigest>,
+    /// Process-epoch and generation window that produced a complete set cache
+    /// with all known segment invalidation producers wired. This proof is
+    /// additive compatibility metadata; absence keeps segment reuse disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_invalidation_proof: Option<DataUsageSegmentInvalidationProof>,
     /// Durable bucket incarnations captured for a complete set aggregate.
     /// Missing or nil entries are legacy/unproven and cannot authorize
     /// skipping an unselected bucket in a later scoped set scan.
@@ -686,6 +703,7 @@ impl Serialize for DataUsageCacheInfo {
             + usize::from(self.lkg_leader_epoch.is_some())
             + usize::from(self.lkg_scan_plan_digest.is_some())
             + usize::from(self.scan_execution_digest.is_some())
+            + usize::from(self.segment_invalidation_proof.is_some())
             + usize::from(!self.scan_bucket_incarnations.is_empty());
         let mut state = serializer.serialize_map(Some(field_count))?;
         state.serialize_entry("name", &self.name)?;
@@ -745,6 +763,9 @@ impl Serialize for DataUsageCacheInfo {
         }
         if let Some(scan_execution_digest) = self.scan_execution_digest {
             state.serialize_entry("scan_execution_digest", &scan_execution_digest)?;
+        }
+        if let Some(proof) = &self.segment_invalidation_proof {
+            state.serialize_entry("segment_invalidation_proof", proof)?;
         }
         if !self.scan_bucket_incarnations.is_empty() {
             state.serialize_entry("scan_bucket_incarnations", &self.scan_bucket_incarnations)?;

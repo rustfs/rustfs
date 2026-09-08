@@ -39,7 +39,7 @@ use s3s::dto::{
     BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled, ReplicationConfiguration, VersioningConfiguration,
 };
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -97,6 +97,24 @@ const METRIC_SCANNER_SET_SCANS_ACTIVE: &str = "rustfs_scanner_set_scans_active";
 const METRIC_SCANNER_SET_SCANS_QUEUED: &str = "rustfs_scanner_set_scans_queued";
 const METRIC_SCANNER_DISK_BUCKET_SCANS_ACTIVE: &str = "rustfs_scanner_disk_bucket_scans_active";
 const METRIC_SCANNER_DISK_BUCKET_SCANS_QUEUED: &str = "rustfs_scanner_disk_bucket_scans_queued";
+
+pub(crate) const SCANNER_SEGMENT_ACTIVATION_PROOF_INPUTS: [&str; 7] = [
+    "source",
+    "bucket_incarnation",
+    "key_format",
+    "baseline_scan_plan_digest",
+    "process_epoch",
+    "generation_window",
+    "producer_identities",
+];
+pub(crate) const SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS: [&str; 6] = [
+    "missing_producer_identity",
+    "restart_gap",
+    "generation_gap",
+    "overflow",
+    "missing_cold_zero_walk_oracle",
+    "distributed_without_peer_invalidation",
+];
 
 pub type DirtyUsageBuckets = HashMap<String, u64>;
 
@@ -163,11 +181,52 @@ struct ScannerPeerDirtyUsageExpectation {
 struct VerifiedRemoteDirtyUsage {
     dirty_buckets: HashSet<String>,
     acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+    peer_count: usize,
+    dirty_peer_count: usize,
 }
 
 struct ScannerBucketScopeResolutionResult {
     scope: ScannerBucketScanScope,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+    distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DistributedSegmentInvalidationEvidence {
+    pub(crate) invalidation_domain: crate::segment_invalidation::SegmentInvalidationDomain,
+    pub(crate) distributed_ec_invalidation: bool,
+    pub(crate) peer_count: usize,
+    pub(crate) dirty_peer_count: usize,
+    pub(crate) same_window_remote_proof: bool,
+    pub(crate) all_peers_bound_to_generation_window: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScannerSegmentReuseActivationProof {
+    pub(crate) production_activation: bool,
+    pub(crate) producer_identity_coverage_complete: bool,
+    pub(crate) durable_producer_identity: bool,
+    pub(crate) restart_gap_absent: bool,
+    pub(crate) generation_window_bound: bool,
+    pub(crate) overflow_absent: bool,
+    pub(crate) cold_zero_walk_oracle: bool,
+    pub(crate) distributed_peer_invalidation: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScannerSegmentReuseActivationPreflight {
+    pub(crate) production_activation: bool,
+    pub(crate) scanner_segment_reuse_activated: bool,
+    pub(crate) proof_inputs: &'static [&'static str],
+    pub(crate) fail_closed_checks: &'static [&'static str],
+    pub(crate) fail_closed_blockers: [Option<&'static str>; 6],
+}
+
+impl ScannerSegmentReuseActivationPreflight {
+    #[cfg(test)]
+    pub(crate) fn fail_closed_blockers(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.fail_closed_blockers.iter().filter_map(|blocker| *blocker)
+    }
 }
 
 fn verified_remote_dirty_usage(
@@ -191,6 +250,7 @@ fn verified_remote_dirty_usage(
             || !snapshot.complete
             || snapshot.pending_bucket_count != u64::try_from(snapshot.buckets.len()).unwrap_or(u64::MAX)
             || (expected.pending && snapshot.pending_bucket_count == 0)
+            || (!expected.pending && snapshot.pending_bucket_count != 0)
         {
             return None;
         }
@@ -216,9 +276,13 @@ fn verified_remote_dirty_usage(
         }
     }
 
+    let peer_count = received_peers.len();
+    let dirty_peer_count = acknowledgements.len();
     (received_peers.len() == expected_peers.len()).then_some(VerifiedRemoteDirtyUsage {
         dirty_buckets,
         acknowledgements,
+        peer_count,
+        dirty_peer_count,
     })
 }
 
@@ -244,8 +308,11 @@ fn resolve_remote_dirty_usage_scope(
     let default_result = |scope: ScannerBucketScanScope| ScannerBucketScopeResolutionResult {
         scope,
         remote_dirty_usage_acknowledgements: Vec::new(),
+        distributed_segment_invalidation_evidence: None,
     };
 
+    let peer_count = remote_dirty_usage.peer_count;
+    let dirty_peer_count = remote_dirty_usage.dirty_peer_count;
     dirty_buckets.extend(remote_dirty_usage.dirty_buckets);
     // Peer snapshots contribute bucket names only; the local prefix scopes
     // would narrow a bucket a peer dirtied elsewhere, so the merged scope
@@ -283,10 +350,21 @@ fn resolve_remote_dirty_usage_scope(
     if scanner_scoped_dirty_usage_ack_exceeds_cost_threshold(&scoped_acknowledgements) {
         return default_result(ScannerBucketScanScope::default());
     }
+    let has_scoped_acknowledgements = !scoped_acknowledgements.is_empty();
 
     ScannerBucketScopeResolutionResult {
         scope,
         remote_dirty_usage_acknowledgements: scoped_acknowledgements,
+        distributed_segment_invalidation_evidence: (dirty_peer_count > 0 && has_scoped_acknowledgements).then_some(
+            DistributedSegmentInvalidationEvidence {
+                invalidation_domain: crate::segment_invalidation::SegmentInvalidationDomain::DistributedEc,
+                distributed_ec_invalidation: true,
+                peer_count,
+                dirty_peer_count,
+                same_window_remote_proof: true,
+                all_peers_bound_to_generation_window: true,
+            },
+        ),
     }
 }
 
@@ -406,10 +484,63 @@ fn scoped_scan_scope_from_dirty_buckets(
     ScannerBucketScanScope::from_dirty_buckets(selected_buckets, selected_bucket_prefixes, baseline_scan_plan_digest)
 }
 
-fn scanner_segment_reuse_activated() -> bool {
+fn scanner_segment_reuse_activation_preflight() -> ScannerSegmentReuseActivationPreflight {
     // Production segment reuse stays disabled until a durable mutation-stream
     // proof satisfies the segment invalidation contract.
-    false
+    scanner_segment_reuse_activation_preflight_from_proof(ScannerSegmentReuseActivationProof::default())
+}
+
+fn scanner_segment_reuse_activation_preflight_from_proof(
+    proof: ScannerSegmentReuseActivationProof,
+) -> ScannerSegmentReuseActivationPreflight {
+    ScannerSegmentReuseActivationPreflight {
+        production_activation: proof.production_activation,
+        scanner_segment_reuse_activated: proof.production_activation
+            && proof.producer_identity_coverage_complete
+            && proof.durable_producer_identity
+            && proof.restart_gap_absent
+            && proof.generation_window_bound
+            && proof.overflow_absent
+            && proof.cold_zero_walk_oracle
+            && proof.distributed_peer_invalidation,
+        proof_inputs: &SCANNER_SEGMENT_ACTIVATION_PROOF_INPUTS,
+        fail_closed_checks: &SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS,
+        fail_closed_blockers: [
+            (!proof.producer_identity_coverage_complete || !proof.durable_producer_identity)
+                .then_some("missing_producer_identity"),
+            (!proof.restart_gap_absent).then_some("restart_gap"),
+            (!proof.generation_window_bound).then_some("generation_gap"),
+            (!proof.overflow_absent).then_some("overflow"),
+            (!proof.cold_zero_walk_oracle).then_some("missing_cold_zero_walk_oracle"),
+            (!proof.distributed_peer_invalidation).then_some("distributed_without_peer_invalidation"),
+        ],
+    }
+}
+
+fn scanner_segment_reuse_activation_preflight_for_cycle(
+    dirty_usage_snapshot: &DirtyUsageSnapshot,
+    dirty_usage_producer_evidence: DirtyUsageProducerEvidence,
+    distributed: bool,
+    distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
+    cold_zero_walk_oracle: bool,
+) -> ScannerSegmentReuseActivationPreflight {
+    scanner_segment_reuse_activation_preflight_from_proof(ScannerSegmentReuseActivationProof {
+        production_activation: false,
+        producer_identity_coverage_complete: dirty_usage_producer_evidence.producer_identity_coverage_complete,
+        durable_producer_identity: dirty_usage_producer_evidence.durable_producer_identity,
+        restart_gap_absent: dirty_usage_producer_evidence.restart_gap_absent,
+        generation_window_bound: dirty_usage_snapshot.covers_all_pending
+            && dirty_usage_snapshot.generation != 0
+            && dirty_usage_snapshot.generation != u64::MAX
+            && dirty_usage_producer_evidence.generation_window_bound,
+        overflow_absent: dirty_usage_snapshot.covers_all_pending,
+        cold_zero_walk_oracle,
+        distributed_peer_invalidation: !distributed || distributed_segment_invalidation_evidence.is_some(),
+    })
+}
+
+fn scanner_segment_reuse_activated() -> bool {
+    scanner_segment_reuse_activation_preflight().scanner_segment_reuse_activated
 }
 
 pub(crate) fn is_scanner_metadata_corrupt_error(err: &StorageError) -> bool {
@@ -471,6 +602,8 @@ pub struct ScannerBucketScanPlan {
     bucket_failures: ScannerBucketFailureState,
     pending_maintenance_work: Arc<AtomicBool>,
     cache_cycle_floor: Arc<AtomicU64>,
+    cold_zero_walk_reuse_observed: Arc<AtomicBool>,
+    segment_invalidation_proof: Option<crate::DataUsageSegmentInvalidationProof>,
 }
 
 #[derive(Clone, Default)]
@@ -601,6 +734,25 @@ fn scanner_bucket_scan_status(has_failed: bool, has_partial: bool, has_namespace
     } else {
         ScannerBucketScanStatus::Complete
     }
+}
+
+fn scanner_cycle_cold_zero_walk_oracle(
+    scan_scope: &ScannerBucketScanScope,
+    all_buckets: &[BucketInfo],
+    completed_all_sets: bool,
+    scan_scope_matches: bool,
+    bucket_scan_status: ScannerBucketScanStatus,
+    cold_zero_walk_reuse_observed: bool,
+) -> bool {
+    let Some(selected_buckets) = scan_scope.selected_buckets.as_deref() else {
+        return false;
+    };
+    cold_zero_walk_reuse_observed
+        && !selected_buckets.is_empty()
+        && completed_all_sets
+        && scan_scope_matches
+        && bucket_scan_status == ScannerBucketScanStatus::Complete
+        && all_buckets.iter().any(|bucket| !selected_buckets.contains(&bucket.name))
 }
 
 fn classify_nsscanner_cycle(
@@ -1056,6 +1208,8 @@ pub(crate) struct ScannerCycleResult {
     observational_snapshot_published: bool,
     dirty_usage_clear: Option<DirtyUsageBuckets>,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+    distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
+    segment_reuse_activation_preflight: ScannerSegmentReuseActivationPreflight,
     remote_publication_lease_targets: Vec<(String, String, u64)>,
     failed_dirty_usage: bool,
     pending_maintenance_work: bool,
@@ -1072,6 +1226,8 @@ impl ScannerCycleResult {
             observational_snapshot_published: false,
             dirty_usage_clear,
             remote_dirty_usage_acknowledgements: Vec::new(),
+            distributed_segment_invalidation_evidence: None,
+            segment_reuse_activation_preflight: scanner_segment_reuse_activation_preflight(),
             remote_publication_lease_targets: Vec::new(),
             failed_dirty_usage: false,
             pending_maintenance_work: false,
@@ -1134,6 +1290,21 @@ impl ScannerCycleResult {
     ) -> Self {
         self.publication_expectation = None;
         self.remote_dirty_usage_acknowledgements = acknowledgements;
+        self
+    }
+
+    fn with_distributed_segment_invalidation_evidence(
+        mut self,
+        evidence: Option<DistributedSegmentInvalidationEvidence>,
+    ) -> Self {
+        self.publication_expectation = None;
+        self.distributed_segment_invalidation_evidence = evidence;
+        self
+    }
+
+    fn with_segment_reuse_activation_preflight(mut self, preflight: ScannerSegmentReuseActivationPreflight) -> Self {
+        self.publication_expectation = None;
+        self.segment_reuse_activation_preflight = preflight;
         self
     }
 
@@ -1224,9 +1395,9 @@ pub(crate) use cache::{
 pub use dirty_usage::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageSnapshot, ScannerDirtyUsageState,
     acknowledge_dirty_usage_generation, acknowledge_scoped_dirty_usage, clear_dirty_usage_bucket, record_dirty_usage_bucket,
-    record_dirty_usage_bucket_from_producer, record_dirty_usage_object, record_dirty_usage_object_from_producer,
-    record_scanner_maintenance_change, scanner_activity_epoch, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
-    scanner_maintenance_generation,
+    record_dirty_usage_bucket_from_producer, record_dirty_usage_bucket_from_producers, record_dirty_usage_object,
+    record_dirty_usage_object_from_producer, record_scanner_maintenance_change, scanner_activity_epoch,
+    scanner_dirty_usage_snapshot, scanner_dirty_usage_state, scanner_maintenance_generation,
 };
 #[cfg(test)]
 pub(crate) use dirty_usage::{clear_dirty_usage_buckets_for_tests, dirty_usage_buckets_for_tests};

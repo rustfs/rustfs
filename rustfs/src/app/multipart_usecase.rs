@@ -532,7 +532,11 @@ impl DefaultMultipartUsecase {
             .await
         {
             Ok(_) => {
-                rustfs_scanner::record_dirty_usage_object(&bucket, &key);
+                rustfs_scanner::record_dirty_usage_object_from_producer(
+                    &bucket,
+                    &key,
+                    rustfs_scanner::SegmentInvalidationProducerIdentity::AbortMultipartUpload,
+                );
                 Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
             }
             Err(err) => {
@@ -802,7 +806,11 @@ impl DefaultMultipartUsecase {
                     schedule_object_replication(obj_info.clone(), store, completion_replication_decision).await;
                 }
 
-                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                rustfs_scanner::record_dirty_usage_object_from_producer(
+                    &bucket,
+                    &key,
+                    rustfs_scanner::SegmentInvalidationProducerIdentity::CompleteMultipartUpload,
+                );
                 Ok::<_, S3Error>(obj_info)
             }
         });

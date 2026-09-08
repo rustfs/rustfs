@@ -964,9 +964,10 @@ async fn run_scanner_usage_recovery_intents_for_startup(
     Ok(attempted)
 }
 
-/// Start normal scanning when enabled, or one resume-only cleanup attempt.
+/// Start normal scanning when enabled, or one bounded recovery attempt.
 /// The disabled branch returns a finite task for the startup owner to join;
-/// it never enables ordinary namespace scanning or accepts a new reset intent.
+/// it never enables ordinary namespace scanning while it replays durable reset
+/// intents and cleanup markers.
 pub async fn init_scanner_with_recovery(
     ctx: CancellationToken,
     storeapi: Arc<ECStore>,
@@ -988,6 +989,17 @@ pub async fn init_scanner_with_recovery(
         return None;
     }
     Some(tokio::spawn(async move {
+        if let Err(error) = run_scanner_usage_recovery_intents_for_startup(ctx.clone(), storeapi.clone()).await {
+            warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "recovery_intent_startup_discovery_failed",
+                error = %error,
+                "Scanner recovery intent startup discovery failed"
+            );
+        }
         if let Err(error) = resume_scanner_cycle_cleanup(ctx, storeapi).await {
             warn!(
                 target: "rustfs::scanner",

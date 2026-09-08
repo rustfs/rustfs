@@ -138,6 +138,7 @@ async fn run_entry(store: &Arc<ECStore>, cycle: u64, selected: Option<&str>, exp
     .expect("entry cycle should finish within the fixture deadline")
     .expect("entry cycle should succeed");
     assert_eq!(result.status, ScannerCycleStatus::Complete);
+    let activation_preflight = result.segment_reuse_activation_preflight;
     let scope = observed.await.expect("production resolver should report its decision");
     assert_eq!(
         scope.selected_buckets.as_deref(),
@@ -174,6 +175,20 @@ async fn run_entry(store: &Arc<ECStore>, cycle: u64, selected: Option<&str>, exp
         actual, expected_walks,
         "each listed source/bucket must have exactly the expected real walks"
     );
+    assert!(!activation_preflight.production_activation);
+    assert!(!activation_preflight.scanner_segment_reuse_activated);
+    let activation_blockers = activation_preflight.fail_closed_blockers().collect::<Vec<_>>();
+    if selected.is_some() && expect_walks {
+        assert!(
+            !activation_blockers.contains(&"missing_cold_zero_walk_oracle"),
+            "a complete scoped reuse cycle must carry the cold zero-walk oracle: cycle={cycle} selected={selected:?} blockers={activation_blockers:?}"
+        );
+    } else {
+        assert!(
+            activation_blockers.contains(&"missing_cold_zero_walk_oracle"),
+            "unscoped or same-cycle cache reuse must not claim the cold zero-walk oracle: cycle={cycle} selected={selected:?} expect_walks={expect_walks} blockers={activation_blockers:?}"
+        );
+    }
     assert_eq!(
         read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
             .await

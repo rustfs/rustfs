@@ -837,6 +837,55 @@ emit_step_result() {
             self.assertIn(value, contents)
         self.assertNotIn("OLD RUN EVIDENCE", contents)
 
+    def test_performance_commands_bind_runner_selection_and_preserve_failures(self) -> None:
+        self.prepare("performance")
+        source = self.source.splitlines()
+        job = yaml_block(source, "performance-test", 2)
+        runner = WorkflowSteps()
+        runner.directory = self.directory / "workspace with spaces"
+        scripts = runner.directory / "auto-testing"
+        scripts.mkdir(parents=True)
+        wrapper = scripts / "rustfs_performance_test.sh"
+        wrapper.write_text(f"#!{sys.executable}\nimport json, os, sys\n" +
+                           "print(json.dumps({'args': sys.argv[1:], 'env': {key: os.environ.get(key) for key in " +
+                           "('RUSTFS_BENCH_SCRIPT', 'RUSTFS_WARP_METHODS', 'RUSTFS_WARP_SIZES', " +
+                           "'RUSTFS_WARP_DURATION', 'RUSTFS_WARP_CONCURRENCY', 'WARP_METHODS', " +
+                           "'WARP_SIZES', 'WARP_DURATION', 'WARP_CONCURRENCY')}}))\n" +
+                           "sys.exit(int(os.environ['FAKE_BENCH_EXIT']))\n")
+        wrapper.chmod(0o755)
+        runner.steps = named_steps(job)
+        for methods, sizes, duration, concurrency in (
+            ("get", "1KiB", "1s", "7"), ("all", "all", "5m", "64"), ("", "", "5m", "64")
+        ):
+            runner.context = {"github.workspace": str(runner.directory), "inputs.test_method": methods,
+                              "inputs.object_size": sizes, "inputs.warp_duration || '5m'": duration,
+                              "inputs.warp_concurrency || '64'": concurrency}
+            runner.env = {**self.env, "RUSTFS_BENCH_SCRIPT": "/unverified/home-script.sh",
+                          "RUSTFS_WARP_METHODS": "put", "RUSTFS_WARP_SIZES": "64MiB",
+                          "RUSTFS_WARP_DURATION": "99h", "RUSTFS_WARP_CONCURRENCY": "2",
+                          "WARP_DURATION": "88h", "WARP_CONCURRENCY": "3", "WARP_METHODS": "mixed", "WARP_SIZES": "32MiB",
+                          "LOG_FILE": str(self.directory / "suite.log")}
+            runner.env.update(runner.step_env(job, indent=4))
+            for step, number in (("Run benchmark (GET/PUT/MIXED)", "5"), ("Analyze results", "6")):
+                for code in (0, 42):
+                    with self.subTest(methods=methods, sizes=sizes, step=step, exit=code):
+                        runner.env["FAKE_BENCH_EXIT"] = str(code)
+                        result = runner.run_step(step)
+                        self.assertEqual(result.returncode, code, result.stderr)
+                        invocation = json.loads(result.stdout)
+                        expected = ["--step", number, "-y", "--log-file", runner.env["LOG_FILE"]]
+                        self.assertEqual(invocation["args"], expected)
+                        self.assertEqual(invocation["env"]["RUSTFS_BENCH_SCRIPT"], str(scripts / "rustfs_performance_testing.sh"))
+                        self.assertEqual(invocation["env"]["RUSTFS_WARP_METHODS"], methods)
+                        self.assertEqual(invocation["env"]["RUSTFS_WARP_SIZES"], sizes)
+                        self.assertEqual(invocation["env"]["RUSTFS_WARP_DURATION"], duration)
+                        self.assertEqual(invocation["env"]["RUSTFS_WARP_CONCURRENCY"], concurrency)
+                        if number == "6":
+                            self.assertEqual(invocation["env"]["WARP_METHODS"], methods)
+                            self.assertEqual(invocation["env"]["WARP_SIZES"], sizes)
+                            self.assertEqual(invocation["env"]["WARP_DURATION"], duration)
+                            self.assertEqual(invocation["env"]["WARP_CONCURRENCY"], concurrency)
+
 
 if __name__ == "__main__":
     unittest.main()

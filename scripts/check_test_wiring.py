@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1516,11 +1517,63 @@ def is_json_artifact_format(value: str) -> bool:
     return normalized == "json" or normalized.endswith("+json")
 
 
+def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple[str, ...]:
+    fields: list[str] = []
+    if gate in ("G03", "G09", "R-L"):
+        fields.extend(("versions", "mixed_version_role"))
+    if gate in ("G04", "G07", "R-E", "R-L"):
+        fields.append("crash_points")
+    if gate == "G03":
+        fields.append("scoped_ack_cases")
+        if field == "durable_root_publication_proof":
+            fields.extend(("root_cas_observed", "root_readback_observed"))
+        if field == "scoped_ack_request_identity":
+            fields.append("whole_cycle_fallback_observed")
+    if gate == "G04" and field == "root_floor_intent_crash_evidence":
+        fields.extend(("durable_intent_cases", "persist_failure_blocks_acceptance"))
+    if gate == "G07":
+        fields.append({
+            "mrf_responsibility_oracle": "mrf_responsibility_cases",
+            "commit_boundary_crash_matrix": "commit_crash_cases",
+        }[field])
+    if gate == "G08":
+        fields.append({
+            "mrf_capacity_evidence": "capacity_cases",
+            "disk_full_matrix": "disk_full_cases",
+            "replica_loss_matrix": "replica_loss_cases",
+        }[field])
+    if gate == "G09":
+        fields.append("mixed_version_cases")
+        if field == "rollback_payload_evidence":
+            fields.append("rollback_payload_replayed")
+    if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
+        fields.extend(("replayed_records", "responsibility_anchor_retained", "successor_snapshot_published"))
+    if gate == "P4" and field == "retained_responsibility_evidence":
+        fields.extend((
+            "duration_seconds",
+            "retained_responsibility_cases",
+            "retention_window_seconds",
+            "idle_cleanup_observed",
+            "verified_proof_discharge_observed",
+        ))
+    if gate == "P4" and field == "mrf_cleanup_gc_soak_evidence":
+        fields.extend((
+            "duration_seconds",
+            "cleanup_gc_cases",
+            "verified_idle_gc_observed",
+            "pending_responsibilities_after_gc",
+            "stale_journals_after_gc",
+        ))
+    return tuple(dict.fromkeys(fields))
+
+
 def validate_release_bundle_json_artifact_payload(path: Path, source_revision: str, gate: str, field: str,
                                                  run_id: str, window_id: str,
                                                  artifact_kind: str | None = None) -> None:
     payload = read_json(path)
     prefix = f"{gate}.{field}"
+    for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
+        require(payload.get(marker) is not True, f"{prefix} JSON artifact is {marker}")
     require(payload.get("evidence_type") == "measured", f"{prefix} JSON artifact must be measured")
     require(payload.get("source_revision") == source_revision, f"{prefix} JSON artifact source revision mismatch")
     require(payload.get("run_id") == run_id, f"{prefix} JSON artifact run_id mismatch")
@@ -1529,6 +1582,62 @@ def validate_release_bundle_json_artifact_payload(path: Path, source_revision: s
     require(payload.get("field") == field, f"{prefix} JSON artifact field mismatch")
     if artifact_kind is not None:
         require(payload.get("artifact_kind") == artifact_kind, f"{prefix} JSON artifact kind mismatch")
+    mirror_fields = release_bundle_json_artifact_mirrored_fields(gate, field)
+    for mirror_field in mirror_fields:
+        require(mirror_field in payload, f"{prefix} JSON artifact missing {mirror_field}")
+    if not mirror_fields:
+        return
+    validate_release_bundle_domain_evidence(gate, field, payload)
+    if gate in ("G03", "G09", "R-L"):
+        versions = payload.get("versions")
+        require(isinstance(versions, list) and
+                len(set(versions)) >= 2 and
+                all(isinstance(version, str) and re.fullmatch(r"[0-9a-f]{40}", version) is not None
+                    for version in versions),
+                f"{prefix} JSON artifact requires mixed-version evidence")
+        require(source_revision in versions, f"{prefix} JSON artifact versions omit tested source revision")
+        expected_role = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
+        require(payload.get("mixed_version_role") == expected_role,
+                f"{prefix} JSON artifact mixed-version role must be {expected_role}")
+    if gate in ("G04", "G07", "R-E", "R-L"):
+        crash_points = payload.get("crash_points")
+        require(isinstance(crash_points, list) and crash_points,
+                f"{prefix} JSON artifact requires crash-boundary evidence")
+    if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
+        evidence_integer(payload.get("replayed_records"), f"{prefix} JSON artifact replayed_records", 1, 2**63 - 1)
+        require(payload.get("responsibility_anchor_retained") is True,
+                f"{prefix} JSON artifact requires retained MRF responsibility anchors")
+        require(payload.get("successor_snapshot_published") is True,
+                f"{prefix} JSON artifact requires successor snapshot publication evidence")
+    if gate == "P4" and field == "mrf_cleanup_gc_soak_evidence":
+        release_bundle_exact_strings(
+            payload.get("cleanup_gc_cases"),
+            SCANNER_HEAL_RELEASE_MRF_CLEANUP_GC_SOAK_CASES,
+            f"{prefix} JSON artifact cleanup_gc_cases",
+        )
+        require(payload.get("verified_idle_gc_observed") is True,
+                f"{prefix} JSON artifact requires verified idle GC evidence")
+        require(payload.get("pending_responsibilities_after_gc") == 0,
+                f"{prefix} JSON artifact requires zero pending responsibilities after GC")
+        require(payload.get("stale_journals_after_gc") == 0,
+                f"{prefix} JSON artifact requires zero stale journals after GC")
+    if gate == "G07":
+        case_field = {
+            "mrf_responsibility_oracle": "mrf_responsibility_cases",
+            "commit_boundary_crash_matrix": "commit_crash_cases",
+        }[field]
+        cases = evidence_string_list(payload.get(case_field), f"{prefix} JSON artifact {case_field}")
+        missing_cases = sorted(set(SCANNER_HEAL_RELEASE_G07_REQUIRED_CASES[field]) - set(cases))
+        require(not missing_cases, f"{prefix} JSON artifact missing cases: {', '.join(missing_cases)}")
+    if gate == "G08":
+        case_field = {
+            "mrf_capacity_evidence": "capacity_cases",
+            "disk_full_matrix": "disk_full_cases",
+            "replica_loss_matrix": "replica_loss_cases",
+        }[field]
+        cases = evidence_string_list(payload.get(case_field), f"{prefix} JSON artifact {case_field}")
+        missing_cases = sorted(set(SCANNER_HEAL_RELEASE_G08_REQUIRED_CASES[field]) - set(cases))
+        require(not missing_cases, f"{prefix} JSON artifact missing cases: {', '.join(missing_cases)}")
 
 
 def release_bundle_bool_true(value: object, name: str) -> None:
@@ -1872,6 +1981,52 @@ def validate_release_bundle_gate_windows(gate: str, field_windows: dict[str, str
         require(len(windows) == 1, f"{gate} evidence fields must share one measurement window")
 
 
+def validate_scanner_heal_release_bundle_gate(bundle_path: Path, source_revision: str,
+                                              requirements: dict[str, dict[str, object]],
+                                              raw_gates: dict[str, object], gate: str) -> list[str]:
+    gate_errors: list[str] = []
+    requirement = requirements[gate]
+    gate_evidence = raw_gates.get(gate)
+    if not isinstance(gate_evidence, dict):
+        return ["missing gate evidence"]
+    if gate_evidence.get("status") != "pass":
+        gate_errors.append("gate status must be pass")
+    if gate_evidence.get("lane") != requirement["lane"]:
+        gate_errors.append("gate lane mismatch")
+    if gate_evidence.get("evidence_type") != "measured":
+        gate_errors.append("gate evidence type must be measured")
+    fields = gate_evidence.get("evidence_fields")
+    if not isinstance(fields, dict):
+        gate_errors.append("missing gate evidence fields")
+        fields = {}
+    required_fields = tuple(SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate])
+    missing_fields = [field for field in required_fields if field not in fields]
+    if missing_fields:
+        gate_errors.append(f"missing required fields: {', '.join(missing_fields)}")
+    field_windows: dict[str, str] = {}
+    for field in required_fields:
+        if field not in fields:
+            continue
+        evidence = fields[field]
+        if not isinstance(evidence, dict):
+            gate_errors.append(f"{field} must be an object")
+            continue
+        for marker in ("fixture_only", "dry_run", "synthetic"):
+            if evidence.get(marker) is True:
+                gate_errors.append(f"{field} is {marker}")
+                continue
+        try:
+            field_windows[field] = validate_release_bundle_artifact(bundle_path, source_revision, gate, field, evidence)
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            gate_errors.append(str(error))
+    if not gate_errors:
+        try:
+            validate_release_bundle_gate_windows(gate, field_windows)
+        except ValueError as error:
+            gate_errors.append(str(error))
+    return gate_errors
+
+
 def scanner_heal_release_bundle_status(root: Path, bundle_path: Path) -> dict[str, object]:
     """Validate a complete hard-gate evidence bundle without accepting synthetic claims."""
     registry = read_json(root / ".config/scanner-heal-required-tests.json")
@@ -1893,47 +2048,8 @@ def scanner_heal_release_bundle_status(root: Path, bundle_path: Path) -> dict[st
 
     verified: list[str] = []
     rejected: dict[str, list[str]] = {}
-    for gate, requirement in requirements.items():
-        gate_errors: list[str] = []
-        gate_evidence = raw_gates.get(gate)
-        if not isinstance(gate_evidence, dict):
-            rejected[gate] = ["missing gate evidence"]
-            continue
-        if gate_evidence.get("status") != "pass":
-            gate_errors.append("gate status must be pass")
-        if gate_evidence.get("lane") != requirement["lane"]:
-            gate_errors.append("gate lane mismatch")
-        if gate_evidence.get("evidence_type") != "measured":
-            gate_errors.append("gate evidence type must be measured")
-        fields = gate_evidence.get("evidence_fields")
-        if not isinstance(fields, dict):
-            gate_errors.append("missing gate evidence fields")
-            fields = {}
-        required_fields = tuple(SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate])
-        missing_fields = [field for field in required_fields if field not in fields]
-        if missing_fields:
-            gate_errors.append(f"missing required fields: {', '.join(missing_fields)}")
-        field_windows: dict[str, str] = {}
-        for field in required_fields:
-            if field not in fields:
-                continue
-            evidence = fields[field]
-            if not isinstance(evidence, dict):
-                gate_errors.append(f"{field} must be an object")
-                continue
-            for marker in ("fixture_only", "dry_run", "synthetic"):
-                if evidence.get(marker) is True:
-                    gate_errors.append(f"{field} is {marker}")
-                    continue
-            try:
-                field_windows[field] = validate_release_bundle_artifact(bundle_path, source_revision, gate, field, evidence)
-            except (OSError, KeyError, TypeError, ValueError) as error:
-                gate_errors.append(str(error))
-        if not gate_errors:
-            try:
-                validate_release_bundle_gate_windows(gate, field_windows)
-            except ValueError as error:
-                gate_errors.append(str(error))
+    for gate in requirements:
+        gate_errors = validate_scanner_heal_release_bundle_gate(bundle_path, source_revision, requirements, raw_gates, gate)
         if gate_errors:
             rejected[gate] = gate_errors
         else:
@@ -1953,6 +2069,153 @@ def scanner_heal_release_bundle_status(root: Path, bundle_path: Path) -> dict[st
         "pending_gates": [] if approved else sorted(gate for gate in requirements if gate not in verified),
         "pending_lanes": [] if approved else pending_lanes,
     }
+
+
+def scanner_heal_release_bundle_gate_status(root: Path, bundle_path: Path, gate: str) -> dict[str, object]:
+    """Validate one measured release-bundle gate without approving the full release."""
+    registry = read_json(root / ".config/scanner-heal-required-tests.json")
+    requirements, release_schema_capable, pending_lanes = scanner_heal_release_requirements(registry)
+    require(release_schema_capable, "scanner/heal release bundle gate requires schema 2 registry")
+    require(gate in requirements, f"unknown scanner/heal release gate: {gate}")
+    bundle_path = bundle_path.resolve()
+    bundle = read_json(bundle_path)
+    for marker in ("fixture_only", "dry_run", "synthetic"):
+        require(bundle.get(marker) is not True, f"scanner/heal release evidence bundle is {marker}")
+    require(bundle.get("schema") == 1, "unsupported scanner/heal release evidence bundle schema")
+    require(bundle.get("evidence") == "measured", "scanner/heal release evidence bundle must be measured")
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    source_revision = bundle.get("source_revision")
+    require(isinstance(source_revision, str) and re.fullmatch(r"[0-9a-f]{40}", source_revision) is not None and
+            source_revision == revision,
+            "scanner/heal release evidence source revision mismatch")
+    raw_gates = bundle.get("gates")
+    require(isinstance(raw_gates, dict), "scanner/heal release evidence bundle missing gates")
+    unknown = sorted(set(raw_gates) - set(requirements))
+    require(not unknown, f"scanner/heal release evidence bundle has unknown gates: {', '.join(unknown)}")
+
+    gate_errors = validate_scanner_heal_release_bundle_gate(bundle_path, source_revision, requirements, raw_gates, gate)
+    verified = not gate_errors
+    return {
+        "schema": 1,
+        "decision": "verified" if verified else "blocked",
+        "release_approved": False,
+        "release_schema_capable": release_schema_capable,
+        "verified_gate": gate if verified else None,
+        "rejected_gate": None if verified else gate,
+        "rejected_errors": gate_errors,
+        "pending_gates": sorted(item for item in requirements if item != gate),
+        "pending_lanes": pending_lanes,
+    }
+
+
+def release_bundle_descriptor_path(descriptor_path: Path, raw_path: object, gate: str, field: str) -> Path:
+    require(isinstance(raw_path, str) and raw_path.strip(), f"{gate}.{field} missing source artifact")
+    path = Path(raw_path)
+    resolved = path if path.is_absolute() else descriptor_path.parent / path
+    resolved = resolved.resolve(strict=True)
+    require(resolved.is_file(), f"{gate}.{field} source artifact is missing")
+    require(resolved.stat().st_size > 0, f"{gate}.{field} source artifact is empty")
+    return resolved
+
+
+def release_bundle_artifact_suffix(path: Path) -> str:
+    suffix = path.suffix
+    if re.fullmatch(r"\.[A-Za-z0-9._+-]{1,16}", suffix or "") is not None:
+        return suffix
+    return ".artifact"
+
+
+def reject_release_bundle_markers(item: dict[str, object], label: str) -> None:
+    for marker in ("fixture_only", "dry_run", "synthetic"):
+        require(item.get(marker) is not True, f"{label} is {marker}")
+
+
+def copy_release_bundle_artifact(descriptor_path: Path, bundle_dir: Path, evidence: dict[str, object],
+                                 gate: str, field: str, label: str) -> None:
+    source = release_bundle_descriptor_path(descriptor_path, evidence.get("artifact"), gate, field)
+    source_sha = digest(source)
+    if "sha256" in evidence:
+        require(sha(evidence.get("sha256")) and evidence["sha256"] == source_sha,
+                f"{gate}.{field} descriptor artifact hash mismatch")
+    artifact_dir = bundle_dir / "artifacts"
+    safe_label = re.sub(r"[^A-Za-z0-9._-]", "-", label)
+    target = artifact_dir / f"{safe_label}{release_bundle_artifact_suffix(source)}"
+    require(not target.exists(), f"{gate}.{field} duplicate assembled artifact path")
+    shutil.copyfile(source, target)
+    require(digest(target) == source_sha, f"{gate}.{field} assembled artifact hash mismatch")
+    evidence["artifact"] = target.relative_to(bundle_dir).as_posix()
+    evidence["sha256"] = source_sha
+
+
+def assemble_scanner_heal_release_bundle(root: Path, descriptor_path: Path, directory: Path) -> tuple[Path, dict[str, object]]:
+    """Copy measured Scanner/Heal evidence into one validated release bundle."""
+    require(not directory.exists(), "scanner/heal release bundle directory must be new")
+    registry = read_json(root / ".config/scanner-heal-required-tests.json")
+    requirements, release_schema_capable, _ = scanner_heal_release_requirements(registry)
+    require(release_schema_capable, "scanner/heal release bundle assembly requires schema 2 registry")
+    descriptor_path = descriptor_path.resolve(strict=True)
+    descriptor = read_json(descriptor_path)
+    reject_release_bundle_markers(descriptor, "scanner/heal release evidence descriptor")
+    require(descriptor.get("schema") == 1, "unsupported scanner/heal release evidence descriptor schema")
+    require(descriptor.get("evidence") == "measured", "scanner/heal release evidence descriptor must be measured")
+    source_revision = descriptor.get("source_revision")
+    require(isinstance(source_revision, str) and re.fullmatch(r"[0-9a-f]{40}", source_revision) is not None,
+            "scanner/heal release evidence descriptor source revision is invalid")
+    raw_gates = descriptor.get("gates")
+    require(isinstance(raw_gates, dict), "scanner/heal release evidence descriptor missing gates")
+    unknown_gates = sorted(set(raw_gates) - set(requirements))
+    require(not unknown_gates, f"scanner/heal release evidence descriptor has unknown gates: {', '.join(unknown_gates)}")
+
+    bundle_dir = directory.resolve()
+    artifact_dir = bundle_dir / "artifacts"
+    artifact_dir.mkdir(parents=True)
+    assembled_gates = {}
+    for gate in sorted(raw_gates):
+        raw_gate = raw_gates[gate]
+        require(isinstance(raw_gate, dict), f"{gate} descriptor gate must be an object")
+        reject_release_bundle_markers(raw_gate, f"{gate} descriptor gate")
+        raw_fields = raw_gate.get("evidence_fields", raw_gate)
+        require(isinstance(raw_fields, dict), f"{gate} descriptor gate missing evidence fields")
+        required_fields = set(SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate])
+        unknown_fields = sorted(set(raw_fields) - required_fields)
+        require(not unknown_fields, f"{gate} descriptor has unknown fields: {', '.join(unknown_fields)}")
+        fields = {}
+        for field in sorted(raw_fields):
+            raw_evidence = raw_fields[field]
+            require(isinstance(raw_evidence, dict), f"{gate}.{field} descriptor evidence must be an object")
+            evidence = json.loads(json.dumps(raw_evidence))
+            reject_release_bundle_markers(evidence, f"{gate}.{field} descriptor evidence")
+            copy_release_bundle_artifact(descriptor_path, bundle_dir, evidence, gate, field, f"{gate}-{field}")
+            profile_artifacts = evidence.get("profile_artifacts")
+            if profile_artifacts is not None:
+                require(isinstance(profile_artifacts, dict), f"{gate}.{field} profile artifacts must be an object")
+                for artifact_kind, item in sorted(profile_artifacts.items()):
+                    require(isinstance(item, dict), f"{gate}.{field}.{artifact_kind} descriptor profile artifact must be an object")
+                    reject_release_bundle_markers(item, f"{gate}.{field}.{artifact_kind} descriptor profile artifact")
+                    copy_release_bundle_artifact(
+                        descriptor_path,
+                        bundle_dir,
+                        item,
+                        gate,
+                        f"{field}.{artifact_kind}",
+                        f"{gate}-{field}-{artifact_kind}",
+                    )
+            fields[field] = evidence
+        assembled_gates[gate] = {
+            "status": "pass",
+            "lane": requirements[gate]["lane"],
+            "evidence_type": "measured",
+            "evidence_fields": fields,
+        }
+
+    bundle = bundle_dir / "release-evidence.json"
+    write_json(bundle, {
+        "schema": 1,
+        "evidence": "measured",
+        "source_revision": source_revision,
+        "gates": assembled_gates,
+    })
+    return bundle, scanner_heal_release_bundle_status(root, bundle)
 
 
 def write_scanner_heal_release_bundle_fixture(root: Path, directory: Path) -> Path:
@@ -2393,17 +2656,6 @@ class SelfTests(unittest.TestCase):
                     evidence.update({"completed_heal_objects": 1, "duplicate_task_count": 0})
                 if gate == "P3" and field == "recovery_window_measurement":
                     evidence.update({"pressure_recovery_window_seconds": 5, "lock_hold_p95_ms": 0})
-                write_json(artifact, {
-                    "schema": 1,
-                    "evidence_type": "measured",
-                    "source_revision": source_revision,
-                    "run_id": run_id,
-                    "measurement_window_id": window_id,
-                    "gate": gate,
-                    "field": field,
-                    "fixture": True,
-                })
-                evidence["sha256"] = digest(artifact)
                 if gate in ("G03", "G09", "R-L"):
                     evidence["versions"] = ["a" * 40, source_revision]
                     evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
@@ -2504,8 +2756,8 @@ class SelfTests(unittest.TestCase):
                     evidence["saved_bytes"] = 2048
                     artifacts = {}
                     for artifact_kind in RELEASE_PROFILE_ARTIFACTS:
-                        artifact = artifact_dir / f"{gate}-{field}-{artifact_kind}.json"
-                        write_json(artifact, {
+                        profile_artifact = artifact_dir / f"{gate}-{field}-{artifact_kind}.json"
+                        write_json(profile_artifact, {
                             "schema": 1,
                             "evidence_type": "measured",
                             "source_revision": source_revision,
@@ -2514,11 +2766,10 @@ class SelfTests(unittest.TestCase):
                             "gate": gate,
                             "field": field,
                             "artifact_kind": artifact_kind,
-                            "fixture": True,
                         })
                         artifacts[artifact_kind] = {
-                            "artifact": artifact.relative_to(bundle_dir).as_posix(),
-                            "sha256": digest(artifact),
+                            "artifact": profile_artifact.relative_to(bundle_dir).as_posix(),
+                            "sha256": digest(profile_artifact),
                             "artifact_format": "json",
                         }
                     evidence["profile_artifacts"] = artifacts
@@ -2548,6 +2799,19 @@ class SelfTests(unittest.TestCase):
                     evidence["fault_modes"] = ["process-restart", "process-crash-restart"]
                     evidence["recovery_p95_ms"] = 500.0
                     evidence["recovery_p99_ms"] = 1000.0
+                artifact_payload = {
+                    "schema": 1,
+                    "evidence_type": "measured",
+                    "source_revision": source_revision,
+                    "run_id": run_id,
+                    "measurement_window_id": window_id,
+                    "gate": gate,
+                    "field": field,
+                }
+                for mirror_field in release_bundle_json_artifact_mirrored_fields(gate, field):
+                    artifact_payload[mirror_field] = evidence[mirror_field]
+                write_json(artifact, artifact_payload)
+                evidence["sha256"] = digest(artifact)
                 fields[field] = evidence
             gates[gate] = {
                 "status": "pass",
@@ -2569,6 +2833,75 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(len(status["verified_gates"]), len(SCANNER_HEAL_RELEASE_REQUIRED_GATES))
             self.assertEqual(status["pending_gates"], [])
             self.assertEqual(status["pending_lanes"], [])
+
+    def test_scanner_heal_release_bundle_assembler_copies_measured_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, descriptor = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                bundle, status = assemble_scanner_heal_release_bundle(root, descriptor, Path(tmp) / "assembled")
+            self.assertEqual(status["decision"], "approved")
+            self.assertTrue(status["release_approved"])
+            assembled = read_json(bundle)
+            evidence = assembled["gates"]["G01"]["evidence_fields"]["root_authority_evidence"]
+            self.assertEqual(evidence["artifact"], "artifacts/G01-root_authority_evidence.json")
+            self.assertEqual(evidence["sha256"], digest(bundle.parent / evidence["artifact"]))
+            self.assertTrue((bundle.parent / evidence["artifact"]).is_file())
+
+    def test_scanner_heal_release_bundle_gate_accepts_single_measured_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            data = read_json(bundle)
+            data["gates"] = {"G09": data["gates"]["G09"]}
+            write_json(bundle, data)
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                status = scanner_heal_release_bundle_gate_status(root, bundle, "G09")
+                full_status = scanner_heal_release_bundle_status(root, bundle)
+            self.assertEqual(status["decision"], "verified")
+            self.assertFalse(status["release_approved"])
+            self.assertEqual(status["verified_gate"], "G09")
+            self.assertIn("G07", status["pending_gates"])
+            self.assertEqual(full_status["decision"], "blocked")
+            self.assertFalse(full_status["release_approved"])
+
+    def test_scanner_heal_release_bundle_gate_rejects_missing_field(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            data = read_json(bundle)
+            del data["gates"]["G09"]["evidence_fields"]["rollback_payload_evidence"]
+            write_json(bundle, data)
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                status = scanner_heal_release_bundle_gate_status(root, bundle, "G09")
+            self.assertEqual(status["decision"], "blocked")
+            self.assertFalse(status["release_approved"])
+            self.assertIn("missing required fields: rollback_payload_evidence", status["rejected_errors"])
+
+    def test_scanner_heal_release_bundle_gate_rejects_unknown_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            data = read_json(bundle)
+            data["gates"] = {"G09": data["gates"]["G09"], "Z99": {"status": "pass"}}
+            write_json(bundle, data)
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                with self.assertRaisesRegex(ValueError, "unknown gates: Z99"):
+                    scanner_heal_release_bundle_gate_status(root, bundle, "G09")
+
+    def test_scanner_heal_release_bundle_assembler_rejects_fixture_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self.scanner_heal_fixture(Path(tmp))
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                descriptor = write_scanner_heal_release_bundle_fixture(root, Path(tmp) / "bundle")
+                with self.assertRaisesRegex(ValueError, "fixture_only"):
+                    assemble_scanner_heal_release_bundle(root, descriptor, Path(tmp) / "assembled")
+
+    def test_scanner_heal_release_bundle_assembler_rejects_hash_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, descriptor = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            data = read_json(descriptor)
+            data["gates"]["G01"]["evidence_fields"]["root_authority_evidence"]["sha256"] = "0" * 64
+            write_json(descriptor, data)
+
+            with self.assertRaisesRegex(ValueError, "descriptor artifact hash mismatch"):
+                assemble_scanner_heal_release_bundle(root, descriptor, Path(tmp) / "assembled")
 
     def test_scanner_heal_release_bundle_fixture_writer_is_not_release_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2838,6 +3171,24 @@ class SelfTests(unittest.TestCase):
                 lambda payload: payload.update({"run_id": "p1-different-profile-run"}),
                 ("P1", "profile_evidence", "rss-samples"),
                 "JSON artifact run_id mismatch",
+            ),
+            (
+                "fixture-marker",
+                lambda payload: payload.update({"fixture": True}),
+                ("G08", "disk_full_matrix"),
+                "JSON artifact is fixture",
+            ),
+            (
+                "g08-case-mirror",
+                lambda payload: payload["disk_full_cases"].remove("manifest-write-enospc"),
+                ("G08", "disk_full_matrix"),
+                "JSON artifact missing cases",
+            ),
+            (
+                "p4-gc-mirror",
+                lambda payload: payload.update({"pending_responsibilities_after_gc": 1}),
+                ("P4", "mrf_cleanup_gc_soak_evidence"),
+                "JSON artifact requires zero pending responsibilities",
             ),
         ):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
@@ -4027,6 +4378,8 @@ def main() -> int:
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
     if sys.argv[1:2] in (["--begin-scanner-heal"], ["--finish-scanner-heal"], ["--check-scanner-heal"],
                          ["--check-scanner-heal-release"], ["--check-scanner-heal-release-bundle"],
+                         ["--check-scanner-heal-release-bundle-gate"],
+                         ["--assemble-scanner-heal-release-bundle"],
                          ["--write-scanner-heal-release-bundle-fixture"]):
         try:
             if len(sys.argv) == 5 and sys.argv[1] == "--begin-scanner-heal":
@@ -4060,11 +4413,30 @@ def main() -> int:
                     return 2
                 print(json.dumps(status, sort_keys=True, separators=(",", ":")))
                 return 0 if status["release_approved"] else 1
+            if len(sys.argv) == 4 and sys.argv[1] == "--check-scanner-heal-release-bundle-gate":
+                try:
+                    status = scanner_heal_release_bundle_gate_status(ROOT, Path(sys.argv[2]), sys.argv[3])
+                except (OSError, KeyError, TypeError, ValueError, ET.ParseError) as error:
+                    print(json.dumps({"schema": 1, "decision": "invalid", "release_approved": False,
+                                      "error": str(error)}, sort_keys=True, separators=(",", ":")))
+                    return 2
+                print(json.dumps(status, sort_keys=True, separators=(",", ":")))
+                return 0 if status["decision"] == "verified" else 1
+            if len(sys.argv) == 4 and sys.argv[1] == "--assemble-scanner-heal-release-bundle":
+                try:
+                    bundle, status = assemble_scanner_heal_release_bundle(ROOT, Path(sys.argv[2]), Path(sys.argv[3]))
+                except (OSError, KeyError, TypeError, ValueError, ET.ParseError) as error:
+                    print(json.dumps({"schema": 1, "decision": "invalid", "release_approved": False,
+                                      "error": str(error)}, sort_keys=True, separators=(",", ":")))
+                    return 2
+                print(bundle)
+                print(json.dumps(status, sort_keys=True, separators=(",", ":")))
+                return 0 if status["release_approved"] else 1
             if len(sys.argv) == 3 and sys.argv[1] == "--write-scanner-heal-release-bundle-fixture":
                 bundle = write_scanner_heal_release_bundle_fixture(ROOT, Path(sys.argv[2]))
                 print(bundle)
                 return 0
-            raise ValueError("expected --begin-scanner-heal DIR BINARY TEST_BINARY, --finish-scanner-heal DIR EXIT, --check-scanner-heal DIR CASE|release, --check-scanner-heal-release DIR, --check-scanner-heal-release-bundle FILE, or --write-scanner-heal-release-bundle-fixture DIR")
+            raise ValueError("expected --begin-scanner-heal DIR BINARY TEST_BINARY, --finish-scanner-heal DIR EXIT, --check-scanner-heal DIR CASE|release, --check-scanner-heal-release DIR, --check-scanner-heal-release-bundle FILE, --check-scanner-heal-release-bundle-gate FILE GATE, --assemble-scanner-heal-release-bundle DESCRIPTOR DIR, or --write-scanner-heal-release-bundle-fixture DIR")
         except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
             print(f"ERROR: {error}", file=sys.stderr)
             return 1
@@ -4092,7 +4464,8 @@ def main() -> int:
         print(
             "usage: check_test_wiring.py [--self-test | --check-core LISTING | --check-profile PROFILE LISTING | "
             "--update-profile PROFILE LISTING PLATFORM | --check-scanner-heal-release-bundle FILE | "
-            "--write-scanner-heal-release-bundle-fixture DIR]",
+            "--check-scanner-heal-release-bundle-gate FILE GATE | "
+            "--assemble-scanner-heal-release-bundle DESCRIPTOR DIR | --write-scanner-heal-release-bundle-fixture DIR]",
             file=sys.stderr,
         )
         return 2
