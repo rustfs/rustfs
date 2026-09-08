@@ -1686,6 +1686,7 @@ fn complete_usage_baseline(
             scan_plan_digest: Some(scan_plan_digest.0),
             complete: true,
             tombstone: false,
+            segment_invalidation_proof: None,
         }],
         ..Default::default()
     };
