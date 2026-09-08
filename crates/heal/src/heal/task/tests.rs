@@ -1329,6 +1329,43 @@ async fn object_heal_records_matching_positive_storage_receipt() {
 }
 
 #[tokio::test]
+async fn cancelled_object_heal_rejects_matching_positive_storage_receipt() {
+    let incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage::default());
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), Some("version-a".to_string())),
+        storage,
+    );
+    task.cancel().await.expect("task cancellation should succeed");
+
+    let expected = HealObjectIdentity {
+        kind: HealObjectKind::Object,
+        bucket: "bucket-a".to_string(),
+        object: "object-a".to_string(),
+        version_id: Some("version-a".to_string()),
+        bucket_incarnation_id: Some(incarnation),
+        pool_index: None,
+        set_index: None,
+    };
+    let accepted = task
+        .record_verified_storage_receipt(
+            expected,
+            Some(object_receipt(
+                "object-a",
+                Some("version-a"),
+                HealObjectDisposition::Repaired,
+                incarnation,
+            )),
+        )
+        .await;
+
+    let outcome = task.get_outcome().await;
+    assert!(!accepted);
+    assert_eq!(outcome.counters.healed, 0);
+    assert!(outcome.objects.is_empty());
+}
+
+#[tokio::test]
 async fn object_heal_latches_expected_incarnation_before_repair() {
     let original_incarnation = Uuid::new_v4();
     let successor_incarnation = Uuid::new_v4();

@@ -609,7 +609,7 @@ impl HealTask {
         expected: HealObjectIdentity,
         receipt: Option<HealObjectReceipt>,
     ) -> bool {
-        if self.options.dry_run {
+        if self.options.dry_run || self.cancel_token.is_cancelled() {
             return false;
         }
         let Some(receipt) = receipt else {
