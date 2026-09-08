@@ -609,6 +609,36 @@ pub const ENV_OBJECT_LOCK_RPC_TIMEOUT_MS: &str = "RUSTFS_OBJECT_LOCK_RPC_TIMEOUT
 /// Default remote lock RPC transport timeout: 3000 milliseconds.
 pub const DEFAULT_OBJECT_LOCK_RPC_TIMEOUT_MS: u64 = 3000;
 
+/// Environment variable for the minimum interval between evictions of the
+/// cached lock RPC channel to one peer, in milliseconds.
+///
+/// A lock RPC that fails on transport, or that times out while the peer has
+/// not completed any lock RPC for two deadlines, evicts the shared HTTP/2
+/// channel so the next request re-dials. Evictions are rate limited per peer
+/// so one slow lock endpoint cannot drive a reset/GOAWAY/reconnect loop
+/// (issue #7363). `0` disables the cooldown.
+///
+/// Default: 5000 milliseconds.
+pub const ENV_OBJECT_LOCK_RPC_EVICTION_COOLDOWN_MS: &str = "RUSTFS_OBJECT_LOCK_RPC_EVICTION_COOLDOWN_MS";
+
+/// Default minimum interval between lock RPC channel evictions per peer: 5000 milliseconds.
+pub const DEFAULT_OBJECT_LOCK_RPC_EVICTION_COOLDOWN_MS: u64 = 5000;
+
+/// Environment variable for how many timed-out lock RPCs per peer may keep
+/// running in the background instead of being cancelled.
+///
+/// Cancelling a timed-out stream sends `RST_STREAM`; enough of them make the
+/// peer answer `GOAWAY too_many_resets` and drop every stream on the
+/// connection. A detached RPC ends on its own within the internode RPC
+/// timeout, and a lock it acquires after its caller gave up is released
+/// immediately. Beyond this budget timed-out RPCs are cancelled as before.
+///
+/// Default: 256.
+pub const ENV_OBJECT_LOCK_RPC_DETACHED_LIMIT: &str = "RUSTFS_OBJECT_LOCK_RPC_DETACHED_LIMIT";
+
+/// Default per-peer budget of detached (timed-out but still running) lock RPCs: 256.
+pub const DEFAULT_OBJECT_LOCK_RPC_DETACHED_LIMIT: usize = 256;
+
 /// Environment variable to enable object namespace lock diagnostics.
 ///
 /// When enabled, RustFS emits slow lock acquisition and long lock hold

@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::core::pools::{
-    PoolMetaBootstrapAuthority, PoolMetaReplicaState, PoolMetaWriteState, local_decommission_queue_prefix,
+    PoolMetaReplicaState, PoolMetaWriteState, local_decommission_queue_prefix, persist_pool_meta_identity_for_attested_pools,
     persist_pool_meta_identity_for_startup, pool_meta_has_active_decommission,
 };
 use crate::runtime::instance::InstanceContext;
@@ -174,9 +174,20 @@ where
     S: EcstoreObjectIO,
 {
     if elected_writer && write_state.bootstrap_identity_proven() {
-        persist_pool_meta_identity_for_startup(pools, write_state, false).await?;
+        return persist_pool_meta_identity_for_startup(pools, write_state, false).await;
     }
-    Ok(())
+    if write_state.bootstrap_identity_proven() {
+        return Ok(());
+    }
+    // Multi-pool bootstrap whose pools were formatted by different nodes: no
+    // single process can prove the whole deployment fresh in memory, so each
+    // creator attests the pools it formatted first-hand with the shared nonce
+    // and the elected writer waits for a complete, agreeing pending set.
+    let attested = write_state.attested_pool_indices();
+    if attested.is_empty() {
+        return Ok(());
+    }
+    persist_pool_meta_identity_for_attested_pools(pools, write_state, &attested).await
 }
 
 async fn save_validated_pool_meta_for_startup<S>(
@@ -407,7 +418,7 @@ impl ECStore {
         preflight_startup_rpc_secret(&endpoint_pools)?;
 
         let mut deployment_id = None;
-        let mut pool_meta_bootstrap_authority = None;
+        let mut pool_meta_bootstrap_authorities = Vec::new();
 
         // let (endpoint_pools, _) = EndpointServerPools::create_server_endpoints(address.as_str(), &layouts)?;
 
@@ -523,12 +534,10 @@ impl ECStore {
                     }
                 }
             }?;
-            pool_meta_bootstrap_authority = Some(pool_meta_bootstrap_authority.map_or(
-                loaded_format.pool_meta_bootstrap_authority,
-                |authority: PoolMetaBootstrapAuthority| {
-                    authority.combine_across_pools(loaded_format.pool_meta_bootstrap_authority)
-                },
-            ));
+            // First-hand authority for this pool only: `Fresh` when this process
+            // formatted it, `LegacyAdoption` when it verified the migration, and
+            // `None` when it merely read a format another node created.
+            pool_meta_bootstrap_authorities.push(loaded_format.pool_meta_bootstrap_authority);
             let fm = loaded_format.format;
 
             // Format loading succeeded, enable health monitoring on all disks
@@ -569,9 +578,13 @@ impl ECStore {
         let peer_sys = S3PeerSys::new_with_instance_ctx(&endpoint_pools, instance_ctx.clone());
         let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
         pool_meta.dont_save = true;
-        let pool_meta_write_state = PoolMetaWriteState::for_startup_with_bootstrap_authority(
+        let elected_bootstrap_writer = pools
+            .first()
+            .is_some_and(|pool| pool_first_endpoint_is_local(&pool.endpoints));
+        let pool_meta_write_state = PoolMetaWriteState::for_startup_with_pool_bootstrap_authorities(
             deployment_id,
-            pool_meta_bootstrap_authority.unwrap_or_default(),
+            pool_meta_bootstrap_authorities,
+            elected_bootstrap_writer,
         );
 
         let decommission_cancelers = RwLock::new(vec![None; pools.len()]);
@@ -961,8 +974,9 @@ mod tests {
         bucket::replication::{ReplicationState, ReplicationStatusType, replication_statuses_map},
         core::pools::{
             DecommissionErasureLayout, DecommissionPoolCapacityInfo, POOL_META_IDENTITY_NAME, POOL_META_NAME, POOL_META_VERSION,
-            PoolDecommissionInfo, PoolMeta, PoolStatus, pool_meta_identity_initialized_for_test,
-            pool_meta_v3_commit_state_for_test, set_decommission_capacity_info_overrides_for_test,
+            PoolDecommissionInfo, PoolMeta, PoolStatus, pending_pool_meta_identity_for_test,
+            pool_meta_identity_initialized_for_test, pool_meta_v3_commit_state_for_test,
+            set_decommission_capacity_info_overrides_for_test,
         },
         disk::endpoint::Endpoint,
         error::{Error, Result, StorageError},
@@ -1463,6 +1477,331 @@ mod tests {
             },
         )
         .await;
+    }
+
+    fn startup_object(storage: &StartupPoolMetaStorage, object: &str) -> Option<Vec<u8>> {
+        storage
+            .objects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(object)
+            .map(|(payload, _)| payload.clone())
+    }
+
+    /// Startup errors wrap their cause in context whose `Display` hides the
+    /// source, so assertions walk the chain the same way
+    /// `Error::pool_metadata_failure` does.
+    fn error_chain_text(err: &Error) -> String {
+        let mut parts = vec![err.to_string()];
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+        while let Some(error) = current {
+            current = if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                io.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static))
+            } else {
+                error.source()
+            };
+            if let Some(next) = current {
+                parts.push(next.to_string());
+            }
+        }
+        parts.join(" <- ")
+    }
+
+    fn inject_startup_object(storage: &StartupPoolMetaStorage, object: &str, payload: Vec<u8>) {
+        storage
+            .objects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(object.to_string(), (payload, format!("injected-{object}")));
+    }
+
+    fn init_test_pool_meta_with_pools(pool_count: usize) -> PoolMeta {
+        PoolMeta {
+            version: POOL_META_VERSION,
+            pools: (0..pool_count)
+                .map(|id| PoolStatus {
+                    id,
+                    cmd_line: format!("pool-{id}"),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: None,
+                })
+                .collect(),
+            dont_save: false,
+        }
+    }
+
+    /// Two single-node pools whose formats were created by different nodes:
+    /// node0 formatted pool0 and only read pool1's format, node1 the reverse.
+    fn two_pool_creator_states(deployment_id: Uuid) -> (PoolMetaWriteState, PoolMetaWriteState) {
+        let node0 = PoolMetaWriteState::for_startup_with_pool_bootstrap_authorities(
+            deployment_id,
+            vec![PoolMetaBootstrapAuthority::Fresh, PoolMetaBootstrapAuthority::None],
+            true,
+        );
+        let node1 = PoolMetaWriteState::for_startup_with_pool_bootstrap_authorities(
+            deployment_id,
+            vec![PoolMetaBootstrapAuthority::None, PoolMetaBootstrapAuthority::Fresh],
+            false,
+        );
+        (node0, node1)
+    }
+
+    #[tokio::test]
+    async fn test_two_pool_bootstrap_with_distinct_format_creators_converges_through_creator_attestation() {
+        let deployment_id = Uuid::new_v4();
+        let pool0 = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let pool1 = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let pools = vec![pool0.clone(), pool1.clone()];
+        let (mut node0, mut node1) = two_pool_creator_states(deployment_id);
+        assert!(!node0.bootstrap_identity_proven(), "reading pool1's format is not deployment-wide proof");
+        assert!(!node1.bootstrap_identity_proven());
+
+        // node1 (pool1 creator, non-elected) starts first: no durable nonce exists
+        // yet, so it must neither mint one nor latch its write gate while waiting.
+        establish_pool_meta_bootstrap_identity_if_proven(pools.clone(), &mut node1, false)
+            .await
+            .expect("a non-first creator without a durable nonce writes nothing");
+        assert!(startup_object(&pool0, POOL_META_IDENTITY_NAME).is_none());
+        assert!(startup_object(&pool1, POOL_META_IDENTITY_NAME).is_none());
+        let err = load_pool_meta_for_startup(pools.clone(), &mut node1)
+            .await
+            .expect_err("nothing durable authorizes a non-elected node");
+        assert!(err.to_string().contains("bootstrap pending"), "{err}");
+        node1
+            .ensure_write_safe("waiting non-elected creator")
+            .expect("waiting for the elected writer must not latch the write gate");
+
+        // node0 (pool0 creator, elected) mints the nonce on the pool it created;
+        // pool1 is still unattested, so it cannot publish pool.bin and must not latch.
+        establish_pool_meta_bootstrap_identity_if_proven(pools.clone(), &mut node0, true)
+            .await
+            .expect("the first pool's creator mints the pending identity");
+        let minted = startup_object(&pool0, POOL_META_IDENTITY_NAME).expect("pool0 pending identity");
+        assert!(!pool_meta_identity_initialized_for_test(&minted).expect("decode pending identity"));
+        assert!(
+            startup_object(&pool1, POOL_META_IDENTITY_NAME).is_none(),
+            "node0 holds no first-hand proof for pool1 and must not attest it"
+        );
+        let err = load_pool_meta_for_startup(pools.clone(), &mut node0)
+            .await
+            .expect_err("an unattested pool keeps the elected writer from publishing");
+        assert!(err.to_string().contains("waiting for every pool creator"), "{err}");
+        node0
+            .ensure_write_safe("waiting elected writer")
+            .expect("waiting for creators must not latch the write gate");
+        assert!(startup_object(&pool0, POOL_META_NAME).is_none());
+
+        // node1 retries: it copies pool0's pending identity (same nonce) onto the
+        // pool it created, then keeps waiting for the elected writer's pool.bin.
+        establish_pool_meta_bootstrap_identity_if_proven(pools.clone(), &mut node1, false)
+            .await
+            .expect("the pool1 creator attests with the durable nonce");
+        assert_eq!(startup_object(&pool1, POOL_META_IDENTITY_NAME).as_deref(), Some(minted.as_slice()));
+        let err = load_pool_meta_for_startup(pools.clone(), &mut node1)
+            .await
+            .expect_err("a complete pending set never unlocks a non-elected node");
+        assert!(err.to_string().contains("waiting for the elected writer to publish"), "{err}");
+        node1
+            .ensure_write_safe("attested non-elected creator")
+            .expect("waiting for pool.bin must not latch the write gate");
+        assert!(startup_object(&pool0, POOL_META_NAME).is_none());
+
+        // node0 retries: every pool is attested under one nonce, so it publishes
+        // pool.bin and commits the identity on both pools.
+        establish_pool_meta_bootstrap_identity_if_proven(pools.clone(), &mut node0, true)
+            .await
+            .expect("re-establishing an already minted identity is idempotent");
+        let (_, replica_state) = load_pool_meta_for_startup(pools.clone(), &mut node0)
+            .await
+            .expect("complete creator attestation authorizes the initial pool metadata write");
+        persist_pool_meta_for_startup_if_safe(
+            &init_test_pool_meta_with_pools(2),
+            pools.clone(),
+            replica_state,
+            &mut node0,
+            true,
+            true,
+        )
+        .await
+        .expect("the elected writer publishes pool.bin and commits the identity");
+        for pool in [&pool0, &pool1] {
+            assert!(startup_object(pool, POOL_META_NAME).is_some());
+            let identity = startup_object(pool, POOL_META_IDENTITY_NAME).expect("committed identity");
+            assert!(pool_meta_identity_initialized_for_test(&identity).expect("decode committed identity"));
+        }
+
+        // node1 retries once more: pool.bin exists and nothing is rewritten.
+        let before = startup_object(&pool1, POOL_META_IDENTITY_NAME);
+        establish_pool_meta_bootstrap_identity_if_proven(pools.clone(), &mut node1, false)
+            .await
+            .expect("an initialized deployment never reopens bootstrap");
+        assert_eq!(startup_object(&pool1, POOL_META_IDENTITY_NAME), before);
+        load_pool_meta_for_startup(pools, &mut node1)
+            .await
+            .expect("published pool metadata admits the non-elected node");
+        node1
+            .ensure_write_safe("converged non-elected creator")
+            .expect("no latch remains after convergence");
+    }
+
+    #[tokio::test]
+    async fn test_two_pool_bootstrap_rejects_pending_replicas_from_different_bootstraps() {
+        let deployment_id = Uuid::new_v4();
+        let pool0 = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let pool1 = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let pools = vec![pool0.clone(), pool1.clone()];
+        let (mut node0, _) = two_pool_creator_states(deployment_id);
+        establish_pool_meta_bootstrap_identity_if_proven(pools.clone(), &mut node0, true)
+            .await
+            .expect("the first pool's creator mints the pending identity");
+        inject_startup_object(
+            &pool1,
+            POOL_META_IDENTITY_NAME,
+            pending_pool_meta_identity_for_test(deployment_id, 1, Uuid::new_v4()).expect("encode foreign pending identity"),
+        );
+
+        let err = load_pool_meta_for_startup(pools.clone(), &mut node0)
+            .await
+            .expect_err("a pending replica bound to another bootstrap nonce must fail closed");
+        let chain = error_chain_text(&err);
+        assert!(chain.contains("disagree on fresh-bootstrap proof"), "{chain}");
+        node0
+            .ensure_write_safe("split bootstrap")
+            .expect_err("a split bootstrap latches the write gate");
+        assert!(startup_object(&pool0, POOL_META_NAME).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_two_pool_bootstrap_treats_corrupt_creator_replica_as_recovery_not_waiting() {
+        let deployment_id = Uuid::new_v4();
+        let pool0 = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let pool1 = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let pools = vec![pool0.clone(), pool1.clone()];
+        let (mut node0, _) = two_pool_creator_states(deployment_id);
+        establish_pool_meta_bootstrap_identity_if_proven(pools.clone(), &mut node0, true)
+            .await
+            .expect("the first pool's creator mints the pending identity");
+        // Keep the on-disk format/version header so the replica classifies as
+        // corrupt (undecodable payload) rather than as an incompatible format.
+        let mut corrupt = pending_pool_meta_identity_for_test(deployment_id, 1, Uuid::new_v4()).expect("encode identity");
+        corrupt.truncate(4);
+        corrupt.extend_from_slice(b"not a cluster identity");
+        inject_startup_object(&pool1, POOL_META_IDENTITY_NAME, corrupt);
+
+        let err = load_pool_meta_for_startup(pools.clone(), &mut node0)
+            .await
+            .expect_err("a corrupt replica is not a creator that is still catching up");
+        let chain = error_chain_text(&err);
+        assert!(chain.contains("no verified fresh-bootstrap proof"), "{chain}");
+        node0
+            .ensure_write_safe("corrupt attestation")
+            .expect_err("a corrupt attestation latches the write gate");
+        assert!(startup_object(&pool0, POOL_META_NAME).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_elected_restart_without_first_hand_proof_cannot_reuse_a_complete_pending_set() {
+        let deployment_id = Uuid::new_v4();
+        let pool0 = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let pool1 = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let pools = vec![pool0.clone(), pool1.clone()];
+        let (mut node0, mut node1) = two_pool_creator_states(deployment_id);
+        establish_pool_meta_bootstrap_identity_if_proven(pools.clone(), &mut node0, true)
+            .await
+            .expect("mint");
+        establish_pool_meta_bootstrap_identity_if_proven(pools.clone(), &mut node1, false)
+            .await
+            .expect("attest");
+        assert_eq!(
+            startup_object(&pool0, POOL_META_IDENTITY_NAME),
+            startup_object(&pool1, POOL_META_IDENTITY_NAME),
+            "both creators attested the same pending identity"
+        );
+
+        // The elected node restarts before publishing: it now merely reads both
+        // formats, so the complete pending set alone must not reopen bootstrap.
+        let mut restarted = PoolMetaWriteState::for_startup_with_pool_bootstrap_authorities(
+            deployment_id,
+            vec![PoolMetaBootstrapAuthority::None, PoolMetaBootstrapAuthority::None],
+            true,
+        );
+        establish_pool_meta_bootstrap_identity_if_proven(pools.clone(), &mut restarted, true)
+            .await
+            .expect("a restart without first-hand proof writes nothing");
+        let err = load_pool_meta_for_startup(pools.clone(), &mut restarted)
+            .await
+            .expect_err("a pending set alone never authorizes a writer without first-hand proof");
+        assert!(err.to_string().contains("no verified fresh-bootstrap proof"), "{err}");
+        restarted
+            .ensure_write_safe("unproven restart")
+            .expect_err("the rejected restart latches the write gate");
+        assert!(startup_object(&pool0, POOL_META_NAME).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fresh_pool_joining_an_initialized_deployment_never_reopens_bootstrap() {
+        let deployment_id = Uuid::new_v4();
+        let pool0 = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let mut founder = PoolMetaWriteState::for_startup(deployment_id, true);
+        establish_pool_meta_bootstrap_identity_if_proven(vec![pool0.clone()], &mut founder, true)
+            .await
+            .expect("the founder mints");
+        let (_, replica_state) = load_pool_meta_for_startup(vec![pool0.clone()], &mut founder)
+            .await
+            .expect("the founder may initialize");
+        persist_pool_meta_for_startup_if_safe(
+            &init_test_pool_meta(None),
+            vec![pool0.clone()],
+            replica_state,
+            &mut founder,
+            true,
+            true,
+        )
+        .await
+        .expect("the founder commits");
+        let founded = startup_object(&pool0, POOL_META_IDENTITY_NAME).expect("committed identity");
+        assert!(pool_meta_identity_initialized_for_test(&founded).expect("decode committed identity"));
+
+        // Expansion: pool1 is fresh and was formatted first-hand by the node
+        // hosting its first endpoint, whether or not that node is elected.
+        let pool1 = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let pools = vec![pool0.clone(), pool1.clone()];
+        for elected in [false, true] {
+            let mut joiner = PoolMetaWriteState::for_startup_with_pool_bootstrap_authorities(
+                deployment_id,
+                vec![PoolMetaBootstrapAuthority::None, PoolMetaBootstrapAuthority::Fresh],
+                elected,
+            );
+            establish_pool_meta_bootstrap_identity_if_proven(pools.clone(), &mut joiner, elected)
+                .await
+                .expect("an initialized deployment ignores first-hand proof for a new pool");
+            assert!(
+                startup_object(&pool1, POOL_META_IDENTITY_NAME).is_none(),
+                "no pending identity may be written to an expansion pool"
+            );
+            assert_eq!(startup_object(&pool0, POOL_META_IDENTITY_NAME).as_deref(), Some(founded.as_slice()));
+            let (_, replica_state) = load_pool_meta_for_startup(pools.clone(), &mut joiner)
+                .await
+                .expect("published pool metadata admits the joiner");
+            joiner
+                .ensure_write_safe("expansion joiner")
+                .expect("joining never latches the write gate");
+            if elected {
+                persist_pool_meta_for_startup_if_safe(
+                    &init_test_pool_meta_with_pools(2),
+                    pools.clone(),
+                    replica_state,
+                    &mut joiner,
+                    true,
+                    true,
+                )
+                .await
+                .expect("the topology update repairs the new pool's replicas");
+                let identity = startup_object(&pool1, POOL_META_IDENTITY_NAME).expect("expansion pool identity");
+                assert!(pool_meta_identity_initialized_for_test(&identity).expect("decode repaired identity"));
+                assert!(startup_object(&pool1, POOL_META_NAME).is_some());
+            }
+        }
     }
 
     #[tokio::test]
