@@ -23,9 +23,7 @@ use super::ScannerCycleOutcome;
 use crate::data_usage_define::DataUsageCacheRevision;
 use crate::storage_api::ScannerStorage;
 use crate::storage_api::owner::ObjectIO as _;
-use crate::{
-    BUCKET_META_PREFIX, ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerObjectOptions, SetDisks, save_config_with_preconditions,
-};
+use crate::{BUCKET_META_PREFIX, ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerObjectOptions, SetDisks};
 use futures::future::join_all;
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -1195,13 +1193,14 @@ where
         };
         let revision = revisions.get(&id).cloned();
         let data = data.clone();
+        let storeapi = storeapi.clone();
         async move {
             let Some(revision) = revision else {
                 return (id, Err("replica revision is unavailable".to_string()));
             };
-            let result = save_config_with_preconditions(set, SCANNER_PAUSE_BACKLOG_PATH.as_str(), data, revision.preconditions())
+            let result = storeapi
+                .save_scanner_pause_backlog_replica(id.pool_index, id.set_index, data, revision.preconditions())
                 .await
-                .map(|_| ())
                 .map_err(|err| err.to_string());
             (id, result)
         }

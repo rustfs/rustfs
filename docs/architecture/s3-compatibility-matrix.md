@@ -55,6 +55,15 @@ Standard S3 areas that must not be described as complete:
 
 `excluded_tests.txt` holds tests that must not block the compatibility gate: vendor-specific or non-portable behavior, and intentionally unsupported product behavior such as ACL authorization.
 
+## Intentional Deviations From AWS S3
+
+Object keys are stored as file-system paths under each drive (`{drive}/{bucket}/{object}/xl.meta`), the same layout MinIO uses. The rules below exist to keep that layout unambiguous and are not compatibility gaps to close; clients that need the AWS behavior must adapt on their side.
+
+| Behavior | RustFS | AWS S3 | Why |
+|---|---|---|---|
+| Object key with a `.` or `..` path segment, or an empty segment (`//`), such as `a//b/./c/../d` | `400 InvalidArgument` (`check_object_args` in `crates/ecstore/src/bucket/utils.rs`, mirroring MinIO `IsValidObjectPrefix`) | Accepted as an opaque key | A `..` segment would resolve to a parent directory and `.`/`//` segments would alias other keys on disk; encoding them would change the MinIO-compatible on-disk format. |
+| Directory marker (key ending in `/`, with or without a body) in a versioned bucket | Stored as the null version: `PutObject`/`HeadObject` report version id `00000000-0000-0000-0000-000000000000`, `ListObjectVersions` reports `null`, and a later PUT of the same key overwrites in place (`put_opts` in `rustfs/src/storage/options.rs`, mirroring MinIO `putOpts`: "for directory objects skip creating new versions") | A real version id per PUT, with a version history | The marker only exists to make an empty prefix listable; keeping a history for it would leave hidden versions behind every prefix delete. Replication still copies the marker as its null version (`test_bucket_replication_replicates_directory_marker_in_versioned_bucket` in `crates/e2e_test/src/replication_extension_test.rs`). |
+
 ## Update Rule
 
 When a feature starts passing, move its test entries from `unimplemented_tests.txt` to `implemented_tests.txt` and update the row here in the same PR. Do not change README wording beyond the supported coverage. Handler-level status (missing, stubbed, or diverging endpoints) is tracked in [minio-rustfs-router-compatibility.md](minio-rustfs-router-compatibility.md).

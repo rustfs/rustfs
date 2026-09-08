@@ -19,14 +19,14 @@ use super::meta::{
     complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue, defer_bucket_in_rebalance_queue,
     ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, first_rebalance_bucket,
     has_deferred_rebalance_error, is_rebalance_actively_running, is_rebalance_conflicting_with_decommission,
-    is_rebalance_in_progress, is_rebalance_meta_replaceable_for_new_id, is_rebalance_stopped_terminal_event,
-    mark_rebalance_bucket_done, merge_rebalance_bucket_lists, merge_rebalance_meta, next_rebal_bucket_from_stat,
-    percent_free_ratio, rebalance_goal_reached, rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error,
-    rebalance_meta_load_unknown_version_error, rebalance_requires_worker_activation, record_rebalance_cleanup_warning_in_meta,
-    remove_rebalanced_buckets_from_queue, resolve_next_rebalance_bucket, resolve_rebalance_participants,
-    should_accept_rebalance_stats_update, should_ignore_rebalance_data_usage_cache, should_pool_participate,
-    should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
-    take_bucket_from_rebalance_queue, validate_init_rebalance_state, validate_start_rebalance_state,
+    is_rebalance_in_progress, is_rebalance_meta_replaceable_for_new_id, mark_rebalance_bucket_done, merge_rebalance_bucket_lists,
+    merge_rebalance_meta, next_rebal_bucket_from_stat, percent_free_ratio, rebalance_goal_reached,
+    rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
+    rebalance_requires_worker_activation, record_rebalance_cleanup_warning_in_meta, remove_rebalanced_buckets_from_queue,
+    resolve_next_rebalance_bucket, resolve_rebalance_participants, should_accept_rebalance_stats_update,
+    should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
+    should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
+    validate_init_rebalance_state, validate_start_rebalance_state,
 };
 use super::migration::{
     MigrationBackend, MigrationVersionResult, migrate_entry_version, migrate_entry_version_with_retry_wait,
@@ -1677,6 +1677,30 @@ fn test_resolve_rebalance_stats_update_result_passthrough() {
 }
 
 #[test]
+fn test_rebalance_stop_preserves_cancellation_through_entry_context() {
+    let err = resolve_rebalance_stats_update_result(Err(Error::OperationCanceled), 0, "bucket", "object")
+        .expect_err("canceled stats update");
+    let err = with_rebalance_entry_context("stats", "bucket", "object", err);
+    assert!(matches!(err, Error::OperationCanceled));
+    assert!(matches!(
+        classify_rebalance_terminal_event(Some(Err(err)), OffsetDateTime::now_utc()),
+        RebalanceTerminalEvent::Stopped { .. }
+    ));
+}
+
+#[tokio::test]
+async fn test_rebalance_stop_does_not_hide_later_entry_failure() {
+    let tasks = Arc::new(tokio::sync::Mutex::new(vec![
+        tokio::spawn(async { Err(Error::OperationCanceled) }),
+        tokio::spawn(async { Err(Error::ErasureWriteQuorum) }),
+    ]));
+    let err = wait_rebalance_entry_tasks(0, tasks)
+        .await
+        .expect_err("entry I/O failure must survive sibling cancellation");
+    assert!(matches!(err, Error::ErasureWriteQuorum));
+}
+
+#[test]
 fn test_resolve_rebalance_stats_update_result_wraps_error_context() {
     let err = resolve_rebalance_stats_update_result(Err(Error::SlowDown), 2, "bucket-a", "obj.txt")
         .expect_err("stats update error should include context");
@@ -2365,9 +2389,9 @@ fn test_resolve_rebalance_terminal_error_wraps_signal_failure_context() {
 }
 
 #[test]
-fn test_resolve_rebalance_bucket_error_prefers_entry_error() {
+fn test_resolve_rebalance_bucket_error_prefers_real_failure_over_entry_cancellation() {
     let err = resolve_rebalance_bucket_error(Some(Error::OperationCanceled), Some(Error::SlowDown)).unwrap_err();
-    assert!(matches!(err, Error::OperationCanceled));
+    assert!(matches!(err, Error::SlowDown));
 }
 
 #[test]
@@ -2513,19 +2537,6 @@ fn test_apply_rebalance_terminal_event_stopped_clears_error() {
 }
 
 #[test]
-fn test_is_rebalance_stopped_terminal_event_only_matches_stopped_variant() {
-    let stopped = RebalanceTerminalEvent::Stopped {
-        msg: "stopped".to_string(),
-    };
-    let completed = RebalanceTerminalEvent::Completed {
-        msg: "completed".to_string(),
-    };
-
-    assert!(is_rebalance_stopped_terminal_event(&stopped));
-    assert!(!is_rebalance_stopped_terminal_event(&completed));
-}
-
-#[test]
 fn test_should_preserve_rebalance_stopped_state_when_meta_marked_stopped() {
     let event = RebalanceTerminalEvent::Completed {
         msg: "completed".to_string(),
@@ -2535,13 +2546,14 @@ fn test_should_preserve_rebalance_stopped_state_when_meta_marked_stopped() {
 }
 
 #[test]
-fn test_should_preserve_rebalance_stopped_state_when_pool_already_stopped() {
+fn test_rebalance_stop_does_not_hide_real_terminal_failure() {
     let event = RebalanceTerminalEvent::Failed {
         msg: "failed".to_string(),
         last_error: "boom".to_string(),
     };
 
-    assert!(should_preserve_rebalance_stopped_state(false, RebalStatus::Stopped, &event));
+    assert!(!should_preserve_rebalance_stopped_state(false, RebalStatus::Stopped, &event));
+    assert!(!should_preserve_rebalance_stopped_state(true, RebalStatus::Started, &event));
 }
 
 #[test]
@@ -2714,6 +2726,32 @@ async fn test_start_rebalance_for_id_rejects_stopped_metadata() {
         .expect_err("staged start must not restart stopped metadata");
 
     assert!(err.to_string().contains("was stopped before start"));
+}
+
+#[test]
+fn test_rebalance_stop_intent_blocks_activation_before_durable_timestamp() {
+    let mut meta = RebalanceMeta {
+        id: "stopping".to_string(),
+        stop_requested: true,
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            buckets: vec!["pending".to_string()],
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let outcome = commit_local_rebalance_worker_activation(&mut meta, "stopping", CancellationToken::new())
+        .expect("stop must prevent activation without a new error");
+    assert_eq!(outcome, RebalanceLocalActivationOutcome::NotStartedTerminal);
+    assert!(meta.cancel.is_none());
+    assert!(meta.stopped_at.is_none());
+    let bytes = rmp_serde::to_vec_named(&meta).expect("encode legacy-compatible metadata");
+    let reloaded: RebalanceMeta = rmp_serde::from_slice(&bytes).expect("decode metadata");
+    assert!(!reloaded.stop_requested, "operator intent is local, not a new persisted field");
 }
 
 #[test]

@@ -119,8 +119,9 @@ pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
         PostObjectRequestMarker, ReqInfo, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
         authorize_internal_object_request, authorize_request, bucket_config_mutation_incarnation, has_bypass_governance_header,
-        load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization,
-        recursive_force_delete_is_authorized, replication_request_authorized, req_info_mut, req_info_ref,
+        load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
+        prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_is_authorized,
+        replication_request_authorized, req_info_mut, req_info_ref,
     };
 }
 
@@ -377,9 +378,11 @@ pub(crate) mod timeout_wrapper_consumer {
 
 pub(crate) mod tonic_service_consumer {
     #[cfg(test)]
+    pub(crate) use super::super::tonic_service::make_server;
+    #[cfg(test)]
     pub(crate) use super::super::tonic_service::{heal_topology_fingerprint, make_heal_control_server_for_source};
     pub(crate) use super::super::tonic_service::{
-        make_heal_control_server_with_cache, make_scanner_control_server, make_server, make_tier_mutation_control_server,
+        make_heal_control_server_with_cache, make_scanner_control_server, make_server_for_slot, make_tier_mutation_control_server,
     };
 }
 
@@ -407,8 +410,8 @@ pub(crate) mod ecstore_bucket {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::bucket::lifecycle::tier_delete_journal::test_util::install_all_v6_fleet_capability_proof;
     pub(crate) use rustfs_ecstore::api::bucket::{
-        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, migration, object_lock, on_demand_migration,
-        policy_sys, remote_s3_client, replication, tagging, target, utils,
+        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, migration, object_lock, policy_sys,
+        remote_s3_client, replication, tagging, target, utils,
     };
     pub(crate) use rustfs_ecstore::api::bucket::{quota, versioning, versioning_sys};
 }
@@ -416,7 +419,7 @@ pub(crate) mod ecstore_bucket {
 pub(crate) mod ecstore_capacity {
     pub(crate) use rustfs_ecstore::api::capacity::{
         DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
-        is_reserved_or_invalid_bucket,
+        is_pool_activation_fleet_proof_error, is_reserved_or_invalid_bucket,
     };
 }
 
@@ -466,17 +469,20 @@ pub(crate) mod ecstore_data_usage {
 #[allow(unused_imports)]
 pub(crate) mod ecstore_disk {
     pub(crate) use rustfs_ecstore::api::disk::{
-        BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskStore,
-        FileInfoVersions, FileReader, FileWriter, OldCurrentSize, PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq,
-        ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-        get_object_disk_read_timeout, validate_batch_read_version_item_count,
+        BUCKET_META_PREFIX, BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo,
+        DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, OldCurrentSize, PartTransactionAction,
+        RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken,
+        UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout, validate_batch_read_version_item_count,
     };
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
 
 pub(crate) mod ecstore_error {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::error::PoolMetadataFailure;
     pub(crate) use rustfs_ecstore::api::error::{
-        Error, Result, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+        Error, PoolMetadataError, Result, StorageError, is_err_bucket_not_found, is_err_object_not_found,
+        is_err_version_not_found,
     };
 }
 
@@ -512,8 +518,8 @@ pub(crate) mod ecstore_notification {
     pub(crate) use rustfs_ecstore::api::notification::rotate_cross_pool_fence_fleet_proof_for_test;
     pub(crate) use rustfs_ecstore::api::notification::{
         ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
-        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, new_global_notification_sys,
-        start_remote_version_state_fleet_probe,
+        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, ilm_recovery_export_local_process_epoch,
+        new_global_notification_sys, start_remote_version_state_fleet_probe,
     };
 }
 
@@ -549,8 +555,8 @@ pub(crate) mod ecstore_rpc {
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
-        build_put_file_auth_trailer, gen_signature_headers, gen_tonic_signature_headers, set_tonic_canonical_body_digest,
-        verify_put_file_capability, verify_tonic_rpc_response_proof,
+        ScannerScopedDirtyUsageAckEntry, build_put_file_auth_trailer, gen_signature_headers, gen_tonic_signature_headers,
+        set_tonic_canonical_body_digest, verify_put_file_capability, verify_tonic_rpc_response_proof,
     };
 }
 
@@ -560,7 +566,7 @@ pub(crate) mod ecstore_object {
     pub(crate) use rustfs_ecstore::api::object::{
         EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup,
         ObjectEncryptionResolver, ObjectMutationHook, PrepareSelectObjectSnapshotError, ReadEncryptionMaterial,
-        ReadEncryptionMode, ReadEncryptionRequest, SelectObjectSnapshot, get_object_body_cache_plaintext_len,
+        ReadEncryptionMode, ReadEncryptionRequest, SelectObjectSnapshot, WriteCompletion, get_object_body_cache_plaintext_len,
         lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
         unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
@@ -599,8 +605,8 @@ pub(crate) mod ecstore_storage {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
     pub(crate) use rustfs_ecstore::api::storage::{
-        ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk, all_local_disk_path,
-        find_local_disk_by_ref, init_local_disks_with_instance_ctx, init_lock_clients,
+        BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
+        all_local_disk_path, find_local_disk_by_ref, init_local_disks_with_instance_ctx, init_lock_clients,
         prewarm_local_disk_id_map_with_instance_ctx,
     };
 }
@@ -676,6 +682,9 @@ type EcstoreReplicationStats = ecstore_bucket::replication::ReplicationStats;
 pub(crate) type DynReplicationPool = StorageReplicationPoolHandle;
 pub(crate) type DynReader = ecstore_rio::DynReader;
 pub(crate) type ECStore = ecstore_storage::ECStore;
+pub(crate) type BootstrapLocalTarget = ecstore_storage::BootstrapLocalTarget;
+#[cfg(all(test, not(windows)))]
+pub(crate) use rustfs_ecstore::api::disk::{LocalPublicationPause, LocalPublicationStage};
 pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
 #[cfg(test)]
 pub(crate) type Endpoints = ecstore_layout::Endpoints;
@@ -693,6 +702,8 @@ pub(crate) type ServerContextSlot = crate::storage::runtime_sources::ServerConte
 pub(crate) type LocalPeerS3Client = ecstore_rpc::LocalPeerS3Client;
 #[cfg(test)]
 pub(crate) type PeerRestClient = ecstore_rpc::PeerRestClient;
+#[cfg(test)]
+pub(crate) type ScannerScopedDirtyUsageAckEntry = ecstore_rpc::ScannerScopedDirtyUsageAckEntry;
 pub(crate) type MetricType = ecstore_metrics::MetricType;
 pub(crate) type ObjectPartInfo = rustfs_filemeta::ObjectPartInfo;
 pub(crate) type ObjectLockBlockReason = ecstore_bucket::object_lock::objectlock_sys::ObjectLockBlockReason;
@@ -1179,6 +1190,10 @@ pub(crate) async fn new_global_notification_sys(endpoint_pools: EndpointServerPo
 
 pub(crate) fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
     ecstore_notification::start_remote_version_state_fleet_probe(topology_fingerprint);
+}
+
+pub(crate) fn ilm_recovery_export_local_process_epoch() -> uuid::Uuid {
+    ecstore_notification::ilm_recovery_export_local_process_epoch()
 }
 
 pub(crate) async fn read_config(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {

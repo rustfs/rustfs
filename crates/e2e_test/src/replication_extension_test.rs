@@ -368,23 +368,23 @@ impl Drop for SlowReplicationTargetGuard {
 // Mirrors madmin-go `ResyncTargetsInfo`/`ResyncTarget` json tags — the same
 // shape `mc replicate resync status` decodes.
 #[derive(Debug, Clone, serde::Deserialize)]
-struct ReplicationResetStatusResponse {
+pub(crate) struct ReplicationResetStatusResponse {
     #[serde(rename = "target", default)]
-    targets: Vec<ReplicationResetStatusTarget>,
+    pub(crate) targets: Vec<ReplicationResetStatusTarget>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-struct ReplicationResetStatusTarget {
+pub(crate) struct ReplicationResetStatusTarget {
     #[serde(rename = "arn", default)]
-    arn: String,
+    pub(crate) arn: String,
     #[serde(rename = "resetid", default)]
-    reset_id: String,
+    pub(crate) reset_id: String,
     #[serde(rename = "resyncStatus", default)]
-    status: String,
+    pub(crate) status: String,
     #[serde(rename = "replicationCount", default)]
-    replicated_count: i64,
+    pub(crate) replicated_count: i64,
     #[serde(rename = "object", default)]
-    object: String,
+    pub(crate) object: String,
 }
 
 fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
@@ -512,7 +512,7 @@ pub(crate) async fn put_bucket_replication(
     put_bucket_replication_with_delete_statuses(env, bucket, target_arn, "Enabled", None).await
 }
 
-async fn put_bucket_replication_with_delete_statuses(
+pub(crate) async fn put_bucket_replication_with_delete_statuses(
     env: &RustFSTestEnvironment,
     bucket: &str,
     target_arn: &str,
@@ -627,7 +627,7 @@ async fn put_bucket_replication_rules(
     Ok(())
 }
 
-async fn delete_bucket_replication(
+pub(crate) async fn delete_bucket_replication(
     env: &RustFSTestEnvironment,
     bucket: &str,
 ) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
@@ -2294,7 +2294,7 @@ async fn site_replication_state_edit(
 /// return the target `(arn, reset_id)`, asserting the response carries the
 /// madmin `ResyncTargetsInfo` shape (`target[0].arn` / `target[0].resetid`)
 /// that `mc replicate resync start` decodes.
-async fn start_bucket_replication_reset(
+pub(crate) async fn start_bucket_replication_reset(
     env: &RustFSTestEnvironment,
     bucket: &str,
 ) -> Result<(String, String), Box<dyn Error + Send + Sync>> {
@@ -2314,7 +2314,7 @@ async fn start_bucket_replication_reset(
     Ok((arn, reset_id))
 }
 
-async fn get_replication_reset_status(
+pub(crate) async fn get_replication_reset_status(
     env: &RustFSTestEnvironment,
     bucket: &str,
     arn: &str,
@@ -3833,6 +3833,244 @@ async fn test_bucket_replication_converges_delete_marker_and_version_purge() -> 
         .send()
         .await?;
     assert_eq!(retained.body.collect().await?.into_bytes().as_ref(), b"versioned replication payload v2");
+
+    Ok(())
+}
+
+/// Regression for rustfs/backlog#2340 (not Wasabi specific): a directory
+/// marker (`prefix/` with a body) in a versioned bucket is stored as the null
+/// version, like MinIO (`putOpts`: "for directory objects skip creating new
+/// versions"), and must still replicate to completion instead of staying
+/// `PENDING`.
+#[tokio::test]
+async fn test_bucket_replication_replicates_directory_marker_in_versioned_bucket() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-dir-marker-src";
+    let target_bucket = "replication-dir-marker-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let marker_key = "dir/trailing/";
+    let body = b"directory marker body";
+    let put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(marker_key)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await?;
+    assert!(
+        put.version_id()
+            .is_none_or(|id| id == "null" || id == uuid::Uuid::nil().to_string()),
+        "a directory marker is the null version even in a versioned bucket: {:?}",
+        put.version_id()
+    );
+
+    wait_for_source_replication_status(&source_client, source_bucket, marker_key, "COMPLETED", false).await?;
+
+    let replica = target_client
+        .get_object()
+        .bucket(target_bucket)
+        .key(marker_key)
+        .send()
+        .await?;
+    assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body);
+    let listed = target_client
+        .list_object_versions()
+        .bucket(target_bucket)
+        .prefix(marker_key)
+        .send()
+        .await?;
+    let marker_versions: Vec<_> = listed.versions().iter().filter(|v| v.key() == Some(marker_key)).collect();
+    assert_eq!(marker_versions.len(), 1, "the marker must land exactly once: {marker_versions:?}");
+    assert_eq!(
+        marker_versions[0].version_id(),
+        Some("null"),
+        "the replica keeps the null version identity"
+    );
+
+    Ok(())
+}
+
+/// Regression for rustfs/backlog#2340 (not Wasabi specific): permanently
+/// deleting a version whose payload lives in a data dir must leave the source
+/// clean once the purge replicates. Managed-SSE objects are never inlined and a
+/// plain object above the inline threshold takes the same layout. The version
+/// retained with a pending purge used to lose its data dir, so the purge state
+/// could never be applied (`VersionNotFound` on every retry) and the bucket
+/// stayed `BucketNotEmpty` while `ListObjectVersions` was already empty.
+#[tokio::test]
+async fn test_bucket_replication_version_purge_of_non_inline_object_releases_source_bucket() -> TestResult {
+    init_logging();
+
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("purge-datadir", true, true).await?;
+    let target_arn = wait_for_remote_target_arn(&source_env, &source_bucket).await?;
+    put_bucket_replication_with_delete_statuses(&source_env, &source_bucket, &target_arn, "Enabled", Some("Enabled")).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    let sse_key = "sse-object.bin";
+    let large_key = "large-object.bin";
+    let sse_put = source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(sse_key)
+        .body(ByteStream::from_static(b"encrypted source payload"))
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .send()
+        .await?;
+    let large_put = source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(large_key)
+        .body(ByteStream::from(vec![0x5a; 2 * 1024 * 1024]))
+        .send()
+        .await?;
+    let purged = [
+        (sse_key, sse_put.version_id().ok_or("SSE PUT omitted version ID")?.to_string()),
+        (large_key, large_put.version_id().ok_or("large PUT omitted version ID")?.to_string()),
+    ];
+    assert_replication_converged(&source_client, &source_bucket, &target_client, &target_bucket).await?;
+
+    for (key, version_id) in &purged {
+        source_client
+            .delete_object()
+            .bucket(&source_bucket)
+            .key(*key)
+            .version_id(version_id)
+            .send()
+            .await?;
+    }
+    assert_replication_converged(&source_client, &source_bucket, &target_client, &target_bucket).await?;
+    let target_state = list_replication_state(&target_client, &target_bucket).await?;
+    assert!(target_state.is_empty(), "target retained an explicitly purged version: {target_state:?}");
+
+    // The purge state is applied on the source asynchronously after the target
+    // acknowledges the delete; only then does the retained version go away and
+    // the bucket become deletable. A listing that is empty while DeleteBucket
+    // keeps answering BucketNotEmpty is exactly the regression.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let listing = source_client.list_object_versions().bucket(&source_bucket).send().await?;
+        let listed = listing.versions().len() + listing.delete_markers().len();
+        match source_client.delete_bucket().bucket(&source_bucket).send().await {
+            Ok(_) => break,
+            Err(err) if err.code() == Some("BucketNotEmpty") => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "source bucket stayed BucketNotEmpty after the version purge replicated; \
+                         ListObjectVersions shows {listed} entries"
+                    )
+                    .into());
+                }
+                sleep(Duration::from_millis(500)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Ok(())
+}
+
+/// Regression for rustfs/backlog#2340 (not Wasabi specific): a single-part
+/// object uploaded with `x-amz-checksum-*` must reach the target with the same
+/// checksum. The outbound options keyed the stored record by algorithm name,
+/// which the target client sent as `x-amz-meta-*` user metadata, so a replica
+/// never carried a checksum although the source HEAD returned one.
+#[tokio::test]
+async fn test_bucket_replication_forwards_single_part_object_checksums() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-checksum-src";
+    let target_bucket = "replication-checksum-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let body = b"123456789";
+    let crc32_key = "checksum-crc32.txt";
+    let sha256_key = "checksum-sha256.txt";
+    let crc32_put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(crc32_key)
+        .body(ByteStream::from_static(body))
+        .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
+        .send()
+        .await?;
+    let expected_crc32 = crc32_put.checksum_crc32().ok_or("source PUT omitted CRC32")?.to_string();
+    let sha256_put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(sha256_key)
+        .body(ByteStream::from_static(body))
+        .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
+        .send()
+        .await?;
+    let expected_sha256 = sha256_put.checksum_sha256().ok_or("source PUT omitted SHA256")?.to_string();
+
+    for key in [crc32_key, sha256_key] {
+        wait_for_source_replication_status(&source_client, source_bucket, key, "COMPLETED", false).await?;
+    }
+
+    let replica = target_client
+        .head_object()
+        .bucket(target_bucket)
+        .key(crc32_key)
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(replica.checksum_crc32(), Some(expected_crc32.as_str()), "replica lost the CRC32 checksum");
+    let replica = target_client
+        .head_object()
+        .bucket(target_bucket)
+        .key(sha256_key)
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(
+        replica.checksum_sha256(),
+        Some(expected_sha256.as_str()),
+        "replica lost the SHA256 checksum"
+    );
+    // The bare algorithm name must not leak as user metadata either.
+    assert!(
+        replica
+            .metadata()
+            .is_none_or(|meta| !meta.keys().any(|k| k.eq_ignore_ascii_case("sha256"))),
+        "replica carries the checksum as user metadata: {:?}",
+        replica.metadata()
+    );
 
     Ok(())
 }
@@ -8817,9 +9055,11 @@ async fn test_replication_check_flags_multipart_only_version_minting_target() ->
             .is_some_and(|error| error.contains("CreateMultipartUpload")),
         "the failure must name the multipart path: {payload}"
     );
-    // The PutObject leg mirrored, so it is the multipart probe that failed.
+    // The PutObject leg mirrored, so it is the multipart probe that failed;
+    // the mutation phases address the id the PUT reported and still run.
     assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
-    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionDelete"]["Status"], "OK", "{payload}");
     assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
 
     let probe_key = target
@@ -9007,6 +9247,9 @@ async fn test_replication_check_flags_version_minting_target() -> TestResult {
     let target_bucket = "version-fidelity-dst";
     target.create_bucket(target_bucket);
     target.assign_own_version_ids(true);
+    // Wasabi shape: the probe version the VersionDelete phase removed answers
+    // NoSuchVersion to cleanup's second DELETE, which must count as clean.
+    target.reject_unknown_version_deletes(true);
 
     let mut source_env = RustFSTestEnvironment::new().await?;
     let mut env_vars = replication_fast_env();
@@ -9051,11 +9294,13 @@ async fn test_replication_check_flags_version_minting_target() -> TestResult {
         fidelity["Code"], "BucketRemoteTargetVersionMismatch",
         "the failure must carry a machine-readable code: {payload}"
     );
-    // The probe PUT itself succeeded (fidelity is judged from its response);
-    // the later mutation phases are pointless against a drifting target and
-    // must be skipped, but cleanup still runs.
+    // The probe PUT itself succeeded (fidelity is judged from its response).
+    // The mutation phases address the id the target assigned — the ledger
+    // the worker records per object (rustfs/backlog#2340) — so they run and
+    // pass on a drifting target, and cleanup uses the same id.
     assert_eq!(target_report["Phases"]["Put"]["Status"], "OK", "{payload}");
-    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "SKIPPED", "{payload}");
+    assert_eq!(target_report["Phases"]["DeleteMarker"]["Status"], "OK", "{payload}");
+    assert_eq!(target_report["Phases"]["VersionDelete"]["Status"], "OK", "{payload}");
     assert_eq!(target_report["Phases"]["Cleanup"]["Status"], "OK", "{payload}");
 
     // The probe PUT must carry the source version as `?versionId=` — the
@@ -9943,5 +10188,201 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
 
     drop(source_env);
     target.shutdown().await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// backlog#2363
+// ---------------------------------------------------------------------------
+
+/// Wait until the source reports a terminal replication status for `key`.
+async fn wait_terminal_replication_status(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    ssec: bool,
+    timeout: Duration,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let request = client.head_object().bucket(bucket).key(key);
+        let head = if ssec {
+            request
+                .sse_customer_algorithm("AES256")
+                .sse_customer_key(&customer_key)
+                .sse_customer_key_md5(&customer_key_md5)
+                .send()
+                .await?
+        } else {
+            request.send().await?
+        };
+        let status = head.replication_status().map(|status| status.as_str().to_string());
+        if matches!(status.as_deref(), Some("COMPLETED") | Some("FAILED")) {
+            return Ok(status.unwrap_or_default());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("{bucket}/{key}: replication never reached a terminal status; last {status:?}").into());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// backlog#2363: SSE-C ciphertext passthrough of objects the source stored
+/// compressed. The replica on a RustFS target must decrypt to the original
+/// bytes for a single PUT and for a multipart upload.
+#[tokio::test]
+async fn test_bucket_replication_sse_c_compressed_passthrough() -> TestResult {
+    init_logging();
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    let mut source_process_env = replication_fast_env();
+    source_process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_process_env.extend_from_slice(FAST_SCANNER_ENV);
+    source_process_env.extend_from_slice(&[
+        ("NO_PROXY", "127.0.0.1,localhost"),
+        ("HTTP_PROXY", ""),
+        ("HTTPS_PROXY", ""),
+        ("RUSTFS_COMPRESSION_ENABLED", "true"),
+        ("RUSTFS_COMPRESSION_MULTIPART_ENABLED", "true"),
+    ]);
+    source_env.start_rustfs_server_with_env(vec![], &source_process_env).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(&[
+            ("NO_PROXY", "127.0.0.1,localhost"),
+            ("HTTP_PROXY", ""),
+            ("HTTPS_PROXY", ""),
+        ])
+        .await?;
+
+    let source_bucket = "ssec-compressed-src";
+    let target_bucket = "ssec-compressed-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+    let text = |len: usize, seed: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 64);
+        let mut line = 0u64;
+        while out.len() < len {
+            out.extend_from_slice(format!("ssec compressed passthrough seed={seed} line={line} lorem ipsum dolor\n").as_bytes());
+            line += 1;
+        }
+        out.truncate(len);
+        out
+    };
+
+    let single_key = "ssec-compressed-single.txt";
+    let single_body = text(1024 * 1024 + 17, 1);
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(single_key)
+        .content_type("text/plain")
+        .body(ByteStream::from(single_body.clone()))
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+
+    let multipart_key = "ssec-compressed-multipart.txt";
+    let multipart_parts = [text(PART_SIZE, 2), text(1024 * 1024 + 4096, 3)];
+    let multipart_body: Vec<u8> = multipart_parts.concat();
+    let created = source_client
+        .create_multipart_upload()
+        .bucket(source_bucket)
+        .key(multipart_key)
+        .content_type("text/plain")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    let upload_id = created.upload_id().ok_or("missing multipart upload id")?.to_string();
+    let mut completed = Vec::new();
+    for (index, part) in multipart_parts.iter().enumerate() {
+        let part_number = i32::try_from(index + 1)?;
+        let uploaded = source_client
+            .upload_part()
+            .bucket(source_bucket)
+            .key(multipart_key)
+            .upload_id(&upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(part.clone()))
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(&customer_key)
+            .sse_customer_key_md5(&customer_key_md5)
+            .send()
+            .await?;
+        completed.push(
+            CompletedPart::builder()
+                .part_number(part_number)
+                .set_e_tag(uploaded.e_tag().map(str::to_string))
+                .build(),
+        );
+    }
+    source_client
+        .complete_multipart_upload()
+        .bucket(source_bucket)
+        .key(multipart_key)
+        .upload_id(&upload_id)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed)).build())
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+
+    let mut failures = Vec::new();
+    for (key, body) in [(single_key, &single_body), (multipart_key, &multipart_body)] {
+        let status = wait_terminal_replication_status(&source_client, source_bucket, key, true, Duration::from_secs(120)).await?;
+        if status != "COMPLETED" {
+            failures.push(format!("{key}: source reports {status}"));
+            continue;
+        }
+        let replica = target_client
+            .get_object()
+            .bucket(target_bucket)
+            .key(key)
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(&customer_key)
+            .sse_customer_key_md5(&customer_key_md5)
+            .send()
+            .await;
+        match replica {
+            Ok(replica) => {
+                let content_length = replica.content_length();
+                match replica.body.collect().await {
+                    Ok(collected) => {
+                        let bytes = collected.into_bytes();
+                        if bytes.as_ref() != body.as_slice() {
+                            failures.push(format!(
+                                "{key}: replica bytes differ (content_length={content_length:?}, got {} bytes, want {})",
+                                bytes.len(),
+                                body.len()
+                            ));
+                        }
+                    }
+                    Err(err) => failures.push(format!("{key}: replica body read failed: {err}")),
+                }
+            }
+            Err(err) => failures.push(format!("{key}: replica GET failed: {err}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "SSE-C compressed passthrough replicas must decrypt to the source bytes: {failures:?}"
+    );
     Ok(())
 }

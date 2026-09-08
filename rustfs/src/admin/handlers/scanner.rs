@@ -62,6 +62,26 @@ struct ScannerCycleResetRequest {
 #[serde(deny_unknown_fields)]
 struct ScannerUsageStateResetRequest {
     mode: String,
+    #[serde(default, rename = "async")]
+    async_intent: bool,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScannerRecoveryIntentResponse {
+    status: &'static str,
+    action: String,
+    mode: String,
+    intent_id: String,
+    state: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ScannerRecoveryIntentConflictResponse {
+    status: &'static str,
+    intent_id: String,
+    state: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,6 +264,11 @@ pub fn register_scanner_route(r: &mut S3Router<AdminOperation>) -> std::io::Resu
     )?;
     r.insert(
         Method::GET,
+        format!("{ADMIN_PREFIX}/v3/scanner/usage-state/recovery-intents/{{intent_id}}").as_str(),
+        AdminOperation(&ScannerUsageStateRecoveryIntentStatusHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
         format!("{ADMIN_PREFIX}/v3/ilm/expiry/status").as_str(),
         AdminOperation(&IlmExpiryStatusHandler {}),
     )?;
@@ -269,11 +294,91 @@ async fn validate_scanner_reset_request(req: &S3Request<Body>) -> S3Result<Crede
 }
 
 fn json_response(body: Vec<u8>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    json_response_with_status(StatusCode::OK, body)
+}
+
+fn json_response_with_status(status: StatusCode, body: Vec<u8>) -> S3Result<S3Response<(StatusCode, Body)>> {
     let mut headers = HeaderMap::new();
     let content_type = HeaderValue::from_str(JSON_CONTENT_TYPE)
         .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid content type: {err}")))?;
     headers.insert(CONTENT_TYPE, content_type);
-    Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), headers))
+    Ok(S3Response::with_headers((status, Body::from(body)), headers))
+}
+
+fn scanner_recovery_intent_error(err: rustfs_scanner::ScannerError) -> S3Error {
+    let message = err.to_string();
+    let code = if message.contains("action is unsupported")
+        || message.contains("mode is unsupported")
+        || message.contains("actor identity is invalid")
+        || message.contains("intent id is invalid")
+        || message.contains("idempotency key")
+        || message.contains("requires")
+    {
+        S3ErrorCode::InvalidRequest
+    } else {
+        S3ErrorCode::InternalError
+    };
+    S3Error::with_message(code, message)
+}
+
+fn scanner_recovery_intent_record_response(
+    status_code: StatusCode,
+    status: &'static str,
+    record: rustfs_scanner::ScannerRecoveryIntentRecord,
+) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let response = ScannerRecoveryIntentResponse {
+        status,
+        action: record.action,
+        mode: record.mode,
+        intent_id: record.intent_id,
+        state: record.state,
+    };
+    let body = serde_json::to_vec(&response).map_err(|err| {
+        S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("failed to encode scanner recovery intent response: {err}"),
+        )
+    })?;
+    json_response_with_status(status_code, body)
+}
+
+fn scanner_recovery_intent_accept_response(
+    result: rustfs_scanner::ScannerRecoveryIntentAcceptResult,
+) -> S3Result<S3Response<(StatusCode, Body)>> {
+    match result {
+        rustfs_scanner::ScannerRecoveryIntentAcceptResult::Accepted { record } => {
+            scanner_recovery_intent_record_response(StatusCode::ACCEPTED, "accepted", record)
+        }
+        rustfs_scanner::ScannerRecoveryIntentAcceptResult::Replayed { record } => {
+            scanner_recovery_intent_record_response(StatusCode::ACCEPTED, "replayed", record)
+        }
+        rustfs_scanner::ScannerRecoveryIntentAcceptResult::Conflict { existing } => {
+            let response = ScannerRecoveryIntentConflictResponse {
+                status: "conflict",
+                intent_id: existing.intent_id,
+                state: existing.state,
+            };
+            let body = serde_json::to_vec(&response).map_err(|err| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("failed to encode scanner recovery intent conflict: {err}"),
+                )
+            })?;
+            json_response_with_status(StatusCode::CONFLICT, body)
+        }
+    }
+}
+
+fn scanner_recovery_intent_executor_id(result: &rustfs_scanner::ScannerRecoveryIntentAcceptResult) -> Option<String> {
+    match result {
+        rustfs_scanner::ScannerRecoveryIntentAcceptResult::Accepted { record }
+        | rustfs_scanner::ScannerRecoveryIntentAcceptResult::Replayed { record }
+            if matches!(record.state.as_str(), "accepted" | "running") =>
+        {
+            Some(record.intent_id.clone())
+        }
+        _ => None,
+    }
 }
 
 pub struct ScannerStatusHandler {}
@@ -313,6 +418,8 @@ pub struct IlmExpiryStatusHandler {}
 pub struct ScannerCycleStateResetHandler {}
 
 pub struct ScannerUsageStateResetHandler {}
+
+pub struct ScannerUsageStateRecoveryIntentStatusHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ScannerCycleStateResetHandler {
@@ -361,6 +468,35 @@ impl Operation for ScannerUsageStateResetHandler {
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "storage layer not initialized"))?;
         let store = current_object_store_handle_for_context(Some(context.as_ref()))
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "storage layer not initialized"))?;
+        if reset.async_intent {
+            let idempotency_key = reset
+                .idempotency_key
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "async reset requires idempotency_key"))?;
+            let request = rustfs_scanner::ScannerRecoveryIntentRequest {
+                action: rustfs_scanner::SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD.to_string(),
+                mode: reset.mode,
+                idempotency_key,
+                actor_sha256: rustfs_scanner::scanner_recovery_actor_sha256(&_cred.access_key),
+            };
+            let executor_store = store.clone();
+            let accepted = rustfs_scanner::accept_scanner_usage_recovery_intent(store, request)
+                .await
+                .map_err(scanner_recovery_intent_error)?;
+            if let Some(intent_id) = scanner_recovery_intent_executor_id(&accepted) {
+                tokio::spawn(async move {
+                    let _ = rustfs_scanner::scanner::run_scanner_usage_recovery_intent(
+                        CancellationToken::new(),
+                        executor_store,
+                        intent_id,
+                    )
+                    .await;
+                });
+            }
+            return scanner_recovery_intent_accept_response(accepted);
+        }
+        if reset.idempotency_key.is_some() {
+            return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "idempotency_key requires async reset"));
+        }
         let result = supervise_admin_mutation("scanner usage state reset", async move {
             rustfs_scanner::scanner::reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store)
                 .await
@@ -374,6 +510,27 @@ impl Operation for ScannerUsageStateResetHandler {
             )
         })?;
         json_response(body)
+    }
+}
+
+#[async_trait::async_trait]
+impl Operation for ScannerUsageStateRecoveryIntentStatusHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let _cred = validate_scanner_reset_request(&req).await?;
+        let intent_id = params.get("intent_id").unwrap_or("");
+        let context = app_context_from_req(&req)
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "storage layer not initialized"))?;
+        let store = current_object_store_handle_for_context(Some(context.as_ref()))
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "storage layer not initialized"))?;
+        let record = rustfs_scanner::get_scanner_usage_recovery_intent(store, intent_id)
+            .await
+            .map_err(scanner_recovery_intent_error)?
+            .ok_or_else(|| {
+                let mut err = S3Error::with_message(S3ErrorCode::NoSuchKey, "scanner recovery intent not found");
+                err.set_status_code(StatusCode::NOT_FOUND);
+                err
+            })?;
+        scanner_recovery_intent_record_response(StatusCode::OK, "found", record)
     }
 }
 
@@ -472,6 +629,8 @@ mod tests {
         let full_rebuild: ScannerUsageStateResetRequest =
             serde_json::from_str(r#"{"mode":"full-rebuild"}"#).expect("full rebuild must be accepted");
         assert_eq!(full_rebuild.mode, "full-rebuild");
+        assert!(!full_rebuild.async_intent);
+        assert!(full_rebuild.idempotency_key.is_none());
         let cycle_mode: ScannerUsageStateResetRequest =
             serde_json::from_str(r#"{"mode":"full-rescan"}"#).expect("mode validation belongs to the handler");
         assert_ne!(cycle_mode.mode, "full-rebuild");
@@ -479,6 +638,110 @@ mod tests {
             serde_json::from_str::<ScannerUsageStateResetRequest>(r#"{"mode":"full-rebuild","delete_files":[".usage.v2.json"]}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn admin_usage_reset_accepts_explicit_async_intent_contract() {
+        let request: ScannerUsageStateResetRequest =
+            serde_json::from_str(r#"{"mode":"full-rebuild","async":true,"idempotency_key":"reset-key-0001"}"#)
+                .expect("async reset intent contract should parse");
+
+        assert_eq!(request.mode, "full-rebuild");
+        assert!(request.async_intent);
+        assert_eq!(request.idempotency_key.as_deref(), Some("reset-key-0001"));
+    }
+
+    #[test]
+    fn scanner_recovery_intent_response_uses_accepted_status() {
+        let record = rustfs_scanner::ScannerRecoveryIntentRecord {
+            schema_version: 1,
+            intent_id: "0".repeat(64),
+            action: rustfs_scanner::SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD.to_string(),
+            mode: "full-rebuild".to_string(),
+            state: "accepted".to_string(),
+            actor_sha256: "1".repeat(64),
+            idempotency_key_sha256: "2".repeat(64),
+            request_sha256: "3".repeat(64),
+            accepted_at_unix_secs: 7,
+        };
+
+        let response =
+            scanner_recovery_intent_accept_response(rustfs_scanner::ScannerRecoveryIntentAcceptResult::Accepted { record })
+                .expect("accepted intent response");
+
+        assert_eq!(response.output.0, StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn scanner_recovery_intent_executor_only_starts_non_terminal_work() {
+        let mut record = rustfs_scanner::ScannerRecoveryIntentRecord {
+            schema_version: 1,
+            intent_id: "0".repeat(64),
+            action: rustfs_scanner::SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD.to_string(),
+            mode: "full-rebuild".to_string(),
+            state: "accepted".to_string(),
+            actor_sha256: "1".repeat(64),
+            idempotency_key_sha256: "2".repeat(64),
+            request_sha256: "3".repeat(64),
+            accepted_at_unix_secs: 7,
+        };
+
+        assert_eq!(
+            scanner_recovery_intent_executor_id(&rustfs_scanner::ScannerRecoveryIntentAcceptResult::Accepted {
+                record: record.clone(),
+            })
+            .as_deref(),
+            Some(record.intent_id.as_str())
+        );
+        record.state = "running".to_string();
+        assert_eq!(
+            scanner_recovery_intent_executor_id(&rustfs_scanner::ScannerRecoveryIntentAcceptResult::Replayed {
+                record: record.clone(),
+            })
+            .as_deref(),
+            Some(record.intent_id.as_str())
+        );
+        record.state = "completed".to_string();
+        assert!(
+            scanner_recovery_intent_executor_id(&rustfs_scanner::ScannerRecoveryIntentAcceptResult::Replayed {
+                record: record.clone(),
+            })
+            .is_none()
+        );
+        assert!(
+            scanner_recovery_intent_executor_id(&rustfs_scanner::ScannerRecoveryIntentAcceptResult::Conflict {
+                existing: rustfs_scanner::ScannerRecoveryIntentConflict {
+                    intent_id: record.intent_id,
+                    state: "accepted".to_string(),
+                },
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn scanner_recovery_intent_response_reports_conflict_status() {
+        let response = scanner_recovery_intent_accept_response(rustfs_scanner::ScannerRecoveryIntentAcceptResult::Conflict {
+            existing: rustfs_scanner::ScannerRecoveryIntentConflict {
+                intent_id: "0".repeat(64),
+                state: "accepted".to_string(),
+            },
+        })
+        .expect("conflict intent response");
+
+        assert_eq!(response.output.0, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn scanner_recovery_intent_error_keeps_persisted_corruption_server_side() {
+        let invalid_actor =
+            scanner_recovery_intent_error(rustfs_scanner::ScannerError::Other("actor identity is invalid".to_string()));
+        assert_eq!(invalid_actor.code(), &S3ErrorCode::InvalidRequest);
+
+        let corrupt_record = scanner_recovery_intent_error(rustfs_scanner::ScannerError::Other(
+            "scanner recovery intent is invalid: expected value".to_string(),
+        ));
+        assert_eq!(corrupt_record.code(), &S3ErrorCode::InternalError);
     }
 
     #[test]

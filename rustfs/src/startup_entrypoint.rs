@@ -62,6 +62,29 @@ fn emit_fatal_stderr(context: &str, error: impl std::fmt::Display) {
 }
 
 async fn async_main() -> Result<()> {
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Ok(nonce) = std::env::var("RUSTFS_E2E_STARTUP_CAS_PROBE") {
+        let nonce = uuid::Uuid::parse_str(&nonce).map_err(Error::other)?;
+        // This precedes CLI parsing and observability, including `--help`.
+        println!(
+            "RUSTFS_E2E_STARTUP_CAS {}",
+            serde_json::json!({
+                "kind": "capability", "schema": "fresh-startup-cas/v1", "nonce": nonce,
+            })
+        );
+        return Ok(());
+    }
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Ok(nonce) = std::env::var("RUSTFS_E2E_STARTUP_CAS_NONCE") {
+        let nonce = uuid::Uuid::parse_str(&nonce).map_err(Error::other)?;
+        let line = format!(
+            "RUSTFS_E2E_STARTUP_CAS {}\n",
+            serde_json::json!({
+                "kind": "observer-ready", "nonce": nonce, "pid": std::process::id(),
+            })
+        );
+        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
+    }
     hotpath::tokio_runtime!();
 
     // Log container resource detection early in startup
@@ -141,10 +164,6 @@ async fn run(config: Config) -> Result<()> {
     // the storage path explicitly (Phase 5 follow-up, backlog#1052); a future
     // multi-instance server constructs its own context here instead.
     let instance_ctx = bootstrap_instance_ctx();
-    // This server's request-path context slot (backlog#1052 S2): handed to the
-    // HTTP service now, installed once IAM bootstrap completes.
-    let server_ctx = ServerContextSlot::new();
-
     let StartupListenContext {
         readiness,
         server_addr,
@@ -152,6 +171,7 @@ async fn run(config: Config) -> Result<()> {
     } = init_startup_listen_context(&config, &instance_ctx).await?;
 
     let endpoint_pools = init_startup_storage_foundation(&server_address, &config.volumes, &instance_ctx).await?;
+    let server_ctx = ServerContextSlot::with_instance_context(instance_ctx.clone());
     let StartupHttpServers {
         state_manager,
         s3_shutdown_tx,
@@ -162,6 +182,33 @@ async fn run(config: Config) -> Result<()> {
         store,
         shutdown_token: ctx,
     } = init_startup_storage_runtime(server_addr, &endpoint_pools, readiness.clone(), instance_ctx).await?;
+
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Ok(nonce) = std::env::var("RUSTFS_E2E_STARTUP_CAS_NONCE") {
+        let nonce = uuid::Uuid::parse_str(&nonce).map_err(Error::other)?;
+        let release = std::path::PathBuf::from(
+            std::env::var_os("RUSTFS_E2E_STARTUP_CAS_RELEASE")
+                .ok_or_else(|| Error::other("startup CAS fixture requires a release path"))?,
+        );
+        if server_ctx.installed_object_store().is_some() {
+            return Err(Error::other("startup CAS gate reached an installed slot"));
+        }
+        let line = format!(
+            "RUSTFS_E2E_STARTUP_CAS {}\n",
+            serde_json::json!({
+                "kind": "gate", "nonce": nonce, "pid": std::process::id(), "slot_installed": false,
+            })
+        );
+        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
+        tokio::time::timeout(std::time::Duration::from_secs(180), async {
+            while !tokio::fs::try_exists(&release).await? {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            Ok::<_, Error>(())
+        })
+        .await
+        .map_err(|_| Error::other("startup CAS gate release timed out"))??;
+    }
 
     let capacity_tasks = crate::capacity::capacity_integration::init_capacity_management_managed().await;
 

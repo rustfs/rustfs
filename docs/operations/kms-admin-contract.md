@@ -39,7 +39,7 @@ The wire prefix is `/rustfs/admin/v3`. `GET /kms/status` and `GET /kms/service-s
 | `POST /kms/restore/dry-run` | `kms:Restore` | sensitive | no | Preflight; writes nothing |
 | `POST /kms/restore` | `kms:Restore` | high | no | Requires `confirm_backup_id` and `confirm_conflict_policy` |
 | `POST /kms/restore/abort` | `kms:Restore` | high | no | Requires `confirm_target_key_dir` |
-| `POST /kms/create-key`, `POST /kms/key/create` | `kms:Configure` | high | no | Legacy `mc` aliases of `POST /kms/keys` |
+| `POST /kms/create-key`, `POST /kms/key/create` | `kms:Configure` | high | no | Legacy `mc` aliases of `POST /kms/keys`; the key name comes from the `key-id` query parameter (`mc`'s form) or the `name` tag, and a request carrying both with different values is refused with `400` |
 | `GET /kms/describe-key`, `GET /kms/key/status` | `kms:DescribeKey` | sensitive | yes | Legacy aliases of `GET /kms/keys/{key_id}` |
 | `GET /kms/list-keys` | `kms:ListKeys` | sensitive | no | Legacy alias of `GET /kms/keys`; same listing contract |
 

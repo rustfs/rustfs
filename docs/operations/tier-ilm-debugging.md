@@ -22,6 +22,16 @@
 | `FileMeta` / `FileInfo` / version metadata | `crates/filemeta/src/` |
 | Dual-key internal metadata helpers (`insert_bytes` / `get_bytes`) | `crates/utils/src/http/metadata_compat.rs` |
 
+## Lifecycle rule limits and evaluation
+
+Each lifecycle rule supports at most one `Transition` and one `NoncurrentVersionTransition`. A version can make one initial transition; chaining additional tiers after it reaches `complete` is not supported. Splitting stages across overlapping rules does not enable a transition chain. `PutBucketLifecycleConfiguration` rejects multiple entries in either transition array with `InvalidArgument`, including in disabled rules. Existing stored multi-entry arrays are not executed; replace each with a single intended destination. Independent expiration actions in the rule remain eligible.
+
+`Expiration.Days` and `Expiration.Date` are mutually exclusive. A request containing both is rejected instead of silently selecting the date. When expiration and transition are both eligible, expiration takes precedence; a failed earlier transition does not keep an expired object indefinitely. Deadlines select the earliest action within the same action class.
+
+Noncurrent expiration and transition have independent `NewerNoncurrentVersions` limits. A transition with a positive limit waits for a complete version-group evaluation to establish that enough newer noncurrent versions remain. Single-object evaluation, including the current manual transition and immediate-enqueue paths, conservatively defers these counted transitions to the lifecycle scanner. An unmet expiration retention limit does not suppress a separately eligible transition.
+
+An expired restored local copy can be cleaned up under Object Lock because the retained logical version and remote data remain intact. Cleanup requires a completed transition and still waits for pending or failed replication. The storage layer revalidates the source identity and restore metadata before removing the local copy; restore headers alone do not authorize cleanup.
+
 ## Free-version recovery controls
 
 The dedicated free-version recovery loop is enabled by default and is independent of the data scanner and heal switches. Setting `RUSTFS_SCANNER_ENABLED=false` does not stop this repair loop. Set `RUSTFS_TIER_FREE_VERSION_RECOVERY_ENABLED=false` before process startup to disable only the dedicated persisted-marker walk. That setting does not disable lifecycle workers or prevent another scanner path from discovering a free version, and it can leave remote cleanup markers pending for longer, so use it as a break-glass pressure control rather than a cleanup mechanism.
@@ -132,6 +142,8 @@ Inspect the aggregate counters before widening scope. Full object-key lists are 
 
 Historical transition transactions in `upload_outcome_unknown` state can use an explicit two-stage operator workflow when the tier probe is ambiguous and the provider supports exact version deletion. The endpoint refuses transactions that are still inside their ownership window or are in any other state.
 
+Current fleets can produce two valid v1 state profiles. The legacy profile begins at `upload_started@1` and normally reaches `upload_outcome_unknown@2`, `uploaded`, `local_commit_started`, and `committed`. The compact profile is admitted only while every current member proves `transition_transaction_compaction_v1`; it begins at `upload_outcome_unknown@1` and moves directly to `local_commit_started@2` with a known remote version. Treat `upload_outcome_unknown@1` as a pre-PUT fence, not proof that PUT ran. Treat `local_commit_started@2` as an exact commit fence: if the matching `xl.meta` tuple is complete, recovery removes only the record; otherwise it retains the owner evidence. Do not rewrite either state by hand. An unavailable or older peer automatically makes new transitions use the legacy profile.
+
 1. Inspect the transaction without changing it:
 
    ```text
@@ -163,7 +175,7 @@ Historical transition transactions in `upload_outcome_unknown` state can use an 
 
 ## Inspect and disposition retained recovery records
 
-This section describes an **approved target that is not implemented yet**. Current servers do not expose the routes below and continue to quarantine tier-delete journal v1/v2 records. Do not remove internal metadata objects by hand: that loses ETag, all-pool, decommission, export, and audit guarantees.
+Current servers expose the routes below for retained recovery controls. Do not remove internal metadata objects by hand: that loses ETag, all-pool, decommission, export, and audit guarantees.
 
 The approved read-only inventory is bounded and paginated:
 
@@ -212,6 +224,39 @@ Canonical replay of an identical export/disposition consumes no new quota. New o
 Malformed/unsupported records and journal v3-v6 cannot use abandon. Known-version and v6 manifest ownership must converge through their normal exact recovery protocol. Operators may inspect, export, and request a bounded retry, but cannot bypass source/free-version proof, manifest membership, topology, or version semantics.
 
 Automatic retry state survives restart. Retryable transport/quorum failures use a 60-second exponential base capped at one hour and a deterministic 80-to-100-percent multiplier, so jitter never increases the capped delay. After 32 consecutive failures or seven days from the first persisted failure, automatic work stops at `operator_required`. Unsupported or ambiguous evidence goes directly to `retained_ambiguous`/`operator_required`; age alone never deletes it. Resolved controls, immutable exports, and completed disposition receipts have minimum 30-day, 90-day, and 365-day retention respectively, and are collected only after exact source absence, decommission, successor, and audit checks.
+
+### Retry a retained transition transaction
+
+For a `transition_transaction` control, inspect returns an additional `transition_retry` object when the exact transaction source and recovery-control generation are still consistent. It contains `retry_ready`, `control_revision`, `source_generation_sha256`, the current classification and counters, and a bounded refusal reason. A missing `transition_retry` with `transition_retry_not_ready_reason=source_or_control_not_ready` means the server could not reconstruct exact live evidence; do not retry from an older response.
+
+First perform a dry-run with the exact revision and source-generation digest returned by the latest inspect:
+
+```json
+POST /rustfs/admin/v3/ilm/recovery/records/<control-id>
+{
+  "action": "retry_transition_recovery",
+  "mode": "dry_run",
+  "expected_control_revision": 7,
+  "expected_source_generation_sha256": "<sha256>"
+}
+```
+
+After repairing the reported storage, tier, or capability problem, repeat inspect and dry-run, then execute with the newly observed values:
+
+```json
+POST /rustfs/admin/v3/ilm/recovery/records/<control-id>
+{
+  "action": "retry_transition_recovery",
+  "mode": "execute",
+  "expected_control_revision": 7,
+  "expected_source_generation_sha256": "<sha256>",
+  "confirm": true
+}
+```
+
+Execution performs one ETag-CAS update of the exact ownerless `retained_ambiguous` or `operator_required` control to `retrying`. It preserves the lifetime attempt count and failure history, clears only the consecutive-failure backoff, and does not mutate the transaction source or issue a tier PUT, GET, probe, or DELETE. The normal recovery worker then acquires a fresh bounded owner lease and repeats every source and remote proof before any side effect.
+
+A historical v1 `UploadStarted` record can return to `retained_ambiguous` because its bytes do not prove whether PUT reached the provider. `LocalCommitStarted` becomes terminal only when the local object still matches the recorded version ID, data directory, modification time, size, ETag, and exact transitioned remote tuple; otherwise it returns to `operator_required`. Retrying is therefore a bounded re-evaluation after an underlying repair, not an override of missing evidence.
 
 The full schema, lease, mixed-version, retry, privacy, and metric requirements are in [../architecture/ilm-tiering-persistence-contracts.md](../architecture/ilm-tiering-persistence-contracts.md#bounded-recovery-control-and-operator-disposition).
 

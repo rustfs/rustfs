@@ -465,7 +465,7 @@ impl Operation for ValidateOidcConfigHandler {
                 valid: true,
                 message: "OIDC configuration is valid".to_string(),
                 issuer: Some(validation.issuer),
-                authorization_endpoint: Some(validation.authorization_endpoint),
+                authorization_endpoint: validation.authorization_endpoint,
                 token_endpoint: validation.token_endpoint,
             },
         )
@@ -1295,6 +1295,101 @@ mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, HeaderValue, Uri};
     use temp_env::with_var;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn validate_handler_preserves_workload_null_and_console_endpoints() {
+        use crate::admin::runtime_sources::{AppContext, publish_test_app_context};
+        use http_body_util::BodyExt as _;
+        use rustfs_iam::store::{Store as _, object::IAM_CONFIG_PREFIX};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // The admin URL boundary rejects literal loopback hosts. A local proxy
+        // serves the public-shaped test origin without external DNS or traffic.
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let base = "http://oidc-handler.example.invalid".to_string();
+        temp_env::async_with_vars(
+            [("RUSTFS_OUTBOUND_ALLOW_ORIGINS", Some(base.as_str())),
+             ("HTTP_PROXY", Some(proxy.as_str())), ("http_proxy", Some(proxy.as_str())),
+             ("HTTPS_PROXY", None), ("https_proxy", None), ("ALL_PROXY", None), ("all_proxy", None),
+             ("NO_PROXY", Some("")), ("no_proxy", Some(""))],
+            async {
+                let _ = rustfs_credentials::init_global_action_credentials(Some("OIDCVALIDATEROOT".into()), Some("oidcValidateRootSecret123".into()));
+                let env = rustfs_test_utils::TestECStoreEnv::builder().prefix("oidc_validate_handler")
+                    .disk_count(1).init_bucket_metadata(false).build().await;
+                rustfs_iam::store::object::ObjectStore::new(Arc::clone(&env.ecstore))
+                    .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX)).await.unwrap();
+                let iam = rustfs_iam::init_iam_sys(Arc::clone(&env.ecstore)).await.unwrap();
+                publish_test_app_context(Arc::new(AppContext::with_default_interfaces(
+                    Arc::clone(&env.ecstore), iam, Arc::new(rustfs_kms::KmsServiceManager::new()),
+                )));
+                let server_base = base.clone();
+                let server = tokio::spawn(async move {
+                    for path in ["/.well-known/openid-configuration", "/jwks", "/.well-known/openid-configuration", "/complete/.well-known/openid-configuration", "/complete/jwks"] {
+                        let (mut stream, _) = tokio::time::timeout(std::time::Duration::from_secs(15), listener.accept()).await.unwrap().unwrap();
+                        let mut request = Vec::new();
+                        while !request.ends_with(b"\r\n\r\n") {
+                            request.push(stream.read_u8().await.unwrap());
+                            assert!(request.len() < 8192);
+                        }
+                        let request = String::from_utf8(request).unwrap();
+                        let target = Url::parse(request.lines().next().unwrap().split_whitespace().nth(1).unwrap()).unwrap();
+                        assert_eq!(target.origin().ascii_serialization(), server_base);
+                        assert_eq!(target.path(), path);
+                        let mut body = if path.ends_with("/jwks") { serde_json::json!({"keys": []}) } else {
+                            serde_json::json!({"issuer": server_base, "jwks_uri": format!("{server_base}/jwks"), "id_token_signing_alg_values_supported": ["RS256"]})
+                        };
+                        if path == "/complete/.well-known/openid-configuration" {
+                            body["authorization_endpoint"] = serde_json::json!(format!("{server_base}/authorize"));
+                            body["token_endpoint"] = serde_json::json!(format!("{server_base}/token"));
+                            body["response_types_supported"] = serde_json::json!(["code"]);
+                            body["subject_types_supported"] = serde_json::json!(["public"]);
+                        }
+                        let body = body.to_string();
+                        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    }
+                });
+                for (hidden, complete) in [(true, false), (false, false), (false, true)] {
+                    let document = serde_json::json!({"provider_id": "workload", "client_id": "rustfs-test", "issuer": base,
+                        "config_url": format!("{base}{}/.well-known/openid-configuration", if complete { "/complete" } else { "" }), "hide_from_ui": hidden});
+                    let request = || {
+                        let mut req = build_oidc_request("/rustfs/admin/v3/oidc/validate", None, None);
+                        req.method = Method::POST;
+                        req.input = Body::from(document.to_string());
+                        req
+                    };
+                    let denied = ValidateOidcConfigHandler {}.call(request(), Params::new()).await.unwrap_err();
+                    assert_eq!(denied.code(), &S3ErrorCode::InvalidRequest);
+                    assert_eq!(denied.message(), Some("authentication required"));
+                    let mut req = request();
+                    req.credentials = Some(s3s::auth::Credentials { access_key: "OIDCVALIDATEROOT".into(), secret_key: "oidcValidateRootSecret123".into() });
+                    let result = ValidateOidcConfigHandler {}.call(req, Params::new()).await;
+                    if !hidden && !complete {
+                        let err = result.unwrap_err();
+                        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+                        assert!(err.message().unwrap().contains("authorization_endpoint"));
+                        continue;
+                    }
+                    let (status, body) = result.unwrap().output;
+                    assert_eq!(status, StatusCode::OK);
+                    let body = body.collect().await.unwrap().to_bytes();
+                    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(response["valid"], true);
+                    assert_eq!(response["issuer"], base);
+                    if complete {
+                        assert_eq!(response["authorization_endpoint"], format!("{base}/authorize"));
+                        assert_eq!(response["token_endpoint"], format!("{base}/token"));
+                    } else {
+                        assert_eq!(response.get("authorization_endpoint"), Some(&serde_json::Value::Null));
+                        assert_eq!(response.get("token_endpoint"), Some(&serde_json::Value::Null));
+                    }
+                }
+                server.await.unwrap();
+            },
+        ).await;
+    }
 
     fn build_oidc_request(
         uri: &'static str,

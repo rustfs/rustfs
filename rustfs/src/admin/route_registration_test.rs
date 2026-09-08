@@ -209,6 +209,22 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route_sample(Method::POST, "/v3/tier/{tiername}", "/v3/tier/HOT"),
         admin_route(Method::POST, "/v3/tier/clear"),
         admin_route(Method::GET, "/v3/ilm/expiry/status"),
+        admin_route(Method::GET, "/v3/ilm/recovery/records"),
+        admin_route_sample(
+            Method::GET,
+            "/v3/ilm/recovery/records/{control_id}",
+            "/v3/ilm/recovery/records/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/ilm/recovery/records/{control_id}",
+            "/v3/ilm/recovery/records/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        admin_route_sample(
+            Method::GET,
+            "/v3/ilm/recovery/exports/{export_id}",
+            "/v3/ilm/recovery/exports/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
         admin_route(Method::POST, "/v3/ilm/transition/run"),
         admin_route_sample(
             Method::GET,
@@ -274,6 +290,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/scanner/status"),
         admin_route(Method::POST, "/v3/scanner/cycle-state/reset"),
         admin_route(Method::POST, "/v3/scanner/usage-state/reset"),
+        admin_route_sample(
+            Method::GET,
+            "/v3/scanner/usage-state/recovery-intents/{intent_id}",
+            "/v3/scanner/usage-state/recovery-intents/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
         admin_route(Method::GET, "/v3/audit/target/list"),
         admin_route_sample(
             Method::PUT,
@@ -929,7 +950,28 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/scanner/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/scanner/cycle-state/reset"));
     assert_route(&router, Method::POST, &admin_path("/v3/scanner/usage-state/reset"));
+    assert_route(
+        &router,
+        Method::GET,
+        &admin_path("/v3/scanner/usage-state/recovery-intents/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
     assert_route(&router, Method::GET, &admin_path("/v3/ilm/expiry/status"));
+    assert_route(&router, Method::GET, &admin_path("/v3/ilm/recovery/records"));
+    assert_route(
+        &router,
+        Method::GET,
+        &admin_path("/v3/ilm/recovery/records/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &admin_path("/v3/ilm/recovery/records/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &admin_path("/v3/ilm/recovery/exports/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    );
     assert_route(&router, Method::POST, &admin_path("/v3/ilm/transition/run"));
     assert_route(
         &router,
@@ -1426,6 +1468,12 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::GET, compat_admin_alias_path("/v3/scanner/status")),
         (Method::POST, compat_admin_alias_path("/v3/scanner/cycle-state/reset")),
         (Method::POST, compat_admin_alias_path("/v3/scanner/usage-state/reset")),
+        (
+            Method::GET,
+            compat_admin_alias_path(
+                "/v3/scanner/usage-state/recovery-intents/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ),
         (Method::GET, compat_admin_alias_path("/v3/ilm/expiry/status")),
         (Method::PUT, compat_admin_alias_path("/v3/on-demand-migration/b")),
         (Method::GET, compat_admin_alias_path("/v3/on-demand-migration/b")),

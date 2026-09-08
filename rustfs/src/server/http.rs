@@ -36,7 +36,9 @@ use crate::server::{
 };
 use crate::storage_api::server::http as storage;
 use crate::storage_api::server::http::rpc::InternodeRpcService;
+#[cfg(test)]
 use crate::storage_api::server::http::tonic_service::make_server;
+use crate::storage_api::server::http::tonic_service::make_server_for_slot;
 use crate::storage_api::server::http::{
     ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
     tonic_boot_epoch_response_headers, verify_tonic_rpc_signature_with_bootstrap,
@@ -1014,6 +1016,10 @@ pub async fn start_http_server(
         // Common setup for both IPv4 and successful dual-stack IPv6
         let backlog = get_listen_backlog();
         let keepalive = get_default_tcp_keepalive();
+        let recv_buffer_bytes = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_HTTP_SOCKET_RECV_BUFFER_BYTES,
+            rustfs_config::DEFAULT_HTTP_SOCKET_RECV_BUFFER_BYTES,
+        );
 
         // Helper to configure socket with optimized parameters
         let configure_socket = |socket: &socket2::Socket| -> Result<()> {
@@ -1068,10 +1074,25 @@ pub async fn start_http_server(
                 );
             }
 
-            // 4. Increase receive/send buffer to support BDP at GB-level throughput.
+            // 4. Socket buffers. The receive buffer is left to kernel autotuning
+            // unless RUSTFS_HTTP_SOCKET_RECV_BUFFER_BYTES is set: a fixed SO_RCVBUF
+            // is inherited by every accepted socket and disables autotuning, so a
+            // request whose body is not being read yet (a multipart part queued
+            // for a foreground write permit) lets up to the fixed size of unread
+            // body accumulate in kernel memory — the former hard-coded 4 MiB held
+            // up to 8 MiB per queued connection on Linux, which doubles the
+            // requested size. Autotuning keeps an unread connection at the
+            // kernel's initial size and grows only connections that are actually
+            // being drained (issue #7385). The send buffer stays fixed at 4 MiB
+            // because the stock Linux send autotuning ceiling (`tcp_wmem` max,
+            // 4 MiB) is below what a GB-level response stream needs, whereas the
+            // receive ceiling (`tcp_rmem` max, 6 MiB) already exceeds the old
+            // fixed request.
             // Some constrained local environments reject these socket options with
             // EPERM/ENOPROTOOPT-style failures; log and continue in that case.
-            if let Err(e) = socket.set_recv_buffer_size(4 * rustfs_config::MI_B) {
+            if recv_buffer_bytes > 0
+                && let Err(e) = socket.set_recv_buffer_size(recv_buffer_bytes)
+            {
                 debug!(
                     event = "socket_option_unavailable",
                     component = LOG_COMPONENT_SERVER,
@@ -1566,9 +1587,11 @@ pub async fn start_http_server(
             let socket_ref = SockRef::from(&socket);
 
             // ── POST-ACCEPT SOCKET SYSCALLS ──
-            // The listening socket already sets TCP_NODELAY, TCP_KEEPALIVE,
-            // SO_RCVBUF, and SO_SNDBUF. On Linux/BSD, these are inherited by
-            // accepted sockets, so we skip redundant re-application here.
+            // The listening socket already sets TCP_NODELAY, TCP_KEEPALIVE, and
+            // SO_SNDBUF (SO_RCVBUF stays kernel-autotuned unless
+            // RUSTFS_HTTP_SOCKET_RECV_BUFFER_BYTES is set, see the listener
+            // setup). On Linux/BSD, these are inherited by accepted sockets, so
+            // we skip redundant re-application here.
             //
             // Only TCP_QUICKACK (Linux) is kept — it is inherently per-connection
             // and NOT inherited from the listening socket.
@@ -1834,7 +1857,7 @@ fn process_connection(
         // each service in the auth interceptor.
         let rpc_max_message_size = rustfs_protos::internode_rpc_max_message_size();
         let node_service = InterceptedService::new(
-            NodeServiceServer::new(make_server())
+            NodeServiceServer::new(make_server_for_slot(Arc::clone(&server_ctx)))
                 .max_decoding_message_size(rpc_max_message_size)
                 .max_encoding_message_size(rpc_max_message_size),
             check_auth,
@@ -2418,6 +2441,7 @@ fn get_default_tcp_keepalive() -> TcpKeepalive {
 mod tests {
     use super::*;
     use crate::server::compress::RequestPathCategory;
+    use crate::storage_api::server::http::ScannerScopedDirtyUsageAckEntry;
     use bytes::Bytes;
     use http::Request as HttpRequest;
     use http::{HeaderMap, StatusCode};
@@ -3454,9 +3478,9 @@ mod tests {
             .scanner_scoped_dirty_usage_capability(
                 "11111111-1111-1111-1111-111111111111".to_string(),
                 "a".repeat(32),
-                vec![rustfs_protos::proto_gen::node_service::ScannerScopedDirtyUsageEntry {
-                    bucket: "photos".into(),
-                    bucket_incarnation: vec![1; 16].into(),
+                vec![ScannerScopedDirtyUsageAckEntry {
+                    bucket: "photos".to_string(),
+                    bucket_incarnation: uuid::Uuid::from_u128(0x11111111111111111111111111111111),
                     generation: 8,
                 }],
             )

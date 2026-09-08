@@ -16,23 +16,140 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::chaos::{VersionShardCensus, census_object_version_on_disk, signed_admin_post};
+    use crate::chaos::{VersionShardCensus, census_object_version_on_disk, sha256_hex, signed_admin_post};
     use crate::common::{
         FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request, init_logging,
+        rustfs_binary_path,
     };
     use crate::storage_api::RUSTFS_META_BUCKET;
     use aws_sdk_s3::primitives::ByteStream;
     use http::Method;
+    use sha2::{Digest, Sha256};
     use std::collections::HashSet;
     use std::error::Error;
+    use std::io::{Read, Write};
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use tokio::net::TcpStream;
     use tokio::time::{Duration, Instant, sleep, timeout};
     use tracing::info;
+    #[cfg(target_os = "linux")]
+    use tracing::warn;
 
     const POOL_METADATA_OBJECT: &str = "pool.bin";
+
+    #[derive(serde::Deserialize)]
+    struct EvidenceBuild {
+        sha256: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RestartEvidenceRun {
+        schema: u32,
+        run_id: String,
+        source_revision: String,
+        test_build: serde_json::Value,
+        binary: EvidenceBuild,
+        test_binary: EvidenceBuild,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ScannerHealEvidenceCase {
+        id: &'static str,
+        oracle: &'static str,
+        evidence: &'static str,
+        unclean_shutdown_marker: bool,
+    }
+
+    const BACKGROUND_TARGET_RESTART_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
+        id: "background-target-restart",
+        oracle: "background-target-restart.json",
+        evidence: "process-restart",
+        unclean_shutdown_marker: false,
+    };
+
+    const BACKGROUND_TARGET_CRASH_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
+        id: "background-target-crash",
+        oracle: "background-target-crash.json",
+        evidence: "process-crash-restart",
+        unclean_shutdown_marker: true,
+    };
+
+    struct RestartEvidenceContext {
+        directory: PathBuf,
+        run: RestartEvidenceRun,
+        case: ScannerHealEvidenceCase,
+    }
+
+    fn file_sha256(path: &Path) -> Result<String, Box<dyn Error + Send + Sync>> {
+        let mut file = std::fs::File::open(path)?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        Ok(digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    fn restart_evidence_run(
+        binary: &Path,
+        case: ScannerHealEvidenceCase,
+    ) -> Result<Option<RestartEvidenceContext>, Box<dyn Error + Send + Sync>> {
+        let Some(directory) = std::env::var_os("RUSTFS_SCANNER_HEAL_RUN_DIR") else {
+            return Ok(None);
+        };
+        if case.id.is_empty()
+            || case.oracle.is_empty()
+            || !case.oracle.ends_with(".json")
+            || case.oracle.contains('/')
+            || case.oracle.contains('\\')
+            || case.oracle.contains("..")
+            || !matches!(case.evidence, "process-restart" | "process-crash-restart")
+            || (case.evidence == "process-crash-restart") != case.unclean_shutdown_marker
+        {
+            return Err("invalid scanner/heal evidence case".into());
+        }
+        let directory = PathBuf::from(directory);
+        let receipt = directory.join("run.json");
+        if receipt.metadata()?.len() > 1024 * 1024 {
+            return Err("oversized scanner/heal execution receipt".into());
+        }
+        let run: RestartEvidenceRun = serde_json::from_slice(&std::fs::read(receipt)?)?;
+        if run.schema != 1 || run.run_id.len() != 32 || run.source_revision.len() != 40 {
+            return Err("invalid scanner/heal execution identity".into());
+        }
+        let built = compiled_test_identity();
+        for key in ["source_revision", "dirty", "lock_blob", "features"] {
+            assert_eq!(built[key], run.test_build[key], "compiled test identity differs for {key}");
+        }
+        assert_eq!(file_sha256(binary)?, run.binary.sha256, "server binary must match the run receipt");
+        assert_eq!(
+            file_sha256(&std::env::current_exe()?)?,
+            run.test_binary.sha256,
+            "test executable must match the run receipt"
+        );
+        if directory.join(case.oracle).exists() {
+            return Err("scanner/heal oracle already exists; create a new execution receipt".into());
+        }
+        Ok(Some(RestartEvidenceContext { directory, run, case }))
+    }
+
+    fn compiled_test_identity() -> serde_json::Value {
+        serde_json::json!({
+            "source_revision": env!("RUSTFS_E2E_BUILD_COMMIT"),
+            "dirty": env!("RUSTFS_E2E_BUILD_DIRTY") != "false",
+            "lock_blob": env!("RUSTFS_E2E_BUILD_LOCK"),
+            "features": env!("RUSTFS_E2E_BUILD_FEATURES"),
+            "target": env!("RUSTFS_E2E_BUILD_TARGET"),
+            "profile": env!("RUSTFS_E2E_BUILD_PROFILE"),
+            "rustflags_hex": env!("RUSTFS_E2E_BUILD_RUSTFLAGS_HEX"),
+        })
+    }
 
     struct TcpPortBlackhole {
         port: u16,
@@ -42,6 +159,49 @@ mod tests {
     }
 
     impl TcpPortBlackhole {
+        /// Environment flag that turns an unusable fault-injection host into a
+        /// hard failure instead of a logged skip. Lanes that provision
+        /// `CAP_NET_ADMIN` set it so a broken runner cannot pass silently.
+        #[cfg(target_os = "linux")]
+        const REQUIRE_ENV: &str = "RUSTFS_E2E_REQUIRE_NET_FAULT_INJECTION";
+
+        /// Probe whether this host can manipulate the OUTPUT chain at all.
+        ///
+        /// Returns `Ok(Some(reason))` when `iptables` is missing or lacks
+        /// `CAP_NET_ADMIN` (the nf_tables backend reports "Permission denied"
+        /// even under `sudo` inside an unprivileged container) and the lane did
+        /// not demand fault injection; returns an error when the lane demands
+        /// it; returns `Ok(None)` when the blackhole can be installed.
+        #[cfg(target_os = "linux")]
+        fn unavailable_reason() -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+            let id = Command::new("id").arg("-u").output()?;
+            if !id.status.success() {
+                return Err(format!("failed to determine the test process uid: {}", String::from_utf8_lossy(&id.stderr)).into());
+            }
+            let use_sudo = String::from_utf8_lossy(&id.stdout).trim() != "0";
+            let mut command = if use_sudo {
+                let mut command = Command::new("sudo");
+                command.args(["-n", "iptables"]);
+                command
+            } else {
+                Command::new("iptables")
+            };
+            let probe = command.args(["-w", "5", "-S", "OUTPUT"]).output();
+            let reason = match probe {
+                Ok(output) if output.status.success() => return Ok(None),
+                Ok(output) => format!(
+                    "iptables cannot read the OUTPUT chain (status {}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                Err(err) => format!("iptables is not runnable: {err}"),
+            };
+            if std::env::var_os(Self::REQUIRE_ENV).is_some() {
+                return Err(format!("{} is set but network fault injection is unavailable: {reason}", Self::REQUIRE_ENV).into());
+            }
+            Ok(Some(reason))
+        }
+
         fn install(address: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
             let address = address.parse::<SocketAddr>()?;
             if !address.ip().is_loopback() {
@@ -126,6 +286,27 @@ mod tests {
         }
     }
 
+    /// Remove a disk directory underneath a running server. Background writers
+    /// (scanner, usage cache, heal markers) can recreate entries between the
+    /// recursive listing and the final `rmdir`, which surfaces as
+    /// `DirectoryNotEmpty` on macOS; retry briefly so the wipe reflects the
+    /// operator action rather than a listing race.
+    fn wipe_directory_while_server_runs(disk: &Path) -> std::io::Result<()> {
+        let mut last_err = None;
+        for _ in 0..20 {
+            match std::fs::remove_dir_all(disk) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                    last_err = Some(err);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_err.expect("retry loop only exits without success after recording an error"))
+    }
+
     fn has_file_under(path: &Path) -> bool {
         let Ok(entries) = std::fs::read_dir(path) else {
             return false;
@@ -195,8 +376,9 @@ mod tests {
         clients: &[aws_sdk_s3::Client],
         bucket: &str,
         expected_keys: &HashSet<String>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<Vec<Vec<String>>, Box<dyn Error + Send + Sync>> {
         const PAGE_SIZE: i32 = 10;
+        let mut node_listings = Vec::with_capacity(clients.len());
         for (node_index, client) in clients.iter().enumerate() {
             let mut listed_keys = Vec::new();
             let mut continuation_token = None;
@@ -243,8 +425,10 @@ mod tests {
                 &listed_key_set, expected_keys,
                 "node {node_index} did not expose the complete recovered namespace"
             );
+            listed_keys.sort();
+            node_listings.push(listed_keys);
         }
-        Ok(())
+        Ok(node_listings)
     }
 
     fn heal_task_status_diagnostic(body: &str) -> String {
@@ -405,7 +589,7 @@ mod tests {
             );
         }
 
-        std::fs::remove_dir_all(&disk0).expect("disk0 wipe should succeed while server is running");
+        wipe_directory_while_server_runs(&disk0).expect("disk0 wipe should succeed while server is running");
         std::fs::create_dir_all(&disk0).expect("disk0 should be recreated empty while server is running");
         assert!(!has_file_under(&disk0), "disk0 must be empty immediately after runtime wipe");
 
@@ -780,6 +964,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_cluster_root_heal_recovers_remote_shards_after_background_target_crash()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        timeout(
+            Duration::from_secs(420),
+            run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetCrash),
+        )
+        .await?
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_cluster_root_heal_recovers_remote_shards_after_coordinator_restart() -> Result<(), Box<dyn Error + Send + Sync>>
     {
         timeout(
@@ -792,6 +986,18 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_cluster_root_heal_recovers_after_target_endpoint_blackhole() -> Result<(), Box<dyn Error + Send + Sync>> {
+        if let Some(reason) = TcpPortBlackhole::unavailable_reason()? {
+            init_logging();
+            warn!(
+                event = "heal_interruption_skipped",
+                component = "e2e_test",
+                subsystem = "heal",
+                interruption_kind = "target_endpoint_blackhole",
+                reason,
+                "Skipping endpoint blackhole scenario: network fault injection is unavailable on this host"
+            );
+            return Ok(());
+        }
         timeout(
             Duration::from_secs(420),
             run_cluster_root_heal_interruption(InterruptionScenario::TargetEndpointBlackhole),
@@ -803,14 +1009,27 @@ mod tests {
     enum InterruptionScenario {
         IsolatedTargetRestart,
         BackgroundTargetRestart,
+        BackgroundTargetCrash,
         BackgroundCoordinatorRestart,
         TargetEndpointBlackhole,
     }
 
     async fn run_cluster_root_heal_interruption(scenario: InterruptionScenario) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let server_binary = rustfs_binary_path();
+        let evidence_run = match scenario {
+            InterruptionScenario::BackgroundTargetRestart => {
+                restart_evidence_run(&server_binary, BACKGROUND_TARGET_RESTART_EVIDENCE)?
+            }
+            InterruptionScenario::BackgroundTargetCrash => {
+                restart_evidence_run(&server_binary, BACKGROUND_TARGET_CRASH_EVIDENCE)?
+            }
+            _ => None,
+        };
+        let mut evidence_objects = Vec::new();
         let (background_enabled, interruption_node, interruption_kind) = match scenario {
             InterruptionScenario::IsolatedTargetRestart => (false, 1, "target_restart"),
             InterruptionScenario::BackgroundTargetRestart => (true, 1, "background_target_restart"),
+            InterruptionScenario::BackgroundTargetCrash => (true, 1, "background_target_crash"),
             InterruptionScenario::BackgroundCoordinatorRestart => (true, 0, "coordinator_restart"),
             InterruptionScenario::TargetEndpointBlackhole => (false, 1, "target_endpoint_blackhole"),
         };
@@ -855,7 +1074,7 @@ mod tests {
         for node_index in 0..cluster.nodes.len() {
             cluster.set_node_capture_log_path(node_index, format!("{log_dir}/node{node_index}.log"))?;
         }
-        cluster.start().await?;
+        cluster.start_with_binary(&server_binary).await?;
         let clients = cluster.create_all_clients()?;
 
         let bucket = "heal-restart-during-rebuild";
@@ -877,6 +1096,7 @@ mod tests {
             .unwrap_or(4 * 1024 * 1024)
             .clamp(1024 * 1024, 16 * 1024 * 1024);
         let mut expected_manifests = Vec::with_capacity(online_object_count);
+        let mut unclean_shutdown_marker_observed = None;
         for index in 0..online_object_count {
             let key = format!("cluster/online/object-{index:04}.bin");
             let payload_seed = u8::try_from(index + 1).expect("clamped object count must fit in u8");
@@ -996,7 +1216,7 @@ mod tests {
             }
         }
 
-        cluster.start_node(1).await?;
+        cluster.start_node_from_binary(1, &server_binary).await?;
 
         let status_url = format!("{}/rustfs/admin/v3/background-heal/status", cluster.nodes[0].url);
         let recovery_deadline = Instant::now() + Duration::from_secs(60);
@@ -1243,7 +1463,11 @@ mod tests {
                 "Restored target endpoint forwarding"
             );
         } else {
-            cluster.stop_node(interruption_node)?;
+            if scenario == InterruptionScenario::BackgroundTargetRestart {
+                cluster.stop_node_gracefully(interruption_node).await?;
+            } else {
+                cluster.stop_node(interruption_node)?;
+            }
             let stopped_count = metadata_count(&replaced_disk, bucket, &expected_manifests);
             assert!(
                 stopped_count > 0 && stopped_count < expected_manifests.len(),
@@ -1259,9 +1483,12 @@ mod tests {
                 .join(".rustfs.sys")
                 .join("unclean-shutdown");
             if background_enabled {
+                let marker_exists = unclean_shutdown_marker.is_file();
+                unclean_shutdown_marker_observed = Some(marker_exists);
+                let expected_marker = !matches!(scenario, InterruptionScenario::BackgroundTargetRestart);
                 assert!(
-                    unclean_shutdown_marker.is_file(),
-                    "background restart must retain the real unclean-shutdown marker"
+                    marker_exists == expected_marker,
+                    "background restart/crash lane observed unexpected unclean-shutdown marker state"
                 );
             } else {
                 match std::fs::remove_file(&unclean_shutdown_marker) {
@@ -1274,7 +1501,7 @@ mod tests {
                     }
                 }
             }
-            cluster.start_node(interruption_node).await?;
+            cluster.start_node_from_binary(interruption_node, &server_binary).await?;
             if interruption_node == 0 {
                 let target = cluster.nodes[1]
                     .process
@@ -1373,7 +1600,7 @@ mod tests {
             .map(|manifest| manifest.key.clone())
             .collect::<HashSet<_>>();
         assert!(expected_keys.insert(outage_key.to_string()));
-        assert_all_nodes_list_exact_keys(&clients, bucket, &expected_keys).await?;
+        let node_listings = assert_all_nodes_list_exact_keys(&clients, bucket, &expected_keys).await?;
 
         let target_client = cluster.create_s3_client(1)?;
         for expected in &expected_manifests {
@@ -1381,11 +1608,31 @@ mod tests {
             let actual = response.body.collect().await?.into_bytes();
             let expected_body = deterministic_object_body(object_size_bytes, expected.payload_seed);
             assert_eq!(actual.as_ref(), expected_body.as_slice(), "object body changed for {}", expected.key);
+            if evidence_run.is_some() {
+                evidence_objects.push(serde_json::json!({
+                    "key": expected.key, "version_id": expected.shard_census.version_id,
+                    "expected_bytes": expected_body.len(), "actual_bytes": actual.len(),
+                    "expected_sha256": sha256_hex(&expected_body),
+                    "actual_sha256": sha256_hex(&actual),
+                    "expected_physical": expected.shard_census,
+                    "physical": census_object_version_on_disk(&replaced_disk, bucket, &expected.key, None)?,
+                }));
+            }
         }
         let response = target_client.get_object().bucket(bucket).key(outage_key).send().await?;
         let actual = response.body.collect().await?.into_bytes();
         let expected_outage_body = deterministic_object_body(object_size_bytes, outage_payload_seed);
         assert_eq!(actual.as_ref(), expected_outage_body.as_slice(), "object body changed for {outage_key}");
+        if evidence_run.is_some() {
+            evidence_objects.push(serde_json::json!({
+                "key": outage_key, "version_id": null,
+                "expected_bytes": expected_outage_body.len(), "actual_bytes": actual.len(),
+                "expected_sha256": sha256_hex(&expected_outage_body),
+                "actual_sha256": sha256_hex(&actual),
+                "expected_physical": null,
+                "physical": census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?,
+            }));
+        }
 
         let terminal_deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -1430,6 +1677,37 @@ mod tests {
         }
         if task_status["summary"].as_str() != Some("finished") {
             return Err(format!("heal data rebuilt but task did not finish successfully: {task_status}").into());
+        }
+
+        if let Some(evidence_context) = evidence_run {
+            let restarted_pid = cluster.nodes[1].process.as_ref().ok_or("restarted target is absent")?.id();
+            assert_ne!(target_pid, restarted_pid, "target must be a new process");
+            assert_eq!(
+                file_sha256(&server_binary)?,
+                evidence_context.run.binary.sha256,
+                "server build changed during restart"
+            );
+            let evidence = serde_json::json!({
+                "schema": 1, "case": evidence_context.case.id, "evidence": evidence_context.case.evidence,
+                "run_id": evidence_context.run.run_id, "source_revision": evidence_context.run.source_revision,
+                "test_build": compiled_test_identity(),
+                "binary_sha256": evidence_context.run.binary.sha256,
+                "test_binary_sha256": evidence_context.run.test_binary.sha256,
+                "topology": {"nodes": cluster.nodes.len(), "drives_per_node": cluster.nodes[0].data_dirs.len()},
+                "pid_before": target_pid, "pid_after": restarted_pid,
+                "unclean_shutdown_marker": unclean_shutdown_marker_observed.unwrap_or(false),
+                "objects": evidence_objects, "node_listings": node_listings,
+            });
+            let data = serde_json::to_vec(&evidence)?;
+            if data.len() > 1024 * 1024 {
+                return Err("scanner/heal oracle exceeds the 1 MiB artifact budget".into());
+            }
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(evidence_context.directory.join(evidence_context.case.oracle))?;
+            output.write_all(&data)?;
+            output.sync_all()?;
         }
 
         Ok(())

@@ -3900,6 +3900,38 @@ async fn table_data_plane_resource_does_not_match_sibling_prefix() {
 }
 
 #[tokio::test]
+async fn object_catalog_registration_scans_warehouse_prefixes_once() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+    store
+        .create_namespace(test_namespace_entry(bucket, &namespace))
+        .await
+        .unwrap();
+
+    let mut reads = Vec::new();
+    for name in ["orders", "returns", "shipments"] {
+        let table = IdentifierSegment::parse(name).expect("table should parse");
+        let mut entry = test_table_entry(
+            bucket,
+            &namespace,
+            &table,
+            default_table_metadata_file_path(&namespace, &table, "00001.metadata.json"),
+        );
+        entry.table_id = format!("table-{name}");
+        entry.warehouse_location = format!("s3://{bucket}/tables/{name}");
+        backend.reset_call_counts().await;
+        store.create_table(entry).await.expect("table should be created");
+        reads.push(backend.read_call_count().await);
+        assert_eq!(backend.list_call_count().await, 2, "one table scan and one warehouse index scan");
+    }
+    assert_eq!(reads[2] - reads[1], 2, "each existing table and its index should be read once");
+    assert_eq!(store.list_tables(bucket, &namespace.public_name()).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn catalog_backings_reject_overlapping_registered_warehouse_prefixes() {
     let backend = TestCatalogObjectBackend::default();
     let store = ObjectTableCatalogStore::new(backend);
@@ -15044,6 +15076,7 @@ async fn object_table_catalog_store_commits_with_token_match_and_writes_log() {
         .unwrap();
     backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
 
+    backend.reset_call_counts().await;
     let result = store
         .commit_table(TableCommitRequest {
             table_bucket: bucket.to_string(),
@@ -15061,6 +15094,11 @@ async fn object_table_catalog_store_commits_with_token_match_and_writes_log() {
         .await
         .unwrap();
 
+    assert_eq!(
+        backend.list_call_count().await,
+        0,
+        "an unchanged warehouse must not trigger a catalog scan"
+    );
     assert_eq!(result.table.metadata_location, new_metadata);
     assert_ne!(result.table.version_token, "token-v1");
     assert_eq!(result.table.generation, 2);

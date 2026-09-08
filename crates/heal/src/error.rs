@@ -54,6 +54,15 @@ pub enum Error {
     #[error("Heal task execution failed: {message}")]
     TaskExecutionFailed { message: String },
 
+    /// The current page already exhausted its local retry budget. Retrying
+    /// the enclosing bucket would replay pages whose results were counted.
+    #[error("Heal listing failed for bucket {bucket}: {source}")]
+    HealListingFailed {
+        bucket: String,
+        #[source]
+        source: Box<Error>,
+    },
+
     #[error("Invalid heal type: {heal_type}")]
     InvalidHealType { heal_type: String },
 

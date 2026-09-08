@@ -150,6 +150,7 @@ impl HealManager {
                                 Err(DiskError::UnformattedDisk) => {
                                     if !super::super::replacement_readiness::auto_replacement_target_ready(disk, &local_disks)
                                         .await
+                                        && !super::super::replacement_readiness::directory_backed_replacement_fallback_enabled()
                                     {
                                         deferred_replacement_endpoints.insert(endpoint.to_string());
                                         skipped_invalid_count += 1;

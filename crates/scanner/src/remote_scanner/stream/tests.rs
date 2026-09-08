@@ -195,6 +195,7 @@ fn test_usage(bucket: &str, objects: usize) -> DataUsageEntryInfo {
         name: bucket.to_string(),
         parent: crate::DATA_USAGE_ROOT.to_string(),
         entry,
+        bucket_incarnation: Some(Uuid::from_u128(7)),
         tier_registry_generation: Some(0),
     }
 }

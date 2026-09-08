@@ -29,6 +29,33 @@ use tokio::sync::Mutex;
 
 const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([3; 32]);
 
+mod cache_cost;
+
+#[test]
+fn scoped_scan_coverage_metadata_preserves_map_compatibility() {
+    #[derive(serde::Deserialize)]
+    struct LegacyInfo {
+        name: String,
+        next_cycle: u64,
+    }
+    let mut info = DataUsageCacheInfo {
+        name: DATA_USAGE_ROOT.to_string(),
+        next_cycle: 7,
+        ..Default::default()
+    };
+    let old = serde_json::to_value(&info).expect("legacy metadata should encode");
+    assert!(old.get("scan_coverage_digest").is_none());
+    let old: DataUsageCacheInfo = serde_json::from_value(old).expect("missing coverage must remain readable");
+    assert!(old.scan_coverage_digest.is_none());
+    info.scan_coverage_digest = Some(TEST_PLAN_DIGEST);
+    let encoded = rmp_serde::to_vec(&info).expect("coverage metadata should remain map encoded");
+    let legacy: LegacyInfo = rmp_serde::from_slice(&encoded).expect("old map readers should ignore additive proof fields");
+    assert_eq!(legacy.name, DATA_USAGE_ROOT);
+    assert_eq!(legacy.next_cycle, 7);
+    let decoded: DataUsageCacheInfo = rmp_serde::from_slice(&encoded).expect("new reader should restore the coverage proof");
+    assert_eq!(decoded.scan_coverage_digest, Some(TEST_PLAN_DIGEST));
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct CachePutRecord {
     object: String,
@@ -1067,6 +1094,7 @@ fn test_data_usage_cache_info_deserialize_defaults_scan_resume_after() {
     assert!(decoded.source.is_none());
     assert!(!decoded.snapshot_complete);
     assert!(decoded.scan_plan_digest.is_none());
+    assert!(decoded.scan_execution_digest.is_none());
     assert_eq!(decoded.cache_key_format, 0);
 }
 
@@ -1105,10 +1133,12 @@ fn test_data_usage_cache_info_unmarshal_old_msgpack_defaults_scan_resume_after()
     assert_eq!(decoded.failed_objects.get("bad-object"), Some(&11));
     assert!(decoded.scan_resume_after.is_none());
     assert!(decoded.scan_checkpoint.is_none());
+    assert!(decoded.scan_raw_enumeration_cursor.is_none());
     assert!(decoded.pending_heals.is_empty());
     assert!(decoded.source.is_none());
     assert!(!decoded.snapshot_complete);
     assert!(decoded.scan_plan_digest.is_none());
+    assert!(decoded.scan_execution_digest.is_none());
     assert_eq!(decoded.cache_key_format, 0);
 }
 
@@ -1143,8 +1173,16 @@ fn test_new_data_usage_cache_msgpack_round_trips_and_supports_old_reader() {
             skip_healing: true,
             failed_objects: HashMap::from([("bad-object".to_string(), 11)]),
             source: Some(DataUsageCacheSource::new(1, 2)),
+            scan_raw_enumeration_cursor: Some(DataUsageRawEnumerationCursor::new(
+                "bucket/prefix".to_string(),
+                Some("last-object".to_string()),
+                7,
+                [7; 32],
+            )),
+            scan_raw_enumeration_page_index: Some(raw_page_index_fixture("bucket/prefix", &["entry-a"], false)),
             snapshot_complete: true,
             scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            scan_execution_digest: Some(DataUsageScanPlanDigest([42; 32])),
             cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
             ..Default::default()
         },
@@ -1162,8 +1200,18 @@ fn test_new_data_usage_cache_msgpack_round_trips_and_supports_old_reader() {
     let current = DataUsageCache::unmarshal(&buf).expect("Current reader failed to deserialize new cache");
     assert_eq!(current.info.leader_epoch, 9);
     assert_eq!(current.info.source, Some(DataUsageCacheSource::new(1, 2)));
+    assert_eq!(
+        current
+            .info
+            .scan_raw_enumeration_cursor
+            .as_ref()
+            .map(|cursor| cursor.last_entry.as_deref()),
+        Some(Some("last-object"))
+    );
+    assert!(current.info.scan_raw_enumeration_page_index.is_some());
     assert!(current.info.snapshot_complete);
     assert_eq!(current.info.scan_plan_digest, Some(TEST_PLAN_DIGEST));
+    assert_eq!(current.info.scan_execution_digest, Some(DataUsageScanPlanDigest([42; 32])));
     assert_eq!(current.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
     assert_eq!(current.find("bucket").map(|entry| entry.objects), Some(3));
 
@@ -1181,6 +1229,179 @@ fn test_new_data_usage_cache_msgpack_round_trips_and_supports_old_reader() {
     assert!(decoded.info.pending_heals.is_empty());
     assert!(decoded.info.object_lock.is_none());
     assert_eq!(decoded.cache.get("bucket").map(|entry| entry.objects), Some(3));
+}
+
+fn valid_scan_identity() -> DataUsageScanIdentity {
+    DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation: uuid::Uuid::new_v4(),
+        set_layout: TEST_PLAN_DIGEST,
+        publication_epoch: 5,
+        tier_registry_generation: 9,
+        scan_mode: HealScanMode::Normal,
+    }
+}
+
+fn cache_with_raw_cursor(cursor: DataUsageRawEnumerationCursor) -> DataUsageCache {
+    DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            leader_epoch: 1,
+            source: Some(DataUsageCacheSource::new(1, 2)),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            scan_identity: Some(valid_scan_identity()),
+            tier_registry_generation: Some(9),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_raw_enumeration_cursor: Some(cursor),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn raw_page_index_fixture(parent: &str, entries: &[&str], complete: bool) -> RawEnumerationPageIndex {
+    let mut index = RawEnumerationPageIndex::new(parent, 2).expect("raw page index should initialize");
+    let generation = index.generation().expect("raw page index should expose generation");
+    let outcome = if complete {
+        index.ingest_owner_entries(entries.iter().map(|entry| (*entry).to_string()), entries.len().max(1), generation)
+    } else {
+        index.ingest_partial_owner_entries(entries.iter().map(|entry| (*entry).to_string()), entries.len().max(1), generation)
+    }
+    .expect("raw page index fixture should ingest entries");
+    if outcome.ready_to_commit {
+        let generation = index.generation().expect("raw page index should expose commit generation");
+        index
+            .commit_building_page(generation)
+            .expect("raw page index fixture should commit ready page");
+    }
+    index
+}
+
+#[test]
+fn raw_enumeration_cursor_validation_requires_bucket_identity_and_bounded_marker() {
+    let valid = DataUsageRawEnumerationCursor::new("bucket/raw".to_string(), Some("entry-001".to_string()), 1, [8; 32]);
+    let cache = cache_with_raw_cursor(valid.clone());
+    assert_eq!(cache.validated_raw_enumeration_cursor(), Some(&valid));
+
+    let page_begin = DataUsageRawEnumerationCursor::new("bucket/raw".to_string(), None, 0, [8; 32]);
+    let cache = cache_with_raw_cursor(page_begin.clone());
+    assert_eq!(cache.validated_raw_enumeration_cursor(), Some(&page_begin));
+
+    let seen_without_marker = DataUsageRawEnumerationCursor::new("bucket/raw".to_string(), None, 1, [8; 32]);
+    assert!(
+        cache_with_raw_cursor(seen_without_marker)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+
+    let mut missing_identity = cache_with_raw_cursor(valid.clone());
+    missing_identity.info.scan_identity = None;
+    assert!(missing_identity.validated_raw_enumeration_cursor().is_none());
+
+    let mut outside_bucket = valid.clone();
+    outside_bucket.parent = "other/raw".to_string();
+    assert!(
+        cache_with_raw_cursor(outside_bucket)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+
+    let mut future_version = valid.clone();
+    future_version.version = DATA_USAGE_RAW_ENUMERATION_CURSOR_VERSION + 1;
+    assert!(
+        cache_with_raw_cursor(future_version)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+
+    let mut zero_digest = valid.clone();
+    zero_digest.page_digest = [0; 32];
+    assert!(
+        cache_with_raw_cursor(zero_digest)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+
+    let mut nested_marker = valid;
+    nested_marker.last_entry = Some("child/object".to_string());
+    assert!(
+        cache_with_raw_cursor(nested_marker)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+
+    let oversized_marker =
+        DataUsageRawEnumerationCursor::new("bucket/raw".to_string(), Some("x".repeat(16 * 1024 + 1)), 1, [8; 32]);
+    assert!(
+        cache_with_raw_cursor(oversized_marker)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+}
+
+#[test]
+fn prepare_bucket_checkpoint_preserves_only_valid_raw_enumeration_cursor() {
+    let identity = valid_scan_identity();
+    let source = DataUsageCacheSource::new(1, 2);
+    let cursor = DataUsageRawEnumerationCursor::new("bucket/raw".to_string(), Some("entry-001".to_string()), 1, [9; 32]);
+    let mut cache = cache_with_raw_cursor(cursor.clone());
+    cache.info.scan_identity = Some(identity);
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert_eq!(cache.info.scan_raw_enumeration_cursor, Some(cursor));
+
+    let invalid = DataUsageRawEnumerationCursor::new("other/raw".to_string(), Some("entry-001".to_string()), 1, [9; 32]);
+    let mut cache = cache_with_raw_cursor(invalid);
+    cache.info.scan_identity = Some(identity);
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert!(cache.info.scan_raw_enumeration_cursor.is_none());
+    assert!(cache.info.scan_progress.is_some());
+}
+
+#[test]
+fn prepare_bucket_checkpoint_preserves_only_valid_raw_page_index() {
+    let identity = valid_scan_identity();
+    let source = DataUsageCacheSource::new(1, 2);
+    let page_index = raw_page_index_fixture("bucket/raw", &["entry-001"], false);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            leader_epoch: 1,
+            source: Some(source),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            scan_identity: Some(identity),
+            tier_registry_generation: Some(9),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_raw_enumeration_page_index: Some(page_index.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert_eq!(cache.info.scan_raw_enumeration_page_index, Some(page_index));
+
+    let invalid = raw_page_index_fixture("other/raw", &["entry-001"], false);
+    cache.info.scan_raw_enumeration_page_index = Some(invalid);
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert!(cache.info.scan_raw_enumeration_page_index.is_none());
+    assert!(cache.info.scan_progress.is_some());
 }
 
 /// Deterministic, fully populated cache used to pin the persisted

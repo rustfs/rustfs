@@ -15,6 +15,7 @@
 use super::*;
 use crate::storage_api::ScannerStorage;
 use crate::storage_api::scan::SCANNER_ACTIVITY_V6_PROTOCOL_VERSION;
+use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ScannerCycleWakeReason {
@@ -51,18 +52,25 @@ pub(crate) fn scanner_cycle_outcome_with_pending_maintenance(
     }
 }
 
-pub(super) async fn remote_dirty_usage_acknowledgement_pending<F, E>(
+pub(super) async fn remote_dirty_usage_acknowledgement_pending<F, E, C, CF>(
     cycle: u64,
     acknowledgement_count: usize,
+    acknowledgements: &[ScannerDirtyUsageAcknowledgement],
     acknowledgement: F,
+    confirm_after_error: C,
 ) -> bool
 where
     F: Future<Output = Result<bool, E>>,
     E: std::fmt::Display,
+    C: FnOnce() -> CF,
+    CF: Future<Output = Result<ScannerActivitySnapshot, String>>,
 {
     match acknowledgement.await {
         Ok(dirty_usage_pending) => dirty_usage_pending,
         Err(err) => {
+            if remote_dirty_usage_acknowledgement_loss_reconciled(acknowledgements, confirm_after_error().await) {
+                return false;
+            }
             warn!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_PERSIST_STATE,
@@ -77,6 +85,29 @@ where
             true
         }
     }
+}
+
+pub(super) fn remote_dirty_usage_acknowledgement_loss_reconciled(
+    acknowledgements: &[ScannerDirtyUsageAcknowledgement],
+    activity_after_error: Result<ScannerActivitySnapshot, String>,
+) -> bool {
+    if acknowledgements.is_empty() {
+        return false;
+    }
+    let Ok(activity_after_error) = activity_after_error else {
+        return false;
+    };
+    if !scanner_activity_allows_usage_publication(&activity_after_error) {
+        return false;
+    }
+    let mut acknowledged_hosts = HashSet::with_capacity(acknowledgements.len());
+    acknowledgements.iter().all(|acknowledgement| {
+        if !acknowledged_hosts.insert(acknowledgement.host.as_str()) {
+            return false;
+        }
+        scanner_activity_dirty_usage_state_for_host(&activity_after_error, &acknowledgement.host)
+            .is_some_and(|(instance_id, _generation, pending)| instance_id == acknowledgement.instance_id && !pending)
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -441,11 +472,59 @@ pub(crate) struct ScannerNodeActivity {
 
 pub(crate) type ScannerActivitySnapshot = BTreeMap<String, ScannerNodeActivity>;
 
+#[cfg(test)]
+pub(crate) fn scanner_node_activity_for_tests(
+    instance_id: &str,
+    namespace_generation: u64,
+    dirty_usage_generation: u64,
+    dirty_usage_pending: bool,
+) -> ScannerNodeActivity {
+    ScannerNodeActivity {
+        instance_id: instance_id.to_string(),
+        namespace_generation,
+        maintenance_generation: 0,
+        protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+        topology_digest: [0; 32],
+        data_movement_active: false,
+        dirty_usage_generation,
+        dirty_usage_pending,
+        movement_generation: 0,
+        publication_blocked: false,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScannerDirtyUsageAcknowledgement {
     pub(crate) host: String,
     pub(crate) instance_id: String,
-    pub(crate) generation: u64,
+    pub(crate) kind: ScannerDirtyUsageAcknowledgementKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ScannerDirtyUsageAcknowledgementKind {
+    Generation(u64),
+    Scoped {
+        owner_id: String,
+        entries: Vec<crate::storage_api::EcstoreScannerScopedDirtyUsageAckEntry>,
+    },
+}
+
+impl From<ScannerDirtyUsageAcknowledgement> for crate::storage_api::EcstoreScannerDirtyUsageAcknowledgement {
+    fn from(acknowledgement: ScannerDirtyUsageAcknowledgement) -> Self {
+        match acknowledgement.kind {
+            ScannerDirtyUsageAcknowledgementKind::Generation(generation) => Self::Generation {
+                host: acknowledgement.host,
+                instance_id: acknowledgement.instance_id,
+                generation,
+            },
+            ScannerDirtyUsageAcknowledgementKind::Scoped { owner_id, entries } => Self::Scoped {
+                host: acknowledgement.host,
+                owner_id,
+                instance_id: acknowledgement.instance_id,
+                entries,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -902,7 +981,6 @@ where
     observation
 }
 
-#[cfg(test)]
 pub(crate) fn scanner_activity_snapshot_digest(snapshot: &ScannerActivitySnapshot) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(u64::try_from(snapshot.len()).unwrap_or(u64::MAX).to_be_bytes());
@@ -975,7 +1053,7 @@ pub(crate) fn scanner_dirty_usage_acknowledgements(snapshot: &ScannerActivitySna
         .map(|(host, activity)| ScannerDirtyUsageAcknowledgement {
             host: host.clone(),
             instance_id: activity.instance_id.clone(),
-            generation: activity.dirty_usage_generation,
+            kind: ScannerDirtyUsageAcknowledgementKind::Generation(activity.dirty_usage_generation),
         })
         .collect()
 }

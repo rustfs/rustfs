@@ -671,9 +671,9 @@ mod tests {
     use crate::cluster::rpc::PeerS3Client;
     use crate::config::com::{delete_config, read_config_no_lock_preserve_empty_with_metadata, save_config};
     use crate::core::pools::{
-        DecommissionCapacityLockOrderBarrier, DecommissionErasureLayout, DecommissionPoolCapacityInfo, POOL_META_IDENTITY_NAME,
-        PoolDecommissionInfo, PoolMetaReplicaState, PoolStatus, initialized_pool_meta_identity_for_test,
-        set_decommission_capacity_info_overrides_for_test,
+        DecommissionCapacityAdmission, DecommissionCapacityLockOrderBarrier, DecommissionErasureLayout,
+        DecommissionPoolCapacityInfo, POOL_META_IDENTITY_NAME, PoolDecommissionInfo, PoolMetaReplicaState, PoolStatus,
+        initialized_pool_meta_identity_for_test, set_decommission_capacity_info_overrides_for_test,
     };
     use crate::core::sets::HealFormatAfterSaveBarrier;
     use crate::disk::error::Result as DiskResult;
@@ -1149,7 +1149,7 @@ mod tests {
         let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
         let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
         let capacity_guard = store
-            .acquire_external_decommission_capacity_fence(&[0], "heal")
+            .acquire_external_decommission_capacity_fence(&[0], DecommissionCapacityAdmission::Heal)
             .await
             .expect("ordinary heal capacity fence should be acquired");
 
@@ -2353,11 +2353,22 @@ mod tests {
             .await
             .expect("quorum boundary heal should return a mapped result");
         *store.pools[0].disk_set[0].disks.write().await = original_quorum_disks;
+        let quorum_err = quorum_err
+            .as_ref()
+            .expect("heal must fail closed when capacity admission cannot verify pool metadata");
+        let quorum_failure = quorum_err
+            .pool_metadata_failure()
+            .expect("capacity admission failure should preserve typed pool metadata context");
+        assert_eq!(
+            quorum_failure.kind,
+            crate::error::PoolMetadataFailure::ReadUnavailable,
+            "read-only capacity admission failure must remain retryable"
+        );
+        assert_eq!(quorum_failure.operation, "target capacity admission failed");
+        assert_eq!(quorum_failure.phase, "pool_read");
         assert!(
-            quorum_err.as_ref().is_some_and(|err| err
-                .to_string()
-                .contains("pool metadata writes remain blocked after a recovery-required replica state")),
-            "heal must fail closed when capacity admission cannot verify pool metadata, got {quorum_err:?}"
+            store.pool_meta_writes_ready().await,
+            "read-only capacity admission failure must not latch the pool metadata writer"
         );
         shutdown.cancel();
     }

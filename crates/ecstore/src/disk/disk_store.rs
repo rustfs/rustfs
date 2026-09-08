@@ -195,6 +195,13 @@ fn resolve_drive_timeout_profile_from_env() -> DriveTimeoutProfile {
     DriveTimeoutProfile::parse(rustfs_config::DEFAULT_DRIVE_TIMEOUT_PROFILE).unwrap_or(DriveTimeoutProfile::Default)
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Artificial `disk_info` latency for tests that pin how the admin storage
+    /// walk composes per-drive probe time.
+    pub(crate) static DISK_INFO_PROBE_DELAY_FOR_TEST: Duration;
+}
+
 fn get_drive_timeout_profile() -> DriveTimeoutProfile {
     #[cfg(test)]
     {
@@ -324,6 +331,70 @@ impl DiskStoreRenameDataExt for LocalDiskWrapper {
 }
 
 impl LocalDiskWrapper {
+    pub(in crate::disk) async fn delete_version_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        self.track_disk_health_mutation(
+            "delete_version",
+            DiskMetricMutation::Delete,
+            || async {
+                Box::pin(
+                    self.disk
+                        .delete_version_with_namespace_owner(volume, path, fi, force_del_marker, opts, namespace_owner),
+                )
+                .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    pub(in crate::disk) async fn delete_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        self.track_disk_health_mutation(
+            "delete",
+            DiskMetricMutation::Delete,
+            || async { Box::pin(self.disk.delete_with_namespace_owner(volume, path, opts, namespace_owner)).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    pub(in crate::disk) async fn undo_write_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        self.track_disk_health_mutation(
+            "delete_version",
+            DiskMetricMutation::Delete,
+            || async {
+                // Preserve the old DiskAPI future's boxing boundary.
+                Box::pin(
+                    self.disk
+                        .undo_write_with_namespace_owner(volume, path, fi, opts, namespace_owner),
+                )
+                .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     pub(in crate::disk) async fn rename_data_observed(
         &self,
         src_volume: &str,
@@ -333,6 +404,34 @@ impl LocalDiskWrapper {
         dst_path: &str,
         external_guard: Option<Arc<dyn Send + Sync>>,
     ) -> super::RenameDataObservation {
+        self.rename_data_observed_with_guards(
+            src_volume,
+            src_path,
+            fi,
+            dst_volume,
+            dst_path,
+            super::RenameDataGuards {
+                external_guard,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub(in crate::disk) async fn rename_data_observed_with_guards(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        guards: super::RenameDataGuards,
+    ) -> super::RenameDataObservation {
+        let super::RenameDataGuards {
+            external_guard,
+            namespace_owner,
+            ..
+        } = guards;
         let operation = self.clone();
         let src_volume = src_volume.to_owned();
         let src_path = src_path.to_owned();
@@ -357,13 +456,15 @@ impl LocalDiskWrapper {
                     DiskMetricMutation::Write,
                     || async {
                         // Preserve the former DiskAPI future's single boxing boundary.
-                        let observed =
-                            Box::pin(
-                                operation
-                                    .disk
-                                    .rename_data_observed(&src_volume, &src_path, &fi, &dst_volume, &dst_path),
-                            )
-                            .await;
+                        let observed = Box::pin(operation.disk.rename_data_observed(
+                            &src_volume,
+                            &src_path,
+                            &fi,
+                            &dst_volume,
+                            &dst_path,
+                            namespace_owner,
+                        ))
+                        .await;
                         preflight_rejection = observed.preflight_rejection;
                         observed.result
                     },
@@ -1301,6 +1402,7 @@ impl LocalDiskWrapper {
         self.disk.get_object_path(volume, path)
     }
 
+    #[cfg(unix)]
     pub(crate) fn get_object_path_for_io(&self, volume: &str, path: &str) -> crate::disk::error::Result<std::path::PathBuf> {
         self.disk.get_object_path_for_io(volume, path)
     }
@@ -1941,6 +2043,10 @@ impl DiskAPI for LocalDiskWrapper {
             .track_disk_health_with_op_and_timeout_action(
                 "disk_info",
                 || async {
+                    #[cfg(test)]
+                    if let Ok(delay) = DISK_INFO_PROBE_DELAY_FOR_TEST.try_with(|delay| *delay) {
+                        tokio::time::sleep(delay).await;
+                    }
                     let result = self.disk.disk_info(opts).await?;
 
                     if let Some(current_disk_id) = *self.disk_id.read().await

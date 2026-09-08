@@ -19,7 +19,6 @@
 #![allow(clippy::all)]
 
 use http::{HeaderMap, HeaderValue, StatusCode};
-use http_body_util::BodyExt;
 use hyper::body::Body;
 use hyper::body::Bytes;
 use rustfs_utils::EMPTY_STRING_SHA256_HASH;
@@ -119,14 +118,9 @@ impl TransitionClient {
             let resp_status = resp.status();
             let h = resp.headers().clone();
 
-            let mut body_vec = Vec::new();
-            let mut body = resp.into_body();
-            while let Some(frame) = body.frame().await {
-                let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-                if let Some(data) = frame.data_ref() {
-                    body_vec.extend_from_slice(data);
-                }
-            }
+            let body_vec = self
+                .collect_response_body(resp.into_body(), rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE)
+                .await?;
             let resperr = http_resp_to_error_response(resp_status, &h, body_vec, bucket_name, "");
 
             warn!("bucket exists, resperr: {:?}", resperr);
@@ -170,11 +164,13 @@ impl TransitionClient {
                 let resp_status = resp.status();
                 let h = resp.headers().clone();
 
-                let body_vec = collect_response_body(resp.into_body(), rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE).await?;
+                let body_vec = self
+                    .collect_response_body(resp.into_body(), rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE)
+                    .await?;
                 parse_bucket_versioning_response(resp_status, &h, body_vec, bucket_name)
             }
 
-            Err(err) => Err(std::io::Error::other(err)),
+            Err(err) => Err(err),
         }
     }
 
@@ -274,8 +270,14 @@ impl TransitionClient {
 #[cfg(test)]
 mod tests {
     use super::parse_bucket_versioning_response;
+    use crate::{
+        credentials::{Credentials, SignatureType, Static, Value},
+        transition_api::{BucketLookupType, Options, TransitionClient, TransitionClientTimeouts},
+    };
     use http::{HeaderMap, StatusCode};
     use s3s::dto::BucketVersioningStatus;
+    use std::time::Duration;
+    use tokio::{io::AsyncReadExt, net::TcpListener};
 
     #[test]
     fn parses_bucket_versioning_statuses_mfa_delete_and_unversioned_state() {
@@ -337,5 +339,64 @@ mod tests {
                 .expect_err("unknown GetBucketVersioning XML must fail closed");
             assert_eq!(strict_err.kind(), std::io::ErrorKind::InvalidData);
         }
+    }
+
+    #[tokio::test]
+    async fn get_bucket_versioning_preserves_request_timeout_kind() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let endpoint = listener
+            .local_addr()
+            .expect("listener local address should be available")
+            .to_string();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("fixture should accept one versioning request");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.expect("fixture should read request headers");
+                assert_ne!(read, 0, "connection closed before request headers were received");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let client = TransitionClient::new_with_timeouts(
+            &endpoint,
+            Options {
+                creds: Credentials::new(Static(Value {
+                    access_key_id: "access-key".to_string(),
+                    secret_access_key: "secret-key".to_string(),
+                    signer_type: SignatureType::SignatureV4,
+                    ..Default::default()
+                })),
+                region: "us-east-1".to_string(),
+                bucket_lookup: BucketLookupType::BucketLookupPath,
+                max_retries: 1,
+                ..Default::default()
+            },
+            "",
+            TransitionClientTimeouts::new(Duration::from_secs(1), Duration::from_millis(50), Duration::from_secs(1)),
+        )
+        .await
+        .expect("fixture client should build");
+        client
+            .bucket_loc_cache
+            .lock()
+            .expect("location cache should lock")
+            .set("bucket", "us-east-1");
+
+        let err = client
+            .get_bucket_versioning("bucket")
+            .await
+            .expect_err("a stalled versioning request must time out");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        fixture.await.expect("fixture should join");
     }
 }

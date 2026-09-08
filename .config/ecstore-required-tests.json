@@ -40,6 +40,21 @@
       "invariant": "corrupt-part-arrays",
       "suite": "rustfs-filemeta",
       "name": "filemeta::test::crc_valid_but_part_arrays_corrupt_into_fileinfo_errors_not_panics"
+    },
+    {
+      "invariant": "odm-source-contract-s3",
+      "suite": "rustfs",
+      "name": "on_demand_migration::source_client::tests::s3_backend_satisfies_the_shared_backend_contract"
+    },
+    {
+      "invariant": "odm-source-contract-azure",
+      "suite": "rustfs",
+      "name": "on_demand_migration::azure::tests::azure_backend_satisfies_the_shared_backend_contract"
+    },
+    {
+      "invariant": "odm-source-contract-gcs",
+      "suite": "rustfs",
+      "name": "on_demand_migration::gcs::tests::gcs_native_backend_satisfies_the_shared_backend_contract"
     }
   ],
   "fixtures": [

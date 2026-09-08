@@ -27,7 +27,6 @@ use crate::{
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient, collect_response_body},
 };
 use http::{HeaderMap, StatusCode};
-use http_body_util::BodyExt;
 use hyper::body::Body;
 use hyper::body::Bytes;
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
@@ -124,14 +123,9 @@ impl TransitionClient {
         }
 
         //let mut list_bucket_result = ListBucketV2Result::default();
-        let mut body_vec = Vec::new();
-        let mut body = resp.into_body();
-        while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            if let Some(data) = frame.data_ref() {
-                body_vec.extend_from_slice(data);
-            }
-        }
+        let body_vec = self
+            .collect_response_body(resp.into_body(), MAX_S3_CLIENT_RESPONSE_SIZE)
+            .await?;
         let mut list_bucket_result = match quick_xml::de::from_str::<ListBucketV2Result>(&String::from_utf8_lossy(&body_vec)) {
             Ok(result) => result,
             Err(err) => {
@@ -214,7 +208,9 @@ impl TransitionClient {
 
         let resp_status = resp.status();
         let headers = resp.headers().clone();
-        let body = collect_response_body(resp.into_body(), MAX_S3_CLIENT_RESPONSE_SIZE).await?;
+        let body = self
+            .collect_response_body(resp.into_body(), MAX_S3_CLIENT_RESPONSE_SIZE)
+            .await?;
         if resp_status != StatusCode::OK {
             return Err(std::io::Error::other(http_resp_to_error_response(
                 resp_status,
@@ -428,6 +424,30 @@ fn decode_s3_name(name: &str, encoding_type: &str) -> Result<String, std::io::Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        credentials::{Credentials, SignatureType, Static, Value},
+        transition_api::{BucketLookupType, Options, TransitionClientTimeouts},
+    };
+    use std::time::Duration;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    fn timeout_test_options() -> Options {
+        Options {
+            creds: Credentials::new(Static(Value {
+                access_key_id: "access-key".to_string(),
+                secret_access_key: "secret-key".to_string(),
+                signer_type: SignatureType::SignatureV4,
+                ..Default::default()
+            })),
+            region: "us-east-1".to_string(),
+            bucket_lookup: BucketLookupType::BucketLookupPath,
+            max_retries: 1,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn list_versions_xml_preserves_versions_and_delete_markers() {
@@ -524,5 +544,57 @@ mod tests {
 
         assert_eq!(parsed.common_prefixes.len(), 1);
         assert_eq!(parsed.common_prefixes[0].prefix, "subdir/");
+    }
+
+    #[tokio::test]
+    async fn list_objects_v2_body_stall_returns_timed_out() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let endpoint = listener
+            .local_addr()
+            .expect("listener local address should be available")
+            .to_string();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("fixture should accept one list request");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.expect("fixture should read request headers");
+                assert_ne!(read, 0, "connection closed before request headers were received");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 512\r\nConnection: close\r\n\r\n<ListBucketResult><Name>warm")
+                .await
+                .expect("fixture should write a partial list response");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let client = TransitionClient::new_with_timeouts(
+            &endpoint,
+            timeout_test_options(),
+            "",
+            TransitionClientTimeouts::new(Duration::from_secs(1), Duration::from_secs(1), Duration::from_millis(50)),
+        )
+        .await
+        .expect("fixture client should build");
+        client
+            .bucket_loc_cache
+            .lock()
+            .expect("location cache should lock")
+            .set("bucket", "us-east-1");
+
+        let err = client
+            .list_objects_v2_query("bucket", "", "", false, false, "", "", 1, HeaderMap::new())
+            .await
+            .expect_err("a stalled ListObjectsV2 body must be bounded");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        fixture.await.expect("fixture should join");
     }
 }

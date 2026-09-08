@@ -106,6 +106,7 @@ bytes.workspace = true
 hex-simd.workspace = true
 
 [dev-dependencies]
+rustfs-heal.workspace = true
 tracing-subscriber = { workspace = true, features = ["json", "env-filter", "time"] }
 serial_test = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }

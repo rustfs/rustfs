@@ -36,6 +36,13 @@ class BinaryProvenanceTests(unittest.TestCase):
 if os.environ.get("FAKE_BUILD_FAIL"):
     raise SystemExit(23)
 args = sys.argv[1:]
+if args[:2] == ["nextest", "run"]:
+    receipt = json.loads(pathlib.Path(os.environ["RUSTFS_E2E_BINARY_RECEIPT"]).read_text())
+    assert pathlib.Path(receipt["binary"]) == pathlib.Path(os.environ["CARGO_BIN_EXE_rustfs"]).resolve()
+    if os.environ.get("RUSTFS_E2E_STARTUP_CAS_BINARY"):
+        assert pathlib.Path(receipt["binary"]) == pathlib.Path(os.environ["RUSTFS_E2E_STARTUP_CAS_BINARY"]).resolve()
+    pathlib.Path("target/nextest-command.json").write_text(json.dumps(args))
+    raise SystemExit(int(os.environ.get("FAKE_TEST_EXIT", "0")))
 target = pathlib.Path(args[args.index("--target-dir") + 1])
 binary = target / ("release" if "--release" in args else "debug") / "rustfs"
 binary.parent.mkdir(parents=True, exist_ok=True)
@@ -141,6 +148,50 @@ if os.environ.get("FAKE_BUILD_MUTATE"):
             shutil.copy2(self.sidecar, clone / "target/debug/rustfs.e2e.json")
             result = subprocess.run([sys.executable, str(clone / "scripts/e2e_binary.py"), "run", "--", sys.executable, "-c", "pass"], cwd=clone, env=self.env, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ci_build_preserves_both_manifests_and_runs_the_copied_server(self):
+        from check_test_wiring import yaml_block
+        from test_security_workflow import named_steps, shell_body
+
+        source = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text().splitlines()
+        build_steps = named_steps(yaml_block(source, "build-rustfs-debug-binary", 2))
+        run_steps = named_steps(yaml_block(source, "e2e-full", 2))
+        (self.root / "Cargo.lock").write_text("fixture lock\n")
+        subprocess.run(["git", "add", "Cargo.lock"], cwd=self.root, check=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "lock"], cwd=self.root, check=True)
+        copied = self.root / "target/startup-cas-input/rustfs"
+        env = dict(self.env, STARTUP_CAS_INPUT=str(copied.parent), RUSTFS_E2E_STARTUP_CAS_BINARY=str(copied))
+        for step in (build_steps["Build debug binary"], run_steps["Preserve startup CAS binary input"]):
+            result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", shell_body(step)], cwd=self.root, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("rustfs.e2e.json", "rustfs.e2e-startup-cas-build.json"):
+            self.assertIn("            target/debug/" + name, build_steps["Upload debug binary"])
+            self.assertEqual((self.binary.parent / name).read_bytes(), (copied.parent / name).read_bytes())
+        manifest = json.loads(copied.with_name("rustfs.e2e-startup-cas-build.json").read_text())
+        self.assertEqual(manifest["argv"], ["python3", "scripts/e2e_binary.py", "build", "--bins", "--features", "e2e-test-hooks"])
+        self.assertTrue(manifest["clean_before"] and manifest["clean_after"])
+        body = next(line.removeprefix("        run: ") for line in run_steps["Run e2e full suite"] if line.startswith("        run: "))
+        for status in (0, 23):
+            result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=self.root, env=dict(env, FAKE_TEST_EXIT=str(status)), capture_output=True, text=True)
+            self.assertEqual(result.returncode, status, result.stderr)
+        copied.write_text("replaced preserved binary")
+        result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_distributed_workflow_runs_both_filter_branches_with_receipts(self):
+        from check_test_wiring import yaml_block
+        from test_security_workflow import named_steps, shell_body
+
+        source = (Path(__file__).resolve().parents[1] / ".github/workflows/e2e-distributed.yml").read_text().splitlines()
+        steps = named_steps(yaml_block(source, "distributed", 2))
+        result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", shell_body(steps["Build rustfs binary"])], cwd=self.root, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for selected in ("", "test(distributed::s3_basic)"):
+            for status in (0, 23):
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", shell_body(steps["Run distributed 4-node e2e suite"])], cwd=self.root, env=dict(self.env, FILTER=selected, FAKE_TEST_EXIT=str(status)), capture_output=True, text=True)
+                self.assertEqual(result.returncode, status, result.stderr)
+                argv = json.loads((self.root / "target/nextest-command.json").read_text())
+                self.assertEqual(argv, ["nextest", "run", "--profile", "e2e-distributed", "-p", "e2e_test", *(["-E", selected] if selected else ["--no-tests=fail"])])
 
     def test_target_directory_and_profile_are_explicit(self):
         env = dict(self.env, CARGO_TARGET_DIR="target/custom")

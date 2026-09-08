@@ -15,9 +15,7 @@
 //! Cross-cutting helpers shared by the object use-case modules.
 
 use super::*;
-use crate::app::storage_api::object_usecase::bucket::on_demand_migration::{
-    OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead,
-};
+use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead};
 
 pub(super) const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 
@@ -810,56 +808,7 @@ pub(super) async fn resolve_put_object_expiration(bucket: &str, obj_info: &Objec
     build_put_object_expiration_header(&event)
 }
 
-/// Cadence for the "I/O queue congestion detected" WARN. Under sustained
-/// overload (client concurrency at or above the disk-read permit pool) every
-/// GET observes >=80% utilization, so an unthrottled WARN floods the log
-/// from the already saturated hot path; congestion metrics stay per-request.
-const IO_QUEUE_CONGESTION_WARN_INTERVAL_MS: u64 = 5_000;
-
-/// At-most-one-WARN-per-interval limiter for the I/O queue congestion log.
-/// Callers supply monotonic milliseconds so tests can drive the clock.
-pub(super) struct IoQueueCongestionWarnThrottle {
-    /// Timestamp of the last emitted WARN; `u64::MAX` until the first one.
-    last_warn_ms: AtomicU64,
-    /// Congested requests left unlogged since the last emitted WARN.
-    suppressed: AtomicU64,
-}
-
-impl IoQueueCongestionWarnThrottle {
-    const fn new() -> Self {
-        Self {
-            last_warn_ms: AtomicU64::new(u64::MAX),
-            suppressed: AtomicU64::new(0),
-        }
-    }
-
-    /// Claim the right to emit one WARN. Returns the number of events
-    /// suppressed since the previous emission, or `None` while the interval
-    /// window is still closed (the event is counted, not logged).
-    pub(super) fn claim(&self, now_ms: u64) -> Option<u64> {
-        let last = self.last_warn_ms.load(Ordering::Relaxed);
-        let window_open = last == u64::MAX || now_ms.saturating_sub(last) >= IO_QUEUE_CONGESTION_WARN_INTERVAL_MS;
-        if window_open
-            && self
-                .last_warn_ms
-                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            Some(self.suppressed.swap(0, Ordering::Relaxed))
-        } else {
-            self.suppressed.fetch_add(1, Ordering::Relaxed);
-            None
-        }
-    }
-
-    /// Monotonic milliseconds since the first call, for production callers.
-    pub(super) fn now_ms() -> u64 {
-        static ANCHOR: OnceLock<std::time::Instant> = OnceLock::new();
-        ANCHOR.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
-    }
-}
-
-pub(super) static IO_QUEUE_CONGESTION_WARN_THROTTLE: IoQueueCongestionWarnThrottle = IoQueueCongestionWarnThrottle::new();
+pub(super) static IO_QUEUE_CONGESTION_WARN_THROTTLE: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
 
 pub(super) async fn track_object_read_setup<F>(health: Option<&ObjectTrafficHealth>, future: F) -> F::Output
 where
@@ -992,7 +941,7 @@ pub(crate) fn odm_source_error_response(policy: &PolicyConfig, class: &'static s
 /// Metrics/message label for a bucket whose source client could not be built.
 pub(crate) fn odm_state_error_class(error: &OdmStateError) -> &'static str {
     match error {
-        OdmStateError::AnonymousUnsupported => "unsupported",
+        OdmStateError::AnonymousUnsupported | OdmStateError::BackendNotCompiled(_) => "unsupported",
         OdmStateError::ClientBuild(_) => "client_build",
     }
 }
@@ -1014,11 +963,44 @@ pub(crate) fn mark_on_demand_migration_list_local_only(headers: &mut HeaderMap) 
 /// forwarded to the source: a 304/412 answered by the source would be
 /// indistinguishable from a source failure.
 pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceHead) -> S3Result<()> {
+    let if_match = headers
+        .get(http::header::IF_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    let if_none_match = headers
+        .get(http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    let needs_etag = if_match.is_some_and(|value| value != "*") || if_none_match.is_some_and(|value| value != "*");
+    let needs_mtime = (!headers.contains_key(http::header::IF_MATCH) && headers.contains_key(http::header::IF_UNMODIFIED_SINCE))
+        || (!headers.contains_key(http::header::IF_NONE_MATCH) && headers.contains_key(http::header::IF_MODIFIED_SINCE));
+    if (needs_etag && head.etag.is_none()) || (needs_mtime && head.last_modified.is_none()) {
+        return Err(odm_source_unavailable_error("missing_source_validator"));
+    }
     let info = ObjectInfo {
         etag: head.etag.clone(),
         mod_time: head.last_modified.map(OffsetDateTime::from),
         ..Default::default()
     };
+    // A successful source read establishes wildcard existence, but the
+    // remaining conditions must still run in their ordinary precedence.
+    if head.etag.is_none() && (if_match == Some("*") || if_none_match == Some("*")) {
+        let mut remaining = headers.clone();
+        if if_match == Some("*") {
+            remaining.remove(http::header::IF_MATCH);
+            remaining.remove(http::header::IF_UNMODIFIED_SINCE);
+        }
+        if if_none_match == Some("*") {
+            remaining.remove(http::header::IF_NONE_MATCH);
+            remaining.remove(http::header::IF_MODIFIED_SINCE);
+        }
+        check_preconditions(&remaining, &info)?;
+        return if if_none_match == Some("*") {
+            Err(S3Error::new(S3ErrorCode::NotModified))
+        } else {
+            Ok(())
+        };
+    }
     check_preconditions(headers, &info)
 }
 
@@ -1031,19 +1013,6 @@ mod tests {
         ServerSideEncryptionRule,
     };
     use std::sync::Arc;
-
-    #[test]
-    fn io_queue_congestion_warn_throttle_emits_once_per_interval() {
-        let throttle = IoQueueCongestionWarnThrottle::new();
-        // The first congested request logs immediately.
-        assert_eq!(throttle.claim(0), Some(0));
-        // Requests inside the window are counted, not logged.
-        assert_eq!(throttle.claim(1), None);
-        assert_eq!(throttle.claim(IO_QUEUE_CONGESTION_WARN_INTERVAL_MS - 1), None);
-        // The next emission reports how many stayed silent.
-        assert_eq!(throttle.claim(IO_QUEUE_CONGESTION_WARN_INTERVAL_MS), Some(2));
-        assert_eq!(throttle.claim(IO_QUEUE_CONGESTION_WARN_INTERVAL_MS + 1), None);
-    }
 
     #[test]
     fn parse_expires_header_accepts_http_date() {
@@ -2002,6 +1971,7 @@ mod on_demand_migration_tests {
     #[test]
     fn odm_state_error_class_is_stable() {
         assert_eq!(odm_state_error_class(&OdmStateError::AnonymousUnsupported), "unsupported");
+        assert_eq!(odm_state_error_class(&OdmStateError::BackendNotCompiled("gcs_native")), "unsupported");
         assert_eq!(odm_state_error_class(&OdmStateError::ClientBuild("tls".to_string())), "client_build");
     }
 
@@ -2075,8 +2045,42 @@ mod on_demand_migration_tests {
         .expect_err("modified since an earlier date is 412");
         assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
 
-        // A source without validators cannot fail a precondition.
         let bare = SourceHead::default();
-        assert!(odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "\"other\""), &bare).is_ok());
+        let err =
+            odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "\"other\""), &bare).expect_err("missing ETag");
+        assert_eq!(err.status_code(), Some(http::StatusCode::FAILED_DEPENDENCY));
+        assert!(odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "*"), &bare).is_ok());
+        let err =
+            odm_check_source_preconditions(&headers_with(http::header::IF_NONE_MATCH, "*"), &bare).expect_err("source exists");
+        assert_eq!(err.code(), &S3ErrorCode::NotModified);
+        let dated = SourceHead {
+            last_modified: head.last_modified,
+            ..Default::default()
+        };
+        assert!(odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "*"), &dated).is_ok());
+        let mut combined = headers_with(http::header::IF_NONE_MATCH, "*");
+        combined.insert(http::header::IF_MATCH, HeaderValue::from_static("\"other\""));
+        assert_eq!(
+            odm_check_source_preconditions(&combined, &dated)
+                .expect_err("specific ETag unavailable")
+                .status_code(),
+            Some(http::StatusCode::FAILED_DEPENDENCY)
+        );
+        combined.remove(http::header::IF_MATCH);
+        combined.insert(
+            http::header::IF_UNMODIFIED_SINCE,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(
+            odm_check_source_preconditions(&combined, &dated)
+                .expect_err("unmodified-since fails before none-match")
+                .code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+        for header in [http::header::IF_MODIFIED_SINCE, http::header::IF_UNMODIFIED_SINCE] {
+            let err = odm_check_source_preconditions(&headers_with(header, "Wed, 21 Oct 2015 07:28:00 GMT"), &bare)
+                .expect_err("missing timestamp");
+            assert_eq!(err.status_code(), Some(http::StatusCode::FAILED_DEPENDENCY));
+        }
     }
 }

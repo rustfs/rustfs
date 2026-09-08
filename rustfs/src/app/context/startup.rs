@@ -37,8 +37,8 @@ impl AppContext {
         // also publishes to the process default (first server wins) so legacy
         // free-function readers keep resolving the first server's context.
         let context = Arc::new(AppContext::with_default_interfaces(store, iam, kms_interface));
-        publish_global_app_context(context.clone());
-        let _ = server_ctx.install(context);
+        server_ctx.try_install(context.clone())?;
+        publish_global_app_context(context);
         Ok(())
     }
 }

@@ -327,6 +327,23 @@ fn delete_response_version_id(version_id: Option<Uuid>, synthetic_version_id: bo
     }
 }
 
+fn project_delete_objects_pre_stat_error(
+    object: ObjectToDelete,
+    synthetic_version_id: bool,
+    error: ApiError,
+) -> S3Result<s3s::dto::Error> {
+    // Bucket loss invalidates the shared request, not just one object.
+    if error.code == S3ErrorCode::NoSuchBucket {
+        return Err(error.into());
+    }
+    Ok(s3s::dto::Error {
+        code: Some(error.code.as_str().to_string()),
+        key: Some(object.object_name),
+        message: Some(error.message),
+        version_id: delete_response_version_id(object.version_id, synthetic_version_id),
+    })
+}
+
 /// Version identity for a `DeleteObjects` `<Deleted>` entry (and its
 /// notification). A delete marker removed by version id carries no storage
 /// `version_id` on the committed result, so fall back to the identity the
@@ -577,11 +594,12 @@ impl DefaultObjectUsecase {
             });
         }
 
-        struct AdmittedDelete {
+        struct PreStatDelete {
             idx: usize,
             object: ObjectToDelete,
             versioned: bool,
             version_suspended: bool,
+            error: Option<ApiError>,
         }
 
         // Phase 2 (bounded concurrency, backlog#929 / HP-8): collect the
@@ -590,7 +608,7 @@ impl DefaultObjectUsecase {
         // Lock admission is enforced later in set_disk under the write lock.
         let store_ref = &store;
         let bucket_ref = bucket.as_str();
-        let admitted_deletes: Vec<AdmittedDelete> =
+        let pre_stat_deletes: Vec<PreStatDelete> =
             futures::stream::iter(prepared_deletes.into_iter().map(|prepared| async move {
                 let PreparedDelete {
                     idx,
@@ -599,35 +617,49 @@ impl DefaultObjectUsecase {
                     skip_stat,
                 } = prepared;
                 let synthetic_version_id = object.version_id.is_none() && is_dir_object(&object.object_name);
-                if !skip_stat {
-                    match store_ref.get_object_info(bucket_ref, &object.object_name, &opts).await {
-                        Ok(_) => {}
-                        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
-                        Err(err) => return Err(ApiError::from(err)),
+                let error = if skip_stat {
+                    None
+                } else {
+                    match store_ref
+                        .get_object_info_for_delete(bucket_ref, &object.object_name, &opts)
+                        .await
+                    {
+                        Ok(_) => None,
+                        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => None,
+                        Err(err) => Some(ApiError::from(err)),
                     }
-                }
+                };
 
                 if synthetic_version_id {
                     object.version_id = Some(Uuid::nil());
                 }
 
-                Ok::<_, ApiError>(AdmittedDelete {
+                PreStatDelete {
                     idx,
                     object,
                     versioned: opts.versioned,
                     version_suspended: opts.version_suspended,
-                })
+                    error,
+                }
             }))
             .buffered(DELETE_OBJECTS_PRE_STAT_CONCURRENCY)
-            .try_collect()
-            .await?;
+            .collect()
+            .await;
 
         // Phase 3 (serial): apply outcomes in the original request order so
         // per-key success/failure reporting is unchanged.
         let mut object_to_delete = Vec::new();
         let mut object_to_delete_idx = Vec::new();
         let mut object_versioning = Vec::new();
-        for admitted in admitted_deletes {
+        for admitted in pre_stat_deletes {
+            if let Some(error) = admitted.error {
+                delete_results[admitted.idx].error = Some(project_delete_objects_pre_stat_error(
+                    admitted.object,
+                    delete_results[admitted.idx].synthetic_version_id,
+                    error,
+                )?);
+                continue;
+            }
             object_to_delete_idx.push(admitted.idx);
             object_versioning.push((admitted.versioned, admitted.version_suspended));
             object_to_delete.push(admitted.object);
@@ -904,7 +936,7 @@ impl DefaultObjectUsecase {
         let mut force_delete_intent = None;
 
         let get_opts = opts.clone();
-        let existing_object_info = match store.get_object_info(&bucket, &key, &get_opts).await {
+        let existing_object_info = match store.get_object_info_for_delete(&bucket, &key, &get_opts).await {
             Ok(obj_info) => Some(obj_info),
             Err(err) => {
                 // If object not found, allow deletion to proceed (will return 204 No Content)
@@ -1143,7 +1175,7 @@ impl DefaultObjectUsecase {
         let manager = get_capacity_manager();
         manager.record_write_operation().await;
         let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        rustfs_scanner::record_dirty_usage_object(&bucket, &key);
         result
     }
 }
@@ -1158,6 +1190,428 @@ mod tests {
         ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, SourceSelectionCriteria,
     };
     use std::sync::Arc;
+
+    #[test]
+    #[serial_test::serial]
+    fn execute_delete_marker_versions_in_single_and_multi_pool() {
+        crate::app::gating_test_env::run_large_stack_test("delete-marker-api", || async {
+            use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+            let single_pool = crate::app::gating_test_env::shared_gating_ecstore().await;
+            if current_app_context().is_none() {
+                crate::app::runtime_sources::install_test_app_context(Arc::clone(&single_pool)).await;
+            }
+            let ambient = current_app_context().expect("delete API test context");
+            let (_temp_dir, _disk_paths, multi_pool) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            for (pool_count, store) in [(2, multi_pool), (1, single_pool)] {
+                let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+                let usecase = DefaultObjectUsecase::with_context(Some(context));
+                for (suspended, batch) in [(false, false), (false, true), (true, false), (true, true)] {
+                    let bucket = format!("delete-marker-api-{pool_count}-{}", Uuid::new_v4());
+                    store
+                        .make_bucket(
+                            &bucket,
+                            &MakeBucketOptions {
+                                versioning_enabled: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("create versioned API fixture");
+                    let key = if batch { "batch" } else { "single" };
+                    let payload = b"historical payload must survive marker removal";
+                    let mut reader = PutObjReader::from_vec(payload.to_vec());
+                    let original = store
+                        .put_object(
+                            &bucket,
+                            key,
+                            &mut reader,
+                            &ObjectOptions {
+                                versioned: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("write historical version");
+                    if suspended {
+                        store
+                            .update_bucket_metadata_config(
+                                &bucket,
+                                crate::app::storage_api::test::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+                                b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+                            )
+                            .await
+                            .expect("suspend versioning after writing the historical UUID version");
+                    }
+                    let marker = store
+                        .delete_object(
+                            &bucket,
+                            key,
+                            ObjectOptions {
+                                versioned: !suspended,
+                                version_suspended: suspended,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("create marker");
+                    assert!(marker.delete_marker);
+                    let marker_id = delete_response_version_id(marker.version_id, false).expect("marker has a version identity");
+                    assert_eq!(marker_id == "null", suspended);
+                    let get = GetObjectInput::builder()
+                        .bucket(bucket.clone())
+                        .key(key.to_string())
+                        .version_id(Some(marker_id.clone()))
+                        .build()
+                        .unwrap();
+                    let get_err = Box::pin(usecase.execute_get_object(build_request(get, Method::GET)))
+                        .await
+                        .expect_err("GET of a marker remains forbidden");
+                    assert_eq!(get_err.code(), &S3ErrorCode::MethodNotAllowed);
+                    let head = HeadObjectInput::builder()
+                        .bucket(bucket.clone())
+                        .key(key.to_string())
+                        .version_id(Some(marker_id.clone()))
+                        .build()
+                        .unwrap();
+                    let head_err = Box::pin(usecase.execute_head_object(build_request(head, Method::HEAD)))
+                        .await
+                        .expect_err("HEAD of a marker remains forbidden");
+                    assert_eq!(head_err.code(), &S3ErrorCode::MethodNotAllowed);
+
+                    if batch {
+                        let mut req = build_request(
+                            DeleteObjectsInput::builder()
+                                .bucket(bucket.clone())
+                                .delete(Delete {
+                                    objects: vec![ObjectIdentifier {
+                                        key: key.to_string(),
+                                        version_id: Some(marker_id.clone()),
+                                        ..Default::default()
+                                    }],
+                                    quiet: None,
+                                })
+                                .build()
+                                .unwrap(),
+                            Method::POST,
+                        );
+                        req.extensions.insert(crate::storage::access::ReqInfo {
+                            cred: Some(rustfs_credentials::Credentials::default()),
+                            is_owner: true,
+                            ..Default::default()
+                        });
+                        let response = Box::pin(usecase.execute_delete_objects(req))
+                            .await
+                            .expect("batch marker delete must reach the authoritative mutation");
+                        assert!(response.output.errors.as_ref().is_none_or(Vec::is_empty), "{:?}", response.output.errors);
+                        let deleted = response.output.deleted.expect("batch deleted entries");
+                        assert_eq!(deleted.len(), 1);
+                        assert_eq!(deleted[0].version_id.as_deref(), Some(marker_id.as_str()));
+                        assert_eq!(deleted[0].delete_marker, Some(true));
+                    } else {
+                        let mut req = build_request(
+                            DeleteObjectInput::builder()
+                                .bucket(bucket.clone())
+                                .key(key.to_string())
+                                .version_id(Some(marker_id.clone()))
+                                .build()
+                                .unwrap(),
+                            Method::DELETE,
+                        );
+                        req.extensions.insert(crate::storage::access::ReqInfo {
+                            cred: Some(rustfs_credentials::Credentials::default()),
+                            is_owner: true,
+                            ..Default::default()
+                        });
+                        let response = Box::pin(usecase.execute_delete_object(req))
+                            .await
+                            .expect("single marker delete must reach the authoritative mutation");
+                        assert_eq!(response.output.version_id.as_deref(), Some(marker_id.as_str()));
+                        assert_eq!(response.output.delete_marker, Some(true));
+                    }
+                    let remaining = store
+                        .get_object_info(
+                            &bucket,
+                            key,
+                            &ObjectOptions {
+                                versioned: !suspended,
+                                version_suspended: suspended,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("historical version is current after removing the marker");
+                    assert_eq!(remaining.version_id, original.version_id);
+                    assert!(!remaining.delete_marker);
+                    assert_eq!(remaining.size, payload.len() as i64);
+                    let removed = GetObjectInput::builder()
+                        .bucket(bucket.clone())
+                        .key(key.to_string())
+                        .version_id(Some(marker_id))
+                        .build()
+                        .unwrap();
+                    let missing = Box::pin(usecase.execute_get_object(build_request(removed, Method::GET)))
+                        .await
+                        .expect_err("the marker version must actually be gone");
+                    assert_eq!(
+                        missing.code(),
+                        &if pool_count == 1 {
+                            S3ErrorCode::NoSuchKey
+                        } else {
+                            S3ErrorCode::NoSuchVersion
+                        },
+                        "pool_count={pool_count} suspended={suspended} batch={batch}: removed marker lookup returned {missing:?}"
+                    );
+                    let get = GetObjectInput::builder()
+                        .bucket(bucket.clone())
+                        .key(key.to_string())
+                        .build()
+                        .unwrap();
+                    let response = Box::pin(usecase.execute_get_object(build_request(get, Method::GET)))
+                        .await
+                        .expect("GET restores the historical payload");
+                    let mut body = response.output.body.expect("GET body");
+                    let mut actual = Vec::new();
+                    while let Some(chunk) = body.next().await {
+                        actual.extend_from_slice(&chunk.expect("historical data remains readable"));
+                    }
+                    assert_eq!(actual, payload);
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn execute_delete_marker_batch_isolates_pre_stat_errors_and_retention() {
+        crate::app::gating_test_env::run_large_stack_test("delete-marker-batch-errors", || async {
+            use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            let shared = crate::app::gating_test_env::shared_gating_ecstore().await;
+            if current_app_context().is_none() {
+                crate::app::runtime_sources::install_test_app_context(shared).await;
+            }
+            let ambient = current_app_context().expect("delete API test context");
+            let (_temp_dir, disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+            let usecase = DefaultObjectUsecase::with_context(Some(context));
+            let bucket = format!("delete-marker-batch-errors-{}", Uuid::new_v4());
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        lock_enabled: true,
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create locked versioned bucket");
+            let mut objects = Vec::new();
+            for key in ["damaged", "healthy", "retained"] {
+                let mut user_defined = HashMap::new();
+                if key == "retained" {
+                    user_defined.insert("x-amz-object-lock-mode".to_string(), "COMPLIANCE".to_string());
+                    user_defined.insert(
+                        "x-amz-object-lock-retain-until-date".to_string(),
+                        (time::OffsetDateTime::now_utc() + time::Duration::days(30))
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap(),
+                    );
+                }
+                let mut reader = PutObjReader::from_vec(b"must not silently disappear".to_vec());
+                let original = store
+                    .put_object(
+                        &bucket,
+                        key,
+                        &mut reader,
+                        &ObjectOptions {
+                            versioned: true,
+                            user_defined,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("write batch fixture");
+                objects.push(ObjectIdentifier {
+                    key: key.to_string(),
+                    version_id: original.version_id.map(|id| id.to_string()),
+                    ..Default::default()
+                });
+            }
+            let marker = store
+                .delete_object(
+                    &bucket,
+                    "marker",
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create explicit marker fixture");
+            objects.push(ObjectIdentifier {
+                key: "marker".to_string(),
+                version_id: marker.version_id.map(|id| id.to_string()),
+                ..Default::default()
+            });
+            objects.push(ObjectIdentifier {
+                key: "invalid-version".to_string(),
+                version_id: Some("not-a-uuid".to_string()),
+                ..Default::default()
+            });
+            let retained_id = objects[2].version_id.clone();
+            let all_pre_stat_failures = vec![objects[0].clone(), objects[4].clone()];
+            let mut corrupted = 0;
+            for path in disk_paths.iter().flatten() {
+                let metadata = path.join(&bucket).join("damaged").join("xl.meta");
+                if metadata.is_file() {
+                    tokio::fs::write(metadata, b"invalid xl metadata")
+                        .await
+                        .expect("corrupt only this test object's metadata");
+                    corrupted += 1;
+                }
+            }
+            assert!(corrupted >= 3, "the corrupt-metadata failure must cover read quorum");
+            let mut req = build_request(
+                DeleteObjectsInput::builder()
+                    .bucket(bucket.clone())
+                    .delete(Delete { objects, quiet: None })
+                    .build()
+                    .unwrap(),
+                Method::POST,
+            );
+            req.extensions.insert(crate::storage::access::ReqInfo {
+                cred: Some(rustfs_credentials::Credentials::default()),
+                is_owner: true,
+                ..Default::default()
+            });
+            let response = Box::pin(usecase.execute_delete_objects(req))
+                .await
+                .expect("a pre-stat failure must not abort independent batch entries");
+            let deleted = response.output.deleted.expect("per-key successes");
+            assert_eq!(
+                deleted.iter().map(|item| item.key.as_deref().unwrap()).collect::<Vec<_>>(),
+                vec!["healthy", "marker"]
+            );
+            let errors = response.output.errors.expect("per-key errors");
+            assert_eq!(
+                errors.iter().map(|item| item.key.as_deref().unwrap()).collect::<Vec<_>>(),
+                vec!["damaged", "retained", "invalid-version"]
+            );
+            assert_eq!(errors[0].code.as_deref(), Some("InternalError"));
+            assert_eq!(errors[0].message.as_deref(), Some("File is corrupted"));
+            assert_eq!(errors[1].code.as_deref(), Some("AccessDenied"));
+            assert_eq!(errors[2].code.as_deref(), Some("NoSuchVersion"));
+            for quiet in [false, true] {
+                let mut req = build_request(
+                    DeleteObjectsInput::builder()
+                        .bucket(bucket.clone())
+                        .delete(Delete {
+                            objects: all_pre_stat_failures.clone(),
+                            quiet: Some(quiet),
+                        })
+                        .build()
+                        .unwrap(),
+                    Method::POST,
+                );
+                req.extensions.insert(crate::storage::access::ReqInfo {
+                    cred: Some(rustfs_credentials::Credentials::default()),
+                    is_owner: true,
+                    ..Default::default()
+                });
+                let response = Box::pin(usecase.execute_delete_objects(req))
+                    .await
+                    .expect("all pre-stat failures still produce per-key results");
+                assert!(response.output.deleted.as_ref().is_none_or(Vec::is_empty));
+                let errors = response.output.errors.expect("quiet mode must not suppress errors");
+                assert_eq!(
+                    errors.iter().map(|item| item.key.as_deref().unwrap()).collect::<Vec<_>>(),
+                    vec!["damaged", "invalid-version"]
+                );
+                assert_eq!(errors[0].code.as_deref(), Some("InternalError"));
+                assert_eq!(errors[0].version_id, all_pre_stat_failures[0].version_id);
+                assert_eq!(errors[1].code.as_deref(), Some("NoSuchVersion"));
+            }
+            let mut req = build_request(
+                DeleteObjectInput::builder()
+                    .bucket(bucket.clone())
+                    .key("retained".to_string())
+                    .version_id(retained_id.clone())
+                    .build()
+                    .unwrap(),
+                Method::DELETE,
+            );
+            req.extensions.insert(crate::storage::access::ReqInfo {
+                cred: Some(rustfs_credentials::Credentials::default()),
+                is_owner: true,
+                ..Default::default()
+            });
+            let error = Box::pin(usecase.execute_delete_object(req))
+                .await
+                .expect_err("single delete must also retain Object Lock protection");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            store
+                .get_object_info(
+                    &bucket,
+                    "retained",
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: retained_id,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("both rejected deletes preserve the retained version");
+            for key in ["healthy", "marker"] {
+                let error = store
+                    .get_object_info(
+                        &bucket,
+                        key,
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect_err("successful entries must actually be removed");
+                assert!(is_err_object_not_found(&error) || is_err_version_not_found(&error));
+            }
+        });
+    }
+
+    #[test]
+    fn delete_objects_pre_stat_error_preserves_request_scope_and_version_identity() {
+        let error = project_delete_objects_pre_stat_error(
+            ObjectToDelete::default(),
+            false,
+            ApiError::from(StorageError::BucketNotFound("missing".to_string())),
+        )
+        .expect_err("shared bucket loss remains a request failure");
+        assert_eq!(error.code(), &S3ErrorCode::NoSuchBucket);
+
+        let version = Uuid::new_v4();
+        for (version_id, synthetic, expected) in [
+            (Some(version), false, Some(version.to_string())),
+            (Some(Uuid::nil()), false, Some("null".to_string())),
+            (Some(Uuid::nil()), true, None),
+            (None, false, None),
+        ] {
+            let error = project_delete_objects_pre_stat_error(
+                ObjectToDelete {
+                    object_name: "damaged".to_string(),
+                    version_id,
+                    ..Default::default()
+                },
+                synthetic,
+                ApiError::from(StorageError::FileCorrupt),
+            )
+            .expect("metadata corruption belongs to the addressed entry");
+            assert_eq!(error.code.as_deref(), Some("InternalError"));
+            assert_eq!(error.message.as_deref(), Some("File is corrupted"));
+            assert_eq!(error.key.as_deref(), Some("damaged"));
+            assert_eq!(error.version_id, expected);
+        }
+    }
 
     #[test]
     fn delete_response_version_id_preserves_null_and_synthetic_semantics() {

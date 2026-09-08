@@ -26,7 +26,6 @@ use crate::{
     transition_api::{CreateBucketConfiguration, LocationConstraint, TransitionClient},
 };
 use http::Request;
-use http_body_util::BodyExt;
 use hyper::StatusCode;
 use hyper::body::Body;
 use hyper::body::Bytes;
@@ -86,7 +85,7 @@ impl TransitionClient {
         let req = self.get_bucket_location_request(bucket_name)?;
 
         let mut resp = self.doit(req).await?;
-        location = process_bucket_location_response(resp, bucket_name, &self.tier_type).await?;
+        location = process_bucket_location_response(self, resp, bucket_name, &self.tier_type).await?;
         {
             if let Ok(mut bucket_loc_cache) = self.bucket_loc_cache.lock() {
                 bucket_loc_cache.set(bucket_name, &location);
@@ -198,6 +197,7 @@ impl TransitionClient {
 }
 
 async fn process_bucket_location_response(
+    client: &TransitionClient,
     mut resp: http::Response<Incoming>,
     bucket_name: &str,
     tier_type: &str,
@@ -237,14 +237,9 @@ async fn process_bucket_location_response(
     }
     //}
 
-    let mut body_vec = Vec::new();
-    let mut body = resp.into_body();
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        if let Some(data) = frame.data_ref() {
-            body_vec.extend_from_slice(data);
-        }
-    }
+    let body_vec = client
+        .collect_response_body(resp.into_body(), MAX_S3_CLIENT_RESPONSE_SIZE)
+        .await?;
     let mut location = "".to_string();
     if tier_type == "huaweicloud" {
         if let Ok(body_str) = String::from_utf8(body_vec) {

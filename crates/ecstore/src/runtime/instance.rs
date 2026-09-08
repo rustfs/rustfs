@@ -75,7 +75,23 @@ pub(crate) const SCANNER_PUBLICATION_LEASE_TTL: std::time::Duration = std::time:
 pub(crate) struct ScannerPublicationLeaseEntry {
     pub(crate) expires_at: Instant,
     pub(crate) movement_generation: u64,
+    pub(crate) namespace_generation: u64,
     pub(crate) _operation_guard: OwnedRwLockReadGuard<()>,
+}
+
+pub(crate) struct NamespaceCommitGuard {
+    ctx: Arc<InstanceContext>,
+    counted: bool,
+}
+
+impl Drop for NamespaceCommitGuard {
+    fn drop(&mut self) {
+        if self.counted {
+            // Publish the new generation before a zero-pending publication probe.
+            self.ctx.advance_namespace_commit_generation();
+            self.ctx.namespace_commits.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 /// Runtime state owned by a single `ECStore` instance.
@@ -209,9 +225,13 @@ pub struct InstanceContext {
     /// Last storage-owned movement snapshot observed under the operation
     /// gate. SetDisks cache writers fail closed until ECStore refreshes it.
     scanner_publication_state: AtomicU8,
+    namespace_commits: AtomicU64,
+    namespace_commit_generation: AtomicU64,
     /// Resolves object-encryption material at the application boundary.
     object_encryption_resolver: OnceLock<Arc<dyn ObjectEncryptionResolver>>,
     tier_delete_journal_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
+    #[cfg(test)]
+    suppress_tier_delete_journal_recovery: bool,
     transition_transaction_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
     tier_delete_journal_recovery_wakeup: tokio::sync::Notify,
 }
@@ -256,8 +276,12 @@ impl InstanceContext {
             data_movement_generation_exhausted: AtomicBool::new(false),
             data_movement_generation_notify: Arc::new(Notify::new()),
             scanner_publication_state: AtomicU8::new(SCANNER_PUBLICATION_STATE_UNKNOWN),
+            namespace_commits: AtomicU64::new(0),
+            namespace_commit_generation: AtomicU64::new(0),
             object_encryption_resolver: OnceLock::new(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            suppress_tier_delete_journal_recovery: false,
             transition_transaction_recovery_stores: std::sync::Mutex::new(HashSet::new()),
             tier_delete_journal_recovery_wakeup: tokio::sync::Notify::new(),
         }
@@ -282,6 +306,7 @@ impl InstanceContext {
         token: Uuid,
         expires_at: Instant,
         movement_generation: u64,
+        namespace_generation: u64,
         operation_guard: OwnedRwLockReadGuard<()>,
     ) -> bool {
         let mut leases = self.scanner_publication_leases.lock().await;
@@ -293,6 +318,7 @@ impl InstanceContext {
             ScannerPublicationLeaseEntry {
                 expires_at,
                 movement_generation,
+                namespace_generation,
                 _operation_guard: operation_guard,
             },
         );
@@ -303,39 +329,21 @@ impl InstanceContext {
         self.scanner_publication_leases.lock().await.remove(&token).is_some()
     }
 
-    /// Check a lease token while the caller holds the movement read guard.
-    ///
-    /// The token table is deliberately process-owned and non-persistent: a
-    /// restarted instance has no entries from the previous process, so an old
-    /// coordinator proof cannot become valid again merely because the
-    /// movement generation counter restarted at zero.
-    pub(crate) async fn scanner_publication_lease_is_active(&self, token: Uuid) -> bool {
+    /// Return both generations from the same live lease while the caller holds
+    /// the movement read guard. Namespace commits do not take that guard, so
+    /// the caller must compare the saved namespace generation after this await.
+    /// The process-owned table rejects tokens from a prior instance or expiry.
+    pub(crate) async fn scanner_publication_lease_generations(&self, token: Uuid) -> Option<(u64, u64)> {
         let mut leases = self.scanner_publication_leases.lock().await;
         let now = Instant::now();
-        let Some(expires_at) = leases.get(&token).map(|entry| entry.expires_at) else {
-            return false;
-        };
-        if expires_at <= now {
-            leases.remove(&token);
-            return false;
-        }
-        true
-    }
-
-    /// Return the generation bound to a live lease.  The lease entry owns the
-    /// movement read guard, so a successful lookup remains valid for the
-    /// caller's guard-protected operation; expiry is still fail-closed.
-    pub(crate) async fn scanner_publication_lease_generation(&self, token: Uuid) -> Option<u64> {
-        let mut leases = self.scanner_publication_leases.lock().await;
-        let now = Instant::now();
-        let (expires_at, movement_generation) = leases
+        let (expires_at, movement_generation, namespace_generation) = leases
             .get(&token)
-            .map(|entry| (entry.expires_at, entry.movement_generation))?;
+            .map(|entry| (entry.expires_at, entry.movement_generation, entry.namespace_generation))?;
         if expires_at <= now {
             leases.remove(&token);
             return None;
         }
-        Some(movement_generation)
+        Some((movement_generation, namespace_generation))
     }
 
     pub(crate) async fn expire_scanner_publication_lease(&self, token: Uuid, expires_at: Instant) {
@@ -383,6 +391,36 @@ impl InstanceContext {
         !self.data_movement_operation_epoch_exhausted()
             && !self.data_movement_generation_exhausted()
             && self.scanner_publication_state.load(Ordering::Acquire) == SCANNER_PUBLICATION_STATE_ALLOWED
+    }
+
+    pub(crate) fn begin_namespace_commit(self: &Arc<Self>) -> Arc<NamespaceCommitGuard> {
+        let counted = self
+            .namespace_commits
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_add(1))
+            .is_ok();
+        if counted {
+            self.advance_namespace_commit_generation();
+        } else {
+            self.namespace_commit_generation.store(u64::MAX, Ordering::Release);
+        }
+        Arc::new(NamespaceCommitGuard {
+            ctx: Arc::clone(self),
+            counted,
+        })
+    }
+
+    fn advance_namespace_commit_generation(&self) {
+        let _ = self
+            .namespace_commit_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| Some(generation.saturating_add(1)));
+    }
+
+    pub(crate) fn namespace_commit_generation(&self) -> u64 {
+        self.namespace_commit_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn namespace_commits_pending(&self) -> bool {
+        self.namespace_commits.load(Ordering::Acquire) != 0 || self.namespace_commit_generation() == u64::MAX
     }
 
     pub(crate) fn set_scanner_publication_state(&self, blocked: bool) {
@@ -461,6 +499,11 @@ impl InstanceContext {
             .store(epoch == u64::MAX, Ordering::Release);
         self.scanner_publication_state
             .store(SCANNER_PUBLICATION_STATE_UNKNOWN, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_namespace_commit_generation_for_test(&self, generation: u64) {
+        self.namespace_commit_generation.store(generation, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -640,10 +683,19 @@ impl InstanceContext {
     }
 
     pub(crate) fn mark_tier_delete_journal_recovery_started(&self, store_id: Uuid) -> bool {
+        #[cfg(test)]
+        if self.suppress_tier_delete_journal_recovery {
+            return false;
+        }
         self.tier_delete_journal_recovery_stores
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(store_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn suppress_tier_delete_journal_recovery_for_test(&mut self) {
+        self.suppress_tier_delete_journal_recovery = true;
     }
 
     pub(crate) fn mark_transition_transaction_recovery_started(&self, store_id: Uuid) -> bool {
@@ -755,6 +807,70 @@ pub fn bootstrap_ctx() -> Arc<InstanceContext> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_commit_guards_are_instance_local_and_count_until_last_owner() {
+        let first = Arc::new(InstanceContext::new());
+        let other = Arc::new(InstanceContext::new());
+        first.set_scanner_publication_state(false);
+        other.set_scanner_publication_state(false);
+        assert!(first.scanner_publication_state_allowed());
+        let one = first.begin_namespace_commit();
+        let shared_owner = Arc::clone(&one);
+        let two = first.begin_namespace_commit();
+        assert!(first.namespace_commits_pending());
+        assert!(first.scanner_publication_state_allowed(), "pending writes must not block scan admission");
+        assert_eq!(first.namespace_commit_generation(), 2);
+        assert!(!other.namespace_commits_pending());
+        assert_eq!(other.namespace_commit_generation(), 0);
+        assert!(other.scanner_publication_state_allowed());
+        drop(one);
+        assert_eq!(first.namespace_commit_generation(), 2);
+        drop(shared_owner);
+        assert!(first.namespace_commits_pending());
+        assert_eq!(first.namespace_commit_generation(), 3);
+        drop(two);
+        assert!(!first.namespace_commits_pending());
+        assert_eq!(first.namespace_commit_generation(), 4);
+        assert!(first.scanner_publication_state_allowed());
+    }
+
+    #[test]
+    fn namespace_commit_counter_exhaustion_keeps_publication_blocked() {
+        for (count, generation) in [(0, u64::MAX - 1), (u64::MAX, 0)] {
+            let ctx = Arc::new(InstanceContext::new());
+            ctx.set_scanner_publication_state(false);
+            ctx.namespace_commits.store(count, Ordering::Release);
+            ctx.namespace_commit_generation.store(generation, Ordering::Release);
+            let guard = ctx.begin_namespace_commit();
+            assert!(ctx.namespace_commits_pending());
+            assert_eq!(ctx.namespace_commit_generation(), u64::MAX);
+            drop(guard);
+            assert!(ctx.namespace_commits_pending());
+            assert_eq!(ctx.namespace_commit_generation(), u64::MAX);
+            assert_eq!(ctx.namespace_commits.load(Ordering::Acquire), count);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scanner_lease_generations_remain_bound_until_expiry() {
+        let ctx = Arc::new(InstanceContext::new());
+        let token = Uuid::new_v4();
+        let gate = ctx.data_movement_operation_gate();
+        let permit = gate.clone().read_owned().await;
+        assert!(
+            ctx.install_scanner_publication_lease(token, Instant::now() + SCANNER_PUBLICATION_LEASE_TTL, 7, 11, permit)
+                .await
+        );
+        drop(ctx.begin_namespace_commit());
+        assert_eq!(ctx.namespace_commit_generation(), 2);
+        assert_eq!(ctx.scanner_publication_lease_generations(token).await, Some((7, 11)));
+        assert!(gate.clone().try_write_owned().is_err(), "lookup must retain the stored permit");
+        tokio::time::advance(SCANNER_PUBLICATION_LEASE_TTL).await;
+        assert_eq!(ctx.scanner_publication_lease_generations(token).await, None);
+        assert!(!ctx.remove_scanner_publication_lease(token).await);
+        assert!(gate.try_write_owned().is_ok(), "expiry releases the stored permit");
+    }
 
     // The SetupType inputs must derive the exact (is_erasure,
     // is_dist_erasure, is_erasure_sd) triples that the original three
@@ -1073,6 +1189,12 @@ mod tests {
         assert!(!ctx_a.mark_tier_delete_journal_recovery_started(store_a));
         assert!(ctx_a.mark_tier_delete_journal_recovery_started(store_b));
         assert!(ctx_b.mark_tier_delete_journal_recovery_started(store_a));
+
+        let mut manual_ctx = InstanceContext::new();
+        manual_ctx.suppress_tier_delete_journal_recovery_for_test();
+        assert!(!manual_ctx.mark_tier_delete_journal_recovery_started(store_a));
+        assert!(!manual_ctx.mark_tier_delete_journal_recovery_started(store_b));
+        assert!(ctx_b.mark_tier_delete_journal_recovery_started(store_b));
     }
 
     #[test]

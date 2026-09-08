@@ -316,10 +316,15 @@ async fn can_skip_hidden_prefix_check(options: &ListPathOptions) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether an empty listing of `prefix` is the proof that lets the caller
+/// reclaim delete residue under it. Any first page that scanned the whole
+/// prefix without finding an object or a sub-prefix qualifies, with or without
+/// a delimiter: that is the shape clients issue when they stat, browse, or
+/// recursively remove a phantom folder. The purge itself re-verifies every
+/// directory on every disk before deleting anything.
 fn should_purge_empty_directory_listing(
     prefix: &str,
     marker: Option<&str>,
-    delimiter: Option<&str>,
     max_keys: i32,
     incl_deleted: bool,
     result: &ListObjectsInfo,
@@ -327,8 +332,7 @@ fn should_purge_empty_directory_listing(
     !prefix.is_empty()
         && prefix.ends_with(SLASH_SEPARATOR)
         && marker.is_none()
-        && delimiter.is_none_or(str::is_empty)
-        && max_keys == 1
+        && max_keys > 0
         && !incl_deleted
         && !result.is_truncated
         && result.objects.is_empty()
@@ -3847,16 +3851,10 @@ impl ECStore {
                 .list_objects_from_opt_in_key_only_provider(&opts, mode, max_keys, incl_deleted)
                 .await?
         {
-            if should_purge_empty_directory_listing(
-                prefix,
-                opts.marker.as_deref(),
-                delimiter.as_deref(),
-                max_keys,
-                incl_deleted,
-                &result,
-            ) && has_authoritative_never_versioned_state_in(&self.ctx, bucket)
-                .await
-                .unwrap_or(false)
+            if should_purge_empty_directory_listing(prefix, opts.marker.as_deref(), max_keys, incl_deleted, &result)
+                && has_authoritative_never_versioned_state_in(&self.ctx, bucket)
+                    .await
+                    .unwrap_or(false)
             {
                 self.purge_orphan_dir_object(bucket, prefix).await;
             }
@@ -3943,16 +3941,10 @@ impl ECStore {
             objects,
             prefixes,
         };
-        if should_purge_empty_directory_listing(
-            prefix,
-            opts.marker.as_deref(),
-            delimiter.as_deref(),
-            max_keys,
-            incl_deleted,
-            &result,
-        ) && has_authoritative_never_versioned_state_in(&self.ctx, bucket)
-            .await
-            .unwrap_or(false)
+        if should_purge_empty_directory_listing(prefix, opts.marker.as_deref(), max_keys, incl_deleted, &result)
+            && has_authoritative_never_versioned_state_in(&self.ctx, bucket)
+                .await
+                .unwrap_or(false)
         {
             self.purge_orphan_dir_object(bucket, prefix).await;
         }
@@ -8843,26 +8835,28 @@ mod test {
     }
 
     #[test]
-    fn empty_directory_listing_purge_requires_complete_exact_recursive_request() {
+    fn empty_directory_listing_purge_requires_complete_first_page_of_prefix() {
         let empty = ListObjectsInfo::default();
-        assert!(should_purge_empty_directory_listing("ghost/", None, None, 1, false, &empty));
-        assert!(should_purge_empty_directory_listing("ghost/", None, Some(""), 1, false, &empty));
-        assert!(!should_purge_empty_directory_listing("ghost", None, None, 1, false, &empty));
-        assert!(!should_purge_empty_directory_listing("ghost/", Some("marker"), None, 1, false, &empty));
-        assert!(!should_purge_empty_directory_listing("ghost/", None, Some("/"), 1, false, &empty));
-        assert!(!should_purge_empty_directory_listing("ghost/", None, None, 0, false, &empty));
-        assert!(!should_purge_empty_directory_listing("ghost/", None, None, 2, false, &empty));
-        assert!(!should_purge_empty_directory_listing("ghost/", None, None, 1, true, &empty));
+        assert!(should_purge_empty_directory_listing("ghost/", None, 1, false, &empty));
+        assert!(should_purge_empty_directory_listing("ghost/", None, 1000, false, &empty));
+        assert!(!should_purge_empty_directory_listing("ghost", None, 1, false, &empty));
+        assert!(!should_purge_empty_directory_listing("ghost/", Some("marker"), 1, false, &empty));
+        assert!(!should_purge_empty_directory_listing("ghost/", None, 0, false, &empty));
+        assert!(!should_purge_empty_directory_listing("ghost/", None, 1, true, &empty));
 
         let mut live = ListObjectsInfo::default();
         live.objects.push(ObjectInfo::default());
-        assert!(!should_purge_empty_directory_listing("ghost/", None, None, 1, false, &live));
+        assert!(!should_purge_empty_directory_listing("ghost/", None, 1, false, &live));
+
+        let mut prefixed = ListObjectsInfo::default();
+        prefixed.prefixes.push("ghost/child/".to_owned());
+        assert!(!should_purge_empty_directory_listing("ghost/", None, 1, false, &prefixed));
 
         let truncated = ListObjectsInfo {
             is_truncated: true,
             ..Default::default()
         };
-        assert!(!should_purge_empty_directory_listing("ghost/", None, None, 1, false, &truncated));
+        assert!(!should_purge_empty_directory_listing("ghost/", None, 1, false, &truncated));
     }
 
     #[tokio::test]
@@ -8912,6 +8906,59 @@ mod test {
             assert!(
                 !dir.path().join(bucket).join("ghost").exists(),
                 "the empty listing should reclaim its committed delete residue"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_delimiter_listing_hides_and_purges_committed_delete_residue() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "listing-purge-delimiter-bucket";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created with authoritative metadata");
+        let data_dir = uuid::Uuid::new_v4();
+        let transaction = uuid::Uuid::new_v4();
+        for dir in &dirs {
+            let residue = dir
+                .path()
+                .join(bucket)
+                .join("metrics")
+                .join("2026")
+                .join("object.parquet")
+                .join(data_dir.to_string());
+            tokio::fs::create_dir_all(&residue)
+                .await
+                .expect("committed delete residue should be created");
+            tokio::fs::write(residue.join("part.1"), b"stale")
+                .await
+                .expect("stale part should be written");
+            tokio::fs::write(
+                residue.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+                [],
+            )
+            .await
+            .expect("committed delete marker should be written");
+        }
+
+        // The object directory holds only a deleted version's data dir, so a
+        // console-style browse of its parent must not show it as a folder.
+        let result = store
+            .clone()
+            .list_objects_generic(bucket, "metrics/2026/", None, Some("/".to_owned()), 1000, false)
+            .await
+            .expect("delimiter listing should succeed");
+        assert!(result.objects.is_empty());
+        assert!(result.prefixes.is_empty(), "delete residue must not surface as a prefix");
+        for dir in &dirs {
+            assert!(
+                !dir.path().join(bucket).join("metrics").join("2026").exists(),
+                "the empty delimiter listing should reclaim the committed delete residue under it"
             );
         }
     }

@@ -14,6 +14,7 @@
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
+#[allow(clippy::module_inception, reason = "preserve the public services::tier::tier path")]
 pub mod tier;
 pub mod tier_admin;
 pub mod tier_config;
@@ -25,6 +26,7 @@ pub(crate) mod tier_probe_intent;
 pub mod warm_backend;
 pub mod warm_backend_aliyun;
 pub mod warm_backend_azure;
+#[cfg(feature = "gcs")]
 pub mod warm_backend_gcs;
 pub mod warm_backend_huaweicloud;
 pub mod warm_backend_minio;

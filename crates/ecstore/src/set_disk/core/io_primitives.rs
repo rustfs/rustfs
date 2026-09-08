@@ -111,10 +111,11 @@ use crate::disk::{
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::ShardReader;
 use crate::io_support::bitrot::{
-    BitrotReaderStageMetrics, DeferredReaderStripeHandle, adjust_shard_read_params,
-    create_bitrot_reader_from_bytes_with_stage_metrics, create_deferred_bitrot_reader_with_stripe_handle,
-    object_mmap_read_max_length,
+    BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_from_bytes_with_stage_metrics,
+    create_deferred_bitrot_reader_with_stripe_handle,
 };
+#[cfg(unix)]
+use crate::io_support::bitrot::{adjust_shard_read_params, object_mmap_read_max_length};
 use crate::set_disk::runtime_sources;
 use crate::set_disk::shard_source::ShardReadCost;
 use crate::storage_api_contracts::object::ObjectOperations;
@@ -3558,6 +3559,11 @@ impl RenameRollbackReceipt {
     }
 }
 
+struct RenameRollbackOwnership {
+    receipt: Option<RenameRollbackReceipt>,
+    namespace_commit_guard: Option<Arc<crate::runtime::instance::NamespaceCommitGuard>>,
+}
+
 async fn inspect_incomplete_rename_rollback(
     disks: &[Option<DiskStore>],
     bucket: &str,
@@ -3604,8 +3610,12 @@ async fn rollback_failed_rename(
     dispatch_states: &[RenameDispatchState],
     rollback_dirs: &[Option<Uuid>],
     dst: (&str, &str),
-    receipt: Option<RenameRollbackReceipt>,
+    ownership: RenameRollbackOwnership,
 ) {
+    let RenameRollbackOwnership {
+        receipt,
+        namespace_commit_guard,
+    } = ownership;
     let owned_disks = disks.to_vec();
     let owned_errs = errs.to_vec();
     let owned_dispatch_states = dispatch_states.to_vec();
@@ -3651,27 +3661,32 @@ async fn rollback_failed_rename(
             let fi = std::mem::take(&mut file_infos[disk_index]);
             let bucket = bucket.to_string();
             let object = object.to_string();
+            let disk_namespace_commit_guard = namespace_commit_guard.clone();
             let task = tokio::spawn(async move {
+                let _namespace_commit_guard = disk_namespace_commit_guard.clone();
                 #[allow(clippy::let_unit_value)]
                 let _task_guard = SetDisks::rename_fanout_task_guard(&object);
                 SetDisks::rename_fanout_barrier(&object, disk_index, rename_fanout_barrier_phase::ROLLBACK).await;
                 #[cfg(test)]
                 rollback_fault_injection::before_undo(&object, disk_index)?;
-                disk.delete_version(
+                disk.undo_write_with_namespace_owner(
                     &bucket,
                     &object,
                     fi,
-                    false,
                     DeleteOptions {
                         undo_write: true,
                         old_data_dir: rollback_dir,
                         ..Default::default()
                     },
+                    disk_namespace_commit_guard.map(|owner| owner as Arc<dyn Send + Sync>),
                 )
                 .await
             });
             tasks.push(async move { (disk_index, task.await) });
         }
+        #[cfg(test)]
+        rollback_fault_injection::after_undo_dispatch(object);
+        let _namespace_commit_guard = namespace_commit_guard;
         for (disk_index, result) in join_all(tasks).await {
             outcomes[disk_index].outcome = rename_rollback_task_outcome(result);
         }
@@ -3778,6 +3793,7 @@ pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
     write_quorum: usize,
     scanner_publication_lease_tokens: Option<&'a HashMap<String, Uuid>>,
     scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
+    namespace_commit_guard: Option<Arc<crate::runtime::instance::NamespaceCommitGuard>>,
     rollback_receipt: Option<RenameRollbackReceipt>,
 }
 
@@ -3790,6 +3806,7 @@ impl<'a> RenameDataFenceOptions<'a> {
             write_quorum,
             scanner_publication_lease_tokens,
             scanner_publication_commit_scope: None,
+            namespace_commit_guard: None,
             rollback_receipt: None,
         }
     }
@@ -3804,6 +3821,14 @@ impl<'a> RenameDataFenceOptions<'a> {
         scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
     ) -> Self {
         self.scanner_publication_commit_scope = scanner_publication_commit_scope;
+        self
+    }
+
+    pub(in crate::set_disk) fn with_namespace_commit_guard(
+        mut self,
+        namespace_commit_guard: Option<Arc<crate::runtime::instance::NamespaceCommitGuard>>,
+    ) -> Self {
+        self.namespace_commit_guard = namespace_commit_guard;
         self
     }
 }
@@ -4164,6 +4189,7 @@ impl SetDisks {
             write_quorum,
             scanner_publication_lease_tokens,
             scanner_publication_commit_scope: _scanner_publication_commit_scope,
+            namespace_commit_guard,
             rollback_receipt,
         } = fence_options;
         if let Some(file_info) = disks
@@ -4210,7 +4236,9 @@ impl SetDisks {
                     let dst_object = fanout_dst_object.clone();
                     let file_info = file_info.clone();
                     let successful_rename_completion_rank = successful_rename_completion_rank.clone();
+                    let namespace_commit_guard = namespace_commit_guard.clone();
                     tasks.spawn(async move {
+                        let _namespace_commit_guard = namespace_commit_guard.clone();
                         let mut dispatch_state = RenameDispatchState::NotDispatched;
                         let result = std::panic::AssertUnwindSafe(async {
                             #[allow(clippy::let_unit_value)]
@@ -4245,7 +4273,13 @@ impl SetDisks {
                                     &file_info,
                                     &dst_bucket,
                                     &dst_object,
-                                    scanner_publication_lease_token,
+                                    crate::disk::RenameDataGuards {
+                                        scanner_publication_lease_token,
+                                        namespace_owner: namespace_commit_guard
+                                            .clone()
+                                            .map(|owner| owner as Arc<dyn Send + Sync>),
+                                        ..Default::default()
+                                    },
                                 )
                                 .await;
                             let rejected_before_publication = observed.rejected_before_publication();
@@ -4372,7 +4406,10 @@ impl SetDisks {
                         &dispatch_states,
                         &data_dirs,
                         (&fanout_dst_bucket, &fanout_dst_object),
-                        rollback_receipt,
+                        RenameRollbackOwnership {
+                            receipt: rollback_receipt,
+                            namespace_commit_guard,
+                        },
                     )
                     .await;
                     if let Some(commit_tx) = commit_tx.take() {
@@ -4528,6 +4565,7 @@ impl SetDisks {
             write_quorum,
             scanner_publication_lease_tokens,
             scanner_publication_commit_scope,
+            namespace_commit_guard,
             rollback_receipt,
         } = fence_options;
         if let Some(file_info) = disks
@@ -4561,6 +4599,7 @@ impl SetDisks {
         let fanout_dst_bucket = dst_bucket.clone();
         let fanout_dst_object = dst_object.clone();
         let fanout_publication_scope = scanner_publication_commit_scope.clone();
+        let fanout_namespace_commit_guard = namespace_commit_guard.clone();
         // Keep one coordinator task so a cancelled caller cannot drop partially
         // completed disk mutations. Per-disk futures stay ordered in `join_all`,
         // preserving slot-indexed quorum and convergence accounting without a
@@ -4569,6 +4608,7 @@ impl SetDisks {
             // Keep the storage-owned movement permit attached to the actual
             // fan-out owner, even if the caller future is cancelled.
             let _fanout_publication_scope = fanout_publication_scope;
+            let _namespace_commit_guard = fanout_namespace_commit_guard.clone();
             let successful_rename_completion_rank =
                 rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
             let futures = fanout_disks
@@ -4583,6 +4623,7 @@ impl SetDisks {
                     let dst_bucket = fanout_dst_bucket.clone();
                     let successful_rename_completion_rank = successful_rename_completion_rank.clone();
                     let publication_scope = scanner_publication_commit_scope.clone();
+                    let namespace_commit_guard = fanout_namespace_commit_guard.clone();
 
                     async move {
                         let mut dispatch_state = RenameDispatchState::NotDispatched;
@@ -4635,7 +4676,13 @@ impl SetDisks {
                                     file_info,
                                     &dst_bucket,
                                     &dst_object,
-                                    scanner_publication_lease_token,
+                                    crate::disk::RenameDataGuards {
+                                        scanner_publication_lease_token,
+                                        namespace_owner: namespace_commit_guard
+                                            .clone()
+                                            .map(|owner| owner as Arc<dyn Send + Sync>),
+                                        ..Default::default()
+                                    },
                                 )
                                 .await;
                             let rejected_before_publication = observed.rejected_before_publication();
@@ -4790,7 +4837,10 @@ impl SetDisks {
                 &dispatch_states,
                 &data_dirs,
                 (&dst_bucket, &dst_object),
-                rollback_receipt,
+                RenameRollbackOwnership {
+                    receipt: rollback_receipt,
+                    namespace_commit_guard,
+                },
             )
             .await;
             return Err(ret_err);
@@ -6503,9 +6553,9 @@ impl SetDisks {
         match oi {
             Ok(oi) => {
                 // Ordinary writes may proceed past a top-level delete marker;
-                // data movement must not replace an acknowledged deletion.
+                // data movement and guarded internal writes must preserve it.
                 if oi.delete_marker {
-                    return opts.data_movement.then_some(StorageError::PreconditionFailed);
+                    return (opts.data_movement || opts.preserve_delete_marker).then_some(StorageError::PreconditionFailed);
                 }
                 let if_none_match = http_preconditions.if_none_match_value().map(str::to_owned);
                 let if_match = http_preconditions.if_match_value().map(str::to_owned);
@@ -6754,6 +6804,7 @@ pub(in crate::set_disk) mod rollback_fault_injection {
         VolumeNotFoundAfterRename,
         PanicAfterRename,
         CoordinatorPanic,
+        RollbackCoordinatorPanic,
     }
 
     fn registry() -> &'static Mutex<HashMap<String, (usize, Fault)>> {
@@ -6814,6 +6865,17 @@ pub(in crate::set_disk) mod rollback_fault_injection {
             .copied();
         if matches!(fault, Some((_, Fault::CoordinatorPanic))) {
             panic!("injected rename coordinator panic");
+        }
+    }
+
+    pub(super) fn after_undo_dispatch(object: &str) {
+        let fault = registry()
+            .lock()
+            .expect("rollback registry should not poison")
+            .get(object)
+            .copied();
+        if matches!(fault, Some((_, Fault::RollbackCoordinatorPanic))) {
+            panic!("injected rollback coordinator panic");
         }
     }
 }
@@ -6977,7 +7039,7 @@ pub(crate) mod rename_fanout_barrier {
     use tokio::sync::Notify;
 
     pub use super::rename_fanout_barrier_phase::{
-        CLEANUP as PHASE_CLEANUP, READ_VERSION as PHASE_READ_VERSION, RENAME as PHASE_RENAME,
+        CLEANUP as PHASE_CLEANUP, READ_VERSION as PHASE_READ_VERSION, RENAME as PHASE_RENAME, ROLLBACK as PHASE_ROLLBACK,
     };
 
     /// One armed barrier: the fan-out task matching `(disk_index, phase)` pauses.
@@ -10811,82 +10873,532 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
-    #[serial_test::serial(capacity_dirty_scope)]
-    async fn rename_rollback_incomplete_receipt_waits_for_undo_barrier() {
-        for cancel_caller in [false, true] {
-            let bucket = "rename-rollback-barrier";
-            let object = if cancel_caller {
-                "rollback-barrier-cancelled"
-            } else {
-                "rollback-barrier-object"
-            };
-            let (dirs, disks) = call_counter_local_disks(bucket, 4).await;
-            prepare_rename_source_dirs(&dirs, &disks, "source").await;
-            let mut old = metadata_test_fileinfo(object);
-            old.mod_time = Some(OffsetDateTime::now_utc());
-            old.data = Some(Bytes::from_static(b"old-inline-body"));
-            old.set_inline_data();
-            old.metadata.insert("etag".to_string(), "old-etag".to_string());
-            for disk in disks.iter().flatten() {
-                disk.write_metadata(bucket, bucket, object, old.clone())
-                    .await
-                    .expect("old metadata should be staged");
-            }
-            let _rename_fault = rename_fault_injection::fail_rename_on(object, &[2, 3]);
-            let _undo_fault = rollback_fault_injection::arm(object, 0, rollback_fault_injection::Fault::Io);
-            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier_phase::ROLLBACK);
-            let receipt = RenameRollbackReceipt::default();
-            let mut rename = Box::pin(SetDisks::rename_data_owned_with_fence(
-                &disks,
-                (RUSTFS_META_TMP_BUCKET, "source"),
-                rename_commit_fileinfos(object, 4, "new-etag"),
-                (bucket, object),
-                false,
-                RenameDataFenceOptions::new(3, None).with_rollback_receipt(receipt.clone()),
-            ));
-            tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
-                tokio::select! {
-                    () = barrier.wait_until_paused() => {}
-                    _ = rename.as_mut() => panic!("rename returned before the armed rollback barrier"),
+    #[cfg(not(windows))]
+    async fn assert_namespace_owner_survives_physical_publication_timeout(allow_early_ack: bool) {
+        use crate::disk::os;
+        use futures::FutureExt;
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60")),
+                (ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true")),
+            ],
+            async {
+                const DISKS: usize = 4;
+                let bucket = "namespace-physical-tail";
+                let object = "inline-overwrite";
+                let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+                prepare_rename_source_dirs(&dirs, &disks, "source").await;
+                let mut old = metadata_test_fileinfo(object);
+                old.mod_time = Some(OffsetDateTime::now_utc());
+                old.size = 15;
+                old.parts.clear();
+                old.add_object_part(1, "old-etag".to_string(), 15, None, 15, None, None);
+                old.data = Some(Bytes::from_static(b"old-inline-body"));
+                old.set_inline_data();
+                old.metadata.insert("etag".to_string(), "old-etag".to_string());
+                let mut infos = rename_commit_fileinfos(object, DISKS, "new-etag");
+                let mut hooks = Vec::new();
+                let mut entered = Vec::new();
+                let mut releases = Vec::new();
+                let mut publication_paths = Vec::new();
+                for (disk, info) in disks.iter().flatten().zip(&mut infos) {
+                    disk.write_metadata(bucket, bucket, object, old.clone())
+                        .await
+                        .expect("the old inline version must be readable before overwrite");
+                    info.size = 11;
+                    info.parts.clear();
+                    info.add_object_part(1, "new-etag".to_string(), 11, None, 11, None, None);
+                    let crate::disk::Disk::Local(local) = disk.as_ref() else {
+                        panic!("physical publication fixture requires local disks");
+                    };
+                    // Linux IO paths use a mount FD, which is also the namespace lock key.
+                    let destination = local
+                        .get_disk()
+                        .get_object_path_for_io(bucket, object)
+                        .expect("the publication path must resolve through the disk's mount lease");
+                    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                    hooks.push(os::prepared_publication_test_hooks::install(
+                        &destination.join(STORAGE_FORMAT_FILE),
+                        move || {
+                            let _ = entered_tx.send(());
+                            // Sender drop also releases the syscall when an earlier assertion fails.
+                            let _ = release_rx.recv();
+                        },
+                    ));
+                    entered.push(entered_rx);
+                    releases.push(release_tx);
+                    publication_paths.push(destination);
                 }
-            })
-            .await
-            .expect("undo must reach its disk barrier");
-            assert!(receipt.0.get().is_none(), "pending undo must not be recorded as success");
-            if cancel_caller {
-                drop(rename);
-                barrier.release();
-                tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
-                    while receipt.0.get().is_none() {
+                let namespace_owner = ctx.begin_namespace_commit();
+                let namespace_probe = Arc::downgrade(&namespace_owner);
+                let receipt = RenameRollbackReceipt::default();
+                let mut rename = Box::pin(SetDisks::rename_data_owned_with_fence(
+                    &disks,
+                    (RUSTFS_META_TMP_BUCKET, "source"),
+                    infos,
+                    (bucket, object),
+                    allow_early_ack,
+                    RenameDataFenceOptions::new(3, None)
+                        .with_rollback_receipt(receipt.clone())
+                        .with_namespace_commit_guard(Some(namespace_owner)),
+                ));
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::select! {
+                        signals = join_all(entered) => {
+                            assert!(signals.into_iter().all(|signal| signal.is_ok()), "all physical publishers must enter");
+                        }
+                        _ = rename.as_mut() => panic!("rename must not finish before physical publication is paused"),
+                    }
+                })
+                .await
+                .expect("all four prepared metadata renames must reach their blocking syscall");
+                assert!(ctx.namespace_commits_pending());
+                assert_eq!(ctx.namespace_commit_generation(), 1);
+
+                // Every wrapper timer exists before advancing; the physical closures stay blocked.
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(61)).await;
+                tokio::time::resume();
+                let result = tokio::time::timeout(Duration::from_secs(5), rename)
+                    .await
+                    .expect("ordinary disk timeout must not wait for the physical rename");
+                assert!(result.is_err(), "four timed-out disks cannot satisfy write quorum");
+                let report = receipt.0.get().expect("failed fanout must finish rollback accounting");
+                assert_eq!(report.disks.len(), DISKS);
+                assert!(
+                    report
+                        .disks
+                        .iter()
+                        .all(|disk| matches!(disk.outcome, RenameRollbackOutcome::Indeterminate(DiskError::Timeout)))
+                );
+                let pending_before_release = ctx.namespace_commits_pending();
+                let owner_alive_before_release = namespace_probe.upgrade().is_some();
+                let old_snapshot_generation = ctx.namespace_commit_generation();
+                for (disk, destination) in disks.iter().flatten().zip(&publication_paths) {
+                    let root = disk.path();
+                    assert!(
+                        os::acquire_rename_data_mutation_lease(&root, bucket, destination)
+                            .now_or_never()
+                            .is_none(),
+                        "the physical publication must still own object serialization after the async timeout"
+                    );
+                    assert!(
+                        root.join(RUSTFS_META_TMP_BUCKET)
+                            .join("source")
+                            .join(STORAGE_FORMAT_FILE)
+                            .exists()
+                    );
+                    let stored = disk
+                        .read_version(
+                            "",
+                            bucket,
+                            object,
+                            "",
+                            &ReadOptions {
+                                read_data: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("a scanner can still read the complete old metadata while publication is paused");
+                    assert_eq!(stored.size, 15);
+                    assert_eq!(stored.data.as_deref(), Some(b"old-inline-body".as_slice()));
+                }
+                assert_eq!(ctx.namespace_commit_generation(), old_snapshot_generation);
+
+                // Drain real syscalls before checking the regression, including on the RED run.
+                drop(releases);
+                for (disk, destination) in disks.iter().flatten().zip(&publication_paths) {
+                    let root = disk.path();
+                    let lease = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        os::acquire_rename_data_mutation_lease(&root, bucket, destination),
+                    )
+                    .await
+                    .expect("released physical publishers must drain");
+                    drop(lease);
+                }
+                for dir in &dirs {
+                    let reopened = reopen_local_disk(dir).await;
+                    let stored = reopened
+                        .read_version(
+                            "",
+                            bucket,
+                            object,
+                            "",
+                            &ReadOptions {
+                                read_data: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("the detached prepared rename must actually publish after timeout");
+                    assert_eq!(stored.size, 11);
+                    assert_eq!(stored.data.as_deref(), Some(b"inline-body".as_slice()));
+                }
+                // The lease releases its locks before dropping the namespace owner, and the
+                // owner's `Drop` runs after its `Weak` probe stops upgrading, so wait for the
+                // pending counter itself instead of asserting it right after the drain.
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while ctx.namespace_commits_pending() || namespace_probe.upgrade().is_some() {
                         tokio::task::yield_now().await;
                     }
                 })
                 .await
-                .expect("cancelled caller must not cancel rollback accounting");
-            } else {
-                barrier.release();
-                assert!(rename.await.is_err());
-            }
-            assert!(receipt.is_incomplete(), "drained undo failure must survive in the receipt");
-            for dir in dirs.iter().skip(1) {
-                let reopened = reopen_local_disk(dir).await;
-                let restored = reopened
-                    .read_version(
-                        "",
-                        bucket,
-                        object,
-                        "",
-                        &ReadOptions {
-                            read_data: true,
-                            ..Default::default()
-                        },
+                .expect("released physical publishers must release namespace ownership");
+                let generation_after_publication = ctx.namespace_commit_generation();
+                assert!(!ctx.namespace_commits_pending());
+                assert!(namespace_probe.upgrade().is_none());
+                assert!(receipt.is_incomplete(), "late publication must not erase failed-write recovery evidence");
+                assert!(
+                    pending_before_release && owner_alive_before_release,
+                    "physical publication outlived namespace accounting: early_ack={allow_early_ack}, \
+                     pending={pending_before_release}, owner_alive={owner_alive_before_release}, \
+                     old_snapshot_generation={old_snapshot_generation}, after_late_publication={generation_after_publication}"
+                );
+                assert!(
+                    generation_after_publication > old_snapshot_generation,
+                    "physical completion must invalidate the scanner's old metadata snapshot"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn rename_full_wait_timeout_keeps_namespace_owner_until_physical_publication() {
+        assert_namespace_owner_survives_physical_publication_timeout(false).await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn rename_early_ack_timeout_keeps_namespace_owner_until_physical_publication() {
+        assert_namespace_owner_survives_physical_publication_timeout(true).await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn successful_rename_ack_keeps_physical_tail_owner_after_caller_cancellation() {
+        use crate::disk::os;
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60")),
+                (ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true")),
+            ],
+            async {
+                let bucket = "physical-ack-tail";
+                let object = "ack-object";
+                let (dirs, disks) = call_counter_local_disks(bucket, 4).await;
+                prepare_rename_source_dirs(&dirs, &disks, "source").await;
+                let mut infos = rename_commit_fileinfos(object, 4, "new-etag");
+                for info in &mut infos {
+                    info.size = 11;
+                    info.parts.clear();
+                    info.add_object_part(1, "new-etag".to_string(), 11, None, 11, None, None);
+                }
+                let disk = disks[3].as_ref().expect("tail disk");
+                let crate::disk::Disk::Local(local) = disk.as_ref() else {
+                    panic!("local fixture");
+                };
+                let destination = local.get_disk().get_object_path_for_io(bucket, object).expect("tail IO path");
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                let _hook = os::prepared_publication_test_hooks::install(&destination.join(STORAGE_FORMAT_FILE), move || {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                });
+                let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                let owner = ctx.begin_namespace_commit();
+                let owner_probe = Arc::downgrade(&owner);
+                let receipt = RenameRollbackReceipt::default();
+                let caller_receipt = receipt.clone();
+                let caller_disks = disks.clone();
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                let caller = tokio::spawn(async move {
+                    let commit = SetDisks::rename_data_owned_with_fence(
+                        &caller_disks,
+                        (RUSTFS_META_TMP_BUCKET, "source"),
+                        infos,
+                        (bucket, object),
+                        true,
+                        RenameDataFenceOptions::new(3, None)
+                            .with_namespace_commit_guard(Some(owner))
+                            .with_rollback_receipt(caller_receipt),
                     )
                     .await
-                    .expect("old version must remain readable after caller cancellation");
-                assert_eq!(restored.data.as_deref(), Some(b"old-inline-body".as_slice()));
+                    .expect("three real disk publications must produce a successful ACK");
+                    assert!(ack_tx.send(commit).is_ok(), "deliver successful ACK");
+                    std::future::pending::<()>().await;
+                });
+                let mut commit = tokio::time::timeout(Duration::from_secs(10), async {
+                    entered_rx.await.expect("physical tail entry");
+                    ack_rx
+                        .await
+                        .expect("ACK must arrive while the fourth disk is physically paused")
+                })
+                .await
+                .expect("successful quorum ACK must not wait for its physical tail");
+                assert_eq!(commit.online_disks.iter().flatten().count(), 3);
+                assert!(!destination.join(STORAGE_FORMAT_FILE).exists(), "tail has not published at ACK");
+                let tail_drain = commit.tail_drain.take().expect("early ACK transfers a real tail handle");
+                drop(commit);
+                caller.abort();
+                assert!(caller.await.expect_err("cancel caller after it delivered ACK").is_cancelled());
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(61)).await;
+                tokio::time::resume();
+                let tail = tokio::time::timeout(Duration::from_secs(5), tail_drain)
+                    .await
+                    .expect("ordinary tail timeout stays bounded after ACK")
+                    .expect("tail owner must not panic")
+                    .expect("successful ACK keeps its convergence result");
+                assert_eq!(tail.convergence, RenameConvergence::PartialCommit);
+                assert!(receipt.0.get().is_none(), "an acknowledged write must never enter rollback");
+                let pending = ctx.namespace_commits_pending();
+                let alive = owner_probe.upgrade().is_some();
+                let generation = ctx.namespace_commit_generation();
+                for disk in disks.iter().flatten().take(3) {
+                    let stored = disk
+                        .read_version(
+                            "",
+                            bucket,
+                            object,
+                            "",
+                            &ReadOptions {
+                                read_data: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("all ACK voters keep the new object after caller cancellation");
+                    assert_eq!(stored.data.as_deref(), Some(b"inline-body".as_slice()));
+                }
+                drop(release_tx);
+                let lease = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    os::acquire_rename_data_mutation_lease(&disk.path(), bucket, &destination),
+                )
+                .await
+                .expect("late physical tail drains");
+                drop(lease);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while ctx.namespace_commits_pending() || owner_probe.upgrade().is_some() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("late physical tail must release namespace ownership");
+                for dir in &dirs {
+                    let stored = reopen_local_disk(dir)
+                        .await
+                        .read_version(
+                            "",
+                            bucket,
+                            object,
+                            "",
+                            &ReadOptions {
+                                read_data: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("successful ACK remains committed on every disk after late publication");
+                    assert_eq!(stored.data.as_deref(), Some(b"inline-body".as_slice()));
+                }
+                assert!(
+                    pending && alive,
+                    "physical ACK tail must retain namespace ownership after the coordinator exits"
+                );
+                assert!(!ctx.namespace_commits_pending());
+                assert!(owner_probe.upgrade().is_none());
+                assert!(ctx.namespace_commit_generation() > generation);
+                assert!(receipt.0.get().is_none(), "late publication cannot change success into rollback");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn rename_rollback_incomplete_receipt_waits_for_undo_barrier() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            for (allow_early_ack, cancel_caller, object) in [
+                (false, false, "rollback-barrier-object"),
+                (false, true, "rollback-barrier-cancelled"),
+                (true, false, "rollback-barrier-early-object"),
+                (true, true, "rollback-barrier-early-cancelled"),
+            ] {
+                let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                let bucket = "rename-rollback-barrier";
+                let (dirs, disks) = call_counter_local_disks(bucket, 4).await;
+                prepare_rename_source_dirs(&dirs, &disks, "source").await;
+                let mut old = metadata_test_fileinfo(object);
+                old.mod_time = Some(OffsetDateTime::now_utc());
+                old.data = Some(Bytes::from_static(b"old-inline-body"));
+                old.set_inline_data();
+                old.metadata.insert("etag".to_string(), "old-etag".to_string());
+                for disk in disks.iter().flatten() {
+                    disk.write_metadata(bucket, bucket, object, old.clone())
+                        .await
+                        .expect("old metadata should be staged");
+                }
+                let _rename_fault = rename_fault_injection::fail_rename_on(object, &[2, 3]);
+                let _undo_fault = rollback_fault_injection::arm(object, 0, rollback_fault_injection::Fault::Io);
+                let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier_phase::ROLLBACK);
+                let receipt = RenameRollbackReceipt::default();
+                let mut rename = Box::pin(SetDisks::rename_data_owned_with_fence(
+                    &disks,
+                    (RUSTFS_META_TMP_BUCKET, "source"),
+                    rename_commit_fileinfos(object, 4, "new-etag"),
+                    (bucket, object),
+                    allow_early_ack,
+                    RenameDataFenceOptions::new(3, None)
+                        .with_rollback_receipt(receipt.clone())
+                        .with_namespace_commit_guard(Some(ctx.begin_namespace_commit())),
+                ));
+                tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                    tokio::select! {
+                        () = barrier.wait_until_paused() => {}
+                        _ = rename.as_mut() => panic!("rename returned before the armed rollback barrier"),
+                    }
+                })
+                .await
+                .expect("undo must reach its disk barrier");
+                assert!(receipt.0.get().is_none(), "pending undo must not be recorded as success");
+                assert!(ctx.namespace_commits_pending());
+                assert_eq!(ctx.namespace_commit_generation(), 1);
+                if cancel_caller {
+                    drop(rename);
+                    assert!(ctx.namespace_commits_pending(), "caller cancellation must not retire pending undo work");
+                    assert_eq!(ctx.namespace_commit_generation(), 1);
+                    barrier.release();
+                    tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                        while receipt.0.get().is_none() || ctx.namespace_commits_pending() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("cancelled caller must not cancel rollback accounting");
+                } else {
+                    barrier.release();
+                    assert!(rename.await.is_err());
+                }
+                assert!(
+                    !ctx.namespace_commits_pending(),
+                    "the completed rollback must release its namespace ownership"
+                );
+                assert_eq!(ctx.namespace_commit_generation(), 2);
+                assert!(receipt.is_incomplete(), "drained undo failure must survive in the receipt");
+                for dir in dirs.iter().skip(1) {
+                    let reopened = reopen_local_disk(dir).await;
+                    let restored = reopened
+                        .read_version(
+                            "",
+                            bucket,
+                            object,
+                            "",
+                            &ReadOptions {
+                                read_data: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("old version must remain readable after caller cancellation");
+                    assert_eq!(restored.data.as_deref(), Some(b"old-inline-body".as_slice()));
+                }
             }
-        }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn rename_rollback_children_keep_namespace_ownership_after_coordinator_panic() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            for (allow_early_ack, object) in [
+                (false, "rollback-coordinator-panic"),
+                (true, "rollback-coordinator-panic-early"),
+            ] {
+                let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                let bucket = "rename-rollback-coordinator-panic";
+                let (dirs, disks) = call_counter_local_disks(bucket, 4).await;
+                prepare_rename_source_dirs(&dirs, &disks, "source").await;
+                let mut old = metadata_test_fileinfo(object);
+                old.mod_time = Some(OffsetDateTime::now_utc());
+                old.data = Some(Bytes::from_static(b"old-inline-body"));
+                old.set_inline_data();
+                old.metadata.insert("etag".to_string(), "old-etag".to_string());
+                for disk in disks.iter().flatten() {
+                    disk.write_metadata(bucket, bucket, object, old.clone())
+                        .await
+                        .expect("old metadata should be staged");
+                }
+                let _rename_fault = rename_fault_injection::fail_rename_on(object, &[2, 3]);
+                let _rollback_fault =
+                    rollback_fault_injection::arm(object, 0, rollback_fault_injection::Fault::RollbackCoordinatorPanic);
+                let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier_phase::ROLLBACK);
+                let receipt = RenameRollbackReceipt::default();
+                let result = tokio::time::timeout(
+                    BARRIER_PAUSE_GUARD,
+                    SetDisks::rename_data_owned_with_fence(
+                        &disks,
+                        (RUSTFS_META_TMP_BUCKET, "source"),
+                        rename_commit_fileinfos(object, 4, "new-etag"),
+                        (bucket, object),
+                        allow_early_ack,
+                        RenameDataFenceOptions::new(3, None)
+                            .with_rollback_receipt(receipt.clone())
+                            .with_namespace_commit_guard(Some(ctx.begin_namespace_commit())),
+                    ),
+                )
+                .await
+                .expect("coordinator failure must return without waiting for detached undo tasks");
+                assert!(result.is_err());
+                tokio::time::timeout(BARRIER_PAUSE_GUARD, barrier.wait_until_paused())
+                    .await
+                    .expect("detached undo must reach its disk barrier");
+                assert!(
+                    receipt.is_incomplete(),
+                    "coordinator failure must preserve indeterminate recovery evidence"
+                );
+                assert!(ctx.namespace_commits_pending(), "the paused child must retain namespace ownership");
+                assert_eq!(ctx.namespace_commit_generation(), 1);
+                barrier.release();
+                tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                    while ctx.namespace_commits_pending() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("completed undo children must release their namespace ownership");
+                assert_eq!(ctx.namespace_commit_generation(), 2);
+                for dir in &dirs {
+                    let reopened = reopen_local_disk(dir).await;
+                    let restored = reopened
+                        .read_version(
+                            "",
+                            bucket,
+                            object,
+                            "",
+                            &ReadOptions {
+                                read_data: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("old version must remain readable after rollback coordinator failure");
+                    assert_eq!(restored.data.as_deref(), Some(b"old-inline-body".as_slice()));
+                }
+            }
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -11001,9 +11513,35 @@ mod tests {
         let mut file_infos = rename_commit_fileinfos(object, DISKS, "fresh-rollback-etag");
         file_infos[3] = FileInfo::default();
 
-        SetDisks::rename_data(&disks, RUSTFS_META_TMP_BUCKET, "source", &file_infos, bucket, object, 4)
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        ctx.set_scanner_publication_state(false);
+        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_ROLLBACK);
+        let rename = SetDisks::rename_data_owned_with_fence(
+            &disks,
+            (RUSTFS_META_TMP_BUCKET, "source"),
+            file_infos,
+            (bucket, object),
+            false,
+            RenameDataFenceOptions::new(4, None).with_namespace_commit_guard(Some(ctx.begin_namespace_commit())),
+        );
+        let control = async {
+            barrier.wait_until_paused().await;
+            assert!(ctx.namespace_commits_pending(), "rollback must retain namespace publication ownership");
+            assert!(ctx.scanner_publication_state_allowed(), "rollback must not disable namespace walks");
+            assert_eq!(ctx.namespace_commit_generation(), 1);
+            barrier.release();
+        };
+        let (result, ()) = tokio::time::timeout(BARRIER_PAUSE_GUARD, async { tokio::join!(rename, control) })
             .await
-            .expect_err("three successful disks must fail a strict write quorum of four");
+            .expect("rename rollback must reach its barrier and finish after release");
+        assert_eq!(
+            result.err(),
+            Some(DiskError::ErasureWriteQuorum),
+            "three successful disks must fail a strict write quorum of four"
+        );
+        assert!(!ctx.namespace_commits_pending());
+        assert!(ctx.scanner_publication_state_allowed());
+        assert_eq!(ctx.namespace_commit_generation(), 2);
 
         for (idx, dir) in dirs.iter().enumerate() {
             let reopened = reopen_local_disk(dir).await;

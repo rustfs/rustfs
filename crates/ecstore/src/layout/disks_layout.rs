@@ -25,6 +25,20 @@ pub(crate) const MAX_ERASURE_SET_DRIVE_COUNT: usize = 16;
 const SET_SIZES: [usize; 15] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, MAX_ERASURE_SET_DRIVE_COUNT];
 const ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT: &str = "RUSTFS_ERASURE_SET_DRIVE_COUNT";
 
+#[derive(Debug, thiserror::Error)]
+enum PoolDriveCountError {
+    #[error(
+        "Incorrect number of endpoints provided, size {size}; an erasure pool requires at least {} drive endpoints on one or more nodes; for a standalone single-drive deployment, use a single local path without ellipses",
+        SET_SIZES[0]
+    )]
+    BelowMinimum { size: usize },
+    #[error(
+        "Incorrect number of endpoints provided, size {size}; {}={set_drive_count} requires at least {set_drive_count} drive endpoints per pool",
+        ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT
+    )]
+    BelowSetWidth { size: usize, set_drive_count: usize },
+}
+
 #[derive(Deserialize, Debug, Default)]
 pub struct PoolDisksLayout {
     cmd_line: String,
@@ -132,7 +146,7 @@ impl DisksLayout {
         for arg in args.iter() {
             if !has_ellipses(&[arg]) && args.len() > 1 {
                 return Err(Error::other(
-                    "all args must have ellipses for pool expansion (Invalid arguments specified)",
+                    "all args must have ellipses for pool expansion (Invalid arguments specified); each pool must expand to at least 2 drive endpoints on one or more nodes; a single-drive pool cannot be added to a multi-pool deployment",
                 ));
             }
 
@@ -396,9 +410,11 @@ fn get_set_indexes<T: AsRef<str>>(
     }
 
     for &size in total_sizes {
-        // Check if total_sizes has minimum range upto set_size
-        if size < SET_SIZES[0] || size < set_drive_count {
-            return Err(Error::other(format!("Incorrect number of endpoints provided, size {size}")));
+        if size < SET_SIZES[0] {
+            return Err(Error::other(PoolDriveCountError::BelowMinimum { size }));
+        }
+        if size < set_drive_count {
+            return Err(Error::other(PoolDriveCountError::BelowSetWidth { size, set_drive_count }));
         }
     }
 
@@ -707,7 +723,7 @@ mod test {
                 arg: "http://rustfs{2...3}/export/set{1...0}",
                 ..Default::default()
             },
-            // Range cannot be smaller than 4 minimum.
+            // Ranges must use three dots.
             TestCase {
                 num: 4,
                 arg: "/export{1..2}",
@@ -927,10 +943,145 @@ mod test {
     }
 
     #[test]
+    fn pool_expansion_accepts_single_node_multi_drive_pools() {
+        temp_env::with_var(ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, Some("0"), || {
+            for (volumes, drives) in [
+                (["http://node1:9000/data{1...2}", "http://node2:9000/data{1...2}"], 2),
+                (["http://node1:9000/data{1...4}", "http://node2:9000/data{1...4}"], 4),
+                (["http://node{1...4}:9000/data", "http://node5:9000/data{1...4}"], 4),
+                (["http://node5:9000/data{1...4}", "http://node{1...4}:9000/data"], 4),
+            ] {
+                let layout = DisksLayout::from_volumes(&volumes).expect("single-node multi-drive pools are valid");
+
+                assert!(!layout.legacy);
+                assert_eq!(layout.pools.len(), 2);
+                for (index, volume) in volumes.iter().enumerate() {
+                    assert_eq!(layout.get_set_count(index), 1);
+                    assert_eq!(layout.get_drives_per_set(index), drives);
+                    assert_eq!(layout.get_cmd_line(index), *volume);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn pool_expansion_accepts_multi_node_single_drive_pools() {
+        temp_env::with_var(ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, Some("0"), || {
+            for nodes in [2, 3, 4] {
+                let volumes = [
+                    format!("http://pool1-node{{1...{nodes}}}:9000/data"),
+                    format!("http://pool2-node{{1...{nodes}}}:9000/data"),
+                ];
+                let layout = DisksLayout::from_volumes(&volumes).expect("each node may contribute one drive to a pool");
+
+                assert_eq!(layout.pools.len(), 2);
+                for pool in 0..2 {
+                    assert_eq!(layout.get_set_count(pool), 1);
+                    assert_eq!(layout.get_drives_per_set(pool), nodes);
+                    let expected = (1..=nodes)
+                        .map(|node| format!("http://pool{}-node{node}:9000/data", pool + 1))
+                        .collect::<Vec<_>>();
+                    assert_eq!(layout.pools[pool].layout, vec![expected]);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn explicit_endpoints_without_ellipses_form_one_pool() {
+        temp_env::with_var(ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, Some("0"), || {
+            let volumes = ["http://node1:9000/data", "http://node2:9000/data"];
+            let layout = DisksLayout::from_volumes(&volumes).expect("explicit endpoints form one legacy pool");
+
+            assert!(layout.legacy);
+            assert_eq!(layout.pools.len(), 1);
+            assert_eq!(layout.pools[0].layout, vec![volumes.to_vec()]);
+        });
+    }
+
+    #[test]
+    fn standalone_single_drive_path_remains_supported() {
+        temp_env::with_var(ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, Some("0"), || {
+            let layout = DisksLayout::from_volumes(&["/data"]).expect("standalone single-drive deployment is valid");
+
+            assert!(layout.is_single_drive_layout());
+            assert_eq!(layout.get_single_drive_layout(), "/data");
+        });
+    }
+
+    #[test]
+    fn pool_expansion_rejects_plain_single_drive_pool_with_notice() {
+        temp_env::with_var(ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, Some("0"), || {
+            for volumes in [
+                ["http://node{1...2}:9000/data", "http://node3:9000/data"],
+                ["http://node3:9000/data", "http://node{1...2}:9000/data"],
+            ] {
+                let err = DisksLayout::from_volumes(&volumes).expect_err("a plain endpoint cannot be an expansion pool");
+                let message = err.to_string();
+
+                assert!(message.contains("all args must have ellipses for pool expansion"), "{message}");
+                assert!(message.contains("at least 2 drive endpoints"), "{message}");
+            }
+        });
+    }
+
+    #[test]
+    fn pool_expansion_rejects_singleton_ellipsis_pool_with_notice() {
+        temp_env::with_var(ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, Some("0"), || {
+            for singleton in ["http://node{3...3}:9000/data", "http://node3:9000/data{1...1}"] {
+                for volumes in [
+                    vec!["http://node{1...2}:9000/data", singleton],
+                    vec![singleton, "http://node{1...2}:9000/data"],
+                    vec![singleton],
+                ] {
+                    let err = DisksLayout::from_volumes(&volumes).expect_err("a singleton range still contains one drive");
+                    let message = err.to_string();
+
+                    assert_eq!(err.kind(), std::io::ErrorKind::Other);
+                    assert!(matches!(
+                        err.get_ref().and_then(|source| source.downcast_ref::<PoolDriveCountError>()),
+                        Some(PoolDriveCountError::BelowMinimum { size: 1 })
+                    ));
+                    assert!(message.contains("at least 2 drive endpoints"), "{message}");
+                    assert!(message.contains("single local path without ellipses"), "{message}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn explicit_set_size_counts_drives_not_nodes() {
+        for volume in ["http://node1:9000/data{1...4}", "http://node{1...4}:9000/data"] {
+            let sets = get_all_sets(2, true, &[volume]).expect("four endpoints can form two two-drive sets");
+            assert_eq!(sets.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 2]);
+        }
+    }
+
+    #[test]
+    fn undersized_pool_error_identifies_requested_set_size() {
+        let err =
+            get_all_sets(4, true, &["http://node{1...2}:9000/data"]).expect_err("two endpoints cannot fill a four-drive set");
+        let message = err.to_string();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(matches!(
+            err.get_ref().and_then(|source| source.downcast_ref::<PoolDriveCountError>()),
+            Some(PoolDriveCountError::BelowSetWidth {
+                size: 2,
+                set_drive_count: 4
+            })
+        ));
+        assert!(message.contains("size 2"), "{message}");
+        assert!(message.contains("RUSTFS_ERASURE_SET_DRIVE_COUNT=4"), "{message}");
+    }
+
+    #[test]
     fn layout_errors_do_not_echo_url_credentials() {
         for volumes in [
             vec!["http://:duplicate-secret@server/path", "http://:duplicate-secret@server/path"],
             vec!["http://:ellipsis...secret@server/path"],
+            vec!["http://server{1...2}/data", "http://:plain-secret@server3/data"],
+            vec!["http://server{1...2}/data", "http://:singleton-secret@server{3...3}/data"],
         ] {
             let err = DisksLayout::from_volumes(&volumes).unwrap_err();
             assert!(!err.to_string().contains("secret"), "layout error leaked endpoint credentials: {err}");

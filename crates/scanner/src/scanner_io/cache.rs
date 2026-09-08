@@ -112,6 +112,10 @@ pub(crate) fn current_cache_root_entry_with_generation(
     let metadata_is_current = cache.info.name == name
         && cache.info.source == Some(source)
         && cache.info.snapshot_complete
+        && cache.info.scan_progress.is_none()
+        && cache.info.scan_checkpoint.is_none()
+        && cache.info.scan_resume_after.is_none()
+        && cache.info.scan_coverage_receipt.is_none()
         && cache.info.scan_plan_digest == Some(scan_plan_digest)
         && cache.info.last_update.is_some()
         && cache.info.next_cycle == next_cycle
@@ -137,6 +141,7 @@ pub(crate) enum DataUsageCacheScanState {
 pub(crate) struct DataUsageCacheReuseOptions {
     pub(crate) require_source: bool,
     pub(crate) tier_registry_generation: Option<u64>,
+    pub(crate) checkpoint_identity: Option<crate::DataUsageScanIdentity>,
 }
 
 #[cfg(test)]
@@ -159,6 +164,7 @@ pub(crate) fn current_cache_root_or_prepare(
         DataUsageCacheReuseOptions {
             require_source,
             tier_registry_generation: None,
+            checkpoint_identity: None,
         },
     )
 }
@@ -172,6 +178,12 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
     scan_plan_digest: DataUsageScanPlanDigest,
     options: DataUsageCacheReuseOptions,
 ) -> DataUsageCacheScanState {
+    if cache.info.next_cycle <= next_cycle
+        && cache.info.leader_epoch <= leader_epoch
+        && cache.info.scan_identity != options.checkpoint_identity
+    {
+        cache.info.scan_plan_digest = None;
+    }
     if options.tier_registry_generation.is_some_and(|generation| {
         cache.info.next_cycle <= next_cycle
             && cache.info.leader_epoch <= leader_epoch
@@ -193,7 +205,12 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
         Ok(Some(root)) => DataUsageCacheScanState::Current(Box::new(root)),
         current => DataUsageCacheScanState::Prepared {
             invalid_current: current.err(),
-            outcome: cache.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, options.require_source),
+            outcome: match options.checkpoint_identity.filter(crate::DataUsageScanIdentity::is_valid) {
+                Some(identity) => {
+                    cache.prepare_bucket_checkpoint(name, next_cycle, leader_epoch, source, scan_plan_digest, identity)
+                }
+                None => cache.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, options.require_source),
+            },
         },
     }
 }
@@ -213,15 +230,184 @@ pub(super) fn cache_snapshot_is_current(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ScannerSnapshotIdentity {
+    pub(super) cycle: u64,
+    pub(super) leader_epoch: u64,
+    pub(super) plan_digest: DataUsageScanPlanDigest,
+    pub(super) coverage_digest: DataUsageScanPlanDigest,
+    pub(super) tier_registry_generation: Option<u64>,
+}
+
+pub(super) struct ScannerSnapshotScope<'a> {
+    pub(super) sources: &'a HashSet<DataUsageCacheSource>,
+    pub(super) buckets: &'a [String],
+    pub(super) identity: ScannerSnapshotIdentity,
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(super) enum ScannerSnapshotValidationError {
+    #[error("scanner snapshot does not cover the expected complete sets")]
+    IncompleteSets,
+    #[error("scanner snapshot does not match the requested generation")]
+    GenerationMismatch,
+    #[error("scanner snapshot bucket inventory is invalid")]
+    InvalidInventory,
+    #[error("scanner snapshot root is incomplete or corrupt")]
+    InvalidRoot,
+}
+
+struct ValidatedScannerSnapshot<'a> {
+    results: &'a [DataUsageCache],
+    last_update: SystemTime,
+}
+
+impl<'a> ValidatedScannerSnapshot<'a> {
+    fn validate(
+        results: &'a [DataUsageCache],
+        scope: &ScannerSnapshotScope<'_>,
+    ) -> std::result::Result<Self, ScannerSnapshotValidationError> {
+        if !scanner_results_form_complete_snapshot(results, scope.sources) {
+            return Err(ScannerSnapshotValidationError::IncompleteSets);
+        }
+        let bucket_keys = scope
+            .buckets
+            .iter()
+            .map(|bucket| crate::hash_path(bucket).key())
+            .collect::<HashSet<_>>();
+        if bucket_keys.len() != scope.buckets.len()
+            || scope
+                .buckets
+                .iter()
+                .any(|bucket| bucket.is_empty() || bucket == DATA_USAGE_ROOT)
+        {
+            return Err(ScannerSnapshotValidationError::InvalidInventory);
+        }
+        for result in results {
+            if result.info.next_cycle != scope.identity.cycle
+                || result.info.leader_epoch != scope.identity.leader_epoch
+                || result.info.scan_plan_digest != Some(scope.identity.plan_digest)
+                || result.info.scan_coverage_digest != Some(scope.identity.coverage_digest)
+                || result.info.tier_registry_generation != scope.identity.tier_registry_generation
+            {
+                return Err(ScannerSnapshotValidationError::GenerationMismatch);
+            }
+            if result.info.name != DATA_USAGE_ROOT
+                || result.info.cache_key_format != DATA_USAGE_CACHE_KEY_FORMAT
+                || !result.has_complete_root_inventory(&bucket_keys)
+            {
+                return Err(ScannerSnapshotValidationError::InvalidRoot);
+            }
+        }
+        let last_update = results
+            .iter()
+            .filter_map(|result| result.info.last_update)
+            .max()
+            .ok_or(ScannerSnapshotValidationError::IncompleteSets)?;
+        Ok(Self { results, last_update })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScannerPublicationExpectation {
+    candidate: Arc<([u8; 32], DataUsageScanPlanDigest)>,
+}
+
+impl ScannerPublicationExpectation {
+    pub(crate) fn matches_encoded_candidate(&self, digest: &[u8; 32]) -> bool {
+        &self.candidate.0 == digest
+    }
+
+    pub(crate) fn same_candidate(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.candidate, &other.candidate) && self.candidate.1 == other.candidate.1
+    }
+}
+
+pub(super) struct ValidatedUsageCandidate {
+    data: DataUsageInfo,
+    #[cfg(test)]
+    last_update: SystemTime,
+    coverage_digest: DataUsageScanPlanDigest,
+}
+
+pub(super) fn empty_namespace_usage_candidate(
+    all_buckets: &[BucketInfo],
+    sources: &HashSet<DataUsageCacheSource>,
+    buckets_by_source: &HashMap<DataUsageCacheSource, Vec<BucketInfo>>,
+    identity: ScannerSnapshotIdentity,
+) -> Option<ValidatedUsageCandidate> {
+    if !all_buckets.is_empty()
+        || sources.is_empty()
+        || sources.len() != buckets_by_source.len()
+        || sources
+            .iter()
+            .any(|source| buckets_by_source.get(source).is_none_or(|buckets| !buckets.is_empty()))
+    {
+        return None;
+    }
+    let last_update = SystemTime::now();
+    Some(ValidatedUsageCandidate {
+        data: DataUsageInfo {
+            last_update: Some(last_update),
+            scanner_cycle: Some(identity.cycle),
+            scanner_epoch: Some(identity.leader_epoch),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        },
+        #[cfg(test)]
+        last_update,
+        coverage_digest: identity.coverage_digest,
+    })
+}
+
+impl ValidatedUsageCandidate {
+    pub(super) fn prepare(mut self, status: ScannerCycleStatus) -> (DataUsageInfo, Option<ScannerPublicationExpectation>) {
+        self.data.usage_snapshot_converged = Some(status == ScannerCycleStatus::Complete);
+        let expectation = if status == ScannerCycleStatus::Complete {
+            struct DigestWriter(Sha256);
+            impl std::io::Write for DigestWriter {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0.update(bytes);
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut writer = DigestWriter(Sha256::new());
+            serde_json::to_writer(&mut writer, &self.data)
+                .ok()
+                .map(|()| ScannerPublicationExpectation {
+                    candidate: Arc::new((writer.0.finalize().into(), self.coverage_digest)),
+                })
+        } else {
+            None
+        };
+        (self.data, expectation)
+    }
+}
+
+#[cfg(test)]
 pub(super) fn completed_data_usage_info(
     results: &[DataUsageCache],
-    expected_sources: &HashSet<DataUsageCacheSource>,
-    all_buckets: &[String],
+    scope: &ScannerSnapshotScope<'_>,
     tier_registry_names: &[String],
     bucket_plan_complete: bool,
     budget_elapsed: bool,
     cancelled: bool,
 ) -> Option<(DataUsageInfo, SystemTime)> {
+    completed_usage_candidate(results, scope, tier_registry_names, bucket_plan_complete, budget_elapsed, cancelled)
+        .map(|candidate| (candidate.data, candidate.last_update))
+}
+
+pub(super) fn completed_usage_candidate(
+    results: &[DataUsageCache],
+    scope: &ScannerSnapshotScope<'_>,
+    tier_registry_names: &[String],
+    bucket_plan_complete: bool,
+    budget_elapsed: bool,
+    cancelled: bool,
+) -> Option<ValidatedUsageCandidate> {
     if !bucket_plan_complete {
         return None;
     }
@@ -229,26 +415,10 @@ pub(super) fn completed_data_usage_info(
     if !should_publish_completed_snapshot(completed_set_count, results.len(), budget_elapsed, cancelled) {
         return None;
     }
-    if !scanner_results_form_complete_snapshot(results, expected_sources) {
-        return None;
-    }
-
-    // A generation is comparable across nodes because it is derived from the
-    // frozen registry names. Cycle and leader fencing remain separate cache
-    // metadata. Legacy peers omit the generation; an all-legacy result remains
-    // readable, but mixing legacy and new (or two new generations) would make
-    // the per-tier accounting ambiguous.
-    let registry_generation = results.first()?.info.tier_registry_generation;
-    if results.iter().any(|result| match registry_generation {
-        Some(generation) => result.info.tier_registry_generation != Some(generation),
-        None => result.info.tier_registry_generation.is_some(),
-    }) {
-        return None;
-    }
-
-    if results.iter().any(|result| result.root().is_none()) {
-        return None;
-    }
+    let validated = ValidatedScannerSnapshot::validate(results, scope).ok()?;
+    let results = validated.results;
+    let all_buckets = scope.buckets;
+    let registry_generation = scope.identity.tier_registry_generation;
 
     let mut total = DataUsageEntry::default();
     let mut bucket_entries = HashMap::with_capacity(all_buckets.len());
@@ -273,7 +443,7 @@ pub(super) fn completed_data_usage_info(
         return None;
     }
 
-    let merged_last_update = results.iter().filter_map(|result| result.info.last_update).max()?;
+    let merged_last_update = validated.last_update;
     let buckets_usage = bucket_entries
         .iter()
         .map(|(bucket, entry)| Some((bucket.clone(), checked_bucket_usage_info(entry)?)))
@@ -300,8 +470,8 @@ pub(super) fn completed_data_usage_info(
     usage_snapshot_set_states.sort_by_key(|state| (state.pool_index, state.set_index));
     let data_usage_info = DataUsageInfo {
         last_update: Some(merged_last_update),
-        scanner_cycle: Some(results.first()?.info.next_cycle),
-        scanner_epoch: Some(results.first()?.info.leader_epoch),
+        scanner_cycle: Some(scope.identity.cycle),
+        scanner_epoch: Some(scope.identity.leader_epoch),
         objects_total_count: u64::try_from(total.objects).ok()?,
         versions_total_count: u64::try_from(total.versions).ok()?,
         delete_markers_total_count: u64::try_from(total.delete_markers).ok()?,
@@ -315,7 +485,12 @@ pub(super) fn completed_data_usage_info(
         usage_snapshot_set_states,
         ..Default::default()
     };
-    Some((data_usage_info, merged_last_update))
+    Some(ValidatedUsageCandidate {
+        data: data_usage_info,
+        #[cfg(test)]
+        last_update: merged_last_update,
+        coverage_digest: scope.identity.coverage_digest,
+    })
 }
 
 fn tier_accounting_proof_is_publishable(
@@ -604,10 +779,13 @@ pub(super) async fn persist_and_publish_cache_snapshot(
     store: Arc<SetDisks>,
     updates: &mpsc::Sender<DataUsageCache>,
     mut cache_snapshot: DataUsageCache,
+    initial_revisions: Option<&DataUsageCacheRevisions>,
     cache_cycle_floor: &AtomicU64,
     expected_publication_epoch: u64,
 ) -> Option<SystemTime> {
     let source = cache_snapshot.info.source?;
+    let coverage_digest = cache_snapshot.info.scan_coverage_digest?;
+    let execution_digest = cache_snapshot.info.scan_execution_digest?;
     let guard = match acquire_scanner_cache_locks(store.as_ref(), DATA_USAGE_CACHE_NAME, source).await {
         Ok(guard) => guard,
         Err(err) => {
@@ -672,20 +850,37 @@ pub(super) async fn persist_and_publish_cache_snapshot(
         );
         return None;
     }
-    if matches!(
-        current_cache_root_entry_with_generation(
-            &persisted,
-            DATA_USAGE_ROOT,
-            source,
-            cache_snapshot.info.next_cycle,
-            cache_snapshot.info.leader_epoch,
-            scan_plan_digest,
-            cache_snapshot.info.tier_registry_generation,
-        ),
-        Ok(Some(_))
-    ) {
+    if persisted.info.scan_coverage_digest == Some(coverage_digest)
+        && persisted.info.scan_execution_digest == Some(execution_digest)
+        && matches!(
+            current_cache_root_entry_with_generation(
+                &persisted,
+                DATA_USAGE_ROOT,
+                source,
+                cache_snapshot.info.next_cycle,
+                cache_snapshot.info.leader_epoch,
+                scan_plan_digest,
+                cache_snapshot.info.tier_registry_generation,
+            ),
+            Ok(Some(_))
+        )
+    {
         cache_snapshot = persisted;
     } else {
+        // A later execution may have completed while this scan was walking.
+        // Only replace the cache revision from which this scan started.
+        if initial_revisions != Some(&revisions) {
+            warn!(
+                target: "rustfs::scanner::io",
+                event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_IO,
+                state = "scan_baseline_revision_changed",
+                cache_name = DATA_USAGE_CACHE_NAME,
+                "Scanner skipped set snapshot without an unchanged baseline revision"
+            );
+            return None;
+        }
         if guard.is_lock_lost() {
             error!(
                 target: "rustfs::scanner::io",

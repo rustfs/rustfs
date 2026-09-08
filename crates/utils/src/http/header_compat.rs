@@ -43,6 +43,16 @@ pub const SUFFIX_FORCE_DELETE: &str = "force-delete";
 pub const SUFFIX_INCLUDE_DELETED: &str = "include-deleted";
 pub const SUFFIX_REPLICATION_RESET_STATUS: &str = "replication-reset-status";
 pub const SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE: &str = "replication-actual-object-size";
+/// SSE-C ciphertext passthrough of an object the source stored compressed:
+/// the stored compression scheme travels under this name so the replica
+/// decompresses after decrypting (backlog#2363).
+pub const SUFFIX_REPLICATION_COMPRESSION: &str = "replication-compression";
+/// Plaintext size of a compressed passthrough object (backlog#2363).
+pub const SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE: &str = "replication-compression-actual-size";
+/// Plaintext length of one passthrough multipart part, sent on UploadPart so
+/// the replica records the logical part size and checks the 5 MiB minimum
+/// against it rather than against the stored bytes (backlog#2363).
+pub const SUFFIX_REPLICATION_PART_ACTUAL_SIZE: &str = "replication-part-actual-size";
 pub const SUFFIX_SOURCE_VERSION_ID: &str = "source-version-id";
 pub const SUFFIX_SOURCE_MTIME: &str = "source-mtime";
 pub const SUFFIX_SOURCE_ETAG: &str = "source-etag";

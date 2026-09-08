@@ -14,7 +14,8 @@
 
 use crate::bucket::lifecycle::tier_last_day_stats::DailyAllTierStats;
 use crate::cluster::rpc::{
-    PeerRestClient, ScannerPeerActivity, ScannerPeerDirtyUsageSnapshot, ScannerPublicationLease, TierConfigReloadOutcome,
+    PeerRestClient, ScannerDirtyUsageAcknowledgement, ScannerPeerActivity, ScannerPeerDirtyUsageSnapshot,
+    ScannerPublicationLease, TierConfigReloadOutcome,
 };
 use crate::diagnostics::admin_server_info::get_commit_id;
 use crate::disk::DiskAPI;
@@ -30,14 +31,14 @@ use lazy_static::lazy_static;
 use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysServices};
 use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::net::NetInfo;
-use rustfs_madmin::{ItemState, ServerProperties, StorageInfo};
+use rustfs_madmin::{ItemState, ServerProperties, StorageInfo, StorageInfoObservation, StorageInfoProbeStatus};
 use rustfs_utils::XHost;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::DefaultHasher};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, LazyLock, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
@@ -52,6 +53,7 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_NOTIFICATION: &str = "notification";
 const EVENT_NOTIFICATION_PEER_PROPAGATION: &str = "notification_peer_propagation";
 const EVENT_NOTIFICATION_CAPABILITY_PROBE: &str = "notification_capability_probe";
+const EVENT_STORAGE_INFO_PROBE: &str = "storage_info_probe";
 const SCANNER_ACTIVITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TIER_DAILY_STATS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TIER_CONFIG_RELOAD_RETRY_BASE: Duration = Duration::from_millis(100);
@@ -72,6 +74,29 @@ const LOCAL_CROSS_POOL_FENCE_POLICY_SUPPORTED_VERSION: u32 = 4;
 /// service must not advertise this version until the conditional writer from
 /// rustfs/backlog#684 is available.
 const LEGACY_TRANSITION_STATE_RECONCILE_POLICY_SUPPORTED_VERSION: u32 = 5;
+
+fn resolve_admin_peer_probe_timeout_secs(configured: Option<u64>) -> u64 {
+    configured
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(rustfs_config::DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS)
+        .min(rustfs_config::MAX_ADMIN_PEER_PROBE_TIMEOUT_SECS)
+}
+
+fn admin_peer_probe_timeout() -> Duration {
+    let configured = rustfs_utils::get_env_opt_u64_with_aliases(rustfs_config::ENV_ADMIN_PEER_PROBE_TIMEOUT_SECS, &[]);
+    let seconds = resolve_admin_peer_probe_timeout_secs(configured);
+    Duration::from_secs(seconds)
+}
+
+fn remaining_admin_peer_probe_timeout(deadline: Instant) -> Option<Duration> {
+    remaining_admin_peer_probe_timeout_at(deadline, Instant::now())
+}
+
+fn remaining_admin_peer_probe_timeout_at(deadline: Instant, now: Instant) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
+    (!remaining.is_zero()).then_some(remaining)
+}
+
 type CrossPoolFencePolicyResult = Result<BTreeMap<String, Uuid>>;
 
 fn cross_pool_fence_policy_results(
@@ -116,6 +141,8 @@ pub struct ScannerPublicationLeaseGrant {
 /// Cached result from the last successful admin call to a peer.
 struct PeerAdminCache {
     last_storage_info: Option<StorageInfo>,
+    /// Wall time is for operators; the monotonic clock bounds cache reuse.
+    last_storage_success: Option<(SystemTime, Instant)>,
     last_server_info: Option<ServerProperties>,
     storage_failures: u32,
     server_failures: u32,
@@ -139,6 +166,7 @@ impl PeerAdminCache {
     fn new() -> Self {
         Self {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: None,
             storage_failures: 0,
             server_failures: 0,
@@ -151,6 +179,9 @@ impl PeerAdminCache {
 /// failure: rather than reporting a stale `online`, the member falls through to
 /// the live unknown/degraded/offline classification (rustfs/backlog#1049 P2).
 const SERVER_INFO_CACHE_MAX_AGE: Duration = Duration::from_secs(60);
+// Diagnostic inventory may bridge a short probe interruption, but never more
+// than one minute. Failed probes are marked unknown even within this budget.
+const STORAGE_INFO_CACHE_MAX_AGE: Duration = Duration::from_secs(60);
 
 lazy_static! {
     pub static ref GLOBAL_NOTIFICATION_SYS: OnceLock<Arc<NotificationSys>> = OnceLock::new();
@@ -288,12 +319,29 @@ pub struct LegacyTransitionStateReconcileFleetProofToken {
     _permit: FleetCapabilityProofPermit,
 }
 
+/// Effect-window authority for one immutable ILM recovery export.
+pub struct IlmRecoveryExportFleetProofToken {
+    token: FleetCapabilityProofToken,
+    _permit: FleetCapabilityProofPermit,
+}
+
+/// Effect-window authority for emitting the compact transition-transaction
+/// state sequence. The generation permit prevents a successor proof from
+/// being published until the admitted writer has finished.
+pub(crate) struct TransitionTransactionCompactionFleetProofToken {
+    token: FleetCapabilityProofToken,
+    _permit: FleetCapabilityProofPermit,
+}
+
 static REMOTE_VERSION_STATE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static CROSS_POOL_FENCE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static TIER_DELETE_JOURNAL_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static DECOMMISSION_TARGET_FENCE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static LEGACY_TRANSITION_STATE_RECONCILE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
+static ILM_RECOVERY_EXPORT_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
+static TRANSITION_TRANSACTION_COMPACTION_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static REMOTE_VERSION_STATE_PROBE_TOPOLOGY: OnceLock<String> = OnceLock::new();
+static ILM_RECOVERY_EXPORT_LOCAL_PROCESS_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
 
 fn cross_pool_fence_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
     CROSS_POOL_FENCE_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
@@ -313,6 +361,14 @@ fn decommission_target_fence_fleet_proof_slot() -> &'static std::sync::RwLock<Fl
 
 fn legacy_transition_state_reconcile_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
     LEGACY_TRANSITION_STATE_RECONCILE_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
+}
+
+fn ilm_recovery_export_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
+    ILM_RECOVERY_EXPORT_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
+}
+
+fn transition_transaction_compaction_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
+    TRANSITION_TRANSACTION_COMPACTION_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
 }
 
 fn revoke_fleet_capability_proof_state(state: &mut FleetCapabilityProofState) {
@@ -413,6 +469,33 @@ fn acquire_fleet_capability_proof_from(
 
 pub(crate) fn remote_version_state_fleet_proof_matches(proof: &RemoteVersionStateFleetProofToken) -> bool {
     fleet_capability_proof_matches(remote_version_state_fleet_proof_slot(), &proof.0)
+}
+
+pub(crate) fn acquire_transition_transaction_compaction_fleet_proof() -> Option<TransitionTransactionCompactionFleetProofToken> {
+    let expected_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get()?;
+    let state = transition_transaction_compaction_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let token = acquire_fleet_capability_proof_from(&state, expected_topology, Instant::now())?;
+    let permit = state.proof.as_ref()?.generation.try_acquire()?;
+    Some(TransitionTransactionCompactionFleetProofToken { token, _permit: permit })
+}
+
+pub(crate) fn transition_transaction_compaction_fleet_proof_matches(
+    proof: &TransitionTransactionCompactionFleetProofToken,
+) -> bool {
+    let Some(expected_topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else {
+        return false;
+    };
+    let state = transition_transaction_compaction_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    proof._permit.generation.is_accepting()
+        && fleet_capability_proof_matches_at(&state, &proof.token, expected_topology, Instant::now())
+        && state
+            .proof
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.generation, &proof._permit.generation))
 }
 
 pub fn acquire_cross_pool_fence_fleet_proof() -> Option<CrossPoolFenceFleetProofToken> {
@@ -550,6 +633,117 @@ pub async fn legacy_transition_state_reconcile_fleet_proof_matches(
     .await
 }
 
+pub async fn acquire_ilm_recovery_export_fleet_proof() -> Option<IlmRecoveryExportFleetProofToken> {
+    let expected_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get()?;
+    let proof = {
+        let state = ilm_recovery_export_fleet_proof_slot()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        acquire_ilm_recovery_export_fleet_proof_from(&state, expected_topology, Instant::now())?
+    };
+    let observed = observe_ilm_recovery_export_fleet(expected_topology).await?;
+    let state = ilm_recovery_export_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ilm_recovery_export_fleet_proof_matches_observation_at(&state, &proof, expected_topology, &observed, Instant::now())
+        .then_some(proof)
+}
+
+fn acquire_ilm_recovery_export_fleet_proof_from(
+    state: &FleetCapabilityProofState,
+    expected_topology: &str,
+    now: Instant,
+) -> Option<IlmRecoveryExportFleetProofToken> {
+    let token = acquire_fleet_capability_proof_from(state, expected_topology, now)?;
+    let permit = state.proof.as_ref()?.generation.try_acquire()?;
+    Some(IlmRecoveryExportFleetProofToken { token, _permit: permit })
+}
+
+pub async fn ilm_recovery_export_fleet_proof_matches(proof: &IlmRecoveryExportFleetProofToken) -> bool {
+    let Some(expected_topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else {
+        return false;
+    };
+    {
+        let state = ilm_recovery_export_fleet_proof_slot()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !ilm_recovery_export_fleet_proof_matches_at(&state, proof, expected_topology, Instant::now()) {
+            return false;
+        }
+    }
+    let Some(observed) = observe_ilm_recovery_export_fleet(expected_topology).await else {
+        return false;
+    };
+    let state = ilm_recovery_export_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ilm_recovery_export_fleet_proof_matches_observation_at(&state, proof, expected_topology, &observed, Instant::now())
+}
+
+pub fn ilm_recovery_export_topology_generation(proof: &IlmRecoveryExportFleetProofToken) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rustfs-ilm-recovery-export-topology-v1\0");
+    hasher.update(proof.token.topology_fingerprint.as_bytes());
+    rustfs_utils::crypto::hex(hasher.finalize().as_slice())
+}
+
+pub fn ilm_recovery_export_member_epochs_sha256(proof: &IlmRecoveryExportFleetProofToken) -> String {
+    let encoded = serde_json::to_vec(proof.token.peer_epochs.as_ref()).expect("member epoch map is JSON encodable");
+    let mut hasher = Sha256::new();
+    hasher.update(b"rustfs-ilm-recovery-export-members-v1\0");
+    hasher.update(encoded);
+    rustfs_utils::crypto::hex(hasher.finalize().as_slice())
+}
+
+pub fn ilm_recovery_export_local_process_epoch() -> Uuid {
+    *ILM_RECOVERY_EXPORT_LOCAL_PROCESS_EPOCH
+}
+
+fn ilm_recovery_export_fleet_proof_matches_at(
+    state: &FleetCapabilityProofState,
+    proof: &IlmRecoveryExportFleetProofToken,
+    expected_topology: &str,
+    now: Instant,
+) -> bool {
+    proof._permit.generation.is_accepting()
+        && fleet_capability_proof_matches_at(state, &proof.token, expected_topology, now)
+        && state
+            .proof
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.generation, &proof._permit.generation))
+}
+
+fn ilm_recovery_export_fleet_proof_matches_observation_at(
+    state: &FleetCapabilityProofState,
+    proof: &IlmRecoveryExportFleetProofToken,
+    expected_topology: &str,
+    observed: &BTreeMap<String, Uuid>,
+    now: Instant,
+) -> bool {
+    ilm_recovery_export_fleet_proof_matches_at(state, proof, expected_topology, now)
+        && proof.token.peer_epochs.as_ref() == observed
+}
+
+async fn observe_ilm_recovery_export_fleet(expected_topology: &str) -> Option<BTreeMap<String, Uuid>> {
+    #[cfg(test)]
+    {
+        let state = ilm_recovery_export_fleet_proof_slot()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if fleet_capability_proof_valid_at(state.proof.as_ref(), expected_topology, Instant::now()) {
+            return state.proof.as_ref().map(|proof| proof.peer_epochs.as_ref().clone());
+        }
+    }
+    let notification_sys = get_global_notification_sys()?;
+    timeout(
+        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+        notification_sys.probe_ilm_recovery_export_fleet(expected_topology),
+    )
+    .await
+    .ok()?
+    .ok()
+}
+
 async fn legacy_transition_state_reconcile_fleet_proof_matches_with_observer<F, Fut>(
     slot: &std::sync::RwLock<FleetCapabilityProofState>,
     proof: &LegacyTransitionStateReconcileFleetProofToken,
@@ -638,7 +832,7 @@ pub(crate) fn install_cross_pool_fence_fleet_proof_for_test() {
         state.proof.clone()
     } else {
         Some(FleetCapabilityProof::new(
-            topology,
+            topology.clone(),
             Arc::new(BTreeMap::new()),
             now + Duration::from_secs(60 * 60),
         ))
@@ -671,6 +865,21 @@ pub(crate) fn install_cross_pool_fence_fleet_proof_for_test() {
     decommission_state.topology_conflict = false;
     decommission_state.draining_generation = None;
     decommission_state.proof = proof.as_ref().map(FleetCapabilityProof::with_fresh_generation);
+    drop(decommission_state);
+    let mut export_state = ilm_recovery_export_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !fleet_capability_proof_valid_at(export_state.proof.as_ref(), &topology, now) {
+        debug_assert!(
+            export_state
+                .proof
+                .as_ref()
+                .is_none_or(|current| current.generation.is_drained())
+        );
+        export_state.topology_conflict = false;
+        export_state.draining_generation = None;
+        export_state.proof = proof.as_ref().map(FleetCapabilityProof::with_fresh_generation);
+    }
 }
 
 #[cfg(test)]
@@ -911,6 +1120,35 @@ pub(crate) fn install_remote_version_state_fleet_proof_for_test(topology_fingerp
     RemoteVersionStateFleetProofGuard
 }
 
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) struct TransitionTransactionCompactionFleetProofGuard;
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for TransitionTransactionCompactionFleetProofGuard {
+    fn drop(&mut self) {
+        revoke_fleet_capability_proof(transition_transaction_compaction_fleet_proof_slot());
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) fn install_transition_transaction_compaction_fleet_proof_for_test(
+    topology_fingerprint: &str,
+) -> TransitionTransactionCompactionFleetProofGuard {
+    let _ = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.set(topology_fingerprint.to_string());
+    let effective_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY
+        .get()
+        .expect("transition transaction compaction test topology should be initialized");
+    if let Some(err) = publish_fleet_capability_probe_result(
+        transition_transaction_compaction_fleet_proof_slot(),
+        effective_topology,
+        Ok(BTreeMap::new()),
+        Instant::now(),
+    ) {
+        panic!("test proof installation must not fail: {err}");
+    }
+    TransitionTransactionCompactionFleetProofGuard
+}
+
 fn insert_remote_version_state_peer(peer_epochs: &mut BTreeMap<String, Uuid>, peer: String, epoch: Uuid) -> Result<()> {
     if epoch.is_nil() || peer_epochs.values().any(|existing| *existing == epoch) || peer_epochs.insert(peer, epoch).is_some() {
         return Err(Error::other("remote version state capability peer identity is invalid"));
@@ -927,6 +1165,8 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 tier_delete_journal_fleet_proof_slot(),
                 decommission_target_fence_fleet_proof_slot(),
                 legacy_transition_state_reconcile_fleet_proof_slot(),
+                ilm_recovery_export_fleet_proof_slot(),
+                transition_transaction_compaction_fleet_proof_slot(),
             ] {
                 mark_fleet_capability_topology_conflict(slot);
             }
@@ -936,29 +1176,59 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
 
     tokio::spawn(async move {
         loop {
-            let result = match get_global_notification_sys() {
-                Some(notification_sys) => {
-                    match timeout(
+            let notification_sys = get_global_notification_sys();
+            let remote_version_state_probe = async {
+                match notification_sys.as_ref() {
+                    Some(notification_sys) => timeout(
                         REMOTE_VERSION_STATE_PROBE_TIMEOUT,
                         notification_sys.probe_remote_version_state_fleet(&topology_fingerprint),
                     )
                     .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => Err(Error::other("remote version state fleet capability probe timed out")),
-                    }
+                    .unwrap_or_else(|_| Err(Error::other("remote version state fleet capability probe timed out"))),
+                    None => Err(Error::other("remote version state fleet capability notification system is unavailable")),
                 }
-                None => Err(Error::other("remote version state fleet capability notification system is unavailable")),
             };
-            let fence_probe = match get_global_notification_sys() {
-                Some(notification_sys) => timeout(
-                    REMOTE_VERSION_STATE_PROBE_TIMEOUT,
-                    notification_sys.probe_cross_pool_fence_fleet(&topology_fingerprint),
-                )
-                .await
-                .unwrap_or_else(|_| Err(Error::other("cross-pool fence fleet capability probe timed out"))),
-                None => Err(Error::other("cross-pool fence fleet capability notification system is unavailable")),
+            let cross_pool_fence_probe = async {
+                match notification_sys.as_ref() {
+                    Some(notification_sys) => timeout(
+                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                        notification_sys.probe_cross_pool_fence_fleet(&topology_fingerprint),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(Error::other("cross-pool fence fleet capability probe timed out"))),
+                    None => Err(Error::other("cross-pool fence fleet capability notification system is unavailable")),
+                }
             };
+            let recovery_export_probe = async {
+                match notification_sys.as_ref() {
+                    Some(notification_sys) => timeout(
+                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                        notification_sys.probe_ilm_recovery_export_fleet(&topology_fingerprint),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(Error::other("ILM recovery export fleet capability probe timed out"))),
+                    None => Err(Error::other("ILM recovery export fleet capability notification system is unavailable")),
+                }
+            };
+            let transition_transaction_compaction_probe = async {
+                match notification_sys.as_ref() {
+                    Some(notification_sys) => timeout(
+                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                        notification_sys.probe_transition_transaction_compaction_fleet(&topology_fingerprint),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(Error::other("transition transaction compaction fleet capability probe timed out"))),
+                    None => Err(Error::other(
+                        "transition transaction compaction fleet capability notification system is unavailable",
+                    )),
+                }
+            };
+            let (result, fence_probe, recovery_export_result, transition_transaction_compaction_result) = tokio::join!(
+                remote_version_state_probe,
+                cross_pool_fence_probe,
+                recovery_export_probe,
+                transition_transaction_compaction_probe
+            );
             let (fence_result, journal_result, decommission_target_fence_result, reconcile_result) = match fence_probe {
                 Ok((peer_epochs, minimum_version)) => cross_pool_fence_policy_results(peer_epochs, minimum_version),
                 Err(err) => {
@@ -981,6 +1251,8 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 revoke_fleet_capability_proof(tier_delete_journal_fleet_proof_slot());
                 revoke_fleet_capability_proof(decommission_target_fence_fleet_proof_slot());
                 revoke_fleet_capability_proof(legacy_transition_state_reconcile_fleet_proof_slot());
+                revoke_fleet_capability_proof(ilm_recovery_export_fleet_proof_slot());
+                revoke_fleet_capability_proof(transition_transaction_compaction_fleet_proof_slot());
             } else if let Some(err) = publish_fleet_capability_probe_result(
                 remote_version_state_fleet_proof_slot(),
                 &topology_fingerprint,
@@ -1002,6 +1274,42 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_NOTIFICATION,
                     capability = "cross_pool_fence",
+                    state = "failed_closed",
+                    error = %err,
+                    "notification capability probe"
+                );
+            }
+            if !topology_conflict
+                && let Some(err) = publish_fleet_capability_probe_result(
+                    ilm_recovery_export_fleet_proof_slot(),
+                    &topology_fingerprint,
+                    recovery_export_result,
+                    Instant::now(),
+                )
+            {
+                debug!(
+                    event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    capability = "ilm_recovery_export_v1",
+                    state = "failed_closed",
+                    error = %err,
+                    "notification capability probe"
+                );
+            }
+            if !topology_conflict
+                && let Some(err) = publish_fleet_capability_probe_result(
+                    transition_transaction_compaction_fleet_proof_slot(),
+                    &topology_fingerprint,
+                    transition_transaction_compaction_result,
+                    Instant::now(),
+                )
+            {
+                debug!(
+                    event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    capability = "transition_transaction_compaction_v1",
                     state = "failed_closed",
                     error = %err,
                     "notification capability probe"
@@ -1129,6 +1437,28 @@ impl NotificationSys {
         Ok(peer_epochs)
     }
 
+    async fn probe_transition_transaction_compaction_fleet(&self, topology_fingerprint: &str) -> Result<BTreeMap<String, Uuid>> {
+        if self.peer_clients.len() != self.peer_topology_hosts.len() {
+            return Err(Error::other(
+                "transition transaction compaction capability fleet membership is incomplete",
+            ));
+        }
+        let probes = self.peer_clients.iter().map(|client| async {
+            let client = client
+                .as_ref()
+                .ok_or_else(|| Error::other("transition transaction compaction capability peer is unreachable"))?;
+            client
+                .probe_transition_transaction_compaction(topology_fingerprint.to_string())
+                .await
+        });
+        let mut peer_epochs = BTreeMap::new();
+        for result in join_all(probes).await {
+            let (peer, epoch) = result?;
+            insert_remote_version_state_peer(&mut peer_epochs, peer, epoch)?;
+        }
+        Ok(peer_epochs)
+    }
+
     async fn probe_cross_pool_fence_fleet(&self, topology_fingerprint: &str) -> Result<(BTreeMap<String, Uuid>, u32)> {
         if self.peer_clients.len() != self.peer_topology_hosts.len() {
             return Err(Error::other("cross-pool fence capability fleet membership is incomplete"));
@@ -1151,6 +1481,46 @@ impl NotificationSys {
         }
         Ok((peer_epochs, minimum_version))
     }
+
+    async fn probe_ilm_recovery_export_fleet(&self, topology_fingerprint: &str) -> Result<BTreeMap<String, Uuid>> {
+        if self.peer_clients.len() != self.peer_topology_hosts.len() {
+            return Err(Error::other("ILM recovery export capability fleet membership is incomplete"));
+        }
+        let local_member = runtime_sources::local_node_name().await;
+        if local_member.trim().is_empty() {
+            return Err(Error::other("ILM recovery export local member identity is unavailable"));
+        }
+        let mut peer_epochs = BTreeMap::new();
+        insert_remote_version_state_peer(&mut peer_epochs, local_member.clone(), ilm_recovery_export_local_process_epoch())?;
+        let probes = self.peer_clients.iter().map(|client| async {
+            let client = client
+                .as_ref()
+                .ok_or_else(|| Error::other("ILM recovery export capability peer is unreachable"))?;
+            client.probe_ilm_recovery_export(topology_fingerprint.to_string()).await
+        });
+        for result in join_all(probes).await {
+            let (peer, epoch) = result?;
+            insert_remote_version_state_peer(&mut peer_epochs, peer, epoch)?;
+        }
+        validate_ilm_recovery_export_members(&self.peer_topology_hosts, &local_member, &peer_epochs)?;
+        Ok(peer_epochs)
+    }
+}
+
+fn validate_ilm_recovery_export_members(
+    expected_remote_members: &[String],
+    local_member: &str,
+    observed: &BTreeMap<String, Uuid>,
+) -> Result<()> {
+    let expected = expected_remote_members
+        .iter()
+        .cloned()
+        .chain(std::iter::once(local_member.to_string()))
+        .collect::<BTreeSet<_>>();
+    if expected.len() != expected_remote_members.len().saturating_add(1) || observed.keys().ne(expected.iter()) {
+        return Err(Error::other("ILM recovery export capability fleet membership does not match topology"));
+    }
+    Ok(())
 }
 
 /// Rolling tier activity summed over every cluster member that answered, with
@@ -1538,52 +1908,68 @@ impl NotificationSys {
     {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         let endpoints = runtime_sources::endpoint_pools().unwrap_or_else(|| Vec::new().into());
-        let peer_timeout = Duration::from_secs(5);
+        let peer_timeout = admin_peer_probe_timeout();
 
         for (idx, client) in self.peer_clients.iter().enumerate() {
             let endpoints = endpoints.clone();
             let cache = self.peer_admin_caches.get(idx);
+            let topology_host = self.peer_topology_hosts.get(idx);
             futures.push(async move {
                 if let Some(client) = client {
                     let host = client.host.to_string();
-                    match timeout(peer_timeout, client.local_storage_info()).await {
+                    let deadline = Instant::now() + peer_timeout;
+                    let probe_timeout = remaining_admin_peer_probe_timeout(deadline).unwrap_or_default();
+                    match timeout(probe_timeout, client.local_storage_info()).await {
                         Ok(Ok(mut info)) => {
                             normalize_and_cache_peer_storage_info(cache, &host, &mut info);
                             Some(info)
                         }
-                        Ok(Err(err)) => {
-                            warn!("peer {} storage_info failed: {}", host, err);
-                            handle_peer_failure(cache, &host, &endpoints)
-                        }
-                        Err(_) => {
-                            warn!("peer {} storage_info timed out after {:?}", host, peer_timeout);
-                            client.evict_connection().await;
-                            handle_peer_failure(cache, &host, &endpoints)
-                        }
+                        Ok(Err(err)) => handle_peer_failure(cache, &host, &endpoints, &err),
+                        Err(_) => handle_peer_failure(cache, &host, &endpoints, &Error::Timeout),
                     }
                 } else {
-                    None
+                    topology_host.and_then(|host| {
+                        handle_peer_failure(
+                            cache,
+                            host,
+                            &endpoints,
+                            &Error::RemoteClientUnavailable("storage inventory client is unavailable".to_string()),
+                        )
+                    })
                 }
             });
         }
 
         let mut replies = join_all(futures).await;
 
-        replies.push(Some(StorageAdminApi::local_storage_info(api).await));
+        let mut local = StorageAdminApi::local_storage_info(api).await;
+        local.observations = vec![storage_info_observation(
+            &runtime_sources::local_node_name().await,
+            StorageInfoProbeStatus::Succeeded,
+            false,
+            Some((SystemTime::now(), Instant::now())),
+        )];
+        replies.push(Some(local));
 
         let mut disks = Vec::new();
+        let mut observations = Vec::new();
         for info in replies.into_iter().flatten() {
             disks.extend(info.disks);
+            observations.extend(info.observations);
         }
 
         let backend = StorageAdminApi::backend_info(api).await;
-        rustfs_madmin::StorageInfo { disks, backend }
+        rustfs_madmin::StorageInfo {
+            disks,
+            backend,
+            observations,
+        }
     }
 
     pub async fn server_info(&self) -> Vec<ServerProperties> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         let endpoints = runtime_sources::endpoint_pools().unwrap_or_else(|| Vec::new().into());
-        let peer_timeout = Duration::from_secs(5);
+        let peer_timeout = admin_peer_probe_timeout();
 
         for (idx, client) in self.peer_clients.iter().enumerate() {
             let host = self
@@ -1600,12 +1986,23 @@ impl NotificationSys {
                     };
                 };
 
+                let deadline = Instant::now() + peer_timeout;
+                let Some(first_timeout) = remaining_admin_peer_probe_timeout(deadline) else {
+                    let health = peer_disk_health_with_deadline(&host, deadline).await;
+                    return PeerServerInfoProbe {
+                        host,
+                        result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                    };
+                };
+
                 // First attempt. A single evicted or half-open internode channel
                 // is enough to fail one probe and, before retrying, would drop
-                // the member to unknown/offline for this whole snapshot. So on any
-                // first-attempt failure we evict the channel and re-dial once
-                // before falling back (rustfs/backlog#1049, P1-B).
-                match timeout(peer_timeout, client.server_info()).await {
+                // the member to unknown/offline for this whole snapshot. On a
+                // quick failure we evict the channel and re-dial once before
+                // falling back (rustfs/backlog#1049, P1-B). A slow attempt
+                // consumes the round budget and therefore does not trigger a
+                // second full wait or an asynchronous eviction side effect.
+                match timeout(first_timeout, client.server_info()).await {
                     Ok(Ok(info)) => {
                         return PeerServerInfoProbe { host, result: Ok(info) };
                     }
@@ -1619,14 +2016,37 @@ impl NotificationSys {
                 // `evict_connection` would leave that gate up and the retry would
                 // fast-fail with "temporarily offline" instead of reconnecting
                 // (rustfs/backlog#1049 P1-B).
-                client.prepare_retry().await;
+                let Some(retry_budget) = remaining_admin_peer_probe_timeout(deadline) else {
+                    let health = peer_disk_health_with_deadline(&host, deadline).await;
+                    return PeerServerInfoProbe {
+                        host,
+                        result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                    };
+                };
+                // Bound connection-cache cleanup too. The helper clears the offline gate even
+                // when eviction itself times out, so cancellation cannot strand this peer in
+                // fast-fail mode.
+                if !client.prepare_retry_with_timeout(retry_budget).await {
+                    let health = peer_disk_health_with_deadline(&host, deadline).await;
+                    return PeerServerInfoProbe {
+                        host,
+                        result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                    };
+                }
 
                 // Second and final attempt on the fresh channel.
-                match timeout(peer_timeout, client.server_info()).await {
+                let Some(retry_timeout) = remaining_admin_peer_probe_timeout(deadline) else {
+                    let health = peer_disk_health_with_deadline(&host, deadline).await;
+                    return PeerServerInfoProbe {
+                        host,
+                        result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                    };
+                };
+                match timeout(retry_timeout, client.server_info()).await {
                     Ok(Ok(info)) => PeerServerInfoProbe { host, result: Ok(info) },
                     Ok(Err(err)) => {
                         warn!("peer {host} server_info failed after retry: {err}");
-                        let health = peer_disk_health(&host).await;
+                        let health = peer_disk_health_with_deadline(&host, deadline).await;
                         PeerServerInfoProbe {
                             host,
                             result: Err(PeerServerInfoProbeFailure::Rpc { health }),
@@ -1634,8 +2054,7 @@ impl NotificationSys {
                     }
                     Err(_) => {
                         warn!("peer {host} server_info timed out after retry ({peer_timeout:?})");
-                        client.evict_connection().await;
-                        let health = peer_disk_health(&host).await;
+                        let health = peer_disk_health_with_deadline(&host, deadline).await;
                         PeerServerInfoProbe {
                             host,
                             result: Err(PeerServerInfoProbeFailure::Rpc { health }),
@@ -2284,11 +2703,70 @@ impl NotificationSys {
         Ok(snapshots)
     }
 
-    pub async fn acknowledge_scanner_dirty_usage(&self, acknowledgements: Vec<(String, String, u64)>) -> Result<bool> {
+    pub async fn scanner_scoped_dirty_usage_capabilities(
+        &self,
+        acknowledgements: Vec<ScannerDirtyUsageAcknowledgement>,
+    ) -> Result<bool> {
         let mut by_host = HashMap::with_capacity(acknowledgements.len());
-        for (host, instance_id, generation) in acknowledgements {
-            if by_host.insert(host.clone(), (instance_id, generation)).is_some() {
-                return Err(Error::other(format!("duplicate scanner dirty usage acknowledgement target: {host}")));
+        for acknowledgement in acknowledgements {
+            let host = match &acknowledgement {
+                ScannerDirtyUsageAcknowledgement::Scoped { host, .. } => host.clone(),
+                ScannerDirtyUsageAcknowledgement::Generation { .. } => {
+                    return Err(Error::other("scanner scoped dirty usage capability requires scoped acknowledgements"));
+                }
+            };
+            if by_host.insert(host.clone(), acknowledgement).is_some() {
+                return Err(Error::other("duplicate scanner dirty usage acknowledgement target"));
+            }
+        }
+
+        let clients = self
+            .peer_clients
+            .iter()
+            .flatten()
+            .map(|client| (client.grid_host.clone(), client.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut futures = Vec::with_capacity(by_host.len());
+        for (host, acknowledgement) in by_host {
+            let Some(client) = clients.get(&host).cloned() else {
+                return Err(Error::other("scanner scoped dirty usage capability failed: peer is not reachable"));
+            };
+            futures.push(async move {
+                let ScannerDirtyUsageAcknowledgement::Scoped {
+                    owner_id,
+                    instance_id,
+                    entries,
+                    ..
+                } = acknowledgement
+                else {
+                    unreachable!("scoped acknowledgement was validated before probing");
+                };
+                timeout(
+                    SCANNER_ACTIVITY_PROBE_TIMEOUT,
+                    client.scanner_scoped_dirty_usage_capability(owner_id, instance_id, entries),
+                )
+                .await
+                .map_err(|_| Error::other("scanner scoped dirty usage capability timed out"))?
+            });
+        }
+
+        for result in join_all(futures).await {
+            if !result? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub async fn acknowledge_scanner_dirty_usage(&self, acknowledgements: Vec<ScannerDirtyUsageAcknowledgement>) -> Result<bool> {
+        let mut by_host = HashMap::with_capacity(acknowledgements.len());
+        for acknowledgement in acknowledgements {
+            let host = match &acknowledgement {
+                ScannerDirtyUsageAcknowledgement::Generation { host, .. }
+                | ScannerDirtyUsageAcknowledgement::Scoped { host, .. } => host.clone(),
+            };
+            if by_host.insert(host.clone(), acknowledgement).is_some() {
+                return Err(Error::other("duplicate scanner dirty usage acknowledgement target"));
             }
         }
 
@@ -2300,18 +2778,34 @@ impl NotificationSys {
             .collect::<HashMap<_, _>>();
         let mut failures = Vec::new();
         let mut futures = Vec::with_capacity(by_host.len());
-        for (host, (instance_id, generation)) in by_host {
+        for (host, acknowledgement) in by_host {
             let Some(client) = clients.get(&host).cloned() else {
                 failures.push(format!("peer {host} scanner dirty usage acknowledgement failed: peer is not reachable"));
                 continue;
             };
             futures.push(async move {
-                let result = scanner_activity_with_timeout(
-                    SCANNER_ACTIVITY_PROBE_TIMEOUT,
-                    &host,
-                    client.acknowledge_scanner_dirty_usage(instance_id, generation),
-                )
-                .await;
+                let result = match acknowledgement {
+                    ScannerDirtyUsageAcknowledgement::Generation {
+                        instance_id, generation, ..
+                    } => {
+                        scanner_activity_with_timeout(
+                            SCANNER_ACTIVITY_PROBE_TIMEOUT,
+                            &host,
+                            client.acknowledge_scanner_dirty_usage(instance_id, generation),
+                        )
+                        .await
+                    }
+                    ScannerDirtyUsageAcknowledgement::Scoped {
+                        owner_id,
+                        instance_id,
+                        entries,
+                        ..
+                    } => {
+                        client
+                            .acknowledge_scanner_scoped_dirty_usage(owner_id, instance_id, entries)
+                            .await
+                    }
+                };
                 (host, result)
             });
         }
@@ -2867,56 +3361,80 @@ where
     }
 }
 
-/// Handle a peer failure for storage_info: return cached data if available,
-/// or mark offline only after consecutive failures exceed the threshold.
+fn storage_info_observation(
+    host: &str,
+    status: StorageInfoProbeStatus,
+    cached: bool,
+    last_success: Option<(SystemTime, Instant)>,
+) -> StorageInfoObservation {
+    StorageInfoObservation {
+        endpoint: host.to_string(),
+        status,
+        cached,
+        last_success_unix_millis: last_success
+            .and_then(|(wall, _)| wall.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .and_then(|age| u64::try_from(age.as_millis()).ok()),
+        snapshot_age_seconds: last_success.map(|(_, monotonic)| monotonic.elapsed().as_secs()),
+        error_code: None,
+    }
+}
+
+/// An admin RPC failure is missing evidence, not evidence of failed drives.
+/// Preserve bounded historical inventory without presenting its states as live.
 fn handle_peer_failure(
     cache: Option<&Mutex<PeerAdminCache>>,
     host: &str,
     endpoints: &EndpointServerPools,
+    error: &Error,
 ) -> Option<StorageInfo> {
-    let cache = cache?;
-
-    let mut c = match cache.lock() {
-        Ok(cache) => cache,
-        Err(poisoned) => {
-            warn!("peer {host} storage_info cache mutex poisoned");
-            poisoned.into_inner()
-        }
-    };
-    c.storage_failures += 1;
-
-    if let Some(ref cached) = c.last_storage_info
-        && c.storage_failures < CONSECUTIVE_FAILURE_THRESHOLD
-    {
-        debug!(
-            event = "peer_probe_failure",
-            peer = host,
-            probe = "storage_info",
-            consecutive_failures = c.storage_failures,
-            threshold = CONSECUTIVE_FAILURE_THRESHOLD,
-            "peer storage_info probe failed; returning cached state until the offline threshold is reached"
-        );
-        return Some(cached.clone());
-    }
-
-    if c.storage_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
-        if c.storage_failures == CONSECUTIVE_FAILURE_THRESHOLD {
+    let mut cache = cache.map(|cache| cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    let last_success = cache.as_ref().and_then(|cache| cache.last_storage_success);
+    let historical = cache
+        .as_ref()
+        .filter(|_| last_success.is_some_and(|(_, when)| when.elapsed() < STORAGE_INFO_CACHE_MAX_AGE))
+        .and_then(|cache| cache.last_storage_info.clone());
+    let cached = historical.is_some();
+    let mut info = historical.unwrap_or_else(|| StorageInfo {
+        disks: synthesized_disks(host, endpoints, ItemState::Unknown),
+        ..Default::default()
+    });
+    if let Some(cache) = &mut cache {
+        cache.storage_failures = cache.storage_failures.saturating_add(1);
+        if cache.storage_failures == 1 {
             warn!(
-                event = "peer_marked_offline",
+                event = EVENT_STORAGE_INFO_PROBE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                state = "failed",
                 peer = host,
-                probe = "storage_info",
-                consecutive_failures = c.storage_failures,
-                threshold = CONSECUTIVE_FAILURE_THRESHOLD,
-                "reporting peer disks offline after consecutive storage_info failures"
+                error_code = ?error.code(),
+                cached,
+                "Storage inventory probe failed; current drive health is unknown"
             );
         }
-        return Some(StorageInfo {
-            disks: synthesized_disks(host, endpoints, ItemState::Offline),
-            ..Default::default()
-        });
     }
-
-    None
+    for disk in &mut info.disks {
+        disk.state = rustfs_madmin::ITEM_UNKNOWN.to_string();
+        disk.runtime_state = Some(rustfs_madmin::ITEM_UNKNOWN.to_string());
+        disk.offline_duration_seconds = None;
+        disk.capacity_observation_source = Some(if cached { "snapshot" } else { "missing" }.to_string());
+        disk.capacity_observation_age_seconds = if cached {
+            disk.capacity_observation_age_seconds
+                .zip(last_success)
+                .map(|(age, (_, when))| age.saturating_add(when.elapsed().as_secs()))
+        } else {
+            None
+        };
+        disk.local = false;
+    }
+    info.observations = vec![storage_info_observation(
+        host,
+        StorageInfoProbeStatus::Failed,
+        cached,
+        last_success,
+    )];
+    info.observations[0].error_code = Some(format!("{:?}", error.code()));
+    Some(info)
 }
 
 fn normalize_and_cache_peer_storage_info(cache: Option<&Mutex<PeerAdminCache>>, host: &str, info: &mut StorageInfo) {
@@ -2925,6 +3443,15 @@ fn normalize_and_cache_peer_storage_info(cache: Option<&Mutex<PeerAdminCache>>, 
     for disk in &mut info.disks {
         disk.local = false;
     }
+    let last_success = (SystemTime::now(), Instant::now());
+    // The aggregator owns probe provenance, including when an older peer
+    // returns no observation or a peer sends its own observation fields.
+    info.observations = vec![storage_info_observation(
+        host,
+        StorageInfoProbeStatus::Succeeded,
+        false,
+        Some(last_success),
+    )];
 
     let Some(cache) = cache else {
         return;
@@ -2937,16 +3464,20 @@ fn normalize_and_cache_peer_storage_info(cache: Option<&Mutex<PeerAdminCache>>, 
             poisoned.into_inner()
         }
     };
-    if c.storage_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
+    if c.storage_failures > 0 {
         info!(
-            event = "peer_recovered_online",
+            event = EVENT_STORAGE_INFO_PROBE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+            state = "succeeded",
             peer = host,
             probe = "storage_info",
             consecutive_failures = c.storage_failures,
-            "peer storage_info probe succeeded again; peer disks reported online"
+            "Storage inventory probe recovered"
         );
     }
     c.last_storage_info = Some(info.clone());
+    c.last_storage_success = Some(last_success);
     c.storage_failures = 0;
 }
 
@@ -3021,6 +3552,11 @@ async fn peer_disk_health(host: &str) -> Option<PeerDiskHealth> {
     } else {
         Some(PeerDiskHealth { any_online, disks })
     }
+}
+
+async fn peer_disk_health_with_deadline(host: &str, deadline: Instant) -> Option<PeerDiskHealth> {
+    let remaining = remaining_admin_peer_probe_timeout(deadline)?;
+    timeout(remaining, peer_disk_health(host)).await.ok().flatten()
 }
 
 /// Handle a peer failure for server_info: return cached data if available, or
@@ -3443,6 +3979,81 @@ mod tests {
         );
 
         assert!(captured != restarted.token());
+    }
+
+    #[test]
+    fn ilm_recovery_export_member_digest_is_order_independent_and_epoch_bound() {
+        let now = Instant::now();
+        let local_epoch = ilm_recovery_export_local_process_epoch();
+        assert!(!local_epoch.is_nil());
+        assert_eq!(local_epoch, ilm_recovery_export_local_process_epoch());
+        let remote_epoch = Uuid::new_v4();
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let peers = BTreeMap::from([("node-b".to_string(), remote_epoch), ("node-a".to_string(), local_epoch)]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(peers), now).is_none());
+        let proof = {
+            let state = slot.read().expect("export proof slot should not poison");
+            acquire_ilm_recovery_export_fleet_proof_from(&state, "topology-a", now).expect("complete fleet should admit export")
+        };
+        let digest = ilm_recovery_export_member_epochs_sha256(&proof);
+
+        let changed_slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let changed = BTreeMap::from([("node-a".to_string(), local_epoch), ("node-b".to_string(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&changed_slot, "topology-a", Ok(changed), now).is_none());
+        let changed_proof = {
+            let state = changed_slot.read().expect("export proof slot should not poison");
+            acquire_ilm_recovery_export_fleet_proof_from(&state, "topology-a", now).expect("complete fleet should admit export")
+        };
+        assert_ne!(digest, ilm_recovery_export_member_epochs_sha256(&changed_proof));
+    }
+
+    #[test]
+    fn ilm_recovery_export_members_must_match_the_exact_topology() {
+        let expected_remote = vec!["node-b".to_string()];
+        let local = "node-a";
+        let complete = BTreeMap::from([
+            (local.to_string(), Uuid::new_v4()),
+            (expected_remote[0].clone(), Uuid::new_v4()),
+        ]);
+        assert!(validate_ilm_recovery_export_members(&expected_remote, local, &complete).is_ok());
+
+        let unexpected = BTreeMap::from([(local.to_string(), Uuid::new_v4()), ("node-c".to_string(), Uuid::new_v4())]);
+        assert!(validate_ilm_recovery_export_members(&expected_remote, local, &unexpected).is_err());
+        assert!(
+            validate_ilm_recovery_export_members(&[local.to_string()], local, &complete).is_err(),
+            "the configured remote set cannot repeat the local member"
+        );
+    }
+
+    #[test]
+    fn ilm_recovery_export_restart_revokes_authority_until_permit_drains() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let original = BTreeMap::from([("node-a".to_string(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(original), now).is_none());
+        let admitted = {
+            let state = slot.read().expect("export proof slot should not poison");
+            acquire_ilm_recovery_export_fleet_proof_from(&state, "topology-a", now).expect("fresh fleet should admit export")
+        };
+
+        let restarted = BTreeMap::from([("node-a".to_string(), Uuid::new_v4())]);
+        let draining = publish_fleet_capability_probe_result(&slot, "topology-a", Ok(restarted.clone()), now)
+            .expect("restart must wait for the admitted export effect window");
+        assert!(draining.to_string().contains("previous generation to drain"));
+        {
+            let state = slot.read().expect("export proof slot should not poison");
+            assert!(!ilm_recovery_export_fleet_proof_matches_at(&state, &admitted, "topology-a", now));
+            assert!(
+                acquire_ilm_recovery_export_fleet_proof_from(&state, "topology-a", now).is_none(),
+                "successor authority must wait for the old effect window to drain"
+            );
+        }
+        drop(admitted);
+        assert!(
+            publish_fleet_capability_probe_result(&slot, "topology-a", Ok(restarted), now + Duration::from_millis(1)).is_none()
+        );
+        let state = slot.read().expect("export proof slot should not poison");
+        assert!(acquire_ilm_recovery_export_fleet_proof_from(&state, "topology-a", now).is_some());
     }
 
     #[test]
@@ -4017,6 +4628,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn admin_peer_probe_timeout_rejects_zero_and_caps_large_values() {
+        assert_eq!(
+            resolve_admin_peer_probe_timeout_secs(None),
+            rustfs_config::DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_admin_peer_probe_timeout_secs(Some(0)),
+            rustfs_config::DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_admin_peer_probe_timeout_secs(Some(rustfs_config::MAX_ADMIN_PEER_PROBE_TIMEOUT_SECS + 1)),
+            rustfs_config::MAX_ADMIN_PEER_PROBE_TIMEOUT_SECS
+        );
+        assert_eq!(resolve_admin_peer_probe_timeout_secs(Some(7)), 7);
+    }
+
+    #[tokio::test]
+    async fn admin_peer_probe_health_fallback_respects_expired_deadline() {
+        let deadline = Instant::now();
+        assert!(peer_disk_health_with_deadline("peer-1", deadline).await.is_none());
+    }
+
+    #[test]
+    fn admin_peer_probe_deadline_is_shared_across_attempts() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        assert!(remaining_admin_peer_probe_timeout_at(deadline, start + Duration::from_secs(6)).is_some());
+        assert!(remaining_admin_peer_probe_timeout_at(deadline, start + Duration::from_secs(10)).is_none());
+    }
+
     #[tokio::test]
     async fn call_peer_with_timeout_returns_value_when_fast() {
         let result = call_peer_with_timeout(
@@ -4309,6 +4951,7 @@ mod tests {
             server_failures: 1,
             storage_failures: 0,
             last_storage_info: None,
+            last_storage_success: None,
         });
         let cache_b = Mutex::new(PeerAdminCache {
             last_server_info: Some(build_props("cached-b")),
@@ -4316,6 +4959,7 @@ mod tests {
             server_failures: 1,
             storage_failures: 0,
             last_storage_info: None,
+            last_storage_success: None,
         });
         let caches = [cache_a, cache_b];
         let endpoints = EndpointServerPools::from(Vec::new());
@@ -4365,15 +5009,28 @@ mod tests {
             peer_topology_hosts: Vec::new(),
         };
         let missing = sys
-            .acknowledge_scanner_dirty_usage(vec![("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7)])
+            .acknowledge_scanner_dirty_usage(vec![ScannerDirtyUsageAcknowledgement::Generation {
+                host: "peer-1".to_string(),
+                instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+                generation: 7,
+            }])
             .await
             .expect_err("a missing acknowledgement target must remain pending");
         assert!(missing.to_string().contains("peer is not reachable"));
 
         let duplicate = sys
             .acknowledge_scanner_dirty_usage(vec![
-                ("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7),
-                ("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7),
+                ScannerDirtyUsageAcknowledgement::Generation {
+                    host: "peer-1".to_string(),
+                    instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+                    generation: 7,
+                },
+                ScannerDirtyUsageAcknowledgement::Scoped {
+                    host: "peer-1".to_string(),
+                    owner_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                    instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+                    entries: Vec::new(),
+                },
             ])
             .await
             .expect_err("duplicate acknowledgement targets must be rejected");
@@ -4701,13 +5358,78 @@ mod tests {
 
     // --- Tests for handle_peer_failure / handle_server_info_failure caching ---
 
+    #[tokio::test]
+    async fn storage_info_preserves_failed_members_when_no_rpc_client_exists() {
+        #[derive(Debug)]
+        struct LocalInventory;
+
+        #[async_trait::async_trait]
+        impl StorageAdminApi for LocalInventory {
+            type BackendInfo = rustfs_madmin::BackendInfo;
+            type StorageInfo = StorageInfo;
+            type Disk = ();
+            type Error = Error;
+
+            async fn backend_info(&self) -> Self::BackendInfo {
+                Self::BackendInfo::default()
+            }
+
+            async fn storage_info(&self) -> StorageInfo {
+                panic!("aggregation must query local inventory only")
+            }
+
+            async fn local_storage_info(&self) -> StorageInfo {
+                StorageInfo::default()
+            }
+
+            async fn disk_set_inventory(
+                &self,
+                _: crate::storage_api_contracts::admin::DiskSetSelector,
+            ) -> Result<Vec<Option<Self::Disk>>> {
+                panic!("admin probe must not access the data plane")
+            }
+
+            fn set_drive_counts(&self) -> Vec<usize> {
+                Vec::new()
+            }
+        }
+
+        let sys = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: vec![None, None],
+            peer_topology_hosts: vec!["peer-unavailable".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+        };
+        let info = sys.storage_info(&LocalInventory).await;
+        let peer = info
+            .observations
+            .iter()
+            .find(|observation| observation.endpoint == "peer-unavailable")
+            .expect("failed topology member remains visible");
+        assert_eq!(peer.status, StorageInfoProbeStatus::Failed);
+        assert!(!peer.cached);
+        assert_eq!(peer.error_code.as_deref(), Some("RemoteClientUnavailable"));
+        assert!(
+            info.observations
+                .iter()
+                .any(|observation| observation.status == StorageInfoProbeStatus::Succeeded)
+        );
+    }
+
     #[test]
-    fn handle_peer_failure_first_failure_returns_none_when_no_cache() {
+    fn handle_peer_failure_first_failure_reports_unknown_inventory_without_cache() {
         let cache = Mutex::new(PeerAdminCache::new());
         let endpoints = EndpointServerPools::default();
 
-        let result = handle_peer_failure(Some(&cache), "peer-1", &endpoints);
-        assert!(result.is_none());
+        let result = handle_peer_failure(Some(&cache), "peer-1", &endpoints, &Error::Timeout);
+        let info = result.expect("failed peer must remain visible without cached disks");
+        assert!(info.disks.is_empty());
+        assert_eq!(info.observations[0].status, StorageInfoProbeStatus::Failed);
+        assert!(!info.observations[0].cached);
+        assert_eq!(info.observations[0].last_success_unix_millis, None);
+        assert_eq!(info.observations[0].snapshot_age_seconds, None);
+        assert_eq!(info.observations[0].error_code.as_deref(), Some("Timeout"));
         assert_eq!(cache.lock().unwrap().storage_failures, 1);
     }
 
@@ -4724,6 +5446,7 @@ mod tests {
 
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: Some(cached_info),
+            last_storage_success: Some((SystemTime::now(), Instant::now())),
             last_server_info: None,
             storage_failures: 0,
             server_failures: 0,
@@ -4731,11 +5454,17 @@ mod tests {
         });
         let endpoints = EndpointServerPools::default();
 
-        // First failure: should return cached data
-        let result = handle_peer_failure(Some(&cache), "peer-1", &endpoints);
+        // Historical inventory is available, but its health is not live.
+        let result = handle_peer_failure(Some(&cache), "peer-1", &endpoints, &Error::Timeout);
         let info = result.unwrap();
         assert_eq!(info.disks.len(), 1);
-        assert_eq!(info.disks[0].state, "ok");
+        assert_eq!(info.disks[0].state, "unknown");
+        assert_eq!(info.disks[0].runtime_state.as_deref(), Some("unknown"));
+        assert_eq!(info.disks[0].capacity_observation_source.as_deref(), Some("snapshot"));
+        assert_eq!(info.disks[0].capacity_observation_age_seconds, None);
+        assert!(info.observations[0].cached);
+        assert_eq!(info.observations[0].status, StorageInfoProbeStatus::Failed);
+        assert!(info.observations[0].last_success_unix_millis.is_some());
         assert_eq!(cache.lock().unwrap().storage_failures, 1);
     }
 
@@ -4781,13 +5510,13 @@ mod tests {
         );
         drop(cached);
 
-        let degraded = handle_peer_failure(Some(&cache), "peer-1", &EndpointServerPools::default())
+        let degraded = handle_peer_failure(Some(&cache), "peer-1", &EndpointServerPools::default(), &Error::Timeout)
             .expect("first peer failure must return the cached snapshot");
         assert!(degraded.disks.iter().all(|disk| !disk.local));
     }
 
     #[test]
-    fn handle_peer_failure_returns_offline_after_threshold_exceeded() {
+    fn handle_peer_failure_cache_age_does_not_depend_on_poll_count() {
         let cached_info = StorageInfo {
             disks: vec![rustfs_madmin::Disk {
                 endpoint: "disk-0".to_string(),
@@ -4799,6 +5528,7 @@ mod tests {
 
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: Some(cached_info),
+            last_storage_success: Some((SystemTime::now(), Instant::now())),
             last_server_info: None,
             storage_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
             server_failures: 0,
@@ -4806,10 +5536,31 @@ mod tests {
         });
         let endpoints = EndpointServerPools::default();
 
-        // This failure pushes us to the threshold => offline
-        let result = handle_peer_failure(Some(&cache), "peer-1", &endpoints);
-        assert!(result.is_some());
-        assert_eq!(cache.lock().unwrap().storage_failures, CONSECUTIVE_FAILURE_THRESHOLD);
+        for _ in 0..10 {
+            let info = handle_peer_failure(Some(&cache), "peer-1", &endpoints, &Error::Timeout).expect("failed probe");
+            assert_eq!(info.disks.len(), 1);
+            assert_eq!(info.disks[0].state, "unknown");
+            assert!(info.observations[0].cached);
+        }
+        cache.lock().expect("age cache").last_storage_success =
+            Some((SystemTime::now() - Duration::from_secs(61), Instant::now() - Duration::from_secs(61)));
+        let info = handle_peer_failure(Some(&cache), "peer-1", &endpoints, &Error::Timeout).expect("expired probe");
+        assert!(!info.observations[0].cached);
+        assert!(info.observations[0].snapshot_age_seconds.expect("known last success") >= 61);
+        assert!(info.disks.is_empty(), "expired inventory must not be reused");
+
+        let mut recovered = StorageInfo {
+            disks: vec![rustfs_madmin::Disk {
+                state: "ok".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        normalize_and_cache_peer_storage_info(Some(&cache), "peer-1", &mut recovered);
+        assert_eq!(recovered.disks[0].state, "ok");
+        assert_eq!(recovered.observations[0].status, StorageInfoProbeStatus::Succeeded);
+        assert!(!recovered.observations[0].cached);
+        assert_eq!(cache.lock().expect("recovered cache").storage_failures, 0);
     }
 
     #[test]
@@ -4822,6 +5573,7 @@ mod tests {
 
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: Some(cached_props),
             storage_failures: 0,
             server_failures: 0,
@@ -4852,6 +5604,7 @@ mod tests {
 
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: Some(cached_props),
             storage_failures: 0,
             server_failures: 0,
@@ -4979,6 +5732,7 @@ mod tests {
 
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: Some(cached_props),
             storage_failures: 0,
             server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
@@ -4998,6 +5752,7 @@ mod tests {
         // the real per-drive health), not offline (rustfs/backlog#1049 P0-B).
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: None,
             storage_failures: 0,
             server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
@@ -5026,6 +5781,7 @@ mod tests {
         // this is a genuine offline, degraded must not mask it.
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: None,
             storage_failures: 0,
             server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
@@ -5049,6 +5805,7 @@ mod tests {
     fn success_resets_failure_counters_independently() {
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: None,
             storage_failures: 2,
             server_failures: 2,
@@ -5070,6 +5827,7 @@ mod tests {
     fn storage_failures_do_not_affect_server_failures() {
         let cache = Mutex::new(PeerAdminCache {
             last_storage_info: Some(StorageInfo::default()),
+            last_storage_success: None,
             last_server_info: Some(ServerProperties {
                 endpoint: "peer-1".to_string(),
                 state: "online".to_string(),
@@ -5081,7 +5839,7 @@ mod tests {
         });
         let endpoints = EndpointServerPools::default();
 
-        let storage_result = handle_peer_failure(Some(&cache), "peer-1", &endpoints);
+        let storage_result = handle_peer_failure(Some(&cache), "peer-1", &endpoints, &Error::Timeout);
         assert!(storage_result.is_some());
 
         let server_result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints, None);
@@ -5104,8 +5862,10 @@ mod tests {
             panic!("poison server cache mutex");
         });
 
-        let storage_result = handle_peer_failure(Some(&storage_cache), "peer-1", &endpoints);
-        assert!(storage_result.is_none());
+        let storage_result = handle_peer_failure(Some(&storage_cache), "peer-1", &endpoints, &Error::Timeout);
+        let storage = storage_result.expect("poisoned cache must still report the failed peer");
+        assert_eq!(storage.observations[0].status, StorageInfoProbeStatus::Failed);
+        assert!(!storage.observations[0].cached);
 
         let server_result = handle_server_info_failure(Some(&server_cache), "peer-1", &endpoints, None);
         assert_eq!(server_result.endpoint, "peer-1");
@@ -5116,6 +5876,7 @@ mod tests {
     fn poisoned_admin_cache_recovers_on_success_and_resets_failures() {
         let storage_cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: None,
             storage_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
             server_failures: 0,
@@ -5123,6 +5884,7 @@ mod tests {
         });
         let server_cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
+            last_storage_success: None,
             last_server_info: None,
             storage_failures: 0,
             server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
@@ -5161,9 +5923,11 @@ mod tests {
             },
         );
 
-        let storage_result = handle_peer_failure(Some(&storage_cache), "peer-1", &endpoints);
+        let storage_result = handle_peer_failure(Some(&storage_cache), "peer-1", &endpoints, &Error::Timeout);
         assert!(storage_result.is_some());
-        assert_eq!(storage_result.unwrap().disks[0].state, "ok");
+        let storage = storage_result.expect("failed probe after recovery");
+        assert_eq!(storage.disks[0].state, "unknown");
+        assert!(storage.observations[0].cached);
 
         let server_result = handle_server_info_failure(Some(&server_cache), "peer-1", &endpoints, None);
         assert_eq!(server_result.state, "online");

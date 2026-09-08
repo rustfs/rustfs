@@ -241,10 +241,7 @@ impl AdaptiveTTL {
         // 1. Item is cold (low access count)
         // 2. Age is significant (> 50% of TTL)
         // 3. No recent accesses
-        if access_count <= self.cold_threshold && age > current_ttl / 2 {
-            return true;
-        }
-        false
+        access_count <= self.cold_threshold && age > current_ttl / 2
     }
 
     /// Calculate priority score for an item.

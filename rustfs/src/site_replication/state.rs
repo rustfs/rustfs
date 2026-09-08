@@ -64,6 +64,104 @@ pub(crate) struct SiteReplicationState {
     /// newer edit that already landed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) applied_edit_generations: BTreeMap<String, u64>,
+    /// Source timestamp of the newest IAM deletion committed on this site,
+    /// keyed by the deleted entity (`iam_item_deletion_mark_entities`). A
+    /// deletion leaves no local record to judge a later item against, so this
+    /// is what lets the receive-side staleness gate reject a grant that is
+    /// older than the revoke it would otherwise undo (backlog#2291). Marks
+    /// are kept for [`SITE_REPLICATION_IAM_DELETION_MARK_RETENTION`] and never
+    /// evicted by count: see that constant for why a count bound would open
+    /// exactly the window the marks exist to close.
+    #[serde(default, with = "rfc3339_map", skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) iam_deletion_marks: BTreeMap<String, OffsetDateTime>,
+}
+
+/// How long an IAM deletion mark outlives the deletion it records.
+///
+/// A mark fences the delivery paths that can still carry an older grant for
+/// the deleted entity: a live delivery delayed in transit, the same grant
+/// arriving on a sibling node while the revoke is being applied, and a
+/// snapshot (bootstrap / repair / resend) built by a peer that has not yet
+/// received the deletion — which is bounded by this site's own retry queue
+/// towards that peer, whose backoff tops out at one day
+/// (`SITE_REPLICATION_RETRY_DRAIN_MAX_BACKOFF_SECS`). The retry drain itself
+/// never replays a stale grant: it resends snapshots of the current records
+/// and the recorded deletion bodies. Thirty days is an order of magnitude
+/// beyond every one of those windows. Marks are pruned by age only — a count
+/// bound would drop a mark that is still inside the delivery window as soon
+/// as enough newer deletions happen, letting the delayed grant re-create the
+/// entity, which is the very hole the marks close.
+pub(crate) const SITE_REPLICATION_IAM_DELETION_MARK_RETENTION: time::Duration = time::Duration::days(30);
+
+/// Record that deletions of `entities` with source timestamp `deleted_at`
+/// were committed here. Newest wins per entity: an older deletion never
+/// lowers a mark. Marks older than the retention are pruned in the same
+/// pass. Returns whether the state changed.
+pub(crate) fn record_iam_deletion_marks(
+    state: &mut SiteReplicationState,
+    entities: &[String],
+    deleted_at: OffsetDateTime,
+) -> bool {
+    record_iam_deletion_marks_at(state, entities, deleted_at, OffsetDateTime::now_utc())
+}
+
+/// [`record_iam_deletion_marks`] pruning against an explicit `now`.
+pub(crate) fn record_iam_deletion_marks_at(
+    state: &mut SiteReplicationState,
+    entities: &[String],
+    deleted_at: OffsetDateTime,
+    now: OffsetDateTime,
+) -> bool {
+    let mut changed = false;
+    for entity in entities {
+        if state
+            .iam_deletion_marks
+            .get(entity)
+            .is_some_and(|existing| *existing >= deleted_at)
+        {
+            continue;
+        }
+        state.iam_deletion_marks.insert(entity.clone(), deleted_at);
+        changed = true;
+    }
+    let expired_before = now - SITE_REPLICATION_IAM_DELETION_MARK_RETENTION;
+    let before = state.iam_deletion_marks.len();
+    state.iam_deletion_marks.retain(|_, deleted_at| *deleted_at >= expired_before);
+    changed || state.iam_deletion_marks.len() != before
+}
+
+/// Newest deletion mark among `entities`, or `None` when no deletion of any
+/// of them was recorded here. The receive-side staleness gate feeds this in
+/// as the local timestamp when the targeted record is absent.
+pub(crate) fn iam_deletion_mark(state: &SiteReplicationState, entities: &[String]) -> Option<OffsetDateTime> {
+    entities
+        .iter()
+        .filter_map(|entity| state.iam_deletion_marks.get(entity).copied())
+        .max()
+}
+
+/// RFC 3339 map values, matching the other timestamps in the state object
+/// (`time::serde::rfc3339` only applies to a single field).
+mod rfc3339_map {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+    use time::OffsetDateTime;
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(transparent)]
+    struct Stamp(#[serde(with = "time::serde::rfc3339")] OffsetDateTime);
+
+    pub(super) fn serialize<S: Serializer>(map: &BTreeMap<String, OffsetDateTime>, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(map.iter().map(|(entity, deleted_at)| (entity, Stamp(*deleted_at))))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<String, OffsetDateTime>, D::Error> {
+        let map = BTreeMap::<String, Stamp>::deserialize(deserializer)?;
+        Ok(map
+            .into_iter()
+            .map(|(entity, Stamp(deleted_at))| (entity, deleted_at))
+            .collect())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -321,6 +419,33 @@ where
     F: FnOnce(&mut SiteReplicationState) -> S3Result<T> + Send + 'static,
 {
     update_site_replication_state_when_changed(move |state| update(state).map(StateCommit::Changed)).await
+}
+
+/// The state transaction for work that has to await inside it: an IAM write
+/// that must be ordered with the staleness verdict taken before it and the
+/// deletion mark committed after it (backlog#2291). Same boundary as
+/// [`update_site_replication_state`] — load and persist under the
+/// distributed state-object write lock, so two nodes of this site cannot
+/// interleave their verdicts and writes — and the same rules inside: no peer
+/// network calls and no other config locks. The closure hands the state back
+/// as `Some` when it changed it; `None` skips the write.
+pub(crate) async fn with_site_replication_state_transaction<T, F, Fut>(transaction: F) -> S3Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(SiteReplicationState) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = S3Result<(T, Option<SiteReplicationState>)>> + Send + 'static,
+{
+    with_site_replication_state_lock(move || async move {
+        let store = current_object_store_handle()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
+        let state = load_site_replication_state_no_lock(store.clone()).await?;
+        let (result, changed) = transaction(state).await?;
+        if let Some(state) = changed {
+            persist_site_replication_state_no_lock(store, state).await?;
+        }
+        Ok(result)
+    })
+    .await
 }
 
 /// [`update_site_replication_state`] for closures that may find nothing to

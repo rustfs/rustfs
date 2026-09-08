@@ -103,8 +103,13 @@ pub(crate) use rustfs_ecstore::api::rebalance::{
     RebalStatus as EcstoreRebalStatus, RebalanceInfo as EcstoreRebalanceInfo, RebalanceMeta as EcstoreRebalanceMeta,
     RebalanceStats as EcstoreRebalanceStats,
 };
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::rpc::ScannerPeerDirtyUsageBucket as EcstoreScannerPeerDirtyUsageBucket;
 pub(crate) use rustfs_ecstore::api::rpc::{
-    ScannerBucketListing as EcstoreScannerBucketListing, ScannerPeerDirtyUsageSnapshot as EcstoreScannerPeerDirtyUsageSnapshot,
+    ScannerBucketListing as EcstoreScannerBucketListing,
+    ScannerDirtyUsageAcknowledgement as EcstoreScannerDirtyUsageAcknowledgement,
+    ScannerPeerDirtyUsageSnapshot as EcstoreScannerPeerDirtyUsageSnapshot,
+    ScannerScopedDirtyUsageAckEntry as EcstoreScannerScopedDirtyUsageAckEntry,
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::runtime::InstanceContext as EcstoreInstanceContext;
@@ -126,7 +131,13 @@ pub(crate) use rustfs_lifecycle::{
 };
 use rustfs_storage_api as storage_contracts;
 
+#[cfg(test)]
+pub(crate) type EcstoreHealResultItem = <EcstoreStore as storage_contracts::HealOperations>::HealResultItem;
+
 pub(crate) mod owner {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::set_disk::test_util::hold_namespace_commit as ecstore_hold_namespace_commit;
+
     pub(crate) use super::storage_contracts::{
         HTTPPreconditions, HTTPRangeSpec, NS_SCANNER_PROTOCOL_VERSION, ObjectIO, ObjectOperations, ObjectToDelete,
     };
@@ -309,6 +320,7 @@ pub(crate) mod scan {
     pub use super::storage_contracts::{
         SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES,
         SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
+        SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES,
     };
 }
 
@@ -343,6 +355,13 @@ pub(crate) trait ScannerStorage:
     async fn list_bucket_for_scanner(&self, opts: &storage_contracts::BucketOptions) -> EcstoreResultType<ScannerBucketListing>;
     fn all_set_disks(&self) -> Vec<Arc<EcstoreSetDisks>>;
     async fn scanner_pause_backlog_writable_set_disks(&self) -> Vec<Arc<EcstoreSetDisks>>;
+    async fn save_scanner_pause_backlog_replica(
+        self: Arc<Self>,
+        pool_index: usize,
+        set_index: usize,
+        data: Vec<u8>,
+        preconditions: storage_contracts::HTTPPreconditions,
+    ) -> EcstoreResultType<()>;
     #[cfg(test)]
     fn scanner_observed_probe_store_key(&self) -> usize;
 }
@@ -403,6 +422,18 @@ impl ScannerStorage for EcstoreStore {
 
     async fn scanner_pause_backlog_writable_set_disks(&self) -> Vec<Arc<EcstoreSetDisks>> {
         EcstoreStore::scanner_pause_backlog_writable_set_disks(self).await
+    }
+
+    async fn save_scanner_pause_backlog_replica(
+        self: Arc<Self>,
+        pool_index: usize,
+        set_index: usize,
+        data: Vec<u8>,
+        preconditions: storage_contracts::HTTPPreconditions,
+    ) -> EcstoreResultType<()> {
+        EcstoreStore::save_scanner_pause_backlog_replica(&self, pool_index, set_index, data, preconditions)
+            .await
+            .map(|_| ())
     }
 
     #[cfg(test)]
@@ -563,6 +594,20 @@ mod tests {
 
         async fn scanner_pause_backlog_writable_set_disks(&self) -> Vec<Arc<EcstoreSetDisks>> {
             Vec::new()
+        }
+
+        async fn save_scanner_pause_backlog_replica(
+            self: Arc<Self>,
+            _pool_index: usize,
+            _set_index: usize,
+            _data: Vec<u8>,
+            _preconditions: storage_contracts::HTTPPreconditions,
+        ) -> EcstoreResultType<()> {
+            Err(EcstoreErrorType::InvalidArgument(
+                "scanner-backlog".into(),
+                "replica".into(),
+                "fake storage has no writable replicas".into(),
+            ))
         }
 
         fn scanner_observed_probe_store_key(&self) -> usize {

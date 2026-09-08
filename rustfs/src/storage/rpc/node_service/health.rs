@@ -268,6 +268,7 @@ mod tests {
                 drives_per_set: vec![4, 4],
                 ..Default::default()
             },
+            ..Default::default()
         };
 
         let encoded = encode_msgpack_map(&info).expect("storage info should serialize");

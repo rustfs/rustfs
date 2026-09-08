@@ -385,7 +385,14 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn set_policy(&self, name: &str, policy: Policy) -> Result<OffsetDateTime> {
-        let updated_at = self.store.set_policy(name, policy).await?;
+        self.set_policy_at(name, policy, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::set_policy`] stamping the document with `updated_at` (a
+    /// replicated edit's source time) instead of the local clock; see
+    /// `IamCache::set_policy_at` (backlog#2291).
+    pub async fn set_policy_at(&self, name: &str, policy: Policy, updated_at: OffsetDateTime) -> Result<OffsetDateTime> {
+        let updated_at = self.store.set_policy_at(name, policy, updated_at).await?;
 
         if !self.has_watcher() {
             for r in notify_iam_load_policy(name).await {
@@ -643,7 +650,18 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn set_user_status(&self, name: &str, status: rustfs_madmin::AccountStatus) -> Result<OffsetDateTime> {
-        let updated_at = self.store.set_user_status(name, status).await?;
+        self.set_user_status_at(name, status, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::set_user_status`] stamping the identity with `updated_at` (a
+    /// replicated edit's source time) instead of the local clock (backlog#2291).
+    pub async fn set_user_status_at(
+        &self,
+        name: &str,
+        status: rustfs_madmin::AccountStatus,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
+        let updated_at = self.store.set_user_status_at(name, status, updated_at).await?;
 
         self.notify_for_user(name, false).await;
 
@@ -655,6 +673,20 @@ impl<T: Store> IamSys<T> {
         parent_user: &str,
         groups: Option<Vec<String>>,
         opts: NewServiceAccountOpts,
+    ) -> Result<(Credentials, OffsetDateTime)> {
+        self.new_service_account_at(parent_user, groups, opts, OffsetDateTime::now_utc())
+            .await
+    }
+
+    /// [`Self::new_service_account`] stamping the identity with `updated_at`
+    /// (a replicated edit's source time) instead of the local clock
+    /// (backlog#2291).
+    pub async fn new_service_account_at(
+        &self,
+        parent_user: &str,
+        groups: Option<Vec<String>>,
+        opts: NewServiceAccountOpts,
+        updated_at: OffsetDateTime,
     ) -> Result<(Credentials, OffsetDateTime)> {
         if parent_user.is_empty() {
             return Err(IamError::InvalidArgument);
@@ -724,11 +756,18 @@ impl<T: Store> IamSys<T> {
         let mut cred = create_new_credentials_with_metadata(&access_key, &secret_key, &m, &secret_key)?;
         cred.parent_user = parent_user.to_owned();
         cred.groups = groups;
-        cred.status = ACCOUNT_ON.to_owned();
+        // The status is part of the created identity: a replicated disabled
+        // account must never exist enabled, not even between a create and a
+        // follow-up status write (backlog#2289).
+        cred.status = opts
+            .status
+            .as_deref()
+            .map_or(ACCOUNT_ON, crate::manager::account_status_flag)
+            .to_owned();
         cred.name = opts.name;
         cred.description = opts.description;
 
-        let create_at = self.store.add_service_account(cred.clone()).await?;
+        let create_at = self.store.add_service_account_at(cred.clone(), updated_at).await?;
 
         self.notify_for_service_account(&cred.access_key).await;
 
@@ -736,11 +775,23 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn update_service_account(&self, name: &str, opts: UpdateServiceAccountOpts) -> Result<OffsetDateTime> {
+        self.update_service_account_at(name, opts, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::update_service_account`] stamping the identity with
+    /// `updated_at` (a replicated edit's source time) instead of the local
+    /// clock (backlog#2291).
+    pub async fn update_service_account_at(
+        &self,
+        name: &str,
+        opts: UpdateServiceAccountOpts,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
         if name == SITE_REPLICATOR_SERVICE_ACCOUNT && !opts.allow_site_replicator_account {
             return Err(IamError::IAMActionNotAllowed);
         }
 
-        let updated_at = self.store.update_service_account(name, opts).await?;
+        let updated_at = self.store.update_service_account_at(name, opts, updated_at).await?;
 
         self.notify_for_service_account(name).await;
 
@@ -940,6 +991,17 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn create_user(&self, access_key: &str, args: &AddOrUpdateUserReq) -> Result<OffsetDateTime> {
+        self.create_user_at(access_key, args, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::create_user`] stamping the identity with `updated_at` (a
+    /// replicated edit's source time) instead of the local clock (backlog#2291).
+    pub async fn create_user_at(
+        &self,
+        access_key: &str,
+        args: &AddOrUpdateUserReq,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
         if !is_access_key_valid(access_key) {
             return Err(IamError::InvalidAccessKeyLength);
         }
@@ -952,7 +1014,7 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::InvalidSecretKeyLength);
         }
 
-        let updated_at = self.store.add_user(access_key, args).await?;
+        let updated_at = self.store.add_user_at(access_key, args, updated_at).await?;
         self.load_user(access_key, UserType::Reg).await?;
 
         self.notify_for_user(access_key, false).await;
@@ -1026,10 +1088,21 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn add_users_to_group(&self, group: &str, users: Vec<String>) -> Result<OffsetDateTime> {
+        self.add_users_to_group_at(group, users, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::add_users_to_group`] stamping the group with `updated_at` (a
+    /// replicated edit's source time) instead of the local clock (backlog#2291).
+    pub async fn add_users_to_group_at(
+        &self,
+        group: &str,
+        users: Vec<String>,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
         if contains_reserved_chars(group) {
             return Err(IamError::GroupNameContainsReservedChars);
         }
-        let updated_at = self.store.add_users_to_group(group, users).await?;
+        let updated_at = self.store.add_users_to_group_at(group, users, updated_at).await?;
 
         self.notify_for_group(group).await;
 
@@ -1037,7 +1110,19 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn remove_users_from_group(&self, group: &str, users: Vec<String>) -> Result<OffsetDateTime> {
-        let updated_at = self.store.remove_users_from_group(group, users).await?;
+        self.remove_users_from_group_at(group, users, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::remove_users_from_group`] stamping the group with `updated_at`
+    /// (a replicated edit's source time) instead of the local clock
+    /// (backlog#2291).
+    pub async fn remove_users_from_group_at(
+        &self,
+        group: &str,
+        users: Vec<String>,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
+        let updated_at = self.store.remove_users_from_group_at(group, users, updated_at).await?;
 
         self.notify_for_group(group).await;
 
@@ -1045,7 +1130,13 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn set_group_status(&self, group: &str, enable: bool) -> Result<OffsetDateTime> {
-        let updated_at = self.store.set_group_status(group, enable).await?;
+        self.set_group_status_at(group, enable, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::set_group_status`] stamping the group with `updated_at` (a
+    /// replicated edit's source time) instead of the local clock (backlog#2291).
+    pub async fn set_group_status_at(&self, group: &str, enable: bool, updated_at: OffsetDateTime) -> Result<OffsetDateTime> {
+        let updated_at = self.store.set_group_status_at(group, enable, updated_at).await?;
 
         self.notify_for_group(group).await;
 
@@ -1053,6 +1144,22 @@ impl<T: Store> IamSys<T> {
     }
     pub async fn get_group_description(&self, group: &str) -> Result<GroupDesc> {
         self.store.get_group_description(group).await
+    }
+
+    /// The stored group record itself (see `IamCache::get_group_info`).
+    pub async fn get_group_info(&self, group: &str) -> Option<GroupInfo> {
+        self.store.get_group_info(group).await
+    }
+
+    /// The stored policy document, `Error::NoSuchPolicy` when absent.
+    pub async fn get_policy_doc(&self, name: &str) -> Result<PolicyDoc> {
+        self.store.get_policy_doc(name).await
+    }
+
+    /// The stored mapping record for one user or group (see
+    /// `IamCache::get_mapped_policy_record`).
+    pub async fn get_mapped_policy_record(&self, name: &str, user_type: UserType, is_group: bool) -> Option<MappedPolicy> {
+        self.store.get_mapped_policy_record(name, user_type, is_group).await
     }
 
     pub async fn list_groups_load(&self) -> Result<Vec<String>> {
@@ -1064,7 +1171,24 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn policy_db_set(&self, name: &str, user_type: UserType, is_group: bool, policy: &str) -> Result<OffsetDateTime> {
-        let updated_at = self.store.policy_db_set(name, user_type, is_group, policy).await?;
+        self.policy_db_set_at(name, user_type, is_group, policy, OffsetDateTime::now_utc())
+            .await
+    }
+
+    /// [`Self::policy_db_set`] stamping the mapping with `updated_at` (a
+    /// replicated edit's source time) instead of the local clock (backlog#2291).
+    pub async fn policy_db_set_at(
+        &self,
+        name: &str,
+        user_type: UserType,
+        is_group: bool,
+        policy: &str,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
+        let updated_at = self
+            .store
+            .policy_db_set_at(name, user_type, is_group, policy, updated_at)
+            .await?;
 
         if !self.has_watcher() {
             for r in notify_iam_load_policy_mapping(name, user_type.to_u64(), is_group).await {
@@ -1846,6 +1970,11 @@ pub struct NewServiceAccountOpts {
     pub expiration: Option<OffsetDateTime>,
     pub allow_site_replicator_account: bool,
     pub claims: Option<HashMap<String, Value>>,
+    /// Status the account is created with (`enabled` / `disabled` or the
+    /// stored `on` / `off` flags); `None` creates it enabled. Site
+    /// replication passes the source account's status so a disabled account
+    /// is never enabled on the peer, not even transiently (backlog#2289).
+    pub status: Option<String>,
 }
 
 pub struct UpdateServiceAccountOpts {
@@ -2081,6 +2210,9 @@ mod tests {
         block_delete: Arc<std::sync::atomic::AtomicBool>,
         delete_started: Arc<tokio::sync::Notify>,
         release_delete: Arc<tokio::sync::Notify>,
+        block_group_save: Arc<std::sync::atomic::AtomicBool>,
+        group_save_started: Arc<tokio::sync::Notify>,
+        group_save_release: Arc<tokio::sync::Notify>,
     }
 
     impl StsTestMockStore {
@@ -2094,6 +2226,9 @@ mod tests {
                 block_delete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 delete_started: Arc::new(tokio::sync::Notify::new()),
                 release_delete: Arc::new(tokio::sync::Notify::new()),
+                block_group_save: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                group_save_started: Arc::new(tokio::sync::Notify::new()),
+                group_save_release: Arc::new(tokio::sync::Notify::new()),
             }
         }
 
@@ -2197,11 +2332,15 @@ mod tests {
         }
 
         async fn save_group_info(&self, _name: &str, _item: GroupInfo) -> Result<()> {
-            Err(Error::InvalidArgument)
+            if self.block_group_save.load(std::sync::atomic::Ordering::SeqCst) {
+                self.group_save_started.notify_one();
+                self.group_save_release.notified().await;
+            }
+            Ok(())
         }
 
         async fn delete_group_info(&self, _name: &str) -> Result<()> {
-            Err(Error::InvalidArgument)
+            Ok(())
         }
 
         async fn load_group(&self, name: &str, m: &mut HashMap<String, GroupInfo>) -> Result<()> {
@@ -2376,6 +2515,140 @@ mod tests {
         let store = StsTestMockStore::new(false);
         let cache = IamCache::new(store).await.expect("IAM cache should initialize");
         IamSys::new(cache)
+    }
+
+    async fn assert_group_write_during_reload_is_published(remove: bool) {
+        let iam_sys = Arc::new(temp_env::async_with_vars([("RUSTFS_SKIP_BACKGROUND_TASK", Some("1"))], test_iam_sys()).await);
+        let member = "sts-fallback-test-parent";
+        let group = if remove { "testgroup" } else { "new-published-group" };
+        let source_time = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        iam_sys
+            .store
+            .api
+            .block_group_save
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let before = iam_sys.store.cache.snapshot();
+        let writer_iam = iam_sys.clone();
+        let writer = tokio::spawn(async move {
+            if remove {
+                writer_iam
+                    .remove_users_from_group_at(group, vec![member.to_string()], source_time)
+                    .await
+            } else {
+                writer_iam
+                    .add_users_to_group_at(group, vec![member.to_string()], source_time)
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), iam_sys.store.api.group_save_started.notified())
+            .await
+            .expect("group save should reach the barrier");
+        // The pending store write has not changed the cache, so the production
+        // full-reload snapshot guard permits this replacement.
+        assert!(iam_sys.store.cache.with_write_lock(|cache| cache.matches_snapshot(&before)));
+        iam_sys
+            .store
+            .api
+            .load_all(&iam_sys.store.cache)
+            .await
+            .expect("reload while group save is pending");
+        iam_sys.store.api.group_save_release.notify_one();
+        assert_eq!(writer.await.expect("join group writer").expect("group write should succeed"), source_time);
+        let info = iam_sys
+            .get_group_info(group)
+            .await
+            .expect("successful group write must remain readable after reload");
+        assert_eq!(info.update_at, Some(source_time), "source timestamp must remain on the record");
+        assert_eq!(info.members, if remove { Vec::new() } else { vec![member.to_string()] });
+        let groups = iam_sys.store.cache.snapshot().user_group_memberships.get(member).cloned();
+        assert_eq!(
+            groups.is_some_and(|groups| groups.contains(group)),
+            !remove,
+            "membership index must reflect the write"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn add_group_write_during_reload_publishes_after_store_save() {
+        assert_group_write_during_reload_is_published(false).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn remove_group_write_during_reload_publishes_after_store_save() {
+        assert_group_write_during_reload_is_published(true).await;
+    }
+
+    /// Review finding on rustfs#7195: a replicated group edit carries a source
+    /// stamp that may predate this node's cache load time. The stamp belongs on
+    /// the record only; publishing the cache with it makes `LockedCache::exec`
+    /// drop the write, so the group is written to the store but unreadable
+    /// here and the receiver's next `set_group_status_at` fails with
+    /// `NoSuchGroup`. Add, status and removal must all publish with the local
+    /// clock while keeping the source stamp on `GroupInfo::update_at`.
+    #[tokio::test]
+    async fn group_writes_stamped_before_the_cache_load_time_still_publish() {
+        let iam_sys = test_iam_sys().await;
+        let member = "group-stamp-member";
+        let identity = UserIdentity {
+            version: 1,
+            credentials: Credentials {
+                access_key: member.to_string(),
+                secret_key: "longenoughsecret".to_string(),
+                status: "on".to_string(),
+                ..Default::default()
+            },
+            update_at: Some(OffsetDateTime::now_utc()),
+        };
+        iam_sys.store.cache.with_write_lock(|cache| {
+            cache.add_or_update_user(member, &identity, OffsetDateTime::now_utc());
+            // The startup load publishes every entity with the load time.
+            cache.replace_groups(CacheEntity::new(HashMap::new()));
+            cache.replace_user_group_memberships(CacheEntity::new(HashMap::new()));
+        });
+
+        let group = "group-stamp";
+        let source_time = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let stamped = iam_sys
+            .add_users_to_group_at(group, vec![member.to_string()], source_time)
+            .await
+            .expect("add members with a source stamp older than the cache load");
+        assert_eq!(stamped, source_time, "the returned stamp is the source time");
+        let info = iam_sys
+            .get_group_info(group)
+            .await
+            .expect("the group must be readable right after the add");
+        assert_eq!(info.members, vec![member.to_string()]);
+        assert_eq!(info.update_at, Some(source_time), "the record keeps the source stamp");
+        let memberships = iam_sys.store.cache.snapshot().user_group_memberships.get(member).cloned();
+        assert!(
+            memberships.is_some_and(|groups| groups.contains(group)),
+            "the membership index is published too"
+        );
+
+        let disabled_at = source_time + time::Duration::seconds(1);
+        iam_sys
+            .set_group_status_at(group, false, disabled_at)
+            .await
+            .expect("status change with a source stamp older than the cache load");
+        let info = iam_sys.get_group_info(group).await.expect("group after status change");
+        assert_eq!(info.status, "disabled");
+        assert_eq!(info.update_at, Some(disabled_at));
+
+        let removed_at = source_time + time::Duration::seconds(2);
+        iam_sys
+            .remove_users_from_group_at(group, vec![member.to_string()], removed_at)
+            .await
+            .expect("removal with a source stamp older than the cache load");
+        let info = iam_sys.get_group_info(group).await.expect("group after removal");
+        assert!(info.members.is_empty(), "the removal must be visible in the cache");
+        assert_eq!(info.update_at, Some(removed_at));
+        let memberships = iam_sys.store.cache.snapshot().user_group_memberships.get(member).cloned();
+        assert!(
+            !memberships.is_some_and(|groups| groups.contains(group)),
+            "the membership index follows the removal"
+        );
     }
 
     fn service_account_opts(access_key: &str, secret_key: &str) -> NewServiceAccountOpts {

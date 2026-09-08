@@ -38,6 +38,16 @@ use uuid::Uuid;
 
 const UNLOCK_RETRY_ATTEMPTS: usize = 3;
 const UNLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+/// Slow retry schedule for unlocks that survive the fast retry loop. Lock RPC
+/// timeouts under load are transient (issue #7363); giving up after three
+/// quick attempts left orphaned entries for the server lease to expire.
+const DEFERRED_UNLOCK_BACKOFF: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+];
 const LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const LOCK_ACQUIRE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
 const LOCK_ACQUIRE_SPARE_HEDGES: usize = 1;
@@ -719,22 +729,7 @@ impl DistributedLock {
         let mut pending = entries;
 
         for attempt in 1..=UNLOCK_RETRY_ATTEMPTS {
-            let release_results = join_all(pending.into_iter().map(|(lock_id, client)| async move {
-                match client.release(&lock_id).await {
-                    Ok(true) => None,
-                    Ok(false) => {
-                        warn!(%lock_id, attempt, context, "distributed unlock did not find lock on client");
-                        Some((lock_id, client))
-                    }
-                    Err(err) => {
-                        warn!(%lock_id, attempt, context, "distributed unlock failed on client: {}", err);
-                        Some((lock_id, client))
-                    }
-                }
-            }))
-            .await;
-
-            pending = release_results.into_iter().flatten().collect();
+            pending = Self::release_pending_once(pending, attempt, context).await;
             if pending.is_empty() {
                 debug!(attempt, context, "distributed unlock completed");
                 return;
@@ -749,7 +744,54 @@ impl DistributedLock {
             remaining = pending.len(),
             attempts = UNLOCK_RETRY_ATTEMPTS,
             context,
-            "distributed unlock left unreleased entries after retry"
+            "distributed unlock left unreleased entries after retry; continuing with deferred retries"
+        );
+        Self::release_entries_deferred(pending, context).await;
+    }
+
+    async fn release_pending_once(
+        pending: Vec<(LockId, Arc<dyn LockClient>)>,
+        attempt: usize,
+        context: &'static str,
+    ) -> Vec<(LockId, Arc<dyn LockClient>)> {
+        let release_results = join_all(pending.into_iter().map(|(lock_id, client)| async move {
+            match client.release(&lock_id).await {
+                Ok(true) => None,
+                Ok(false) => {
+                    warn!(%lock_id, attempt, context, "distributed unlock did not find lock on client");
+                    Some((lock_id, client))
+                }
+                Err(err) => {
+                    warn!(%lock_id, attempt, context, "distributed unlock failed on client: {}", err);
+                    Some((lock_id, client))
+                }
+            }
+        }))
+        .await;
+
+        release_results.into_iter().flatten().collect()
+    }
+
+    /// Bounded slow retries for entries the fast loop could not release. Every
+    /// caller runs on a background task, so waiting here blocks nobody; after
+    /// the schedule is exhausted the server lease reclaims the entry.
+    async fn release_entries_deferred(mut pending: Vec<(LockId, Arc<dyn LockClient>)>, context: &'static str) {
+        let mut attempt = UNLOCK_RETRY_ATTEMPTS;
+        for delay in DEFERRED_UNLOCK_BACKOFF {
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+            pending = Self::release_pending_once(pending, attempt, context).await;
+            if pending.is_empty() {
+                debug!(attempt, context, "deferred distributed unlock converged");
+                return;
+            }
+        }
+
+        warn!(
+            remaining = pending.len(),
+            attempts = attempt,
+            context,
+            "distributed unlock abandoned entries after deferred retry; the server lease will expire them"
         );
     }
 
@@ -795,7 +837,9 @@ impl DistributedLock {
                             continue;
                         };
 
-                        Self::release_entries(vec![(lock_id, client.clone())], context).await;
+                        // Deferred retries may wait tens of seconds; never hold up the
+                        // next late completion behind them.
+                        drop(tokio::spawn(Self::release_entries(vec![(lock_id, client.clone())], context)));
                     }
                     Ok((idx, Ok(resp))) => {
                         tracing::debug!(
@@ -1198,8 +1242,8 @@ fn record_lock_held_release(lock_type: LockType) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DistributedLock, LOCK_ACQUIRE_ATTEMPT_TIMEOUT, LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF, LockAcquireFailureKind,
-        LockLostSignal, is_remote_lock_rpc_failure, should_warn_lock_failure,
+        DEFERRED_UNLOCK_BACKOFF, DistributedLock, LOCK_ACQUIRE_ATTEMPT_TIMEOUT, LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF,
+        LockAcquireFailureKind, LockLostSignal, UNLOCK_RETRY_ATTEMPTS, is_remote_lock_rpc_failure, should_warn_lock_failure,
     };
     use crate::{LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, ObjectKey, client::LockClient};
     use rand::{SeedableRng as _, TryRng, rngs::StdRng};
@@ -1690,6 +1734,94 @@ mod tests {
             );
         }
         drop(guard);
+    }
+
+    /// Fails `release` a fixed number of times before succeeding, mimicking a
+    /// peer whose lock RPCs time out under load and then recover.
+    #[derive(Debug)]
+    struct FlakyReleaseClient {
+        failures_left: AtomicUsize,
+        release_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LockClient for FlakyReleaseClient {
+        async fn acquire_lock(&self, _request: &LockRequest) -> crate::Result<LockResponse> {
+            Ok(LockResponse::failure("unused", Duration::ZERO))
+        }
+
+        async fn release(&self, _lock_id: &LockId) -> crate::Result<bool> {
+            self.release_calls.fetch_add(1, Ordering::SeqCst);
+            if self.failures_left.load(Ordering::SeqCst) > 0 {
+                self.failures_left.fetch_sub(1, Ordering::SeqCst);
+                return Err(LockError::internal("remote lock rpc timed out: release"));
+            }
+            Ok(true)
+        }
+
+        async fn refresh(&self, _lock_id: &LockId) -> crate::Result<bool> {
+            Ok(false)
+        }
+
+        async fn force_release(&self, _lock_id: &LockId) -> crate::Result<bool> {
+            Ok(false)
+        }
+
+        async fn check_status(&self, _lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+            Ok(None)
+        }
+
+        async fn get_stats(&self) -> crate::Result<LockStats> {
+            Ok(LockStats::default())
+        }
+
+        async fn close(&self) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn is_online(&self) -> bool {
+            true
+        }
+
+        async fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_entries_keeps_retrying_transient_failures_after_the_fast_loop() {
+        let release_calls = Arc::new(AtomicUsize::new(0));
+        let client: Arc<dyn LockClient> = Arc::new(FlakyReleaseClient {
+            failures_left: AtomicUsize::new(UNLOCK_RETRY_ATTEMPTS + 2),
+            release_calls: release_calls.clone(),
+        });
+        let lock_id = LockId::new_unique(&ObjectKey::new("bucket", "object"));
+
+        DistributedLock::release_entries(vec![(lock_id, client)], "test_deferred_unlock").await;
+
+        assert_eq!(
+            release_calls.load(Ordering::SeqCst),
+            UNLOCK_RETRY_ATTEMPTS + 3,
+            "two deferred attempts fail, the third releases the entry"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_entries_gives_up_after_the_deferred_schedule() {
+        let release_calls = Arc::new(AtomicUsize::new(0));
+        let client: Arc<dyn LockClient> = Arc::new(FlakyReleaseClient {
+            failures_left: AtomicUsize::new(usize::MAX),
+            release_calls: release_calls.clone(),
+        });
+        let lock_id = LockId::new_unique(&ObjectKey::new("bucket", "object"));
+
+        DistributedLock::release_entries(vec![(lock_id, client)], "test_deferred_unlock_abandoned").await;
+
+        assert_eq!(
+            release_calls.load(Ordering::SeqCst),
+            UNLOCK_RETRY_ATTEMPTS + DEFERRED_UNLOCK_BACKOFF.len(),
+            "the retry budget is bounded; the server lease reclaims what remains"
+        );
     }
 
     #[derive(Debug)]

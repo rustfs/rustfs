@@ -15,8 +15,6 @@
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,7 +24,7 @@ use crate::services::tier::{
     tier_config::TierS3,
     warm_backend::{
         TransitionCandidateIdentity, TransitionCandidateProbe, TransitionCandidateReconciler, WarmBackend, WarmBackendGetOpts,
-        build_transition_put_options, endpoint_authority,
+        build_transition_put_options, endpoint_authority, transition_client_timeouts_from_env,
     },
 };
 use http::HeaderMap;
@@ -106,39 +104,36 @@ impl WarmBackendS3 {
         };
         validate_outbound_url(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
 
-        if conf.aws_role_web_identity_token_file == "" && conf.aws_role_arn != ""
-            || conf.aws_role_web_identity_token_file != "" && conf.aws_role_arn == ""
-        {
+        let has_web_identity_token_file = !conf.aws_role_web_identity_token_file.is_empty();
+        let has_role_arn = !conf.aws_role_arn.is_empty();
+        let has_access_key = !conf.access_key.is_empty();
+        let has_secret_key = !conf.secret_key.is_empty();
+
+        if has_web_identity_token_file != has_role_arn {
             return Err(std::io::Error::other("both the token file and the role ARN are required"));
-        } else if conf.access_key == "" && conf.secret_key != "" || conf.access_key != "" && conf.secret_key == "" {
+        } else if has_access_key != has_secret_key {
             return Err(std::io::Error::other("both the access and secret keys are required"));
-        } else if conf.aws_role
-            && (conf.aws_role_web_identity_token_file != ""
-                || conf.aws_role_arn != ""
-                || conf.access_key != ""
-                || conf.secret_key != "")
-        {
+        } else if conf.aws_role && (has_web_identity_token_file || has_role_arn || has_access_key || has_secret_key) {
             return Err(std::io::Error::other(
                 "AWS Role cannot be activated with static credentials or the web identity token file",
             ));
-        } else if conf.bucket == "" {
+        } else if conf.bucket.is_empty() {
             return Err(std::io::Error::other("no bucket name was provided"));
         }
 
-        let creds: Credentials<Static>;
-
-        if conf.access_key != "" && conf.secret_key != "" {
+        let creds = if has_access_key && has_secret_key {
             //creds = Credentials::new_static_v4(conf.access_key, conf.secret_key, "");
-            creds = Credentials::new(Static(Value {
+            Credentials::new(Static(Value {
                 access_key_id: conf.access_key.clone(),
                 secret_access_key: conf.secret_key.clone(),
                 session_token: "".to_string(),
                 signer_type: SignatureType::SignatureV4,
                 ..Default::default()
-            }));
+            }))
         } else {
             return Err(std::io::Error::other("insufficient parameters for S3 backend authentication"));
-        }
+        };
+        let timeouts = transition_client_timeouts_from_env();
         let opts = Options {
             creds,
             secure: u.scheme() == "https",
@@ -147,7 +142,7 @@ impl WarmBackendS3 {
             ..Default::default()
         };
         let endpoint = endpoint_authority(&u)?;
-        let client = TransitionClient::new(&endpoint, opts, tier_type).await?;
+        let client = TransitionClient::new_with_timeouts(&endpoint, opts, tier_type, timeouts).await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));
@@ -161,11 +156,11 @@ impl WarmBackendS3 {
     }
 
     pub fn get_dest(&self, object: &str) -> String {
-        let mut dest_obj = object.to_string();
-        if self.prefix != "" {
-            dest_obj = format!("{}/{}", &self.prefix, object);
+        if self.prefix.is_empty() {
+            object.to_string()
+        } else {
+            format!("{}/{}", self.prefix, object)
         }
-        return dest_obj;
     }
 
     pub(crate) async fn remove_with_result(&self, object: &str, rv: &str) -> Result<RemoveObjectResult, std::io::Error> {
@@ -412,6 +407,10 @@ impl TransitionCandidateVersions {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::items_after_test_module,
+    reason = "keep parsing tests adjacent to the helpers they cover"
+)]
 mod tests {
     use super::*;
     use rustfs_s3_client::api_s3_datatypes::{ListVersionsResult, Version};
@@ -916,7 +915,7 @@ impl WarmBackend for WarmBackendS3 {
             .list_objects_v2(&self.bucket, &self.prefix, "", "", SLASH_SEPARATOR, 1)
             .await?;
 
-        Ok(result.common_prefixes.len() > 0 || result.contents.len() > 0)
+        Ok(!result.common_prefixes.is_empty() || !result.contents.is_empty())
     }
 }
 

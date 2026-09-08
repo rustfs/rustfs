@@ -261,8 +261,8 @@ impl HealTask {
             update_parity: true,
             no_lock: self.options.no_lock,
             read_repair: false,
-            pool: None,
-            set: None,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
         };
 
         let heal_result = self

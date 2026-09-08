@@ -17,7 +17,7 @@
 //! Wire types for `PUT`/`GET`/`DELETE /v3/on-demand-migration/{bucket}`,
 //! `GET .../status`, `POST .../backfill?op=start|cancel` and
 //! `GET .../backfill` (ODM-12), mirroring the server's config model
-//! (`crates/ecstore/src/bucket/on_demand_migration/config.rs`) and handler
+//! (`rustfs/src/on_demand_migration/config.rs`) and handler
 //! responses (`rustfs/src/admin/handlers/on_demand_migration.rs`). The SDK
 //! owns its own copies, madmin-go style; the fixtures under
 //! `fixtures/on_demand_migration/` are the contract both sides pin
@@ -78,10 +78,18 @@ pub struct OnDemandMigrationSource {
     #[serde(default)]
     pub path_style: OnDemandMigrationPathStyle,
     /// `None` means anonymous access to a public source bucket.
+    /// `None` means anonymous access to a public source bucket. The native
+    /// providers carry their credentials in `azure` / `gcs` instead.
     #[serde(default)]
     pub credentials: Option<OnDemandMigrationCredentials>,
     #[serde(default)]
     pub tls: OnDemandMigrationTls,
+    /// Required for `azure` and rejected for every other provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure: Option<OnDemandMigrationAzure>,
+    /// Required for `gcs_native` and rejected for every other provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gcs: Option<OnDemandMigrationGcs>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,7 +100,49 @@ pub enum OnDemandMigrationProvider {
     Minio,
     Rustfs,
     R2,
+    /// GCS XML interoperability API with HMAC keys.
     Gcs,
+    /// Native Azure Blob service.
+    Azure,
+    /// Native GCS JSON API with a service-account key.
+    #[serde(rename = "gcs_native")]
+    GcsNative,
+}
+
+/// Native Azure Blob parameters. The container is `source.bucket`; exactly one
+/// of `account_key` and `sas_token` is set. Responses carry both as `REDACTED`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDemandMigrationAzure {
+    pub account: String,
+    #[serde(default)]
+    pub account_key: Option<String>,
+    #[serde(default)]
+    pub sas_token: Option<String>,
+}
+
+impl fmt::Debug for OnDemandMigrationAzure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OnDemandMigrationAzure")
+            .field("account", &self.account)
+            .field("account_key", &self.account_key.as_ref().map(|_| "REDACTED"))
+            .field("sas_token", &self.sas_token.as_ref().map(|_| "REDACTED"))
+            .finish()
+    }
+}
+
+/// Native GCS parameters. The bucket is `source.bucket`; the key JSON embeds a
+/// private key, so responses carry it as `REDACTED`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDemandMigrationGcs {
+    pub service_account_json: String,
+}
+
+impl fmt::Debug for OnDemandMigrationGcs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OnDemandMigrationGcs")
+            .field("service_account_json", &"REDACTED")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -601,6 +651,10 @@ mod tests {
     use super::*;
     use crate::test_support::TestServer;
 
+    mod before_native_sources {
+        include!("../fixtures/on_demand_migration/source_config_e2a.rs");
+    }
+
     const SET_REQUEST_FIXTURE: &str = include_str!("../fixtures/on_demand_migration/set_request.json");
     const SET_RESPONSE_FIXTURE: &str = include_str!("../fixtures/on_demand_migration/set_response.json");
     const GET_RESPONSE_FIXTURE: &str = include_str!("../fixtures/on_demand_migration/get_response.json");
@@ -632,6 +686,20 @@ mod tests {
             "fixture policy is the documented default"
         );
         assert_eq!(config.source.tls, OnDemandMigrationTls::default());
+    }
+
+    #[test]
+    fn s3_admin_writes_remain_readable_by_the_strict_pre_native_server() {
+        for provider in ["s3", "aws", "minio", "rustfs", "r2", "gcs"] {
+            let historical = SET_REQUEST_FIXTURE.replace("\"provider\":\"minio\"", &format!("\"provider\":\"{provider}\""));
+            let config: OnDemandMigrationConfig = serde_json::from_str(&historical).expect("historical set request");
+            let wire = serde_json::to_string(&config).expect("current admin set request");
+            let actual: serde_json::Value = serde_json::from_str(&wire).expect("admin request JSON");
+            let old_source: before_native_sources::SourceConfig = serde_json::from_value(actual["source"].clone())
+                .expect("the strict e2a server must accept an ordinary S3 source from the new admin client");
+            assert_eq!(serde_json::to_value(old_source).expect("old source wire"), actual["source"]);
+            assert_eq!(wire, historical.trim(), "provider={provider}: preserve the historical request bytes");
+        }
     }
 
     #[test]
@@ -806,6 +874,8 @@ mod tests {
                 session_token: None,
             }),
             tls: OnDemandMigrationTls::default(),
+            azure: None,
+            gcs: None,
         });
         let mut expected: OnDemandMigrationConfig = serde_json::from_str(SET_REQUEST_FIXTURE.trim()).expect("fixture");
         expected.filter.source_prefix = None;
@@ -819,6 +889,52 @@ mod tests {
         assert!(minimal.enabled);
         assert_eq!(minimal.policy.max_concurrent_pulls, 8);
         assert!(minimal.source.credentials.is_none());
+    }
+
+    #[test]
+    fn native_provider_documents_round_trip_and_hide_their_secrets() {
+        for (label, json) in [
+            (
+                "azure",
+                r#"{"provider":"azure","endpoint":null,"region":"auto","bucket":"legacy-photos","path_style":"auto","credentials":null,"tls":{"skip_verify":false,"ca_cert_pem":null},"azure":{"account":"legacyaccount","account_key":null,"sas_token":"sv=2021-08-06&sig=topsecret"}}"#,
+            ),
+            (
+                "gcs_native",
+                r#"{"provider":"gcs_native","endpoint":null,"region":"auto","bucket":"legacy-photos","path_style":"auto","credentials":null,"tls":{"skip_verify":false,"ca_cert_pem":null},"gcs":{"service_account_json":"{\"type\":\"service_account\"}"}}"#,
+            ),
+        ] {
+            let source: OnDemandMigrationSource = serde_json::from_str(json).unwrap_or_else(|err| panic!("{label}: {err}"));
+            assert_eq!(
+                serde_json::to_string(&source).expect("re-encodes"),
+                json,
+                "{label} must reproduce the server wire shape byte for byte"
+            );
+            let mut wire: serde_json::Value = serde_json::from_str(json).expect("native wire fixture");
+            assert!(
+                serde_json::from_value::<before_native_sources::SourceConfig>(wire.clone()).is_err(),
+                "native provider names and fields still require an upgraded server"
+            );
+            wire[if label == "azure" { "gcs" } else { "azure" }] = serde_json::Value::Null;
+            assert_eq!(
+                serde_json::from_value::<OnDemandMigrationSource>(wire).expect("the prior explicit-null wire still decodes"),
+                source
+            );
+        }
+
+        let azure = OnDemandMigrationAzure {
+            account: "legacyaccount".to_string(),
+            account_key: Some("c2VjcmV0".to_string()),
+            sas_token: Some("sig=topsecret".to_string()),
+        };
+        let rendered = format!("{azure:?}");
+        assert!(rendered.contains("legacyaccount"));
+        assert!(!rendered.contains("c2VjcmV0"), "{rendered}");
+        assert!(!rendered.contains("topsecret"), "{rendered}");
+
+        let gcs = OnDemandMigrationGcs {
+            service_account_json: r#"{"private_key":"-----BEGIN PRIVATE KEY-----"}"#.to_string(),
+        };
+        assert!(!format!("{gcs:?}").contains("PRIVATE KEY"), "{gcs:?}");
     }
 
     #[test]
@@ -857,6 +973,10 @@ mod tests {
                 .is_some_and(|auth| auth.starts_with("AWS4-HMAC-SHA256"))
         );
         assert_eq!(request.body, SET_REQUEST_FIXTURE.trim(), "the body is the canonical config document");
+        let body: serde_json::Value = serde_json::from_str(&request.body).expect("signed admin request JSON");
+        let old_source: before_native_sources::SourceConfig = serde_json::from_value(body["source"].clone())
+            .expect("the strict pre-native server must accept the actual signed PUT source");
+        assert_eq!(old_source.provider, before_native_sources::Provider::Minio);
     }
 
     #[tokio::test]

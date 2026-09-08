@@ -15,7 +15,9 @@
 use crate::storage_api::startup::lifecycle::ECStore;
 use crate::{
     connect::runtime::shutdown_connect_runtimes,
-    server::{ServiceStateManager, ShutdownHandle, start_persisted_event_notifier_reconciler, wait_for_shutdown},
+    server::{
+        SHUTDOWN_TIMEOUT, ServiceStateManager, ShutdownHandle, start_persisted_event_notifier_reconciler, wait_for_shutdown,
+    },
     startup_iam::{IamBootstrapDisposition, publish_ready_for_iam_bootstrap},
     startup_runtime_sources,
     startup_services::StartupServiceRuntime,
@@ -23,7 +25,7 @@ use crate::{
 };
 use rustfs_common::GlobalReadiness;
 use rustfs_object_capacity::capacity_manager::CapacityBackgroundTasks;
-use rustfs_scanner::init_data_scanner;
+use rustfs_scanner::init_scanner_with_recovery;
 use std::{
     io::{Error, Result},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -150,9 +152,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
     startup_runtime_sources::publish_init_time_now().await;
     let event_notifier_reconciler = start_persisted_event_notifier_reconciler(store.clone(), shutdown_token.clone());
 
-    if enable_scanner {
-        init_data_scanner(shutdown_token.clone(), store).await;
-    }
+    let scanner_cleanup = init_scanner_with_recovery(shutdown_token.clone(), store, enable_scanner).await;
 
     let shutdown_signal = wait_for_shutdown().await;
     run_startup_shutdown_sequence(
@@ -166,6 +166,9 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
     )
     .await;
     shutdown_connect_runtimes(heartbeat, inventory).await;
+    if let Some(cleanup) = scanner_cleanup {
+        let _ = wait_for_scanner_cleanup(cleanup).await;
+    }
     if let Err(err) = event_notifier_reconciler.await {
         tracing::warn!(
             target: "rustfs::main::run",
@@ -190,6 +193,40 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
     startup_runtime_sources::shutdown_observability_guard()
         .map_err(|err| Error::other(format!("shutdown_global_guard: {err}")))?;
     Ok(())
+}
+
+async fn wait_for_scanner_cleanup(cleanup: tokio::task::JoinHandle<()>) -> bool {
+    // Dropping a JoinHandle detaches rather than aborts the task. Keep an
+    // in-flight reset's guards owned while this runtime remains alive. This
+    // bounded wait does not prove I/O drain at a later runtime/process exit.
+    match tokio::time::timeout(SHUTDOWN_TIMEOUT, cleanup).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                target: "rustfs::main::run",
+                event = EVENT_SERVER_SHUTDOWN_STATE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                state = "scanner_cleanup_join_failed",
+                reason = if error.is_cancelled() { "task_cancelled" } else { "task_panicked" },
+                "Scanner cleanup task failed to join"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "rustfs::main::run",
+                event = EVENT_SERVER_SHUTDOWN_STATE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                state = "scanner_cleanup_not_joined",
+                reason = "timeout",
+                timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
+                "Scanner cleanup completion is unconfirmed; task was not aborted"
+            );
+            false
+        }
+    }
 }
 
 pub(crate) async fn publish_embedded_startup_ready(
@@ -226,11 +263,49 @@ pub(crate) fn log_embedded_server_ready(endpoint_address: SocketAddr) {
 
 #[cfg(test)]
 mod tests {
-    use super::{embedded_endpoint_address, mark_embedded_global_init_started};
+    use super::{embedded_endpoint_address, mark_embedded_global_init_started, wait_for_scanner_cleanup};
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         sync::atomic::{AtomicBool, Ordering},
     };
+
+    #[tokio::test]
+    async fn disabled_cleanup_shutdown_joins_a_finished_task() {
+        assert!(wait_for_scanner_cleanup(tokio::spawn(async {})).await);
+    }
+
+    #[tokio::test]
+    async fn disabled_cleanup_shutdown_reports_task_failure() {
+        assert!(!wait_for_scanner_cleanup(tokio::spawn(async { panic!("fixture cleanup failure") })).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_cleanup_shutdown_timeout_does_not_abort_owned_work() {
+        struct OwnedWork(std::sync::Arc<AtomicBool>);
+        impl Drop for OwnedWork {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let owned = OwnedWork(dropped.clone());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, resume) = tokio::sync::oneshot::channel();
+        let (finished, done) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let owned = owned;
+            started.send(()).expect("work started");
+            resume.await.expect("fixture releases owned work");
+            drop(owned);
+            finished.send(()).expect("work completed");
+        });
+        ready.await.expect("task must actually be in flight");
+        assert!(!wait_for_scanner_cleanup(task).await, "timeout is not a completed join");
+        assert!(!dropped.load(Ordering::SeqCst), "timeout must not abort the reset's owned guards");
+        release.send(()).expect("detached task remains alive");
+        done.await.expect("owned work should finish after explicit release");
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn embedded_global_init_guard_allows_local_retry_before_mark() {

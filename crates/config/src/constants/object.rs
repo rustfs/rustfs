@@ -137,6 +137,28 @@ pub const DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED: bool = false;
 const _: () = assert!(!DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE);
 const _: () = assert!(!DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED);
 
+/// Environment variable for remote tier TCP connect timeout in seconds.
+pub const ENV_TIER_REMOTE_CONNECT_TIMEOUT_SECS: &str = "RUSTFS_TIER_REMOTE_CONNECT_TIMEOUT_SECS";
+/// Default remote tier TCP connect timeout in seconds.
+pub const DEFAULT_TIER_REMOTE_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Environment variable for the remote tier request timeout in seconds.
+///
+/// This bounds upload/download request progress through response headers. The
+/// default is intentionally large so multi-TiB transition uploads keep their
+/// previous production budget while black-hole remotes no longer wait forever.
+pub const ENV_TIER_REMOTE_REQUEST_TIMEOUT_SECS: &str = "RUSTFS_TIER_REMOTE_REQUEST_TIMEOUT_SECS";
+/// Default remote tier request timeout in seconds.
+pub const DEFAULT_TIER_REMOTE_REQUEST_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+/// Environment variable for remote tier response-body idle timeout in seconds.
+///
+/// The timer is re-armed on every non-empty response-body chunk, so slow but
+/// progressing remotes can continue while silent response bodies are cancelled.
+pub const ENV_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS: &str = "RUSTFS_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS";
+/// Default remote tier response-body idle timeout in seconds.
+pub const DEFAULT_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS: u64 = 60;
+
 /// Request the object-transaction fencing contract used by storage-owned
 /// cleanup receipts and lock-window optimizations.
 ///
@@ -343,12 +365,53 @@ pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: &str =
     "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES";
 pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: usize = 0;
 
-/// Time in milliseconds an automatic foreground write waits for a permit.
+/// Time in milliseconds an automatic foreground direct PutObject waits for a permit.
 ///
 /// A short wait smooths transient bursts while still returning S3
 /// `SlowDown`/503 before body ingest when the node is already saturated.
 pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS";
 pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 250;
+
+/// Time in milliseconds a multipart UploadPart waits for a foreground write permit.
+///
+/// SDK-default multipart clients send every part of an upload concurrently, so
+/// a single node routinely sees several times more parts in flight than the
+/// permit pool allows. A queued part waits before body ingest, so the pool
+/// still bounds the number of parts being written, but the wait is not free:
+/// RustFS does not read the request body while the part is queued (hyper only
+/// sends `100 Continue` once the body is first polled, and the AWS SDKs send
+/// the body after a 1-3 s `Expect: 100-continue` grace anyway), so the
+/// client's socket write stalls once the kernel buffers fill, and whatever
+/// timeout the client or an intermediary has configured decides the outcome.
+/// botocore applies its `connect_timeout` (60 s) to the body write, the AWS
+/// SDK for Java v2 has a 30 s socket write timeout, and MinIO bounds the same
+/// wait with a 10 s request deadline. The wait must leave margin under the
+/// shortest of those, not merely fall below an SDK default, so the part
+/// receives S3 `SlowDown`/503 for the client to retry instead of losing its
+/// connection (issue #7385). `0` rejects immediately when the pool is full.
+pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: &str =
+    "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS";
+pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 10_000;
+
+// A queued part holds the client's body write open for the whole wait. The
+// shortest write timeout among mainstream S3 SDKs is the AWS SDK for Java v2's
+// 30 s socket write timeout; keep the compiled default at no more than a third
+// of it. This locks only the default; the environment variable may still raise
+// the wait past any client timeout.
+const _: () = assert!(DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS * 3 <= 30_000);
+
+/// Maximum multipart UploadPart requests waiting for a foreground write permit per process.
+///
+/// Parts beyond this queue depth are rejected with S3 `SlowDown`/503 without
+/// waiting, so a genuinely saturated node still fails fast instead of holding
+/// an unbounded set of connections open for the whole wait timeout. Each
+/// queued HTTP/1 part also holds whatever unread body the client already
+/// pushed into that connection's kernel receive buffer, and a queued HTTP/2
+/// part holds up to its flow-control window in process memory, so the depth
+/// bounds socket and window memory as well as connections.
+/// `0` derives the depth from the permit limit.
+pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING: &str = "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING";
+pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING: usize = 0;
 
 const _: () = assert!(DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE);
 
@@ -545,6 +608,36 @@ pub const ENV_OBJECT_LOCK_RPC_TIMEOUT_MS: &str = "RUSTFS_OBJECT_LOCK_RPC_TIMEOUT
 
 /// Default remote lock RPC transport timeout: 3000 milliseconds.
 pub const DEFAULT_OBJECT_LOCK_RPC_TIMEOUT_MS: u64 = 3000;
+
+/// Environment variable for the minimum interval between evictions of the
+/// cached lock RPC channel to one peer, in milliseconds.
+///
+/// A lock RPC that fails on transport, or that times out while the peer has
+/// not completed any lock RPC for two deadlines, evicts the shared HTTP/2
+/// channel so the next request re-dials. Evictions are rate limited per peer
+/// so one slow lock endpoint cannot drive a reset/GOAWAY/reconnect loop
+/// (issue #7363). `0` disables the cooldown.
+///
+/// Default: 5000 milliseconds.
+pub const ENV_OBJECT_LOCK_RPC_EVICTION_COOLDOWN_MS: &str = "RUSTFS_OBJECT_LOCK_RPC_EVICTION_COOLDOWN_MS";
+
+/// Default minimum interval between lock RPC channel evictions per peer: 5000 milliseconds.
+pub const DEFAULT_OBJECT_LOCK_RPC_EVICTION_COOLDOWN_MS: u64 = 5000;
+
+/// Environment variable for how many timed-out lock RPCs per peer may keep
+/// running in the background instead of being cancelled.
+///
+/// Cancelling a timed-out stream sends `RST_STREAM`; enough of them make the
+/// peer answer `GOAWAY too_many_resets` and drop every stream on the
+/// connection. A detached RPC ends on its own within the internode RPC
+/// timeout, and a lock it acquires after its caller gave up is released
+/// immediately. Beyond this budget timed-out RPCs are cancelled as before.
+///
+/// Default: 256.
+pub const ENV_OBJECT_LOCK_RPC_DETACHED_LIMIT: &str = "RUSTFS_OBJECT_LOCK_RPC_DETACHED_LIMIT";
+
+/// Default per-peer budget of detached (timed-out but still running) lock RPCs: 256.
+pub const DEFAULT_OBJECT_LOCK_RPC_DETACHED_LIMIT: usize = 256;
 
 /// Environment variable to enable object namespace lock diagnostics.
 ///
@@ -809,6 +902,16 @@ mod remote_version_state_tests {
         assert_eq!(
             super::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
             "RUSTFS_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED"
+        );
+    }
+
+    #[test]
+    fn remote_tier_timeout_env_names_are_stable() {
+        assert_eq!(super::ENV_TIER_REMOTE_CONNECT_TIMEOUT_SECS, "RUSTFS_TIER_REMOTE_CONNECT_TIMEOUT_SECS");
+        assert_eq!(super::ENV_TIER_REMOTE_REQUEST_TIMEOUT_SECS, "RUSTFS_TIER_REMOTE_REQUEST_TIMEOUT_SECS");
+        assert_eq!(
+            super::ENV_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS,
+            "RUSTFS_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS"
         );
     }
 

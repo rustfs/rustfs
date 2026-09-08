@@ -39,6 +39,15 @@ pub const DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 20;
 pub const ENV_INTERNODE_RPC_TIMEOUT_SECS: &str = "RUSTFS_INTERNODE_RPC_TIMEOUT_SECS";
 pub const DEFAULT_INTERNODE_RPC_TIMEOUT_SECS: u64 = 30;
 
+/// Total budget for one admin peer probe round, including any reconnect retry.
+///
+/// This is intentionally separate from the transport-level RPC timeout: admin
+/// probes may retry once, but the retry must consume the same round budget.
+pub const ENV_ADMIN_PEER_PROBE_TIMEOUT_SECS: &str = "RUSTFS_ADMIN_PEER_PROBE_TIMEOUT_SECS";
+pub const DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS: u64 = 10;
+pub const MAX_ADMIN_PEER_PROBE_TIMEOUT_SECS: u64 = 60;
+const _: () = assert!(DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS <= MAX_ADMIN_PEER_PROBE_TIMEOUT_SECS);
+
 // ── Client-side internode gRPC channel tuning (P0) ──
 // These mirror the server-side HTTP/2 transport tuning in `rustfs/src/server/http.rs`
 // on the *client* `tonic` `Endpoint` used for internode control-plane RPCs. Prior to
@@ -312,6 +321,7 @@ mod tests {
         assert_eq!(DEFAULT_INTERNODE_HTTP2_KEEPALIVE_INTERVAL_SECS, 5);
         assert_eq!(DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS, 20);
         assert_eq!(DEFAULT_INTERNODE_RPC_TIMEOUT_SECS, 30);
+        assert_eq!(DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS, 10);
         assert_eq!(DEFAULT_INTERNODE_HTTP_TUNING_PROFILE, "legacy");
     }
 
@@ -412,6 +422,7 @@ mod tests {
             "RUSTFS_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS"
         );
         assert_eq!(ENV_INTERNODE_RPC_TIMEOUT_SECS, "RUSTFS_INTERNODE_RPC_TIMEOUT_SECS");
+        assert_eq!(ENV_ADMIN_PEER_PROBE_TIMEOUT_SECS, "RUSTFS_ADMIN_PEER_PROBE_TIMEOUT_SECS");
         assert_eq!(ENV_INTERNODE_HTTP_TUNING_PROFILE, "RUSTFS_INTERNODE_HTTP_TUNING_PROFILE");
         assert_eq!(ENV_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST, "RUSTFS_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST");
         assert_eq!(ENV_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS, "RUSTFS_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS");

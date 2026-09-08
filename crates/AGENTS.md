@@ -33,8 +33,11 @@ Applies to all paths under `crates/`.
 
 ## Type Casting
 
-- Never use `as` for numeric conversions that may truncate or overflow. Use `try_into()` with explicit error handling, or clamp with `value.max(0) as usize` when the domain is bounded.
-- `f64 as usize` saturates but is fragile; clamp to `[0, usize::MAX as f64]` first.
+- Never use `as` for numeric conversions that may truncate or overflow. Use
+  `try_into()` with typed error handling; clamp or saturate only when the domain
+  explicitly requires it.
+- Before converting floating-point input to an integer, validate finiteness,
+  sign, and the destination range. A lower-bound clamp alone is insufficient.
 - Treat every `as` cast in a PR review as a potential bug; require justification.
 
 ## Testing

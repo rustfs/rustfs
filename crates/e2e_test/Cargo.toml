@@ -144,3 +144,6 @@ russh = { workspace = true, features = ["serde"] }
 russh-sftp = { workspace = true }
 zip.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
+
+[dev-dependencies]
+tempfile.workspace = true

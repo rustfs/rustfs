@@ -31,6 +31,7 @@ workspace = true
 
 [features]
 default = []
+gcs = ["dep:google-cloud-storage", "dep:google-cloud-auth"]
 # Compiles the controlled list-objects namespace-journal chaos injector into a
 # production binary (it is always available to tests). Off by default so the
 # RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_* env vars cannot rewrite journal
@@ -117,6 +118,8 @@ hotpath-cpu = [
 # injection, xl.meta transition assertions) via `api::tier::test_util`.
 # Enable only from `[dev-dependencies]` (rustfs/backlog#1148 ilm-6).
 test-util = []
+# Observes real startup CAS only in the dedicated E2E binary.
+e2e-test-hooks = []
 
 [dependencies]
 hotpath.workspace = true
@@ -212,8 +215,8 @@ aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
 parking_lot = { workspace = true }
 base64-simd.workspace = true
 serde_urlencoded.workspace = true
-google-cloud-storage = { workspace = true }
-google-cloud-auth = { workspace = true }
+google-cloud-storage = { workspace = true, optional = true }
+google-cloud-auth = { workspace = true, optional = true }
 faster-hex = { workspace = true }
 ratelimit = { workspace = true }
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["rustls-aws-lc"] }
@@ -225,7 +228,7 @@ metrics = { workspace = true }
 # crates.io. The guard scripts/check_no_tokio_io_uring.sh allows an explicit
 # io-uring integration; only the tokio "io-uring" runtime feature is banned.
 [target.'cfg(target_os = "linux")'.dependencies]
-rustfs-uring = "0.2.1"
+rustfs-uring = "0.2.2"
 
 [target.'cfg(windows)'.dependencies]
 winapi-util.workspace = true

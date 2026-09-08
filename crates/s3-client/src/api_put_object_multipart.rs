@@ -18,7 +18,6 @@
 #![allow(clippy::all)]
 
 use http::{HeaderMap, HeaderName, StatusCode};
-use http_body_util::BodyExt;
 use hyper::body::Bytes;
 use s3s::S3ErrorCode;
 use std::collections::HashMap;
@@ -247,14 +246,9 @@ impl TransitionClient {
         // Parse the CreateMultipartUpload response for the UploadId. Returning a
         // default (empty) result here made every multipart transition fail at the
         // first UploadPart with "UploadID cannot be empty" (rustfs/rustfs#4811).
-        let mut body_vec = Vec::new();
-        let mut body = resp.into_body();
-        while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|e| std::io::Error::other(e.to_string()))?;
-            if let Some(data) = frame.data_ref() {
-                body_vec.extend_from_slice(data);
-            }
-        }
+        let body_vec = self
+            .collect_response_body(resp.into_body(), rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE)
+            .await?;
         let initiate_multipart_upload_result =
             quick_xml::de::from_str::<InitiateMultipartUploadResult>(&String::from_utf8_lossy(&body_vec))
                 .map_err(|e| std::io::Error::other(format!("failed to parse CreateMultipartUpload response: {e}")))?;

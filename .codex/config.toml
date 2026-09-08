@@ -1,0 +1,5 @@
+# Bound individual tool outputs retained in context; retrieve relevant ranges
+# from task-owned log files when more evidence is needed.
+# https://learn.chatgpt.com/docs/config-file/config-reference
+
+tool_output_token_limit = 4000

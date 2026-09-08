@@ -7,8 +7,11 @@ This file contains repository-wide rules. Use the nearest subdirectory
 
 1. System/developer instructions.
 2. The current user request.
-3. The nearest `AGENTS.md`.
-4. This file.
+3. Applicable `AGENTS.md` files, with the nearest file winning conflicts.
+4. Selected skills and reference documents.
+
+Nested instructions add to ancestor rules; they do not discard non-conflicting
+rules. A skill cannot expand the user's requested scope or grant authorization.
 
 ## Operating Model
 
@@ -21,63 +24,29 @@ This file contains repository-wide rules. Use the nearest subdirectory
 - Do not load every skill or inspect unrelated modules preemptively. Select a
   skill only when its description directly matches the request or changed
   surface.
+- Resolve repository workflow skills under `.agents/skills/` when a global
+  skill has the same name, unless the user explicitly selects another path.
 - Avoid repeated reads and equivalent verification commands once enough
   evidence exists.
+- Search for relevant symbols/headings before reading long files; return only
+  matching ranges. If output is truncated, narrow the query instead of repeating
+  a full read. Keep reusable raw logs in task artifacts and report the evidence.
+- Reuse authorization already given in the conversation. Resolve routine choices
+  within that scope and continue independent work while a material question is
+  pending. Before requesting missing approval, prepare the concrete result that
+  is already authorized; retain explicit merge and release gates.
 
-## Worktree and Disk Hygiene
+## Task-Specific Guidance
 
-- Start implementation from the latest `origin/main` and confirm the requested
-  change is not already present.
-- An existing clean, isolated task worktree is sufficient. Create another
-  worktree only when the current checkout is shared, dirty with unrelated work,
-  or belongs to another task.
-- Never commit from a shared checkout.
-- Use a task-specific branch named `<type>/<topic>`, such as `fix/...`,
-  `feat/...`, `test/...`, or `docs/...`, unless the user specifies a name.
-- Do not include agent, tool, contributor, account, or organization names in
-  branch names.
-- Push to the user-requested remote or the repository's configured push remote.
-  Do not hard-code or infer a remote from an account name.
-- Check free space before artifact-heavy builds, tests, coverage, or downloads.
-  Re-check before a broad gate when space is tight.
-- Remove only task-owned temporary/build artifacts. Never delete another task's
-  worktree or uncommitted data.
-- At handoff, mention disk or cleanup details only when they affected execution
-  or artifacts/worktrees remain intentionally.
+Read only the reference needed for the current task, once per unchanged context:
 
-## Change Style
-
-- Preserve existing control flow unless changing it is required for correctness.
-- Prefer a direct local edit over new files, wrappers, managers, or speculative
-  abstractions.
-- Add a helper only when it removes current duplication, names a real domain
-  boundary, or isolates a non-trivial invariant.
-- Remove an in-scope path superseded by the change. If compatibility requires it,
-  adapt at the boundary to one canonical core and use the repository's
-  `RUSTFS_COMPAT_TODO` policy.
-- Comments explain non-obvious invariants or reasons. Do not narrate code or
-  record change history.
-- Mention unrelated problems when useful; do not fix them in a narrow task.
-
-## Reuse and Boundary Rules
-
-- Before adding helpers, constants, fixtures, or wrappers, search the touched
-  crate, the domain-owning crate, `crates/utils`, `crates/common`, and relevant
-  direct dependencies.
-- Reuse requires matching semantics: normalization, error types, deadlines,
-  durability, and compatibility must fit the call site. A narrowly named local
-  helper is better than forced reuse with different semantics.
-- Validate untrusted input at its trust boundary, then trust the validated type.
-  Values crossing disk, RPC, persistence, or version boundaries remain
-  untrusted at every consumer.
-- Re-check boundary values immediately before destructive actions such as
-  delete, overwrite, or quorum decisions.
-- Every new branch needs a concrete triggering input/state. For decoded or peer
-  data, corruption and mixed-version input are valid triggers.
-- Required values must return a typed error when absent or corrupt; do not use a
-  default that converts corruption into a plausible result.
-- Attach error context once where it is actionable. Do not erase typed errors
-  below aggregation or quorum layers.
+- Before code changes or artifact-heavy work, read [implementation rules](.agents/references/implementation.md).
+  For a read-only code review, use its change-style and boundary sections as needed.
+- Before commits, pushes, PR creation/updates, or posting to PRs/issues/discussions,
+  read [Git and PR rules](.agents/references/pull-requests.md).
+  Reuse existing authorization; a reference does not authorize posting, merging, or publishing.
+- Preserve unrelated work. Never commit from a shared checkout or delete another task's artifacts.
+- Source comments, commits, PR titles, and PR bodies are in English.
 
 ## Sources of Truth
 
@@ -147,72 +116,24 @@ requested adversarial/design reviews, and agent-instruction changes that alter
 execution. Ordinary questions, diagnoses, status reports, non-adversarial code
 reviews, and low-risk planning do not trigger it.
 
-Risk and review shape:
+For applicable work and substantial PR reviews, read the [risk tiers and review shape](.agents/references/adversarial-validation.md).
+Load only the matching domain probes; ordinary reviews do not become adversarial
+merely because this reference exists.
 
-- **Exempt:** documentation, comments, formatting, or typos with no runtime,
-  build, test, or agent-execution effect.
-- **Mechanical:** renames, moves, test/tooling-only changes, and agent-rule
-  changes. Run correctness and simplicity lenses.
-- **Standard:** localized behavior changes. Run one integrated final-diff pass
-  covering correctness, simplicity, and test coverage; add only domain lenses
-  matched by the diff.
-- **High risk / substantial PR review:** high risk includes locking,
-  erasure/quorum/heal, replication, multipart, RPC, lifecycle/tiering,
-  persistence/fsync, IAM/KMS/auth, cryptography, on-disk/on-wire formats, and
-  S3-visible semantics. Cover all applicable lenses using exactly two
-  independent reviewers when delegation is explicitly authorized. Split the
-  lenses between them. Otherwise perform two fresh sequential passes.
-- **Outbound client defaults:** what `TargetClient`, `PutObjectOptions`, or
-  the remote SDK configuration sends to every replication or migration target
-  is high risk for every target class even when the change fixes one. Follow
-  the SOP in `docs/postmortems/2026-09-03-replication-checksum-default-regression.md`:
-  run the outbound target matrix, document each new env knob in the same PR,
-  and list verified and unverified target classes in the PR Impact section.
+A review has no finding quota; `No findings` is a complete outcome. A request to
+find problems is not evidence that a defect exists. Before reporting a candidate,
+check callers, invariants, and existing tests for evidence that disproves it.
+Findings need `file:line` and a concrete failure or violation of an explicit
+requirement. Missing required tests/checks are verification gaps, not proof of a
+runtime bug; name the unprotected behavior or unmet gate. Keep optional style or
+refactoring preferences out of defect findings unless that review was requested.
 
-Available domain lenses are security, concurrency/durability, compatibility,
-and performance. Select `.agents/skills/adversarial-validation/SKILL.md` for an
-explicit adversarial request, a high-risk change, or a substantial PR review;
-then read only its matching role references. A routine standard pass does not
-load the playbook unless the reviewer needs a RustFS-specific probe.
-
-A finding must name a concrete input/state/interleaving and wrong outcome, or a
-specific missing regression check, with `file:line`. Resolve it by fixing the
-diff or rebutting it with code-path/test/invariant evidence. After a non-trivial
-fix, rerun only affected lenses.
+Fix or rebut supported findings within the authorized scope. Once the required
+passes are complete, stop. Reopen only for changed code, new evidence, an
+unresolved finding, or an explicit re-review request; an unchanged diff does not
+need another pass at every conversation turn or workflow handoff.
 
 For high-risk PRs, record one concise verdict per covered lens in the PR body.
-
-## Pull Request Lifecycle
-
-- Creating or updating a PR includes one immediate snapshot of checks,
-  mergeability, reviews, and unresolved threads.
-- Unless the user explicitly requests monitoring, a release workflow requires
-  it, or an automation already owns it, hand off after the PR is open with the
-  current state and next event to watch. Do not delay ordinary handoff with
-  fixed quiet-period sleeps.
-- For requested monitoring, use event-driven or bounded waits. Report only state
-  changes, actionable failures, or a meaningful prolonged delay.
-- Investigate failures/comments before changing code. Fix task-attributable
-  issues, rerun affected verification, push, reply or resolve the thread, then
-  resume the requested monitor.
-- Never merge without required reviewer approval or explicit authority.
-- After an observed merge, verify the commit reached the base, then clean the
-  task worktree/branch when safe. Preserve unmerged work for closed PRs unless
-  deletion was explicitly authorized.
-
-## Git and PR Baseline
-
-- Follow Conventional Commits; keep the subject at most 72 characters.
-- Source comments, commits, PR titles, and PR bodies are in English.
-- Keep every heading from `.github/pull_request_template.md`; use `N/A` where
-  needed and include commands actually run.
-- Use `--body-file` for multiline `gh pr create`/`gh pr edit` content.
-- PR/issue/discussion content must not contain the literal sequence `\n` or
-  hard-wrapped prose paragraphs.
-- Do not include local absolute paths or tool-specific labels/prefixes in GitHub
-  content.
-- Resolve review threads after the underlying issue is fixed. If declining a
-  suggestion, reply with a short evidence-based reason.
 
 ## Security Baseline
 
@@ -250,12 +171,6 @@ Use `.agents/skills/rustfs-logging-governance/SKILL.md` for logging changes.
 - `DataUsageCacheInfo` and `DataUsageEntry` keep their hand-written map
   serialization and new fields remain `#[serde(default)]` for older readers.
 
-## Naming
-
-Use Rust API naming: `SCREAMING_SNAKE_CASE` constants/statics, `snake_case`
-functions/variables, and `PascalCase` types. Do not rename unrelated existing
-violations.
-
 ## Scoped Guidance
 
 Before editing, locate the nearest instructions with:
@@ -265,4 +180,4 @@ git ls-files '*AGENTS.md'
 ```
 
 The nearest file wins for domain invariants. Keep generic workflow and
-validation policy in this root file.
+validation policy in this root file and its task-specific references.

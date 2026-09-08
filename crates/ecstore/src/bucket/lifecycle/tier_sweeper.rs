@@ -575,7 +575,7 @@ pub(crate) async fn delete_confirmed_transition_candidate_exact_with_lease_idemp
 #[cfg(test)]
 static CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) async fn delete_confirmed_transition_candidate_exact_with_manager_and_identity(
     obj_name: &str,
     rv_id: &str,
@@ -706,15 +706,16 @@ pub(crate) fn transitioned_delete_journal_entry_for_source(
 
 #[cfg(test)]
 mod test {
+    #[cfg(feature = "test-util")]
+    use super::delete_confirmed_transition_candidate_exact_with_manager_and_identity;
     use rustfs_s3_client::signer_error::invalid_utf8_header_error;
 
     use super::{
         CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES, ERR_REMOTE_DELETE_BREAKER_OPEN, ERR_REMOTE_DELETE_LIMITER_CLOSED, Jentry,
         RemoteDeleteBreaker, RemoteTierDeleteOutcome, TierDeleteJournalState, TierDeleteSourceIdentity,
-        delete_confirmed_transition_candidate_exact_with_manager_and_identity, delete_object_from_remote_tier_idempotent,
-        delete_object_from_remote_tier_idempotent_with_manager_and_identity, is_remote_tier_not_found_error,
-        is_signer_header_error, lifecycle, set_remote_tier_delete_test_hook, should_record_remote_delete_failure,
-        transitioned_delete_journal_entry, transitioned_force_delete_journal_entry,
+        delete_object_from_remote_tier_idempotent, delete_object_from_remote_tier_idempotent_with_manager_and_identity,
+        is_remote_tier_not_found_error, is_signer_header_error, lifecycle, set_remote_tier_delete_test_hook,
+        should_record_remote_delete_failure, transitioned_delete_journal_entry, transitioned_force_delete_journal_entry,
     };
     use crate::storage_api_contracts::lifecycle::TransitionedObject;
     use rustfs_filemeta::TransitionVersionState;

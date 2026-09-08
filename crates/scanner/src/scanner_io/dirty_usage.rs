@@ -16,6 +16,12 @@ use super::*;
 
 pub(super) static DIRTY_USAGE_BUCKET_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub(super) static DIRTY_USAGE_BUCKETS: LazyLock<StdMutex<DirtyUsageBuckets>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+// Lock order when both dirty maps are needed is `DIRTY_USAGE_BUCKETS` followed
+// by `DIRTY_USAGE_BUCKET_SCOPES`. Both are held only for synchronous map
+// updates, so no scanner task can observe a bucket generation without its
+// matching scope.
+pub(super) static DIRTY_USAGE_BUCKET_SCOPES: LazyLock<StdMutex<DirtyUsageBucketScopes>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
 pub(super) static DIRTY_USAGE_BUCKET_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 pub(super) static SCANNER_ACTIVITY_EPOCH: LazyLock<String> = LazyLock::new(|| format!("{:032x}", rand::random::<u128>()));
 pub(super) static SCANNER_MAINTENANCE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -32,6 +38,21 @@ pub struct ScannerDirtyUsageBucket {
     pub bucket: String,
     pub generation: u64,
 }
+
+/// A non-durable optimization hint for a dirty bucket.
+///
+/// A whole-bucket marker always wins over narrow path hints. The scanner never
+/// publishes a prefix-only result as authoritative usage; this only controls
+/// whether a complete per-bucket cache can reuse known-clean direct children.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum DirtyUsageBucketScope {
+    WholeBucket,
+    TopLevelEntries(HashSet<String>),
+}
+
+pub(super) type DirtyUsageBucketScopes = HashMap<String, DirtyUsageBucketScope>;
+
+const MAX_DIRTY_USAGE_TOP_LEVEL_ENTRIES_PER_BUCKET: usize = 128;
 
 /// A point-in-time view of the local dirty bucket generations.
 ///
@@ -67,6 +88,7 @@ pub fn acknowledge_scoped_dirty_usage(
     // No await or storage operation occurs while the dirty map is locked.
     let (cleared, pending) = {
         let mut dirty = dirty_usage_buckets();
+        let mut dirty_scopes = dirty_usage_bucket_scopes();
         let checked = entries
             .iter()
             .map(|(guard, generation)| {
@@ -81,6 +103,7 @@ pub fn acknowledge_scoped_dirty_usage(
             scanner_activity_epoch(),
             DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire),
             &mut dirty,
+            &mut dirty_scopes,
             &checked,
             probe_only,
         )?;
@@ -100,6 +123,7 @@ fn apply_scoped_dirty_usage_ack(
     current_instance: &str,
     current_generation: u64,
     dirty: &mut DirtyUsageBuckets,
+    dirty_scopes: &mut DirtyUsageBucketScopes,
     entries: &[(&str, u64)],
     probe_only: bool,
 ) -> std::result::Result<usize, ScannerDirtyUsageAckError> {
@@ -118,6 +142,7 @@ fn apply_scoped_dirty_usage_ack(
         for (bucket, generation) in entries {
             if dirty.get(*bucket) == Some(generation) {
                 dirty.remove(*bucket);
+                dirty_scopes.remove(*bucket);
                 cleared += 1;
             }
         }
@@ -132,36 +157,72 @@ mod scoped_dirty_usage_tests {
     #[test]
     fn scoped_dirty_usage_preserves_uncovered_newer_and_replayed_generations() {
         let mut dirty = HashMap::from([("hot".to_string(), 7), ("cold".to_string(), 8)]);
-        assert_eq!(apply_scoped_dirty_usage_ack("p", "p", 8, &mut dirty, &[("cold", 8)], true), Ok(0));
+        let mut scopes = HashMap::from([
+            ("hot".to_string(), DirtyUsageBucketScope::WholeBucket),
+            (
+                "cold".to_string(),
+                DirtyUsageBucketScope::TopLevelEntries(HashSet::from(["first".to_string()])),
+            ),
+        ]);
+        assert_eq!(
+            apply_scoped_dirty_usage_ack("p", "p", 8, &mut dirty, &mut scopes, &[("cold", 8)], true),
+            Ok(0)
+        );
         assert_eq!(dirty.len(), 2);
-        assert_eq!(apply_scoped_dirty_usage_ack("p", "p", 8, &mut dirty, &[("cold", 8)], false), Ok(1));
+        assert!(scopes.contains_key("cold"));
+        assert_eq!(
+            apply_scoped_dirty_usage_ack("p", "p", 8, &mut dirty, &mut scopes, &[("cold", 8)], false),
+            Ok(1)
+        );
         assert_eq!(dirty.get("hot"), Some(&7));
-        assert_eq!(apply_scoped_dirty_usage_ack("p", "p", 8, &mut dirty, &[("cold", 8)], false), Ok(0));
+        assert!(!scopes.contains_key("cold"));
+        assert_eq!(
+            apply_scoped_dirty_usage_ack("p", "p", 8, &mut dirty, &mut scopes, &[("cold", 8)], false),
+            Ok(0)
+        );
         dirty.insert("cold".to_string(), 9);
-        assert_eq!(apply_scoped_dirty_usage_ack("p", "p", 9, &mut dirty, &[("cold", 8)], false), Ok(0));
+        scopes.insert("cold".to_string(), DirtyUsageBucketScope::WholeBucket);
+        assert_eq!(
+            apply_scoped_dirty_usage_ack("p", "p", 9, &mut dirty, &mut scopes, &[("cold", 8)], false),
+            Ok(0)
+        );
         assert_eq!(dirty.get("cold"), Some(&9));
+        assert!(scopes.contains_key("cold"));
     }
 
     #[test]
     fn scoped_dirty_usage_rejects_restart_and_invalid_batch_before_clearing() {
         let original = HashMap::from([("hot".to_string(), 7), ("cold".to_string(), 8)]);
         let mut dirty = original.clone();
+        let original_scopes = HashMap::from([
+            ("hot".to_string(), DirtyUsageBucketScope::WholeBucket),
+            ("cold".to_string(), DirtyUsageBucketScope::WholeBucket),
+        ]);
+        let mut scopes = original_scopes.clone();
         assert_eq!(
-            apply_scoped_dirty_usage_ack("old", "new", 8, &mut dirty, &[("cold", 8)], false),
+            apply_scoped_dirty_usage_ack("old", "new", 8, &mut dirty, &mut scopes, &[("cold", 8)], false),
             Err(ScannerDirtyUsageAckError::ProcessChanged)
         );
+        assert_eq!(scopes, original_scopes);
         for generation in [0, 9, u64::MAX] {
             assert_eq!(
-                apply_scoped_dirty_usage_ack("p", "p", 8, &mut dirty, &[("cold", 8), ("hot", generation)], false),
+                apply_scoped_dirty_usage_ack("p", "p", 8, &mut dirty, &mut scopes, &[("cold", 8), ("hot", generation)], false,),
                 Err(ScannerDirtyUsageAckError::InvalidGeneration)
             );
             assert_eq!(dirty, original);
+            assert_eq!(scopes, original_scopes);
         }
     }
 }
 
 pub(super) fn dirty_usage_buckets() -> MutexGuard<'static, DirtyUsageBuckets> {
     DIRTY_USAGE_BUCKETS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn dirty_usage_bucket_scopes() -> MutexGuard<'static, DirtyUsageBucketScopes> {
+    DIRTY_USAGE_BUCKET_SCOPES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub(super) fn usize_to_u64_saturated(value: usize) -> u64 {
@@ -181,8 +242,10 @@ pub fn record_dirty_usage_bucket(bucket: &str) {
 
     let pending_buckets = {
         let mut dirty_buckets = dirty_usage_buckets();
+        let mut dirty_scopes = dirty_usage_bucket_scopes();
         let generation = advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
         dirty_buckets.insert(bucket.to_string(), generation);
+        dirty_scopes.insert(bucket.to_string(), DirtyUsageBucketScope::WholeBucket);
         dirty_buckets.len()
     };
     global_metrics().record_scanner_dirty_usage_pending(usize_to_u64_saturated(pending_buckets));
@@ -191,6 +254,56 @@ pub fn record_dirty_usage_bucket(bucket: &str) {
     // (rustfs/backlog#1872).
     crate::prefix_usage::invalidate_prefix_usage_cache(bucket);
     DIRTY_USAGE_BUCKET_NOTIFY.notify_one();
+}
+
+/// Record a mutation whose affected top-level namespace entry is known.
+///
+/// Object names that cannot be represented as one safe direct child retain the
+/// conservative whole-bucket marker. This journal is intentionally process
+/// local: after restart or any unverified distributed path the scanner falls
+/// back to its ordinary bucket scan.
+pub fn record_dirty_usage_object(bucket: &str, object: &str) {
+    let Some(top_level_entry) = dirty_usage_top_level_entry(object) else {
+        record_dirty_usage_bucket(bucket);
+        return;
+    };
+    if bucket.is_empty() {
+        return;
+    }
+
+    let pending_buckets = {
+        let mut dirty_buckets = dirty_usage_buckets();
+        let mut dirty_scopes = dirty_usage_bucket_scopes();
+        let generation = advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
+        dirty_buckets.insert(bucket.to_string(), generation);
+        let scope = dirty_scopes
+            .entry(bucket.to_string())
+            .or_insert_with(|| DirtyUsageBucketScope::TopLevelEntries(HashSet::new()));
+        let overflowed = match scope {
+            DirtyUsageBucketScope::WholeBucket => false,
+            DirtyUsageBucketScope::TopLevelEntries(entries) => {
+                entries.insert(top_level_entry);
+                entries.len() > MAX_DIRTY_USAGE_TOP_LEVEL_ENTRIES_PER_BUCKET
+            }
+        };
+        if overflowed {
+            *scope = DirtyUsageBucketScope::WholeBucket;
+        }
+        dirty_buckets.len()
+    };
+    global_metrics().record_scanner_dirty_usage_pending(usize_to_u64_saturated(pending_buckets));
+    crate::prefix_usage::invalidate_prefix_usage_cache(bucket);
+    DIRTY_USAGE_BUCKET_NOTIFY.notify_one();
+}
+
+fn dirty_usage_top_level_entry(object: &str) -> Option<String> {
+    let (top_level_entry, _) = object.split_once('/').unwrap_or((object, ""));
+    (!top_level_entry.is_empty()
+        && top_level_entry != "."
+        && top_level_entry != ".."
+        && !object.starts_with('/')
+        && !top_level_entry.contains(['\\', '\0']))
+    .then(|| top_level_entry.to_string())
 }
 
 pub fn record_scanner_maintenance_change(bucket: &str) {
@@ -262,6 +375,7 @@ pub fn acknowledge_dirty_usage_generation(
 
     let (cleared_buckets, pending_buckets) = {
         let mut dirty_buckets = dirty_usage_buckets();
+        let mut dirty_scopes = dirty_usage_bucket_scopes();
         let current_generation = DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire);
         if generation == 0 || generation == u64::MAX || current_generation == u64::MAX || generation > current_generation {
             return Err(ScannerDirtyUsageAckError::InvalidGeneration);
@@ -269,6 +383,7 @@ pub fn acknowledge_dirty_usage_generation(
 
         let before = dirty_buckets.len();
         dirty_buckets.retain(|_, dirty_generation| *dirty_generation > generation);
+        dirty_scopes.retain(|bucket, _| dirty_buckets.contains_key(bucket));
         let cleared_buckets = before.saturating_sub(dirty_buckets.len());
         if cleared_buckets > 0 {
             advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
@@ -291,7 +406,9 @@ pub fn clear_dirty_usage_bucket(bucket: &str) {
 
     let pending_buckets = {
         let mut dirty_buckets = dirty_usage_buckets();
+        let mut dirty_scopes = dirty_usage_bucket_scopes();
         dirty_buckets.remove(bucket);
+        dirty_scopes.remove(bucket);
         advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
         dirty_buckets.len()
     };
@@ -299,8 +416,9 @@ pub fn clear_dirty_usage_bucket(bucket: &str) {
 }
 
 pub(super) fn snapshot_dirty_usage_buckets(buckets: &[BucketInfo], absent_generation_cutoff: u64) -> DirtyUsageSnapshot {
-    let (snapshot, generation, covers_all_pending) = {
+    let (snapshot, scopes, generation, covers_all_pending) = {
         let dirty_buckets = dirty_usage_buckets();
+        let dirty_scopes = dirty_usage_bucket_scopes();
         let listed_buckets = dirty_buckets
             .values()
             .any(|generation| *generation > absent_generation_cutoff)
@@ -315,13 +433,26 @@ pub(super) fn snapshot_dirty_usage_buckets(buckets: &[BucketInfo], absent_genera
             })
             .map(|(bucket, generation)| (bucket.clone(), *generation))
             .collect::<DirtyUsageBuckets>();
+        let scopes = snapshot
+            .keys()
+            .map(|bucket| {
+                (
+                    bucket.clone(),
+                    dirty_scopes
+                        .get(bucket)
+                        .cloned()
+                        .unwrap_or(DirtyUsageBucketScope::WholeBucket),
+                )
+            })
+            .collect::<DirtyUsageBucketScopes>();
         let generation = DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire);
         let covers_all_pending = generation == absent_generation_cutoff && snapshot.len() == dirty_buckets.len();
-        (snapshot, generation, covers_all_pending)
+        (snapshot, scopes, generation, covers_all_pending)
     };
     global_metrics().record_scanner_dirty_usage_cycle_snapshot(usize_to_u64_saturated(snapshot.len()));
     DirtyUsageSnapshot {
         buckets: Arc::new(snapshot),
+        scopes: Arc::new(scopes),
         generation,
         covers_all_pending,
     }
@@ -338,10 +469,12 @@ pub(crate) async fn dirty_usage_bucket_notified() {
 pub(super) fn clear_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) {
     let (cleared_buckets, pending_buckets) = {
         let mut dirty_buckets = dirty_usage_buckets();
+        let mut dirty_scopes = dirty_usage_bucket_scopes();
         let mut cleared_buckets = 0usize;
         for (bucket, generation) in snapshot {
             if dirty_buckets.get(bucket).is_some_and(|current| current == generation) {
                 dirty_buckets.remove(bucket);
+                dirty_scopes.remove(bucket);
                 cleared_buckets += 1;
             }
         }
@@ -443,9 +576,15 @@ pub(super) fn dirty_usage_bucket_count() -> usize {
 #[cfg(test)]
 pub(crate) fn clear_dirty_usage_buckets_for_tests() {
     dirty_usage_buckets().clear();
+    dirty_usage_bucket_scopes().clear();
 }
 
 #[cfg(test)]
 pub(crate) fn dirty_usage_buckets_for_tests() -> DirtyUsageBuckets {
     dirty_usage_buckets().clone()
+}
+
+#[cfg(test)]
+pub(crate) fn dirty_usage_bucket_scopes_for_tests() -> DirtyUsageBucketScopes {
+    dirty_usage_bucket_scopes().clone()
 }

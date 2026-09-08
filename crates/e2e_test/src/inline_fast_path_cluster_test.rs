@@ -1676,6 +1676,8 @@ async fn four_node_inline_storage_and_get_boundaries() -> TestResult {
     let collector = OtlpMetricCollector::start().await?;
     let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
     configure_reader_metric_cluster(&mut cluster, &collector);
+    // Inspect every disk only after the PUT rename fanout has drained.
+    cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
     cluster.start().await?;
 
     for (state_index, state) in [VersionState::Unversioned, VersionState::Enabled, VersionState::Suspended]
@@ -2232,7 +2234,6 @@ async fn four_node_manual_transition_distributed_admission_conflict_reports_stat
     let bucket = format!("distributed-admission-{}", Uuid::new_v4().simple());
     let prefix = "transition/distributed-admission/";
     hot_client.create_bucket().bucket(&bucket).send().await?;
-    put_lifecycle_with_transition_retry(&hot_client, &bucket, &tier_name).await?;
     for index in 0u8..64 {
         let key = format!("{prefix}object-{index:02}.bin");
         hot_client
@@ -2243,6 +2244,7 @@ async fn four_node_manual_transition_distributed_admission_conflict_reports_stat
             .send()
             .await?;
     }
+    put_lifecycle_with_transition_retry(&hot_client, &bucket, &tier_name).await?;
 
     let (node0, node1) = tokio::join!(
         start_manual_transition_job_on_node(&hot, 0, &bucket, prefix, &tier_name, false, 64),
