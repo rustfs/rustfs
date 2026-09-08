@@ -78,8 +78,13 @@ fn data_plane_kms_error(error: &rustfs_kms::KmsError) -> Option<(S3ErrorCode, St
             Some((S3ErrorCode::InvalidRequest, "The KMS configuration cannot serve this request".to_string()))
         }
         // Transient: worth retrying, and must be counted against availability
-        // rather than against the caller.
+        // rather than against the caller. `IoError` belongs here because it is
+        // how a backend reports that its key store itself was unreachable —
+        // rustfs/rustfs#7470 separated that from a missing key precisely so the
+        // two stop looking alike, and leaving it on the 500 fallthrough would
+        // erase that distinction again at the S3 boundary.
         Kms::BackendError { .. }
+        | Kms::IoError { .. }
         | Kms::OperationTimedOut { .. }
         | Kms::OperationCancelled { .. }
         | Kms::CredentialsUnavailable { .. }
@@ -1160,6 +1165,13 @@ mod tests {
                 S3ErrorCode::ServiceUnavailable,
             ),
             (rustfs_kms::KmsError::cache_error("poisoned"), S3ErrorCode::ServiceUnavailable),
+            // A key store that cannot be read is an outage, not a missing key:
+            // rustfs/rustfs#7470 made the backend say so, and the S3 boundary
+            // has to keep the two apart.
+            (
+                rustfs_kms::KmsError::io_error("No such file or directory (os error 2)"),
+                S3ErrorCode::ServiceUnavailable,
+            ),
             // A permanent gap in the configured backend, never a missing resource.
             (
                 rustfs_kms::KmsError::unsupported_capability("local", "rewrap"),
