@@ -71,8 +71,8 @@ case "$build_type" in
     ;;
   preview)
     [[ -z "$dev_sequence" ]] || fail "preview must not have a development sequence"
-    [[ "$source_version" =~ ^${semver_core}-${prerelease_id}-preview\.(0|[1-9][0-9]*)$ ]] ||
-      fail "preview version must be strict prerelease-preview SemVer"
+    [[ "$source_version" =~ ^${semver_core}(-${prerelease_id})?-preview\.(0|[1-9][0-9]*)$ ]] ||
+      fail "preview version must be strict stable-preview or prerelease-preview SemVer"
 
     deb_version=${source_version/-/$tilde}
     rpm_version=${source_version//-/_}

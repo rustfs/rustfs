@@ -85,6 +85,9 @@ run_success rc-amd64 \
 run_success preview-amd64 \
   $'deb_version=1.0.0~rc.5-preview.2\nrpm_version=1.0.0_rc.5_preview.2\nrpm_release=1\ndeb_file=rustfs_1.0.0~rc.5-preview.2_amd64.deb\nrpm_file=rustfs-1.0.0_rc.5_preview.2-1.x86_64.rpm' \
   preview 1.0.0-rc.5-preview.2 '' amd64 x86_64
+run_success stable-preview-arm64 \
+  $'deb_version=1.0.0~preview.1\nrpm_version=1.0.0_preview.1\nrpm_release=1\ndeb_file=rustfs_1.0.0~preview.1_arm64.deb\nrpm_file=rustfs-1.0.0_preview.1-1.aarch64.rpm' \
+  preview 1.0.0-preview.1 '' arm64 aarch64
 run_success development-amd64 \
   "deb_version=0~dev.7463.${sha}
 rpm_version=0
@@ -108,7 +111,9 @@ run_failure release-with-sequence release 1.2.3 1 amd64 x86_64
 run_failure release-prerelease-mismatch release 1.2.3-rc.1 '' amd64 x86_64
 run_failure prerelease-release-mismatch prerelease 1.2.3 '' amd64 x86_64
 run_failure preview-malformed preview 1.2.3-rc.1-preview '' amd64 x86_64
-run_failure preview-wrong-shape preview 1.2.3-preview.1 '' amd64 x86_64
+run_failure preview-wrong-shape preview 1.2.3-dev-preview.1 '' amd64 x86_64
+run_failure preview-leading-zero preview 1.2.3-preview.01 '' amd64 x86_64
+run_failure preview-extra-suffix preview 1.2.3-preview.1-extra '' amd64 x86_64
 run_failure short-semver release 1.2 '' amd64 x86_64
 run_failure leading-v release v1.2.3 '' amd64 x86_64
 run_failure leading-zero release 01.2.3 '' amd64 x86_64
