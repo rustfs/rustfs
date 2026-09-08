@@ -1,159 +1,381 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-UPGRADE_WORKFLOW="${PROJECT_ROOT}/.github/workflows/e2e-upgrade.yml"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON_BIN="${RUSTFS_PYTHON_BIN:-python3}"
+SOURCE_REPOSITORY="${RUSTFS_UPGRADE_SOURCE_REPOSITORY:-rustfs/rustfs}"
+SOURCE_VERSION="${RUSTFS_UPGRADE_SOURCE_VERSION:-1.0.0-rc.5}"
+SOURCE_ASSET="${RUSTFS_UPGRADE_SOURCE_ASSET:-rustfs-linux-x86_64-gnu-v1.0.0-rc.5.zip}"
+SOURCE_SHA256="${RUSTFS_UPGRADE_SOURCE_SHA256:-3ee8df71e8edcfada533be452c4135868f697bc515460ae97b027313eade7a3d}"
 
+RUN_DIR=""
 SOURCE_DIR=""
-OUT_DIR=""
-SKIP_BUILD="false"
+SOURCE_BINARY="${RUSTFS_UPGRADE_SOURCE_BINARY:-}"
+TEST_SELECTION="all"
+PLAN_ONLY=0
+ALLOW_DIRTY=0
+SKIP_BUILD=0
+VERBOSE=0
 
 usage() {
-  cat <<'USAGE'
-Usage:
-  scripts/run_scanner_heal_g09_upgrade_evidence.sh [--source-dir <dir>] [--out-dir <dir>] [--skip-build]
+    cat <<'USAGE'
+Usage: scripts/run_scanner_heal_g09_upgrade_evidence.sh [OPTIONS]
 
-Runs the Scanner/Heal G09 upgrade evidence lanes against the pinned previous
-Linux x86_64 RustFS release used by the e2e-upgrade workflow:
+Build the current checkout, run the Scanner/Heal G09 upgrade compatibility
+lanes, and validate the raw mixed-version/rollback evidence artifacts.
 
-  - rolling mixed-version reader/writer evidence
-  - rollback payload replay evidence
+Options:
+  --run-dir DIR       New evidence directory (default: target/scanner-heal-g09-evidence/TIMESTAMP)
+  --out-dir DIR       Alias for --run-dir
+  --source-dir DIR    Cache directory for the pinned previous release binary
+  --source-binary BIN Use an existing previous-release rustfs binary
+  --test NAME         all, mixed-version, or rollback (default: all)
+  --allow-dirty      Allow tracked source changes while collecting evidence
+  --skip-build       Reuse an existing target/debug/rustfs binary
+  --plan-only        Print the resolved plan without building or running tests
+  --self-test        Run lightweight CLI and artifact-validator checks
+  --verbose          Stream command output instead of storing it under the run directory
+  -h, --help         Show this help
 
-The script builds the current PR head by default, downloads and verifies the
-pinned previous release binary, runs the ignored e2e tests, and fails unless all
-G09 JSON evidence artifacts are present and non-empty.
+The default pinned release asset is Linux x86_64. Use --source-binary when
+running against a custom previous-release binary on another platform.
 USAGE
 }
 
-die() {
-  echo "ERROR: $*" >&2
-  exit 1
-}
-
-parse_args() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --source-dir)
-        [[ $# -ge 2 ]] || die "--source-dir requires a value"
-        SOURCE_DIR="$2"
-        shift 2
-        ;;
-      --out-dir)
-        [[ $# -ge 2 ]] || die "--out-dir requires a value"
-        OUT_DIR="$2"
-        shift 2
-        ;;
-      --skip-build)
-        SKIP_BUILD="true"
-        shift
-        ;;
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      *)
-        die "unknown arg: $1"
-        ;;
+case_names() {
+    case "$TEST_SELECTION" in
+        all)
+            printf '%s\n' mixed-version rollback
+            ;;
+        mixed-version|rollback)
+            printf '%s\n' "$TEST_SELECTION"
+            ;;
+        *)
+            echo "unknown test selection: $TEST_SELECTION" >&2
+            exit 2
+            ;;
     esac
-  done
 }
 
-workflow_env_value() {
-  local key="$1"
-  awk -v key="${key}:" '$1 == key { gsub(/["'\'']/, "", $2); print $2; exit }' "$UPGRADE_WORKFLOW"
+artifact_for() {
+    case "$1" in
+        mixed-version)
+            echo "mixed-version-upgrade"
+            ;;
+        rollback)
+            echo "bucket-config-rollback"
+            ;;
+        *)
+            echo "unknown G09 case: $1" >&2
+            exit 2
+            ;;
+    esac
 }
 
-require_linux_x86_64() {
-  local kernel machine
-  kernel="$(uname -s)"
-  machine="$(uname -m)"
-  [[ "$kernel" == "Linux" ]] || die "G09 upgrade evidence uses the pinned Linux release binary; run this on Linux"
-  [[ "$machine" == "x86_64" || "$machine" == "amd64" ]] || die "G09 upgrade evidence requires x86_64/amd64"
+test_filter_for() {
+    case "$1" in
+        mixed-version)
+            echo "upgrade_compatibility_test::rolling_upgrade_from_rc2_preserves_mixed_version_contracts"
+            ;;
+        rollback)
+            echo "upgrade_compatibility_test::rollback_to_previous_release_reads_current_bucket_metadata"
+            ;;
+        *)
+            echo "unknown G09 case: $1" >&2
+            exit 2
+            ;;
+    esac
 }
 
-source_binary_path() {
-  printf '%s/rustfs\n' "$SOURCE_DIR"
+normalize_path() {
+    local path="$1"
+    if [[ "$path" == /* ]]; then
+        echo "$path"
+    else
+        echo "$ROOT/$path"
+    fi
 }
 
-ensure_previous_release_binary() {
-  local version asset sha archive url binary
-  version="${UPGRADE_SOURCE_VERSION:-$(workflow_env_value UPGRADE_SOURCE_VERSION)}"
-  asset="${UPGRADE_SOURCE_ASSET:-$(workflow_env_value UPGRADE_SOURCE_ASSET)}"
-  sha="${UPGRADE_SOURCE_SHA256:-$(workflow_env_value UPGRADE_SOURCE_SHA256)}"
-  [[ -n "$version" ]] || die "UPGRADE_SOURCE_VERSION is missing"
-  [[ -n "$asset" ]] || die "UPGRADE_SOURCE_ASSET is missing"
-  [[ -n "$sha" ]] || die "UPGRADE_SOURCE_SHA256 is missing"
-
-  SOURCE_DIR="${SOURCE_DIR:-${PROJECT_ROOT}/target/scanner-heal-g09-source/${version}}"
-  mkdir -p "$SOURCE_DIR"
-
-  binary="$(source_binary_path)"
-  if [[ -x "$binary" ]]; then
-    return
-  fi
-
-  archive="${SOURCE_DIR}/${asset}"
-  url="https://github.com/rustfs/rustfs/releases/download/${version}/${asset}"
-  curl --fail --location --retry 3 --output "$archive" "$url"
-  echo "${sha}  ${archive}" | sha256sum --check --strict
-  unzip -q -o "$archive" -d "$SOURCE_DIR"
-  chmod +x "$binary"
-  [[ -x "$binary" ]] || die "downloaded archive did not provide an executable rustfs binary"
+ensure_default_asset_platform() {
+    if [[ -n "$SOURCE_BINARY" ]]; then
+        return
+    fi
+    local os arch
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    if [[ "$os" != "Linux" || ( "$arch" != "x86_64" && "$arch" != "amd64" ) ]]; then
+        echo "default previous-release asset requires Linux x86_64; pass --source-binary for this platform" >&2
+        exit 2
+    fi
 }
 
-build_current_rustfs() {
-  if [[ "$SKIP_BUILD" == "true" ]]; then
-    return
-  fi
-  "${CARGO:-cargo}" build --locked -p rustfs --bin rustfs
-  : > "${PROJECT_ROOT}/target/debug/rustfs.features"
+verify_sha256() {
+    local archive="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s  %s\n' "$SOURCE_SHA256" "$archive" | sha256sum --check --strict
+    elif command -v shasum >/dev/null 2>&1; then
+        printf '%s  %s\n' "$SOURCE_SHA256" "$archive" | shasum -a 256 --check
+    else
+        echo "sha256sum or shasum is required to verify $SOURCE_ASSET" >&2
+        exit 1
+    fi
 }
 
-prepare_output_dir() {
-  local stamp
-  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  OUT_DIR="${OUT_DIR:-${PROJECT_ROOT}/target/scanner-heal-g09-evidence/${stamp}}"
-  mkdir -p "$OUT_DIR"
+resolve_source_binary() {
+    if [[ -n "$SOURCE_BINARY" ]]; then
+        SOURCE_BINARY="$(normalize_path "$SOURCE_BINARY")"
+        test -x "$SOURCE_BINARY"
+        echo "$SOURCE_BINARY"
+        return
+    fi
+
+    ensure_default_asset_platform
+    if [[ -z "$SOURCE_DIR" ]]; then
+        SOURCE_DIR="$ROOT/target/scanner-heal-g09-source/$SOURCE_VERSION"
+    else
+        SOURCE_DIR="$(normalize_path "$SOURCE_DIR")"
+    fi
+
+    local binary="$SOURCE_DIR/rustfs"
+    if [[ -x "$binary" ]]; then
+        echo "$binary"
+        return
+    fi
+
+    mkdir -p "$SOURCE_DIR"
+    local archive="$SOURCE_DIR/$SOURCE_ASSET"
+    curl --fail --location --retry 3 --output "$archive" \
+        "https://github.com/$SOURCE_REPOSITORY/releases/download/$SOURCE_VERSION/$SOURCE_ASSET"
+    verify_sha256 "$archive"
+    unzip -q "$archive" -d "$SOURCE_DIR"
+    chmod +x "$binary"
+    test -x "$binary"
+    echo "$binary"
 }
 
-run_case() {
-  local artifact="$1"
-  local test_name="$2"
-  shift 2
-  local case_dir="${OUT_DIR}/${artifact}"
-  mkdir -p "$case_dir"
-  RUSTFS_UPGRADE_SOURCE_BINARY="$(source_binary_path)" \
-    RUSTFS_E2E_LOG_DIR="${OUT_DIR}/server-logs/${artifact}" \
-    RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR="$case_dir" \
-    "${CARGO:-cargo}" test --locked -p e2e_test \
-      "upgrade_compatibility_test::${test_name}" \
-      -- --ignored --exact --nocapture
-
-  local expected
-  for expected in "$@"; do
-    [[ -s "${case_dir}/${expected}" ]] || die "missing non-empty ${artifact}/${expected}"
-  done
+run_logged() {
+    local label="$1"
+    shift
+    local log="$RUN_DIR/logs/$label.log"
+    mkdir -p "$(dirname "$log")"
+    if [[ "$VERBOSE" == 1 ]]; then
+        "$@"
+        return
+    fi
+    if ! "$@" >"$log" 2>&1; then
+        echo "$label failed; log: $log" >&2
+        tail -80 "$log" >&2 || true
+        return 1
+    fi
+    echo "PASS: $label"
 }
 
-main() {
-  parse_args "$@"
-  [[ -f "$UPGRADE_WORKFLOW" ]] || die "missing e2e-upgrade workflow"
-  require_linux_x86_64
-  cd "$PROJECT_ROOT"
-  ensure_previous_release_binary
-  build_current_rustfs
-  prepare_output_dir
-  run_case \
-    "mixed-version-upgrade" \
-    "rolling_upgrade_from_rc2_preserves_mixed_version_contracts" \
-    "G09-mixed_version_reader_evidence.json" \
-    "G09-mixed_version_writer_evidence.json"
-  run_case \
-    "bucket-config-rollback" \
-    "rollback_to_previous_release_reads_current_bucket_metadata" \
-    "G09-rollback_payload_evidence.json"
-  echo "PASS: Scanner/Heal G09 upgrade evidence written under ${OUT_DIR}"
+validate_artifacts() {
+    local source_revision="$1"
+    "$PYTHON_BIN" - "$RUN_DIR" "$source_revision" "$TEST_SELECTION" <<'PY'
+import json
+import pathlib
+import sys
+
+run_dir = pathlib.Path(sys.argv[1])
+source_revision = sys.argv[2]
+selection = sys.argv[3]
+
+expected = {
+    "mixed-version": [
+        ("mixed-version-upgrade/G09-mixed_version_reader_evidence.json",
+         "mixed_version_reader_evidence", "mixed-version-reader"),
+        ("mixed-version-upgrade/G09-mixed_version_writer_evidence.json",
+         "mixed_version_writer_evidence", "mixed-version-writer"),
+    ],
+    "rollback": [
+        ("bucket-config-rollback/G09-rollback_payload_evidence.json",
+         "rollback_payload_evidence", "rollback-payload"),
+    ],
 }
 
-main "$@"
+if selection != "all":
+    expected = {selection: expected[selection]}
+
+for _, artifacts in expected.items():
+    for relative, field, role in artifacts:
+        path = run_dir / relative
+        if not path.is_file():
+            raise SystemExit(f"missing G09 evidence artifact: {relative}")
+        evidence = json.loads(path.read_text())
+        if evidence.get("schema") != 1:
+            raise SystemExit(f"{relative}: expected schema 1")
+        if evidence.get("evidence_type") != "measured":
+            raise SystemExit(f"{relative}: expected measured evidence")
+        if evidence.get("artifact_kind") != "upgrade-compatibility-e2e":
+            raise SystemExit(f"{relative}: unexpected artifact kind")
+        if evidence.get("gate") != "G09":
+            raise SystemExit(f"{relative}: unexpected gate")
+        if evidence.get("field") != field:
+            raise SystemExit(f"{relative}: expected field {field}")
+        if evidence.get("mixed_version_role") != role:
+            raise SystemExit(f"{relative}: expected role {role}")
+        if evidence.get("current_revision") != source_revision:
+            raise SystemExit(f"{relative}: current revision does not match this checkout")
+        versions = evidence.get("versions")
+        if not isinstance(versions, list) or len(versions) != 2:
+            raise SystemExit(f"{relative}: versions must contain previous and current revisions")
+        if versions[0] == versions[1]:
+            raise SystemExit(f"{relative}: previous and current revisions must differ")
+        if field == "rollback_payload_evidence" and evidence.get("rollback_payload_replayed") is not True:
+            raise SystemExit(f"{relative}: rollback payload was not marked replayed")
+
+print("PASS: G09 raw evidence artifacts verified")
+PY
+}
+
+run_self_test() {
+    local tmp
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/rustfs-g09-evidence-self-test.XXXXXX")"
+    trap "rm -rf '$tmp'" EXIT
+
+    local plan
+    plan="$("$0" --plan-only --run-dir "$tmp/run" --source-binary "$tmp/rustfs-prev" --test all)"
+    [[ "$plan" == *"tests=mixed-version rollback"* ]]
+    [[ "$plan" == *"run_dir=$tmp/run"* ]]
+
+    if "$0" --plan-only --test not-a-case >/dev/null 2>&1; then
+        echo "self-test failed: invalid test selection was accepted" >&2
+        return 1
+    fi
+
+    mkdir -p "$tmp/run/mixed-version-upgrade" "$tmp/run/bucket-config-rollback"
+    local current previous
+    current="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    previous="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    cat >"$tmp/run/mixed-version-upgrade/G09-mixed_version_reader_evidence.json" <<JSON
+{"schema":1,"evidence_type":"measured","artifact_kind":"upgrade-compatibility-e2e","gate":"G09","field":"mixed_version_reader_evidence","mixed_version_role":"mixed-version-reader","current_revision":"$current","previous_revision":"$previous","versions":["$previous","$current"]}
+JSON
+    cat >"$tmp/run/mixed-version-upgrade/G09-mixed_version_writer_evidence.json" <<JSON
+{"schema":1,"evidence_type":"measured","artifact_kind":"upgrade-compatibility-e2e","gate":"G09","field":"mixed_version_writer_evidence","mixed_version_role":"mixed-version-writer","current_revision":"$current","previous_revision":"$previous","versions":["$previous","$current"]}
+JSON
+    cat >"$tmp/run/bucket-config-rollback/G09-rollback_payload_evidence.json" <<JSON
+{"schema":1,"evidence_type":"measured","artifact_kind":"upgrade-compatibility-e2e","gate":"G09","field":"rollback_payload_evidence","mixed_version_role":"rollback-payload","current_revision":"$current","previous_revision":"$previous","versions":["$previous","$current"],"rollback_payload_replayed":true}
+JSON
+    RUN_DIR="$tmp/run" TEST_SELECTION="all" validate_artifacts "$current" >/dev/null
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --run-dir|--out-dir)
+            RUN_DIR="$2"
+            shift 2
+            ;;
+        --source-dir)
+            SOURCE_DIR="$2"
+            shift 2
+            ;;
+        --source-binary)
+            SOURCE_BINARY="$2"
+            shift 2
+            ;;
+        --test)
+            TEST_SELECTION="$2"
+            shift 2
+            ;;
+        --allow-dirty)
+            ALLOW_DIRTY=1
+            shift
+            ;;
+        --skip-build)
+            SKIP_BUILD=1
+            shift
+            ;;
+        --plan-only)
+            PLAN_ONLY=1
+            shift
+            ;;
+        --self-test)
+            run_self_test
+            exit $?
+            ;;
+        --verbose)
+            VERBOSE=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+CASES=()
+while IFS= read -r case_name; do
+    CASES+=("$case_name")
+done < <(case_names)
+if [[ -z "$RUN_DIR" ]]; then
+    RUN_DIR="$ROOT/target/scanner-heal-g09-evidence/$(date -u +%Y%m%dT%H%M%SZ)"
+else
+    RUN_DIR="$(normalize_path "$RUN_DIR")"
+fi
+
+if [[ "$PLAN_ONLY" == 1 ]]; then
+    echo "run_dir=$RUN_DIR"
+    echo "tests=${CASES[*]}"
+    echo "source_repository=$SOURCE_REPOSITORY"
+    echo "source_version=$SOURCE_VERSION"
+    if [[ -n "$SOURCE_BINARY" ]]; then
+        echo "source_binary=$(normalize_path "$SOURCE_BINARY")"
+    else
+        if [[ -z "$SOURCE_DIR" ]]; then
+            echo "source_dir=$ROOT/target/scanner-heal-g09-source/$SOURCE_VERSION"
+        else
+            echo "source_dir=$(normalize_path "$SOURCE_DIR")"
+        fi
+        echo "source_asset=$SOURCE_ASSET"
+    fi
+    exit 0
+fi
+
+cd "$ROOT"
+if [[ "$ALLOW_DIRTY" != 1 && -n "$(git status --porcelain --untracked-files=no)" ]]; then
+    echo "commit tracked source changes before creating release evidence, or pass --allow-dirty for local diagnostics" >&2
+    exit 1
+fi
+if [[ -e "$RUN_DIR" ]]; then
+    echo "evidence run directory already exists: $RUN_DIR" >&2
+    exit 1
+fi
+mkdir -p "$RUN_DIR/logs"
+
+SOURCE_BINARY="$(resolve_source_binary)"
+export RUSTFS_UPGRADE_SOURCE_BINARY="$SOURCE_BINARY"
+export RUSTFS_E2E_LOG_DIR="${RUSTFS_E2E_LOG_DIR:-$RUN_DIR/server-logs}"
+mkdir -p "$RUSTFS_E2E_LOG_DIR"
+
+if [[ "$SKIP_BUILD" != 1 ]]; then
+    run_logged build-current cargo build --locked -p rustfs --bin rustfs
+    : > "$ROOT/target/debug/rustfs.features"
+fi
+
+SOURCE_REVISION="$(git rev-parse HEAD)"
+printf '%s\n' "$SOURCE_REVISION" >"$RUN_DIR/source-revision.txt"
+printf '%s\n' "$SOURCE_VERSION" >"$RUN_DIR/previous-release-version.txt"
+
+for case_name in "${CASES[@]}"; do
+    artifact="$(artifact_for "$case_name")"
+    test_filter="$(test_filter_for "$case_name")"
+    evidence_dir="$RUN_DIR/$artifact"
+    mkdir -p "$evidence_dir"
+    run_logged "$case_name" env \
+        NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}" \
+        HTTP_PROXY= \
+        HTTPS_PROXY= \
+        RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR="$evidence_dir" \
+        cargo test --locked -p e2e_test "$test_filter" -- --ignored --exact --nocapture
+done
+
+validate_artifacts "$SOURCE_REVISION"
+echo "Scanner/Heal G09 evidence verified: $RUN_DIR"
