@@ -22601,6 +22601,56 @@ mod test {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn conditional_mrf_manifest_storage_full_delete_keeps_recovery_anchors() {
+        use tempfile::tempdir;
+
+        const MRF_COMMIT_MANIFEST_SLOT_0: &str = ".heal-mrf-commit.0.bin";
+        const MRF_SCOPED_JOURNAL_PATH: &str = "buckets/.heal/mrf/journal-scoped.bin";
+
+        let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let committed_manifest = Bytes::from_static(b"mrf-committed-manifest-v1");
+        let legacy_journal = Bytes::from_static(b"legacy-mrf-journal-records");
+
+        assert_eq!(
+            disk.compare_and_update_file(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0, None, Some(committed_manifest.clone()),)
+                .await
+                .expect("committed MRF manifest should publish"),
+            ConditionalFileUpdate::Updated
+        );
+        disk.write_all(RUSTFS_META_BUCKET, MRF_SCOPED_JOURNAL_PATH, legacy_journal.clone())
+            .await
+            .expect("legacy MRF journal should be retained");
+
+        let manifest_path = disk
+            .get_object_path(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0)
+            .expect("MRF manifest path should resolve");
+        let parent = manifest_path.parent().expect("MRF manifest path should have a parent");
+        os::fsync_dir_recorder::set_failure(parent, ErrorKind::StorageFull);
+
+        let err = disk
+            .compare_and_update_file(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0, Some(committed_manifest.clone()), None)
+            .await
+            .expect_err("storage-full fsync failure must fail the MRF manifest cleanup delete");
+        assert!(matches!(err, DiskError::Io(ref err) if err.kind() == ErrorKind::StorageFull));
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, MRF_COMMIT_MANIFEST_SLOT_0)
+                .await
+                .expect("committed MRF manifest should be restored after failed cleanup delete"),
+            committed_manifest
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, MRF_SCOPED_JOURNAL_PATH)
+                .await
+                .expect("legacy MRF journal should remain readable after failed cleanup delete"),
+            legacy_journal
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn conditional_file_update_dir_fsync_failure_removes_new_file_without_anchor() {
         use tempfile::tempdir;
 
