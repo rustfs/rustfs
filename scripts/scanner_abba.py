@@ -173,6 +173,18 @@ def release_evidence_true(value, name):
     require(value is True, f"missing release_evidence.{name}")
 
 
+def release_evidence_exact_strings(value, expected, name):
+    require(isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value),
+            f"invalid release_evidence.{name}")
+    observed = set(value)
+    require(len(observed) == len(value), f"duplicate release_evidence.{name}")
+    missing = sorted(set(expected) - observed)
+    require(not missing, f"missing release_evidence.{name}: {', '.join(missing)}")
+    unknown = sorted(observed - set(expected))
+    require(not unknown, f"unknown release_evidence.{name}: {', '.join(unknown)}")
+    return value
+
+
 def validate_release_evidence_manifest(manifest):
     if manifest["evidence"] != "measured":
         return
@@ -210,17 +222,17 @@ def validate_release_evidence_manifest(manifest):
 
     crash = evidence.get("crash_restart")
     require(isinstance(crash, dict), "missing release_evidence.crash_restart")
-    fault_modes = crash.get("fault_modes")
-    require(
-        isinstance(fault_modes, list)
-        and all(mode in fault_modes for mode in RELEASE_FAULT_MODES)
-        and all(isinstance(mode, str) and mode.strip() for mode in fault_modes),
-        "missing release_evidence.crash_restart.fault_modes",
-    )
+    release_evidence_exact_strings(crash.get("fault_modes"), RELEASE_FAULT_MODES, "crash_restart.fault_modes")
     release_evidence_true(crash.get("unclean_shutdown_marker"), "crash_restart.unclean_shutdown_marker")
 
     mixed = evidence.get("mixed_version")
     require(isinstance(mixed, dict), "missing release_evidence.mixed_version")
+    baseline_revision = manifest["baseline"]["revision"]
+    candidate_revision = manifest["candidate"]["revision"]
+    require(baseline_revision != candidate_revision,
+            "release_evidence.mixed_version requires distinct baseline and candidate revisions")
+    require(manifest["baseline"]["sha256"] != manifest["candidate"]["sha256"],
+            "release_evidence.mixed_version requires distinct baseline and candidate binaries")
     revisions = mixed.get("participating_revisions")
     require(
         isinstance(revisions, list)
@@ -229,20 +241,15 @@ def validate_release_evidence_manifest(manifest):
                 for revision in revisions),
         "invalid release_evidence.mixed_version.participating_revisions",
     )
-    for revision in (manifest["baseline"]["revision"], manifest["candidate"]["revision"]):
+    for revision in (baseline_revision, candidate_revision):
         require(revision in revisions, "release_evidence.mixed_version omits tested build revision")
     for key in ("reader", "writer", "rollback_payload"):
         require(mixed.get(key) is True, f"missing release_evidence.mixed_version.{key}")
 
     profile = evidence.get("profile")
     require(isinstance(profile, dict), "missing release_evidence.profile")
-    artifacts = profile.get("required_artifacts")
-    require(
-        isinstance(artifacts, list)
-        and all(item in artifacts for item in RELEASE_PROFILE_ARTIFACTS)
-        and all(isinstance(item, str) and item.strip() for item in artifacts),
-        "missing release_evidence.profile.required_artifacts",
-    )
+    release_evidence_exact_strings(profile.get("required_artifacts"), RELEASE_PROFILE_ARTIFACTS,
+                                   "profile.required_artifacts")
     for key in ("collector_config_sha256", "profiler_config_sha256"):
         require(sha(profile.get(key)), f"invalid release_evidence.profile.{key}")
 
