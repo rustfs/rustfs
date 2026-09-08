@@ -1333,6 +1333,7 @@ def release_bundle_artifact_path(bundle_path: Path, raw_path: object, gate: str,
     resolved = (bundle_path.parent / path).resolve()
     require(resolved.is_relative_to(bundle_path.parent.resolve()), f"{gate}.{field} artifact path escapes bundle directory")
     require(resolved.is_file(), f"{gate}.{field} artifact is missing")
+    require(resolved.stat().st_size > 0, f"{gate}.{field} artifact is empty")
     return resolved
 
 
@@ -1414,7 +1415,6 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
             require(isinstance(item, dict), f"{gate}.{field}.{artifact_kind} must be an object")
             artifact_field = f"{field}.{artifact_kind}"
             artifact_path = release_bundle_artifact_path(bundle_path, item.get("artifact"), gate, artifact_field)
-            require(artifact_path.stat().st_size > 0, f"{gate}.{artifact_field} artifact is empty")
             require(sha(item.get("sha256")) and digest(artifact_path) == item["sha256"],
                     f"{gate}.{artifact_field} artifact hash mismatch")
             evidence_string(item.get("artifact_format"), f"{gate}.{artifact_field}.artifact_format",
@@ -1829,7 +1829,7 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(status["pending_lanes"], [])
 
     def test_scanner_heal_release_bundle_rejects_synthetic_or_missing_fields(self) -> None:
-        for fault in ("synthetic", "missing-field", "hash"):
+        for fault in ("synthetic", "missing-field", "hash", "empty-artifact"):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
                 root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
                 data = read_json(bundle)
@@ -1837,9 +1837,12 @@ class SelfTests(unittest.TestCase):
                     data["evidence"] = "synthetic"
                 elif fault == "missing-field":
                     del data["gates"]["G09"]["evidence_fields"]["rollback_payload_evidence"]
-                else:
+                elif fault == "hash":
                     artifact = bundle.parent / data["gates"]["G01"]["evidence_fields"]["root_authority_evidence"]["artifact"]
                     artifact.write_text(artifact.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+                else:
+                    artifact = bundle.parent / data["gates"]["G01"]["evidence_fields"]["root_authority_evidence"]["artifact"]
+                    artifact.write_text("", encoding="utf-8")
                 write_json(bundle, data)
 
                 with mock.patch("subprocess.check_output", return_value="b" * 40):
