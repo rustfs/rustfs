@@ -30,6 +30,7 @@ METRICS = (
 )
 REPEATABILITY_LIMIT = Decimal("0.05")
 P2_WORK_MULTIPLE_LIMIT = Decimal("1.2")
+W11_RSS_GROWTH_LIMIT = Decimal("0.05")
 RELEASE_PROFILE_ARTIFACTS = (
     "allocation-profile",
     "flamegraph",
@@ -465,6 +466,48 @@ def running_heal_pacing(group, baseline, candidate, p99, throughput, noisy):
     }
 
 
+def bounded_retry_window(group, baseline, candidate, p99, throughput, noisy, candidate_attempt_costs):
+    if group[0]["scenario"] != "running-heal" or group[0]["comparison"] != "build":
+        return {"status": "not_applicable"}
+
+    rss_growth = relative_change_or_none(candidate["rss_bytes"], baseline["rss_bytes"], "rss_bytes")
+    lock_wait_change = relative_change_or_none(
+        candidate["heal_lock_wait_p99_ms"], baseline["heal_lock_wait_p99_ms"], "heal lock wait p99",
+    )
+    latency_improved = p99 < 0 or throughput > 0
+    lock_wait_improved = lock_wait_change is not None and lock_wait_change < 0
+    rss_within_limit = rss_growth is not None and rss_growth <= W11_RSS_GROWTH_LIMIT
+    attempt_cost_available = bool(candidate_attempt_costs)
+    status = (
+        "inconclusive"
+        if noisy
+        else "observed"
+        if latency_improved and lock_wait_improved and rss_within_limit and attempt_cost_available
+        else "rss_regression"
+        if latency_improved and lock_wait_improved and not rss_within_limit
+        else "no_measured_benefit"
+        if attempt_cost_available
+        else "pending"
+    )
+    return {
+        "status": status,
+        "rss_growth_limit": float(W11_RSS_GROWTH_LIMIT),
+        "rss_growth": None if rss_growth is None else float(rss_growth),
+        "rss_within_limit": rss_within_limit,
+        "baseline_rss_bytes": float(baseline["rss_bytes"]),
+        "candidate_rss_bytes": float(candidate["rss_bytes"]),
+        "baseline_heal_lock_wait_p99_ms": float(baseline["heal_lock_wait_p99_ms"]),
+        "candidate_heal_lock_wait_p99_ms": float(candidate["heal_lock_wait_p99_ms"]),
+        "heal_lock_wait_p99_change": None if lock_wait_change is None else float(lock_wait_change),
+        "healthy_page_latency_observed": latency_improved,
+        "foreground_p99_change": float(p99),
+        "foreground_throughput_change": float(throughput),
+        "candidate_attempt_cost_per_healed_object": (
+            None if not candidate_attempt_costs else float(max(candidate_attempt_costs))
+        ),
+    }
+
+
 def convergence(result):
     window = result.get("convergence")
     if not window or window.get("writes_stopped") is not True or window.get("last_mutation_observed") is not True or window.get("first_complete_publication") is not True:
@@ -525,6 +568,7 @@ def evaluate(cells):
             value for cell, value in zip(group, attempt_costs) if cell["leg"].startswith("B") and value is not None
         ]
         w10 = running_heal_pacing(group, a, b, p99, throughput, noise)
+        w11 = bounded_retry_window(group, a, b, p99, throughput, noise, candidate_attempt_costs)
         inconclusive |= noise or p2_pending
         if not noise and not passed:
             failed = True
@@ -541,6 +585,7 @@ def evaluate(cells):
                                 "candidate_vs_baseline": scanner_cache_cost_change(b, a),
                             },
                             "w10": w10,
+                            "w11": w11,
                             "w10_w11": {
                                 "foreground_pressure_high_sample_ratios": [
                                     float(pressure_high_ratio(cell["result"]["metrics"])) for cell in group

@@ -104,6 +104,7 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
                 "heal_duplicate_task_count": [0, 0, 0, 0],
                 "heal_lock_hold_p95_ms": [7.0, 6.0, 6.5, 7.5],
             },
+            "w11": {"status": "not_applicable"},
         }
         self.report = {
             "status": "pass",
@@ -121,6 +122,22 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
                 for round_id in range(1, 4):
                     row = copy.deepcopy(self.comparison)
                     row.update(scenario=scenario, comparison=comparison, round=round_id)
+                    if scenario == "running-heal" and comparison == "build":
+                        row["w11"] = {
+                            "status": "observed",
+                            "rss_growth_limit": 0.05,
+                            "rss_growth": 0.01,
+                            "rss_within_limit": True,
+                            "baseline_rss_bytes": 1000000.0,
+                            "candidate_rss_bytes": 1010000.0,
+                            "baseline_heal_lock_wait_p99_ms": 12.0,
+                            "candidate_heal_lock_wait_p99_ms": 8.0,
+                            "heal_lock_wait_p99_change": -0.33,
+                            "healthy_page_latency_observed": True,
+                            "foreground_p99_change": -0.02,
+                            "foreground_throughput_change": 0.01,
+                            "candidate_attempt_cost_per_healed_object": 1.3,
+                        }
                     comparisons.append(row)
         return comparisons
 
@@ -157,6 +174,11 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         self.assertEqual(result["abba"]["provenance"]["manifest_sha256"], sha(self.abba / "manifest.json"))
         self.assertEqual(result["abba"]["w09_duplicate_task_count"], 0.0)
         self.assertEqual(result["abba"]["w09_worst_heal_start_p95_ms"], 43.0)
+        self.assertEqual(
+            [row["status"] for row in result["abba"]["w11_running_heal_build"]],
+            ["observed", "observed", "observed"],
+        )
+        self.assertIn("w11_running_heal_build_statuses: observed,observed,observed", summary.markdown(result))
         self.assertEqual(result["cache_cost"]["max_save_body_amplification"], 2.0)
 
     def test_synthetic_report_fails_as_performance_conclusion(self):
@@ -247,7 +269,7 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
             summary.build_summary(args)
 
     def test_passing_abba_report_requires_w10_w11_evidence(self):
-        for fault in ("missing", "pressure", "lock", "attempt", "length", "range"):
+        for fault in ("missing", "pressure", "lock", "attempt", "length", "range", "w11-missing", "w11-pending"):
             with self.subTest(fault=fault):
                 self.setUp()
                 target = self.report["comparisons"][0]
@@ -261,6 +283,18 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
                     del target["w10_w11"]["attempt_cost_per_healed_object"]
                 elif fault == "length":
                     target["w10_w11"]["attempt_cost_per_healed_object"] = [None]
+                elif fault == "w11-missing":
+                    running_heal = next(
+                        comparison for comparison in self.report["comparisons"]
+                        if comparison["scenario"] == "running-heal" and comparison["comparison"] == "build"
+                    )
+                    del running_heal["w11"]
+                elif fault == "w11-pending":
+                    running_heal = next(
+                        comparison for comparison in self.report["comparisons"]
+                        if comparison["scenario"] == "running-heal" and comparison["comparison"] == "build"
+                    )
+                    running_heal["w11"]["status"] = "pending"
                 else:
                     target["w10_w11"]["foreground_pressure_high_sample_ratios"] = [1.5, 0.0, 0.0, 0.0]
                 self.write_inputs()
@@ -271,7 +305,7 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
                     "json_out": None,
                     "markdown_out": None,
                 })
-                with self.assertRaisesRegex(ValueError, "W10/W11|performance evidence|length mismatch|above maximum"):
+                with self.assertRaisesRegex(ValueError, "W10/W11|W11|performance evidence|length mismatch|above maximum"):
                     summary.build_summary(args)
 
     def test_passing_abba_report_requires_w09_evidence(self):
