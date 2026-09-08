@@ -693,6 +693,122 @@ fn test_record_iam_deletion_marks_newest_wins_and_expires_by_age_only() {
     );
 }
 
+/// Scheduling a snapshot is not a delivery failure. Repeated imports - the
+/// normal way a bulk IAM migration is done, one archive at a time - must not
+/// walk the peer's entry up to the escalation threshold and report a healthy
+/// site as `retryStats.failed` with the scheduling note as its `lastError`.
+#[test]
+fn repeated_iam_import_snapshots_do_not_escalate_a_healthy_peer() {
+    let local = PeerInfo {
+        deployment_id: "local-dep".to_string(),
+        ..peer("local", "https://local.example.com")
+    };
+    let remote = PeerInfo {
+        deployment_id: "remote-a".to_string(),
+        ..peer("remote-a", "https://a.example.com")
+    };
+    let mut state = SiteReplicationState {
+        peers: BTreeMap::from([
+            (local.deployment_id.clone(), local.clone()),
+            (remote.deployment_id.clone(), remote),
+        ]),
+        ..Default::default()
+    };
+
+    for _ in 0..(SITE_REPLICATION_RETRY_FAILED_AFTER + 2) {
+        record_iam_snapshot_retries(&mut state, &local, "iam import scheduled a full snapshot").expect("record snapshot");
+    }
+
+    assert_eq!(state.retry_queue.len(), 1);
+    let event = &state.retry_queue[0];
+    assert_eq!(event.retry_count, 1, "a schedule must not count as a delivery attempt");
+    assert!(!event.failed, "a scheduled snapshot must not report as an escalated failure");
+}
+
+/// An escalated entry records a deletion a snapshot cannot replay: only a
+/// repair settles it. Scheduling an import snapshot must not clear that
+/// marker to make the entry drainable again, and the peer it skips has to be
+/// reported rather than silently left behind.
+#[test]
+fn an_escalated_peer_keeps_its_marker_and_is_reported() {
+    let local = PeerInfo {
+        deployment_id: "local-dep".to_string(),
+        ..peer("local", "https://local.example.com")
+    };
+    let remote = PeerInfo {
+        deployment_id: "remote-a".to_string(),
+        ..peer("remote-a", "https://a.example.com")
+    };
+    let mut state = SiteReplicationState {
+        peers: BTreeMap::from([
+            (local.deployment_id.clone(), local.clone()),
+            (remote.deployment_id.clone(), remote.clone()),
+        ]),
+        retry_queue: vec![SiteReplicationRetryEvent {
+            id: "escalated".to_string(),
+            peer_deployment_id: remote.deployment_id.clone(),
+            peer_endpoint: remote.endpoint,
+            path: SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH.to_string(),
+            retry_count: SITE_REPLICATION_RETRY_FAILED_AFTER,
+            failed: true,
+            last_error: SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER.to_string(),
+            deletions_recorded: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let escalated =
+        record_iam_snapshot_retries(&mut state, &local, "iam import scheduled a full snapshot").expect("record snapshot retries");
+
+    assert_eq!(escalated, 1);
+    assert_eq!(state.retry_queue.len(), 1);
+    assert_eq!(
+        state.retry_queue[0].last_error, SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER,
+        "the unreplayable-deletion marker must survive a snapshot schedule"
+    );
+}
+
+#[test]
+fn iam_import_snapshot_retry_is_recorded_once_per_remote_peer() {
+    let local = PeerInfo {
+        deployment_id: "local-dep".to_string(),
+        ..peer("local", "https://local.example.com")
+    };
+    let remote_a = PeerInfo {
+        deployment_id: "remote-a".to_string(),
+        ..peer("remote-a", "https://a.example.com")
+    };
+    let remote_b = PeerInfo {
+        deployment_id: "remote-b".to_string(),
+        ..peer("remote-b", "https://b.example.com")
+    };
+    let mut state = SiteReplicationState {
+        peers: BTreeMap::from([
+            (local.deployment_id.clone(), local.clone()),
+            (remote_a.deployment_id.clone(), remote_a),
+            (remote_b.deployment_id.clone(), remote_b),
+        ]),
+        ..Default::default()
+    };
+
+    record_iam_snapshot_retries(&mut state, &local, "IAM import snapshot pending").expect("record snapshot retries");
+
+    assert_eq!(state.retry_queue.len(), 2);
+    assert!(
+        state
+            .retry_queue
+            .iter()
+            .all(|event| event.path == SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH)
+    );
+    assert!(
+        state
+            .retry_queue
+            .iter()
+            .all(|event| event.peer_deployment_id != local.deployment_id)
+    );
+}
+
 /// A failed deletion delivery persists a replay record next to the collapsed
 /// retry entry; a fresh entry is stamped `deletions_recorded` so a later
 /// replay can settle it, and a repeated deletion of the same entity keeps the
