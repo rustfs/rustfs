@@ -467,8 +467,13 @@ where
         } else {
             Vec::new()
         };
-        let segment_reuse_activation_preflight =
-            scanner_segment_reuse_activation_preflight_for_cycle(&dirty_usage_snapshot, distributed, None, false);
+        let segment_reuse_activation_preflight = scanner_segment_reuse_activation_preflight_for_cycle(
+            &dirty_usage_snapshot,
+            dirty_usage_producer_evidence(&dirty_usage_snapshot),
+            distributed,
+            None,
+            false,
+        );
         return Ok(ScannerCycleResult::new(status, dirty_usage_clear)
             .with_publication_epoch(publication_epoch)
             .with_activity_digest(activity_digest)
@@ -708,6 +713,7 @@ where
     );
     let segment_reuse_activation_preflight = scanner_segment_reuse_activation_preflight_for_cycle(
         &dirty_usage_snapshot,
+        dirty_usage_producer_evidence(&dirty_usage_snapshot),
         distributed,
         distributed_segment_invalidation_evidence,
         cold_zero_walk_oracle,

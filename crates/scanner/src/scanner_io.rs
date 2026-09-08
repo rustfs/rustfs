@@ -39,7 +39,7 @@ use s3s::dto::{
     BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled, ReplicationConfiguration, VersioningConfiguration,
 };
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -204,6 +204,7 @@ pub(crate) struct DistributedSegmentInvalidationEvidence {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ScannerSegmentReuseActivationProof {
     pub(crate) production_activation: bool,
+    pub(crate) producer_identity_coverage_complete: bool,
     pub(crate) durable_producer_identity: bool,
     pub(crate) restart_gap_absent: bool,
     pub(crate) generation_window_bound: bool,
@@ -495,6 +496,7 @@ fn scanner_segment_reuse_activation_preflight_from_proof(
     ScannerSegmentReuseActivationPreflight {
         production_activation: proof.production_activation,
         scanner_segment_reuse_activated: proof.production_activation
+            && proof.producer_identity_coverage_complete
             && proof.durable_producer_identity
             && proof.restart_gap_absent
             && proof.generation_window_bound
@@ -504,7 +506,8 @@ fn scanner_segment_reuse_activation_preflight_from_proof(
         proof_inputs: &SCANNER_SEGMENT_ACTIVATION_PROOF_INPUTS,
         fail_closed_checks: &SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS,
         fail_closed_blockers: [
-            (!proof.durable_producer_identity).then_some("missing_producer_identity"),
+            (!proof.producer_identity_coverage_complete || !proof.durable_producer_identity)
+                .then_some("missing_producer_identity"),
             (!proof.restart_gap_absent).then_some("restart_gap"),
             (!proof.generation_window_bound).then_some("generation_gap"),
             (!proof.overflow_absent).then_some("overflow"),
@@ -516,17 +519,20 @@ fn scanner_segment_reuse_activation_preflight_from_proof(
 
 fn scanner_segment_reuse_activation_preflight_for_cycle(
     dirty_usage_snapshot: &DirtyUsageSnapshot,
+    dirty_usage_producer_evidence: DirtyUsageProducerEvidence,
     distributed: bool,
     distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
     cold_zero_walk_oracle: bool,
 ) -> ScannerSegmentReuseActivationPreflight {
     scanner_segment_reuse_activation_preflight_from_proof(ScannerSegmentReuseActivationProof {
         production_activation: false,
-        durable_producer_identity: false,
-        restart_gap_absent: false,
+        producer_identity_coverage_complete: dirty_usage_producer_evidence.producer_identity_coverage_complete,
+        durable_producer_identity: dirty_usage_producer_evidence.durable_producer_identity,
+        restart_gap_absent: dirty_usage_producer_evidence.restart_gap_absent,
         generation_window_bound: dirty_usage_snapshot.covers_all_pending
             && dirty_usage_snapshot.generation != 0
-            && dirty_usage_snapshot.generation != u64::MAX,
+            && dirty_usage_snapshot.generation != u64::MAX
+            && dirty_usage_producer_evidence.generation_window_bound,
         overflow_absent: dirty_usage_snapshot.covers_all_pending,
         cold_zero_walk_oracle,
         distributed_peer_invalidation: !distributed || distributed_segment_invalidation_evidence.is_some(),

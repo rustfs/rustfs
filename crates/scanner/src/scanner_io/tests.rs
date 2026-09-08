@@ -104,6 +104,7 @@ fn scanner_segment_reuse_activation_preflight_reports_release_gate_inputs() {
 fn scanner_segment_reuse_activation_requires_every_preflight_proof() {
     let complete_proof = ScannerSegmentReuseActivationProof {
         production_activation: true,
+        producer_identity_coverage_complete: true,
         durable_producer_identity: true,
         restart_gap_absent: true,
         generation_window_bound: true,
@@ -125,8 +126,12 @@ fn scanner_segment_reuse_activation_requires_every_preflight_proof() {
     assert_eq!(preflight.fail_closed_blockers().collect::<Vec<_>>(), Vec::<&str>::new());
 
     let mut missing_identity = complete_proof;
-    missing_identity.durable_producer_identity = false;
+    missing_identity.producer_identity_coverage_complete = false;
     assert_segment_reuse_activation_blocked_by(missing_identity, "missing_producer_identity");
+
+    let mut non_durable_identity = complete_proof;
+    non_durable_identity.durable_producer_identity = false;
+    assert_segment_reuse_activation_blocked_by(non_durable_identity, "missing_producer_identity");
 
     let mut restart_gap = complete_proof;
     restart_gap.restart_gap_absent = false;
@@ -166,8 +171,13 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_reports_cycle_inputs_wit
         all_peers_bound_to_generation_window: true,
     };
 
-    let preflight =
-        scanner_segment_reuse_activation_preflight_for_cycle(&dirty_usage_snapshot, true, Some(distributed_evidence), true);
+    let preflight = scanner_segment_reuse_activation_preflight_for_cycle(
+        &dirty_usage_snapshot,
+        complete_process_local_producer_evidence(),
+        true,
+        Some(distributed_evidence),
+        true,
+    );
 
     assert!(!preflight.production_activation);
     assert!(!preflight.scanner_segment_reuse_activated);
@@ -186,7 +196,13 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_blocks_unbounded_inputs(
         covers_all_pending: false,
     };
 
-    let preflight = scanner_segment_reuse_activation_preflight_for_cycle(&dirty_usage_snapshot, true, None, false);
+    let preflight = scanner_segment_reuse_activation_preflight_for_cycle(
+        &dirty_usage_snapshot,
+        DirtyUsageProducerEvidence::default(),
+        true,
+        None,
+        false,
+    );
 
     assert!(!preflight.production_activation);
     assert!(!preflight.scanner_segment_reuse_activated);
@@ -205,7 +221,13 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_skips_distributed_blocke
         covers_all_pending: true,
     };
 
-    let preflight = scanner_segment_reuse_activation_preflight_for_cycle(&dirty_usage_snapshot, false, None, true);
+    let preflight = scanner_segment_reuse_activation_preflight_for_cycle(
+        &dirty_usage_snapshot,
+        complete_process_local_producer_evidence(),
+        false,
+        None,
+        true,
+    );
 
     assert!(!preflight.production_activation);
     assert!(!preflight.scanner_segment_reuse_activated);
@@ -219,6 +241,7 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_skips_distributed_blocke
 fn scanner_cycle_result_returns_segment_reuse_activation_preflight() {
     let proof = ScannerSegmentReuseActivationProof {
         production_activation: true,
+        producer_identity_coverage_complete: true,
         durable_producer_identity: true,
         restart_gap_absent: true,
         generation_window_bound: true,
@@ -239,6 +262,15 @@ fn assert_segment_reuse_activation_blocked_by(proof: ScannerSegmentReuseActivati
     assert!(preflight.production_activation);
     assert!(!preflight.scanner_segment_reuse_activated);
     assert_eq!(preflight.fail_closed_blockers().collect::<Vec<_>>(), vec![blocker]);
+}
+
+fn complete_process_local_producer_evidence() -> DirtyUsageProducerEvidence {
+    DirtyUsageProducerEvidence {
+        producer_identity_coverage_complete: true,
+        durable_producer_identity: false,
+        restart_gap_absent: false,
+        generation_window_bound: true,
+    }
 }
 
 async fn setup_two_pool_scanner_store() -> (tempfile::TempDir, Arc<ECStore>) {
@@ -1192,6 +1224,29 @@ fn dirty_usage_snapshot_detects_uncovered_generation() {
     record_dirty_usage_bucket("photos");
 
     assert_eq!(dirty_usage_snapshot_status(&snapshot), DirtyUsageSnapshotStatus::Changed);
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[test]
+#[serial]
+fn dirty_usage_producer_evidence_tracks_process_local_coverage_without_durable_restart_authority() {
+    use crate::segment_invalidation::SegmentInvalidationProducerIdentity;
+
+    clear_dirty_usage_buckets_for_tests();
+    record_dirty_usage_bucket_from_producers("photos", SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION);
+    let snapshot = snapshot_dirty_usage_buckets(&[bucket_info("photos")], dirty_usage_generation());
+
+    let evidence = dirty_usage_producer_evidence(&snapshot);
+
+    assert!(evidence.generation_window_bound);
+    assert!(evidence.producer_identity_coverage_complete);
+    assert!(!evidence.durable_producer_identity);
+    assert!(!evidence.restart_gap_absent);
+
+    record_dirty_usage_bucket_from_producer("videos", SegmentInvalidationProducerIdentity::PutObject);
+    let stale_evidence = dirty_usage_producer_evidence(&snapshot);
+    assert!(!stale_evidence.generation_window_bound);
+    assert!(!stale_evidence.producer_identity_coverage_complete);
     clear_dirty_usage_buckets_for_tests();
 }
 
