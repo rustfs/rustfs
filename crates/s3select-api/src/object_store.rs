@@ -64,6 +64,7 @@ use tokio::{io::AsyncReadExt, sync::OnceCell};
 use tokio_util::io::ReaderStream;
 use transform_stream::AsyncTryStream;
 
+use crate::csv_input::{CsvSyntax, csv_input_requires_normalization, normalize_csv_stream};
 use crate::storage_api::object_store::HTTPRangeSpec;
 
 mod json_document;
@@ -343,6 +344,29 @@ impl EcObjectStore {
     fn record_delimiter_for_conversion(&self) -> Option<Vec<u8>> {
         let delimiter = self.record_delimiter();
         (self.need_convert || (delimiter.len() == 2 && delimiter != NORMALIZED_RECORD_DELIMITER)).then_some(delimiter)
+    }
+
+    fn convert_csv_stream<S>(&self, stream: S) -> BoxStream<'static, Result<Bytes>>
+    where
+        S: Stream<Item = Result<Bytes>> + Send + 'static,
+    {
+        if let Some(csv) = self.input.request.input_serialization.csv.as_ref()
+            && csv_input_requires_normalization(csv.quote_character.as_deref(), csv.quote_escape_character.as_deref())
+        {
+            let syntax = CsvSyntax {
+                quote: csv.quote_character.as_deref(),
+                escape: csv.quote_escape_character.as_deref(),
+                field: csv.field_delimiter.as_deref(),
+                record: csv.record_delimiter.as_deref(),
+                comment: csv.comments.as_ref().and_then(|comment| comment.as_bytes().first().copied()),
+            };
+            return normalize_csv_stream(stream, &syntax);
+        }
+        convert_csv_delimiter_stream(
+            stream,
+            self.record_delimiter_for_conversion(),
+            self.need_convert.then(|| self.delimiter.clone()),
+        )
     }
 
     fn csv_has_header(&self) -> bool {
@@ -820,7 +844,6 @@ impl ObjectStore for EcObjectStore {
             });
         }
 
-        let record_delimiter = self.record_delimiter_for_conversion();
         let needs_scan_context = options.range.is_none() && has_effective_request_range;
         let scan_context = if needs_scan_context {
             if let Some(scan_range) = self.scan_range(original_size)? {
@@ -883,8 +906,7 @@ impl ObjectStore for EcObjectStore {
                     max_processed_bytes,
                     query_guard,
                 )?;
-                let stream =
-                    convert_csv_delimiter_stream(stream, record_delimiter, self.need_convert.then(|| self.delimiter.clone()));
+                let stream = self.convert_csv_stream(stream);
                 GetResultPayload::Stream(stream)
             }
         } else if options.range.is_some() {
@@ -937,8 +959,7 @@ impl ObjectStore for EcObjectStore {
             } else {
                 stream
             };
-            let stream =
-                convert_csv_delimiter_stream(stream, record_delimiter, self.need_convert.then(|| self.delimiter.clone()));
+            let stream = self.convert_csv_stream(stream);
             GetResultPayload::Stream(stream)
         } else {
             let stream_size = usize::try_from(original_size).map_err(|err| o_Error::Generic {
@@ -948,8 +969,7 @@ impl ObjectStore for EcObjectStore {
             let stream = bytes_stream(ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE), stream_size);
             if meter_input {
                 let stream = meter_uncompressed_input_stream(stream, Arc::clone(&self.input_metrics));
-                let stream =
-                    convert_csv_delimiter_stream(stream, record_delimiter, self.need_convert.then(|| self.delimiter.clone()));
+                let stream = self.convert_csv_stream(stream);
                 GetResultPayload::Stream(stream)
             } else {
                 GetResultPayload::Stream(stream.boxed())
@@ -2864,6 +2884,88 @@ mod test {
         assert_eq!(range, b"id"[..]);
         assert_eq!(input_metrics.snapshot().bytes_scanned, 2);
         assert_eq!(input_metrics.snapshot().bytes_processed, 2);
+    }
+
+    #[tokio::test]
+    async fn unicode_csv_quotes_preserve_raw_offsets_and_metrics() {
+        const BUCKET: &str = "s3select-unicode-csv-stream";
+        const HEADER: &str = "عnameع,عkindع\n";
+        const SKIP: &str = "عskipع,عzeroع\n";
+        const ROW: &str = "عA,Bع,عAععBع\n";
+        let data = format!("{HEADER}{SKIP}{ROW}");
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        for (object, compression, range_offset) in [
+            ("plain.csv", None, None),
+            ("range.csv", None, Some(0)),
+            ("range-mid-character.csv", None, Some(1)),
+            ("gzip.csv", Some(CompressionFormat::Gzip), None),
+            ("bzip.csv", Some(CompressionFormat::Bzip2), None),
+        ] {
+            let bytes = match compression {
+                Some(format) => encode_compressed_fixture(format, data.as_bytes()).await,
+                None => data.as_bytes().to_vec(),
+            };
+            let raw_size = bytes.len();
+            let mut reader = SelectPutObjReader::from_vec(bytes);
+            env.ecstore
+                .put_object(BUCKET, object, &mut reader, &Default::default())
+                .await
+                .expect("write Unicode CSV fixture");
+            let mut input = (*csv_input(BUCKET, object)).clone();
+            let csv = input.request.input_serialization.csv.as_mut().expect("CSV input");
+            csv.file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::USE));
+            csv.quote_character = Some("ع".to_owned());
+            csv.quote_escape_character = Some("\\".to_owned());
+            csv.record_delimiter = Some("\n".to_owned());
+            input.request.input_serialization.compression_type = compression.map(|format| {
+                CompressionType::from_static(match format {
+                    CompressionFormat::Gzip => CompressionType::GZIP,
+                    CompressionFormat::Bzip2 => CompressionType::BZIP2,
+                })
+            });
+            let start = HEADER.len() + SKIP.len();
+            if let Some(range_offset) = range_offset {
+                let offset = i64::try_from(start + range_offset).expect("fixture offset");
+                input.request.scan_range = Some(ScanRange {
+                    start: Some(offset),
+                    end: Some(offset),
+                });
+            }
+            let metrics = Arc::new(SelectInputMetrics::default());
+            let store = EcObjectStore::build_with_snapshot(
+                Arc::new(input),
+                Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+                None,
+                Arc::clone(&metrics),
+                prepare_test_snapshot(BUCKET, object).await,
+                JsonSource::default(),
+            )
+            .expect("snapshot store");
+            let result = store
+                .get_opts(&Path::from(object), GetOptions::default())
+                .await
+                .expect("open Unicode CSV stream");
+            let GetResultPayload::Stream(stream) = result.payload else { panic!("CSV must remain streaming") };
+            let output = stream.try_collect::<Vec<_>>().await.expect("normalize CSV stream").concat();
+            let expected = match range_offset {
+                Some(0) => "\"name\",\"kind\"\n\"A,B\",\"AعB\"\n",
+                Some(_) => "\"name\",\"kind\"\n",
+                None => "\"name\",\"kind\"\n\"skip\",\"zero\"\n\"A,B\",\"AعB\"\n",
+            };
+            assert_eq!(output, expected.as_bytes(), "object={object}");
+            let measured = metrics.snapshot();
+            if let Some(range_offset) = range_offset {
+                // The range reader includes one byte of delimiter context and a
+                // separate header read; offsets always refer to the original CSV.
+                let processed = u64::try_from(ROW.len() + 1 - range_offset + HEADER.len()).expect("raw range length");
+                assert_eq!(measured.bytes_scanned, processed);
+                assert_eq!(measured.bytes_processed, processed);
+            } else {
+                assert_eq!(measured.bytes_scanned, u64::try_from(raw_size).expect("raw length"));
+                assert_eq!(measured.bytes_processed, u64::try_from(data.len()).expect("decoded length"));
+            }
+        }
     }
 
     #[tokio::test]

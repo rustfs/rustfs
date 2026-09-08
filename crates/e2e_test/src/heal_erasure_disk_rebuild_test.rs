@@ -1569,7 +1569,9 @@ mod tests {
         } else {
             if matches!(
                 scenario,
-                InterruptionScenario::BackgroundTargetRestart | InterruptionScenario::BackgroundTargetRestartEc84
+                InterruptionScenario::BackgroundTargetRestart
+                    | InterruptionScenario::BackgroundTargetRestartEc84
+                    | InterruptionScenario::BackgroundCoordinatorRestart
             ) {
                 cluster.stop_node_gracefully(interruption_node).await?;
             } else {

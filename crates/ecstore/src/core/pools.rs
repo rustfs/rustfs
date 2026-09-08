@@ -2606,6 +2606,24 @@ where
     usize::try_from(size).unwrap_or_default()
 }
 
+fn is_decommission_set_local_usage_cache(bucket: &str, object: &str) -> bool {
+    if bucket != RUSTFS_META_BUCKET {
+        return false;
+    }
+    let Some(path) = object
+        .strip_prefix(BUCKET_META_PREFIX)
+        .and_then(|path| path.strip_prefix('/'))
+    else {
+        return false;
+    };
+    let name = match path.rsplit_once('/') {
+        Some((bucket, name)) if !bucket.is_empty() && !bucket.contains('/') && bucket != "." && bucket != ".." => name,
+        Some(_) => return false,
+        None => path,
+    };
+    name.strip_suffix(".bkp").unwrap_or(name) == DATA_USAGE_CACHE_NAME
+}
+
 fn with_decommission_entry_context<E: Display>(stage: &str, bucket: &str, object: &str, err: E) -> Error {
     Error::other(format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"))
 }
@@ -13285,6 +13303,12 @@ impl ECStore {
             );
             return Ok(DecommissionEntryAttemptOutcome::Complete);
         }
+        // Scanner caches describe their own erasure set and are rebuilt there.
+        // Copying one onto another set can overwrite unrelated cache contents or
+        // leave an unresolvable target-capacity intent after a conditional PUT.
+        if is_decommission_set_local_usage_cache(&bucket, &entry.name) {
+            return Ok(DecommissionEntryAttemptOutcome::Complete);
+        }
         let durable_ilm_record = if bucket == RUSTFS_META_BUCKET {
             classify_durable_ilm_record(&entry.name)
                 .map_err(|err| with_decommission_entry_context("durable_ilm_namespace", &bucket, &entry.name, err))?
@@ -13842,7 +13866,7 @@ impl ECStore {
 
                 let bucket = bucket.clone();
 
-                let rd = match set
+                let read_result = set
                     .get_object_reader(
                         bucket.as_str(),
                         &encode_dir_object(&version.name),
@@ -13850,23 +13874,17 @@ impl ECStore {
                         HeaderMap::new(),
                         &decommission_object_migration_read_opts(version_id.clone()),
                     )
-                    .await
-                {
+                    .await;
+                #[cfg(test)]
+                let read_result =
+                    decommission_test_wrap_result("object_read", &bucket, &version.name, version_attempt, read_result);
+                let rd = match read_result {
                     Ok(rd) => rd,
                     Err(err) => {
                         if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                             ignore = true;
                             cleanup_ignored = true;
                             break;
-                        }
-
-                        if !ignore {
-                            //
-                            if bucket == RUSTFS_META_BUCKET && version.name.contains(DATA_USAGE_CACHE_NAME) {
-                                ignore = true;
-                                error!("decommission_pool: ignore data usage cache {}", &version.name);
-                                break;
-                            }
                         }
 
                         failure = true;
@@ -16836,7 +16854,7 @@ impl ECStore {
                             return;
                         }
 
-                        if bucket_name == RUSTFS_META_BUCKET && entry.name.contains(DATA_USAGE_CACHE_NAME) {
+                        if is_decommission_set_local_usage_cache(&bucket_name, &entry.name) {
                             return;
                         }
 
@@ -17153,6 +17171,361 @@ mod tests {
     use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
     use crate::storage_api_contracts::multipart::MultipartOperations as _;
     use serde::Serialize;
+
+    #[test]
+    fn decommission_set_local_usage_cache_classification_is_exact() {
+        for object in [
+            "buckets/.usage-cache.bin",
+            "buckets/.usage-cache.bin.bkp",
+            "buckets/photos/.usage-cache.bin",
+            "buckets/photos/.usage-cache.bin.bkp",
+        ] {
+            assert!(is_decommission_set_local_usage_cache(RUSTFS_META_BUCKET, object), "{object}");
+            assert!(!is_decommission_set_local_usage_cache("user-bucket", object), "{object}");
+        }
+        for object in [
+            "buckets/.usage.v2.json",
+            "buckets/.usage.v2.json.bkp",
+            "buckets/.usage-cache.bin.extra",
+            "buckets/.usage-cache.bin.bkp.extra",
+            "buckets/prefix.usage-cache.bin",
+            "buckets/photos/.usage-cache.bin.bkp.bkp",
+            "buckets/photos/nested/.usage-cache.bin",
+            "buckets//.usage-cache.bin",
+            "buckets/../.usage-cache.bin",
+            "buckets/./.usage-cache.bin",
+            "buckets/.usage-cache.bin/child",
+            "config/.usage-cache.bin",
+            "buckets-other/.usage-cache.bin",
+            ".usage-cache.bin",
+        ] {
+            assert!(!is_decommission_set_local_usage_cache(RUSTFS_META_BUCKET, object), "{object}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_keeps_set_local_usage_caches_out_of_target_capacity() {
+        use crate::object_api::PutObjReader;
+        use tokio::io::AsyncReadExt as _;
+
+        // Keep the scenario's large setup and migration futures off the test
+        // future so ordinary metadata I/O retains the default thread stack.
+        let (_temp_dirs, store, _other_store) =
+            Box::pin(crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None)).await;
+        let user_bucket = "decommission-usage-cache-control";
+        Box::pin(store.make_bucket(user_bucket, &MakeBucketOptions::default()))
+            .await
+            .expect("create the ordinary-object control bucket");
+        let incarnation = Box::pin(store.bucket_incarnation_id(user_bucket))
+            .await
+            .expect("control bucket incarnation");
+        let source_time = OffsetDateTime::now_utc();
+        let cache_objects = [
+            "buckets/.usage-cache.bin",
+            "buckets/.usage-cache.bin.bkp",
+            "buckets/photos/.usage-cache.bin",
+            "buckets/photos/.usage-cache.bin.bkp",
+        ];
+        let conflict_object = "buckets/.usage-cache.bin.conflict";
+        let source_read_failure_object = "buckets/.usage-cache.bin.read-error";
+        let source_body = b"source set cache";
+        let target_body = b"independent older target set cache";
+        for object in cache_objects.into_iter().chain([conflict_object]) {
+            for (pool_index, body, mod_time) in [
+                (0, source_body.as_slice(), source_time),
+                (1, target_body.as_slice(), source_time - Duration::seconds(1)),
+            ] {
+                // Scanner cache persistence writes directly to its own set.
+                store.pools[pool_index]
+                    .get_disks_by_key(object)
+                    .put_object(
+                        RUSTFS_META_BUCKET,
+                        object,
+                        &mut PutObjReader::from_vec(body.to_vec()),
+                        &ObjectOptions {
+                            mod_time: Some(mod_time),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("seed distinct native set-local objects");
+            }
+        }
+        let controls = [
+            (RUSTFS_META_BUCKET, "buckets/.usage.v2.json"),
+            (RUSTFS_META_BUCKET, "buckets/photos/.usage-cache.bin.extra"),
+            (user_bucket, "ordinary-object"),
+            (user_bucket, "buckets/.usage-cache.bin"),
+        ];
+        for (bucket, object) in controls {
+            store.pools[0]
+                .put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(b"ordinary object contents".to_vec()),
+                    &ObjectOptions {
+                        expected_bucket_incarnation_id: (bucket == user_bucket).then_some(incarnation),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed a control that must migrate");
+        }
+        store.pools[0]
+            .put_object(
+                RUSTFS_META_BUCKET,
+                source_read_failure_object,
+                &mut PutObjReader::from_vec(source_body.to_vec()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("seed a similarly named object whose source read will fail");
+
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 16_384, 16_384),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 131_072, 131_072, 0),
+            ]],
+        );
+        Box::pin(store.save_current_pool_meta_for_decommission_start(&[0], Vec::new()))
+            .await
+            .expect("activate the decommission capacity reservation");
+
+        for object in cache_objects {
+            Box::pin(store.decommission_entry_for_test(
+                0,
+                MetaCacheEntry {
+                    name: object.to_string(),
+                    ..Default::default()
+                },
+                RUSTFS_META_BUCKET.to_string(),
+                store.pools[0].get_disks_by_key(object),
+            ))
+            .await
+            .expect("set-local cache must not enter cross-pool migration");
+            for (pool_index, expected) in [(0, source_body.as_slice()), (1, target_body.as_slice())] {
+                let mut reader = store.pools[pool_index]
+                    .get_disks_by_key(object)
+                    .get_object_reader(RUSTFS_META_BUCKET, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("each set must retain its own cache");
+                let mut actual = Vec::new();
+                reader.stream.read_to_end(&mut actual).await.expect("read retained cache");
+                assert_eq!(actual, expected, "pool {pool_index}, {object}");
+            }
+            let meta = store.pool_meta.read().await;
+            let info = meta.pools[0].decommission.as_ref().expect("decommission progress");
+            assert_eq!((info.items_decommissioned, info.items_decommission_failed), (0, 0));
+            assert_eq!((info.bytes_done, info.bytes_failed), (0, 0));
+            let reservation = info.capacity_reservation.as_ref().expect("capacity reservation");
+            assert_eq!(reservation.pending_target_physical_bytes, 0);
+            assert_eq!(reservation.consumed_target_physical_bytes, 0);
+            assert!(reservation.targets.iter().all(|target| target.pending_mutation_id.is_none()));
+        }
+        let mut persisted = PoolMeta::default();
+        Box::pin(persisted.load_no_lock_from_replicas(store.pools.clone()))
+            .await
+            .expect("reload durable capacity intents after cache entries");
+        let reservation = persisted.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("durable reservation");
+        assert_eq!(reservation.pending_target_physical_bytes, 0);
+        assert!(reservation.targets.iter().all(|target| target.pending_mutation_id.is_none()));
+
+        let injected_reads = Arc::new(AtomicUsize::new(0));
+        let observed_reads = Arc::clone(&injected_reads);
+        let read_fault = DecommissionTestFaultGuard::install(Arc::new(move |stage, bucket, object, _, success| {
+            if stage == "object_read" && bucket == RUSTFS_META_BUCKET && object == source_read_failure_object && success {
+                observed_reads.fetch_add(1, Ordering::SeqCst);
+                return true;
+            }
+            false
+        }));
+        Box::pin(store.decommission_entry_for_test(
+            0,
+            MetaCacheEntry {
+                name: source_read_failure_object.to_string(),
+                ..Default::default()
+            },
+            RUSTFS_META_BUCKET.to_string(),
+            store.pools[0].get_disks_by_key(source_read_failure_object),
+        ))
+        .await
+        .expect("entry must record the non-NotFound source read failure");
+        drop(read_fault);
+        assert_eq!(injected_reads.load(Ordering::SeqCst), DECOMMISSION_VERSION_COPY_ATTEMPTS);
+        {
+            let meta = store.pool_meta.read().await;
+            let info = meta.pools[0].decommission.as_ref().expect("source read failure progress");
+            assert_eq!((info.items_decommissioned, info.items_decommission_failed), (0, 1));
+            assert_eq!(info.bytes_failed, source_body.len());
+            assert_eq!(
+                info.capacity_reservation
+                    .as_ref()
+                    .expect("reservation")
+                    .pending_target_physical_bytes,
+                0
+            );
+        }
+        let mut retained = store.pools[0]
+            .get_object_reader(
+                RUSTFS_META_BUCKET,
+                source_read_failure_object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("source read failure must retain the source");
+        let mut retained_body = Vec::new();
+        retained
+            .stream
+            .read_to_end(&mut retained_body)
+            .await
+            .expect("read retained source");
+        assert_eq!(retained_body, source_body);
+        drop(retained);
+        let target_err = store.pools[1]
+            .get_object_info(RUSTFS_META_BUCKET, source_read_failure_object, &ObjectOptions::default())
+            .await
+            .expect_err("failed source read must not create a target object");
+        assert!(is_err_object_not_found(&target_err), "unexpected target state: {target_err:?}");
+
+        for (bucket, object) in controls {
+            Box::pin(store.decommission_entry_for_test(
+                0,
+                MetaCacheEntry {
+                    name: object.to_string(),
+                    ..Default::default()
+                },
+                bucket.to_string(),
+                store.pools[0].get_disks_by_key(object),
+            ))
+            .await
+            .expect("ordinary and similarly named objects must migrate");
+            let mut reader = store.pools[1]
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("control must exist on the target");
+            let mut actual = Vec::new();
+            reader.stream.read_to_end(&mut actual).await.expect("read migrated control");
+            assert_eq!(actual, b"ordinary object contents", "{bucket}/{object}");
+            let err = store.pools[0]
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .expect_err("migrated control must be removed from the source");
+            assert!(is_err_object_not_found(&err), "{bucket}/{object}: {err:?}");
+        }
+
+        Box::pin(store.decommission_entry_for_test(
+            0,
+            MetaCacheEntry {
+                name: conflict_object.to_string(),
+                ..Default::default()
+            },
+            RUSTFS_META_BUCKET.to_string(),
+            store.pools[0].get_disks_by_key(conflict_object),
+        ))
+        .await
+        .expect("entry must record a real conditional-copy failure");
+        let meta = store.pool_meta.read().await;
+        let info = meta.pools[0].decommission.as_ref().expect("final progress");
+        assert_eq!(info.items_decommissioned, controls.len());
+        assert_eq!(
+            info.items_decommission_failed, 2,
+            "similar names must not hide read or migration failures"
+        );
+        assert_eq!(info.bytes_failed, source_body.len() * 2);
+        drop(meta);
+        for (pool_index, expected) in [(0, source_body.as_slice()), (1, target_body.as_slice())] {
+            let mut reader = store.pools[pool_index]
+                .get_object_reader(RUSTFS_META_BUCKET, conflict_object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("failed migration must preserve both objects");
+            let mut actual = Vec::new();
+            reader.stream.read_to_end(&mut actual).await.expect("read conflict object");
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_final_sweep_excludes_only_set_local_usage_caches() {
+        use crate::object_api::PutObjReader;
+
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+        for object in [
+            "buckets/.usage-cache.bin",
+            "buckets/.usage-cache.bin.bkp",
+            "buckets/photos/.usage-cache.bin",
+            "buckets/photos/.usage-cache.bin.bkp",
+        ] {
+            store.pools[0]
+                .get_disks_by_key(object)
+                .put_object(
+                    RUSTFS_META_BUCKET,
+                    object,
+                    &mut PutObjReader::from_vec(b"set-local cache".to_vec()),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("seed each supported set-local cache path");
+        }
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 16_384, 16_384),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 131_072, 131_072, 0),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("activate the final-sweep generation");
+        let generation = store.active_decommission_generation(0).await.expect("active generation");
+        store
+            .check_after_decommission(0, &CancellationToken::new(), generation)
+            .await
+            .expect("the four set-local cache forms must not block the final sweep");
+
+        for object in [
+            "buckets/.usage-cache.bin.extra",
+            "buckets/photos/.usage-cache.bin.bkp.extra",
+            "buckets/.usage.v2.json",
+        ] {
+            let source_set = store.pools[0].get_disks_by_key(object);
+            source_set
+                .put_object(
+                    RUSTFS_META_BUCKET,
+                    object,
+                    &mut PutObjReader::from_vec(b"unmigrated ordinary metadata".to_vec()),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("seed ordinary metadata that must prevent completion");
+            let err = store
+                .check_after_decommission(0, &CancellationToken::new(), generation)
+                .await
+                .expect_err("a remaining similar name or global usage snapshot must block completion");
+            assert!(err.to_string().contains("after decommissioning"), "unexpected final-sweep error: {err:?}");
+            assert!(err.to_string().contains(object), "the final sweep must identify {object}: {err:?}");
+            source_set
+                .delete_object(RUSTFS_META_BUCKET, object, ObjectOptions::default())
+                .await
+                .expect("remove only the ordinary-metadata control before the next sweep");
+        }
+        store
+            .check_after_decommission(0, &CancellationToken::new(), generation)
+            .await
+            .expect("only the four set-local caches remain after removing the controls");
+    }
 
     #[test]
     fn pool_activation_fleet_proof_error_classifier_matches_only_retryable_proof_failures() {

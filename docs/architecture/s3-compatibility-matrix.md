@@ -38,6 +38,12 @@ Counts ignore blank lines and comments; compute them from the files. The lifecyc
 
 "Supported" for the SSE row means RustFS encrypts and decrypts its own objects. MinIO SSE objects (SSE-S3, SSE-KMS, SSE-C) are not readable in default builds; see [minio-file-format-compat.md Part C](minio-file-format-compat.md#part-c--server-side-encryption-sse) for the `rio-v2` migration build.
 
+### Client metadata expectations
+
+`CopyObject` with `MetadataDirective=REPLACE` clears standard metadata fields that the request omits, including `Content-Type`; it does not retain the source type or infer a default. Clients requiring a MIME type on the copied object must send `Content-Type` with the replacement metadata. This contract is covered by `crates/e2e_test/src/copy_object_metadata_test.rs`. A client test that expects an implicit `application/octet-stream` does not match this behavior.
+
+The MinIO-style `metadata=true` listing extension returns user metadata names without the HTTP `x-amz-meta-` prefix. It is not the standard S3 `ListObjectsV2` response. Clients that expect canonical HTTP header names in `UserMetadata` must normalize the names at that boundary; ordinary HEAD/GET metadata is unaffected. See `rustfs/src/app/bucket_usecase.rs` and its serialization tests.
+
 ## Not Yet Passing
 
 Standard S3 areas that must not be described as complete:

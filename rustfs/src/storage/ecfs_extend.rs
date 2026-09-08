@@ -1006,11 +1006,21 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         }
 
         // Access-Control-Allow-Headers (required for preflight if headers were requested)
-        if is_preflight && let Some(ref allowed_headers) = rule.allowed_headers {
-            let headers_str = allowed_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
+        if is_preflight && let Some(ref requested_headers) = requested_headers {
+            // Every requested header matched this rule; do not expose its wildcard
+            // or grant headers that the preflight did not request.
+            let headers_str = requested_headers.join(",");
             if let Ok(headers_value) = HeaderValue::from_str(&headers_str) {
                 response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_HEADERS, headers_value);
             }
+        }
+        if is_preflight {
+            let vary = if origin_reflected {
+                "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+            } else {
+                "Access-Control-Request-Method, Access-Control-Request-Headers"
+            };
+            response_headers.insert(cors::standard::VARY, HeaderValue::from_static(vary));
         }
 
         // Access-Control-Expose-Headers (for actual requests)

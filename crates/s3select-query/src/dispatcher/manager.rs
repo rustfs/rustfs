@@ -53,7 +53,7 @@ use rustfs_s3select_api::{
         },
     },
 };
-use s3s::dto::{CompressionType, FileHeaderInfo, JSONType, SelectObjectContentInput};
+use s3s::dto::{FileHeaderInfo, JSONType, SelectObjectContentInput};
 use std::sync::LazyLock;
 use tokio::{
     sync::Semaphore,
@@ -430,13 +430,6 @@ impl SimpleQueryDispatcher {
 
         let path = format!("s3://{}/{}", self.input.bucket, self.input.key);
         let table_path = ListingTableUrl::parse(path)?;
-        let compressed_input = self
-            .input
-            .request
-            .input_serialization
-            .compression_type
-            .as_ref()
-            .is_some_and(|compression| compression.as_str() != CompressionType::NONE);
         let (listing_options, need_rename_volume_name, need_ignore_volume_name) =
             if let Some(csv) = self.input.request.input_serialization.csv.as_ref() {
                 let mut need_rename_volume_name = false;
@@ -485,28 +478,27 @@ impl SimpleQueryDispatcher {
                 if let Some(quote) = csv.quote_character.as_ref() {
                     file_format = file_format.with_quote(quote.as_bytes().first().copied().unwrap_or_default());
                 }
+                if rustfs_s3select_api::csv_input_requires_normalization(
+                    csv.quote_character.as_deref(),
+                    csv.quote_escape_character.as_deref(),
+                ) {
+                    file_format = file_format
+                        .with_quote(b'"')
+                        .with_escape(None)
+                        .with_delimiter(b',')
+                        .with_terminator(Some(b'\n'))
+                        .with_comment(None)
+                        .with_newlines_in_values(true);
+                }
                 (
-                    ListingOptions::new(Arc::new(file_format)).with_file_extension(if compressed_input {
-                        EXACT_OBJECT_FILE_EXTENSION
-                    } else {
-                        ".csv"
-                    }),
+                    ListingOptions::new(Arc::new(file_format)).with_file_extension(EXACT_OBJECT_FILE_EXTENSION),
                     need_rename_volume_name,
                     need_ignore_volume_name,
                 )
             } else if self.input.request.input_serialization.json.is_some() {
                 let file_format = JsonFormat::default();
-                let file_extension = if compressed_input {
-                    EXACT_OBJECT_FILE_EXTENSION.to_string()
-                } else {
-                    std::path::Path::new(&self.input.key)
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .map(|extension| format!(".{extension}"))
-                        .unwrap_or_else(|| ".json".to_string())
-                };
                 (
-                    ListingOptions::new(Arc::new(file_format)).with_file_extension(file_extension),
+                    ListingOptions::new(Arc::new(file_format)).with_file_extension(EXACT_OBJECT_FILE_EXTENSION),
                     false,
                     false,
                 )
@@ -1529,6 +1521,130 @@ mod tests {
         };
 
         assert_eq!(error.select_error(), SelectError::InvalidDataSource);
+    }
+
+    #[tokio::test]
+    async fn unicode_csv_quotes_reach_arrow_without_changing_field_values() {
+        let cases = [
+            ("ع", "\"", ",", "\n", "عcol1ع,عcol2ع,عcol3ع\n", vec![vec!["col1", "col2", "col3"]]),
+            (
+                "ع",
+                "\\",
+                ",",
+                "\n",
+                "\"literal\",عA\\\"Bع,عAععBع\n",
+                vec![vec!["\"literal\"", "A\"B", "AعB"]],
+            ),
+            ("\"", "界", ",", "\n", "\"A界\"B\",🦀\n", vec![vec!["A\"B", "🦀"]]),
+            ("ع", "\\", "界", "^Y", "عa界bع界عline\nbreakع^Y", vec![vec!["a界b", "line\nbreak"]]),
+        ];
+        let env = snapshot_test_env().await;
+        for (index, (quote, escape, field, record, data, expected)) in cases.into_iter().enumerate() {
+            let mut input = test_input();
+            input.bucket = format!("select-unicode-quotes-{index}");
+            input.key = "records".to_owned();
+            let csv = input.request.input_serialization.csv.as_mut().expect("CSV input");
+            csv.file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::NONE));
+            csv.quote_character = Some(quote.to_owned());
+            csv.quote_escape_character = Some(escape.to_owned());
+            csv.field_delimiter = Some(field.to_owned());
+            csv.record_delimiter = Some(record.to_owned());
+            env.make_bucket(&input.bucket, false).await;
+            env.put_object_bytes(&input.bucket, &input.key, data.as_bytes().to_vec())
+                .await;
+            let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+            let input = Arc::new(input);
+            let dispatcher = production_dispatcher(Arc::clone(&input));
+            let query = Query::new_with_snapshot(QueryContext { input }, "SELECT * FROM S3Object".to_owned(), snapshot);
+            let output = dispatcher.execute_query(&query).await.expect("execute Unicode CSV query");
+            let mut stream = output.into_record_batch_stream().expect("record stream");
+            let mut rows = Vec::new();
+            while let Some(batch) = stream.next().await {
+                let batch = batch.expect("Arrow must receive valid UTF-8 fields");
+                for row in 0..batch.num_rows() {
+                    rows.push(
+                        batch
+                            .columns()
+                            .iter()
+                            .map(|column| {
+                                column
+                                    .as_any()
+                                    .downcast_ref::<StringArray>()
+                                    .expect("CSV string column")
+                                    .value(row)
+                                    .to_owned()
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
+            assert_eq!(rows, expected, "fixture={index}");
+        }
+    }
+
+    #[tokio::test]
+    async fn select_uses_input_serialization_independently_of_object_extension() {
+        for (key, json) in [
+            ("records", false),
+            ("records.bin", false),
+            ("records", true),
+            ("records.csv", true),
+        ] {
+            let mut input = test_input();
+            input.key = key.to_owned();
+            let data = if json {
+                input.request.input_serialization.csv = None;
+                input.request.input_serialization.json = Some(s3s::dto::JSONInput {
+                    type_: Some(JSONType::from_static(JSONType::LINES)),
+                });
+                b"{\"value\":\"selected\"}\n".as_slice()
+            } else {
+                b"value\nselected\n".as_slice()
+            };
+            let input = Arc::new(input);
+            let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
+            let dispatcher = test_dispatcher_for_input(
+                Arc::clone(&input),
+                Arc::new(Semaphore::new(1)),
+                Duration::from_secs(30),
+                Arc::new(SqlQueryExecutionFactory::new(optimizer, Arc::new(LocalScheduler {}))),
+            );
+            let query = Query::new(QueryContext { input }, "SELECT * FROM S3Object".to_owned());
+            let machine = dispatcher.build_query_state_machine(query).await.expect("build query state");
+            let store_url = ObjectStoreUrl::parse("s3://test-bucket").expect("test store URL");
+            let store = machine
+                .session
+                .inner()
+                .runtime_env()
+                .object_store(&store_url)
+                .expect("test store");
+            store.put(&Path::from(key), data.into()).await.expect("write selected object");
+            store
+                .put(&Path::from(format!("{key}.other")), b"unrelated\nwrong\n".as_slice().into())
+                .await
+                .expect("write neighboring object");
+            let plan = dispatcher
+                .build_logical_plan(Arc::clone(&machine))
+                .await
+                .expect("infer schema without an extension filter")
+                .expect("select plan");
+            let output = dispatcher
+                .execute_logical_plan(plan, machine)
+                .await
+                .expect("execute selected object");
+            let mut stream = output.into_record_batch_stream().expect("record stream");
+            let mut values = Vec::new();
+            while let Some(batch) = stream.next().await {
+                let batch = batch.expect("selected batch");
+                let column = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    .expect("string column");
+                values.extend(column.iter().map(|value| value.expect("selected value").to_owned()));
+            }
+            assert_eq!(values, ["selected"], "key={key}, json={json}");
+        }
     }
 
     #[tokio::test]
