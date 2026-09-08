@@ -214,6 +214,12 @@ SCANNER_HEAL_RELEASE_MIXED_VERSION_CASES = {
         "unknown-field-retained",
     ),
 }
+SCANNER_HEAL_RELEASE_P4_RETAINED_RESPONSIBILITY_CASES = (
+    "retain-pending-replay-anchor",
+    "verified-proof-discharges-anchor",
+    "idle-cleanup-reclaims-runtime-checkpoint",
+    "idle-cleanup-reclaims-replay-source",
+)
 SCANNER_HEAL_RELEASE_SCHEDULER_BOUNDS = (
     "admission-retry-idempotency",
     "deadline-budget",
@@ -1614,6 +1620,26 @@ def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dic
             for metric in ("recovery_p95_ms", "recovery_p99_ms"):
                 release_bundle_number(evidence.get(metric), f"{gate}.{field}.{metric}", 1)
 
+    if gate == "P4" and field == "retained_responsibility_evidence":
+        release_bundle_exact_strings(
+            evidence.get("retained_responsibility_cases"),
+            SCANNER_HEAL_RELEASE_P4_RETAINED_RESPONSIBILITY_CASES,
+            f"{gate}.{field}.retained_responsibility_cases",
+        )
+        retention_window = evidence_integer(
+            evidence.get("retention_window_seconds"),
+            f"{gate}.{field}.retention_window_seconds",
+            7200,
+            86400,
+        )
+        duration = evidence_integer(evidence.get("duration_seconds"), f"{gate}.{field}.duration_seconds", 1, 86400)
+        require(duration >= retention_window, f"{gate}.{field} duration must cover retention window")
+        release_bundle_bool_true(evidence.get("idle_cleanup_observed"), f"{gate}.{field}.idle_cleanup_observed")
+        release_bundle_bool_true(
+            evidence.get("verified_proof_discharge_observed"),
+            f"{gate}.{field}.verified_proof_discharge_observed",
+        )
+
 
 def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, gate: str, field: str,
                                      evidence: dict[str, object]) -> str:
@@ -2214,6 +2240,15 @@ class SelfTests(unittest.TestCase):
                     evidence["cold_walked_segments"] = 0
                     evidence["full_walk_oracle_equivalent"] = True
                     evidence["published_root_equivalent"] = True
+                if gate == "P4" and field == "retained_responsibility_evidence":
+                    evidence["duration_seconds"] = 7200
+                    evidence["finished_at"] = (started + timedelta(seconds=7200)).isoformat().replace("+00:00", "Z")
+                    evidence["retained_responsibility_cases"] = list(
+                        SCANNER_HEAL_RELEASE_P4_RETAINED_RESPONSIBILITY_CASES
+                    )
+                    evidence["retention_window_seconds"] = 7200
+                    evidence["idle_cleanup_observed"] = True
+                    evidence["verified_proof_discharge_observed"] = True
                 if field == "profile_evidence":
                     evidence["resolved_samples"] = 1
                     evidence["allocation_bytes"] = 1024
@@ -2398,6 +2433,34 @@ class SelfTests(unittest.TestCase):
                 "cold_segment_reuse_measurement",
                 lambda item: item.update({"full_walk_oracle_equivalent": False}),
                 "full-walk oracle equivalence",
+            ),
+            (
+                "p4-retained-responsibility-cases",
+                "P4",
+                "retained_responsibility_evidence",
+                lambda item: item["retained_responsibility_cases"].remove("idle-cleanup-reclaims-replay-source"),
+                "retained_responsibility_cases missing cases",
+            ),
+            (
+                "p4-retention-window",
+                "P4",
+                "retained_responsibility_evidence",
+                lambda item: item.update({"retention_window_seconds": 7199}),
+                "retention_window_seconds",
+            ),
+            (
+                "p4-idle-cleanup",
+                "P4",
+                "retained_responsibility_evidence",
+                lambda item: item.update({"idle_cleanup_observed": False}),
+                "idle_cleanup_observed",
+            ),
+            (
+                "p4-proof-discharge",
+                "P4",
+                "retained_responsibility_evidence",
+                lambda item: item.pop("verified_proof_discharge_observed"),
+                "verified_proof_discharge_observed",
             ),
         ):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
