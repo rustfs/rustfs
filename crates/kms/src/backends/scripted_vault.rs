@@ -74,6 +74,39 @@ impl ScriptedResponse {
     }
 }
 
+/// The `auth/token/lookup-self` answer every scripted Vault serves for free.
+///
+/// A Vault client now probes its token's remaining lifetime at login
+/// (backlog#2369 P3), which is credential plumbing rather than the protocol any
+/// of these tests is scripting. Answering it out of band keeps every existing
+/// script meaningful: `ttl` 0 is Vault's "this token does not expire", so the
+/// probe changes nothing about how a scripted test behaves.
+pub(crate) fn token_lookup_self_response() -> String {
+    serde_json::json!({
+        "data": {
+            "accessor": "scripted-accessor",
+            "creation_time": 1_700_000_000u64,
+            "creation_ttl": 0,
+            "display_name": "token",
+            "entity_id": "",
+            "explicit_max_ttl": 0,
+            "id": "scripted-token",
+            "num_uses": 0,
+            "orphan": true,
+            "path": "auth/token/create",
+            "policies": ["default"],
+            "renewable": false,
+            "ttl": 0
+        }
+    })
+    .to_string()
+}
+
+/// Whether a recorded request line addresses the token self-lookup.
+pub(crate) fn is_token_lookup_self(request_line: &str) -> bool {
+    request_line.contains("/v1/auth/token/lookup-self")
+}
+
 /// A scripted stand-in Vault listening on a loopback port.
 pub(crate) struct ScriptedVault {
     /// Base address (`http://127.0.0.1:port`) to point a Vault client at.
@@ -102,6 +135,19 @@ impl ScriptedVault {
                 let Some((request_line, body, mut stream)) = read_request(stream).await else {
                     continue;
                 };
+                if is_token_lookup_self(&request_line) {
+                    // Served out of band so the credential probe does not
+                    // consume a scripted response meant for the protocol under
+                    // test, and is not recorded as one of its requests.
+                    let body = token_lookup_self_response();
+                    let payload = format!(
+                        "HTTP/1.1 200 Scripted\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(payload.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    continue;
+                }
                 recorded
                     .lock()
                     .expect("scripted vault request log poisoned")
@@ -155,6 +201,19 @@ impl ScriptedVault {
                     let Some((request_line, body, stream)) = read_request(stream).await else {
                         return;
                     };
+                    if is_token_lookup_self(&request_line) {
+                        // Credential plumbing, not part of the KV2 protocol
+                        // this responder models; see token_lookup_self_response.
+                        write_response(
+                            stream,
+                            ScriptedResponse::Http {
+                                status: 200,
+                                body: token_lookup_self_response(),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
                     recorded
                         .lock()
                         .expect("scripted vault request log poisoned")
