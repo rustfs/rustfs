@@ -514,6 +514,24 @@ fn scanner_segment_reuse_activation_preflight_from_proof(
     }
 }
 
+fn scanner_segment_reuse_activation_preflight_for_cycle(
+    dirty_usage_snapshot: &DirtyUsageSnapshot,
+    distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
+    cold_zero_walk_oracle: bool,
+) -> ScannerSegmentReuseActivationPreflight {
+    scanner_segment_reuse_activation_preflight_from_proof(ScannerSegmentReuseActivationProof {
+        production_activation: false,
+        durable_producer_identity: false,
+        restart_gap_absent: false,
+        generation_window_bound: dirty_usage_snapshot.covers_all_pending
+            && dirty_usage_snapshot.generation != 0
+            && dirty_usage_snapshot.generation != u64::MAX,
+        overflow_absent: dirty_usage_snapshot.covers_all_pending,
+        cold_zero_walk_oracle,
+        distributed_peer_invalidation: distributed_segment_invalidation_evidence.is_some(),
+    })
+}
+
 fn scanner_segment_reuse_activated() -> bool {
     scanner_segment_reuse_activation_preflight().scanner_segment_reuse_activated
 }
@@ -1163,6 +1181,7 @@ pub(crate) struct ScannerCycleResult {
     dirty_usage_clear: Option<DirtyUsageBuckets>,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
     distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
+    segment_reuse_activation_preflight: ScannerSegmentReuseActivationPreflight,
     remote_publication_lease_targets: Vec<(String, String, u64)>,
     failed_dirty_usage: bool,
     pending_maintenance_work: bool,
@@ -1180,6 +1199,7 @@ impl ScannerCycleResult {
             dirty_usage_clear,
             remote_dirty_usage_acknowledgements: Vec::new(),
             distributed_segment_invalidation_evidence: None,
+            segment_reuse_activation_preflight: scanner_segment_reuse_activation_preflight(),
             remote_publication_lease_targets: Vec::new(),
             failed_dirty_usage: false,
             pending_maintenance_work: false,
@@ -1251,6 +1271,12 @@ impl ScannerCycleResult {
     ) -> Self {
         self.publication_expectation = None;
         self.distributed_segment_invalidation_evidence = evidence;
+        self
+    }
+
+    fn with_segment_reuse_activation_preflight(mut self, preflight: ScannerSegmentReuseActivationPreflight) -> Self {
+        self.publication_expectation = None;
+        self.segment_reuse_activation_preflight = preflight;
         self
     }
 
