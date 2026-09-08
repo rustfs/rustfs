@@ -1141,6 +1141,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_snapshot_writer_payload_failure_does_not_publish_manifest() {
+        let root = TempDir::new().expect("test directory");
+        let store = disk(&root, "disk").await;
+        let owner = Uuid::new_v4();
+        let old = payload("old");
+        let next = payload("next");
+        commit(&store, 0, owner, 1, &old).await;
+        std::fs::create_dir(root.path().join("disk").join(RUSTFS_META_BUCKET).join(PAYLOAD_PATHS[1]))
+            .expect("payload path blocks successor staging");
+
+        let result = publish_committed_snapshot(std::slice::from_ref(&store), owner, 2, &next, 4096).await;
+
+        assert!(
+            matches!(result, Err(SnapshotError::Disk(_) | SnapshotError::Read(_))),
+            "payload failure must be visible before manifest publication: {result:?}"
+        );
+        let reopened = disk(&root, "disk").await;
+        let recovered = read_committed(std::slice::from_ref(&reopened), 4096)
+            .await
+            .expect("read previous committed snapshot")
+            .expect("old anchor remains committed");
+        assert_eq!(recovered.sequence(), 1);
+        assert_eq!(recovered.slot(), 0);
+        assert_eq!(recovered.payload(), old.as_slice());
+        assert_eq!(
+            EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, PAYLOAD_PATHS[0])
+                .await
+                .expect("old payload retained")
+                .as_ref(),
+            old.as_slice()
+        );
+        assert_eq!(
+            EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[0])
+                .await
+                .expect("old manifest retained")
+                .as_ref(),
+            manifest(owner, 1, &old).as_slice()
+        );
+        assert!(
+            matches!(
+                EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[1]).await,
+                Err(EcstoreDiskError::FileNotFound | EcstoreDiskError::VolumeNotFound)
+            ),
+            "successor manifest must not be published when payload staging fails"
+        );
+    }
+
+    #[tokio::test]
     async fn committed_snapshot_writer_capacity_failure_preserves_previous_anchor() {
         let root = TempDir::new().expect("test directory");
         let store = disk(&root, "disk").await;
