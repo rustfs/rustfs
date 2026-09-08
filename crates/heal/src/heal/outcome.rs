@@ -110,7 +110,8 @@ impl HealObjectReceipt {
             && self.identity.version_id == expected.version_id
             && self.identity.pool_index == expected.pool_index
             && self.identity.set_index == expected.set_index
-            && self.identity.bucket_incarnation_id.is_some()
+            && self.identity.bucket_incarnation_id == expected.bucket_incarnation_id
+            && expected.bucket_incarnation_id.is_some()
     }
 }
 
@@ -496,20 +497,30 @@ mod canonical_outcome_tests {
 
     #[test]
     fn positive_receipt_requires_exact_identity_and_bucket_incarnation() {
-        let expected = item(HealObjectDisposition::Unknown).identity;
+        let incarnation = Uuid::new_v4();
+        let expected = HealObjectIdentity {
+            bucket_incarnation_id: Some(incarnation),
+            ..item(HealObjectDisposition::Unknown).identity
+        };
         let mut receipt = HealObjectReceipt {
             identity: expected.clone(),
             disposition: HealObjectDisposition::Repaired,
         };
 
+        receipt.identity.bucket_incarnation_id = None;
         assert!(
             !receipt.verified_for(&expected),
             "a positive storage receipt without bucket incarnation must remain untrusted"
         );
 
-        let incarnation = Uuid::new_v4();
         receipt.identity.bucket_incarnation_id = Some(incarnation);
         assert!(receipt.verified_for(&expected));
+
+        receipt.identity.bucket_incarnation_id = Some(Uuid::new_v4());
+        assert!(
+            !receipt.verified_for(&expected),
+            "a storage receipt for a different bucket incarnation must not clear the requested responsibility"
+        );
 
         receipt.identity.version_id = Some("older-version".to_string());
         assert!(

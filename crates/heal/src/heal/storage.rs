@@ -20,6 +20,7 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, warn};
+use uuid::Uuid;
 
 use super::outcome::{HealObjectDisposition, HealObjectIdentity, HealObjectKind, HealObjectReceipt};
 use super::progress::stable_generation;
@@ -382,6 +383,11 @@ pub trait HealStorageAPI: Send + Sync {
 
     /// Check object exists
     async fn object_exists(&self, bucket: &str, object: &str) -> Result<bool>;
+
+    /// Stable bucket incarnation observed before an object heal starts.
+    async fn bucket_incarnation_id(&self, _bucket: &str) -> Result<Option<Uuid>> {
+        Ok(None)
+    }
 
     /// Heal object using ecstore
     async fn heal_object(
@@ -1026,6 +1032,14 @@ impl HealStorageAPI for ECStoreHealStorage {
                 }
             }
         }
+    }
+
+    async fn bucket_incarnation_id(&self, bucket: &str) -> Result<Option<Uuid>> {
+        self.ecstore
+            .bucket_incarnation_id(bucket)
+            .await
+            .map(Some)
+            .map_err(Error::Storage)
     }
 
     async fn heal_object(

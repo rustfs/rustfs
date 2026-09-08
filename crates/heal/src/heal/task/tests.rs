@@ -1116,6 +1116,7 @@ struct MockStorage {
     heal_object_outcome: Mutex<Option<MockHealObjectOutcome>>,
     heal_object_outcomes: Mutex<HashMap<String, VecDeque<MockHealObjectOutcome>>>,
     heal_object_receipts: Mutex<HashMap<String, VecDeque<HealObjectReceipt>>>,
+    bucket_incarnation_id: Mutex<Option<Uuid>>,
     format_no_heal_required: Mutex<bool>,
     format_error: Mutex<Option<Error>>,
     global_format_calls: Mutex<u32>,
@@ -1219,14 +1220,19 @@ async fn execute_emits_heal_trace_task_state() {
     assert_eq!(trace_attr_string(&completed, "state").as_deref(), Some("completed"));
 }
 
-fn object_receipt(object: &str, version_id: Option<&str>, disposition: HealObjectDisposition) -> HealObjectReceipt {
+fn object_receipt(
+    object: &str,
+    version_id: Option<&str>,
+    disposition: HealObjectDisposition,
+    bucket_incarnation_id: Uuid,
+) -> HealObjectReceipt {
     HealObjectReceipt {
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: "bucket-a".to_string(),
             object: object.to_string(),
             version_id: version_id.map(ToOwned::to_owned),
-            bucket_incarnation_id: Some(Uuid::new_v4()),
+            bucket_incarnation_id: Some(bucket_incarnation_id),
             pool_index: None,
             set_index: None,
         },
@@ -1236,11 +1242,18 @@ fn object_receipt(object: &str, version_id: Option<&str>, disposition: HealObjec
 
 #[tokio::test]
 async fn object_heal_records_matching_positive_storage_receipt() {
+    let incarnation = Uuid::new_v4();
     let storage = Arc::new(MockStorage {
         heal_object_receipts: Mutex::new(HashMap::from([(
             "object-a".to_string(),
-            VecDeque::from([object_receipt("object-a", Some("version-a"), HealObjectDisposition::Repaired)]),
+            VecDeque::from([object_receipt(
+                "object-a",
+                Some("version-a"),
+                HealObjectDisposition::Repaired,
+                incarnation,
+            )]),
         )])),
+        bucket_incarnation_id: Mutex::new(Some(incarnation)),
         ..Default::default()
     });
     let task = HealTask::from_request(
@@ -1262,15 +1275,18 @@ async fn object_heal_records_matching_positive_storage_receipt() {
 
 #[tokio::test]
 async fn object_heal_rejects_mismatched_or_legacy_storage_receipts() {
+    let expected_incarnation = Uuid::new_v4();
     let storage = Arc::new(MockStorage {
         heal_object_receipts: Mutex::new(HashMap::from([(
             "object-a".to_string(),
             VecDeque::from([object_receipt(
                 "object-a",
-                Some("old-version"),
+                Some("version-a"),
                 HealObjectDisposition::Repaired,
+                Uuid::new_v4(),
             )]),
         )])),
+        bucket_incarnation_id: Mutex::new(Some(expected_incarnation)),
         ..Default::default()
     });
     let task = HealTask::from_request(
@@ -1454,6 +1470,10 @@ impl HealStorageAPI for MockStorage {
             };
         }
         Ok(self.object_exists.lock().unwrap().unwrap_or(true))
+    }
+
+    async fn bucket_incarnation_id(&self, _bucket: &str) -> Result<Option<Uuid>> {
+        Ok(*self.bucket_incarnation_id.lock().unwrap())
     }
 
     async fn heal_object(
