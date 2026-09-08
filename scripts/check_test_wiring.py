@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 from scanner_abba import (
     MAX_JSON_BYTES,
     RELEASE_PROFILE_ARTIFACTS,
+    SCENARIOS,
     digest,
     number,
     read_json,
@@ -167,6 +168,66 @@ SCANNER_HEAL_RELEASE_G08_REQUIRED_CASES = {
         "all-replicas-unavailable",
     ),
 }
+SCANNER_HEAL_RELEASE_CRASH_BOUNDARY_FIELDS = {
+    ("G04", "root_floor_intent_crash_evidence"): (
+        "persist-failure-no-202",
+        "same-key-retry-reuses-intent",
+        "different-params-conflict",
+        "process-restart-replay",
+    ),
+}
+SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES = {
+    "durable_root_publication_proof": (
+        "root-cas-success",
+        "root-readback-success",
+        "dirty-fallback-on-missing-proof",
+    ),
+    "scoped_ack_request_identity": (
+        "bucket-incarnation",
+        "exact-generation",
+        "scanner-instance",
+        "participating-peer-set",
+    ),
+    "participating_peer_capability_snapshot": (
+        "supports-scoped-ack",
+        "probe-only-fallback",
+        "missing-capability-dirty",
+    ),
+    "mixed_peer_ack_fallback_oracle": (
+        "legacy-peer-fallback",
+        "truncated-token-reject",
+        "restarted-peer-reject",
+    ),
+}
+SCANNER_HEAL_RELEASE_MIXED_VERSION_CASES = {
+    "mixed_version_reader_evidence": (
+        "old-writer-new-reader",
+        "new-writer-old-reader",
+    ),
+    "mixed_version_writer_evidence": (
+        "old-reader-new-writer",
+        "new-reader-old-writer",
+    ),
+    "rollback_payload_evidence": (
+        "rollback-to-old",
+        "rollback-to-new",
+        "unknown-field-retained",
+    ),
+}
+SCANNER_HEAL_RELEASE_SCHEDULER_BOUNDS = (
+    "admission-retry-idempotency",
+    "deadline-budget",
+    "lock-hold-bound",
+    "minimum-progress",
+)
+SCANNER_HEAL_RELEASE_PRESSURE_METRICS = (
+    "foreground_p95_ms",
+    "foreground_p99_ms",
+    "throughput_ops",
+    "error_rate",
+    "heal_lock_wait_p99_ms",
+    "attempt_cost_samples",
+)
 SCHEDULED_ALERT_WORKFLOWS = tuple(
     item["workflow"]
     for item in json.loads((ROOT / ".github/scheduled-validations.json").read_text())
@@ -1448,6 +1509,112 @@ def validate_release_bundle_json_artifact_payload(path: Path, source_revision: s
         require(payload.get("artifact_kind") == artifact_kind, f"{prefix} JSON artifact kind mismatch")
 
 
+def release_bundle_bool_true(value: object, name: str) -> None:
+    require(value is True, f"{name} must be true")
+
+
+def release_bundle_exact_strings(value: object, expected: tuple[str, ...], name: str) -> None:
+    require(isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value),
+            f"{name} must list measured cases")
+    observed = set(value)
+    require(len(observed) == len(value), f"{name} has duplicate cases")
+    missing = sorted(set(expected) - observed)
+    require(not missing, f"{name} missing cases: {', '.join(missing)}")
+    unknown = sorted(observed - set(expected))
+    require(not unknown, f"{name} has unknown cases: {', '.join(unknown)}")
+
+
+def release_bundle_number(value: object, name: str, minimum: int | float = 0) -> float:
+    return number(value, name, minimum)
+
+
+def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dict[str, object]) -> None:
+    if gate == "G03":
+        release_bundle_exact_strings(
+            evidence.get("scoped_ack_cases"),
+            SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES[field],
+            f"{gate}.{field}.scoped_ack_cases",
+        )
+        if field == "durable_root_publication_proof":
+            release_bundle_bool_true(evidence.get("root_cas_observed"), f"{gate}.{field}.root_cas_observed")
+            release_bundle_bool_true(evidence.get("root_readback_observed"), f"{gate}.{field}.root_readback_observed")
+        if field == "scoped_ack_request_identity":
+            release_bundle_bool_true(evidence.get("whole_cycle_fallback_observed"),
+                                     f"{gate}.{field}.whole_cycle_fallback_observed")
+
+    if gate == "G04" and field == "root_floor_intent_crash_evidence":
+        release_bundle_exact_strings(
+            evidence.get("durable_intent_cases"),
+            SCANNER_HEAL_RELEASE_CRASH_BOUNDARY_FIELDS[(gate, field)],
+            f"{gate}.{field}.durable_intent_cases",
+        )
+        release_bundle_bool_true(evidence.get("persist_failure_blocks_acceptance"),
+                                 f"{gate}.{field}.persist_failure_blocks_acceptance")
+
+    if gate == "G09":
+        release_bundle_exact_strings(
+            evidence.get("mixed_version_cases"),
+            SCANNER_HEAL_RELEASE_MIXED_VERSION_CASES[field],
+            f"{gate}.{field}.mixed_version_cases",
+        )
+        if field == "rollback_payload_evidence":
+            release_bundle_bool_true(evidence.get("rollback_payload_replayed"),
+                                     f"{gate}.{field}.rollback_payload_replayed")
+
+    if gate == "G10":
+        if field == "scheduler_bound_evidence":
+            release_bundle_exact_strings(
+                evidence.get("scheduler_bounds"),
+                SCANNER_HEAL_RELEASE_SCHEDULER_BOUNDS,
+                f"{gate}.{field}.scheduler_bounds",
+            )
+            release_bundle_bool_true(evidence.get("duplicate_task_bound_observed"),
+                                     f"{gate}.{field}.duplicate_task_bound_observed")
+        if field == "pressure_recovery_evidence":
+            metrics = evidence.get("pressure_metrics")
+            require(isinstance(metrics, dict), f"{gate}.{field} missing pressure metrics")
+            for metric in SCANNER_HEAL_RELEASE_PRESSURE_METRICS:
+                release_bundle_number(metrics.get(metric), f"{gate}.{field}.{metric}")
+            evidence_integer(metrics.get("foreground_pressure_samples"),
+                             f"{gate}.{field}.foreground_pressure_samples", 1, 2**63 - 1)
+            evidence_integer(metrics.get("foreground_pressure_high_samples"),
+                             f"{gate}.{field}.foreground_pressure_high_samples", 1, 2**63 - 1)
+
+    if gate == "P1":
+        if field == "cold_walk_share_measurement":
+            share = release_bundle_number(evidence.get("cold_walk_share"), f"{gate}.{field}.cold_walk_share")
+            require(share <= 1, f"{gate}.{field}.cold_walk_share exceeds one")
+            evidence_integer(evidence.get("walk_objects"), f"{gate}.{field}.walk_objects", 1, 2**63 - 1)
+            evidence_integer(evidence.get("cold_walk_objects"), f"{gate}.{field}.cold_walk_objects", 0, 2**63 - 1)
+        if field == "foreground_latency_throughput_measurement":
+            for metric in ("foreground_p95_ms", "foreground_p99_ms", "throughput_ops", "error_rate"):
+                release_bundle_number(evidence.get(metric), f"{gate}.{field}.{metric}")
+        if field == "profile_evidence":
+            for metric in ("allocation_bytes", "rss_peak_bytes", "save_operations", "saved_bytes"):
+                evidence_integer(evidence.get(metric), f"{gate}.{field}.{metric}", 1, 2**63 - 1)
+
+    if gate == "P3":
+        if field == "two_hour_pressure_measurement":
+            release_bundle_exact_strings(evidence.get("abba_legs"), ("A1", "B1", "B2", "A2"),
+                                         f"{gate}.{field}.abba_legs")
+            release_bundle_exact_strings(evidence.get("scenarios"), SCENARIOS, f"{gate}.{field}.scenarios")
+            for metric in ("foreground_p95_ms", "foreground_p99_ms", "throughput_ops"):
+                release_bundle_number(evidence.get(metric), f"{gate}.{field}.{metric}", 1)
+        if field == "heal_capacity_measurement":
+            capacity = evidence.get("heal_capacity")
+            require(isinstance(capacity, dict), f"{gate}.{field} missing heal capacity")
+            for metric in ("objects", "versions", "bytes", "completed_objects"):
+                evidence_integer(capacity.get(metric), f"{gate}.{field}.{metric}", 1, 2**63 - 1)
+        if field == "recovery_window_measurement":
+            release_bundle_exact_strings(
+                evidence.get("fault_modes"),
+                ("process-restart", "process-crash-restart"),
+                f"{gate}.{field}.fault_modes",
+            )
+            for metric in ("recovery_p95_ms", "recovery_p99_ms"):
+                release_bundle_number(evidence.get(metric), f"{gate}.{field}.{metric}", 1)
+
+
 def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, gate: str, field: str,
                                      evidence: dict[str, object]) -> str:
     require(evidence.get("evidence_type") == "measured", f"{gate}.{field} must be measured evidence")
@@ -1603,6 +1770,7 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
             if "resolved_samples" in item:
                 evidence_integer(item.get("resolved_samples"), f"{gate}.{artifact_field}.resolved_samples",
                                  0, 2**63 - 1)
+    validate_release_bundle_domain_evidence(gate, field, evidence)
     return window_id
 
 
@@ -1973,6 +2141,20 @@ class SelfTests(unittest.TestCase):
                     evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
                 if gate in ("G04", "G07", "R-E", "R-L"):
                     evidence["crash_points"] = ["before-commit"]
+                if gate == "G03":
+                    evidence["scoped_ack_cases"] = list(SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES[field])
+                    if field == "durable_root_publication_proof":
+                        evidence["root_cas_observed"] = True
+                        evidence["root_readback_observed"] = True
+                    if field == "scoped_ack_request_identity":
+                        evidence["whole_cycle_fallback_observed"] = True
+                if gate == "G04" and field == "root_floor_intent_crash_evidence":
+                    evidence["durable_intent_cases"] = list(SCANNER_HEAL_RELEASE_CRASH_BOUNDARY_FIELDS[(gate, field)])
+                    evidence["persist_failure_blocks_acceptance"] = True
+                if gate == "G09":
+                    evidence["mixed_version_cases"] = list(SCANNER_HEAL_RELEASE_MIXED_VERSION_CASES[field])
+                    if field == "rollback_payload_evidence":
+                        evidence["rollback_payload_replayed"] = True
                 if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
                     evidence["replayed_records"] = 2
                     evidence["responsibility_anchor_retained"] = True
@@ -1990,6 +2172,20 @@ class SelfTests(unittest.TestCase):
                         "replica_loss_matrix": "replica_loss_cases",
                     }[field]
                     evidence[case_field] = list(SCANNER_HEAL_RELEASE_G08_REQUIRED_CASES[field])
+                if gate == "G10" and field == "scheduler_bound_evidence":
+                    evidence["scheduler_bounds"] = list(SCANNER_HEAL_RELEASE_SCHEDULER_BOUNDS)
+                    evidence["duplicate_task_bound_observed"] = True
+                if gate == "G10" and field == "pressure_recovery_evidence":
+                    evidence["pressure_metrics"] = {
+                        "foreground_p95_ms": 40.0,
+                        "foreground_p99_ms": 90.0,
+                        "throughput_ops": 250.0,
+                        "error_rate": 0.0,
+                        "heal_lock_wait_p99_ms": 25.0,
+                        "attempt_cost_samples": 8.0,
+                        "foreground_pressure_samples": 120,
+                        "foreground_pressure_high_samples": 12,
+                    }
                 if gate == "G14" and field == "ec8_4_evidence":
                     evidence["topology"] = {"erasure": "EC8+4", "nodes": 3, "drives_per_node": 4}
                 if gate == "G14" and field == "same_window_field_evidence":
@@ -2020,6 +2216,10 @@ class SelfTests(unittest.TestCase):
                     evidence["published_root_equivalent"] = True
                 if field == "profile_evidence":
                     evidence["resolved_samples"] = 1
+                    evidence["allocation_bytes"] = 1024
+                    evidence["rss_peak_bytes"] = 4096
+                    evidence["save_operations"] = 2
+                    evidence["saved_bytes"] = 2048
                     artifacts = {}
                     for artifact_kind in RELEASE_PROFILE_ARTIFACTS:
                         artifact = artifact_dir / f"{gate}-{field}-{artifact_kind}.json"
@@ -2040,6 +2240,32 @@ class SelfTests(unittest.TestCase):
                             "artifact_format": "json",
                         }
                     evidence["profile_artifacts"] = artifacts
+                if gate == "P1" and field == "cold_walk_share_measurement":
+                    evidence["cold_walk_share"] = 0.5
+                    evidence["walk_objects"] = 100
+                    evidence["cold_walk_objects"] = 50
+                if gate == "P1" and field == "foreground_latency_throughput_measurement":
+                    evidence["foreground_p95_ms"] = 50.0
+                    evidence["foreground_p99_ms"] = 100.0
+                    evidence["throughput_ops"] = 200.0
+                    evidence["error_rate"] = 0.0
+                if gate == "P3" and field == "two_hour_pressure_measurement":
+                    evidence["abba_legs"] = ["A1", "B1", "B2", "A2"]
+                    evidence["scenarios"] = list(SCENARIOS)
+                    evidence["foreground_p95_ms"] = 50.0
+                    evidence["foreground_p99_ms"] = 100.0
+                    evidence["throughput_ops"] = 200.0
+                if gate == "P3" and field == "heal_capacity_measurement":
+                    evidence["heal_capacity"] = {
+                        "objects": 100,
+                        "versions": 100,
+                        "bytes": 1048576,
+                        "completed_objects": 100,
+                    }
+                if gate == "P3" and field == "recovery_window_measurement":
+                    evidence["fault_modes"] = ["process-restart", "process-crash-restart"]
+                    evidence["recovery_p95_ms"] = 500.0
+                    evidence["recovery_p99_ms"] = 1000.0
                 fields[field] = evidence
             gates[gate] = {
                 "status": "pass",
@@ -2301,6 +2527,126 @@ class SelfTests(unittest.TestCase):
                 self.assertFalse(status["release_approved"])
                 self.assertTrue(any("must share one measurement window" in error
                                     for error in status["rejected_gates"][gate]))
+
+    def test_scanner_heal_release_bundle_requires_domain_evidence(self) -> None:
+        for fault, gate, field, mutation, expected in (
+            (
+                "scoped-ack-cases",
+                "G03",
+                "scoped_ack_request_identity",
+                lambda item: item["scoped_ack_cases"].remove("exact-generation"),
+                "missing cases",
+            ),
+            (
+                "scoped-ack-fallback",
+                "G03",
+                "scoped_ack_request_identity",
+                lambda item: item.update({"whole_cycle_fallback_observed": False}),
+                "whole_cycle_fallback_observed",
+            ),
+            (
+                "durable-intent-cases",
+                "G04",
+                "root_floor_intent_crash_evidence",
+                lambda item: item["durable_intent_cases"].remove("persist-failure-no-202"),
+                "durable_intent_cases missing cases",
+            ),
+            (
+                "durable-intent-persist",
+                "G04",
+                "root_floor_intent_crash_evidence",
+                lambda item: item.pop("persist_failure_blocks_acceptance"),
+                "persist_failure_blocks_acceptance",
+            ),
+            (
+                "mixed-version-cases",
+                "G09",
+                "mixed_version_writer_evidence",
+                lambda item: item["mixed_version_cases"].remove("old-reader-new-writer"),
+                "mixed_version_cases missing cases",
+            ),
+            (
+                "rollback-payload",
+                "G09",
+                "rollback_payload_evidence",
+                lambda item: item.update({"rollback_payload_replayed": False}),
+                "rollback_payload_replayed",
+            ),
+            (
+                "scheduler-bounds",
+                "G10",
+                "scheduler_bound_evidence",
+                lambda item: item["scheduler_bounds"].remove("lock-hold-bound"),
+                "scheduler_bounds missing cases",
+            ),
+            (
+                "pressure-metric",
+                "G10",
+                "pressure_recovery_evidence",
+                lambda item: item["pressure_metrics"].pop("heal_lock_wait_p99_ms"),
+                "heal_lock_wait_p99_ms",
+            ),
+            (
+                "cold-walk-share",
+                "P1",
+                "cold_walk_share_measurement",
+                lambda item: item.update({"cold_walk_share": 1.2}),
+                "cold_walk_share exceeds one",
+            ),
+            (
+                "foreground-throughput",
+                "P1",
+                "foreground_latency_throughput_measurement",
+                lambda item: item.pop("throughput_ops"),
+                "throughput_ops",
+            ),
+            (
+                "profile-cost",
+                "P1",
+                "profile_evidence",
+                lambda item: item.pop("save_operations"),
+                "save_operations",
+            ),
+            (
+                "abba-leg",
+                "P3",
+                "two_hour_pressure_measurement",
+                lambda item: item["abba_legs"].remove("B2"),
+                "abba_legs missing cases",
+            ),
+            (
+                "pressure-scenario",
+                "P3",
+                "two_hour_pressure_measurement",
+                lambda item: item["scenarios"].remove("running-heal"),
+                "scenarios missing cases",
+            ),
+            (
+                "heal-capacity",
+                "P3",
+                "heal_capacity_measurement",
+                lambda item: item["heal_capacity"].pop("completed_objects"),
+                "completed_objects",
+            ),
+            (
+                "recovery-window",
+                "P3",
+                "recovery_window_measurement",
+                lambda item: item["fault_modes"].remove("process-crash-restart"),
+                "fault_modes missing cases",
+            ),
+        ):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+                data = read_json(bundle)
+                mutation(data["gates"][gate]["evidence_fields"][field])
+                write_json(bundle, data)
+
+                with mock.patch("subprocess.check_output", return_value="b" * 40):
+                    status = scanner_heal_release_bundle_status(root, bundle)
+                self.assertEqual(status["decision"], "blocked")
+                self.assertFalse(status["release_approved"])
+                self.assertTrue(any(expected in error for error in status["rejected_gates"][gate]), fault)
 
     def test_scanner_heal_case_does_not_approve_pending_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
