@@ -170,6 +170,7 @@ SCANNER_HEAL_RELEASE_G08_REQUIRED_CASES = {
         "payload-write-enospc",
         "manifest-write-enospc",
         "journal-write-enospc",
+        "cleanup-delete-enospc",
     ),
     "replica_loss_matrix": (
         "single-replica-loss",
@@ -2641,7 +2642,13 @@ class SelfTests(unittest.TestCase):
             ("versions", "G09", "mixed_version_reader_evidence", lambda item: item.update({"versions": [1, 2]}), "mixed-version"),
             ("stale-versions", "G09", "mixed_version_writer_evidence", lambda item: item.update({"versions": ["a" * 40, "c" * 40]}), "tested source revision"),
             ("g08-capacity-cases", "G08", "mrf_capacity_evidence", lambda item: item.update({"capacity_cases": ["queue-count-limit"]}), "missing cases"),
-            ("g08-disk-full-cases", "G08", "disk_full_matrix", lambda item: item.pop("disk_full_cases"), "non-empty string list"),
+            (
+                "g08-disk-full-cases",
+                "G08",
+                "disk_full_matrix",
+                lambda item: item["disk_full_cases"].remove("cleanup-delete-enospc"),
+                "missing cases",
+            ),
             ("g08-replica-loss-cases", "G08", "replica_loss_matrix", lambda item: item.update({"replica_loss_cases": ["single-replica-loss"]}), "missing cases"),
             ("g07-responsibility-cases", "G07", "mrf_responsibility_oracle", lambda item: item.update({"mrf_responsibility_cases": ["legacy-journal-replay"]}), "missing cases"),
             ("g07-crash-cases", "G07", "commit_boundary_crash_matrix", lambda item: item.pop("commit_crash_cases"), "non-empty string list"),
