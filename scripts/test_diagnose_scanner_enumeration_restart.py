@@ -140,6 +140,15 @@ class ReportTests(unittest.TestCase):
         advanced = dict(current, objects_retained=1)
         self.assertFalse(replays_raw_window(previous, advanced))
 
+    def test_recoverable_quantum_rejects_replayed_raw_window(self):
+        previous = self.report()
+        previous.update(objects_retained=0, versions_retained=0, bytes_retained=0,
+                        objects_processed=0, snapshot_complete=False, outcome="partial")
+        current = dict(previous, round=1, pid=124, objects_before=0)
+
+        with self.assertRaisesRegex(ValueError, "raw enumeration window replayed"):
+            validate_recoverable_quantum([previous, current], objects=4, budget=16, require_converged=False)
+
     def test_recoverable_quantum_requires_three_stage_progress_and_convergence(self):
         first = self.report()
         first.update(round=0, pid=123, raw_entries=2, raw_page_index_committed_entries=2,
@@ -191,6 +200,15 @@ class ReportTests(unittest.TestCase):
         report["snapshot_complete"] = False
         report["outcome"] = "partial"
         with self.assertRaisesRegex(ValueError, "object classification"):
+            validate_recoverable_quantum([report], objects=4, budget=16, require_converged=False)
+
+    def test_recoverable_quantum_rejects_missing_raw_page_commit(self):
+        report = self.report()
+        report.update(snapshot_complete=False, outcome="partial",
+                      raw_page_index_committed_entries=0, raw_page_index_indexed_entries=1,
+                      objects_retained=1, versions_retained=1, bytes_retained=1)
+
+        with self.assertRaisesRegex(ValueError, "durable raw enumeration page"):
             validate_recoverable_quantum([report], objects=4, budget=16, require_converged=False)
 
 

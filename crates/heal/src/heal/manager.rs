@@ -20,7 +20,7 @@ use crate::heal::{
     task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType, demote_to_debug_when},
 };
 use crate::{Error, Result};
-use metrics::{counter, gauge};
+use metrics::{counter, gauge, histogram};
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_concurrency::workload::{ForegroundPressure, foreground_pressure};
 #[cfg(test)]
@@ -34,7 +34,7 @@ use std::sync::LazyLock;
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     sync::{Mutex, Notify, RwLock},
@@ -175,6 +175,13 @@ fn lock_mrf_repair_notice_targets(
 fn lock_displaced_terminals(
     registry: &StdMutex<HashMap<String, Arc<CompletedHealStatus>>>,
 ) -> StdMutexGuard<'_, HashMap<String, Arc<CompletedHealStatus>>> {
+    match registry.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn lock_admission_telemetry(registry: &StdMutex<HealAdmissionTelemetry>) -> StdMutexGuard<'_, HealAdmissionTelemetry> {
     match registry.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -386,6 +393,61 @@ impl HealSourceCounts {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HealAdmissionTelemetry {
+    pub accepted: u64,
+    pub merged: u64,
+    pub full: u64,
+    pub dropped: u64,
+    pub duplicate: u64,
+    pub overlap_rejected: u64,
+    pub displaced: u64,
+    pub force_start: u64,
+    pub max_start_duration_micros: u64,
+    pub max_lock_phase_micros: u64,
+}
+
+impl HealAdmissionTelemetry {
+    fn record(&mut self, observation: HealAdmissionObservation) {
+        match observation.result {
+            HealAdmissionResult::Accepted => self.accepted = self.accepted.saturating_add(1),
+            HealAdmissionResult::Merged => self.merged = self.merged.saturating_add(1),
+            HealAdmissionResult::Full => self.full = self.full.saturating_add(1),
+            HealAdmissionResult::Dropped(_) => self.dropped = self.dropped.saturating_add(1),
+        }
+        if observation.context == "duplicate" {
+            self.duplicate = self.duplicate.saturating_add(1);
+        }
+        if observation.context == "overlap_rejected" {
+            self.overlap_rejected = self.overlap_rejected.saturating_add(1);
+        }
+        if observation.displaced {
+            self.displaced = self.displaced.saturating_add(1);
+        }
+        if observation.force_start {
+            self.force_start = self.force_start.saturating_add(1);
+        }
+        self.max_start_duration_micros = self
+            .max_start_duration_micros
+            .max(duration_micros_saturated(observation.start_duration));
+        self.max_lock_phase_micros = self
+            .max_lock_phase_micros
+            .max(duration_micros_saturated(observation.lock_phase));
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HealAdmissionObservation {
+    source: HealRequestSource,
+    result: HealAdmissionResult,
+    context: &'static str,
+    force_start: bool,
+    displaced: bool,
+    start_duration: Duration,
+    lock_phase: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HealOperationsSnapshot {
     pub queue_length: u64,
     pub active_tasks: u64,
@@ -396,10 +458,16 @@ pub struct HealOperationsSnapshot {
     pub queued_by_source: HealSourceCounts,
     pub active_by_source: HealSourceCounts,
     pub retrying_by_source: HealSourceCounts,
+    #[serde(default)]
+    pub admission: HealAdmissionTelemetry,
 }
 
 fn usize_to_u64_saturated(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn duration_micros_saturated(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 fn heal_type_matches_path(heal_type: &HealType, heal_path: &str) -> bool {
@@ -764,6 +832,9 @@ pub struct HealManager {
     notify: Arc<Notify>,
     /// Optional runtime workload snapshot provider used to protect foreground data-plane work.
     workload_provider: Option<WorkloadSnapshotProviderRef>,
+    /// Bounded, low-cardinality admission telemetry exposed through the
+    /// existing operations snapshot for cluster E2E assertions.
+    admission_telemetry: Arc<StdMutex<HealAdmissionTelemetry>>,
 }
 
 /// Where a task-id lookup resolved. The variants carry the resolved state
@@ -917,6 +988,33 @@ impl HealManager {
             "context" => context.to_string()
         )
         .increment(1);
+    }
+
+    fn record_admission_observation(&self, observation: HealAdmissionObservation) {
+        let result = observation.result.result_label().to_string();
+        let reason = observation.result.reason_label().to_string();
+        let source = observation.source.as_str().to_string();
+        let context = observation.context.to_string();
+        let force_start = observation.force_start.to_string();
+        histogram!(
+            "rustfs_heal_admission_start_duration_seconds",
+            "source" => source.clone(),
+            "result" => result.clone(),
+            "reason" => reason.clone(),
+            "context" => context.clone(),
+            "force_start" => force_start.clone()
+        )
+        .record(observation.start_duration.as_secs_f64());
+        histogram!(
+            "rustfs_heal_admission_lock_phase_seconds",
+            "source" => source,
+            "result" => result,
+            "reason" => reason,
+            "context" => context,
+            "force_start" => force_start
+        )
+        .record(observation.lock_phase.as_secs_f64());
+        lock_admission_telemetry(&self.admission_telemetry).record(observation);
     }
 
     fn remove_mrf_repair_notice_targets_for_task(&self, task_id: &str) {
@@ -1265,6 +1363,7 @@ impl HealManager {
             statistics: Arc::new(RwLock::new(HealStatistics::new())),
             notify: Arc::new(Notify::new()),
             workload_provider,
+            admission_telemetry: Arc::new(StdMutex::new(HealAdmissionTelemetry::default())),
         }
     }
 
@@ -1455,6 +1554,9 @@ impl HealManager {
         preserve_alias: bool,
         mrf_notice_target: Option<MrfRepairNoticeTarget>,
     ) -> Result<HealAdmissionReceipt> {
+        let admission_start = Instant::now();
+        let source = request.source;
+        let force_start = request.force_start;
         // HS-06 forceStart semantics (admin only): MinIO stops the old task
         // first and then starts the new one. Cancel any active admin task
         // overlapping this request's path before entering admission, so the
@@ -1505,6 +1607,7 @@ impl HealManager {
         // Match the scheduler's active -> queue order and keep retry ownership
         // in the same atomic view. Otherwise queue -> active and
         // active -> retrying transitions can slip between duplicate checks.
+        let lock_phase_start = Instant::now();
         let active_heals = self.active_heals.lock().await;
         #[cfg(test)]
         pause_duplicate_admission_after_active_lock(&request.id).await;
@@ -1539,7 +1642,17 @@ impl HealManager {
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
+            let lock_phase = lock_phase_start.elapsed();
             Self::record_admission_metric(request.source, admission, "duplicate");
+            self.record_admission_observation(HealAdmissionObservation {
+                source,
+                result: admission,
+                context: "duplicate",
+                force_start,
+                displaced: false,
+                start_duration: admission_start.elapsed(),
+                lock_phase,
+            });
 
             match admission {
                 HealAdmissionResult::Merged => {
@@ -1618,7 +1731,17 @@ impl HealManager {
                 drop(retrying_heals);
                 drop(queue);
                 drop(active_heals);
+                let lock_phase = lock_phase_start.elapsed();
                 Self::record_admission_metric(request.source, HealAdmissionResult::Dropped(reason), "overlap_rejected");
+                self.record_admission_observation(HealAdmissionObservation {
+                    source,
+                    result: HealAdmissionResult::Dropped(reason),
+                    context: "overlap_rejected",
+                    force_start,
+                    displaced: false,
+                    start_duration: admission_start.elapsed(),
+                    lock_phase,
+                });
                 warn!(
                     target: "rustfs::heal::manager",
                     event = EVENT_HEAL_QUEUE_ADMISSION,
@@ -1663,6 +1786,8 @@ impl HealManager {
         drop(retrying_heals);
         drop(queue);
         drop(active_heals);
+        let lock_phase = lock_phase_start.elapsed();
+        let displaced = displaced_terminal.is_some();
 
         if let (Some(displaced_task_id), Some(displaced_terminal)) = (displaced_task_id, displaced_terminal) {
             // The queue has already removed the displaced request, so the
@@ -1675,6 +1800,16 @@ impl HealManager {
         if should_notify {
             self.notify.notify_one();
         }
+
+        self.record_admission_observation(HealAdmissionObservation {
+            source,
+            result: admission,
+            context: "submit",
+            force_start,
+            displaced,
+            start_duration: admission_start.elapsed(),
+            lock_phase,
+        });
 
         Ok(HealAdmissionReceipt {
             result: admission,
@@ -2111,17 +2246,25 @@ impl HealManager {
         }
         publish_active_heal_count(&active_heals);
         publish_heal_queue_length(&queue);
+        let queue_length = usize_to_u64_saturated(queue.len());
+        let active_tasks = usize_to_u64_saturated(active_heals.len());
+        let retrying_tasks = usize_to_u64_saturated(retrying_heals.len());
+        drop(retrying_heals);
+        drop(queue);
+        drop(active_heals);
+        let admission = *lock_admission_telemetry(&self.admission_telemetry);
 
         HealOperationsSnapshot {
-            queue_length: usize_to_u64_saturated(queue.len()),
-            active_tasks: usize_to_u64_saturated(active_heals.len()),
-            retrying_tasks: usize_to_u64_saturated(retrying_heals.len()),
+            queue_length,
+            active_tasks,
+            retrying_tasks,
             queued_by_priority,
             active_by_priority,
             retrying_by_priority,
             queued_by_source,
             active_by_source,
             retrying_by_source,
+            admission,
         }
     }
 

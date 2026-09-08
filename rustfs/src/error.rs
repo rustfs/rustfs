@@ -13,13 +13,30 @@
 // limitations under the License.
 
 use crate::storage_api::error::contract::{StorageErrorCode, range::HTTPRangeError};
-use crate::storage_api::error::{QuotaError, StorageError};
+use crate::storage_api::error::{PoolMetadataError, QuotaError, StorageError};
 use http::StatusCode;
 use rustfs_kms::KmsUnavailableError;
 use s3s::{S3Error, S3ErrorCode};
 
 const MAX_VERSIONS_EXCEEDED_CODE: &str = "MaxVersionsExceeded";
 const MAX_VERSIONS_EXCEEDED_MESSAGE: &str = "You've exceeded the limit on the number of versions you can create on this object";
+
+/// S3 error code for a request that names a KMS key the KMS does not hold.
+pub const KMS_KEY_NOT_FOUND_ERROR_CODE: &str = "KMS.NotFoundException";
+
+/// HTTP status of the error codes s3s cannot derive on its own.
+///
+/// s3s answers `None` for every `Custom` code, which the response layer turns
+/// into a 500; a code that means "your request named something that does not
+/// exist" has to say so itself.
+fn custom_error_status(code: &S3ErrorCode) -> Option<StatusCode> {
+    match code {
+        S3ErrorCode::Custom(custom) if &**custom == KMS_KEY_NOT_FOUND_ERROR_CODE || &**custom == MAX_VERSIONS_EXCEEDED_CODE => {
+            Some(StatusCode::BAD_REQUEST)
+        }
+        _ => None,
+    }
+}
 
 /// Marks a request body that exceeded a presigned upload size capability.
 ///
@@ -89,7 +106,26 @@ pub(crate) struct ApiErrorDiagnostic {
     pub storage_code: Option<StorageErrorCode>,
     pub io_kind: Option<std::io::ErrorKind>,
     pub rpc_code: Option<tonic::Code>,
+    pub pool_metadata: Option<PoolMetadataDiagnostic>,
     pub truncated: bool,
+}
+
+/// Safe projection of local metadata failure context, without operation text or sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PoolMetadataDiagnostic {
+    pub reason: &'static str,
+    pub phase: &'static str,
+    pub since_unix_secs: i64,
+}
+
+impl From<&PoolMetadataError> for PoolMetadataDiagnostic {
+    fn from(context: &PoolMetadataError) -> Self {
+        Self {
+            reason: context.kind.as_str(),
+            phase: context.phase,
+            since_unix_secs: context.since.unix_timestamp(),
+        }
+    }
 }
 
 impl ApiError {
@@ -105,6 +141,11 @@ impl ApiError {
             }
             if let Some(status) = error.downcast_ref::<tonic::Status>() {
                 diagnostic.rpc_code = Some(status.code());
+            }
+            if diagnostic.pool_metadata.is_none()
+                && let Some(context) = error.downcast_ref::<PoolMetadataError>()
+            {
+                diagnostic.pool_metadata = Some(context.into());
             }
             current = if let Some(io) = error.downcast_ref::<std::io::Error>() {
                 diagnostic.io_kind = Some(io.kind());
@@ -368,9 +409,10 @@ fn error_chain_s3s_body_stream_error(err: &(dyn std::error::Error + 'static)) ->
 
 impl From<ApiError> for S3Error {
     fn from(err: ApiError) -> Self {
+        let status = custom_error_status(&err.code);
         let mut s3e = S3Error::with_message(err.code, err.message);
-        if matches!(s3e.code(), S3ErrorCode::Custom(code) if &**code == MAX_VERSIONS_EXCEEDED_CODE) {
-            s3e.set_status_code(StatusCode::BAD_REQUEST);
+        if let Some(status) = status {
+            s3e.set_status_code(status);
         }
         if let Some(source) = err.source {
             s3e.set_source(source);
@@ -439,6 +481,19 @@ impl From<StorageError> for ApiError {
                 return ApiError {
                     code: S3ErrorCode::ServiceUnavailable,
                     message: ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
+                    source: Some(Box::new(err)),
+                };
+            }
+
+            // A request header or bucket default naming a key the KMS does not
+            // hold is the caller's mistake to correct, and S3 reports it as
+            // 400 `KMS.NotFoundException`. Left to the fallthrough it became a
+            // 500 whose generic message hid which key was missing.
+            if let Some(rustfs_kms::KmsError::KeyNotFound { key_id }) = inner.downcast_ref::<rustfs_kms::KmsError>() {
+                let message = format!("KMS key not found: {key_id}");
+                return ApiError {
+                    code: S3ErrorCode::Custom(KMS_KEY_NOT_FOUND_ERROR_CODE.into()),
+                    message,
                     source: Some(Box::new(err)),
                 };
             }
@@ -954,6 +1009,7 @@ mod tests {
     #[test]
     fn pool_metadata_failures_map_to_503_and_preserve_typed_private_context() {
         use crate::storage_api::error::{PoolMetadataError, PoolMetadataFailure};
+        let since = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed failure time");
         for kind in [
             PoolMetadataFailure::ReadUnavailable,
             PoolMetadataFailure::RecoveryRequired,
@@ -962,9 +1018,9 @@ mod tests {
         ] {
             let error = StorageError::other(PoolMetadataError {
                 kind,
-                operation: "pool metadata test".to_owned(),
+                operation: "private operation path".to_owned(),
                 phase: "prepare_cas",
-                since: time::OffsetDateTime::now_utc(),
+                since,
                 source: Some(std::sync::Arc::new(StorageError::other("private disk failure"))),
             });
             let error = StorageError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, error));
@@ -977,7 +1033,38 @@ mod tests {
             assert!(!api.message.contains("private"));
             let source = api.source.as_ref().unwrap().downcast_ref::<StorageError>().unwrap();
             assert_eq!(source.pool_metadata_failure().unwrap().kind, kind);
+            let diagnostic = api.diagnostic();
+            assert_eq!(
+                diagnostic.pool_metadata,
+                Some(PoolMetadataDiagnostic {
+                    reason: kind.as_str(),
+                    phase: "prepare_cas",
+                    since_unix_secs: since.unix_timestamp(),
+                })
+            );
+            assert!(!diagnostic.truncated);
+            assert!(!format!("{diagnostic:?}").contains("private"));
+            assert_eq!(api.diagnostic(), diagnostic, "inspection must preserve the original failure time");
         }
+    }
+
+    #[test]
+    fn test_kms_key_not_found_maps_to_bad_request_kms_not_found_exception() {
+        let api_error = ApiError::from(StorageError::other(rustfs_kms::KmsError::key_not_found("no-such-key")));
+
+        assert_eq!(api_error.code, S3ErrorCode::Custom(KMS_KEY_NOT_FOUND_ERROR_CODE.into()));
+        assert_eq!(api_error.message, "KMS key not found: no-such-key");
+
+        // s3s knows no status for a custom code; the conversion has to supply it.
+        let s3_error = S3Error::from(api_error);
+        assert_eq!(s3_error.status_code(), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn test_generated_error_codes_keep_their_own_status() {
+        let s3_error = S3Error::from(ApiError::from(StorageError::other(rustfs_kms::KmsError::backend_error("down"))));
+
+        assert_eq!(s3_error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
     }
 
     #[test]

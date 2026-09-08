@@ -1095,6 +1095,191 @@ fn queued_request_id_for_dedup_key_tracks_the_representative() {
 }
 
 #[test]
+fn mrf_verified_repair_event_requires_positive_exact_identity() {
+    use crate::heal::outcome::{HealObjectIdentity, HealObjectKind, HealObjectOutcome};
+    use rustfs_common::mrf_channel::{MrfKind, MrfScope, MrfVerifiedRepairDisposition};
+
+    let version = uuid::Uuid::new_v4();
+    let incarnation = uuid::Uuid::new_v4();
+    let target = MrfRepairNoticeTarget {
+        bucket: Arc::from("bucket"),
+        object: Arc::from("object"),
+        version_id: Some(*version.as_bytes()),
+        kind: MrfKind::PartialWrite,
+        scope: Some(MrfScope {
+            pool_index: 1,
+            set_index: 2,
+        }),
+        lease: None,
+    };
+    let matching = HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: "bucket".to_string(),
+            object: "object".to_string(),
+            version_id: Some(version.to_string()),
+            bucket_incarnation_id: Some(incarnation),
+            pool_index: Some(1),
+            set_index: Some(2),
+        },
+        disposition: HealObjectDisposition::Repaired,
+        detail: None,
+    };
+
+    let event = mrf_verified_repair_event_for_target(&target, &matching).expect("matching positive receipt should publish");
+    assert_eq!(event.kind, MrfKind::PartialWrite);
+    assert_eq!(event.bucket.as_ref(), "bucket");
+    assert_eq!(event.object.as_ref(), "object");
+    assert_eq!(event.version_id, Some(*version.as_bytes()));
+    assert_eq!(
+        event.scope,
+        Some(MrfScope {
+            pool_index: 1,
+            set_index: 2
+        })
+    );
+    assert_eq!(event.lease, None);
+    assert_eq!(event.bucket_incarnation_id, incarnation);
+    assert_eq!(event.disposition, MrfVerifiedRepairDisposition::Repaired);
+
+    assert!(
+        mrf_verified_repair_event_for_target(
+            &MrfRepairNoticeTarget {
+                kind: MrfKind::DecodeFailure,
+                ..target.clone()
+            },
+            &matching
+        )
+        .is_none(),
+        "only receipt-producing partial-write object heals can publish verified events today"
+    );
+
+    for rejected in [
+        HealObjectOutcome {
+            disposition: HealObjectDisposition::Unknown,
+            ..matching.clone()
+        },
+        HealObjectOutcome {
+            identity: HealObjectIdentity {
+                bucket_incarnation_id: None,
+                ..matching.identity.clone()
+            },
+            ..matching.clone()
+        },
+        HealObjectOutcome {
+            identity: HealObjectIdentity {
+                object: "other".to_string(),
+                ..matching.identity.clone()
+            },
+            ..matching.clone()
+        },
+        HealObjectOutcome {
+            identity: HealObjectIdentity {
+                pool_index: Some(3),
+                ..matching.identity.clone()
+            },
+            ..matching
+        },
+    ] {
+        assert!(
+            mrf_verified_repair_event_for_target(&target, &rejected).is_none(),
+            "legacy, incomplete or mismatched outcomes must not discharge MRF responsibility"
+        );
+    }
+}
+
+#[test]
+fn completed_mrf_notice_publishes_only_verified_positive_events() {
+    use crate::heal::outcome::{HealObjectIdentity, HealObjectKind, HealObjectOutcome, HealTaskOutcome};
+    use rustfs_common::mrf_channel::{MrfKind, MrfScope, take_mrf_verified_repair_events_for};
+
+    let bucket = Arc::<str>::from("verified-mrf-completed-bucket");
+    let _ = take_mrf_verified_repair_events_for(bucket.as_ref());
+    let version = uuid::Uuid::new_v4();
+    let incarnation = uuid::Uuid::new_v4();
+    let matching_target = MrfRepairNoticeTarget {
+        bucket: bucket.clone(),
+        object: Arc::from("object-a"),
+        version_id: Some(*version.as_bytes()),
+        kind: MrfKind::PartialWrite,
+        scope: Some(MrfScope {
+            pool_index: 1,
+            set_index: 2,
+        }),
+        lease: None,
+    };
+    let mismatch_target = MrfRepairNoticeTarget {
+        object: Arc::from("object-b"),
+        ..matching_target.clone()
+    };
+    let mut outcome = HealTaskOutcome::default();
+    outcome.execution = HealExecutionOutcome::Completed;
+    outcome.coverage = crate::heal::outcome::HealTraversalCoverage::Complete;
+    outcome.record(HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: bucket.to_string(),
+            object: "object-a".to_string(),
+            version_id: Some(version.to_string()),
+            bucket_incarnation_id: Some(incarnation),
+            pool_index: Some(1),
+            set_index: Some(2),
+        },
+        disposition: HealObjectDisposition::VerifiedHealthy,
+        detail: None,
+    });
+    outcome.record(HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: bucket.to_string(),
+            object: "object-b".to_string(),
+            version_id: Some(version.to_string()),
+            bucket_incarnation_id: None,
+            pool_index: Some(1),
+            set_index: Some(2),
+        },
+        disposition: HealObjectDisposition::Repaired,
+        detail: None,
+    });
+    let completed = CompletedHealStatus {
+        outcome: Some(Arc::new(outcome)),
+        ..completed_retention_fixture(SystemTime::now())
+    };
+
+    publish_verified_mrf_repair_events(&[matching_target.clone(), mismatch_target], &completed);
+
+    let events = take_mrf_verified_repair_events_for(bucket.as_ref());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].object.as_ref(), "object-a");
+    assert_eq!(events[0].lease, None);
+    assert_eq!(events[0].bucket_incarnation_id, incarnation);
+
+    let failed = CompletedHealStatus {
+        status: HealTaskStatus::Failed {
+            error: "terminal failure".to_string(),
+        },
+        ..completed.clone()
+    };
+    publish_verified_mrf_repair_events(std::slice::from_ref(&matching_target), &failed);
+    assert!(
+        take_mrf_verified_repair_events_for(bucket.as_ref()).is_empty(),
+        "failed terminal tasks must not publish a verified repair event"
+    );
+
+    let mut completed_with_errors_outcome = completed.outcome.as_ref().expect("completed outcome").as_ref().clone();
+    completed_with_errors_outcome.execution = crate::heal::outcome::HealExecutionOutcome::CompletedWithErrors;
+    let completed_with_errors = CompletedHealStatus {
+        outcome: Some(Arc::new(completed_with_errors_outcome)),
+        ..completed
+    };
+    publish_verified_mrf_repair_events(std::slice::from_ref(&matching_target), &completed_with_errors);
+    assert!(
+        take_mrf_verified_repair_events_for(bucket.as_ref()).is_empty(),
+        "non-success canonical outcomes must not publish a verified repair event"
+    );
+}
+
+#[test]
 fn test_priority_queue_ordering() {
     let mut queue = PriorityHealQueue::new();
 
@@ -2789,6 +2974,88 @@ async fn admin_force_start_cancels_overlapping_active_task_first() {
     assert!(
         matches!(manager.get_task_status(&old_id).await, Ok(HealTaskStatus::Cancelled)),
         "a cancelled task must no longer resolve as an active heal"
+    );
+}
+
+#[tokio::test]
+async fn admission_snapshot_tracks_start_duplicate_force_start_and_displacement() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let manager = Arc::new(HealManager::new(
+        storage,
+        Some(HealConfig {
+            queue_size: 1,
+            ..Default::default()
+        }),
+    ));
+
+    let mut paused = admin_prefix_request("bucket-a", "logs/");
+    paused.priority = HealPriority::Low;
+    let hook = Arc::new(DuplicateAdmissionTestHook {
+        request_id: paused.id.clone(),
+        active_lock_reached: Notify::new(),
+        active_lock_release: Notify::new(),
+    });
+    *DUPLICATE_ADMISSION_TEST_HOOK.lock().await = Some(hook.clone());
+
+    let submit_manager = Arc::clone(&manager);
+    let mut paused_submission = tokio::spawn(async move { submit_manager.submit_heal_request(paused).await });
+    tokio::time::timeout(Duration::from_secs(1), hook.active_lock_reached.notified())
+        .await
+        .expect("admission should reach the test-only lock phase hook");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut paused_submission)
+            .await
+            .is_err(),
+        "admission must wait while the lock-phase hook is held"
+    );
+    hook.active_lock_release.notify_one();
+    assert_eq!(
+        paused_submission
+            .await
+            .expect("paused admission task should join")
+            .expect("paused admission should succeed"),
+        HealAdmissionResult::Accepted
+    );
+    *DUPLICATE_ADMISSION_TEST_HOOK.lock().await = None;
+
+    let duplicate = admin_prefix_request("bucket-a", "logs/");
+    let duplicate_receipt = manager
+        .submit_heal_request_with_receipt(duplicate)
+        .await
+        .expect("duplicate admission should return a canonical receipt");
+    assert_eq!(duplicate_receipt.result, HealAdmissionResult::Merged);
+
+    let mut high = admin_prefix_request("bucket-b", "logs/");
+    high.priority = HealPriority::High;
+    assert_eq!(
+        manager
+            .submit_heal_request(high)
+            .await
+            .expect("higher priority admin request should displace queued low-priority work"),
+        HealAdmissionResult::Accepted
+    );
+
+    let mut forced = admin_prefix_request("bucket-c", "logs/");
+    forced.force_start = true;
+    assert_eq!(
+        manager
+            .submit_heal_request(forced)
+            .await
+            .expect("forceStart should keep explicit admission semantics"),
+        HealAdmissionResult::Accepted
+    );
+
+    let admission = manager.operations_snapshot().await.admission;
+    assert_eq!(admission.accepted, 3);
+    assert_eq!(admission.merged, 1);
+    assert_eq!(admission.full, 0);
+    assert_eq!(admission.dropped, 0);
+    assert_eq!(admission.duplicate, 1);
+    assert_eq!(admission.displaced, 1);
+    assert_eq!(admission.force_start, 1);
+    assert!(
+        admission.max_lock_phase_micros > 0,
+        "snapshot should expose a measurable queue/admission lock phase for p95-style external aggregation"
     );
 }
 

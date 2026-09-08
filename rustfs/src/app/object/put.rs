@@ -1995,6 +1995,9 @@ impl DefaultObjectUsecase {
                                 storage_error_code = ?diagnostic.storage_code,
                                 io_error_kind = ?diagnostic.io_kind,
                                 rpc_error_code = ?diagnostic.rpc_code,
+                                pool_metadata_reason = diagnostic.pool_metadata.map(|context| context.reason),
+                                pool_metadata_phase = diagnostic.pool_metadata.map(|context| context.phase),
+                                pool_metadata_since_unix_secs = diagnostic.pool_metadata.map(|context| context.since_unix_secs),
                                 source_chain_truncated = diagnostic.truncated,
                                 suppressed_errors,
                                 "PutObject store write returned"

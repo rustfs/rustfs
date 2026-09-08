@@ -3512,6 +3512,80 @@ fn raw_enumeration_progress_checkpoint_commits_budgeted_page_for_oracle() {
     );
 }
 
+#[tokio::test]
+async fn raw_enumeration_root_page_survives_child_partial_boundary() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(temp_dir),
+    };
+    scanner.old_cache.info.name = "bucket".to_string();
+
+    let mut root_progress = RawEnumerationProgress::new("bucket", None);
+    root_progress.record_entry("object-0000");
+    root_progress.record_entry("object-0001");
+    scanner.raw_enumeration_progress.push(root_progress);
+    scanner.finish_raw_enumeration_parent("bucket");
+
+    assert_eq!(scanner.raw_enumeration_progress.len(), 1);
+    let root_index = scanner.raw_enumeration_progress[0]
+        .page_index()
+        .expect("completed scan root should retain its raw-page oracle");
+    assert_eq!(
+        root_index
+            .committed_entries()
+            .expect("retained root raw-page oracle should validate"),
+        vec!["object-0000".to_string(), "object-0001".to_string()]
+    );
+
+    let mut child_progress = RawEnumerationProgress::new("bucket/object-0000", None);
+    child_progress.record_entry("xl.meta");
+    scanner.raw_enumeration_progress.push(child_progress);
+    scanner.finish_raw_enumeration_parent("bucket/object-0000");
+
+    assert_eq!(
+        scanner
+            .raw_enumeration_progress
+            .iter()
+            .map(|progress| progress.parent.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bucket"]
+    );
+}
+
+#[tokio::test]
+async fn raw_enumeration_resume_state_keeps_largest_durable_quantum() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(temp_dir),
+    };
+
+    let mut root_progress = RawEnumerationProgress::new("bucket", None);
+    root_progress.record_entry("object-0000");
+    scanner.raw_enumeration_progress.push(root_progress);
+
+    let mut child_progress = RawEnumerationProgress::new("bucket/object-0000", None);
+    child_progress.record_entry("part-0000");
+    child_progress.record_entry("part-0001");
+    child_progress.record_entry("part-0002");
+    scanner.raw_enumeration_progress.push(child_progress);
+
+    let (cursor, page_index) = scanner.take_raw_enumeration_resume_state();
+    assert_eq!(
+        cursor.as_ref().expect("largest raw quantum should include a cursor").parent,
+        "bucket/object-0000"
+    );
+    assert_eq!(
+        page_index
+            .as_ref()
+            .expect("largest raw quantum should include a page index")
+            .indexed_entries()
+            .expect("selected page index should validate")
+            .len(),
+        3
+    );
+    assert!(scanner.raw_enumeration_progress.is_empty());
+}
+
 #[test]
 fn raw_enumeration_progress_retains_resume_index_until_unordered_entries_reappear() {
     let mut index = RawEnumerationPageIndex::new("bucket", 2).expect("raw page index should initialize");

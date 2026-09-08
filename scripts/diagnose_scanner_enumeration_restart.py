@@ -85,15 +85,20 @@ def validate_recoverable_quantum(reports, *, objects, budget, require_converged)
         raise ValueError("no scanner restart reports were produced")
     previous = None
     made_enumeration_progress = False
+    made_raw_page_commit_progress = False
     made_classification_progress = False
     made_durable_progress = False
     for index, report in enumerate(reports):
         validate_report(report, round_number=index, pid=report["pid"], objects=objects, budget=budget)
+        if report["raw_page_index_parent"] == "bucket" and report["raw_page_index_committed_entries"] > 0:
+            made_raw_page_commit_progress = True
         if previous is not None:
             if report["objects_before"] != previous["objects_retained"]:
                 raise ValueError("durable retained coverage did not survive process restart")
             if report["objects_retained"] < previous["objects_retained"]:
                 raise ValueError("durable retained coverage regressed across restart")
+            if replays_raw_window(previous, report):
+                raise ValueError("raw enumeration window replayed without durable coverage")
             if (report["raw_page_index_parent"] == previous["raw_page_index_parent"]
                     and report["raw_page_index_committed_entries"] < previous["raw_page_index_committed_entries"]
                     and not previous["raw_page_index_complete"]):
@@ -104,6 +109,8 @@ def validate_recoverable_quantum(reports, *, objects, budget, require_converged)
         previous = report
     if not made_enumeration_progress:
         raise ValueError("restart proof did not exercise raw enumeration")
+    if not made_raw_page_commit_progress:
+        raise ValueError("restart proof did not commit a durable raw enumeration page")
     if not made_classification_progress:
         raise ValueError("restart proof did not exercise object classification")
     if not made_durable_progress:

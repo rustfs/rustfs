@@ -373,9 +373,13 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
                 .expect("maintenance object should persist");
             wait_for_namespace_commit_tails(store.as_ref()).await;
             // Only the hot bucket is in the dirty-usage hint. The ordinary
-            // dirty cycle exercises scoped reuse; the following maintenance
-            // cycles mutate cold storage and must still walk it.
-            record_dirty_usage_bucket("hot-bucket");
+            // dirty cycle exercises bucket-scoped reuse; object-level segment
+            // hints remain activation-gated.
+            if index == 1 {
+                record_dirty_usage_object("hot-bucket", &format!("added-{index}"));
+            } else {
+                record_dirty_usage_bucket("hot-bucket");
+            }
         }
         let requested_scope = if explicit_scope {
             ScannerBucketScanScope::from_dirty_buckets(
@@ -421,6 +425,10 @@ async fn scoped_scan_production_entry_preserves_deep_and_full_maintenance_work()
                 resolved.selected_buckets.as_deref(),
                 Some(&HashSet::from(["hot-bucket".to_string()])),
                 "ordinary dirty work must retain the existing planner"
+            );
+            assert!(
+                resolved.prefix_scope_for("hot-bucket").is_none(),
+                "production segment reuse must remain disabled before activation"
             );
         } else {
             assert!(resolved.is_default(), "cycle {cycle} must visit the full maintenance scope");
@@ -1566,6 +1574,7 @@ fn scoped_scan_selects_only_current_dirty_buckets_after_baseline_validation() {
         HashSet::from(["photos".to_string(), "deleted".to_string()]),
         None,
         true,
+        false,
         &[bucket_info("photos")],
         ScannerCacheBaselineProof {
             authoritative_data: Some(&baseline),
@@ -1620,7 +1629,7 @@ fn scoped_scan_baseline_work_proof_requires_uniform_known_set_identity() {
 }
 
 #[test]
-fn scoped_scan_uses_only_locally_verified_prefix_hints() {
+fn scoped_scan_prefix_hints_require_segment_reuse_activation() {
     let source = DataUsageCacheSource::new(1, 2);
     let expected_sources = HashSet::from([source]);
     let scan_plan_digest = DataUsageScanPlanDigest([6; 32]);
@@ -1638,6 +1647,7 @@ fn scoped_scan_uses_only_locally_verified_prefix_hints() {
         HashSet::from(["photos".to_string(), "videos".to_string()]),
         Some(&dirty_scopes),
         true,
+        false,
         &[bucket_info("photos"), bucket_info("videos")],
         ScannerCacheBaselineProof {
             authoritative_data: Some(&baseline),
@@ -1648,13 +1658,40 @@ fn scoped_scan_uses_only_locally_verified_prefix_hints() {
             scan_plan_digest,
         },
     );
-    assert!(locally_scoped.prefix_scope_for("photos").is_some());
+    assert_eq!(
+        locally_scoped.selected_buckets.as_deref(),
+        Some(&HashSet::from(["photos".to_string(), "videos".to_string()]))
+    );
+    assert!(
+        locally_scoped.prefix_scope_for("photos").is_none(),
+        "production must not consume segment hints before activation"
+    );
     assert!(locally_scoped.prefix_scope_for("videos").is_none());
+
+    let activated = scoped_scan_scope_from_dirty_buckets(
+        ScannerBucketScanScope::default(),
+        HashSet::from(["photos".to_string(), "videos".to_string()]),
+        Some(&dirty_scopes),
+        true,
+        true,
+        &[bucket_info("photos"), bucket_info("videos")],
+        ScannerCacheBaselineProof {
+            authoritative_data: Some(&baseline),
+            observed_candidate_data: None,
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest,
+        },
+    );
+    assert!(activated.prefix_scope_for("photos").is_some());
+    assert!(activated.prefix_scope_for("videos").is_none());
 
     let distributed_scope = scoped_scan_scope_from_dirty_buckets(
         ScannerBucketScanScope::default(),
         HashSet::from(["photos".to_string(), "videos".to_string()]),
         None,
+        true,
         true,
         &[bucket_info("photos"), bucket_info("videos")],
         ScannerCacheBaselineProof {
@@ -1699,6 +1736,7 @@ fn remote_dirty_usage_invalidates_local_prefix_hints_until_distributed_proof_exi
         ScannerBucketScanScope::default(),
         HashSet::from(["photos".to_string()]),
         Some(&dirty_scopes),
+        true,
         true,
         &[bucket_info("photos")],
         ScannerCacheBaselineProof {

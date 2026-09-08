@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::harness::{DistCluster, DistLayout, TestResult, cluster_admin_ok, unique_bucket, wait_for_ready};
-use crate::common::{admin_request, init_logging, local_http_client};
+use super::harness::{
+    DistCluster, DistLayout, TestResult, assert_object_bytes, cluster_admin_ok, unique_bucket, wait_for_ready, wait_until,
+};
+use crate::common::{admin_request, init_logging, local_http_client, signal_process, signed_request};
 use aws_sdk_s3::operation::RequestId;
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
@@ -24,7 +26,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use local_ip_address::local_ip;
-use rustfs_madmin::metrics::RealtimeMetrics;
+use rustfs_madmin::metrics::{HttpMetrics, RealtimeMetrics};
 use rustfs_utils::egress::ENV_OUTBOUND_ALLOW_ORIGINS;
 use serde_json::Value;
 use std::convert::Infallible;
@@ -126,6 +128,7 @@ async fn four_node_health_inventory_metrics_and_audit_delivery_are_consistent() 
     let (audit_endpoint, mut audit_entries, collector) = spawn_audit_collector().await?;
     let audit_origin = reqwest::Url::parse(&audit_endpoint)?.origin().ascii_serialization();
     let audit_env = [
+        ("RUST_LOG", "warn"),
         ("RUSTFS_AUDIT_ENABLE", "true"),
         ("RUSTFS_AUDIT_WEBHOOK_ENABLE_DISTRIBUTED", "on"),
         ("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_DISTRIBUTED", audit_endpoint.as_str()),
@@ -231,6 +234,186 @@ async fn four_node_health_inventory_metrics_and_audit_delivery_are_consistent() 
         "audit entry leaked the root secret key"
     );
 
+    let result = verify_write_observations_during_peer_failure(&dist, &bucket).await;
     collector.abort();
+    result
+}
+
+async fn node_admin_body(dist: &DistCluster, node: usize, path: &str) -> TestResult<String> {
+    let (status, body) = timeout(
+        Duration::from_secs(30),
+        admin_request(
+            &dist.cluster.nodes[node].url,
+            Method::GET,
+            path,
+            None,
+            &dist.cluster.access_key,
+            &dist.cluster.secret_key,
+        ),
+    )
+    .await??;
+    assert!(status.is_success(), "node {node} admin request {path}: {status} {body}");
+    Ok(body)
+}
+
+async fn http_put_counts(dist: &DistCluster, node: usize) -> TestResult<[u64; 2]> {
+    let body = node_admin_body(dist, node, "/rustfs/admin/v3/metrics?types=512&by-host=true&n=1").await?;
+    let sample: RealtimeMetrics = serde_json::from_str(body.lines().next().ok_or("empty HTTP metrics stream")?)?;
+    assert!(sample.errors.is_empty(), "HTTP metrics returned errors: {:?}", sample.errors);
+    let http = sample.aggregated.http.ok_or("HTTP metrics missing at WARN log level")?;
+    let count = |http: &HttpMetrics, outcome: &str| {
+        http.requests
+            .iter()
+            .filter(|row| row.method == "PUT" && row.outcome == outcome)
+            .map(|row| row.total)
+            .sum::<u64>()
+    };
+    assert_eq!(sample.by_host.len(), 1, "HTTP admin metrics must remain node-local");
+    let host = sample.by_host.values().next().expect("one reporting host");
+    let host = host.http.as_ref().ok_or("by-host HTTP metrics missing")?;
+    let totals = [count(&http, "2xx"), count(&http, "5xx")];
+    assert_eq!(totals, [count(host, "2xx"), count(host, "5xx")]);
+    Ok(totals)
+}
+
+async fn observed_put(dist: &DistCluster, node: usize, bucket: &str, key: &str) -> TestResult<http::StatusCode> {
+    // One signed HTTP attempt: SDK retries must not change the expected denominator.
+    timeout(Duration::from_secs(90), async {
+        let response = signed_request(
+            Method::PUT,
+            &format!("{}/{bucket}/{key}", dist.cluster.nodes[node].url),
+            &dist.cluster.access_key,
+            &dist.cluster.secret_key,
+            Some(b"write-observation".to_vec()),
+            Some("application/octet-stream"),
+        )
+        .await?;
+        assert!(response.headers().contains_key("x-amz-request-id"), "PUT omitted correlation ID");
+        let status = response.status();
+        let body = response.text().await?;
+        assert!(!body.contains(&dist.cluster.secret_key), "PUT response leaked credentials");
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(status)
+    })
+    .await?
+}
+
+struct SuspendedPeer<'a> {
+    // Borrowing the owned child keeps its PID from being reaped/reused before cleanup.
+    child: &'a std::process::Child,
+    suspended: bool,
+}
+
+impl<'a> SuspendedPeer<'a> {
+    fn suspend(dist: &'a DistCluster, node: usize) -> TestResult<Self> {
+        let child = dist.cluster.nodes[node].process.as_ref().ok_or("peer process missing")?;
+        signal_process(child.id(), "STOP")?;
+        Ok(Self { child, suspended: true })
+    }
+
+    fn resume(&mut self) -> TestResult {
+        signal_process(self.child.id(), "CONT")?;
+        self.suspended = false;
+        Ok(())
+    }
+}
+
+impl Drop for SuspendedPeer<'_> {
+    fn drop(&mut self) {
+        if self.suspended {
+            let _ = signal_process(self.child.id(), "CONT");
+        }
+    }
+}
+
+async fn verify_write_observations_during_peer_failure(dist: &DistCluster, bucket: &str) -> TestResult {
+    let mut baseline = Vec::new();
+    for node in 0..dist.cluster.nodes.len() {
+        let before = http_put_counts(dist, node).await?;
+        assert!(
+            observed_put(dist, node, bucket, &format!("healthy-{node}"))
+                .await?
+                .is_success()
+        );
+        let after = http_put_counts(dist, node).await?;
+        assert_eq!(after, [before[0] + 1, before[1]], "node {node} lost its successful PUT denominator");
+        baseline.push(after);
+    }
+
+    // Refresh provenance immediately before the first failed probe, within the cache age budget.
+    node_admin_body(dist, 0, "/rustfs/admin/v3/storageinfo").await?;
+    let mut suspended = [SuspendedPeer::suspend(dist, 2)?, SuspendedPeer::suspend(dist, 3)?];
+    let storage: Value = serde_json::from_str(&node_admin_body(dist, 0, "/rustfs/admin/v3/storageinfo").await?)?;
+    let observations = storage["info"]["observations"]
+        .as_array()
+        .ok_or("storageinfo omitted observations")?;
+    let disks = storage["info"]["disks"]
+        .as_array()
+        .ok_or("storageinfo omitted disks during peer failure")?;
+    assert_eq!(disks.len(), 16, "failed peers must not vanish from inventory");
+    for node in [2, 3] {
+        let endpoint = &dist.cluster.nodes[node].address;
+        let observation = observations
+            .iter()
+            .find(|item| item["endpoint"].as_str().is_some_and(|value| value.contains(endpoint)))
+            .ok_or_else(|| format!("missing failed peer observation {endpoint}: {storage}"))?;
+        assert_eq!(observation["status"], "failed", "suspension did not affect peer RPC: {observation}");
+        assert_eq!(observation["cached"], true, "first failure must identify the warm cache: {observation}");
+        assert!(observation["last_success_unix_millis"].as_u64().is_some());
+        assert!(observation["snapshot_age_seconds"].as_u64().is_some_and(|age| age < 60));
+        let peer_disks: Vec<_> = disks
+            .iter()
+            .filter(|disk| disk["endpoint"].as_str().is_some_and(|value| value.contains(endpoint)))
+            .collect();
+        assert_eq!(peer_disks.len(), 4, "failed peer lost its four drive identities: {storage}");
+        for disk in peer_disks {
+            assert_eq!(disk["state"], "unknown");
+            assert_eq!(disk["runtimeState"], "unknown");
+        }
+    }
+
+    let snapshot: Value = serde_json::from_str(&node_admin_body(dist, 0, "/rustfs/admin/v4/cluster/snapshot").await?)?;
+    let metadata = &snapshot["snapshot"]["pool_meta_write_gate"];
+    assert_eq!(
+        metadata["state"], "writable",
+        "peer probe failure must not invent a metadata latch: {snapshot}"
+    );
+    assert!(metadata.get("sinceUnixSecs").is_none());
+
+    for attempt in 0..2 {
+        let status = observed_put(dist, 0, bucket, &format!("unavailable-{attempt}")).await?;
+        assert!(status.is_server_error(), "sub-quorum write unexpectedly returned {status}");
+    }
+    assert_eq!(http_put_counts(dist, 0).await?, [baseline[0][0], baseline[0][1] + 2]);
+    assert_eq!(
+        http_put_counts(dist, 1).await?,
+        baseline[1],
+        "internal RPCs must not count as external PUTs"
+    );
+
+    for peer in &mut suspended {
+        peer.resume()?;
+    }
+    wait_until(
+        Duration::from_secs(90),
+        || async {
+            let storage: Value = serde_json::from_str(&node_admin_body(dist, 0, "/rustfs/admin/v3/storageinfo").await?)?;
+            let observations = storage["info"]["observations"]
+                .as_array()
+                .ok_or("recovery omitted observations")?;
+            Ok(observations.len() == 4
+                && observations
+                    .iter()
+                    .all(|item| item["status"] == "succeeded" && item["cached"] == false))
+        },
+        "peer probes recover to fresh successful observations",
+    )
+    .await?;
+    wait_for_ready(&dist.cluster).await?;
+    assert!(observed_put(dist, 0, bucket, "recovered").await?.is_success());
+    assert_eq!(http_put_counts(dist, 0).await?, [baseline[0][0] + 1, baseline[0][1] + 2]);
+    for node in 0..dist.cluster.nodes.len() {
+        assert_object_bytes(&dist.client(node)?, bucket, "healthy-0", b"write-observation").await?;
+        assert_object_bytes(&dist.client(node)?, bucket, "recovered", b"write-observation").await?;
+    }
     Ok(())
 }

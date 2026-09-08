@@ -4336,9 +4336,12 @@ mod tests {
     fn kms_operation_errors_preserve_retryability_classification() {
         let unavailable = kms_operation_error(rustfs_kms::KmsError::backend_error("connection refused"));
         let corrupt = kms_operation_error(rustfs_kms::KmsError::cryptographic_error("decrypt", "authentication failed"));
+        let missing = kms_operation_error(rustfs_kms::KmsError::key_not_found("no-such-key"));
 
         assert_eq!(unavailable.code, S3ErrorCode::ServiceUnavailable);
         assert_eq!(corrupt.code, S3ErrorCode::InternalError);
+        assert_eq!(missing.code, S3ErrorCode::Custom(crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE.into()));
+        assert_eq!(super::kms_data_plane_error_class(&missing), "key_not_found");
     }
 
     #[test]
@@ -5556,6 +5559,37 @@ mod tests {
             error.to_string().contains("rewrap") || format!("{:?}", error.source).contains("rewrap_data_key"),
             "the refusal must come from the backend capability gate: {error:?}"
         );
+
+        reset_sse_dek_provider();
+    }
+
+    /// A write whose resolved key — from the request header or a bucket
+    /// default rule — is unknown to the KMS must come back as the client
+    /// error S3 uses for it, all the way from the backend lookup. Answering
+    /// 500 here made a bucket default pointing at a deleted or mistyped key
+    /// look like a server outage (rustfs/backlog#2330, KMS-312).
+    #[tokio::test]
+    async fn kms_provider_reports_an_unknown_key_as_kms_not_found() {
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+
+        let manager = configure_test_global_local_kms().await;
+        let provider = KmsSseDekProvider::new_with_service_manager(manager)
+            .await
+            .expect("kms provider should initialize from the configured test manager");
+
+        let context = super::build_object_encryption_context("bucket", "object", None);
+        let error = provider
+            .generate_sse_dek(&context, "no-such-key")
+            .await
+            .expect_err("the Local backend must refuse a key it does not hold");
+        assert_eq!(
+            error.code,
+            S3ErrorCode::Custom(crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE.into()),
+            "got {error:?}"
+        );
+        assert!(error.message.contains("no-such-key"), "the missing key must be named: {error:?}");
+        assert_eq!(super::kms_data_plane_error_class(&error), "key_not_found");
 
         reset_sse_dek_provider();
     }

@@ -90,15 +90,22 @@ PY
 
 release_gate_must_remain_blocked() {
     local run_dir="$1"
-    local output="$run_dir/release-check.txt"
-    if "$PYTHON_BIN" "$ROOT/scripts/check_test_wiring.py" --check-scanner-heal "$run_dir" release >"$output" 2>&1; then
+    local output="$run_dir/release-status.json"
+    if "$PYTHON_BIN" "$ROOT/scripts/check_test_wiring.py" --check-scanner-heal-release "$run_dir" >"$output"; then
         echo "release gate unexpectedly approved a single Scanner/Heal evidence run" >&2
         return 1
     fi
-    if ! grep -Eq 'required test not selected:|pending [A-Z0-9-]+:' "$output"; then
-        echo "release gate did not explain why the Scanner/Heal release remains blocked" >&2
-        return 1
-    fi
+    "$PYTHON_BIN" - "$output" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text())
+if status.get("decision") != "blocked" or status.get("release_approved") is not False:
+    raise SystemExit("release status did not record a blocked decision")
+if status.get("release_schema_capable") is not False:
+    raise SystemExit("case-only evidence schema unexpectedly became release-capable")
+PY
 }
 
 run_self_test() {
@@ -242,5 +249,5 @@ fi
 "$PYTHON_BIN" "$ROOT/scripts/check_test_wiring.py" --check-scanner-heal "$RUN_DIR" "$CASE_ID"
 release_gate_must_remain_blocked "$RUN_DIR"
 echo "Scanner/Heal evidence case verified: $CASE_ID"
-echo "Release gate remains blocked; details: $RUN_DIR/release-check.txt"
+echo "Release gate remains blocked; status: $RUN_DIR/release-status.json"
 echo "Evidence directory: $RUN_DIR"

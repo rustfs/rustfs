@@ -264,6 +264,15 @@ pub fn local_http_client() -> HttpClient {
         .expect("failed to build local reqwest client")
 }
 
+pub(crate) fn signal_process(pid: u32, signal: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let output = Command::new("kill").arg(format!("-{signal}")).arg(pid.to_string()).output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(format!("kill -{signal} {pid} failed: {}", String::from_utf8_lossy(&output.stderr)).into())
+}
+
 pub(crate) async fn signed_s3_request(
     method: http::Method,
     url: &str,

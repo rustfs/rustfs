@@ -36,7 +36,9 @@ use crate::server::{
 };
 use crate::storage_api::server::http as storage;
 use crate::storage_api::server::http::rpc::InternodeRpcService;
+#[cfg(test)]
 use crate::storage_api::server::http::tonic_service::make_server;
+use crate::storage_api::server::http::tonic_service::make_server_for_slot;
 use crate::storage_api::server::http::{
     ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
     tonic_boot_epoch_response_headers, verify_tonic_rpc_signature_with_bootstrap,
@@ -1855,7 +1857,7 @@ fn process_connection(
         // each service in the auth interceptor.
         let rpc_max_message_size = rustfs_protos::internode_rpc_max_message_size();
         let node_service = InterceptedService::new(
-            NodeServiceServer::new(make_server())
+            NodeServiceServer::new(make_server_for_slot(Arc::clone(&server_ctx)))
                 .max_decoding_message_size(rpc_max_message_size)
                 .max_encoding_message_size(rpc_max_message_size),
             check_auth,

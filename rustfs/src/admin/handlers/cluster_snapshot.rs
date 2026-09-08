@@ -193,6 +193,7 @@ impl ClusterSnapshotView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ClusterPoolMetaWriteGateView {
+    pub state: &'static str,
     pub writes_ready: bool,
     pub write_blocked: bool,
     pub transaction_aborted: bool,
@@ -200,11 +201,27 @@ pub(crate) struct ClusterPoolMetaWriteGateView {
     pub identity_initialized: Option<bool>,
     pub identity_needs_repair: bool,
     pub cluster_epoch: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_unix_secs: Option<i64>,
 }
 
 impl From<ClusterPoolMetaWriteGateSnapshot> for ClusterPoolMetaWriteGateView {
     fn from(snapshot: ClusterPoolMetaWriteGateSnapshot) -> Self {
+        let state = if snapshot.check_timed_out {
+            "check_timeout"
+        } else if snapshot.writes_ready {
+            "writable"
+        } else if snapshot.write_blocked || snapshot.transaction_aborted {
+            "blocked"
+        } else {
+            "unavailable"
+        };
         Self {
+            state,
             writes_ready: snapshot.writes_ready,
             write_blocked: snapshot.write_blocked,
             transaction_aborted: snapshot.transaction_aborted,
@@ -212,6 +229,9 @@ impl From<ClusterPoolMetaWriteGateSnapshot> for ClusterPoolMetaWriteGateView {
             identity_initialized: snapshot.identity_initialized,
             identity_needs_repair: snapshot.identity_needs_repair,
             cluster_epoch: snapshot.cluster_epoch,
+            reason: snapshot.reason,
+            phase: snapshot.phase,
+            since_unix_secs: snapshot.since_unix_secs,
         }
     }
 }
@@ -686,6 +706,7 @@ fn summarize_storage_readiness(snapshot: &ClusterReadOnlySnapshot) -> Capability
         .filter_map(|reason| match reason {
             ReadinessDegradedReason::StorageQuorumUnavailable
             | ReadinessDegradedReason::PoolMetaWriteBlocked
+            | ReadinessDegradedReason::PoolMetadataCheckTimeout
             | ReadinessDegradedReason::StorageAndIamUnavailable
             | ReadinessDegradedReason::StorageAndLockUnavailable
             | ReadinessDegradedReason::StorageIamAndLockUnavailable => Some(reason.as_str()),
@@ -997,7 +1018,9 @@ fn summarize_named_capability_statuses<const N: usize>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ClusterMembershipView, ClusterSnapshotResponse, ClusterSnapshotSummary, ClusterSnapshotView};
+    use super::{
+        ClusterMembershipView, ClusterPoolMetaWriteGateView, ClusterSnapshotResponse, ClusterSnapshotSummary, ClusterSnapshotView,
+    };
     use crate::admin::storage_api::cluster::CapabilityState;
     use crate::admin::storage_api::cluster::{CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
     use crate::admin::storage_api::cluster::{
@@ -1062,6 +1085,64 @@ mod tests {
     fn cluster_snapshot_response_serializes_none_snapshot() {
         let value = serde_json::to_value(ClusterSnapshotResponse { snapshot: None }).expect("serialize response");
         assert_eq!(value, serde_json::json!({ "snapshot": null }));
+    }
+
+    #[test]
+    fn pool_meta_write_gate_details_are_additive_and_clear_when_not_blocked() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LegacyGate {
+            writes_ready: bool,
+            write_blocked: bool,
+            transaction_aborted: bool,
+        }
+
+        let blocked = ClusterPoolMetaWriteGateSnapshot {
+            writes_ready: false,
+            transaction_aborted: true,
+            reason: Some("transaction_unknown"),
+            phase: Some("publication"),
+            since_unix_secs: Some(1_700_000_000),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(ClusterPoolMetaWriteGateView::from(blocked)).unwrap();
+        assert_eq!(value["state"], "blocked");
+        assert_eq!(value["reason"], "transaction_unknown");
+        assert_eq!(value["phase"], "publication");
+        assert_eq!(value["sinceUnixSecs"], 1_700_000_000);
+        assert!(value.get("since_unix_secs").is_none());
+        assert!(value.get("operation").is_none());
+        assert!(value.get("source").is_none());
+        let legacy: LegacyGate = serde_json::from_value(value).unwrap();
+        assert!(!legacy.writes_ready);
+        assert!(!legacy.write_blocked);
+        assert!(legacy.transaction_aborted);
+
+        for (snapshot, state) in [
+            (ClusterPoolMetaWriteGateSnapshot::default(), "writable"),
+            (
+                ClusterPoolMetaWriteGateSnapshot {
+                    writes_ready: false,
+                    check_timed_out: true,
+                    ..Default::default()
+                },
+                "check_timeout",
+            ),
+            (
+                ClusterPoolMetaWriteGateSnapshot {
+                    writes_ready: false,
+                    ..Default::default()
+                },
+                "unavailable",
+            ),
+        ] {
+            let value = serde_json::to_value(ClusterPoolMetaWriteGateView::from(snapshot)).unwrap();
+            assert_eq!(value["state"], state);
+            assert_eq!(value["writesReady"], state == "writable");
+            for field in ["reason", "phase", "sinceUnixSecs"] {
+                assert!(value.get(field).is_none(), "{state} must not retain {field}: {value}");
+            }
+        }
     }
 
     #[tokio::test]

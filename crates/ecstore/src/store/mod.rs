@@ -442,7 +442,7 @@ pub(crate) mod utils;
 
 use peer::init_local_peer;
 pub use peer::{
-    all_local_disk, all_local_disk_path, find_local_disk_by_ref, get_disk_infos, init_local_disks,
+    BootstrapLocalTarget, all_local_disk, all_local_disk_path, find_local_disk_by_ref, get_disk_infos, init_local_disks,
     init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
     prewarm_local_disk_id_map_with_instance_ctx,
 };
@@ -530,24 +530,32 @@ impl Default for ScannerDataMovementPauseStatus {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct PoolMetaWriteGateStatus {
     pub writes_ready: bool,
+    pub check_timed_out: bool,
     pub write_blocked: bool,
     pub transaction_aborted: bool,
     pub pool_meta_absent: bool,
     pub identity_initialized: Option<bool>,
     pub identity_needs_repair: bool,
     pub cluster_epoch: Option<u64>,
+    pub reason: Option<&'static str>,
+    pub phase: Option<&'static str>,
+    pub since_unix_secs: Option<i64>,
 }
 
 impl Default for PoolMetaWriteGateStatus {
     fn default() -> Self {
         Self {
             writes_ready: true,
+            check_timed_out: false,
             write_blocked: false,
             transaction_aborted: false,
             pool_meta_absent: false,
             identity_initialized: None,
             identity_needs_repair: false,
             cluster_epoch: None,
+            reason: None,
+            phase: None,
+            since_unix_secs: None,
         }
     }
 }
@@ -1089,11 +1097,15 @@ impl ECStore {
             return Err(Error::other("scanner publication lease TTL is not supported"));
         }
 
+        // Bind the original activity generation across the asynchronous checks;
+        // a completed namespace commit must never refresh an existing proof.
+        let namespace_generation = self.scanner_namespace_mutation_generation();
         let operation_gate = self.ctx.data_movement_operation_gate();
         let operation_guard = operation_gate.read_owned().await;
         if self.ctx.data_movement_generation_exhausted()
             || self.ctx.data_movement_operation_epoch_exhausted()
             || self.ctx.data_movement_generation() != expected_generation
+            || namespace_generation == u64::MAX
         {
             return Err(Error::other("scanner publication lease generation is stale"));
         }
@@ -1101,11 +1113,15 @@ impl ECStore {
             return Err(Error::other("scanner publication lease is blocked by data movement"));
         }
 
+        if self.scanner_namespace_mutation_generation() != namespace_generation {
+            return Err(Error::other("scanner publication lease generation is stale"));
+        }
+
         let token = Uuid::new_v4();
         let expires_at = tokio::time::Instant::now() + ttl;
         if !self
             .ctx
-            .install_scanner_publication_lease(token, expires_at, expected_generation, operation_guard)
+            .install_scanner_publication_lease(token, expires_at, expected_generation, namespace_generation, operation_guard)
             .await
         {
             return Err(Error::other("scanner publication lease capacity is exhausted"));
@@ -1139,8 +1155,16 @@ impl ECStore {
         if self.scanner_data_movement_snapshot_locked().await.1 || self.ctx.namespace_commits_pending() {
             return Err(Error::other("scanner publication lease is blocked by data movement"));
         }
-        if !self.ctx.scanner_publication_lease_is_active(token).await {
+        let Some((lease_generation, lease_namespace_generation)) = self.ctx.scanner_publication_lease_generations(token).await
+        else {
             return Err(Error::other("scanner publication lease is unknown or expired"));
+        };
+        let namespace_generation = self.scanner_namespace_mutation_generation();
+        if lease_generation != self.ctx.data_movement_generation()
+            || lease_namespace_generation != namespace_generation
+            || namespace_generation == u64::MAX
+        {
+            return Err(Error::other("scanner publication lease generation is stale"));
         }
         Ok(())
     }
@@ -1159,10 +1183,15 @@ impl ECStore {
         if self.scanner_data_movement_snapshot_locked().await.1 || self.ctx.namespace_commits_pending() {
             return Err(Error::other("scanner publication lease is blocked by data movement"));
         }
-        let Some(lease_generation) = self.ctx.scanner_publication_lease_generation(token).await else {
+        let Some((lease_generation, lease_namespace_generation)) = self.ctx.scanner_publication_lease_generations(token).await
+        else {
             return Err(Error::other("scanner publication lease is unknown or expired"));
         };
-        if lease_generation != self.ctx.data_movement_generation() {
+        let namespace_generation = self.scanner_namespace_mutation_generation();
+        if lease_generation != self.ctx.data_movement_generation()
+            || lease_namespace_generation != namespace_generation
+            || namespace_generation == u64::MAX
+        {
             return Err(Error::other("scanner publication lease generation is stale"));
         }
         Ok(operation_guard)
@@ -1812,7 +1841,7 @@ mod tests {
 
     // Build a minimal ECStore carrying an explicit instance context. Empty
     // pools/disks are sufficient: the Phase 5 accessors read only `self.ctx`.
-    fn build_store_with_ctx(ctx: Arc<InstanceContext>) -> Arc<ECStore> {
+    pub(super) fn build_store_with_ctx(ctx: Arc<InstanceContext>) -> Arc<ECStore> {
         let endpoint_pools = EndpointServerPools::default();
         Arc::new(ECStore {
             id: uuid::Uuid::new_v4(),
@@ -2554,6 +2583,88 @@ mod tests {
             .await
             .expect_err("a stale movement generation must not acquire a lease");
         assert!(error.to_string().contains("generation is stale"));
+    }
+
+    #[tokio::test]
+    async fn scanner_publication_lease_rejects_namespace_change_during_admission() {
+        let ctx = Arc::new(InstanceContext::new());
+        let store = build_store_with_ctx(ctx.clone());
+        let snapshot_blocker = store.rebalance_meta.write().await;
+        let mut acquire =
+            Box::pin(store.acquire_scanner_publication_lease(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL));
+        assert!(futures::poll!(&mut acquire).is_pending(), "acquisition reaches the blocked snapshot");
+        assert!(ctx.data_movement_operation_gate().try_write_owned().is_err());
+        drop(ctx.begin_namespace_commit());
+        assert_eq!(ctx.namespace_commit_generation(), 2);
+        assert!(!ctx.namespace_commits_pending());
+        drop(snapshot_blocker);
+        let error = tokio::time::timeout(Duration::from_secs(1), acquire)
+            .await
+            .expect("snapshot admission must finish")
+            .expect_err("acquisition must preserve its original namespace generation");
+        assert_eq!(error.to_string(), "Io error: scanner publication lease generation is stale");
+        assert!(ctx.data_movement_operation_gate().try_write_owned().is_ok(), "no lease was installed");
+    }
+
+    #[tokio::test]
+    async fn scanner_publication_lease_rechecks_namespace_after_validate_snapshot() {
+        let ctx = Arc::new(InstanceContext::new());
+        let store = build_store_with_ctx(ctx.clone());
+        let (token, generation) = store
+            .acquire_scanner_publication_lease(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect("current lease");
+        let snapshot_blocker = store.rebalance_meta.write().await;
+        let mut validate = Box::pin(store.validate_scanner_publication_lease(token, generation));
+        assert!(futures::poll!(&mut validate).is_pending(), "target guard queues its first snapshot read");
+        let mut next_writer = Box::pin(store.rebalance_meta.write());
+        assert!(futures::poll!(&mut next_writer).is_pending());
+        drop(snapshot_blocker);
+        // Fair lock order admits the first read, then this queued writer, then
+        // validate's second snapshot. The first target check has already passed.
+        assert!(futures::poll!(&mut validate).is_pending(), "validate reaches its second snapshot");
+        let next_writer = next_writer.await;
+        drop(ctx.begin_namespace_commit());
+        assert_eq!(ctx.namespace_commit_generation(), 2);
+        assert!(!ctx.namespace_commits_pending());
+        drop(next_writer);
+        let error = tokio::time::timeout(Duration::from_secs(1), validate)
+            .await
+            .expect("validation must finish without nesting movement read locks")
+            .expect_err("the final snapshot must reject a completed namespace commit");
+        assert_eq!(error.to_string(), "Io error: scanner publication lease generation is stale");
+        assert!(
+            ctx.data_movement_operation_gate().try_write_owned().is_err(),
+            "stale lookup retains the lease permit"
+        );
+        assert!(store.release_scanner_publication_lease(token).await);
+        assert!(ctx.data_movement_operation_gate().try_write_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn scanner_publication_lease_rejects_namespace_generation_exhaustion() {
+        let ctx = Arc::new(InstanceContext::new());
+        let store = build_store_with_ctx(ctx.clone());
+        let (token, generation) = store
+            .acquire_scanner_publication_lease(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect("current lease");
+        ctx.set_namespace_commit_generation_for_test(u64::MAX);
+        assert_eq!(store.scanner_namespace_mutation_generation(), u64::MAX);
+        let acquire = store
+            .acquire_scanner_publication_lease(generation, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect_err("exhausted namespace cannot become a new lease baseline");
+        assert_eq!(acquire.to_string(), "Io error: scanner publication lease generation is stale");
+        let validate = store.validate_scanner_publication_lease(token, generation).await;
+        let target = store.acquire_scanner_publication_lease_guard(token).await;
+        assert!(validate.is_err() && target.is_err(), "exhaustion rejects both old-token entrances");
+        assert!(
+            ctx.data_movement_operation_gate().try_write_owned().is_err(),
+            "rejection must retain the old permit"
+        );
+        assert!(store.release_scanner_publication_lease(token).await);
+        assert!(ctx.data_movement_operation_gate().try_write_owned().is_ok());
     }
 
     #[tokio::test(start_paused = true)]
