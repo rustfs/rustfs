@@ -733,23 +733,30 @@ pub(super) fn mrf_verified_repair_event_for_target(
         HealObjectDisposition::AuthoritativelyAbsent => MrfVerifiedRepairDisposition::AuthoritativelyAbsent,
         _ => return None,
     };
-    if target.kind != MrfKind::PartialWrite {
-        return None;
-    }
-    let expected_kind = HealObjectKind::Object;
+    let expected_kind = match target.kind {
+        MrfKind::DecodeFailure => HealObjectKind::Decode,
+        MrfKind::MetadataCorruption => HealObjectKind::Metadata,
+        MrfKind::PartialWrite => HealObjectKind::Object,
+    };
     if outcome.identity.kind != expected_kind
         || outcome.identity.bucket.as_str() != target.bucket.as_ref()
         || outcome.identity.object.as_str() != target.object.as_ref()
     {
         return None;
     }
-    let version_id = target.version_id.filter(|bytes| *bytes != [0; 16]);
+    let version_id = (!matches!(target.kind, MrfKind::MetadataCorruption))
+        .then_some(target.version_id)
+        .flatten()
+        .filter(|bytes| *bytes != [0; 16]);
     let expected_version = version_id.map(|bytes| uuid::Uuid::from_bytes(bytes).to_string());
     if outcome.identity.version_id != expected_version {
         return None;
     }
-    let expected_pool = target.scope.and_then(|scope| usize::try_from(scope.pool_index).ok());
-    let expected_set = target.scope.and_then(|scope| usize::try_from(scope.set_index).ok());
+    let scope = (!matches!(target.kind, MrfKind::MetadataCorruption))
+        .then_some(target.scope)
+        .flatten();
+    let expected_pool = scope.and_then(|scope| usize::try_from(scope.pool_index).ok());
+    let expected_set = scope.and_then(|scope| usize::try_from(scope.set_index).ok());
     if outcome.identity.pool_index != expected_pool || outcome.identity.set_index != expected_set {
         return None;
     }
@@ -759,7 +766,7 @@ pub(super) fn mrf_verified_repair_event_for_target(
         bucket: target.bucket.clone(),
         object: target.object.clone(),
         version_id,
-        scope: target.scope,
+        scope,
         lease: target.lease,
         bucket_incarnation_id,
         disposition,

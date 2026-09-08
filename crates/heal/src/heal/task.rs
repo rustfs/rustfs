@@ -574,6 +574,18 @@ impl HealTask {
         }
     }
 
+    pub(super) async fn outcome_bucket_incarnation_id(&self, bucket: &str, dry_run: bool) -> Result<Option<Uuid>> {
+        if dry_run {
+            return Ok(None);
+        }
+        match self.await_with_control(self.storage.bucket_incarnation_id(bucket)).await {
+            Ok(incarnation_id) => Ok(incarnation_id),
+            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
+            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
+            Err(_) => Ok(None),
+        }
+    }
+
     fn single_object_identity(&self) -> Option<HealObjectIdentity> {
         let (bucket, object, version) = match &self.heal_type {
             HealType::Object {
