@@ -168,6 +168,8 @@ mod rfc3339_map {
 pub(crate) struct PendingEndpointRefresh {
     pub(crate) id: String,
     pub(crate) peer: PeerInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ilm_expiry_override: Option<bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) remote_peers: BTreeMap<String, PeerInfo>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
