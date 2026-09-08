@@ -20,6 +20,8 @@
 //! contract stays implemented `for SetDisks`, so its associated-type bounds are
 //! unchanged; method bodies are moved verbatim and runtime behavior is the same.
 
+use crate::core::pools::DecommissionCapacityAdmission;
+
 #[cfg(test)]
 use super::super::GetObjectMetadataCacheKey;
 #[cfg(test)]
@@ -1809,7 +1811,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let decommission_capacity_guard = if let Some(store) = opts.decommission_capacity_admission.as_ref() {
                 Some(
                     store
-                        .acquire_external_decommission_capacity_fence(&[self.pool_index], "mutation")
+                        .acquire_external_decommission_capacity_fence(
+                            &[self.pool_index],
+                            DecommissionCapacityAdmission::ExistingMultipart,
+                        )
                         .await?,
                 )
             } else {
@@ -2345,6 +2350,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     bucket,
                     object,
                     opts.no_lock || object_lock_guard.is_some(),
+                    DecommissionCapacityAdmission::ExistingMultipart,
                 )
                 .await?;
             decommission_object_lock_guard = object_guard;
@@ -3110,7 +3116,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         {
             decommission_capacity_guard = Some(
                 store
-                    .acquire_external_decommission_capacity_fence(&[self.pool_index], "mutation")
+                    .acquire_external_decommission_capacity_fence(
+                        &[self.pool_index],
+                        DecommissionCapacityAdmission::ExistingMultipart,
+                    )
                     .await?,
             );
         }

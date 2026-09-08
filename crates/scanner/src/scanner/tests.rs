@@ -153,6 +153,49 @@ fn run_data_scanner_keeps_its_two_argument_api() {
 }
 
 #[tokio::test]
+#[serial]
+async fn native_backlog_replica_writes_preserve_cas_across_writer_restart() {
+    let (_temp_dir, store) = setup_scanner_cycle_store_with_pool_count(false, 2).await;
+    let now = scanner_pause_backlog_now();
+    let mut stale = ScannerPauseBacklogController::claim(store.clone(), now)
+        .await
+        .expect("the original scanner writer must publish to both pools");
+    let original = scanner_pause_backlog_status(store.clone()).await;
+    assert!(original.durable);
+    assert_eq!(original.healthy_replicas, 2);
+    let restarted = restart_scanner_cycle_store_from(&store).await;
+    let _replacement = ScannerPauseBacklogController::claim(restarted.clone(), now.saturating_add(1))
+        .await
+        .expect("the restarted scanner must claim the surviving native replicas");
+    let claimed = scanner_pause_backlog_status(restarted.clone()).await;
+    assert!(claimed.writer_epoch > original.writer_epoch);
+    assert_eq!(claimed.healthy_replicas, 2);
+
+    stale
+        .observe(ScannerPauseBacklogObservation {
+            now_unix_secs: now.saturating_add(2),
+            paused: true,
+            movement_generation: store.scanner_data_movement_generation().saturating_add(1),
+            movement_work_items: 1,
+            pause_started_at_unix_secs: now.saturating_add(2),
+            dirty_usage_buckets: 0,
+            discovered_expiry_items: 0,
+            discovered_transition_items: 0,
+        })
+        .await;
+    let retained = scanner_pause_backlog_status(restarted.clone()).await;
+    assert_eq!(retained.writer_epoch, claimed.writer_epoch);
+    assert_eq!(retained.generation, claimed.generation);
+    assert_eq!(retained.phase, ScannerPauseBacklogPhase::Idle);
+    assert_eq!(retained.healthy_replicas, 2);
+    assert_eq!(retained.stale_or_unavailable_replicas, 0);
+    let _recovered = ScannerPauseBacklogController::claim(restarted.clone(), now.saturating_add(3))
+        .await
+        .expect("a fresh writer must still recover after the stale CAS failure");
+    assert!(scanner_pause_backlog_status(restarted).await.error.is_none());
+}
+
+#[tokio::test]
 async fn restarted_main_loop_completes_durable_pause_backlog_catch_up() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     global_metrics().set_cycle(None).await;

@@ -840,15 +840,21 @@ fn is_decommission_start_active_pool(pool: &PoolStatus) -> bool {
     decommission_start_pool_state(Some(pool)) == DecommissionStartPoolState::Active
 }
 
+fn invalid_decommission_request(reason: impl Into<String>) -> Error {
+    Error::InvalidArgument("decommission".to_string(), "pool-state".to_string(), reason.into())
+}
+
 fn ensure_decommission_start_allowed(state: DecommissionStartPoolState) -> Result<()> {
     match state {
-        DecommissionStartPoolState::Missing => Err(Error::other("failed to start decommission: target pool was not found")),
+        DecommissionStartPoolState::Missing => {
+            Err(invalid_decommission_request("failed to start decommission: target pool was not found"))
+        }
         DecommissionStartPoolState::Active | DecommissionStartPoolState::Retryable => Ok(()),
         DecommissionStartPoolState::Decommissioning => Err(StorageError::DecommissionAlreadyRunning),
-        DecommissionStartPoolState::Decommissioned => {
-            Err(Error::other("failed to start decommission: target pool is already decommissioned"))
-        }
-        DecommissionStartPoolState::Blocked => Err(Error::other(
+        DecommissionStartPoolState::Decommissioned => Err(invalid_decommission_request(
+            "failed to start decommission: target pool is already decommissioned",
+        )),
+        DecommissionStartPoolState::Blocked => Err(invalid_decommission_request(
             "failed to start decommission: target pool decommission is blocked; clear failed or canceled metadata before starting again",
         )),
     }
@@ -865,7 +871,7 @@ fn ensure_decommission_start_keeps_active_pool(meta: &PoolMeta, indices: &[usize
         .filter(|idx| meta.pools.get(**idx).is_some_and(is_decommission_start_active_pool))
         .count();
     if active_count.saturating_sub(active_target_count) == 0 {
-        return Err(Error::other(
+        return Err(invalid_decommission_request(
             "failed to start decommission: at least one active pool must remain after decommission start",
         ));
     }
@@ -1751,8 +1757,53 @@ fn ensure_decommission_capacity_reservations_available(
     Ok(())
 }
 
-fn ensure_external_decommission_target_admission(meta: &PoolMeta, target_pool_index: usize, phase: &'static str) -> Result<()> {
-    if active_decommission_source_indices(meta).into_iter().any(|source_pool_index| {
+#[derive(Clone, Copy)]
+pub(crate) enum DecommissionCapacityAdmission {
+    Mutation,
+    ExistingMultipart,
+    ScannerBacklog,
+    BatchDelete,
+    Heal,
+}
+
+impl DecommissionCapacityAdmission {
+    fn phase(self) -> &'static str {
+        match self {
+            Self::Mutation => "mutation",
+            Self::ExistingMultipart => "existing_multipart",
+            Self::ScannerBacklog => "scanner_backlog",
+            Self::BatchDelete => "batch_delete",
+            Self::Heal => "heal",
+        }
+    }
+}
+
+fn ensure_external_decommission_target_admission(
+    meta: &PoolMeta,
+    target_pool_index: usize,
+    admission: DecommissionCapacityAdmission,
+) -> Result<()> {
+    let phase = admission.phase();
+    // Pool selection may predate retirement or use a stale node-local snapshot.
+    // Recheck publication against the fenced durable state. Repair and pure
+    // capacity release retain their separate admission contracts.
+    if matches!(admission, DecommissionCapacityAdmission::ScannerBacklog)
+        && !meta.scanner_pause_backlog_pool_writable(target_pool_index)
+    {
+        return Err(Error::SlowDown);
+    }
+    let active_sources = active_decommission_source_indices(meta);
+    if meta.is_suspended(target_pool_index) {
+        let active_source = active_sources.contains(&target_pool_index);
+        if !matches!(
+            admission,
+            DecommissionCapacityAdmission::Heal | DecommissionCapacityAdmission::ScannerBacklog
+        ) && !(matches!(admission, DecommissionCapacityAdmission::ExistingMultipart) && active_source)
+        {
+            return Err(Error::SlowDown);
+        }
+    }
+    if active_sources.into_iter().any(|source_pool_index| {
         meta.pools
             .get(source_pool_index)
             .and_then(|pool| pool.decommission.as_ref())
@@ -1761,6 +1812,13 @@ fn ensure_external_decommission_target_admission(meta: &PoolMeta, target_pool_in
     }) {
         metrics::counter!(METRIC_DECOMMISSION_CAPACITY_CONFLICTS_TOTAL, "phase" => phase).increment(1);
         return Err(Error::SlowDown);
+    }
+    // Migration reservations budget the mover, not exclusive ownership of a
+    // healthy pool. Foreground publication shares its actual disk capacity;
+    // migration must retain the source if its capacity or target write fails.
+    // Repair keeps its separate, conservative reservation admission contract.
+    if !matches!(admission, DecommissionCapacityAdmission::Heal) {
+        return Ok(());
     }
     let reserved = active_decommission_target_reservations(meta)
         .get(&target_pool_index)
@@ -4268,7 +4326,7 @@ fn should_retry_decommission_cancel_reload(changed: bool, already_canceled: bool
 
 fn ensure_decommission_cancel_allowed(pool_present: bool, decommission_present: bool, terminal: bool) -> Result<()> {
     if !pool_present {
-        return Err(Error::other("failed to cancel decommission: target pool was not found"));
+        return Err(invalid_decommission_request("failed to cancel decommission: target pool was not found"));
     }
 
     if !decommission_present || terminal {
@@ -4287,7 +4345,7 @@ fn ensure_decommission_clear_allowed(
     unresolved_entries: usize,
 ) -> Result<()> {
     if !pool_present {
-        return Err(Error::other("failed to clear decommission: target pool was not found"));
+        return Err(invalid_decommission_request("failed to clear decommission: target pool was not found"));
     }
 
     if !decommission_present {
@@ -4303,7 +4361,7 @@ fn ensure_decommission_clear_allowed(
     }
 
     if unresolved_entries > 0 {
-        return Err(Error::other(format!(
+        return Err(invalid_decommission_request(format!(
             "failed to clear decommission: {unresolved_entries} unresolved listing entries must be reconciled by retrying decommission"
         )));
     }
@@ -4313,7 +4371,7 @@ fn ensure_decommission_clear_allowed(
 
 fn ensure_decommission_terminal_operation_supported(single_pool: bool, operation: &str) -> Result<()> {
     if single_pool {
-        return Err(Error::other(format!(
+        return Err(invalid_decommission_request(format!(
             "failed to {operation}: single pool deployments do not support decommission"
         )));
     }
@@ -4323,7 +4381,9 @@ fn ensure_decommission_terminal_operation_supported(single_pool: bool, operation
 
 fn validate_start_decommission_request(indices: &[usize], single_pool: bool) -> Result<()> {
     if indices.is_empty() {
-        return Err(Error::other("failed to start decommission: no target pools were provided"));
+        return Err(invalid_decommission_request(
+            "failed to start decommission: no target pools were provided",
+        ));
     }
 
     ensure_decommission_terminal_operation_supported(single_pool, "start decommission")
@@ -4462,9 +4522,41 @@ pub(crate) struct PoolMetaWriteState {
     cluster_epoch: Option<u64>,
     pool_meta_absent: bool,
     bootstrap_authority: PoolMetaBootstrapAuthority,
+    /// First-hand bootstrap authority this process holds for each pool
+    /// (index = pool index): `Fresh` only for pools it formatted itself,
+    /// `LegacyAdoption` only for pools whose migration it verified. Empty when
+    /// the caller tracks deployment-wide authority only.
+    pool_bootstrap_authorities: Vec<PoolMetaBootstrapAuthority>,
+    /// Whether this process hosts the first endpoint of the first pool and is
+    /// therefore the only writer allowed to publish the initial `pool.bin`.
+    /// `None` when the caller did not say; unknown writers are treated as
+    /// elected so every fail-closed rule still applies to them.
+    elected_bootstrap_writer: Option<bool>,
     identity_initialized: Option<bool>,
     identity_fresh_bootstrap_nonce: Option<uuid::Uuid>,
     identity_needs_repair: bool,
+    /// At least one pool has no identity replica at all.
+    identity_replicas_missing: bool,
+    /// At least one pool has a replica that is present but not a valid identity.
+    identity_replicas_invalid: bool,
+}
+
+/// Why an all-missing `pool.bin` set may not be initialized right now.
+enum MissingMetadataRejection {
+    /// Another node still has to act (mint, attest, or publish); retrying the
+    /// startup loop is the remedy, so the write gate stays open.
+    BootstrapPending(Error),
+    /// The durable state contradicts a fresh bootstrap; writes stay blocked
+    /// until an operator recovers the metadata.
+    RecoveryRequired(Error),
+}
+
+impl MissingMetadataRejection {
+    fn into_error(self) -> Error {
+        match self {
+            Self::BootstrapPending(err) | Self::RecoveryRequired(err) => err,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -4496,6 +4588,7 @@ impl PoolMetaWriteState {
         Self::for_startup_with_bootstrap_authority(cluster_id, bootstrap_authority)
     }
 
+    #[cfg(test)]
     pub(crate) fn for_startup_with_bootstrap_authority(
         cluster_id: uuid::Uuid,
         bootstrap_authority: PoolMetaBootstrapAuthority,
@@ -4507,8 +4600,80 @@ impl PoolMetaWriteState {
         }
     }
 
+    /// Startup state for a process that loaded every pool format itself and
+    /// remembers, per pool, whether it created (or adopted) that pool
+    /// first-hand. Deployment-wide authority is the conjunction across pools:
+    /// any pool this process merely read yields `None`, exactly as before.
+    pub(crate) fn for_startup_with_pool_bootstrap_authorities(
+        cluster_id: uuid::Uuid,
+        pool_bootstrap_authorities: Vec<PoolMetaBootstrapAuthority>,
+        elected_bootstrap_writer: bool,
+    ) -> Self {
+        let bootstrap_authority = pool_bootstrap_authorities
+            .iter()
+            .copied()
+            .reduce(PoolMetaBootstrapAuthority::combine_across_pools)
+            .unwrap_or_default();
+        Self {
+            expected_cluster_id: Some(cluster_id),
+            bootstrap_authority,
+            pool_bootstrap_authorities,
+            elected_bootstrap_writer: Some(elected_bootstrap_writer),
+            ..Default::default()
+        }
+    }
+
     pub(crate) fn bootstrap_identity_proven(&self) -> bool {
         self.bootstrap_authority.is_proven()
+    }
+
+    fn pool_bootstrap_authority_proven(&self, pool_idx: usize) -> bool {
+        self.pool_bootstrap_authorities
+            .get(pool_idx)
+            .is_some_and(|authority| authority.is_proven())
+    }
+
+    /// Pools this process formatted or adopted first-hand during this startup.
+    pub(crate) fn attested_pool_indices(&self) -> Vec<usize> {
+        self.pool_bootstrap_authorities
+            .iter()
+            .enumerate()
+            .filter(|(_, authority)| authority.is_proven())
+            .map(|(pool_idx, _)| pool_idx)
+            .collect()
+    }
+
+    /// Deployment-level proof assembled from per-pool creators: this process
+    /// created the first pool itself, and every pool replica carries the same
+    /// pending identity. A pending replica is only ever written by the process
+    /// that formatted that pool with first-hand proof (see
+    /// [`PoolMetaIdentityWriteScope::Pools`]), so a complete, agreeing pending
+    /// set proves that every pool joined this bootstrap fresh. A missing,
+    /// corrupt, or disagreeing replica keeps the writer fail-closed, and a
+    /// restart without first-hand proof never reopens bootstrap on its own.
+    fn pending_identity_attested_by_every_pool(&self) -> bool {
+        self.elected_bootstrap_writer == Some(true)
+            && self.pool_bootstrap_authority_proven(0)
+            && self.identity_initialized == Some(false)
+            && !self.identity_needs_repair
+            && self.identity_fresh_bootstrap_nonce.is_some()
+    }
+
+    /// The elected writer minted (or holds) the nonce and the only thing
+    /// standing between it and a complete attestation is a pool whose creator
+    /// has not written its replica yet. Corrupt replicas are never transient.
+    fn awaiting_creator_attestation(&self) -> bool {
+        self.elected_bootstrap_writer == Some(true)
+            && self.pool_bootstrap_authority_proven(0)
+            && self.identity_initialized == Some(false)
+            && self.identity_fresh_bootstrap_nonce.is_some()
+            && self.identity_needs_repair
+            && self.identity_replicas_missing
+            && !self.identity_replicas_invalid
+    }
+
+    fn is_non_elected_bootstrap_observer(&self) -> bool {
+        self.elected_bootstrap_writer == Some(false)
     }
 
     pub(crate) fn identity_is_pending(&self) -> bool {
@@ -4630,9 +4795,19 @@ impl PoolMetaWriteState {
         self.identity_needs_repair = selection.needs_repair;
         self.identity_initialized = selection.identity.map(|identity| identity.initialized);
         self.identity_fresh_bootstrap_nonce = selection.identity.and_then(|identity| identity.fresh_bootstrap_nonce);
+        self.identity_replicas_missing = selection
+            .cas_tokens
+            .iter()
+            .any(|token| matches!(token, PoolMetaCasToken::Missing));
+        self.identity_replicas_invalid = selection
+            .valid_replicas
+            .iter()
+            .zip(&selection.cas_tokens)
+            .any(|(valid, token)| !valid && !matches!(token, PoolMetaCasToken::Missing));
         if let Some(identity) = selection.identity {
             if identity.initialized {
                 self.bootstrap_authority = PoolMetaBootstrapAuthority::None;
+                self.pool_bootstrap_authorities.clear();
             }
             if let Some(metadata_epoch) = self.cluster_epoch
                 && metadata_epoch != identity.epoch
@@ -4655,22 +4830,44 @@ impl PoolMetaWriteState {
         if !self.pool_meta_absent {
             return Ok(());
         }
-        self.validate_missing_metadata_can_initialize()
-            .map_err(|err| block_pool_meta_validation(self, err, "metadata_absence"))
+        match self.validate_missing_metadata_can_initialize() {
+            Ok(()) => Ok(()),
+            Err(MissingMetadataRejection::BootstrapPending(err)) => Err(err),
+            Err(MissingMetadataRejection::RecoveryRequired(err)) => {
+                Err(block_pool_meta_validation(self, err, "metadata_absence"))
+            }
+        }
     }
 
-    fn validate_missing_metadata_can_initialize(&self) -> Result<()> {
+    fn validate_missing_metadata_can_initialize(&self) -> std::result::Result<(), MissingMetadataRejection> {
+        use MissingMetadataRejection::{BootstrapPending, RecoveryRequired};
         match self.identity_initialized {
-            Some(false) if self.bootstrap_identity_proven() && self.identity_fresh_bootstrap_nonce.is_some() => Ok(()),
-            Some(false) => Err(Error::other(
-                "pool metadata recovery required: pending cluster identity exists but this startup has no verified fresh-bootstrap proof or legacy-adoption proof",
-            )),
-            Some(true) => Err(Error::other(
+            Some(false)
+                if self.identity_fresh_bootstrap_nonce.is_some()
+                    && (self.bootstrap_identity_proven() || self.pending_identity_attested_by_every_pool()) =>
+            {
+                Ok(())
+            }
+            Some(false) if self.awaiting_creator_attestation() => Err(BootstrapPending(Error::other(
+                "pool metadata bootstrap pending: waiting for every pool creator to attest the pending cluster identity",
+            ))),
+            Some(false) if self.is_non_elected_bootstrap_observer() && self.identity_fresh_bootstrap_nonce.is_some() => {
+                Err(BootstrapPending(Error::other(
+                    "pool metadata bootstrap pending: waiting for the elected writer to publish the initial pool.bin",
+                )))
+            }
+            Some(false) => Err(RecoveryRequired(Error::other(
+                "pool metadata recovery required: pending cluster identity exists but this startup has no verified fresh-bootstrap proof, legacy-adoption proof, or complete per-pool creator attestation",
+            ))),
+            Some(true) => Err(RecoveryRequired(Error::other(
                 "pool metadata recovery required: initialized cluster identity exists but every pool.bin replica is missing",
-            )),
-            None => Err(Error::other(
+            ))),
+            None if self.is_non_elected_bootstrap_observer() => Err(BootstrapPending(Error::other(
+                "pool metadata bootstrap pending: waiting for the elected writer to establish the cluster identity",
+            ))),
+            None => Err(RecoveryRequired(Error::other(
                 "pool metadata recovery required: no durable bootstrap identity or pool.bin replica is available",
-            )),
+            ))),
         }
     }
 
@@ -5381,7 +5578,9 @@ where
     write_state.validate_selection(&selection)?;
     selection.replica_state.ensure_write_safe(operation)?;
     if selection.absent && (write_state.expected_cluster_id.is_some() || write_state.identity_initialized.is_some()) {
-        write_state.validate_missing_metadata_can_initialize()?;
+        write_state
+            .validate_missing_metadata_can_initialize()
+            .map_err(MissingMetadataRejection::into_error)?;
     }
     Ok(selection)
 }
@@ -5483,6 +5682,8 @@ struct PoolMetaIdentitySelection {
     needs_repair: bool,
     repair_write_safe: bool,
     cas_tokens: Vec<PoolMetaCasToken>,
+    /// Per pool: whether the replica decoded as a valid identity.
+    valid_replicas: Vec<bool>,
 }
 
 fn encode_pool_meta_identity(identity: PersistedPoolMetaIdentity) -> Result<Vec<u8>> {
@@ -5532,6 +5733,17 @@ pub(crate) fn pool_meta_identity_initialized_for_test(data: &[u8]) -> Result<boo
 }
 
 #[cfg(test)]
+pub(crate) fn pending_pool_meta_identity_for_test(cluster_id: uuid::Uuid, epoch: u64, nonce: uuid::Uuid) -> Result<Vec<u8>> {
+    encode_pool_meta_identity(PersistedPoolMetaIdentity {
+        version: POOL_META_IDENTITY_VERSION,
+        cluster_id,
+        epoch,
+        initialized: false,
+        fresh_bootstrap_nonce: Some(nonce),
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn initialized_pool_meta_identity_for_test(cluster_id: uuid::Uuid, epoch: u64) -> Result<Vec<u8>> {
     encode_pool_meta_identity(PersistedPoolMetaIdentity {
         version: POOL_META_IDENTITY_VERSION,
@@ -5571,6 +5783,10 @@ fn select_pool_meta_identity(
     expected_cluster_id: uuid::Uuid,
 ) -> Result<PoolMetaIdentitySelection> {
     let cas_tokens = reads.iter().map(|read| read.cas.clone()).collect();
+    let valid_replicas = reads
+        .iter()
+        .map(|read| matches!(read.replica, PoolMetaIdentityReplica::Valid(_)))
+        .collect();
     let mut selected: Option<PersistedPoolMetaIdentity> = None;
     let mut needs_repair = false;
     let mut repair_write_safe = true;
@@ -5628,6 +5844,7 @@ fn select_pool_meta_identity(
         needs_repair,
         repair_write_safe,
         cas_tokens,
+        valid_replicas,
     })
 }
 
@@ -5897,10 +6114,43 @@ where
     result
 }
 
+/// Which pool replicas a cluster-identity write may touch.
+#[derive(Debug, Clone, Copy)]
+enum PoolMetaIdentityWriteScope<'a> {
+    /// Every pool. Creating a pending identity here requires deployment-wide
+    /// fresh-bootstrap or legacy-adoption proof.
+    All,
+    /// Only the listed pools, each of which this process formatted or adopted
+    /// first-hand. Multi-pool bootstraps whose pools have distinct format
+    /// creators use this scope: the first pool's creator mints the deployment
+    /// nonce and every other creator copies it to its own pool, so the elected
+    /// writer can verify a complete, agreeing pending set instead of trusting
+    /// an in-process flag it cannot observe on another node.
+    Pools(&'a [usize]),
+}
+
+fn identity_write_satisfied(
+    selection: &PoolMetaIdentitySelection,
+    identity: PersistedPoolMetaIdentity,
+    scope: PoolMetaIdentityWriteScope<'_>,
+    targets: &[usize],
+) -> bool {
+    if selection.identity != Some(identity) {
+        return false;
+    }
+    match scope {
+        PoolMetaIdentityWriteScope::All => !selection.needs_repair,
+        PoolMetaIdentityWriteScope::Pools(_) => targets
+            .iter()
+            .all(|pool_idx| selection.valid_replicas.get(*pool_idx).copied().unwrap_or(false)),
+    }
+}
+
 async fn persist_pool_meta_identity<S>(
     pools: Vec<Arc<S>>,
     write_state: &mut PoolMetaWriteState,
     initialized: bool,
+    scope: PoolMetaIdentityWriteScope<'_>,
     fence: &PoolMetaPersistenceFence<'_>,
     transaction_arm: &mut PoolMetaTransactionArm,
 ) -> Result<()>
@@ -5910,6 +6160,23 @@ where
     let Some(cluster_id) = write_state.expected_cluster_id else {
         return Ok(());
     };
+    let targets: Vec<usize> = match scope {
+        PoolMetaIdentityWriteScope::All => (0..pools.len()).collect(),
+        PoolMetaIdentityWriteScope::Pools(indices) => {
+            if initialized {
+                return Err(Error::other("pool metadata identity commit must address every pool"));
+            }
+            if indices
+                .iter()
+                .any(|pool_idx| *pool_idx >= pools.len() || !write_state.pool_bootstrap_authority_proven(*pool_idx))
+            {
+                return Err(Error::other(
+                    "pool metadata recovery required: a pending cluster identity can only be attested for pools this startup formatted or adopted first-hand",
+                ));
+            }
+            indices.to_vec()
+        }
+    };
     for attempt in 0..POOL_META_CAS_MAX_ATTEMPTS {
         let selection = load_pool_meta_identity_selection_observing(pools.clone(), write_state, cluster_id).await?;
         if !selection.repair_write_safe {
@@ -5918,20 +6185,39 @@ where
                 "pool metadata recovery required: cluster identity has an unreadable replica",
             ));
         }
-        let identity = match selection.identity {
-            Some(identity) if identity.initialized || initialized => PersistedPoolMetaIdentity {
+        let identity = match (selection.identity, scope) {
+            // An initialized deployment (for example a pool expansion) never
+            // reopens bootstrap: first-hand proof for a new pool is not a
+            // reason to publish a pending identity.
+            (Some(identity), PoolMetaIdentityWriteScope::Pools(_)) if identity.initialized => return Ok(()),
+            (Some(identity), _) if identity.initialized || initialized => PersistedPoolMetaIdentity {
                 initialized: true,
                 fresh_bootstrap_nonce: None,
                 ..identity
             },
-            Some(identity) => identity,
-            None if !initialized && !write_state.bootstrap_identity_proven() => {
+            (Some(identity), _) => identity,
+            // Only the first pool's creator mints the deployment nonce; every
+            // other creator waits until it is durable and copies it, so two
+            // concurrent creators can never publish disagreeing replicas.
+            (None, PoolMetaIdentityWriteScope::Pools(indices)) => {
+                if !indices.contains(&0) {
+                    return Ok(());
+                }
+                PersistedPoolMetaIdentity {
+                    version: POOL_META_IDENTITY_VERSION,
+                    cluster_id,
+                    epoch: write_state.cluster_epoch.unwrap_or(POOL_META_INITIAL_EPOCH),
+                    initialized: false,
+                    fresh_bootstrap_nonce: Some(uuid::Uuid::new_v4()),
+                }
+            }
+            (None, PoolMetaIdentityWriteScope::All) if !initialized && !write_state.bootstrap_identity_proven() => {
                 write_state.block_writes();
                 return Err(Error::other(
                     "pool metadata recovery required: cannot create a pending cluster identity without verified fresh-bootstrap proof or legacy-adoption proof",
                 ));
             }
-            None => PersistedPoolMetaIdentity {
+            (None, PoolMetaIdentityWriteScope::All) => PersistedPoolMetaIdentity {
                 version: POOL_META_IDENTITY_VERSION,
                 cluster_id,
                 epoch: write_state.cluster_epoch.unwrap_or(POOL_META_INITIAL_EPOCH),
@@ -5939,12 +6225,15 @@ where
                 fresh_bootstrap_nonce: (!initialized).then(uuid::Uuid::new_v4),
             },
         };
-        if selection.identity == Some(identity) && !selection.needs_repair {
+        if identity_write_satisfied(&selection, identity, scope, &targets) {
             return Ok(());
         }
         let data = encode_pool_meta_identity(identity)?;
         let mut conflict = false;
-        for (pool, token) in pools.iter().cloned().zip(&selection.cas_tokens) {
+        for (pool_idx, (pool, token)) in pools.iter().cloned().zip(&selection.cas_tokens).enumerate() {
+            if !targets.contains(&pool_idx) {
+                continue;
+            }
             match save_pool_meta_object_cas(
                 pool,
                 POOL_META_IDENTITY_NAME,
@@ -5971,7 +6260,7 @@ where
             return Err(Error::PreconditionFailed);
         }
         let confirmed = load_pool_meta_identity_selection_observing(pools.clone(), write_state, cluster_id).await?;
-        if confirmed.identity == Some(identity) && !confirmed.needs_repair {
+        if identity_write_satisfied(&confirmed, identity, scope, &targets) {
             return Ok(());
         }
     }
@@ -6003,6 +6292,34 @@ where
         pools,
         write_state,
         initialized,
+        PoolMetaIdentityWriteScope::All,
+        &PoolMetaPersistenceFence::Distributed(None),
+        &mut transaction_arm,
+    )
+    .await?;
+    transaction_arm.disarm();
+    Ok(())
+}
+
+/// Attest, during startup, the pending cluster identity for the pools this
+/// process formatted or adopted first-hand. The first pool's creator mints the
+/// deployment nonce; every other creator copies it once it is durable. Nothing
+/// is written while the deployment is already initialized or while the nonce
+/// is not yet durable, so callers simply retry through the startup loop.
+pub(crate) async fn persist_pool_meta_identity_for_attested_pools<S>(
+    pools: Vec<Arc<S>>,
+    write_state: &mut PoolMetaWriteState,
+    pool_indices: &[usize],
+) -> Result<()>
+where
+    S: EcstoreObjectIO,
+{
+    let mut transaction_arm = write_state.arm_transaction();
+    persist_pool_meta_identity(
+        pools,
+        write_state,
+        false,
+        PoolMetaIdentityWriteScope::Pools(pool_indices),
         &PoolMetaPersistenceFence::Distributed(None),
         &mut transaction_arm,
     )
@@ -6618,7 +6935,15 @@ where
                 .await?;
         }
     }
-    persist_pool_meta_identity(pools.clone(), write_state, true, fence, &mut transaction_arm).await?;
+    persist_pool_meta_identity(
+        pools.clone(),
+        write_state,
+        true,
+        PoolMetaIdentityWriteScope::All,
+        fence,
+        &mut transaction_arm,
+    )
+    .await?;
     let confirmed = load_pool_meta_for_transaction_recovery(pools, write_state).await?;
     if confirmed.revision != expected_revision
         || confirmed.canonical.as_ref() != Some(&expected_canonical)
@@ -6749,6 +7074,15 @@ impl PoolMeta {
             .get(idx)
             .and_then(|pool| pool.decommission.as_ref())
             .is_some_and(is_decommission_suspended)
+    }
+
+    pub(crate) fn scanner_pause_backlog_pool_writable(&self, idx: usize) -> bool {
+        self.pools.get(idx).is_some_and(|pool| {
+            !pool
+                .decommission
+                .as_ref()
+                .is_some_and(|info| info.has_decommission_state() && !info.failed && !info.canceled)
+        })
     }
 
     fn mark_decommission_progress_saved(&mut self) {
@@ -7235,7 +7569,15 @@ impl PoolMeta {
             }
             if !selection.absent && write_state.identity_requires_repair() {
                 let initialized = write_state.identity_initialized != Some(false) || selection.revision.is_generation_protocol();
-                persist_pool_meta_identity(pools.clone(), write_state, initialized, fence, transaction_arm).await?;
+                persist_pool_meta_identity(
+                    pools.clone(),
+                    write_state,
+                    initialized,
+                    PoolMetaIdentityWriteScope::All,
+                    fence,
+                    transaction_arm,
+                )
+                .await?;
             }
         }
         // Startup is the only path allowed to create an all-missing metadata
@@ -7425,7 +7767,7 @@ impl PoolMeta {
             confirmed
         };
         if confirmed.revision == revision && confirmed.canonical.as_ref() == Some(&durable) {
-            persist_pool_meta_identity(pools, write_state, true, fence, transaction_arm).await?;
+            persist_pool_meta_identity(pools, write_state, true, PoolMetaIdentityWriteScope::All, fence, transaction_arm).await?;
             #[cfg(feature = "e2e-test-hooks")]
             startup_cas_test_observe(serde_json::json!({
                 "kind": "confirmed", "object": POOL_META_NAME,
@@ -9760,10 +10102,10 @@ impl ECStore {
     pub(crate) async fn acquire_external_decommission_capacity_fence(
         &self,
         target_pool_indices: &[usize],
-        phase: &'static str,
+        admission: DecommissionCapacityAdmission,
     ) -> Result<rustfs_lock::NamespaceLockGuard> {
         Ok(self
-            .acquire_external_decommission_capacity_fence_with_active_source(target_pool_indices, phase)
+            .acquire_external_decommission_capacity_fence_with_active_source(target_pool_indices, admission)
             .await?
             .0)
     }
@@ -9771,14 +10113,14 @@ impl ECStore {
     pub(crate) async fn acquire_external_decommission_capacity_fence_with_active_source(
         &self,
         target_pool_indices: &[usize],
-        phase: &'static str,
+        admission: DecommissionCapacityAdmission,
     ) -> Result<(rustfs_lock::NamespaceLockGuard, bool)> {
         let save_guard = self.pool_meta_save_gate.lock().await;
         let (pool_meta_guard, snapshot) = self
             .acquire_pool_meta_read_guard(&save_guard, "target capacity admission failed")
             .await?;
         for target_pool_index in target_pool_indices.iter().copied() {
-            ensure_external_decommission_target_admission(&snapshot, target_pool_index, phase)?;
+            ensure_external_decommission_target_admission(&snapshot, target_pool_index, admission)?;
         }
         let has_active_source = pool_meta_has_active_decommission(&snapshot);
         drop(save_guard);
@@ -9800,7 +10142,9 @@ impl ECStore {
         let admissions = target_pool_indices
             .iter()
             .copied()
-            .map(|target_pool_index| ensure_external_decommission_target_admission(&snapshot, target_pool_index, "heal"))
+            .map(|target_pool_index| {
+                ensure_external_decommission_target_admission(&snapshot, target_pool_index, DecommissionCapacityAdmission::Heal)
+            })
             .collect();
         drop(save_guard);
         Ok((pool_meta_guard, admissions))
@@ -10474,7 +10818,7 @@ impl ECStore {
             ));
         }
         let Some((owner, model_version)) = admitted_owner else {
-            ensure_external_decommission_target_admission(&snapshot, target_pool_index, "mutation")?;
+            ensure_external_decommission_target_admission(&snapshot, target_pool_index, DecommissionCapacityAdmission::Mutation)?;
             drop(save_guard);
             let capacity_lease = read_guard.lock_lost_signal();
             return operation.take().expect("capacity-admitted operation should run once")(capacity_lease).await;
@@ -20638,17 +20982,17 @@ mod pools_tests {
         DecommissionStartPoolState, DecommissionTargetConsumption, DecommissionTerminalState, DecommissionUnresolvedEntry,
         ListCallback, POOL_META_GENERATION_VERSION, POOL_META_IDENTITY_NAME, POOL_META_NAME, POOL_META_V1_VERSION,
         POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolMetaCasToken, PoolMetaPersistenceFence, PoolSpaceInfo, PoolStatus,
-        QueuedDecommissionEntry, REBAL_META_NAME, acquire_pool_rebalance_activation_locks, apply_decommission_status_space_info,
-        await_decommission_worker, bind_decommission_cancelers, bind_missing_decommission_cancelers,
-        build_decommission_capacity_reservation, build_decommission_capacity_reservation_with_model,
-        cancel_decommission_canceler, clamp_decommission_entry_concurrency, classify_decommission_terminal_state,
-        count_decommission_item, decommission_cancel_signal_result, decommission_durable_ilm_receipt_path,
-        decommission_durable_ilm_receipt_run_prefix, decommission_durable_ilm_receipt_run_token,
-        decommission_entry_queue_capacity, decommission_item_size, decommission_meta_bucket_options,
-        decommission_physical_pool_capacity, decommission_retry_backoff_delay, decommission_start_pool_state,
-        decommission_unresolved_listing_error, dedup_indices, default_decommission_bucket_concurrency,
-        default_decommission_entry_concurrency, drain_decommission_entry_queue, enqueue_decommission_entry,
-        ensure_decommission_cancel_allowed, ensure_decommission_capacity_reservations_available,
+        QueuedDecommissionEntry, REBAL_META_NAME, acquire_pool_rebalance_activation_locks, active_decommission_source_indices,
+        apply_decommission_status_space_info, await_decommission_worker, bind_decommission_cancelers,
+        bind_missing_decommission_cancelers, build_decommission_capacity_reservation,
+        build_decommission_capacity_reservation_with_model, cancel_decommission_canceler, clamp_decommission_entry_concurrency,
+        classify_decommission_terminal_state, count_decommission_item, decommission_cancel_signal_result,
+        decommission_durable_ilm_receipt_path, decommission_durable_ilm_receipt_run_prefix,
+        decommission_durable_ilm_receipt_run_token, decommission_entry_queue_capacity, decommission_item_size,
+        decommission_meta_bucket_options, decommission_physical_pool_capacity, decommission_retry_backoff_delay,
+        decommission_start_pool_state, decommission_unresolved_listing_error, dedup_indices,
+        default_decommission_bucket_concurrency, default_decommission_entry_concurrency, drain_decommission_entry_queue,
+        enqueue_decommission_entry, ensure_decommission_cancel_allowed, ensure_decommission_capacity_reservations_available,
         ensure_decommission_clear_allowed, ensure_decommission_generation, ensure_decommission_listing_disks_available,
         ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_decommission_start_keeps_active_pool,
         ensure_decommission_start_local_leader, ensure_decommission_start_pool_states,
@@ -20684,12 +21028,13 @@ mod pools_tests {
         with_decommission_entry_context,
     };
     use super::{
-        DecommissionCapacityOwner, DecommissionCapacityReleaseProof, DecommissionCapacityReservation,
-        DecommissionCapacityTemporaryMutation, decommission_capacity_mutation_id, ensure_decommission_target_owner_admission,
-        ensure_exact_delete_capacity_namespace_fences, ensure_external_decommission_target_admission,
-        is_decommission_capacity_blocked_error, plan_exact_delete_capacity_reconciliations,
-        record_decommission_target_consumption, release_decommission_target_inflight, reserve_decommission_target_pending,
-        resolve_decommission_target_pending, set_decommission_capacity_info_overrides_for_test,
+        DecommissionCapacityAdmission, DecommissionCapacityOwner, DecommissionCapacityReleaseProof,
+        DecommissionCapacityReservation, DecommissionCapacityTemporaryMutation, decommission_capacity_mutation_id,
+        ensure_decommission_target_owner_admission, ensure_exact_delete_capacity_namespace_fences,
+        ensure_external_decommission_target_admission, is_decommission_capacity_blocked_error,
+        plan_exact_delete_capacity_reconciliations, record_decommission_target_consumption, release_decommission_target_inflight,
+        reserve_decommission_target_pending, resolve_decommission_target_pending,
+        set_decommission_capacity_info_overrides_for_test,
     };
     use crate::bucket::lifecycle::{
         DurableIlmRecordCheckpoint,
@@ -24844,6 +25189,25 @@ mod pools_tests {
     }
 
     #[test]
+    fn test_decommission_request_rejections_preserve_invalid_argument_type() {
+        for result in [
+            ensure_decommission_start_allowed(DecommissionStartPoolState::Missing),
+            ensure_decommission_start_allowed(DecommissionStartPoolState::Decommissioned),
+            ensure_decommission_start_allowed(DecommissionStartPoolState::Blocked),
+            ensure_decommission_cancel_allowed(false, false, false),
+            ensure_decommission_clear_allowed(false, false, false, false, false, 0),
+            ensure_decommission_clear_allowed(true, true, false, true, false, 1),
+            ensure_decommission_terminal_operation_supported(true, "cancel decommission"),
+            validate_start_decommission_request(&[], false),
+            validate_start_decommission_request(&[0], true),
+            ensure_decommission_start_keeps_active_pool(&PoolMeta::default(), &[]),
+        ] {
+            let err = result.expect_err("invalid lifecycle requests must be rejected before mutation");
+            assert!(matches!(&err, Error::InvalidArgument(_, _, reason) if !reason.is_empty()), "{err:?}");
+        }
+    }
+
+    #[test]
     fn test_ensure_decommission_start_allowed_rejects_missing_pool() {
         let err =
             ensure_decommission_start_allowed(DecommissionStartPoolState::Missing).expect_err("missing pool should be invalid");
@@ -25545,7 +25909,7 @@ mod pools_tests {
     }
 
     #[test]
-    fn ordinary_write_admission_cannot_race_into_a_reserved_target() {
+    fn ordinary_write_admission_shares_a_reserved_target_without_becoming_its_owner() {
         let now = OffsetDateTime::UNIX_EPOCH + Duration::minutes(2);
         let layout = DecommissionErasureLayout { data: 1, parity: 0 };
         let capacity_infos = vec![
@@ -25569,13 +25933,18 @@ mod pools_tests {
         )
         .expect("the decommission reservation should fit");
 
-        assert!(
-            matches!(
-                ensure_external_decommission_target_admission(&meta, 1, "ordinary_put"),
-                Err(Error::SlowDown)
-            ),
-            "an ordinary write must not consume a target reservation"
-        );
+        for admission in [
+            DecommissionCapacityAdmission::Mutation,
+            DecommissionCapacityAdmission::BatchDelete,
+            DecommissionCapacityAdmission::ScannerBacklog,
+        ] {
+            ensure_external_decommission_target_admission(&meta, 1, admission)
+                .expect("a healthy target must remain writable while sharing capacity with migration");
+        }
+        assert!(matches!(
+            ensure_external_decommission_target_admission(&meta, 1, DecommissionCapacityAdmission::Heal),
+            Err(Error::SlowDown)
+        ));
         let rebalance_opts = ObjectOptions {
             data_movement: true,
             src_pool_idx: 0,
@@ -25602,6 +25971,119 @@ mod pools_tests {
         let mut decommission_opts = rebalance_opts;
         expected_owner.apply_to(&mut decommission_opts);
         assert_eq!(DecommissionCapacityOwner::from_options(&decommission_opts), Some(expected_owner));
+
+        meta.pools[0]
+            .decommission
+            .as_mut()
+            .expect("active source")
+            .capacity_reservation = None;
+        for admission in [
+            DecommissionCapacityAdmission::Mutation,
+            DecommissionCapacityAdmission::BatchDelete,
+            DecommissionCapacityAdmission::ScannerBacklog,
+        ] {
+            assert!(
+                matches!(ensure_external_decommission_target_admission(&meta, 1, admission), Err(Error::SlowDown)),
+                "shared capacity must not bypass an active source's missing durable ledger"
+            );
+        }
+    }
+
+    #[test]
+    fn external_decommission_admission_fences_suspended_sources_but_preserves_repair() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::minutes(2);
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacity_infos = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 30, 30),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 100, 100, 0),
+        ];
+        let mut active = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(0, None), decommission_test_pool_status(1, None)],
+            ..Default::default()
+        };
+        active
+            .decommission(0, capacity_infos[0].space)
+            .expect("start the source admission fixture");
+        reserve_decommission_start_target_capacity(
+            &mut active,
+            &[0],
+            &capacity_infos,
+            uuid::Uuid::new_v4(),
+            1,
+            now,
+            DECOMMISSION_CAPACITY_MODEL_VERSION,
+        )
+        .expect("the active source must have a valid reservation to isolate its write fence");
+
+        for (state, queued, failed, canceled, complete) in [
+            ("running", false, false, false, false),
+            ("queued", true, false, false, false),
+            ("failed", false, true, false, false),
+            ("canceled", false, false, true, false),
+            ("completed", false, false, false, true),
+        ] {
+            let mut meta = active.clone();
+            let info = meta.pools[0].decommission.as_mut().expect("the source fixture must exist");
+            info.queued = queued;
+            info.failed = failed;
+            info.canceled = canceled;
+            info.complete = complete;
+            if queued || failed || canceled || complete {
+                info.start_time = None;
+            }
+            for admission in [
+                DecommissionCapacityAdmission::Mutation,
+                DecommissionCapacityAdmission::BatchDelete,
+            ] {
+                assert!(
+                    matches!(ensure_external_decommission_target_admission(&meta, 0, admission), Err(Error::SlowDown)),
+                    "{state} source must reject new publication until its decommission metadata is cleared"
+                );
+            }
+            let existing_multipart =
+                ensure_external_decommission_target_admission(&meta, 0, DecommissionCapacityAdmission::ExistingMultipart);
+            if active_decommission_source_indices(&meta).contains(&0) {
+                existing_multipart
+                    .unwrap_or_else(|err| panic!("{state} source must allow an existing multipart upload to drain: {err}"));
+            } else {
+                assert!(
+                    matches!(existing_multipart, Err(Error::SlowDown)),
+                    "{state} terminal source must reject an existing multipart publication"
+                );
+            }
+            ensure_external_decommission_target_admission(&meta, 0, DecommissionCapacityAdmission::Heal)
+                .unwrap_or_else(|err| panic!("{state} source repair must retain its capacity-only admission: {err}"));
+            let scanner_result =
+                ensure_external_decommission_target_admission(&meta, 0, DecommissionCapacityAdmission::ScannerBacklog);
+            assert_eq!(
+                meta.scanner_pause_backlog_pool_writable(0),
+                failed || canceled,
+                "{state} scanner selection"
+            );
+            if failed || canceled {
+                scanner_result.unwrap_or_else(|err| panic!("{state} scanner membership repair must remain writable: {err}"));
+            } else {
+                assert!(
+                    matches!(scanner_result, Err(Error::SlowDown)),
+                    "{state} scanner publication must reject its source"
+                );
+            }
+            meta.pools[0].decommission = None;
+            ensure_external_decommission_target_admission(&meta, 0, DecommissionCapacityAdmission::Mutation)
+                .unwrap_or_else(|err| panic!("cleared {state} source must become writable again: {err}"));
+            ensure_external_decommission_target_admission(&meta, 0, DecommissionCapacityAdmission::ScannerBacklog)
+                .unwrap_or_else(|err| panic!("cleared {state} scanner source must rejoin membership: {err}"));
+        }
+        assert!(!active.scanner_pause_backlog_pool_writable(active.pools.len()));
+        assert!(matches!(
+            ensure_external_decommission_target_admission(
+                &active,
+                active.pools.len(),
+                DecommissionCapacityAdmission::ScannerBacklog
+            ),
+            Err(Error::SlowDown)
+        ));
     }
 
     #[test]
