@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::cycle_state::cleanup_io_fault;
+use super::super::cycle_state::{cleanup_io_fault, recovery_intent_accept_fault};
 use super::*;
 use crate::storage_api::owner::{EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats};
 
@@ -254,6 +254,100 @@ async fn scanner_recovery_intent_accept_is_durable_and_idempotent() {
         .await
         .expect("lost response retry should be idempotent");
     assert_eq!(replay, ScannerRecoveryIntentAcceptResult::Replayed { record });
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_recovery_intent_accept_requires_confirmed_readback() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let _fault = recovery_intent_accept_fault::corrupt_next_accept_readback();
+    let error =
+        accept_scanner_usage_recovery_intent(store.clone(), recovery_intent_request("intent-key-0001-readback", "operator-a"))
+            .await
+            .expect_err("accept must fail when the just-written intent cannot be confirmed");
+    assert!(error.to_string().contains("scanner recovery intent is invalid"), "{error}");
+
+    let restarted = restart_scanner_cycle_store_from(&store).await;
+    let error = scanner_usage_recovery_intents_for_startup(&CancellationToken::new(), restarted)
+        .await
+        .expect_err("unconfirmed corrupt intent must remain a fail-closed startup error");
+    assert!(error.to_string().contains("scanner recovery intent is invalid"), "{error}");
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_recovery_intent_accept_replays_if_execution_advances_before_readback() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let request = recovery_intent_request("intent-key-0001-running", "operator-a");
+    let _fault = recovery_intent_accept_fault::advance_next_accept_readback_to_running();
+    let replay = accept_scanner_usage_recovery_intent(store.clone(), request.clone())
+        .await
+        .expect("same request advanced by execution remains idempotent");
+    let record = match replay {
+        ScannerRecoveryIntentAcceptResult::Replayed { record } => record,
+        other => panic!("advanced same-request record must replay instead of conflict: {other:?}"),
+    };
+    assert_eq!(record.state, "running");
+
+    let retry = accept_scanner_usage_recovery_intent(store, request)
+        .await
+        .expect("lost response retry observes the running durable record");
+    assert_eq!(retry, ScannerRecoveryIntentAcceptResult::Replayed { record });
+}
+
+#[tokio::test]
+#[serial]
+async fn concurrent_scanner_recovery_intent_acceptance_uses_one_durable_record() {
+    let (_dir, store) = setup_scanner_cycle_store().await;
+    let request = recovery_intent_request("intent-key-0001-concurrent", "operator-a");
+    let mut tasks = Vec::new();
+    for _ in 0..12 {
+        let store = store.clone();
+        let request = request.clone();
+        tasks.push(tokio::spawn(async move {
+            accept_scanner_usage_recovery_intent(store, request)
+                .await
+                .expect("concurrent same-key accept should converge")
+        }));
+    }
+
+    let mut accepted = 0usize;
+    let mut replayed = 0usize;
+    let mut records = Vec::new();
+    for task in tasks {
+        match task.await.expect("accept task should not panic") {
+            ScannerRecoveryIntentAcceptResult::Accepted { record } => {
+                accepted += 1;
+                records.push(record);
+            }
+            ScannerRecoveryIntentAcceptResult::Replayed { record } => {
+                replayed += 1;
+                records.push(record);
+            }
+            other => panic!("same-key accepts must not conflict: {other:?}"),
+        }
+    }
+    assert_eq!(accepted, 1, "exactly one request may win the missing-record CAS");
+    assert_eq!(replayed, 11, "all other same-key requests must replay the durable winner");
+    assert!(
+        records.windows(2).all(|pair| pair[0] == pair[1]),
+        "all accepts must return the same durable identity"
+    );
+
+    let restarted = restart_scanner_cycle_store_from(&store).await;
+    let replayable = scanner_usage_recovery_intents_for_startup(&CancellationToken::new(), restarted.clone())
+        .await
+        .expect("startup should rediscover the single indexed intent");
+    assert_eq!(replayable, vec![records[0].intent_id.clone()]);
+    let replay = accept_scanner_usage_recovery_intent(restarted, request)
+        .await
+        .expect("lost response after restart should replay the same record");
+    assert_eq!(
+        replay,
+        ScannerRecoveryIntentAcceptResult::Replayed {
+            record: records[0].clone()
+        }
+    );
 }
 
 #[tokio::test]
@@ -547,6 +641,17 @@ async fn scanner_recovery_intent_query_rejects_corrupt_or_unknown_records() {
         .await
         .expect_err("corrupt intent must not decode as absent");
     assert!(error.to_string().contains("scanner recovery intent is invalid"));
+
+    let mut future = serde_json::to_value(&record).expect("record value");
+    future["future_writer_capability"] = serde_json::json!("durable-accept-v2");
+    save_config(store.clone(), &path, serde_json::to_vec(&future).expect("future record should encode"))
+        .await
+        .expect("future durable record");
+    let error = get_scanner_usage_recovery_intent(store.clone(), &record.intent_id)
+        .await
+        .expect_err("future writer payload must not decode as a known terminal state");
+    assert!(error.to_string().contains("scanner recovery intent is invalid"));
+
     let unknown = get_scanner_usage_recovery_intent(store, &scanner_recovery_actor_sha256("missing"))
         .await
         .expect("missing intent should read as absent");
