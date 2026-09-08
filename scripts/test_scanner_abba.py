@@ -163,6 +163,42 @@ class ScannerAbbaTest(unittest.TestCase):
         build = {"binary": str(self.binary), "sha256": harness.digest(self.binary), "revision": "a" * 40}
         self.manifest.update(baseline=build.copy(), candidate=build.copy())
 
+    def measured_manifest(self):
+        manifest = copy.deepcopy(self.manifest)
+        manifest.update(evidence="measured", duration_seconds=900)
+        manifest["candidate"]["revision"] = "b" * 40
+        manifest["release_evidence"] = {
+            "topology": {
+                "nodes": 3,
+                "drives_per_node": 4,
+                "pools": 2,
+                "sets_total": 2,
+                "erasure_data_blocks": 8,
+                "erasure_parity_blocks": 4,
+            },
+            "distributed": {
+                "metrics_endpoints": ["https://node-1:9000", "https://node-2:9000", "https://node-3:9000"],
+                "failure_domain": "three-node-localhost-lab",
+                "same_window_sampling": True,
+            },
+            "crash_restart": {
+                "fault_modes": ["process-restart", "process-crash-restart"],
+                "unclean_shutdown_marker": True,
+            },
+            "mixed_version": {
+                "participating_revisions": ["a" * 40, "b" * 40],
+                "reader": True,
+                "writer": True,
+                "rollback_payload": True,
+            },
+            "profile": {
+                "required_artifacts": ["allocation-profile", "flamegraph", "rss-samples", "save-frequency"],
+                "collector_config_sha256": "4" * 64,
+                "profiler_config_sha256": "5" * 64,
+            },
+        }
+        return manifest
+
     def run_harness(self, fault=""):
         with patch.dict(os.environ, {"SCANNER_ABBA_TEST_FAULT": fault}), contextlib.redirect_stdout(io.StringIO()):
             return harness.run(copy.deepcopy(self.manifest), self.adapter, self.root / "out", self.root / "data")
@@ -440,6 +476,34 @@ class ScannerAbbaTest(unittest.TestCase):
 
                 process.finish.assert_called_once_with(terminate=True)
 
+    def test_live_collector_binds_release_evidence_metrics_endpoints(self):
+        telemetry = self.root / "telemetry"
+        for name in ("status", "heal", "metrics"):
+            (telemetry / name).mkdir(parents=True)
+        (telemetry / "scanner-summary.csv").write_text("timestamp\n")
+        for index in range(16):
+            harness.write_json(telemetry / f"status/scanner-status.{index}.json", {"metrics": {"objects": 10}})
+            for node in ("node-a", "node-b"):
+                harness.write_json(telemetry / f"heal/background-heal-status.{node}.{index}.json",
+                                   {"healOperations": {"queueLength": 0}})
+                harness.write_json(telemetry / f"metrics/admin-metrics.{node}.{index}.ndjson",
+                                   {"errors": [], "final": True,
+                                    "by_host": {f"{node}:9000": {"scanner": {"objects": 10}}}})
+        prepared = {"collector": {"alias": "test", "endpoint": "http://node-a:9000",
+                                  "metrics_endpoints": "http://node-a:9000,http://node-b:9000"}}
+        request = {
+            "duration_seconds": 900,
+            "evidence": "measured",
+            "release_evidence": self.measured_manifest()["release_evidence"],
+        }
+        process = Mock(pid=123, wait=Mock(return_value=0))
+        with patch.object(harness, "OwnedCommand", return_value=process), \
+                patch.object(harness, "invoke", return_value={"sample_count": 10}), \
+                patch.object(harness.time, "monotonic", side_effect=(0, 900)):
+            with self.assertRaisesRegex(ValueError, "collector metrics endpoints"):
+                harness.collect_live(prepared, request, self.root / "request.json", self.adapter)
+        process.finish.assert_called_once_with(terminate=True)
+
     def test_unstable_p1_work_control_is_inconclusive(self):
         with patch.object(harness, "SCENARIOS", ("cold-hot",)):
             self.assertEqual(self.run_harness("unstable-p1-control"), 3)
@@ -462,6 +526,80 @@ class ScannerAbbaTest(unittest.TestCase):
         self.manifest["rounds"] = 2
         with self.assertRaisesRegex(ValueError, "rounds"):
             harness.validate_manifest(self.manifest)
+
+    def test_measured_manifest_requires_release_evidence_contract(self):
+        harness.validate_manifest(self.measured_manifest())
+        faults = {
+            "missing root": lambda manifest: manifest.pop("release_evidence"),
+            "single-set": lambda manifest: manifest["release_evidence"]["topology"].update(sets_total=1),
+            "wrong geometry": lambda manifest: manifest["release_evidence"]["topology"].update(nodes=4),
+            "duplicate endpoint": lambda manifest: manifest["release_evidence"]["distributed"].update(
+                metrics_endpoints=["https://node-1:9000", "https://node-1:9000", "https://node-3:9000"],
+            ),
+            "split sampling": lambda manifest: manifest["release_evidence"]["distributed"].update(
+                same_window_sampling=False,
+            ),
+            "missing crash": lambda manifest: manifest["release_evidence"]["crash_restart"].update(
+                fault_modes=["process-restart"],
+            ),
+            "clean crash marker": lambda manifest: manifest["release_evidence"]["crash_restart"].update(
+                unclean_shutdown_marker=False,
+            ),
+            "mixed version false": lambda manifest: manifest["release_evidence"]["mixed_version"].update(writer=False),
+            "missing candidate": lambda manifest: manifest["release_evidence"]["mixed_version"].update(
+                participating_revisions=["a" * 40, "c" * 40],
+            ),
+            "missing profile": lambda manifest: manifest["release_evidence"]["profile"].update(
+                required_artifacts=["allocation-profile", "flamegraph", "rss-samples"],
+            ),
+            "bad profile hash": lambda manifest: manifest["release_evidence"]["profile"].update(
+                profiler_config_sha256="not-a-sha",
+            ),
+        }
+        for name, mutate in faults.items():
+            with self.subTest(fault=name):
+                manifest = self.measured_manifest()
+                mutate(manifest)
+                with self.assertRaisesRegex(ValueError, "release_evidence"):
+                    harness.validate_manifest(manifest)
+
+    def test_measured_result_must_echo_release_evidence(self):
+        manifest = self.measured_manifest()
+        request = {
+            "schema": 1,
+            "scenario": "cold-hot",
+            "comparison": "build",
+            "round": 1,
+            "leg": "B1",
+            "background": "on",
+            "build": manifest["candidate"],
+            "evidence": manifest["evidence"],
+            "fixed": manifest["fixed"],
+            "release_evidence": manifest["release_evidence"],
+            "duration_seconds": manifest["duration_seconds"],
+            "data_dir": str(self.root / "data"),
+            "expected_healed_objects": manifest["expected_healed_objects"]["cold-hot"],
+        }
+        metrics = dict.fromkeys(harness.METRICS, 10)
+        metrics.update(p99_ms=10, throughput_ops=100, errors=0, requests=100,
+                       walk_objects=100, cold_walk_objects=20, healed_objects=10)
+        result = {
+            "evidence": request["evidence"],
+            "fixed": request["fixed"],
+            "build": request["build"],
+            "data_dir": request["data_dir"],
+            "background": request["background"],
+            "release_evidence": request["release_evidence"],
+            "sample_count": 10,
+            "elapsed_seconds": request["duration_seconds"],
+            "metrics": metrics,
+            "oracle": manifest["oracles"]["cold-hot"],
+        }
+        harness.validate_result(result, request, manifest["oracles"]["cold-hot"])
+        result["release_evidence"] = copy.deepcopy(result["release_evidence"])
+        result["release_evidence"]["profile"]["required_artifacts"].remove("flamegraph")
+        with self.assertRaisesRegex(ValueError, "release evidence provenance mismatch"):
+            harness.validate_result(result, request, manifest["oracles"]["cold-hot"])
 
     def test_existing_data_preserved(self):
         (self.root / "data").mkdir()

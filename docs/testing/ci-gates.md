@@ -157,6 +157,12 @@ feature-specific oracles, measurements and required topologies exist. Missing
 cases cannot be supplied by synthetic W20 results. W20's bounded JSON and
 file-hash helpers are reused; its ABBA performance contracts remain in
 `docs/operations/scanner-benchmark-runbook.md`.
+Measured ABBA manifests must also carry the runbook's `release_evidence`
+contract. The runner rejects reports that cannot bind the exact 3x4 EC8+4
+topology, multi-pool/multi-set shape, distributed same-window metrics endpoints,
+restart/crash modes, mixed-version reader/writer/rollback participation, and
+allocation/flamegraph/RSS/save-frequency profile artifact plan. Synthetic runs
+and manifests missing that contract remain harness-only evidence.
 
 ### Recording One Case
 

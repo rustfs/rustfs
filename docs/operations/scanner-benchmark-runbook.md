@@ -66,6 +66,7 @@ The manifest has the following JSON contract (all fields are required):
 | `rounds`, `duration_seconds`, `min_free_bytes` | 3..10 groups, 900..86400 seconds for measured runs, and the independently estimated free-space reservation in bytes. Synthetic runs may use 1 second. |
 | `baseline`, `candidate` | Each contains executable `binary`, full 40-character `revision`, and verified `sha256`. The runner rehashes binaries before every leg. |
 | `fixed` | `config_sha256`, `dataset_sha256`, `release_flags`, `durability`, `disk_type`, `cache_state`, `load_command`, `resource_isolation`, `topology` (`EC8+4`), and positive `offered_load_ops`. Hashes use 64 lowercase hexadecimal characters. |
+| `release_evidence` | Required for `measured` runs. It binds the 3x4 EC8+4 topology, multi-pool/multi-set coverage, per-node metrics endpoints, same-window distributed sampling, process restart and crash-restart fault modes, mixed-version reader/writer/rollback participation, and allocation/flamegraph/RSS/save-frequency profile artifact requirements. Synthetic runs do not need this field and still cannot approve release evidence. |
 | `oracles` | A map with all five scenario names. Each value contains positive integer `objects`, `versions`, `bytes`, and `sha256` of the independently prepared canonical object/version/content manifest. |
 | `expected_healed_objects` | A map with all five scenario names and independently seeded repair counts. Running-heal and MRF-replay require a positive count. |
 
@@ -75,6 +76,14 @@ object/version/content result. Fix the foreground arrival rate (offered load),
 cache preparation procedure, configuration, and hardware across every leg.
 Do not include credentials in the manifest, adapter output, or saved commands;
 the collector reads `RUSTFS_ACCESS_KEY` and `RUSTFS_SECRET_KEY` from its environment.
+The adapter must echo the measured run's `release_evidence` object in every
+measurement response. A mismatch fails the cell because it means the deployment,
+mixed-version set, crash mode, or profiler contract no longer matches the
+operator-reviewed manifest. This echo is provenance binding only; it does not
+replace the independent correctness oracle, distributed metrics samples, profile
+artifacts, or ABBA comparison thresholds. The summary tool revalidates the same
+manifest contract before it can print a measured PASS result, so hand-built or
+trimmed reports without this provenance fail closed.
 
 #### Deployment Adapter Contract
 
