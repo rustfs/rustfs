@@ -542,7 +542,7 @@ def yaml_scalar_continues(lines: list[str], index: int, indent: int) -> bool:
 def check_quick_checks(root: Path) -> list[str]:
     errors: list[str] = []
     bypass_key = r'''(?:if|continue-on-error|needs|"if"|"continue-on-error"|"needs"|'if'|'continue-on-error'|'needs')\s*:'''
-    for name in ("ci.yml", "ci-docs-only.yml"):
+    for name in ("ci.yml",):
         relative = f".github/workflows/{name}"
         path = root / relative
         job = yaml_block(path.read_text().splitlines(), "quick-checks", 2) if path.is_file() else None
@@ -1165,7 +1165,6 @@ class SelfTests(unittest.TestCase):
                 ".github/workflows/ci.yml": caller.replace(
                     "    steps:", "    if: github.event_name != 'pull_request' || github.event.action != 'closed'\n    steps:"
                 ),
-                ".github/workflows/ci-docs-only.yml": caller,
                 ".github/actions/quick-checks/action.yml": action,
             }
             for relative, source in sources.items():
@@ -1173,7 +1172,7 @@ class SelfTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(source)
             self.assertEqual(check_quick_checks(root), [])
-            for relative in (".github/workflows/ci.yml", ".github/workflows/ci-docs-only.yml"):
+            for relative in (".github/workflows/ci.yml",):
                 source = sources[relative]
                 mutations = {
                     "different action": source.replace("./.github/actions/quick-checks", "./.github/actions/other"),

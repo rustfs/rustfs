@@ -89,6 +89,7 @@ offline-enrollment-e2e-check: core-deps ## Build and exercise the dedicated offl
 test-wiring-check: ## Check tests stay registered and selected by their intended runners
 	@echo "🧪 Checking test wiring..."
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/ci_gate.py --check-workflow
 
 .PHONY: log-analyzer-rules-check
 log-analyzer-rules-check: core-deps ## Check log-analyzer rule anchors still exist verbatim in source
