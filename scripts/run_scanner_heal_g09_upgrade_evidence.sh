@@ -4,10 +4,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${RUSTFS_PYTHON_BIN:-python3}"
-SOURCE_REPOSITORY="${RUSTFS_UPGRADE_SOURCE_REPOSITORY:-rustfs/rustfs}"
-SOURCE_VERSION="${RUSTFS_UPGRADE_SOURCE_VERSION:-1.0.0-rc.5}"
-SOURCE_ASSET="${RUSTFS_UPGRADE_SOURCE_ASSET:-rustfs-linux-x86_64-gnu-v1.0.0-rc.5.zip}"
-SOURCE_SHA256="${RUSTFS_UPGRADE_SOURCE_SHA256:-3ee8df71e8edcfada533be452c4135868f697bc515460ae97b027313eade7a3d}"
+SOURCE_REPOSITORY="${RUSTFS_UPGRADE_SOURCE_REPOSITORY:-${UPGRADE_SOURCE_REPOSITORY:-rustfs/rustfs}}"
+SOURCE_VERSION="${RUSTFS_UPGRADE_SOURCE_VERSION:-${UPGRADE_SOURCE_VERSION:-1.0.0-rc.5}}"
+SOURCE_ASSET="${RUSTFS_UPGRADE_SOURCE_ASSET:-${UPGRADE_SOURCE_ASSET:-rustfs-linux-x86_64-gnu-v1.0.0-rc.5.zip}}"
+SOURCE_SHA256="${RUSTFS_UPGRADE_SOURCE_SHA256:-${UPGRADE_SOURCE_SHA256:-3ee8df71e8edcfada533be452c4135868f697bc515460ae97b027313eade7a3d}}"
 MIN_FREE_KIB="${RUSTFS_G09_MIN_FREE_KIB:-6291456}"
 
 RUN_DIR=""
@@ -17,6 +17,7 @@ TEST_SELECTION="all"
 PLAN_ONLY=0
 ALLOW_DIRTY=0
 SKIP_BUILD=0
+SKIP_DOWNLOAD=0
 VERBOSE=0
 
 usage() {
@@ -31,10 +32,17 @@ Options:
   --out-dir DIR       Alias for --run-dir
   --source-dir DIR    Cache directory for the pinned previous release binary
   --source-binary BIN Use an existing previous-release rustfs binary
+  --version VERSION   Previous release tag (default: 1.0.0-rc.5)
+  --asset NAME        Previous release asset zip name
+  --sha256 HEX        Expected SHA-256 for the previous release asset
+  --repository OWNER/REPO
+                     GitHub repository used to download the release asset (default: rustfs/rustfs)
   --test NAME         all, mixed-version, or rollback (default: all)
   --allow-dirty      Allow tracked source changes while collecting evidence
   --skip-build       Reuse an existing target/debug/rustfs binary
+  --skip-download    Reuse SOURCE_DIR/rustfs instead of downloading the previous release
   --plan-only        Print the resolved plan without building or running tests
+  --dry-run          Validate configuration and print the commands without running them
   --self-test        Run lightweight CLI and artifact-validator checks
   --verbose          Stream command output instead of storing it under the run directory
   -h, --help         Show this help
@@ -43,7 +51,39 @@ The default pinned release asset is Linux x86_64. Use --source-binary when
 running against a custom previous-release binary on another platform. The
 script requires at least 6 GiB free by default; override
 RUSTFS_G09_MIN_FREE_KIB only for a deliberately smaller diagnostic run.
+
+Environment overrides:
+  RUSTFS_SCANNER_HEAL_G09_OUTPUT_ROOT
+  RUSTFS_UPGRADE_SOURCE_DIR
+  RUSTFS_UPGRADE_SOURCE_BINARY
+  RUSTFS_UPGRADE_SOURCE_REPOSITORY / UPGRADE_SOURCE_REPOSITORY
+  RUSTFS_UPGRADE_SOURCE_VERSION / UPGRADE_SOURCE_VERSION
+  RUSTFS_UPGRADE_SOURCE_ASSET / UPGRADE_SOURCE_ASSET
+  RUSTFS_UPGRADE_SOURCE_SHA256 / UPGRADE_SOURCE_SHA256
+
+Per-case test environment set by the runner:
+  RUSTFS_UPGRADE_SOURCE_BINARY
+  RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR
+  RUSTFS_E2E_LOG_DIR
+
+Required output files:
+  mixed-version-upgrade/G09-mixed_version_reader_evidence.json
+  mixed-version-upgrade/G09-mixed_version_writer_evidence.json
+  bucket-config-rollback/G09-rollback_payload_evidence.json
 USAGE
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+require_value() {
+    local option="$1"
+    local count="$2"
+    if [[ "$count" -lt 2 ]]; then
+        die "missing value for $option"
+    fi
 }
 
 case_names() {
@@ -55,8 +95,7 @@ case_names() {
             printf '%s\n' "$TEST_SELECTION"
             ;;
         *)
-            echo "unknown test selection: $TEST_SELECTION" >&2
-            exit 2
+            die "unknown test selection: $TEST_SELECTION"
             ;;
     esac
 }
@@ -70,8 +109,7 @@ artifact_for() {
             echo "bucket-config-rollback"
             ;;
         *)
-            echo "unknown G09 case: $1" >&2
-            exit 2
+            die "unknown G09 case: $1"
             ;;
     esac
 }
@@ -85,8 +123,7 @@ test_filter_for() {
             echo "upgrade_compatibility_test::rollback_to_previous_release_reads_current_bucket_metadata"
             ;;
         *)
-            echo "unknown G09 case: $1" >&2
-            exit 2
+            die "unknown G09 case: $1"
             ;;
     esac
 }
@@ -140,6 +177,17 @@ verify_sha256() {
     fi
 }
 
+validate_source_sha256() {
+    [[ "$SOURCE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--sha256 must be a 64-character lowercase hex digest"
+}
+
+check_empty_case_dir() {
+    local dir="$1"
+    if [[ -d "$dir" ]] && find "$dir" -mindepth 1 -print -quit | grep -q .; then
+        die "evidence case directory is not empty: $dir"
+    fi
+}
+
 ensure_min_free_space() {
     local path="$1"
     local available
@@ -174,6 +222,9 @@ resolve_source_binary() {
     if [[ -x "$binary" ]]; then
         echo "$binary"
         return
+    fi
+    if [[ "$SKIP_DOWNLOAD" == 1 ]]; then
+        die "previous release binary does not exist or is not executable: $binary"
     fi
 
     mkdir -p "$SOURCE_DIR"
@@ -278,6 +329,16 @@ run_self_test() {
         echo "self-test failed: invalid test selection was accepted" >&2
         return 1
     fi
+    if "$0" --dry-run --sha256 bad >/dev/null 2>&1; then
+        echo "self-test failed: invalid SHA-256 was accepted" >&2
+        return 1
+    fi
+    mkdir -p "$tmp/nonempty/mixed-version-upgrade"
+    touch "$tmp/nonempty/mixed-version-upgrade/existing.json"
+    if "$0" --dry-run --run-dir "$tmp/nonempty" --sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >/dev/null 2>&1; then
+        echo "self-test failed: non-empty evidence directory was accepted" >&2
+        return 1
+    fi
 
     mkdir -p "$tmp/run/mixed-version-upgrade" "$tmp/run/bucket-config-rollback"
     local current previous
@@ -298,18 +359,42 @@ JSON
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --run-dir|--out-dir)
+            require_value "$1" "$#"
             RUN_DIR="$2"
             shift 2
             ;;
         --source-dir)
+            require_value "$1" "$#"
             SOURCE_DIR="$2"
             shift 2
             ;;
         --source-binary)
+            require_value "$1" "$#"
             SOURCE_BINARY="$2"
             shift 2
             ;;
+        --version)
+            require_value "$1" "$#"
+            SOURCE_VERSION="$2"
+            shift 2
+            ;;
+        --asset)
+            require_value "$1" "$#"
+            SOURCE_ASSET="$2"
+            shift 2
+            ;;
+        --sha256)
+            require_value "$1" "$#"
+            SOURCE_SHA256="$2"
+            shift 2
+            ;;
+        --repository)
+            require_value "$1" "$#"
+            SOURCE_REPOSITORY="$2"
+            shift 2
+            ;;
         --test)
+            require_value "$1" "$#"
             TEST_SELECTION="$2"
             shift 2
             ;;
@@ -321,7 +406,11 @@ while [[ $# -gt 0 ]]; do
             SKIP_BUILD=1
             shift
             ;;
-        --plan-only)
+        --skip-download)
+            SKIP_DOWNLOAD=1
+            shift
+            ;;
+        --plan-only|--dry-run)
             PLAN_ONLY=1
             shift
             ;;
@@ -354,9 +443,18 @@ if [[ -z "$RUN_DIR" ]]; then
 else
     RUN_DIR="$(normalize_path "$RUN_DIR")"
 fi
+if [[ -n "$SOURCE_DIR" ]]; then
+    SOURCE_DIR="$(normalize_path "$SOURCE_DIR")"
+fi
+
+validate_source_sha256
+for case_name in "${CASES[@]}"; do
+    check_empty_case_dir "$RUN_DIR/$(artifact_for "$case_name")"
+done
 
 if [[ "$PLAN_ONLY" == 1 ]]; then
     echo "run_dir=$RUN_DIR"
+    echo "out_dir=$RUN_DIR"
     echo "tests=${CASES[*]}"
     echo "source_repository=$SOURCE_REPOSITORY"
     echo "source_version=$SOURCE_VERSION"
@@ -367,11 +465,31 @@ if [[ "$PLAN_ONLY" == 1 ]]; then
         if [[ -z "$SOURCE_DIR" ]]; then
             echo "source_dir=$ROOT/target/scanner-heal-g09-source/$SOURCE_VERSION"
         else
-            echo "source_dir=$(normalize_path "$SOURCE_DIR")"
+            echo "source_dir=$SOURCE_DIR"
         fi
         echo "source_asset=$SOURCE_ASSET"
+        echo "download_url=https://github.com/$SOURCE_REPOSITORY/releases/download/$SOURCE_VERSION/$SOURCE_ASSET"
     fi
-    echo "target_dir=$(cargo_target_dir)"
+    target_dir="$(cargo_target_dir)"
+    echo "target_dir=$target_dir"
+    echo "current_binary=$target_dir/debug/rustfs"
+    echo "test_filters:"
+    for case_name in "${CASES[@]}"; do
+        echo "  $(artifact_for "$case_name"): $(test_filter_for "$case_name")"
+    done
+    echo "required_artifacts:"
+    for case_name in "${CASES[@]}"; do
+        artifact="$(artifact_for "$case_name")"
+        case "$case_name" in
+            mixed-version)
+                echo "  $RUN_DIR/$artifact/G09-mixed_version_reader_evidence.json"
+                echo "  $RUN_DIR/$artifact/G09-mixed_version_writer_evidence.json"
+                ;;
+            rollback)
+                echo "  $RUN_DIR/$artifact/G09-rollback_payload_evidence.json"
+                ;;
+        esac
+    done
     exit 0
 fi
 
