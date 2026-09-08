@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import contextlib
 import hashlib
 import io
@@ -33,6 +34,9 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         self.abba = self.root / "abba"
         self.abba.mkdir()
         self.manifest = {
+            "schema": 1,
+            "evidence": "measured",
+            "rounds": 3,
             "fixed": {
                 "config_sha256": "1" * 64,
                 "dataset_sha256": "2" * 64,
@@ -51,6 +55,9 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
                     "drives_per_node": 4,
                     "pools": 2,
                     "sets_total": 2,
+                    "sampled_pools": 2,
+                    "sampled_sets": 2,
+                    "erasure_set_size": 12,
                     "erasure_data_blocks": 8,
                     "erasure_parity_blocks": 4,
                 },
@@ -97,9 +104,19 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
             "performance": "pass",
             "evidence": "measured",
             "cells": 120,
-            "comparisons": [self.comparison],
+            "comparisons": self.full_comparisons(),
         }
         self.write_inputs()
+
+    def full_comparisons(self):
+        comparisons = []
+        for scenario in summary.SCENARIOS:
+            for comparison in ("build", "background"):
+                for round_id in range(1, 4):
+                    row = copy.deepcopy(self.comparison)
+                    row.update(scenario=scenario, comparison=comparison, round=round_id)
+                    comparisons.append(row)
+        return comparisons
 
     def write_inputs(self):
         (self.abba / "manifest.json").write_text(json.dumps(self.manifest), encoding="utf-8")
@@ -184,22 +201,47 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "passing report requires comparisons"):
             summary.build_summary(args)
 
+    def test_passing_abba_report_requires_complete_matrix(self):
+        cases = {
+            "trimmed": lambda: self.report["comparisons"].pop(),
+            "duplicate": lambda: self.report["comparisons"].__setitem__(1, copy.deepcopy(self.report["comparisons"][0])),
+            "bad cells": lambda: self.report.update(cells=119),
+            "bad evidence": lambda: self.manifest.update(evidence="synthetic"),
+            "outside": lambda: self.report["comparisons"][0].update(round=99),
+            "failed comparison": lambda: self.report["comparisons"][0].update(status="inconclusive"),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(fault=name):
+                self.setUp()
+                mutate()
+                self.write_inputs()
+                args = type("Args", (), {
+                    "abba_dir": self.abba,
+                    "cache_cost_log": None,
+                    "require_cache_cost": False,
+                    "json_out": None,
+                    "markdown_out": None,
+                })
+                with self.assertRaisesRegex(ValueError, "ABBA matrix|manifest/report evidence|comparison"):
+                    summary.build_summary(args)
+
     def test_passing_abba_report_requires_w10_w11_evidence(self):
         for fault in ("missing", "pressure", "lock", "attempt", "length", "range"):
             with self.subTest(fault=fault):
                 self.setUp()
+                target = self.report["comparisons"][0]
                 if fault == "missing":
-                    del self.comparison["w10_w11"]
+                    del target["w10_w11"]
                 elif fault == "pressure":
-                    del self.comparison["w10_w11"]["foreground_pressure_high_sample_ratios"]
+                    del target["w10_w11"]["foreground_pressure_high_sample_ratios"]
                 elif fault == "lock":
-                    del self.comparison["w10_w11"]["heal_lock_wait_p99_ms"]
+                    del target["w10_w11"]["heal_lock_wait_p99_ms"]
                 elif fault == "attempt":
-                    del self.comparison["w10_w11"]["attempt_cost_per_healed_object"]
+                    del target["w10_w11"]["attempt_cost_per_healed_object"]
                 elif fault == "length":
-                    self.comparison["w10_w11"]["attempt_cost_per_healed_object"] = [None]
+                    target["w10_w11"]["attempt_cost_per_healed_object"] = [None]
                 else:
-                    self.comparison["w10_w11"]["foreground_pressure_high_sample_ratios"] = [1.5, 0.0, 0.0, 0.0]
+                    target["w10_w11"]["foreground_pressure_high_sample_ratios"] = [1.5, 0.0, 0.0, 0.0]
                 self.write_inputs()
                 args = type("Args", (), {
                     "abba_dir": self.abba,

@@ -12,7 +12,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from scanner_abba import validate_release_evidence_manifest
+from scanner_abba import LEGS, SCENARIOS, validate_release_evidence_manifest
 
 MAX_JSON_BYTES = 1024 * 1024
 CACHE_COST_PREFIX = "CACHE_COST "
@@ -122,6 +122,33 @@ def require_measured_comparison_evidence(comparison: dict[str, Any], index: int)
             f"comparison {index} candidate attempt cost below minimum")
 
 
+def require_complete_abba_matrix(manifest: dict[str, Any], report: dict[str, Any], comparisons: list[dict[str, Any]]) -> None:
+    require(report.get("evidence") == manifest.get("evidence"), "manifest/report evidence mismatch")
+    rounds = manifest.get("rounds")
+    require(type(rounds) is int and 3 <= rounds <= 10, "invalid manifest.rounds")
+    expected_cells = len(SCENARIOS) * 2 * rounds * len(LEGS)
+    require(
+        report.get("cells") == expected_cells,
+        f"ABBA matrix cell count mismatch: expected {expected_cells}, got {report.get('cells')}",
+    )
+    expected_keys = {
+        (scenario, comparison, round_id)
+        for scenario in SCENARIOS
+        for comparison in ("build", "background")
+        for round_id in range(1, rounds + 1)
+    }
+    observed_keys = []
+    for index, comparison in enumerate(comparisons):
+        key = (comparison.get("scenario"), comparison.get("comparison"), comparison.get("round"))
+        require(key in expected_keys, f"comparison {index} is outside the ABBA matrix")
+        require(comparison.get("status") in PASS_STATES, f"comparison {index} did not pass")
+        observed_keys.append(key)
+    observed_set = set(observed_keys)
+    require(len(observed_keys) == len(observed_set), "duplicate ABBA matrix comparison")
+    missing = sorted(expected_keys - observed_set)
+    require(not missing, f"missing ABBA matrix comparison: {missing[0] if missing else ''}")
+
+
 def summarize_abba(abba_dir: Path) -> dict[str, Any]:
     manifest_path = abba_dir / "manifest.json"
     report_path = abba_dir / "report.json"
@@ -170,6 +197,7 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
     measured = report.get("evidence") == "measured"
     passed = report_state in PASS_STATES and performance_state in PASS_STATES and measured
     if passed:
+        require_complete_abba_matrix(manifest, report, comparisons)
         validate_release_evidence_manifest({**manifest, "evidence": "measured"})
         for index, comparison in enumerate(comparisons):
             require_measured_comparison_evidence(comparison, index)

@@ -175,6 +175,9 @@ class ScannerAbbaTest(unittest.TestCase):
                 "drives_per_node": 4,
                 "pools": 2,
                 "sets_total": 2,
+                "sampled_pools": 2,
+                "sampled_sets": 2,
+                "erasure_set_size": 12,
                 "erasure_data_blocks": 8,
                 "erasure_parity_blocks": 4,
             },
@@ -534,7 +537,8 @@ class ScannerAbbaTest(unittest.TestCase):
         faults = {
             "missing root": lambda manifest: manifest.pop("release_evidence"),
             "single-set": lambda manifest: manifest["release_evidence"]["topology"].update(sets_total=1),
-            "wrong geometry": lambda manifest: manifest["release_evidence"]["topology"].update(nodes=4),
+            "unsampled-set": lambda manifest: manifest["release_evidence"]["topology"].update(sampled_sets=1),
+            "wrong geometry": lambda manifest: manifest["release_evidence"]["topology"].update(erasure_set_size=11),
             "duplicate endpoint": lambda manifest: manifest["release_evidence"]["distributed"].update(
                 metrics_endpoints=["https://node-1:9000", "https://node-1:9000", "https://node-3:9000"],
             ),
