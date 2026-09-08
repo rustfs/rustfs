@@ -23,6 +23,9 @@ pub mod common;
 #[cfg(test)]
 pub mod chaos;
 
+#[cfg(test)]
+mod scanner_heal_evidence;
+
 // Programmable S3 target for replication failure-path tests (backlog#1147 repl-8)
 // and on-demand-migration source scenarios (backlog#2151).
 #[cfg(test)]

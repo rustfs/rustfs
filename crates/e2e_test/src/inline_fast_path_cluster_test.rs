@@ -21,7 +21,7 @@
 //! One S3 GET can select readers on multiple EC nodes, so the counter tracks
 //! distributed reader selection rather than HTTP request count.
 
-use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, init_logging};
+use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, init_logging, signal_process};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
@@ -2207,6 +2207,33 @@ async fn four_node_manual_transition_job_status_survives_node_restart() -> TestR
     Ok(())
 }
 
+struct SuspendedTransitionTarget<'a> {
+    // Keep the owned child borrowed until it is resumed so its PID cannot be reused.
+    child: &'a std::process::Child,
+    suspended: bool,
+}
+
+impl<'a> SuspendedTransitionTarget<'a> {
+    fn suspend(child: &'a std::process::Child) -> TestResult<Self> {
+        signal_process(child.id(), "STOP")?;
+        Ok(Self { child, suspended: true })
+    }
+
+    fn resume(&mut self) -> TestResult {
+        signal_process(self.child.id(), "CONT")?;
+        self.suspended = false;
+        Ok(())
+    }
+}
+
+impl Drop for SuspendedTransitionTarget<'_> {
+    fn drop(&mut self) {
+        if self.suspended {
+            let _ = signal_process(self.child.id(), "CONT");
+        }
+    }
+}
+
 #[tokio::test]
 async fn four_node_manual_transition_distributed_admission_conflict_reports_status_and_backpressure() -> TestResult {
     init_logging();
@@ -2244,7 +2271,21 @@ async fn four_node_manual_transition_distributed_admission_conflict_reports_stat
             .send()
             .await?;
     }
-    put_lifecycle_with_transition_retry(&hot_client, &bucket, &tier_name).await?;
+    // Lifecycle PUT starts its own backfill. Keep its first page on a separate
+    // node and stop it at queue backpressure before it reaches the tested prefix:
+    // one active worker, one queued item, then the first rejected item.
+    for index in 0u8..3 {
+        hot_client
+            .put_object()
+            .bucket(&bucket)
+            .key(format!("transition/automatic-admission/object-{index:02}.bin"))
+            .body(ByteStream::from(payload(KIB, index)))
+            .send()
+            .await?;
+    }
+    let mut suspended_cold = SuspendedTransitionTarget::suspend(cold.process.as_ref().ok_or("cold-tier process missing")?)?;
+    let lifecycle_client = hot.create_s3_client(2)?;
+    put_lifecycle_with_transition_retry(&lifecycle_client, &bucket, &tier_name).await?;
 
     let (node0, node1) = tokio::join!(
         start_manual_transition_job_on_node(&hot, 0, &bucket, prefix, &tier_name, false, 64),
@@ -2304,6 +2345,31 @@ async fn four_node_manual_transition_distributed_admission_conflict_reports_stat
     assert_eq!(status["job_id"].as_str(), Some(job_id));
     assert_eq!(status["status_endpoint"].as_str(), Some(status_endpoint));
 
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = read_manual_transition_job_status_endpoint(&hot, accepted.0, status_endpoint).await?;
+        assert_eq!(
+            status["status"].as_str(),
+            Some("running"),
+            "blocked cold tier must keep the admitted job running: {status}"
+        );
+        if status["report"]["skipped_queue_full"].as_u64().is_some_and(|count| count > 0) {
+            assert!(
+                status["report"]["enqueued"].as_u64().is_some_and(|count| count > 0),
+                "the job must own pending transitions while the cold tier is suspended: {status}"
+            );
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "manual transition job did not reach queue backpressure while the cold tier was suspended: {status}"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    suspended_cold.resume()?;
     let terminal = wait_for_manual_transition_job_terminal(&hot, conflict.0, job_id, false).await?;
     assert_eq!(terminal["job_id"].as_str(), Some(job_id));
     assert_eq!(terminal["bucket"].as_str(), Some(bucket.as_str()));

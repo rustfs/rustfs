@@ -14,9 +14,10 @@
 
 use super::harness::{DistCluster, DistLayout, TestResult, assert_inventory, payload_for, put_object, unique_bucket, wait_until};
 use crate::chaos::{
-    VersionShardCensus, census_object_version_on_disk, signed_admin_post, wait_for_complete_physical_shard_on_disk,
+    VersionShardCensus, census_object_version_on_disk, sha256_hex, signed_admin_post, wait_for_complete_physical_shard_on_disk,
 };
-use crate::common::init_logging;
+use crate::common::{init_logging, rustfs_binary_path};
+use crate::scanner_heal_evidence::{EvidenceTopology, RestartObservation, ScannerHealEvidenceCase, restart_evidence_run};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use std::collections::{BTreeMap, HashSet};
@@ -89,6 +90,19 @@ async fn put_large_inventory(client: &Client, bucket: &str) -> TestResult<Vec<Ex
 #[tokio::test]
 async fn three_node_four_drive_ec8_4_root_heal_rebuilds_replaced_drive_after_restart() -> TestResult {
     init_logging();
+    let server_binary = rustfs_binary_path();
+    let evidence_run = restart_evidence_run(
+        &server_binary,
+        ScannerHealEvidenceCase {
+            id: "ec84-target-drive-restart",
+            oracle: "ec84-target-drive-restart.json",
+            evidence: "process-restart",
+            unclean_shutdown_marker: false,
+            topology: EvidenceTopology::new(3, 4),
+            storage_class_standard: Some("EC:4"),
+            erasure_set_drive_count: Some("12"),
+        },
+    )?;
     let mut dist = DistCluster::start_with_env(
         DistLayout::ThreeByFourEc84,
         &[
@@ -119,7 +133,17 @@ async fn three_node_four_drive_ec8_4_root_heal_rebuilds_replaced_drive_after_res
 
     let format_path = replaced_drive.join(".rustfs.sys").join("format.json");
     let format_json = std::fs::read(&format_path)?;
+    let pid_before = dist.cluster.nodes[replaced_node]
+        .process
+        .as_ref()
+        .ok_or("target process is absent")?
+        .id();
     dist.cluster.stop_node_gracefully(replaced_node).await?;
+    let unclean_shutdown_marker = Path::new(&dist.cluster.nodes[replaced_node].data_dir)
+        .join(".rustfs.sys")
+        .join("unclean-shutdown")
+        .is_file();
+    assert!(!unclean_shutdown_marker, "graceful target shutdown must remove its unclean marker");
     let retired_drive = PathBuf::from(format!("{}.retired", replaced_drive.display()));
     std::fs::rename(&replaced_drive, &retired_drive)?;
     std::fs::create_dir_all(format_path.parent().ok_or("replacement format path has no parent")?)?;
@@ -170,6 +194,7 @@ async fn three_node_four_drive_ec8_4_root_heal_rebuilds_replaced_drive_after_res
         .chain(std::iter::once((outage_key.to_string(), outage_body.clone())))
         .collect::<BTreeMap<_, _>>();
     let expected_keys = inventory.keys().cloned().collect::<HashSet<_>>();
+    let mut node_listings = Vec::new();
     for node_index in 0..dist.cluster.nodes.len() {
         let client = dist.client(node_index)?;
         assert_inventory(&client, &bucket, &inventory).await?;
@@ -180,6 +205,45 @@ async fn three_node_four_drive_ec8_4_root_heal_rebuilds_replaced_drive_after_res
             .filter_map(|object| object.key().map(str::to_owned))
             .collect::<HashSet<_>>();
         assert_eq!(observed, expected_keys, "node {node_index} listing diverged after EC8+4 heal");
+        let mut keys = observed.into_iter().collect::<Vec<_>>();
+        keys.sort();
+        node_listings.push(keys);
+    }
+
+    if let Some(evidence_run) = evidence_run {
+        let target_client = dist.client(replaced_node)?;
+        let mut objects = Vec::with_capacity(inventory.len());
+        for (key, body) in &inventory {
+            let response = target_client.get_object().bucket(&bucket).key(key).send().await?;
+            let actual = response.body.collect().await?.into_bytes();
+            assert_eq!(actual.as_ref(), body.as_slice(), "object body changed for {key}");
+            let physical = census_object_version_on_disk(&replaced_drive, &bucket, key, None)?;
+            assert_ec84_geometry(&physical, key)?;
+            let baseline = expected.iter().find(|item| item.key == *key).map(|item| &item.baseline);
+            objects.push(serde_json::json!({
+                "key": key, "version_id": null,
+                "expected_bytes": body.len(), "actual_bytes": actual.len(),
+                "expected_sha256": sha256_hex(body), "actual_sha256": sha256_hex(&actual),
+                "expected_physical": baseline, "physical": physical,
+            }));
+        }
+        let pid_after = dist.cluster.nodes[replaced_node]
+            .process
+            .as_ref()
+            .ok_or("restarted target is absent")?
+            .id();
+        evidence_run.write(
+            &server_binary,
+            RestartObservation {
+                nodes: dist.cluster.nodes.len(),
+                drives_per_node: dist.cluster.topology.drives_per_node,
+                pid_before,
+                pid_after,
+                unclean_shutdown_marker,
+                objects,
+                node_listings,
+            },
+        )?;
     }
 
     Ok(())

@@ -21,16 +21,15 @@ mod tests {
         wait_for_complete_physical_shard_on_disk,
     };
     use crate::common::{
-        ClusterTopology, FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request,
-        init_logging, rustfs_binary_path,
+        FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request, init_logging,
+        rustfs_binary_path,
     };
+    use crate::scanner_heal_evidence::{EvidenceTopology, RestartObservation, ScannerHealEvidenceCase, restart_evidence_run};
     use crate::storage_api::RUSTFS_META_BUCKET;
     use aws_sdk_s3::primitives::ByteStream;
     use http::Method;
-    use sha2::{Digest, Sha256};
     use std::collections::HashSet;
     use std::error::Error;
-    use std::io::{Read, Write};
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -41,52 +40,6 @@ mod tests {
     use tracing::warn;
 
     const POOL_METADATA_OBJECT: &str = "pool.bin";
-
-    #[derive(serde::Deserialize)]
-    struct EvidenceBuild {
-        sha256: String,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct RestartEvidenceRun {
-        schema: u32,
-        run_id: String,
-        source_revision: String,
-        test_build: serde_json::Value,
-        binary: EvidenceBuild,
-        test_binary: EvidenceBuild,
-    }
-
-    #[derive(Clone, Copy)]
-    struct ScannerHealEvidenceCase {
-        id: &'static str,
-        oracle: &'static str,
-        evidence: &'static str,
-        unclean_shutdown_marker: bool,
-        topology: EvidenceTopology,
-        storage_class_standard: Option<&'static str>,
-        erasure_set_drive_count: Option<&'static str>,
-    }
-
-    #[derive(Clone, Copy)]
-    struct EvidenceTopology {
-        nodes: usize,
-        drives_per_node: usize,
-    }
-
-    impl EvidenceTopology {
-        const fn new(nodes: usize, drives_per_node: usize) -> Self {
-            Self { nodes, drives_per_node }
-        }
-
-        fn total_drives(self) -> usize {
-            self.nodes * self.drives_per_node
-        }
-
-        fn cluster_topology(self) -> ClusterTopology {
-            ClusterTopology::single_pool_multidrive(self.nodes, self.drives_per_node)
-        }
-    }
 
     const BACKGROUND_TARGET_RESTART_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
         id: "background-target-restart",
@@ -127,81 +80,6 @@ mod tests {
         storage_class_standard: Some("EC:4"),
         erasure_set_drive_count: Some("12"),
     };
-
-    struct RestartEvidenceContext {
-        directory: PathBuf,
-        run: RestartEvidenceRun,
-        case: ScannerHealEvidenceCase,
-    }
-
-    fn file_sha256(path: &Path) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let mut file = std::fs::File::open(path)?;
-        let mut digest = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            digest.update(&buffer[..read]);
-        }
-        Ok(digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
-    }
-
-    fn restart_evidence_run(
-        binary: &Path,
-        case: ScannerHealEvidenceCase,
-    ) -> Result<Option<RestartEvidenceContext>, Box<dyn Error + Send + Sync>> {
-        let Some(directory) = std::env::var_os("RUSTFS_SCANNER_HEAL_RUN_DIR") else {
-            return Ok(None);
-        };
-        if case.id.is_empty()
-            || case.oracle.is_empty()
-            || !case.oracle.ends_with(".json")
-            || case.oracle.contains('/')
-            || case.oracle.contains('\\')
-            || case.oracle.contains("..")
-            || !matches!(case.evidence, "process-restart" | "process-crash-restart")
-            || (case.evidence == "process-crash-restart") != case.unclean_shutdown_marker
-        {
-            return Err("invalid scanner/heal evidence case".into());
-        }
-        let directory = PathBuf::from(directory);
-        let receipt = directory.join("run.json");
-        if receipt.metadata()?.len() > 1024 * 1024 {
-            return Err("oversized scanner/heal execution receipt".into());
-        }
-        let run: RestartEvidenceRun = serde_json::from_slice(&std::fs::read(receipt)?)?;
-        if run.schema != 1 || run.run_id.len() != 32 || run.source_revision.len() != 40 {
-            return Err("invalid scanner/heal execution identity".into());
-        }
-        let built = compiled_test_identity();
-        for key in ["source_revision", "dirty", "lock_blob", "features"] {
-            assert_eq!(built[key], run.test_build[key], "compiled test identity differs for {key}");
-        }
-        assert_eq!(file_sha256(binary)?, run.binary.sha256, "server binary must match the run receipt");
-        assert_eq!(
-            file_sha256(&std::env::current_exe()?)?,
-            run.test_binary.sha256,
-            "test executable must match the run receipt"
-        );
-        if directory.join(case.oracle).exists() {
-            return Err("scanner/heal oracle already exists; create a new execution receipt".into());
-        }
-        Ok(Some(RestartEvidenceContext { directory, run, case }))
-    }
-
-    fn compiled_test_identity() -> serde_json::Value {
-        serde_json::json!({
-            "source_revision": env!("RUSTFS_E2E_BUILD_COMMIT"),
-            "dirty": env!("RUSTFS_E2E_BUILD_DIRTY") != "false",
-            "lock_blob": env!("RUSTFS_E2E_BUILD_LOCK"),
-            "features": env!("RUSTFS_E2E_BUILD_FEATURES"),
-            "target": env!("RUSTFS_E2E_BUILD_TARGET"),
-            "profile": env!("RUSTFS_E2E_BUILD_PROFILE"),
-            "rustflags_hex": env!("RUSTFS_E2E_BUILD_RUSTFLAGS_HEX"),
-        })
-    }
 
     struct TcpPortBlackhole {
         port: u16,
@@ -943,7 +821,10 @@ mod tests {
         cluster: &RustFSTestClusterEnvironment,
         previous_cycle_end: u64,
     ) -> Result<u64, Box<dyn Error + Send + Sync>> {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let started = Instant::now();
+        let mut deadline = started + Duration::from_secs(60);
+        let catch_up_deadline = deadline + Duration::from_secs(300);
+        let mut catch_up_wait_observed = false;
         loop {
             let mut latest_cycle_end = 0;
             let mut versions_observed = false;
@@ -971,24 +852,61 @@ mod tests {
                 let versions_scanned = metrics["versions_scanned"]
                     .as_u64()
                     .ok_or("scanner status is missing its version-coverage counter")?;
-                latest_cycle_end = latest_cycle_end.max(cycle_end);
+                let cycle_result = metrics["last_cycle_result"]
+                    .as_str()
+                    .ok_or("scanner status is missing its cycle result")?;
+                if cycle_result == "success" {
+                    latest_cycle_end = latest_cycle_end.max(cycle_end);
+                }
                 versions_observed |= versions_scanned > 0;
+                let backlog = &status["pause_backlog"];
+                if !catch_up_wait_observed
+                    && backlog["persistence_state"].as_str() == Some("healthy")
+                    && backlog["durable"].as_bool() == Some(true)
+                    && backlog["phase"].as_str() == Some("catching_up")
+                    && backlog["rate_limited"].as_bool() == Some(true)
+                    && backlog["retry_exhausted"].as_bool() == Some(false)
+                {
+                    let next_attempt = backlog["next_attempt_at_unix_secs"]
+                        .as_u64()
+                        .ok_or("rate-limited scanner backlog is missing its next attempt")?;
+                    let interval = backlog["thresholds"]["catch_up_min_interval_seconds"]
+                        .as_u64()
+                        .ok_or("rate-limited scanner backlog is missing its catch-up interval")?;
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+                    let remaining = next_attempt.saturating_sub(now);
+                    if remaining > 0 {
+                        if interval > 300 || remaining > interval {
+                            return Err(
+                                format!("scanner catch-up schedule exceeds the bounded recovery budget: {backlog}").into()
+                            );
+                        }
+                        // The durable catch-up interval overrides SCANNER_CYCLE=1.
+                        // Honor one observed retry without restarting the deadline on every poll.
+                        deadline = deadline
+                            .max(Instant::now() + Duration::from_secs(remaining + 60))
+                            .min(catch_up_deadline);
+                        catch_up_wait_observed = true;
+                    }
+                }
                 observations.push(format!(
-                    "node{node_index}: end={cycle_end}, versions={versions_scanned}, cycle={}, active={}, leader={}, result={}",
+                    "node{node_index}: end={cycle_end}, versions={versions_scanned}, cycle={}, active={}, leader={}, result={}, backlog={}",
                     metrics["current_cycle"],
                     metrics["current_cycle_active"],
                     metrics["leader_lock_state"],
                     metrics["last_cycle_result"],
+                    backlog,
                 ));
             }
-            // The coordinator records cycle completion, but remote workers
-            // record scanned versions. Both witnesses need not share a node.
+            // Only a successful coordinator cycle counts as completion; deferred
+            // and superseded attempts also advance its end timestamp. Remote
+            // workers record version coverage, so the witnesses can span nodes.
             if latest_cycle_end > previous_cycle_end && versions_observed {
                 return Ok(latest_cycle_end);
             }
             if Instant::now() >= deadline {
                 return Err(format!(
-                    "enabled scanner did not complete an object-scanning cycle after {previous_cycle_end}: {observations:?}"
+                    "enabled scanner did not complete a successful object-scanning cycle after {previous_cycle_end}: {observations:?}"
                 )
                 .into());
             }
@@ -1008,7 +926,7 @@ mod tests {
     async fn test_cluster_root_heal_recovers_remote_shards_after_background_target_restart()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         timeout(
-            Duration::from_secs(420),
+            Duration::from_secs(720),
             run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetRestart),
         )
         .await?
@@ -1018,7 +936,7 @@ mod tests {
     async fn test_cluster_root_heal_recovers_remote_shards_after_background_target_crash()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         timeout(
-            Duration::from_secs(420),
+            Duration::from_secs(720),
             run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetCrash),
         )
         .await?
@@ -1028,7 +946,7 @@ mod tests {
     async fn test_cluster_root_heal_recovers_ec84_shards_after_background_target_restart()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         timeout(
-            Duration::from_secs(420),
+            Duration::from_secs(720),
             run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetRestartEc84),
         )
         .await?
@@ -1038,7 +956,7 @@ mod tests {
     async fn test_cluster_root_heal_recovers_ec84_shards_after_background_target_crash()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         timeout(
-            Duration::from_secs(420),
+            Duration::from_secs(720),
             run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetCrashEc84),
         )
         .await?
@@ -1048,7 +966,7 @@ mod tests {
     async fn test_cluster_root_heal_recovers_remote_shards_after_coordinator_restart() -> Result<(), Box<dyn Error + Send + Sync>>
     {
         timeout(
-            Duration::from_secs(420),
+            Duration::from_secs(720),
             run_cluster_root_heal_interruption(InterruptionScenario::BackgroundCoordinatorRestart),
         )
         .await?
@@ -1155,10 +1073,19 @@ mod tests {
         let server_rust_log = std::env::var("RUSTFS_HEAL_CHAOS_SERVER_RUST_LOG")
             .unwrap_or_else(|_| "rustfs::heal::task=info,rustfs=error".to_string());
         cluster.set_env("RUST_LOG", server_rust_log);
-        let log_dir = std::env::var("RUSTFS_HEAL_CHAOS_LOG_DIR").unwrap_or_else(|_| format!("{}/logs", cluster.temp_dir));
+        let log_dir = if let Some(directory) = std::env::var_os("RUSTFS_HEAL_CHAOS_LOG_DIR") {
+            PathBuf::from(directory)
+        } else if let Some(directory) = std::env::var_os("RUSTFS_E2E_LOG_DIR") {
+            let cluster_name = Path::new(&cluster.temp_dir)
+                .file_name()
+                .ok_or("cluster directory has no name")?;
+            PathBuf::from(directory).join(cluster_name).join("heal")
+        } else {
+            PathBuf::from(&cluster.temp_dir).join("logs")
+        };
         std::fs::create_dir_all(&log_dir)?;
         for node_index in 0..cluster.nodes.len() {
-            cluster.set_node_capture_log_path(node_index, format!("{log_dir}/node{node_index}.log"))?;
+            cluster.set_node_capture_log_path(node_index, log_dir.join(format!("node{node_index}.log")).to_string_lossy())?;
         }
         cluster.start_with_binary(&server_binary).await?;
         let clients = cluster.create_all_clients()?;
@@ -1435,7 +1362,7 @@ mod tests {
         let pre_interrupt_status: serde_json::Value = serde_json::from_str(&pre_interrupt_status_body)
             .map_err(|err| format!("pre-interrupt background heal status is not JSON ({err}): {pre_interrupt_status_body}"))?;
         let pre_interrupt_replacement = replacement_recovery_status(&cluster).await?;
-        let coordinator_log = std::fs::read_to_string(format!("{log_dir}/node0.log"))?;
+        let coordinator_log = std::fs::read_to_string(log_dir.join("node0.log"))?;
         assert!(
             coordinator_log
                 .lines()
@@ -1797,32 +1724,18 @@ mod tests {
         if let Some(evidence_context) = evidence_run {
             let restarted_pid = cluster.nodes[1].process.as_ref().ok_or("restarted target is absent")?.id();
             assert_ne!(target_pid, restarted_pid, "target must be a new process");
-            assert_eq!(
-                file_sha256(&server_binary)?,
-                evidence_context.run.binary.sha256,
-                "server build changed during restart"
-            );
-            let evidence = serde_json::json!({
-                "schema": 1, "case": evidence_context.case.id, "evidence": evidence_context.case.evidence,
-                "run_id": evidence_context.run.run_id, "source_revision": evidence_context.run.source_revision,
-                "test_build": compiled_test_identity(),
-                "binary_sha256": evidence_context.run.binary.sha256,
-                "test_binary_sha256": evidence_context.run.test_binary.sha256,
-                "topology": {"nodes": cluster.nodes.len(), "drives_per_node": cluster.nodes[0].data_dirs.len()},
-                "pid_before": target_pid, "pid_after": restarted_pid,
-                "unclean_shutdown_marker": unclean_shutdown_marker_observed.unwrap_or(false),
-                "objects": evidence_objects, "node_listings": node_listings,
-            });
-            let data = serde_json::to_vec(&evidence)?;
-            if data.len() > 1024 * 1024 {
-                return Err("scanner/heal oracle exceeds the 1 MiB artifact budget".into());
-            }
-            let mut output = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(evidence_context.directory.join(evidence_context.case.oracle))?;
-            output.write_all(&data)?;
-            output.sync_all()?;
+            evidence_context.write(
+                &server_binary,
+                RestartObservation {
+                    nodes: cluster.nodes.len(),
+                    drives_per_node: cluster.nodes[0].data_dirs.len(),
+                    pid_before: target_pid,
+                    pid_after: restarted_pid,
+                    unclean_shutdown_marker: unclean_shutdown_marker_observed.ok_or("missing shutdown marker observation")?,
+                    objects: evidence_objects,
+                    node_listings,
+                },
+            )?;
         }
 
         Ok(())

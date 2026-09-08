@@ -19,7 +19,7 @@
 # case is a two-site 4-node 1-drive pair or a 4-node upgrade). Membership is
 # `[profile.e2e-distributed]` in `.config/nextest.toml`. Storage-sensitive PRs,
 # nightly runs, and manual dispatches all execute the same fail-closed suite.
-# Upgrade cases download the same pinned previous release as e2e-upgrade.yml.
+# Upgrade cases use an independent 1.0.0-rc.2 pin defined below.
 #
 # Isolated pool filesystems: expand/decommission/rebalance cases require
 # independent `statfs` capacity. This job runs on GitHub-hosted
@@ -87,7 +87,7 @@ jobs:
       NO_PROXY: 127.0.0.1,localhost
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
-      # Pinned previous release used by distributed::upgrade_test (same pin as e2e-upgrade.yml).
+      # Independent 1.0.0-rc.2 source pin for distributed::upgrade_test.
       UPGRADE_SOURCE_VERSION: 1.0.0-rc.2
       UPGRADE_SOURCE_ASSET: rustfs-linux-x86_64-gnu-v1.0.0-rc.2.zip
       UPGRADE_SOURCE_SHA256: 7c789386bf85278f865b8e0d359bf4edb84d5aa408cc3fa54a18c25ca74cd6e7
