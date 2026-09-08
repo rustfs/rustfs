@@ -378,6 +378,26 @@ impl ECStore {
         Ok(result)
     }
 
+    /// Whether this replacement set owns the pool's metadata replica.
+    ///
+    /// Pool metadata follows normal object placement within each pool. A valid
+    /// non-owner set has no replica to repair; missing metadata on the owner
+    /// set still requires healing and target-specific readback.
+    pub fn replacement_pool_metadata_applies(&self, pool_index: usize, set_index: usize) -> Result<bool> {
+        let pool = self
+            .pools
+            .get(pool_index)
+            .ok_or_else(|| invalid_heal_pool_index(pool_index, self.pools.len()))?;
+        let selected = pool.get_disks_for_heal_object(
+            POOL_META_NAME,
+            &HealOpts {
+                set: Some(set_index),
+                ..Default::default()
+            },
+        )?;
+        Ok(Arc::ptr_eq(&selected, &pool.get_disks_by_key(POOL_META_NAME)))
+    }
+
     #[instrument(skip(self, targets), fields(pool_index, set_index, target_count = targets.len()))]
     pub async fn replacement_targets_have_version(
         &self,
@@ -827,6 +847,73 @@ mod tests {
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn replacement_pool_metadata_applies_to_the_written_replica_in_each_pool() {
+        let mut store = minimal_heal_store().await;
+        for pool_index in 0..store.pools.len() {
+            assert!(
+                store
+                    .replacement_pool_metadata_applies(pool_index, 0)
+                    .expect("a valid single-set pool should have a metadata owner")
+            );
+        }
+        store.ctx = Arc::new(InstanceContext::new());
+        for algorithm in [
+            crate::disk::format::DistributionAlgoVersion::V1,
+            crate::disk::format::DistributionAlgoVersion::V2,
+            crate::disk::format::DistributionAlgoVersion::V3,
+        ] {
+            let mut temp_dirs = Vec::new();
+            for pool_index in 0..store.pools.len() {
+                let (dirs, mut pool) =
+                    crate::core::sets::make_local_two_set_sets_for_pool_with_ctx(Arc::clone(&store.ctx), pool_index).await;
+                temp_dirs.extend(dirs);
+                Arc::get_mut(&mut pool)
+                    .expect("fixture pool should have one owner")
+                    .distribution_algo = algorithm.clone();
+                store.pools[pool_index] = pool;
+            }
+            for (pool_index, pool) in store.pools.iter().enumerate() {
+                let mut required_sets = 0;
+                for set_index in 0..pool.disk_set.len() {
+                    required_sets += usize::from(
+                        store
+                            .replacement_pool_metadata_applies(pool_index, set_index)
+                            .expect("valid replacement topology should be classified before metadata exists"),
+                    );
+                }
+                assert_eq!(required_sets, 1, "missing metadata cannot exempt the owner set");
+                save_config(pool.clone(), POOL_META_NAME, b"pool metadata placement".to_vec())
+                    .await
+                    .expect("normal config writes should persist one metadata replica per pool");
+                for (set_index, set) in pool.disk_set.iter().enumerate() {
+                    let applies = store
+                        .replacement_pool_metadata_applies(pool_index, set_index)
+                        .expect("valid replacement topology should be classified");
+                    let disks = set.disks.read().await.clone();
+                    for disk in disks.iter().flatten() {
+                        let replica = disk.read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false).await;
+                        if applies {
+                            replica.expect("the metadata owner must match actual persisted shards");
+                        } else {
+                            assert!(
+                                matches!(replica, Err(crate::disk::error::DiskError::FileNotFound)),
+                                "non-owner sets must have no persisted metadata shard; observed error: {:?}",
+                                replica.as_ref().err()
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    store
+                        .replacement_pool_metadata_applies(pool_index, pool.disk_set.len())
+                        .is_err()
+                );
+            }
+        }
+        assert!(store.replacement_pool_metadata_applies(store.pools.len(), 0).is_err());
     }
 
     async fn remove_pool_meta_shard(store: &ECStore, pool_idx: usize) -> DiskStore {

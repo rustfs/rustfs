@@ -168,6 +168,10 @@ pub async fn test_sftp_core_operations() -> Result<()> {
             .await
             .map_err(|e| anyhow!("{}", e))?;
 
+        // Protocol listeners can accept connections before IAM is initialized.
+        let s3 = build_test_s3_client(S3_ENDPOINT);
+        wait_for_s3_ready(&s3, S3_READY_ATTEMPTS).await?;
+
         let (session, sftp) = connect_sftp().await?;
 
         // --- 1. Subsystem canary: SFTP session reachable after password auth ---
@@ -348,16 +352,6 @@ pub async fn test_sftp_core_operations() -> Result<()> {
         let _ = bad_session.disconnect(russh::Disconnect::ByApplication, "", "en").await;
         info!("PASS: bad-password authentication rejected");
 
-        // --- Cross-protocol setup: aws-sdk-s3 client against the same server ---
-        // The rustfs binary spawned for this suite serves both SFTP on port
-        // 9022 and S3 on port 9000. The S3 stack may need a moment to finish
-        // initialising after TCP is listening, so list_buckets is polled
-        // until it succeeds before any cross-protocol assertion runs.
-        info!("Testing SFTP: prepare aws-sdk-s3 client and wait for S3 readiness");
-        let s3 = build_test_s3_client(S3_ENDPOINT);
-        wait_for_s3_ready(&s3, S3_READY_ATTEMPTS).await?;
-        info!("PASS: S3 endpoint reachable from cross-protocol client");
-
         // --- SFTP write, S3 read: SHA256 round-trip ---
         // SFTP creates the object, then assert_cross_protocol_sha_match
         // fetches it via both S3 GetObject and SFTP READ and compares
@@ -521,6 +515,9 @@ pub async fn test_sftp_idle_timeout_disconnects() -> Result<()> {
         ProtocolTestEnvironment::wait_for_port_ready(IDLE_SFTP_PORT, 30)
             .await
             .map_err(|e| anyhow!("{}", e))?;
+
+        let s3 = build_test_s3_client(&format!("http://{IDLE_S3_ADDRESS}"));
+        wait_for_s3_ready(&s3, S3_READY_ATTEMPTS).await?;
 
         let (session, sftp) = connect_sftp_to(IDLE_SFTP_ADDRESS).await?;
 

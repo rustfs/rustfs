@@ -957,6 +957,10 @@ impl ErasureSetHealer {
             });
         }
 
+        if !self.storage.replacement_pool_metadata_applies(&self.heal_opts).await? {
+            return Ok(());
+        }
+
         let object_key = format!("{RUSTFS_META_BUCKET}/{POOL_META_NAME}");
         let checkpoint_key = compose_key(&object_key, None);
         let checkpoint = checkpoint_manager.get_checkpoint().await;
@@ -2029,6 +2033,8 @@ mod resume_loop_tests {
     #[derive(Clone)]
     enum HealOutcome {
         Ok,
+        /// The object has no metadata on any disk in the selected set.
+        FileNotFound,
         /// The version vanished before heal ran (deleted mid-heal).
         VersionNotFound,
         /// A transient infrastructure condition (offline disk / unmet quorum):
@@ -2054,6 +2060,8 @@ mod resume_loop_tests {
         /// Target-specific physical readback evidence per `compose_key`; the
         /// fake models a healthy backend unless a test explicitly revokes it.
         replacement_commit_evidence: Mutex<HashMap<String, ReplacementCommitEvidence>>,
+        pool_metadata_not_applicable: AtomicBool,
+        fail_pool_metadata_scope: AtomicBool,
         lifecycle_expired: Mutex<HashSet<String>>,
         /// every heal_object call recorded as (name, version_id)
         heal_calls: Mutex<Vec<(String, Option<String>)>>,
@@ -2155,6 +2163,7 @@ mod resume_loop_tests {
             let outcome = self.outcomes.lock().unwrap().get(&key).cloned().unwrap_or(HealOutcome::Ok);
             match outcome {
                 HealOutcome::Ok => Ok((self.results.lock().unwrap().get(&key).cloned().unwrap_or_default(), None)),
+                HealOutcome::FileNotFound => Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileNotFound)))),
                 HealOutcome::VersionNotFound => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
@@ -2167,6 +2176,17 @@ mod resume_loop_tests {
         }
         async fn heal_format(&self, _dry: bool) -> Result<(HealResultItem, Option<Error>)> {
             Ok((HealResultItem::default(), None))
+        }
+        async fn replacement_pool_metadata_applies(&self, opts: &HealOpts) -> Result<bool> {
+            if self.fail_pool_metadata_scope.load(Ordering::SeqCst) {
+                return Err(Error::other("injected pool metadata scope failure"));
+            }
+            if self.pool_metadata_not_applicable.load(Ordering::SeqCst) {
+                assert_eq!(opts.pool, Some(0));
+                assert_eq!(opts.set, Some(1));
+                return Ok(false);
+            }
+            Ok(true)
         }
         async fn replacement_targets_have_version(
             &self,
@@ -2711,6 +2731,111 @@ mod resume_loop_tests {
         );
         assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
         drop(checkpoint);
+    }
+
+    #[tokio::test]
+    async fn replacement_pool_metadata_non_owner_completes_but_missing_owner_retries() {
+        for owns_pool_metadata in [false, true] {
+            let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+            let replacement_task_id = ResumeUtils::generate_task_id();
+            let set_index = usize::from(!owns_pool_metadata);
+            let set_disk_id = format!("pool_0_set_{set_index}");
+            ResumeManager::new_replacement_intent(
+                env.healer.disk.clone(),
+                replacement_task_id.clone(),
+                set_disk_id.clone(),
+                vec!["b".to_string()],
+                vec!["replacement-a".to_string()],
+                vec![crate::heal::resume::ReplacementTargetIdentity {
+                    endpoint: "replacement-a".to_string(),
+                    canonical_path: "/mnt/replacement-a".to_string(),
+                    physical_device_ids: vec!["device-a".to_string()],
+                    filesystem_identity: "1:2:3".to_string(),
+                }],
+            )
+            .await
+            .expect("replacement intent should persist");
+            env.storage
+                .pool_metadata_not_applicable
+                .store(!owns_pool_metadata, Ordering::SeqCst);
+            env.storage.set_outcome(POOL_META_NAME, None, HealOutcome::FileNotFound);
+            let healer = ErasureSetHealer::new(
+                env.storage.clone(),
+                Arc::new(RwLock::new(HealProgress::new())),
+                CancellationToken::new(),
+                env.healer.disk.clone(),
+                HealOpts {
+                    pool: Some(0),
+                    set: Some(set_index),
+                    ..Default::default()
+                },
+                HealRequestSource::AutoHeal,
+            )
+            .with_replacement_targets(vec!["replacement-a".to_string()], Some(replacement_task_id.clone()));
+
+            let result = healer.heal_erasure_set(&["b".to_string()], &set_disk_id).await;
+            let state = ResumeManager::load_replacement_intent(env.healer.disk.clone(), &replacement_task_id)
+                .await
+                .expect("replacement state must remain until marker cleanup")
+                .get_state()
+                .await;
+            if owns_pool_metadata {
+                let error = result.expect_err("missing metadata in the owner set must keep replacement incomplete");
+                assert!(error.to_string().contains("Replacement erasure set heal incomplete"));
+                assert!(!state.completed);
+                assert_eq!(state.replacement_phase, crate::heal::resume::ReplacementPhase::Intent);
+                assert_eq!(state.retry_count, 1);
+                assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
+            } else {
+                result.expect("a non-owner set must complete without a pool metadata replica");
+                assert!(state.completed);
+                assert_eq!(state.replacement_phase, crate::heal::resume::ReplacementPhase::Verified);
+                assert_eq!(state.retry_count, 0);
+                assert!(env.storage.calls().is_empty(), "non-owner sets must not attempt pool metadata repair");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_pool_metadata_unknown_scope_cannot_complete() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts {
+                pool: Some(0),
+                set: Some(0),
+                ..Default::default()
+            },
+            HealRequestSource::AutoHeal,
+        )
+        .with_replacement_targets(vec!["replacement-a".to_string()], Some("generation-a".to_string()));
+        env.storage.fail_pool_metadata_scope.store(true, Ordering::SeqCst);
+        env.storage
+            .set_result(POOL_META_NAME, None, replacement_target_ok_result("replacement-a", POOL_META_NAME));
+        let mut processed_objects = 0;
+        let mut successful_objects = 0;
+        let mut failed_objects = 0;
+        let mut skipped_objects = 0;
+        let error = healer
+            .heal_replacement_pool_metadata(
+                "pool_0_set_0",
+                &mut super::ErasureSetPassCounters {
+                    processed_objects: &mut processed_objects,
+                    successful_objects: &mut successful_objects,
+                    failed_objects: &mut failed_objects,
+                    skipped_objects: &mut skipped_objects,
+                },
+                &env.resume,
+                &env.checkpoint,
+            )
+            .await
+            .expect_err("unknown metadata placement must keep replacement incomplete");
+        assert!(error.to_string().contains("injected pool metadata scope failure"));
+        assert!(env.storage.calls().is_empty());
+        assert_eq!((processed_objects, successful_objects, failed_objects, skipped_objects), (0, 0, 0, 0));
     }
 
     #[tokio::test]

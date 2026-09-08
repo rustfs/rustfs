@@ -436,6 +436,14 @@ pub trait HealStorageAPI: Send + Sync {
         Err(Error::other("target-scoped replacement format is unsupported"))
     }
 
+    /// Whether the selected replacement set owns the pool metadata replica.
+    ///
+    /// Only a topology-aware backend may exempt a valid non-owner set. The
+    /// conservative default requires the existing repair and readback checks.
+    async fn replacement_pool_metadata_applies(&self, _opts: &HealOpts) -> Result<bool> {
+        Ok(true)
+    }
+
     /// Read target-specific physical evidence for one replacement version.
     ///
     /// This is only used by automatic replacement healing after the normal
@@ -1265,6 +1273,18 @@ impl HealStorageAPI for ECStoreHealStorage {
             .heal_replacement_format(dry_run, pool_index, set_index, targets)
             .await
             .map(|(result, error)| (result, error.map(Error::Storage)))
+            .map_err(Error::Storage)
+    }
+
+    async fn replacement_pool_metadata_applies(&self, opts: &HealOpts) -> Result<bool> {
+        let pool_index = opts
+            .pool
+            .ok_or_else(|| Error::other("replacement pool metadata is missing pool scope"))?;
+        let set_index = opts
+            .set
+            .ok_or_else(|| Error::other("replacement pool metadata is missing set scope"))?;
+        self.ecstore
+            .replacement_pool_metadata_applies(pool_index, set_index)
             .map_err(Error::Storage)
     }
 

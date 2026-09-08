@@ -79,6 +79,11 @@ pub async fn test_sftp_compliance_suite() -> Result<()> {
             .await
             .map_err(|e| anyhow!("{}", e))?;
 
+        // Protocol listeners can accept connections before IAM is initialized.
+        // A signed S3 request establishes readiness before the first SFTP login.
+        let s3 = build_test_s3_client(&format!("http://{COMPLIANCE_RW_S3_ADDRESS}"));
+        wait_for_s3_ready(&s3, 30).await?;
+
         let (session, sftp) = connect_sftp_to(COMPLIANCE_RW_SFTP_ADDRESS).await?;
 
         cmptst_01::run_medium_binary_round_trip(&sftp).await?;
@@ -101,8 +106,6 @@ pub async fn test_sftp_compliance_suite() -> Result<()> {
         // reach the finalised object as x-amz-meta-* user metadata
         // through the CreateMultipartUpload input field. The S3 client
         // connects to the same rustfs process this suite already drives.
-        let s3 = build_test_s3_client(&format!("http://{COMPLIANCE_RW_S3_ADDRESS}"));
-        wait_for_s3_ready(&s3, 30).await?;
         cmptst_34::run_open_attrs_round_trip_multipart(&sftp, &s3).await?;
 
         drop(sftp);
