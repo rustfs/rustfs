@@ -59,6 +59,36 @@ async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::
 
     assert_eq!(put_response.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
 
+    // A missing key in the healthy store is a client error, unlike a store outage.
+    let missing_key_object = "test-missing-kms-key";
+    let missing_key_error = s3_client
+        .put_object()
+        .bucket(TEST_BUCKET)
+        .key(missing_key_object)
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"must not be published"))
+        .server_side_encryption(ServerSideEncryption::AwsKms)
+        .ssekms_key_id("rustfs-e2e-test-missing-key")
+        .send()
+        .await
+        .expect_err("an unknown key in a healthy Local KMS store must reject the write");
+    assert_eq!(missing_key_error.raw_response().map(|response| response.status().as_u16()), Some(400));
+    assert_eq!(
+        missing_key_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("KMS.NotFoundException")
+    );
+    let missing_key_absence = s3_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(missing_key_object)
+        .send()
+        .await
+        .expect_err("a write rejected by a missing KMS key must not publish an object");
+    assert_eq!(missing_key_absence.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(
+        missing_key_absence.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("NoSuchKey")
+    );
+
     // Temporarily rename the key directory to simulate unavailability
     info!("🔧 Simulating key directory unavailability");
     let backup_dir = format!("{}.backup", kms_env.kms_keys_dir);

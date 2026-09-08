@@ -1233,6 +1233,9 @@ impl LocalKmsClient {
     async fn decode_stored_key(&self, key_id: &str) -> Result<(StoredMasterKey, Vec<u8>)> {
         let key_path = self.master_key_path(key_id)?;
         if !fs::try_exists(&key_path).await? {
+            // Only an accessible key store can establish that a single key is
+            // missing; a directory outage must retain its filesystem error.
+            let _ = fs::read_dir(&self.config.key_dir).await?;
             return Err(KmsError::key_not_found(key_id));
         }
 
@@ -2385,6 +2388,76 @@ mod tests {
         };
         let client = LocalKmsClient::new(config).await.expect("Failed to create dev-mode client");
         (client, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn local_key_directory_outage_is_io_error_and_recovers_original_key() {
+        let root = TempDir::new().expect("create isolated key store");
+        let key_dir = root.path().join("keys");
+        let unavailable_dir = root.path().join("keys-unavailable");
+        let config = KmsConfig::local(key_dir.clone()).with_insecure_development_defaults();
+        let backend = LocalKmsBackend::new(config).await.expect("start Local KMS");
+        let key_id = "directory-outage-key";
+        backend
+            .create_key(CreateKeyRequest {
+                key_name: Some(key_id.to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("create the original key");
+        let request = |key_id: &str| GenerateDataKeyRequest {
+            key_id: key_id.to_string(),
+            key_spec: KeySpec::Aes256,
+            encryption_context: HashMap::new(),
+        };
+        let before = backend
+            .generate_data_key(request(key_id))
+            .await
+            .expect("generate a data key before the outage");
+        let missing_key = backend.generate_data_key(request("no-such-key")).await;
+        let key_path = key_dir.join(format!("{key_id}.key"));
+        let original_record = fs::read(&key_path).await.expect("read the original key record");
+
+        fs::rename(&key_dir, &unavailable_dir)
+            .await
+            .expect("make the key directory unavailable");
+        let unavailable = backend.generate_data_key(request(key_id)).await;
+        // Restore before checking the error so the failing regression leaves no
+        // orphaned key store; both paths also belong to the same temporary root.
+        fs::rename(&unavailable_dir, &key_dir)
+            .await
+            .expect("restore the original key directory");
+
+        let after = backend
+            .generate_data_key(request(key_id))
+            .await
+            .expect("generate a data key after directory restoration");
+        for data_key in [&before, &after] {
+            let decrypted = backend
+                .decrypt(DecryptRequest {
+                    ciphertext: data_key.ciphertext_blob.clone(),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                })
+                .await
+                .expect("the original master key must decrypt both data keys");
+            assert!(
+                decrypted.plaintext == data_key.plaintext_key,
+                "directory restoration must preserve the original key material"
+            );
+        }
+        assert!(
+            fs::read(&key_path).await.expect("read the restored key record") == original_record,
+            "reads and recovery must not rewrite the key record"
+        );
+        assert!(
+            matches!(missing_key, Err(KmsError::KeyNotFound { key_id }) if key_id == "no-such-key"),
+            "a missing key in a readable directory must remain KeyNotFound"
+        );
+        assert!(
+            matches!(unavailable, Err(KmsError::IoError { .. })),
+            "an unavailable key directory must remain an I/O error, not KeyNotFound"
+        );
     }
 
     /// With the AAD write switch on, the Local backend seals the stored
