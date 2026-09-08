@@ -1873,6 +1873,52 @@ def validate_release_bundle_gate_windows(gate: str, field_windows: dict[str, str
         require(len(windows) == 1, f"{gate} evidence fields must share one measurement window")
 
 
+def validate_scanner_heal_release_bundle_gate(bundle_path: Path, source_revision: str,
+                                              requirements: dict[str, dict[str, object]],
+                                              raw_gates: dict[str, object], gate: str) -> list[str]:
+    gate_errors: list[str] = []
+    requirement = requirements[gate]
+    gate_evidence = raw_gates.get(gate)
+    if not isinstance(gate_evidence, dict):
+        return ["missing gate evidence"]
+    if gate_evidence.get("status") != "pass":
+        gate_errors.append("gate status must be pass")
+    if gate_evidence.get("lane") != requirement["lane"]:
+        gate_errors.append("gate lane mismatch")
+    if gate_evidence.get("evidence_type") != "measured":
+        gate_errors.append("gate evidence type must be measured")
+    fields = gate_evidence.get("evidence_fields")
+    if not isinstance(fields, dict):
+        gate_errors.append("missing gate evidence fields")
+        fields = {}
+    required_fields = tuple(SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate])
+    missing_fields = [field for field in required_fields if field not in fields]
+    if missing_fields:
+        gate_errors.append(f"missing required fields: {', '.join(missing_fields)}")
+    field_windows: dict[str, str] = {}
+    for field in required_fields:
+        if field not in fields:
+            continue
+        evidence = fields[field]
+        if not isinstance(evidence, dict):
+            gate_errors.append(f"{field} must be an object")
+            continue
+        for marker in ("fixture_only", "dry_run", "synthetic"):
+            if evidence.get(marker) is True:
+                gate_errors.append(f"{field} is {marker}")
+                continue
+        try:
+            field_windows[field] = validate_release_bundle_artifact(bundle_path, source_revision, gate, field, evidence)
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            gate_errors.append(str(error))
+    if not gate_errors:
+        try:
+            validate_release_bundle_gate_windows(gate, field_windows)
+        except ValueError as error:
+            gate_errors.append(str(error))
+    return gate_errors
+
+
 def scanner_heal_release_bundle_status(root: Path, bundle_path: Path) -> dict[str, object]:
     """Validate a complete hard-gate evidence bundle without accepting synthetic claims."""
     registry = read_json(root / ".config/scanner-heal-required-tests.json")
@@ -1894,47 +1940,8 @@ def scanner_heal_release_bundle_status(root: Path, bundle_path: Path) -> dict[st
 
     verified: list[str] = []
     rejected: dict[str, list[str]] = {}
-    for gate, requirement in requirements.items():
-        gate_errors: list[str] = []
-        gate_evidence = raw_gates.get(gate)
-        if not isinstance(gate_evidence, dict):
-            rejected[gate] = ["missing gate evidence"]
-            continue
-        if gate_evidence.get("status") != "pass":
-            gate_errors.append("gate status must be pass")
-        if gate_evidence.get("lane") != requirement["lane"]:
-            gate_errors.append("gate lane mismatch")
-        if gate_evidence.get("evidence_type") != "measured":
-            gate_errors.append("gate evidence type must be measured")
-        fields = gate_evidence.get("evidence_fields")
-        if not isinstance(fields, dict):
-            gate_errors.append("missing gate evidence fields")
-            fields = {}
-        required_fields = tuple(SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate])
-        missing_fields = [field for field in required_fields if field not in fields]
-        if missing_fields:
-            gate_errors.append(f"missing required fields: {', '.join(missing_fields)}")
-        field_windows: dict[str, str] = {}
-        for field in required_fields:
-            if field not in fields:
-                continue
-            evidence = fields[field]
-            if not isinstance(evidence, dict):
-                gate_errors.append(f"{field} must be an object")
-                continue
-            for marker in ("fixture_only", "dry_run", "synthetic"):
-                if evidence.get(marker) is True:
-                    gate_errors.append(f"{field} is {marker}")
-                    continue
-            try:
-                field_windows[field] = validate_release_bundle_artifact(bundle_path, source_revision, gate, field, evidence)
-            except (OSError, KeyError, TypeError, ValueError) as error:
-                gate_errors.append(str(error))
-        if not gate_errors:
-            try:
-                validate_release_bundle_gate_windows(gate, field_windows)
-            except ValueError as error:
-                gate_errors.append(str(error))
+    for gate in requirements:
+        gate_errors = validate_scanner_heal_release_bundle_gate(bundle_path, source_revision, requirements, raw_gates, gate)
         if gate_errors:
             rejected[gate] = gate_errors
         else:
@@ -1953,6 +1960,43 @@ def scanner_heal_release_bundle_status(root: Path, bundle_path: Path) -> dict[st
         "rejected_gates": rejected,
         "pending_gates": [] if approved else sorted(gate for gate in requirements if gate not in verified),
         "pending_lanes": [] if approved else pending_lanes,
+    }
+
+
+def scanner_heal_release_bundle_gate_status(root: Path, bundle_path: Path, gate: str) -> dict[str, object]:
+    """Validate one measured release-bundle gate without approving the full release."""
+    registry = read_json(root / ".config/scanner-heal-required-tests.json")
+    requirements, release_schema_capable, pending_lanes = scanner_heal_release_requirements(registry)
+    require(release_schema_capable, "scanner/heal release bundle gate requires schema 2 registry")
+    require(gate in requirements, f"unknown scanner/heal release gate: {gate}")
+    bundle_path = bundle_path.resolve()
+    bundle = read_json(bundle_path)
+    for marker in ("fixture_only", "dry_run", "synthetic"):
+        require(bundle.get(marker) is not True, f"scanner/heal release evidence bundle is {marker}")
+    require(bundle.get("schema") == 1, "unsupported scanner/heal release evidence bundle schema")
+    require(bundle.get("evidence") == "measured", "scanner/heal release evidence bundle must be measured")
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    source_revision = bundle.get("source_revision")
+    require(isinstance(source_revision, str) and re.fullmatch(r"[0-9a-f]{40}", source_revision) is not None and
+            source_revision == revision,
+            "scanner/heal release evidence source revision mismatch")
+    raw_gates = bundle.get("gates")
+    require(isinstance(raw_gates, dict), "scanner/heal release evidence bundle missing gates")
+    unknown = sorted(set(raw_gates) - set(requirements))
+    require(not unknown, f"scanner/heal release evidence bundle has unknown gates: {', '.join(unknown)}")
+
+    gate_errors = validate_scanner_heal_release_bundle_gate(bundle_path, source_revision, requirements, raw_gates, gate)
+    verified = not gate_errors
+    return {
+        "schema": 1,
+        "decision": "verified" if verified else "blocked",
+        "release_approved": False,
+        "release_schema_capable": release_schema_capable,
+        "verified_gate": gate if verified else None,
+        "rejected_gate": None if verified else gate,
+        "rejected_errors": gate_errors,
+        "pending_gates": sorted(item for item in requirements if item != gate),
+        "pending_lanes": pending_lanes,
     }
 
 
@@ -2693,6 +2737,44 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(evidence["artifact"], "artifacts/G01-root_authority_evidence.json")
             self.assertEqual(evidence["sha256"], digest(bundle.parent / evidence["artifact"]))
             self.assertTrue((bundle.parent / evidence["artifact"]).is_file())
+
+    def test_scanner_heal_release_bundle_gate_accepts_single_measured_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            data = read_json(bundle)
+            data["gates"] = {"G09": data["gates"]["G09"]}
+            write_json(bundle, data)
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                status = scanner_heal_release_bundle_gate_status(root, bundle, "G09")
+                full_status = scanner_heal_release_bundle_status(root, bundle)
+            self.assertEqual(status["decision"], "verified")
+            self.assertFalse(status["release_approved"])
+            self.assertEqual(status["verified_gate"], "G09")
+            self.assertIn("G07", status["pending_gates"])
+            self.assertEqual(full_status["decision"], "blocked")
+            self.assertFalse(full_status["release_approved"])
+
+    def test_scanner_heal_release_bundle_gate_rejects_missing_field(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            data = read_json(bundle)
+            del data["gates"]["G09"]["evidence_fields"]["rollback_payload_evidence"]
+            write_json(bundle, data)
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                status = scanner_heal_release_bundle_gate_status(root, bundle, "G09")
+            self.assertEqual(status["decision"], "blocked")
+            self.assertFalse(status["release_approved"])
+            self.assertIn("missing required fields: rollback_payload_evidence", status["rejected_errors"])
+
+    def test_scanner_heal_release_bundle_gate_rejects_unknown_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            data = read_json(bundle)
+            data["gates"] = {"G09": data["gates"]["G09"], "Z99": {"status": "pass"}}
+            write_json(bundle, data)
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                with self.assertRaisesRegex(ValueError, "unknown gates: Z99"):
+                    scanner_heal_release_bundle_gate_status(root, bundle, "G09")
 
     def test_scanner_heal_release_bundle_assembler_rejects_fixture_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4169,6 +4251,7 @@ def main() -> int:
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
     if sys.argv[1:2] in (["--begin-scanner-heal"], ["--finish-scanner-heal"], ["--check-scanner-heal"],
                          ["--check-scanner-heal-release"], ["--check-scanner-heal-release-bundle"],
+                         ["--check-scanner-heal-release-bundle-gate"],
                          ["--assemble-scanner-heal-release-bundle"],
                          ["--write-scanner-heal-release-bundle-fixture"]):
         try:
@@ -4203,6 +4286,15 @@ def main() -> int:
                     return 2
                 print(json.dumps(status, sort_keys=True, separators=(",", ":")))
                 return 0 if status["release_approved"] else 1
+            if len(sys.argv) == 4 and sys.argv[1] == "--check-scanner-heal-release-bundle-gate":
+                try:
+                    status = scanner_heal_release_bundle_gate_status(ROOT, Path(sys.argv[2]), sys.argv[3])
+                except (OSError, KeyError, TypeError, ValueError, ET.ParseError) as error:
+                    print(json.dumps({"schema": 1, "decision": "invalid", "release_approved": False,
+                                      "error": str(error)}, sort_keys=True, separators=(",", ":")))
+                    return 2
+                print(json.dumps(status, sort_keys=True, separators=(",", ":")))
+                return 0 if status["decision"] == "verified" else 1
             if len(sys.argv) == 4 and sys.argv[1] == "--assemble-scanner-heal-release-bundle":
                 try:
                     bundle, status = assemble_scanner_heal_release_bundle(ROOT, Path(sys.argv[2]), Path(sys.argv[3]))
@@ -4217,7 +4309,7 @@ def main() -> int:
                 bundle = write_scanner_heal_release_bundle_fixture(ROOT, Path(sys.argv[2]))
                 print(bundle)
                 return 0
-            raise ValueError("expected --begin-scanner-heal DIR BINARY TEST_BINARY, --finish-scanner-heal DIR EXIT, --check-scanner-heal DIR CASE|release, --check-scanner-heal-release DIR, --check-scanner-heal-release-bundle FILE, --assemble-scanner-heal-release-bundle DESCRIPTOR DIR, or --write-scanner-heal-release-bundle-fixture DIR")
+            raise ValueError("expected --begin-scanner-heal DIR BINARY TEST_BINARY, --finish-scanner-heal DIR EXIT, --check-scanner-heal DIR CASE|release, --check-scanner-heal-release DIR, --check-scanner-heal-release-bundle FILE, --check-scanner-heal-release-bundle-gate FILE GATE, --assemble-scanner-heal-release-bundle DESCRIPTOR DIR, or --write-scanner-heal-release-bundle-fixture DIR")
         except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
             print(f"ERROR: {error}", file=sys.stderr)
             return 1
@@ -4245,6 +4337,7 @@ def main() -> int:
         print(
             "usage: check_test_wiring.py [--self-test | --check-core LISTING | --check-profile PROFILE LISTING | "
             "--update-profile PROFILE LISTING PLATFORM | --check-scanner-heal-release-bundle FILE | "
+            "--check-scanner-heal-release-bundle-gate FILE GATE | "
             "--assemble-scanner-heal-release-bundle DESCRIPTOR DIR | --write-scanner-heal-release-bundle-fixture DIR]",
             file=sys.stderr,
         )
