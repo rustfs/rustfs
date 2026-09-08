@@ -88,7 +88,7 @@ use std::sync::{LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 use url::form_urlencoded;
 use uuid::Uuid;
@@ -4238,7 +4238,31 @@ async fn drive_pending_endpoint_refresh(
     Ok((peer_errors, complete))
 }
 
+/// The coordinator of an endpoint edit snapshots the topology it must fan out
+/// to into `remote_peers`; the peer-side handler persists its journal with an
+/// empty map ([`SRPeerEditHandler`]) because it fans out to nobody. Only the
+/// coordinator's journal may be resumed here. A receiver's journal has no
+/// required peers, so it would read as complete on the first tick and commit
+/// through [`edit_state`] instead of [`apply_internal_peer_edit`] — dropping
+/// the local-name sync and racing the in-flight request that owns it, whose
+/// own commit would then report the refresh as changed and leave the
+/// coordinator waiting for an acknowledgement it will never get. A receiver's
+/// journal is redriven by the coordinator resending the same refresh id.
+fn pending_endpoint_refresh_is_locally_driven(pending: &PendingEndpointRefresh) -> bool {
+    !pending.remote_peers.is_empty()
+}
+
 async fn resume_pending_endpoint_refresh(state: &SiteReplicationState, pending: &PendingEndpointRefresh) {
+    if !pending_endpoint_refresh_is_locally_driven(pending) {
+        debug!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "pending_endpoint_refresh_owned_by_peer_request",
+            "admin site replication state"
+        );
+        return;
+    }
     match drive_pending_endpoint_refresh(state, pending).await {
         Ok((peer_errors, true)) if peer_errors.is_empty() => {
             info!(
@@ -11814,6 +11838,38 @@ mod tests {
                 ..Default::default()
             }
         ));
+    }
+
+    /// The peer-side edit handler journals a refresh with no `remote_peers`
+    /// and commits it inside the same request. That journal reads as complete
+    /// on sight, so the reconcile tick must not adopt it: committing it here
+    /// would use `edit_state` (no local-name sync) and would clear the journal
+    /// under the request that owns it, whose own commit then reports the
+    /// refresh as changed and denies the coordinator its acknowledgement.
+    #[test]
+    fn a_peer_side_endpoint_refresh_journal_is_not_resumed_locally() {
+        let (state, coordinator_pending, local) = endpoint_refresh_remove_fixture();
+        let peer_side = PendingEndpointRefresh {
+            remote_peers: BTreeMap::new(),
+            acked_deployment_ids: BTreeSet::new(),
+            ..coordinator_pending.clone()
+        };
+
+        assert!(pending_endpoint_refresh_is_locally_driven(&coordinator_pending));
+        assert!(!pending_endpoint_refresh_is_locally_driven(&peer_side));
+        assert!(
+            pending_endpoint_refresh_is_complete(&state, &peer_side, &local),
+            "a peer-side journal has no required peers, so only the driver guard keeps the tick off it"
+        );
+        assert!(
+            include_str!("site_replication.rs")
+                .split("async fn resume_pending_endpoint_refresh")
+                .nth(1)
+                .and_then(|rest| rest.split("async fn pending_remove_ready_to_finalize").next())
+                .expect("resume body")
+                .contains("pending_endpoint_refresh_is_locally_driven"),
+            "the resume path must refuse a journal it does not own"
+        );
     }
 
     #[test]
