@@ -33,7 +33,7 @@
 1|crates/ecstore/src/disk/mod.rs
 5|crates/ecstore/src/erasure/codec/bridge.rs
 1|crates/ecstore/src/erasure/coding/decode_reader.rs
-10|crates/ecstore/src/erasure/coding/encode.rs
+8|crates/ecstore/src/erasure/coding/encode.rs
 25|crates/ecstore/src/erasure/coding/erasure.rs
 3|crates/ecstore/src/layout/disks_layout.rs
 2|crates/ecstore/src/layout/endpoint.rs
