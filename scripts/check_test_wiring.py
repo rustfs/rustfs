@@ -75,6 +75,9 @@ SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
         "multi_pool_evidence",
         "distributed_segment_invalidation_evidence",
     ),
+    "P4": (
+        "mrf_cleanup_gc_soak_evidence",
+    ),
     "P2": (
         "post_stop_convergence_measurement",
         "cold_segment_reuse_measurement",
@@ -98,7 +101,12 @@ SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS = {
     "P1": ("cold_walk_share_measurement", "foreground_latency_throughput_measurement", "profile_evidence"),
     "P2": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P2"],
     "P3": ("two_hour_pressure_measurement", "heal_capacity_measurement", "recovery_window_measurement"),
-    "P4": ("mrf_scale_measurement", "mrf_replay_cost_measurement", "retained_responsibility_evidence"),
+    "P4": (
+        "mrf_scale_measurement",
+        "mrf_replay_cost_measurement",
+        "retained_responsibility_evidence",
+        "mrf_cleanup_gc_soak_evidence",
+    ),
     "R-E": ("fixed_budget_restart_evidence", "enumeration_evidence", "classification_evidence"),
     "R-D": ("manager_disposition_evidence", "event_disposition_evidence", "ledger_disposition_evidence", "grace_handling"),
     "R-L": ("legacy_source_conflict_evidence", "migration_gap_evidence", "crash_safe_source_retirement_evidence"),
@@ -120,6 +128,7 @@ SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS = {
     ("G07", "commit_boundary_crash_matrix"),
     ("P4", "mrf_replay_cost_measurement"),
     ("P4", "retained_responsibility_evidence"),
+    ("P4", "mrf_cleanup_gc_soak_evidence"),
 }
 SCANNER_HEAL_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS = (
     "missing_producer_identity",
@@ -168,6 +177,12 @@ SCANNER_HEAL_RELEASE_G08_REQUIRED_CASES = {
         "all-replicas-unavailable",
     ),
 }
+SCANNER_HEAL_RELEASE_MRF_CLEANUP_GC_SOAK_CASES = (
+    "retained-anchor-survives-restart",
+    "verified-successor-allows-idle-gc",
+    "stale-legacy-journal-cleanup",
+    "repeated-replay-no-resurrection",
+)
 SCANNER_HEAL_RELEASE_CRASH_BOUNDARY_FIELDS = {
     ("G04", "root_floor_intent_crash_evidence"): (
         "persist-failure-no-202",
@@ -1670,6 +1685,8 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
         require(duration >= 900, f"{gate}.{field} requires at least 900 seconds")
         if gate == "P3" and field == "two_hour_pressure_measurement":
             require(duration >= 7200, f"{gate}.{field} requires at least two hours")
+        if gate == "P4" and field == "mrf_cleanup_gc_soak_evidence":
+            require(duration >= 7200, f"{gate}.{field} requires at least two hours")
     elif "duration_seconds" in evidence:
         evidence_integer(evidence.get("duration_seconds"), f"{gate}.{field}.duration_seconds", 1, 86400)
     if gate in ("G03", "G09", "R-L"):
@@ -1693,6 +1710,18 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
                 f"{gate}.{field} requires retained MRF responsibility anchors")
         require(evidence.get("successor_snapshot_published") is True,
                 f"{gate}.{field} requires successor snapshot publication evidence")
+    if gate == "P4" and field == "mrf_cleanup_gc_soak_evidence":
+        release_bundle_exact_strings(
+            evidence.get("cleanup_gc_cases"),
+            SCANNER_HEAL_RELEASE_MRF_CLEANUP_GC_SOAK_CASES,
+            f"{gate}.{field}.cleanup_gc_cases",
+        )
+        require(evidence.get("verified_idle_gc_observed") is True,
+                f"{gate}.{field} requires verified idle GC evidence")
+        require(evidence.get("pending_responsibilities_after_gc") == 0,
+                f"{gate}.{field} requires zero pending responsibilities after GC")
+        require(evidence.get("stale_journals_after_gc") == 0,
+                f"{gate}.{field} requires zero stale journals after GC")
     if field == "segment_activation_preflight":
         require(evidence.get("production_activation") is False,
                 f"{gate}.{field} must keep production activation disabled")
@@ -2150,6 +2179,9 @@ class SelfTests(unittest.TestCase):
                 if gate == "P3" and field == "two_hour_pressure_measurement":
                     duration = 7200
                     evidence["duration_seconds"] = duration
+                if gate == "P4" and field == "mrf_cleanup_gc_soak_evidence":
+                    duration = 7200
+                    evidence["duration_seconds"] = duration
                 evidence["finished_at"] = (started + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z")
                 write_json(artifact, {
                     "schema": 1,
@@ -2185,6 +2217,11 @@ class SelfTests(unittest.TestCase):
                     evidence["replayed_records"] = 2
                     evidence["responsibility_anchor_retained"] = True
                     evidence["successor_snapshot_published"] = True
+                if gate == "P4" and field == "mrf_cleanup_gc_soak_evidence":
+                    evidence["cleanup_gc_cases"] = list(SCANNER_HEAL_RELEASE_MRF_CLEANUP_GC_SOAK_CASES)
+                    evidence["verified_idle_gc_observed"] = True
+                    evidence["pending_responsibilities_after_gc"] = 0
+                    evidence["stale_journals_after_gc"] = 0
                 if gate == "G07":
                     case_field = {
                         "mrf_responsibility_oracle": "mrf_responsibility_cases",
@@ -2356,6 +2393,7 @@ class SelfTests(unittest.TestCase):
             ("topology", "G14", "ec8_4_evidence", lambda item: item.update({"topology": {"erasure": "EC4+2", "nodes": 2, "drives_per_node": 3}}), "EC8+4"),
             ("missing-duration", "P1", "cold_walk_share_measurement", lambda item: item.pop("duration_seconds"), "duration_seconds"),
             ("duration", "P3", "two_hour_pressure_measurement", lambda item: item.update({"duration_seconds": 7199}), "two hours"),
+            ("mrf-cleanup-soak-duration", "P4", "mrf_cleanup_gc_soak_evidence", lambda item: item.update({"duration_seconds": 7199}), "two hours"),
             ("profile", "P1", "profile_evidence", lambda item: item.pop("resolved_samples"), "resolved_samples"),
             (
                 "profile-artifact",
@@ -2390,6 +2428,34 @@ class SelfTests(unittest.TestCase):
             ("mrf-records", "G07", "mrf_responsibility_oracle", lambda item: item.pop("replayed_records"), "replayed_records"),
             ("mrf-anchor", "G07", "commit_boundary_crash_matrix", lambda item: item.update({"responsibility_anchor_retained": False}), "retained MRF responsibility anchors"),
             ("mrf-successor", "P4", "retained_responsibility_evidence", lambda item: item.pop("successor_snapshot_published"), "successor snapshot"),
+            (
+                "mrf-cleanup-gc-cases",
+                "P4",
+                "mrf_cleanup_gc_soak_evidence",
+                lambda item: item["cleanup_gc_cases"].remove("repeated-replay-no-resurrection"),
+                "cleanup_gc_cases missing cases",
+            ),
+            (
+                "mrf-cleanup-gc-idle",
+                "P4",
+                "mrf_cleanup_gc_soak_evidence",
+                lambda item: item.update({"verified_idle_gc_observed": False}),
+                "verified idle GC",
+            ),
+            (
+                "mrf-cleanup-gc-pending",
+                "P4",
+                "mrf_cleanup_gc_soak_evidence",
+                lambda item: item.update({"pending_responsibilities_after_gc": 1}),
+                "zero pending responsibilities",
+            ),
+            (
+                "mrf-cleanup-gc-stale",
+                "P4",
+                "mrf_cleanup_gc_soak_evidence",
+                lambda item: item.update({"stale_journals_after_gc": 1}),
+                "zero stale journals",
+            ),
             ("same-window-fields", "G14", "same_window_field_evidence", lambda item: item.update({"same_window_fields": ["ec8_4_evidence", "multi_set_evidence"]}), "missing fields"),
             ("activation-enabled", "G11", "segment_activation_preflight", lambda item: item.update({"production_activation": True}), "production activation disabled"),
             (
@@ -2784,12 +2850,13 @@ class SelfTests(unittest.TestCase):
             self.assertIn("segment_activation_preflight", requirements["G11"]["evidence_fields"])
             self.assertIn("distributed_segment_invalidation_evidence", requirements["G14"]["evidence_fields"])
             self.assertIn("cold_segment_reuse_measurement", requirements["P2"]["evidence_fields"])
+            self.assertIn("mrf_cleanup_gc_soak_evidence", requirements["P4"]["evidence_fields"])
 
     def test_scanner_heal_required_evidence_fields_cannot_be_removed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, run_dir = self.scanner_heal_fixture(Path(tmp))
             registry = read_json(root / ".config/scanner-heal-required-tests.json")
-            for gate in ("G03", "G07", "G08", "G09", "G11", "G14", "P2"):
+            for gate in ("G03", "G07", "G08", "G09", "G11", "G14", "P2", "P4"):
                 for requirement in registry["release_requirements"]:
                     if requirement["gate"] == gate:
                         requirement["evidence_fields"] = []
