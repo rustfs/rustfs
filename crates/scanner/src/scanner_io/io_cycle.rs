@@ -411,6 +411,7 @@ where
     let remote_dirty_usage_acknowledgements = scope_resolution.remote_dirty_usage_acknowledgements;
     let distributed_segment_invalidation_evidence = scope_resolution.distributed_segment_invalidation_evidence;
     let scan_scope = scope_resolution.scope;
+    let segment_invalidation_proof = dirty_usage_producer_evidence(&dirty_usage_snapshot).segment_invalidation_proof();
     #[cfg(test)]
     if let Some(observer) = resolved_scope_observer {
         let _ = observer.send(scan_scope.clone());
@@ -600,6 +601,7 @@ where
             pending_maintenance_work: pending_maintenance_work.clone(),
             cache_cycle_floor: cache_cycle_floor.clone(),
             cold_zero_walk_reuse_observed: cold_zero_walk_reuse_observed.clone(),
+            segment_invalidation_proof: segment_invalidation_proof.clone(),
         };
         // Spawn task to run the scanner
         let scanner_fut = tokio::spawn(async move {

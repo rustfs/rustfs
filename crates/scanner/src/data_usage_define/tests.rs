@@ -1095,6 +1095,7 @@ fn test_data_usage_cache_info_deserialize_defaults_scan_resume_after() {
     assert!(!decoded.snapshot_complete);
     assert!(decoded.scan_plan_digest.is_none());
     assert!(decoded.scan_execution_digest.is_none());
+    assert!(decoded.segment_invalidation_proof.is_none());
     assert_eq!(decoded.cache_key_format, 0);
 }
 
@@ -1183,6 +1184,12 @@ fn test_new_data_usage_cache_msgpack_round_trips_and_supports_old_reader() {
             snapshot_complete: true,
             scan_plan_digest: Some(TEST_PLAN_DIGEST),
             scan_execution_digest: Some(DataUsageScanPlanDigest([42; 32])),
+            segment_invalidation_proof: Some(DataUsageSegmentInvalidationProof {
+                process_epoch: "scanner-process".to_string(),
+                generation_start: 7,
+                generation_end: 9,
+                producer_identity_coverage_complete: true,
+            }),
             cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
             ..Default::default()
         },
@@ -1212,6 +1219,15 @@ fn test_new_data_usage_cache_msgpack_round_trips_and_supports_old_reader() {
     assert!(current.info.snapshot_complete);
     assert_eq!(current.info.scan_plan_digest, Some(TEST_PLAN_DIGEST));
     assert_eq!(current.info.scan_execution_digest, Some(DataUsageScanPlanDigest([42; 32])));
+    assert_eq!(
+        current.info.segment_invalidation_proof,
+        Some(DataUsageSegmentInvalidationProof {
+            process_epoch: "scanner-process".to_string(),
+            generation_start: 7,
+            generation_end: 9,
+            producer_identity_coverage_complete: true,
+        })
+    );
     assert_eq!(current.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
     assert_eq!(current.find("bucket").map(|entry| entry.objects), Some(3));
 
