@@ -52,6 +52,7 @@ docs
 __pycache__/
 !docs/
 docs/*
+!docs/README.md
 !docs/architecture/
 !docs/architecture/**
 !docs/operations/

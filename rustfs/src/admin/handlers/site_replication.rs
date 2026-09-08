@@ -62,12 +62,13 @@ use rustfs_iam::sys::{
 };
 use rustfs_madmin::{
     BucketBandwidth, GroupStatus, IDPSettings, InProgressMetric, InQueueMetric, LDAPConfigSettings, LDAPSettings,
-    OpenIDProviderSettings, OpenIDSettings, PeerInfo, PeerSite, QStat, ReplProxyMetric, ReplicateAddStatus, ReplicateEditStatus,
-    ReplicateRemoveStatus, ResyncBucketStatus, SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC, SR_IAM_ITEM_STS_ACC_LEGACY,
-    SRBucketInfo, SRBucketMeta, SRBucketStatsSummary, SRGroupInfo, SRGroupStatsSummary, SRIAMItem, SRIAMUser,
-    SRILMExpiryStatsSummary, SRInfo, SRMetric, SRMetricsSummary, SRPeerError, SRPeerJoinReq, SRPendingOperation, SRPolicyMapping,
-    SRPolicyStatsSummary, SRRemoveReq, SRResyncOpStatus, SRSTSCredential, SRSiteSummary, SRStateEditReq, SRStateInfo,
-    SRStatusInfo, SRSvcAccChange, SRSvcAccCreate, SRUserStatsSummary, SiteReplicationInfo, SyncStatus, WorkerStat,
+    OpenIDProviderSettings, OpenIDSettings, PeerInfo, PeerSite, QStat, RStat, ReplProxyMetric, ReplicateAddStatus,
+    ReplicateEditStatus, ReplicateRemoveStatus, ResyncBucketStatus, SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC,
+    SR_IAM_ITEM_STS_ACC_LEGACY, SRBucketInfo, SRBucketMeta, SRBucketStatsSummary, SRGroupInfo, SRGroupStatsSummary, SRIAMItem,
+    SRIAMUser, SRILMExpiryStatsSummary, SRInfo, SRMetric, SRMetricsSummary, SRPeerError, SRPeerJoinReq, SRPendingOperation,
+    SRPolicyMapping, SRPolicyStatsSummary, SRRemoveReq, SRResyncOpStatus, SRSTSCredential, SRSiteSummary, SRStateEditReq,
+    SRStateInfo, SRStatusInfo, SRSvcAccChange, SRSvcAccCreate, SRUserStatsSummary, SiteReplicationInfo, SyncStatus,
+    TimedErrStats, WorkerStat,
 };
 use rustfs_policy::policy::{
     Policy,
@@ -1866,7 +1867,8 @@ fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Fut
 
         match load_site_replication_state().await {
             Ok(state) => {
-                if state.pending_endpoint_refresh.is_some() {
+                if let Some(pending_endpoint_refresh) = state.pending_endpoint_refresh.clone() {
+                    resume_pending_endpoint_refresh(&state, &pending_endpoint_refresh).await;
                     return;
                 }
                 // A wedged rotation is worse than a wedged removal: the local
@@ -2173,6 +2175,7 @@ fn peer_metric_entry(
     reachable: bool,
     (total_downtime_ns, last_online): (i64, Option<OffsetDateTime>),
     local_counters: (i64, i64),
+    local_failures: TimedErrStats,
 ) -> SRMetric {
     let (replica_size, replica_count) = local_counters;
 
@@ -2187,6 +2190,25 @@ fn peer_metric_entry(
         // remote entries would double-count them cluster-wide.
         replicated_size: if is_local { replica_size } else { 0 },
         replicated_count: if is_local { replica_count } else { 0 },
+        failed: if is_local { local_failures } else { TimedErrStats::default() },
+        ..Default::default()
+    }
+}
+
+fn site_failure_stats(node: &crate::storage::storage_api::ReplicationSiteMetricsSnapshot) -> TimedErrStats {
+    TimedErrStats {
+        last_minute: RStat {
+            count: node.failed_last_minute_count as f64,
+            bytes: node.failed_last_minute_bytes,
+        },
+        last_hour: RStat {
+            count: node.failed_last_hour_count as f64,
+            bytes: node.failed_last_hour_bytes,
+        },
+        totals: RStat {
+            count: node.failed_count as f64,
+            bytes: node.failed_bytes,
+        },
         ..Default::default()
     }
 }
@@ -2201,6 +2223,7 @@ async fn build_metrics_summary(
     };
 
     let node = stats.site_metrics_snapshot().await;
+    let failures = site_failure_stats(&node);
     let mut metrics = BTreeMap::new();
 
     // Emit an entry for every peer, not just the local one. An operator reading
@@ -2221,6 +2244,7 @@ async fn build_metrics_summary(
                 reachable,
                 health,
                 (node.replica_size, node.replica_count),
+                failures.clone(),
             ),
         );
     }
@@ -2234,6 +2258,7 @@ async fn build_metrics_summary(
         last_online: Some(OffsetDateTime::now_utc()),
         replicated_size: node.replica_size,
         replicated_count: node.replica_count,
+        failed: failures,
         ..Default::default()
     });
 
@@ -3762,6 +3787,21 @@ fn pending_operation_for_state(state: &SiteReplicationState, local_peer: &PeerIn
         });
     }
 
+    if let Some(pending) = pending_endpoint_refresh(state) {
+        let pending_peers = pending_endpoint_refresh_required_peer_ids(state, &pending, local_peer)
+            .into_iter()
+            .filter(|deployment_id| !pending.acked_deployment_ids.contains(deployment_id))
+            .collect();
+        return Some(SRPendingOperation {
+            operation: "endpoint-refresh".to_string(),
+            id: pending.id,
+            pending_peers,
+            acked_peers: pending.acked_deployment_ids.into_iter().collect(),
+            updated_at: None,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        });
+    }
+
     state.pending_rotation.as_ref().map(|pending| {
         let pending_peers = pending_remote_peer_ids(&pending.peers, local_peer)
             .into_iter()
@@ -3796,6 +3836,78 @@ fn pending_all_remote_peers_acked(
     pending_remote_peer_ids(peers, local_peer)
         .iter()
         .all(|deployment_id| acked_deployment_ids.contains(deployment_id))
+}
+
+fn pending_endpoint_refresh_required_peer_ids(
+    state: &SiteReplicationState,
+    pending: &PendingEndpointRefresh,
+    local_peer: &PeerInfo,
+) -> BTreeSet<String> {
+    pending
+        .remote_peers
+        .values()
+        .filter(|peer| {
+            state.peers.contains_key(&peer.deployment_id)
+                && peer.deployment_id != local_peer.deployment_id
+                && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+        })
+        .map(|peer| peer.deployment_id.clone())
+        .collect()
+}
+
+fn pending_endpoint_refresh_is_complete(
+    state: &SiteReplicationState,
+    pending: &PendingEndpointRefresh,
+    local_peer: &PeerInfo,
+) -> bool {
+    pending_endpoint_refresh_required_peer_ids(state, pending, local_peer)
+        .iter()
+        .all(|deployment_id| pending.acked_deployment_ids.contains(deployment_id))
+}
+
+fn pending_endpoint_refresh_allows_remove(
+    state: &SiteReplicationState,
+    pending: &PendingEndpointRefresh,
+    local_peer: &PeerInfo,
+    remove_req: &SRRemoveReq,
+) -> bool {
+    if remove_req.remove_all || remove_req.site_names.iter().any(|name| name == &local_peer.name) {
+        return true;
+    }
+    let removed = removed_deployment_ids_for_remove_req(state, remove_req);
+    pending_endpoint_refresh_required_peer_ids(state, pending, local_peer)
+        .difference(&pending.acked_deployment_ids)
+        .all(|deployment_id| removed.contains(deployment_id))
+}
+
+fn discard_endpoint_refresh_if_target_was_removed(state: &mut SiteReplicationState) {
+    if pending_endpoint_refresh(state)
+        .as_ref()
+        .is_some_and(|pending| !state.peers.contains_key(&pending.peer.deployment_id))
+    {
+        clear_pending_endpoint_refresh(state);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointRefreshPostwriteState {
+    Current,
+    Superseded,
+    TargetRemoved,
+}
+
+fn endpoint_refresh_postwrite_state(
+    state: &SiteReplicationState,
+    pending_id: &str,
+    target_deployment_id: &str,
+) -> EndpointRefreshPostwriteState {
+    if !state.peers.contains_key(target_deployment_id) {
+        EndpointRefreshPostwriteState::TargetRemoved
+    } else if pending_endpoint_refresh(state).is_some_and(|pending| pending.id == pending_id) {
+        EndpointRefreshPostwriteState::Current
+    } else {
+        EndpointRefreshPostwriteState::Superseded
+    }
 }
 
 fn push_unique_secret_candidate(candidates: &mut Vec<String>, secret: String) {
@@ -4012,6 +4124,147 @@ async fn resume_pending_rotation(state: &SiteReplicationState, pending: &Pending
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
                 result = "pending_rotation_resume_failed",
+                error = ?err,
+                "admin site replication state"
+            );
+        }
+    }
+}
+
+async fn mark_pending_endpoint_refresh_peer_acked(refresh_id: &str, deployment_id: &str) -> S3Result<()> {
+    let refresh_id = refresh_id.to_string();
+    let deployment_id = deployment_id.to_string();
+    update_site_replication_state_when_changed(move |state| {
+        let Some(pending) = state
+            .pending_endpoint_refresh
+            .as_mut()
+            .filter(|pending| pending.id == refresh_id)
+        else {
+            return Ok(StateCommit::Unchanged(()));
+        };
+        pending.acked_deployment_ids.insert(deployment_id);
+        Ok(StateCommit::Changed(()))
+    })
+    .await
+}
+
+async fn finalize_pending_endpoint_refresh_if_complete(refresh_id: &str, service_account_secret_key: &str) -> S3Result<bool> {
+    let state = load_site_replication_state().await?;
+    let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == refresh_id) else {
+        return Ok(true);
+    };
+    let local_peer = current_local_runtime_peer(&state);
+    if !pending_endpoint_refresh_is_complete(&state, &pending, &local_peer) {
+        return Ok(false);
+    }
+
+    refresh_bucket_targets_after_endpoint_edit(refresh_id, service_account_secret_key).await?;
+
+    let refresh_id = refresh_id.to_string();
+    update_site_replication_state_when_changed(move |state| {
+        let Some(pending) = pending_endpoint_refresh(state).filter(|pending| pending.id == refresh_id) else {
+            return Ok(StateCommit::Unchanged(true));
+        };
+        let local_peer = current_local_runtime_peer(state);
+        if !pending_endpoint_refresh_is_complete(state, &pending, &local_peer) {
+            return Ok(StateCommit::Unchanged(false));
+        }
+        *state = edit_state(std::mem::take(state), pending.peer, pending.ilm_expiry_override);
+        clear_pending_endpoint_refresh(state);
+        Ok(StateCommit::Changed(true))
+    })
+    .await
+}
+
+async fn drive_pending_endpoint_refresh(
+    state: &SiteReplicationState,
+    pending: &PendingEndpointRefresh,
+) -> S3Result<(Vec<String>, bool)> {
+    if state.service_account_access_key.is_empty() {
+        return Err(s3_error!(InvalidRequest, "site replication service account is not configured"));
+    }
+    let service_account_secret_key = site_replicator_service_account_secret(&state.service_account_access_key).await?;
+    let local_peer = current_local_runtime_peer(state);
+    let required = pending_endpoint_refresh_required_peer_ids(state, pending, &local_peer);
+    let mut peer_errors = Vec::new();
+
+    for target in pending.remote_peers.values().filter(|target| {
+        required.contains(&target.deployment_id) && !pending.acked_deployment_ids.contains(&target.deployment_id)
+    }) {
+        let refreshed = async {
+            let (status, body) = send_endpoint_refresh_admin_request_raw(
+                target,
+                pending,
+                SITE_REPLICATION_PEER_EDIT_CAPABILITY_PATH,
+                &state.service_account_access_key,
+                &service_account_secret_key,
+                &(),
+            )
+            .await?;
+            if endpoint_refresh_capability_supported(target, status, &body)? {
+                let request = EndpointRefreshRequest {
+                    id: pending.id.clone(),
+                    peer: pending.peer.clone(),
+                };
+                let body = send_endpoint_refresh_admin_request(
+                    target,
+                    pending,
+                    SITE_REPLICATION_PEER_EDIT_REFRESH_PATH,
+                    &state.service_account_access_key,
+                    &service_account_secret_key,
+                    &request,
+                )
+                .await?;
+                parse_endpoint_refresh_status(target, &body)
+            } else {
+                refresh_legacy_peer_bucket_targets(
+                    target,
+                    pending,
+                    &state.service_account_access_key,
+                    &service_account_secret_key,
+                )
+                .await
+            }
+        }
+        .await;
+
+        match refreshed {
+            Ok(()) => mark_pending_endpoint_refresh_peer_acked(&pending.id, &target.deployment_id).await?,
+            Err(err) => peer_errors.push(summarize_peer_error_detail(&format!("{}: {err}", target.endpoint))),
+        }
+    }
+
+    let complete = finalize_pending_endpoint_refresh_if_complete(&pending.id, &service_account_secret_key).await?;
+    Ok((peer_errors, complete))
+}
+
+async fn resume_pending_endpoint_refresh(state: &SiteReplicationState, pending: &PendingEndpointRefresh) {
+    match drive_pending_endpoint_refresh(state, pending).await {
+        Ok((peer_errors, true)) if peer_errors.is_empty() => {
+            info!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "pending_endpoint_refresh_resumed",
+                "admin site replication state"
+            );
+        }
+        Ok((peer_errors, _)) => {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "pending_endpoint_refresh_still_pending",
+                error_count = peer_errors.len(),
+                "admin site replication state"
+            );
+        }
+        Err(err) => {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "pending_endpoint_refresh_resume_failed",
                 error = ?err,
                 "admin site replication state"
             );
@@ -5027,6 +5280,21 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
             expected_incarnation_id,
         )
         .await?;
+
+        // A remove accepted on another node can clear this journal while the
+        // bucket rewrite is in flight. Re-check after the write: if it removed
+        // the edited peer, undo this bucket's stale target after releasing the
+        // process-local target lock. If it committed the same edit, the write
+        // is equivalent but this driver no longer owns finalization.
+        let latest = load_site_replication_state().await?;
+        let postwrite = endpoint_refresh_postwrite_state(&latest, pending_id, &pending.peer.deployment_id);
+        drop(_targets_guard);
+        if postwrite == EndpointRefreshPostwriteState::TargetRemoved {
+            cleanup_removed_site_replication_bucket(&bucket.name, &HashSet::from([pending.peer.deployment_id.clone()])).await?;
+        }
+        if postwrite != EndpointRefreshPostwriteState::Current {
+            return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
+        }
     }
 
     Ok(())
@@ -6023,14 +6291,17 @@ async fn apply_iam_group_info_item(
         return Ok(IamItemVerdict::Apply);
     }
 
+    let status_only = update.members.is_empty();
     iam_sys
         .add_users_to_group_at(&update.group, update.members, stamp)
         .await
         .map_err(ApiError::from)?;
-    iam_sys
-        .set_group_status_at(&update.group, matches!(update.status, GroupStatus::Enabled), stamp)
-        .await
-        .map_err(ApiError::from)?;
+    if status_only {
+        iam_sys
+            .set_group_status_at(&update.group, matches!(update.status, GroupStatus::Enabled), stamp)
+            .await
+            .map_err(ApiError::from)?;
+    }
     Ok(IamItemVerdict::Apply)
 }
 
@@ -6611,13 +6882,15 @@ impl Operation for SiteReplicationRemoveHandler {
         let (pending_remove, local_peer) = {
             let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
             update_site_replication_state_when_changed(move |state| {
-                if pending_endpoint_refresh(state).is_some() {
+                let local_peer = local_peer_at_endpoint(local_endpoint, state);
+                if let Some(pending) = pending_endpoint_refresh(state)
+                    && !pending_endpoint_refresh_allows_remove(state, &pending, &local_peer, &remove_req)
+                {
                     return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
                 }
                 if state.pending_rotation.is_some() {
                     return Err(s3_error!(InvalidRequest, "service account rotation is pending"));
                 }
-                let local_peer = local_peer_at_endpoint(local_endpoint, state);
 
                 // Resuming: the peers were already told about this pending
                 // removal, so re-persisting the same record buys nothing.
@@ -6632,6 +6905,11 @@ impl Operation for SiteReplicationRemoveHandler {
                 let mut peer_remove_req = remove_req.clone();
                 peer_remove_req.requesting_dep_id = local_peer.deployment_id.clone();
                 *state = remove_sites(std::mem::take(state), remove_req);
+                // A permitted remove can include the endpoint being edited.
+                // Drop that obsolete journal before recording the removal;
+                // otherwise its resume path would commit the edited peer back
+                // into the topology on the next heavyweight tick.
+                discard_endpoint_refresh_if_target_was_removed(state);
                 let pending = PendingRemove {
                     id: Uuid::new_v4().to_string(),
                     req: peer_remove_req,
@@ -7198,6 +7476,7 @@ impl Operation for SiteReplicationEditHandler {
             persisted_pending.clone().unwrap_or_else(|| PendingEndpointRefresh {
                 id: Uuid::new_v4().to_string(),
                 peer: normalize_peer_info(incoming.clone()),
+                ilm_expiry_override,
                 remote_peers: current_state.peers.clone(),
                 acked_deployment_ids: BTreeSet::new(),
             })
@@ -7362,7 +7641,7 @@ impl Operation for SiteReplicationEditHandler {
                     let Some(pending) = pending_endpoint_refresh(state).filter(|pending| pending.id == pending_id) else {
                         return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
                     };
-                    *state = edit_state(std::mem::take(state), pending.peer, ilm_expiry_override);
+                    *state = edit_state(std::mem::take(state), pending.peer, pending.ilm_expiry_override);
                     clear_pending_endpoint_refresh(state);
                     Ok(())
                 })
@@ -7567,6 +7846,7 @@ impl Operation for SRPeerEditHandler {
                     PendingEndpointRefresh {
                         id: commit_refresh_id.unwrap_or_default(),
                         peer: incoming,
+                        ilm_expiry_override,
                         remote_peers: BTreeMap::new(),
                         acked_deployment_ids: BTreeSet::new(),
                     },
@@ -7631,7 +7911,7 @@ impl Operation for SRPeerEditHandler {
                 let Some(pending) = pending_endpoint_refresh(state).filter(|pending| pending.id == pending_id) else {
                     return Ok(StateCommit::Unchanged(false));
                 };
-                *state = apply_internal_peer_edit(std::mem::take(state), &local_peer, pending.peer, ilm_expiry_override)?;
+                *state = apply_internal_peer_edit(std::mem::take(state), &local_peer, pending.peer, pending.ilm_expiry_override)?;
                 clear_pending_endpoint_refresh(state);
                 Ok(StateCommit::Changed(true))
             })
@@ -8108,6 +8388,7 @@ mod tests {
             false,
             (5_000_000_000, Some(heartbeat_last_online)),
             (4096, 8),
+            TimedErrStats::default(),
         );
 
         assert!(!entry.online, "an unreachable peer must not be reported online");
@@ -8123,14 +8404,52 @@ mod tests {
     /// or a two-site cluster would double-count its own traffic.
     #[test]
     fn peer_metric_entry_keeps_replication_counters_on_the_local_entry() {
-        let local = peer_metric_entry("local", "http://local.example:9000", true, true, (0, None), (4096, 8));
-        let remote = peer_metric_entry("remote", "http://remote.example:9000", false, true, (0, None), (4096, 8));
+        let local = peer_metric_entry(
+            "local",
+            "http://local.example:9000",
+            true,
+            true,
+            (0, None),
+            (4096, 8),
+            TimedErrStats::default(),
+        );
+        let remote = peer_metric_entry(
+            "remote",
+            "http://remote.example:9000",
+            false,
+            true,
+            (0, None),
+            (4096, 8),
+            TimedErrStats::default(),
+        );
 
         assert_eq!(local.replicated_size, 4096);
         assert_eq!(local.replicated_count, 8);
         assert_eq!(remote.replicated_size, 0);
         assert_eq!(remote.replicated_count, 0);
         assert!(remote.online, "a reachable remote peer is still online");
+    }
+
+    #[test]
+    fn peer_metric_entry_wires_local_replication_failures() {
+        let source = include_str!("site_replication.rs");
+        let body = source
+            .split("fn peer_metric_entry(")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn build_metrics_summary").next())
+            .expect("peer metric builder");
+
+        assert!(body.contains("failed:"), "the local site metric must expose failed replication totals");
+
+        let failures = TimedErrStats {
+            totals: RStat { count: 3.0, bytes: 900 },
+            ..Default::default()
+        };
+        let local = peer_metric_entry("local", "http://local", true, true, (0, None), (0, 0), failures.clone());
+        let remote = peer_metric_entry("remote", "http://remote", false, true, (0, None), (0, 0), failures);
+        assert_eq!(local.failed.totals.count, 3.0);
+        assert_eq!(local.failed.totals.bytes, 900);
+        assert_eq!(remote.failed.totals.count, 0.0, "node-local failures must not be copied to peers");
     }
 
     #[test]
@@ -8462,6 +8781,35 @@ mod tests {
         assert_eq!(identity.credentials.status, "off", "the T2 disable must land after the delayed T1 create");
         assert_eq!(identity.update_at, Some(t2));
 
+        clear_seeded_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn apply_group_member_add_preserves_a_disabled_group_status() {
+        publish_ready_iam_context().await;
+        seed_two_peer_state_for_iam_apply().await;
+        let iam = current_iam_handle().expect("test IAM");
+        let member = "sr-disabled-group-member";
+        let group = "sr-disabled-group";
+        iam.create_user(member, &user_req("member-secret-key-123", rustfs_madmin::AccountStatus::Enabled))
+            .await
+            .expect("member");
+        iam.add_users_to_group(group, Vec::new()).await.expect("group");
+        iam.set_group_status(group, false).await.expect("disable group");
+
+        apply_iam_item(sr_group_item(
+            group,
+            &[member],
+            false,
+            OffsetDateTime::now_utc() + time::Duration::seconds(1),
+        ))
+        .await
+        .expect("replicated member add");
+
+        let info = iam.get_group_info(group).await.expect("group after replicated member add");
+        assert_eq!(info.status, "disabled", "a membership-only update must not enable the group");
+        assert!(info.members.iter().any(|current| current == member));
         clear_seeded_state().await;
     }
 
@@ -9456,6 +9804,21 @@ mod tests {
 
         let merged = merge_pending_endpoint_refresh(&state, &stale, ["peer-b".to_string()]).expect("merge ACKs");
         assert_eq!(merged.acked_deployment_ids, BTreeSet::from(["peer-a".to_string(), "peer-b".to_string()]));
+    }
+
+    #[test]
+    fn reconcile_redrives_a_pending_endpoint_refresh() {
+        let source = include_str!("site_replication.rs");
+        let body = source
+            .split("fn reconcile_site_replication_wiring()")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn send_site_replication_bootstrap_plan").next())
+            .expect("reconcile function body");
+
+        assert!(
+            body.contains("resume_pending_endpoint_refresh"),
+            "the heavyweight reconcile tick must resume a persisted endpoint refresh"
+        );
     }
 
     #[test]
@@ -11391,6 +11754,115 @@ mod tests {
         );
     }
 
+    fn endpoint_refresh_remove_fixture() -> (SiteReplicationState, PendingEndpointRefresh, PeerInfo) {
+        let local = PeerInfo {
+            deployment_id: "site-a-dep".to_string(),
+            name: "site-a".to_string(),
+            ..peer("site-a", "https://site-a.example.com")
+        };
+        let edited = PeerInfo {
+            deployment_id: "site-b-dep".to_string(),
+            name: "site-b".to_string(),
+            ..peer("site-b", "https://new-site-b.example.com")
+        };
+        let unavailable = PeerInfo {
+            deployment_id: "site-c-dep".to_string(),
+            name: "site-c".to_string(),
+            ..peer("site-c", "https://site-c.example.com")
+        };
+        let peers = BTreeMap::from([
+            (local.deployment_id.clone(), local.clone()),
+            (edited.deployment_id.clone(), edited.clone()),
+            (unavailable.deployment_id.clone(), unavailable),
+        ]);
+        let pending = PendingEndpointRefresh {
+            id: "refresh-1".to_string(),
+            peer: edited,
+            remote_peers: peers.clone(),
+            acked_deployment_ids: BTreeSet::from(["site-b-dep".to_string()]),
+            ..Default::default()
+        };
+        let state = SiteReplicationState {
+            name: local.name.clone(),
+            peers,
+            pending_endpoint_refresh: Some(pending.clone()),
+            ..Default::default()
+        };
+        (state, pending, local)
+    }
+
+    #[test]
+    fn pending_endpoint_refresh_allows_removing_every_unacked_peer() {
+        let (state, pending, local) = endpoint_refresh_remove_fixture();
+        let remove_unacked = SRRemoveReq {
+            site_names: vec!["site-c".to_string()],
+            ..Default::default()
+        };
+        let remove_acked_only = SRRemoveReq {
+            site_names: vec!["site-b".to_string()],
+            ..Default::default()
+        };
+
+        assert!(pending_endpoint_refresh_allows_remove(&state, &pending, &local, &remove_unacked));
+        assert!(!pending_endpoint_refresh_allows_remove(&state, &pending, &local, &remove_acked_only));
+        assert!(pending_endpoint_refresh_allows_remove(
+            &state,
+            &pending,
+            &local,
+            &SRRemoveReq {
+                remove_all: true,
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn pending_endpoint_refresh_completion_ignores_a_peer_removed_from_the_topology() {
+        let (mut state, pending, local) = endpoint_refresh_remove_fixture();
+        assert!(!pending_endpoint_refresh_is_complete(&state, &pending, &local));
+
+        state.peers.remove("site-c-dep");
+        assert!(pending_endpoint_refresh_is_complete(&state, &pending, &local));
+    }
+
+    #[test]
+    fn removing_the_edited_peer_discards_its_pending_endpoint_refresh() {
+        let (state, pending, _) = endpoint_refresh_remove_fixture();
+        assert_eq!(
+            endpoint_refresh_postwrite_state(&state, &pending.id, &pending.peer.deployment_id),
+            EndpointRefreshPostwriteState::Current
+        );
+        let mut state = remove_sites(
+            state,
+            SRRemoveReq {
+                site_names: vec!["site-b".to_string(), "site-c".to_string()],
+                ..Default::default()
+            },
+        );
+
+        discard_endpoint_refresh_if_target_was_removed(&mut state);
+
+        assert!(pending_endpoint_refresh(&state).is_none());
+        assert!(
+            state
+                .retry_queue
+                .iter()
+                .all(|event| event.path != SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH)
+        );
+        assert_eq!(
+            endpoint_refresh_postwrite_state(&state, &pending.id, &pending.peer.deployment_id),
+            EndpointRefreshPostwriteState::TargetRemoved,
+            "a refresh write racing this removal must clean the stale target it may have restored"
+        );
+
+        let mut completed = endpoint_refresh_remove_fixture().0;
+        completed.pending_endpoint_refresh = None;
+        assert_eq!(
+            endpoint_refresh_postwrite_state(&completed, &pending.id, &pending.peer.deployment_id),
+            EndpointRefreshPostwriteState::Superseded
+        );
+    }
+
     #[test]
     fn test_normalize_join_peers_rewrites_local_endpoint_to_real_deployment_id() {
         let local_peer = PeerInfo {
@@ -12394,6 +12866,7 @@ mod tests {
             PendingEndpointRefresh {
                 id: "refresh-1".to_string(),
                 peer: retry_peer.clone(),
+                ilm_expiry_override: None,
                 remote_peers,
                 acked_deployment_ids: BTreeSet::new(),
             },
@@ -12649,6 +13122,51 @@ mod tests {
         assert_eq!(operation.id, "remove-id");
         assert_eq!(operation.acked_peers, vec!["remote-a".to_string()]);
         assert_eq!(operation.pending_peers, vec!["remote-b".to_string()]);
+    }
+
+    #[test]
+    fn test_pending_operation_for_state_reports_endpoint_refresh_progress() {
+        let local = PeerInfo {
+            deployment_id: "local".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let remote_a = PeerInfo {
+            deployment_id: "remote-a".to_string(),
+            ..peer("remote-a", "https://remote-a.example.com")
+        };
+        let remote_b = PeerInfo {
+            deployment_id: "remote-b".to_string(),
+            ..peer("remote-b", "https://remote-b.example.com")
+        };
+        let state = SiteReplicationState {
+            peers: BTreeMap::from([
+                (local.deployment_id.clone(), local.clone()),
+                (remote_a.deployment_id.clone(), remote_a.clone()),
+                (remote_b.deployment_id.clone(), remote_b.clone()),
+            ]),
+            pending_endpoint_refresh: Some(PendingEndpointRefresh {
+                id: "refresh-id".to_string(),
+                peer: PeerInfo {
+                    endpoint: "https://remote-a-new.example.com".to_string(),
+                    ..remote_a.clone()
+                },
+                remote_peers: BTreeMap::from([
+                    (remote_a.deployment_id.clone(), remote_a),
+                    (remote_b.deployment_id.clone(), remote_b),
+                    (local.deployment_id.clone(), local.clone()),
+                ]),
+                acked_deployment_ids: BTreeSet::from(["remote-b".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let operation = pending_operation_for_state(&state, &local).expect("pending endpoint refresh operation");
+
+        assert_eq!(operation.operation, "endpoint-refresh");
+        assert_eq!(operation.id, "refresh-id");
+        assert_eq!(operation.acked_peers, vec!["remote-b".to_string()]);
+        assert_eq!(operation.pending_peers, vec!["remote-a".to_string()]);
     }
 
     #[test]

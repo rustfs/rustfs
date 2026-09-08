@@ -693,6 +693,46 @@ fn test_record_iam_deletion_marks_newest_wins_and_expires_by_age_only() {
     );
 }
 
+#[test]
+fn iam_import_snapshot_retry_is_recorded_once_per_remote_peer() {
+    let local = PeerInfo {
+        deployment_id: "local-dep".to_string(),
+        ..peer("local", "https://local.example.com")
+    };
+    let remote_a = PeerInfo {
+        deployment_id: "remote-a".to_string(),
+        ..peer("remote-a", "https://a.example.com")
+    };
+    let remote_b = PeerInfo {
+        deployment_id: "remote-b".to_string(),
+        ..peer("remote-b", "https://b.example.com")
+    };
+    let mut state = SiteReplicationState {
+        peers: BTreeMap::from([
+            (local.deployment_id.clone(), local.clone()),
+            (remote_a.deployment_id.clone(), remote_a),
+            (remote_b.deployment_id.clone(), remote_b),
+        ]),
+        ..Default::default()
+    };
+
+    record_iam_snapshot_retries(&mut state, &local, "IAM import snapshot pending").expect("record snapshot retries");
+
+    assert_eq!(state.retry_queue.len(), 2);
+    assert!(
+        state
+            .retry_queue
+            .iter()
+            .all(|event| event.path == SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH)
+    );
+    assert!(
+        state
+            .retry_queue
+            .iter()
+            .all(|event| event.peer_deployment_id != local.deployment_id)
+    );
+}
+
 /// A failed deletion delivery persists a replay record next to the collapsed
 /// retry entry; a fresh entry is stamped `deletions_recorded` so a later
 /// replay can settle it, and a repeated deletion of the same entity keeps the

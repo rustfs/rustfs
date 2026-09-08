@@ -1318,6 +1318,8 @@ impl Operation for ImportIam {
             failed,
         };
 
+        crate::site_replication::enqueue_site_replication_iam_snapshot("IAM import snapshot pending").await?;
+
         let body = serde_json::to_vec(&ret).map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
         let mut header = HeaderMap::new();
@@ -1422,6 +1424,16 @@ mod tests {
     fn add_user_operation_maps_create_errors() {
         let mapper_call = concat!("map_err(map_add_user_", "create_error)");
         assert!(include_str!("user.rs").contains(mapper_call));
+    }
+
+    #[test]
+    fn import_iam_enqueues_a_site_replication_snapshot() {
+        let body = source_block(include_str!("user.rs"), "impl Operation for ImportIam");
+
+        assert!(
+            body.contains("enqueue_site_replication_iam_snapshot"),
+            "a successful IAM import must schedule a full IAM snapshot for every remote site"
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use rand::RngExt as _;
 use rustfs_storage_api as storage_contracts;
@@ -836,6 +837,35 @@ impl StorageReplicationStatsHandle {
 
     pub(crate) async fn site_metrics_snapshot(&self) -> ReplicationSiteMetricsSnapshot {
         let metrics = self.inner.get_sr_metrics_for_node().await;
+        let bucket_stats = self.inner.get_all().await;
+        let (
+            failed_count,
+            failed_bytes,
+            failed_last_minute_count,
+            failed_last_minute_bytes,
+            failed_last_hour_count,
+            failed_last_hour_bytes,
+        ) = bucket_stats.values().flat_map(|bucket| bucket.stats.values()).fold(
+            (0i64, 0i64, 0i64, 0i64, 0i64, 0i64),
+            |totals, stat| {
+                let sampled_minute = stat.fail_stats.recent_since(Duration::from_secs(60));
+                let sampled_hour = stat.fail_stats.recent_since(Duration::from_secs(3600));
+                (
+                    totals.0.saturating_add(stat.fail_stats.count),
+                    totals.1.saturating_add(stat.fail_stats.size),
+                    totals
+                        .2
+                        .saturating_add(sampled_minute.count.max(stat.fail_stats.last_minute.count)),
+                    totals
+                        .3
+                        .saturating_add(sampled_minute.size.max(stat.fail_stats.last_minute.size)),
+                    totals
+                        .4
+                        .saturating_add(sampled_hour.count.max(stat.fail_stats.last_hour.count)),
+                    totals.5.saturating_add(sampled_hour.size.max(stat.fail_stats.last_hour.size)),
+                )
+            },
+        );
         ReplicationSiteMetricsSnapshot {
             uptime: metrics.uptime,
             queued_curr_count: metrics.queued.curr.count,
@@ -859,6 +889,12 @@ impl StorageReplicationStatsHandle {
             proxy_delete_tag_failed: metrics.proxied.delete_tag_failed,
             replica_size: metrics.replica_size,
             replica_count: metrics.replica_count,
+            failed_count,
+            failed_bytes,
+            failed_last_minute_count,
+            failed_last_minute_bytes,
+            failed_last_hour_count,
+            failed_last_hour_bytes,
         }
     }
 
@@ -899,6 +935,12 @@ pub(crate) struct ReplicationSiteMetricsSnapshot {
     pub(crate) proxy_delete_tag_failed: i64,
     pub(crate) replica_size: i64,
     pub(crate) replica_count: i64,
+    pub(crate) failed_count: i64,
+    pub(crate) failed_bytes: i64,
+    pub(crate) failed_last_minute_count: i64,
+    pub(crate) failed_last_minute_bytes: i64,
+    pub(crate) failed_last_hour_count: i64,
+    pub(crate) failed_last_hour_bytes: i64,
 }
 
 pub(crate) async fn get_local_server_property() -> rustfs_madmin::ServerProperties {
@@ -2043,12 +2085,31 @@ pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStor
 #[cfg(test)]
 mod tests {
     use super::{
-        BUCKET_RESYNC_LOCK_RETRY_MAX_MS, apply_active_resync_intents, bucket_resync_transaction_lock_retry_ceiling_ms,
-        bucket_resync_transaction_lock_retry_delay, bucket_resync_transaction_lock_retry_reason,
-        bucket_targets_metadata_lock_shard, ecstore_bucket, lock_bucket_targets_metadata, new_instance_ctx,
-        retry_bucket_resync_transaction_lock, scanner_maintenance_config_file,
+        BUCKET_RESYNC_LOCK_RETRY_MAX_MS, StorageReplicationStatsHandle, apply_active_resync_intents,
+        bucket_resync_transaction_lock_retry_ceiling_ms, bucket_resync_transaction_lock_retry_delay,
+        bucket_resync_transaction_lock_retry_reason, bucket_targets_metadata_lock_shard, ecstore_bucket,
+        lock_bucket_targets_metadata, new_instance_ctx, retry_bucket_resync_transaction_lock, scanner_maintenance_config_file,
     };
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn site_metrics_snapshot_includes_live_failure_windows() {
+        let stats = StorageReplicationStatsHandle::new();
+        let mut target = ecstore_bucket::replication::BucketReplicationStat::default();
+        target.fail_stats.add_size(2048, None::<&std::io::Error>);
+        let mut bucket = ecstore_bucket::replication::BucketReplicationStats::new();
+        bucket.stats.insert("arn:replication::remote:photos".to_string(), target);
+        stats.inner.cache.write().await.insert("photos".to_string(), bucket);
+
+        let snapshot = stats.site_metrics_snapshot().await;
+
+        assert_eq!(snapshot.failed_count, 1);
+        assert_eq!(snapshot.failed_bytes, 2048);
+        assert_eq!(snapshot.failed_last_minute_count, 1);
+        assert_eq!(snapshot.failed_last_minute_bytes, 2048);
+        assert_eq!(snapshot.failed_last_hour_count, 1);
+        assert_eq!(snapshot.failed_last_hour_bytes, 2048);
+    }
 
     #[tokio::test]
     async fn bucket_target_metadata_locks_serialize_only_matching_shards() {

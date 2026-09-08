@@ -365,6 +365,39 @@ pub(crate) async fn enqueue_site_replication_retry_event_for_generation(
     }
 }
 
+pub(crate) fn record_iam_snapshot_retries(state: &mut SiteReplicationState, local_peer: &PeerInfo, reason: &str) -> S3Result<()> {
+    let peers = state
+        .peers
+        .values()
+        .filter(|peer| {
+            peer.deployment_id != local_peer.deployment_id && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for peer in peers {
+        upsert_site_replication_retry_event(
+            &mut state.retry_queue,
+            &peer,
+            SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
+            reason,
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+/// Schedule one collapsed full-IAM snapshot per remote peer after a bulk
+/// local mutation such as `import-iam`.
+pub(crate) async fn enqueue_site_replication_iam_snapshot(reason: &str) -> S3Result<()> {
+    let state = load_site_replication_state().await?;
+    if !state.enabled() {
+        return Ok(());
+    }
+    let local_peer = current_local_runtime_peer(&state);
+    let reason = reason.to_string();
+    update_site_replication_state(move |state| record_iam_snapshot_retries(state, &local_peer, &reason)).await
+}
+
 pub(crate) const SITE_REPLICATION_PEER_IAM_ITEM_WIRE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/iam-item";
 
 /// Per-peer cap on recorded deletion bodies. Beyond it the peer's collapsed
