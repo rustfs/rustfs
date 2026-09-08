@@ -256,6 +256,32 @@ mixed-peer fallback oracles; G09 keeps mixed-version reader, writer, and rollbac
 payload evidence explicit. These fields are part of the release contract, not
 evidence by themselves.
 
+When the real release lanes have produced their dedicated artifacts, validate
+the complete hard-gate bundle with:
+
+```bash
+scripts/python_bin.sh scripts/check_test_wiring.py \
+  --check-scanner-heal-release-bundle /path/to/release-evidence.json
+```
+
+The bundle checker is intentionally stricter than the case checker. It requires
+schema 2 registry metadata, `evidence: measured`, the current checkout revision,
+all G01-G14/P1-P4/R-E/R-D/R-L gates, per-gate `status: pass`, lane identity,
+relative artifact paths, matching SHA256 hashes, and non-empty summaries. It
+also binds the hard evidence shape for the release claims: mixed-version gates
+must name at least two participating versions, crash/durable replay gates must
+include crash-boundary evidence, G14 must record EC8+4 with at least three nodes
+and four drives per node plus multi-set and multi-pool evidence, performance
+gates need measured durations, P3's pressure run needs at least two hours, and
+P1 needs a symbolized profile summary with resolved samples. Missing, synthetic,
+stale, tampered, undersized, or topology-mismatched evidence returns a compact
+blocked or invalid JSON result and a nonzero exit.
+
+This command validates the evidence package; it does not create evidence. A
+handwritten JSON file, a synthetic harness pass, a single focused case, or a
+local unit fixture still cannot satisfy the distributed, mixed-version,
+crash-restart, durable MRF replay, EC8+4, ABBA, or profiling gates.
+
 Run parser/receipt regressions with
 `scripts/python_bin.sh scripts/check_test_wiring.py --self-test`. Those fixtures
 validate the checker only and produce no runtime or performance evidence.
