@@ -122,6 +122,7 @@ where
     let default_result = |scope: ScannerBucketScanScope| ScannerBucketScopeResolutionResult {
         scope,
         remote_dirty_usage_acknowledgements: Vec::new(),
+        distributed_segment_invalidation_evidence: None,
     };
     if resolution.requires_full_scan {
         return default_result(ScannerBucketScanScope::default());
@@ -408,6 +409,7 @@ where
     )
     .await;
     let remote_dirty_usage_acknowledgements = scope_resolution.remote_dirty_usage_acknowledgements;
+    let distributed_segment_invalidation_evidence = scope_resolution.distributed_segment_invalidation_evidence;
     let scan_scope = scope_resolution.scope;
     #[cfg(test)]
     if let Some(observer) = resolved_scope_observer {
@@ -783,6 +785,7 @@ where
         .with_observational_snapshot_published(observational_snapshot_published)
         .with_remote_publication_lease_targets(remote_publication_lease_targets)
         .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
+        .with_distributed_segment_invalidation_evidence(distributed_segment_invalidation_evidence)
         .with_failed_dirty_usage(!failed_buckets.is_empty())
         .with_pending_maintenance_work(pending_maintenance_work)
         .with_required_cycle_floor(required_cycle_floor)

@@ -797,6 +797,18 @@ impl DefaultObjectUsecase {
         let resp_elements =
             build_event_resp_elements(&S3Response::new(DeleteObjectsOutput::default()), &request_context.request_id);
         let deleted_any = delete_results.iter().any(|result| result.delete_object.is_some());
+        let delete_producers = delete_results
+            .iter()
+            .filter_map(|result| {
+                result.delete_object.as_ref().map(|deleted_object| {
+                    if deleted_object.delete_marker && result.requested_version_id.is_none() {
+                        rustfs_scanner::SegmentInvalidationProducerIdentity::DeleteMarker
+                    } else {
+                        rustfs_scanner::SegmentInvalidationProducerIdentity::DeleteObject
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
         let notify_bucket = bucket.clone();
         spawn_background_with_context(Some(request_context), async move {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
@@ -838,7 +850,7 @@ impl DefaultObjectUsecase {
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
         if deleted_any {
-            rustfs_scanner::record_dirty_usage_bucket(&bucket);
+            rustfs_scanner::record_dirty_usage_bucket_from_producers(&bucket, delete_producers);
         }
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
         let manager = get_capacity_manager();
@@ -1101,7 +1113,10 @@ impl DefaultObjectUsecase {
             let manager = get_capacity_manager();
             manager.record_write_operation().await;
             let _ = helper.complete(&result);
-            rustfs_scanner::record_dirty_usage_bucket(&bucket);
+            rustfs_scanner::record_dirty_usage_bucket_from_producer(
+                &bucket,
+                rustfs_scanner::SegmentInvalidationProducerIdentity::DeleteObject,
+            );
             return result;
         }
 

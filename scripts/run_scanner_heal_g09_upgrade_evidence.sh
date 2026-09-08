@@ -15,6 +15,7 @@ SOURCE_BINARY="${RUSTFS_UPGRADE_SOURCE_BINARY:-}"
 TEST_SELECTION="all"
 PLAN_ONLY=0
 ALLOW_DIRTY=0
+SKIP_BUILD=0
 VERBOSE=0
 
 usage() {
@@ -26,10 +27,12 @@ lanes, and validate the raw mixed-version/rollback evidence artifacts.
 
 Options:
   --run-dir DIR       New evidence directory (default: target/scanner-heal-g09-evidence/TIMESTAMP)
+  --out-dir DIR       Alias for --run-dir
   --source-dir DIR    Cache directory for the pinned previous release binary
   --source-binary BIN Use an existing previous-release rustfs binary
   --test NAME         all, mixed-version, or rollback (default: all)
   --allow-dirty      Allow tracked source changes while collecting evidence
+  --skip-build       Reuse an existing target/debug/rustfs binary
   --plan-only        Print the resolved plan without building or running tests
   --self-test        Run lightweight CLI and artifact-validator checks
   --verbose          Stream command output instead of storing it under the run directory
@@ -260,7 +263,7 @@ JSON
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --run-dir)
+        --run-dir|--out-dir)
             RUN_DIR="$2"
             shift 2
             ;;
@@ -278,6 +281,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --allow-dirty)
             ALLOW_DIRTY=1
+            shift
+            ;;
+        --skip-build)
+            SKIP_BUILD=1
             shift
             ;;
         --plan-only)
@@ -348,8 +355,10 @@ export RUSTFS_UPGRADE_SOURCE_BINARY="$SOURCE_BINARY"
 export RUSTFS_E2E_LOG_DIR="${RUSTFS_E2E_LOG_DIR:-$RUN_DIR/server-logs}"
 mkdir -p "$RUSTFS_E2E_LOG_DIR"
 
-run_logged build-current cargo build --locked -p rustfs --bin rustfs
-: > "$ROOT/target/debug/rustfs.features"
+if [[ "$SKIP_BUILD" != 1 ]]; then
+    run_logged build-current cargo build --locked -p rustfs --bin rustfs
+    : > "$ROOT/target/debug/rustfs.features"
+fi
 
 SOURCE_REVISION="$(git rev-parse HEAD)"
 printf '%s\n' "$SOURCE_REVISION" >"$RUN_DIR/source-revision.txt"
