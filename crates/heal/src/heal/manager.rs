@@ -1567,6 +1567,18 @@ impl HealManager {
             .await
     }
 
+    pub(crate) async fn durable_mrf_repair_anchor(
+        &self,
+        intent: &rustfs_common::mrf_channel::MrfIntent,
+    ) -> Option<rustfs_common::mrf_channel::MrfDurableRepairAnchor> {
+        match self.storage.mrf_bucket_incarnation_id(intent.bucket.as_ref()).await {
+            Ok(Some(bucket_incarnation_id)) => {
+                rustfs_common::mrf_channel::MrfDurableRepairAnchor::from_intent(intent, bucket_incarnation_id)
+            }
+            Ok(None) | Err(_) => None,
+        }
+    }
+
     async fn submit_heal_request_with_receipt_alias_and_mrf_notice(
         &self,
         request: HealRequest,

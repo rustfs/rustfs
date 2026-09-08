@@ -314,6 +314,48 @@ mod canonical_outcome {
     }
 
     #[tokio::test]
+    async fn bucket_heal_records_matching_positive_storage_receipt() {
+        let incarnation = Uuid::new_v4();
+        let storage = Arc::new(MockStorage {
+            heal_object_receipts: Mutex::new(HashMap::from([(
+                "object-a".to_string(),
+                VecDeque::from([object_receipt("object-a", None, HealObjectDisposition::Repaired, incarnation)]),
+            )])),
+            bucket_incarnation_id: Mutex::new(Some(incarnation)),
+            ..Default::default()
+        });
+        let task = bucket_task(storage);
+
+        task.execute().await.expect("bucket heal should complete");
+
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.counters.processed, 2);
+        assert_eq!(outcome.counters.healed, 1);
+        assert_eq!(outcome.counters.unknown, 1);
+        assert_eq!(
+            outcome
+                .objects
+                .iter()
+                .filter(|item| item.identity.object == "object-a")
+                .count(),
+            1
+        );
+        let repaired = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.object == "object-a")
+            .expect("receipt-backed bucket object should be recorded");
+        assert_eq!(repaired.identity.bucket_incarnation_id, Some(incarnation));
+        assert_eq!(repaired.disposition, HealObjectDisposition::Repaired);
+        let legacy = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.object == "object-b")
+            .expect("legacy bucket object should still be recorded");
+        assert_eq!(legacy.disposition, HealObjectDisposition::Unknown);
+    }
+
+    #[tokio::test]
     async fn grace_single_object_is_completed_but_deferred() {
         let storage = Arc::new(MockStorage {
             heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::DanglingGraceDeferred)),

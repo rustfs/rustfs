@@ -167,6 +167,10 @@ impl HealTask {
             self.outcome_identity(bucket, object, version_id, self.options.pool_index, self.options.set_index);
         expected_identity.bucket_incarnation_id = expected_bucket_incarnation_id;
 
+        let mut expected_identity =
+            self.outcome_identity(bucket, object, version_id, self.options.pool_index, self.options.set_index);
+        expected_identity.bucket_incarnation_id = self.outcome_bucket_incarnation_id(bucket, self.options.dry_run).await?;
+
         let heal_fut = self.storage.heal_object_with_receipt(bucket, object, version_id, &heal_opts);
         let heal_result = if self.source == HealRequestSource::ReadRepair {
             let result = heal_fut.await;
