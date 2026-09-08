@@ -82,7 +82,14 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
     report_path = abba_dir / "report.json"
     manifest = read_json(manifest_path)
     report = read_json(report_path)
+    report_state = report.get("status")
+    performance_state = report.get("performance")
+    require(isinstance(report_state, str) and report_state, "report.status missing")
+    require(isinstance(performance_state, str) and performance_state, "report.performance missing")
     comparisons = report.get("comparisons")
+    if comparisons is None:
+        require(report_state not in PASS_STATES, "passing report requires comparisons")
+        comparisons = []
     require(isinstance(comparisons, list), "report.comparisons must be a list")
 
     counts = Counter()
@@ -115,15 +122,13 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
         if isinstance(p2, list):
             p2_values.extend(maybe_number(value, "p2_post_stop_work_multiple") for value in p2)
 
-    report_state = report.get("status")
-    performance_state = report.get("performance")
-    require(isinstance(report_state, str) and report_state, "report.status missing")
-    require(isinstance(performance_state, str) and performance_state, "report.performance missing")
     measured = report.get("evidence") == "measured"
     passed = report_state in PASS_STATES and performance_state in PASS_STATES and measured
     gate_state = "pass" if passed else "fail"
     if report_state == "synthetic_validated":
         reason = "synthetic evidence validates the harness only; measured performance remains pending"
+    elif report_state in FAIL_STATES and isinstance(report.get("error"), str) and report["error"]:
+        reason = f"ABBA report status is {report_state}: {report['error']}"
     elif report_state not in PASS_STATES:
         reason = f"ABBA report status is {report_state}"
     elif performance_state not in PASS_STATES:
@@ -142,6 +147,8 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
         "performance": performance_state,
         "evidence": report.get("evidence"),
         "cells": report.get("cells", 0),
+        "completed_cells": report.get("completed_cells"),
+        "error": report.get("error"),
         "comparisons_total": len(comparisons),
         "comparison_status_counts": dict(sorted(counts.items())),
         "worst_p99_regression": None if not p99_regressions else float(max(p99_regressions)),
@@ -247,6 +254,10 @@ def markdown(summary: dict[str, Any]) -> str:
         f"- worst_throughput_loss: {pct(throughput)}",
         f"- p2_worst_post_stop_work_multiple: {ratio(p2)}",
     ]
+    if abba.get("completed_cells") is not None:
+        lines.append(f"- completed_cells: {abba['completed_cells']}")
+    if abba.get("error"):
+        lines.append(f"- error: {abba['error']}")
     if summary.get("cache_cost") is not None:
         cache = summary["cache_cost"]
         lines.extend([

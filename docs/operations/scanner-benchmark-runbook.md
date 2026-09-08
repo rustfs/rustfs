@@ -204,6 +204,10 @@ The command prints only `PASS scanner_heal_perf ...` for measured passing ABBA
 evidence, otherwise `FAIL scanner_heal_perf ...`. The JSON and Markdown outputs
 carry the key p99/throughput/P1/P2/cache-cost fields and artifact provenance
 hashes; raw per-cell logs remain in the original artifact tree for audit.
+Failed or interrupted ABBA reports that contain only `status`, `performance`,
+`completed_cells`, and `error` also summarize as `FAIL`; they do not become
+performance evidence, and a missing comparison matrix is accepted only for a
+non-passing report.
 
 They cover the complete 120-cell schedule, data isolation, missing builds and
 oracles, zero samples/requests, swallowed request errors, offered-load drift,
