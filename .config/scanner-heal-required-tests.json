@@ -316,7 +316,10 @@
       "lane": "mrf-responsibility",
       "status": "pending",
       "description": "Measured MRF scale and replay cost with retained responsibility",
-      "requires": ["MRF scale measurement", "MRF replay-cost measurement", "retained responsibility evidence"]
+      "requires": ["MRF scale measurement", "MRF replay-cost measurement", "retained responsibility evidence", "cleanup/GC soak evidence"],
+      "evidence_fields": [
+        "mrf_cleanup_gc_soak_evidence"
+      ]
     },
     {
       "gate": "R-E",
