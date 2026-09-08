@@ -22,7 +22,7 @@ pub(crate) use crate::object_api::{
     GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader, ReplicationStatusWritebackCondition, ReplicationStatusWritebackMode,
 };
 #[cfg(test)]
-pub(crate) use crate::object_api::{NamespaceLockFence, NamespaceLockSignalTestFence};
+pub(crate) use crate::object_api::{NamespaceLockFence, NamespaceLockSignalTestFence, ReadPlan};
 pub(crate) use crate::storage_api_contracts::list::{
     ListOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions,
 };
