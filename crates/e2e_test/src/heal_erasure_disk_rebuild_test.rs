@@ -1338,7 +1338,7 @@ mod tests {
         let pre_interrupt_status: serde_json::Value = serde_json::from_str(&pre_interrupt_status_body)
             .map_err(|err| format!("pre-interrupt background heal status is not JSON ({err}): {pre_interrupt_status_body}"))?;
         let pre_interrupt_replacement = replacement_recovery_status(&cluster).await?;
-        let coordinator_log = std::fs::read_to_string(format!("{log_dir}/node0.log"))?;
+        let coordinator_log = std::fs::read_to_string(log_dir.join("node0.log"))?;
         assert!(
             coordinator_log
                 .lines()
