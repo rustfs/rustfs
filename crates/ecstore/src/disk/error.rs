@@ -627,7 +627,13 @@ impl From<tokio::task::JoinError> for DiskError {
 impl Clone for DiskError {
     fn clone(&self) -> Self {
         match self {
-            DiskError::Io(io_error) => DiskError::Io(std::io::Error::new(io_error.kind(), io_error.to_string())),
+            DiskError::Io(io_error) => DiskError::Io(
+                rustfs_rio::clone_internode_http_io_error(io_error)
+                    .and_then(std::io::Error::into_inner)
+                    // The helper derives a kind from the source; Clone must retain the original outer kind.
+                    .map(|source| std::io::Error::new(io_error.kind(), source))
+                    .unwrap_or_else(|| std::io::Error::new(io_error.kind(), io_error.to_string())),
+            ),
             DiskError::MaxVersionsExceeded => DiskError::MaxVersionsExceeded,
             DiskError::Unexpected => DiskError::Unexpected,
             DiskError::CorruptedFormat => DiskError::CorruptedFormat,
