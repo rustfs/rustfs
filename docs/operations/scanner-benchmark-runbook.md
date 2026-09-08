@@ -208,6 +208,10 @@ Failed or interrupted ABBA reports that contain only `status`, `performance`,
 `completed_cells`, and `error` also summarize as `FAIL`; they do not become
 performance evidence, and a missing comparison matrix is accepted only for a
 non-passing report.
+Measured passing reports must also retain the W10/W11 foreground-pressure,
+heal-lock-wait, and heal-attempt-cost fields emitted by the ABBA evaluator. If
+those fields are removed, empty, malformed, or length-mismatched, the quiet
+summary fails closed instead of treating the report as performance evidence.
 
 They cover the complete 120-cell schedule, data isolation, missing builds and
 oracles, zero samples/requests, swallowed request errors, offered-load drift,

@@ -77,6 +77,49 @@ def max_decimal(values: list[Decimal | None]) -> Decimal | None:
     return max(present)
 
 
+def require_metric_series(value: Any, name: str, minimum: Decimal | None = None,
+                          maximum: Decimal | None = None) -> list[Decimal | None]:
+    require(isinstance(value, list) and value, f"missing performance evidence field: {name}")
+    parsed = [maybe_number(item, name) for item in value]
+    for item in parsed:
+        if item is None:
+            continue
+        if minimum is not None:
+            require(item >= minimum, f"{name} below minimum")
+        if maximum is not None:
+            require(item <= maximum, f"{name} above maximum")
+    return parsed
+
+
+def require_measured_comparison_evidence(comparison: dict[str, Any], index: int) -> None:
+    w10_w11 = comparison.get("w10_w11")
+    require(isinstance(w10_w11, dict), f"comparison {index} missing W10/W11 evidence")
+    pressure = require_metric_series(
+        w10_w11.get("foreground_pressure_high_sample_ratios"),
+        f"comparison {index} foreground_pressure_high_sample_ratios",
+        Decimal("0"),
+        Decimal("1"),
+    )
+    lock_wait = require_metric_series(
+        w10_w11.get("heal_lock_wait_p99_ms"),
+        f"comparison {index} heal_lock_wait_p99_ms",
+        Decimal("0"),
+    )
+    attempt_cost = require_metric_series(
+        w10_w11.get("attempt_cost_per_healed_object"),
+        f"comparison {index} attempt_cost_per_healed_object",
+        Decimal("0"),
+    )
+    require(len(pressure) == len(lock_wait) == len(attempt_cost),
+            f"comparison {index} W10/W11 evidence length mismatch")
+    candidate_attempt_cost = maybe_number(
+        w10_w11.get("candidate_attempt_cost_per_healed_object"),
+        f"comparison {index} candidate_attempt_cost_per_healed_object",
+    )
+    require(candidate_attempt_cost is None or candidate_attempt_cost >= 0,
+            f"comparison {index} candidate attempt cost below minimum")
+
+
 def summarize_abba(abba_dir: Path) -> dict[str, Any]:
     manifest_path = abba_dir / "manifest.json"
     report_path = abba_dir / "report.json"
@@ -124,6 +167,9 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
 
     measured = report.get("evidence") == "measured"
     passed = report_state in PASS_STATES and performance_state in PASS_STATES and measured
+    if passed:
+        for index, comparison in enumerate(comparisons):
+            require_measured_comparison_evidence(comparison, index)
     gate_state = "pass" if passed else "fail"
     if report_state == "synthetic_validated":
         reason = "synthetic evidence validates the harness only; measured performance remains pending"

@@ -55,6 +55,12 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
             "throughput_change": -0.01,
             "p1": {"required_reduction": 0.8, "observed_reduction": 0.82, "repeatability_drift": 0.01},
             "p2_post_stop_work_multiples": [None, 1.1, 1.0, None],
+            "w10_w11": {
+                "foreground_pressure_high_sample_ratios": [0.0, 0.25, 0.25, 0.0],
+                "heal_lock_wait_p99_ms": [12.0, 8.0, 9.0, 13.0],
+                "attempt_cost_per_healed_object": [None, 1.2, 1.3, None],
+                "candidate_attempt_cost_per_healed_object": 1.3,
+            },
         }
         self.report = {
             "status": "pass",
@@ -147,6 +153,33 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         })
         with self.assertRaisesRegex(ValueError, "passing report requires comparisons"):
             summary.build_summary(args)
+
+    def test_passing_abba_report_requires_w10_w11_evidence(self):
+        for fault in ("missing", "pressure", "lock", "attempt", "length", "range"):
+            with self.subTest(fault=fault):
+                self.setUp()
+                if fault == "missing":
+                    del self.comparison["w10_w11"]
+                elif fault == "pressure":
+                    del self.comparison["w10_w11"]["foreground_pressure_high_sample_ratios"]
+                elif fault == "lock":
+                    del self.comparison["w10_w11"]["heal_lock_wait_p99_ms"]
+                elif fault == "attempt":
+                    del self.comparison["w10_w11"]["attempt_cost_per_healed_object"]
+                elif fault == "length":
+                    self.comparison["w10_w11"]["attempt_cost_per_healed_object"] = [None]
+                else:
+                    self.comparison["w10_w11"]["foreground_pressure_high_sample_ratios"] = [1.5, 0.0, 0.0, 0.0]
+                self.write_inputs()
+                args = type("Args", (), {
+                    "abba_dir": self.abba,
+                    "cache_cost_log": None,
+                    "require_cache_cost": False,
+                    "json_out": None,
+                    "markdown_out": None,
+                })
+                with self.assertRaisesRegex(ValueError, "W10/W11|performance evidence|length mismatch|above maximum"):
+                    summary.build_summary(args)
 
     def test_requires_cache_profile_when_requested(self):
         args = type("Args", (), {
