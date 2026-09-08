@@ -166,6 +166,24 @@ fn rule_replicates(rule: &ReplicationRule, obj: &ObjectOpts) -> bool {
     }
 }
 
+fn replication_filter_tags_match(filter: &s3s::dto::ReplicationRuleFilter, object_tags: &HashMap<String, String>) -> bool {
+    let tag_matches = |tag: &s3s::dto::Tag| match (&tag.key, &tag.value) {
+        (None, None) => true,
+        (Some(key), _) if key.is_empty() => true,
+        (Some(key), Some(value)) => object_tags.get(key) == Some(value),
+        _ => false,
+    };
+
+    filter
+        .and
+        .as_ref()
+        .and_then(|and| and.tags.as_deref())
+        .into_iter()
+        .flatten()
+        .chain(filter.tag.iter())
+        .all(tag_matches)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicationTargetValidationError {
     RoleWithMultipleDestinations,
@@ -704,7 +722,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
 
             if let Some(filter) = &rule.filter {
                 let object_tags = ReplicationTagFilter::decode_tags_to_map(&obj.user_tags);
-                if filter.test_tags(&object_tags) {
+                if replication_filter_tags_match(filter, &object_tags) {
                     rules.push(rule.clone());
                 }
             } else {
@@ -1137,6 +1155,47 @@ mod tests {
         });
 
         assert_eq!(validate_replication_config_structure(&structure_config(vec![rule])), Ok(()));
+    }
+
+    #[test]
+    fn actionable_rules_require_every_and_tag_to_match() {
+        let mut rule = replication_rule("rule-1", "arn:target:a");
+        rule.filter = Some(s3s::dto::ReplicationRuleFilter {
+            and: Some(s3s::dto::ReplicationRuleAndOperator {
+                prefix: None,
+                tags: Some(vec![
+                    s3s::dto::Tag {
+                        key: Some("env".to_string()),
+                        value: Some("prod".to_string()),
+                    },
+                    s3s::dto::Tag {
+                        key: Some("tier".to_string()),
+                        value: Some("gold".to_string()),
+                    },
+                ]),
+            }),
+            ..Default::default()
+        });
+        let config = structure_config(vec![rule]);
+        let object = |user_tags: &str| ObjectOpts {
+            name: "object".to_string(),
+            user_tags: user_tags.to_string(),
+            ..Default::default()
+        };
+
+        assert!(config.filter_target_arns(&object("env=prod")).is_empty());
+        assert_eq!(config.filter_target_arns(&object("env=prod&tier=gold")), vec!["arn:target:a"]);
+        assert!(config.filter_target_arns(&object("")).is_empty());
+
+        let mut malformed = config;
+        malformed.rules[0].filter.as_mut().unwrap().and.as_mut().unwrap().tags = Some(vec![s3s::dto::Tag {
+            key: Some("env".to_string()),
+            value: None,
+        }]);
+        assert!(
+            malformed.filter_target_arns(&object("env=prod")).is_empty(),
+            "a malformed tag filter must fail closed"
+        );
     }
 
     #[test]

@@ -580,6 +580,30 @@ impl FailStats {
         FailedMetric { count, size }
     }
 
+    /// Both rolling windows from one walk of the samples. `short` must be the
+    /// narrower window; the walk stops at `long`. Callers that need both (the
+    /// per-node site snapshot) would otherwise scan the deque twice while
+    /// holding the bucket-stats read lock, and the deque is only bounded by
+    /// the one-hour window - an unreachable target under load fills it.
+    pub fn recent_windows(&self, short: Duration, long: Duration) -> (FailedMetric, FailedMetric) {
+        let now = Instant::now();
+        let mut short_metric = FailedMetric::default();
+        let mut long_metric = FailedMetric::default();
+        for sample in self.recent.iter().rev() {
+            let age = now.duration_since(sample.observed_at);
+            if age > long {
+                break;
+            }
+            if age <= short {
+                short_metric.count += 1;
+                short_metric.size += sample.size;
+            }
+            long_metric.count += 1;
+            long_metric.size += sample.size;
+        }
+        (short_metric, long_metric)
+    }
+
     pub fn merge(&self, other: &FailStats) -> Self {
         Self {
             count: self.count.saturating_add(other.count),
@@ -910,6 +934,26 @@ mod tests {
         assert_eq!(last_minute.size, 96);
         assert_eq!(last_hour.count, 2);
         assert_eq!(last_hour.size, 96);
+    }
+
+    #[test]
+    fn fail_stats_recent_windows_matches_two_separate_scans() {
+        let mut stats = FailStats::default();
+        stats.add_size(64, None::<&()>);
+        stats.add_size(32, None::<&()>);
+
+        let (minute, hour) = stats.recent_windows(Duration::from_secs(60), Duration::from_secs(60 * 60));
+        let expected_minute = stats.recent_since(Duration::from_secs(60));
+        let expected_hour = stats.recent_since(Duration::from_secs(60 * 60));
+
+        assert_eq!((minute.count, minute.size), (expected_minute.count, expected_minute.size));
+        assert_eq!((hour.count, hour.size), (expected_hour.count, expected_hour.size));
+        assert_eq!(minute.count, 2);
+        assert_eq!(hour.size, 96);
+
+        let empty = FailStats::default();
+        let (minute, hour) = empty.recent_windows(Duration::from_secs(60), Duration::from_secs(60 * 60));
+        assert_eq!((minute.count, minute.size, hour.count, hour.size), (0, 0, 0, 0));
     }
 
     #[test]
