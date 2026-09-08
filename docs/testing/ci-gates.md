@@ -148,10 +148,14 @@ and exact S3 content.
 This case is a **four-node, one-drive-per-node process-restart test**. It is not
 power-loss validation, a 3x4 EC8+4 experiment, an all-version inventory, or proof
 of scanner enumeration, exact MRF disposition, legacy migration, or rollback.
-The registry keeps all G01-G14/P1-P4 and R-E/R-D/R-L release requirements pending
-until their actual feature-specific oracles and required topologies exist.
-Missing cases cannot be supplied by synthetic W20 results. W20's bounded JSON
-and file-hash helpers are reused; its ABBA performance contracts remain in
+The schema 2 registry separates the implemented single-set restart lane from
+structured release lanes for authority coverage, checkpoint/crash, status and
+outcome, MRF responsibility, mixed-version rollback, scheduler pressure,
+maintenance producers, and EC8+4 multi-set coverage. All G01-G14/P1-P4 and
+R-E/R-D/R-L release requirements stay `pending` until their actual
+feature-specific oracles, measurements and required topologies exist. Missing
+cases cannot be supplied by synthetic W20 results. W20's bounded JSON and
+file-hash helpers are reused; its ABBA performance contracts remain in
 `docs/operations/scanner-benchmark-runbook.md`.
 
 ### Recording One Case
@@ -232,14 +236,18 @@ For automation, `--check-scanner-heal-release "$RUN_DIR"` emits one compact
 JSON decision and exits nonzero while blocked. `verified_cases` contains only
 cases that pass the complete receipt, build provenance, nextest/JUnit and real
 oracle checks; `rejected_cases` names registered cases that do not, and
-`pending_gates` names the unimplemented release requirements. Approval requires
-every registered case to verify, `pending_gates` to be empty, and a future
-registry schema capable of representing the complete release matrix. Schema 1
-is deliberately marked `release_schema_capable: false`: it models only the
-single-version, unversioned-object restart/crash cases and cannot represent
-mixed-version, rollback, EC8+4 or performance evidence. A focused run,
-synthetic harness, compile-only result, skipped/retried test, ordinary CI
-success, or removal of pending text therefore cannot become a release approval.
+`pending_gates` names the unimplemented release requirements and
+`pending_lanes` names the structured release lanes that still need real
+evidence. Schema 1 is deliberately marked `release_schema_capable: false`
+because it models only the single-version, unversioned-object restart/crash
+cases. Schema 2 can describe the wider release matrix, but approval still
+requires every registered case to verify and every required gate to leave
+`pending` only after a future checker can bind it to real feature-specific
+evidence. The current checker hard-rejects missing structured requirements and
+pending gates mapped to an implemented lane, so clearing pending text cannot
+become approval. A focused run, synthetic harness, compile-only result,
+skipped/retried test, ordinary CI success, or unregistered mixed-version,
+rollback, EC8+4 or performance claim therefore cannot become a release approval.
 
 Run parser/receipt regressions with
 `scripts/python_bin.sh scripts/check_test_wiring.py --self-test`. Those fixtures

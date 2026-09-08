@@ -27,6 +27,11 @@ from scanner_abba import MAX_JSON_BYTES, digest, number, read_json, require, sha
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SCANNER_HEAL_REGISTRY_SCHEMA_MAX = 2
+SCANNER_HEAL_RELEASE_REQUIRED_GATES = (
+    "G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08", "G09", "G10", "G11", "G12", "G13", "G14",
+    "P1", "P2", "P3", "P4", "R-E", "R-D", "R-L",
+)
 SCHEDULED_ALERT_WORKFLOWS = tuple(
     item["workflow"]
     for item in json.loads((ROOT / ".github/scheduled-validations.json").read_text())
@@ -886,9 +891,13 @@ def evidence_integer(value: object, name: str, minimum: int, maximum: int) -> in
     return value
 
 
+def scanner_heal_registry_schema(registry: dict[str, object]) -> int:
+    return evidence_integer(registry.get("schema"), "registry schema", 1, SCANNER_HEAL_REGISTRY_SCHEMA_MAX)
+
+
 def scanner_heal_oracle_names(root: Path) -> tuple[str, ...]:
     registry = read_json(root / ".config/scanner-heal-required-tests.json")
-    evidence_integer(registry.get("schema"), "registry schema", 1, 1)
+    scanner_heal_registry_schema(registry)
     cases = registry.get("cases")
     require(isinstance(cases, dict) and cases, "invalid scanner/heal registry")
     names = set()
@@ -904,6 +913,77 @@ def scanner_heal_oracle_names(root: Path) -> tuple[str, ...]:
                 f"invalid unclean-shutdown marker expectation for {case_id}")
         names.add(oracle)
     return tuple(sorted(names))
+
+
+def scanner_heal_release_requirements(registry: dict[str, object]) -> tuple[dict[str, dict[str, object]], bool, list[str]]:
+    schema = scanner_heal_registry_schema(registry)
+    if schema == 1:
+        pending = registry.get("release_pending")
+        require(isinstance(pending, dict), "invalid scanner/heal release requirements")
+        requirements = {}
+        for gate, reason in pending.items():
+            require(isinstance(gate, str) and re.fullmatch(r"[A-Z][A-Z0-9-]*", gate) is not None,
+                    "invalid scanner/heal release gate")
+            require(isinstance(reason, str) and reason.strip(), f"missing release requirement for {gate}")
+            requirements[gate] = {"gate": gate, "status": "pending", "lane": "schema-1-pending",
+                                  "description": reason, "requires": [reason]}
+        return requirements, False, ["schema-1-pending"] if requirements else []
+
+    lanes = registry.get("release_lanes")
+    cases = registry.get("cases")
+    require(isinstance(cases, dict) and cases, "invalid scanner/heal registry")
+    require(isinstance(lanes, dict) and lanes, "invalid scanner/heal release lanes")
+    lane_statuses = {}
+    lane_gates = {}
+    for lane_id, lane in lanes.items():
+        require(isinstance(lane_id, str) and re.fullmatch(r"[a-z0-9-]+", lane_id) is not None,
+                "invalid scanner/heal release lane")
+        require(isinstance(lane, dict), f"invalid release lane {lane_id}")
+        status = lane.get("status")
+        require(status in ("implemented", "pending"), f"invalid release lane status for {lane_id}")
+        lane_statuses[lane_id] = status
+        if status == "implemented":
+            lane_cases = lane.get("cases")
+            require(isinstance(lane_cases, list) and lane_cases and all(isinstance(case, str) and case for case in lane_cases),
+                    f"implemented release lane {lane_id} has no cases")
+            require(all(case in cases for case in lane_cases), f"implemented release lane {lane_id} has unknown cases")
+        else:
+            gates = lane.get("gates")
+            require(isinstance(gates, list) and gates and all(isinstance(gate, str) and gate for gate in gates),
+                    f"pending release lane {lane_id} has no gates")
+            lane_gates[lane_id] = set(gates)
+
+    raw_requirements = registry.get("release_requirements")
+    require(isinstance(raw_requirements, list) and raw_requirements, "invalid scanner/heal release requirements")
+    requirements: dict[str, dict[str, object]] = {}
+    for item in raw_requirements:
+        require(isinstance(item, dict), "invalid scanner/heal release requirement")
+        gate = item.get("gate")
+        require(isinstance(gate, str) and re.fullmatch(r"[A-Z][A-Z0-9-]*", gate) is not None,
+                "invalid scanner/heal release gate")
+        require(gate not in requirements, f"duplicate scanner/heal release gate {gate}")
+        status = item.get("status")
+        require(status == "pending", f"release gate {gate} must stay pending until real evidence is registered")
+        lane = item.get("lane")
+        require(isinstance(lane, str) and lane in lane_statuses, f"unknown release lane for {gate}")
+        require(lane_statuses[lane] == "pending", f"pending release gate {gate} mapped to non-pending lane {lane}")
+        description = item.get("description")
+        require(isinstance(description, str) and description.strip(), f"missing release requirement for {gate}")
+        requires = item.get("requires")
+        require(isinstance(requires, list) and requires and
+                all(isinstance(requirement, str) and requirement.strip() for requirement in requires),
+                f"missing concrete evidence requirements for {gate}")
+        requirements[gate] = item
+
+    missing = sorted(set(SCANNER_HEAL_RELEASE_REQUIRED_GATES) - set(requirements))
+    require(not missing, f"missing scanner/heal release requirements: {', '.join(missing)}")
+    for lane, gates in lane_gates.items():
+        unknown = sorted(gates - set(requirements))
+        require(not unknown, f"pending release lane {lane} has unknown gates: {', '.join(unknown)}")
+        mapped = {gate for gate, requirement in requirements.items() if requirement["lane"] == lane}
+        require(gates == mapped, f"pending release lane {lane} gates do not match release requirements")
+    pending_lanes = sorted(lane for lane, status in lane_statuses.items() if status == "pending")
+    return requirements, True, pending_lanes
 
 
 def begin_scanner_heal_receipt(root: Path, directory: Path, binary: Path, test_binary: Path) -> None:
@@ -969,7 +1049,7 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
     """Validate one actual case, or fail the release while required lanes are pending."""
     try:
         registry = read_json(root / ".config/scanner-heal-required-tests.json")
-        evidence_integer(registry.get("schema"), "registry schema", 1, 1)
+        scanner_heal_registry_schema(registry)
         require(registry.get("cases"), "invalid scanner/heal registry")
         selected = registry["cases"] if case_id == "release" else {case_id: registry["cases"][case_id]}
         run = read_json(directory / "run.json")
@@ -1088,7 +1168,10 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
             require(all(keys == sorted(obj["key"] for obj in objects) for keys in node_listings),
                     "S3 listing differs from object oracle")
         if case_id == "release":
-            errors.extend(f"pending {gate}: {reason}" for gate, reason in registry["release_pending"].items())
+            release_requirements, _, _ = scanner_heal_release_requirements(registry)
+            errors.extend(
+                f"pending {gate}: {requirement['description']}" for gate, requirement in release_requirements.items()
+            )
         return errors
     except (OSError, KeyError, TypeError, ValueError, ET.ParseError) as error:
         return [f"scanner/heal evidence rejected: {error}"]
@@ -1097,15 +1180,10 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
 def scanner_heal_release_status(root: Path, directory: Path) -> dict[str, object]:
     """Return a compact release decision without weakening case validation."""
     registry = read_json(root / ".config/scanner-heal-required-tests.json")
-    evidence_integer(registry.get("schema"), "registry schema", 1, 1)
+    scanner_heal_registry_schema(registry)
     cases = registry.get("cases")
     require(isinstance(cases, dict) and cases, "invalid scanner/heal registry")
-    pending = registry.get("release_pending")
-    require(isinstance(pending, dict), "invalid scanner/heal release requirements")
-    for gate, reason in pending.items():
-        require(isinstance(gate, str) and re.fullmatch(r"[A-Z][A-Z0-9-]*", gate) is not None,
-                "invalid scanner/heal release gate")
-        require(isinstance(reason, str) and reason.strip(), f"missing release requirement for {gate}")
+    release_requirements, release_schema_capable, pending_lanes = scanner_heal_release_requirements(registry)
 
     verified_cases = []
     rejected_cases = []
@@ -1119,10 +1197,11 @@ def scanner_heal_release_status(root: Path, directory: Path) -> dict[str, object
         "schema": 1,
         "decision": "blocked",
         "release_approved": False,
-        "release_schema_capable": False,
+        "release_schema_capable": release_schema_capable,
         "verified_cases": verified_cases,
         "rejected_cases": rejected_cases,
-        "pending_gates": sorted(pending),
+        "pending_gates": sorted(release_requirements),
+        "pending_lanes": pending_lanes,
     }
 
 
@@ -1346,14 +1425,21 @@ class SelfTests(unittest.TestCase):
             status = scanner_heal_release_status(root, run_dir)
             self.assertEqual(status["decision"], "blocked")
             self.assertFalse(status["release_approved"])
+            self.assertTrue(status["release_schema_capable"])
             self.assertEqual(status["rejected_cases"], [])
             self.assertEqual(len(status["pending_gates"]), 21)
+            self.assertIn("mixed-version-rollback", status["pending_lanes"])
+            self.assertIn("ec8-4-multiset", status["pending_lanes"])
+            self.assertIn("scheduler-pressure", status["pending_lanes"])
 
     def test_scanner_heal_case_only_schema_cannot_approve_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, run_dir = self.scanner_heal_fixture(Path(tmp))
             registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["schema"] = 1
             registry["release_pending"] = {}
+            registry.pop("release_lanes")
+            registry.pop("release_requirements")
             write_json(root / ".config/scanner-heal-required-tests.json", registry)
 
             status = scanner_heal_release_status(root, run_dir)
@@ -1363,11 +1449,53 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(status["rejected_cases"], [])
             self.assertEqual(status["pending_gates"], [])
 
+    def test_scanner_heal_release_requirements_cannot_be_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["release_requirements"] = []
+            write_json(root / ".config/scanner-heal-required-tests.json", registry)
+
+            with self.assertRaisesRegex(ValueError, "invalid scanner/heal release requirements"):
+                scanner_heal_release_status(root, run_dir)
+
+    def test_scanner_heal_release_matrix_lanes_remain_pending_without_real_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+
+            errors = check_scanner_heal_evidence(root, run_dir, "release")
+            for gate, text in (
+                ("G09", "mixed-version reader/writer"),
+                ("G14", "3x4 EC8+4"),
+                ("P3", "two-hour pressure/heal capacity"),
+                ("R-L", "Legacy source conflicts"),
+            ):
+                self.assertTrue(any(error.startswith(f"pending {gate}:") and text in error for error in errors), gate)
+
+            status = scanner_heal_release_status(root, run_dir)
+            self.assertFalse(status["release_approved"])
+            self.assertIn("mixed-version-rollback", status["pending_lanes"])
+            self.assertIn("ec8-4-multiset", status["pending_lanes"])
+            self.assertIn("scheduler-pressure", status["pending_lanes"])
+
+    def test_scanner_heal_pending_gate_cannot_map_to_implemented_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["release_requirements"][0]["lane"] = "single-set-restart"
+            write_json(root / ".config/scanner-heal-required-tests.json", registry)
+
+            with self.assertRaisesRegex(ValueError, "mapped to non-pending lane"):
+                scanner_heal_release_status(root, run_dir)
+
     def test_scanner_heal_release_status_rejects_synthetic_case(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, run_dir = self.scanner_heal_fixture(Path(tmp))
             registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["schema"] = 1
             registry["release_pending"] = {}
+            registry.pop("release_lanes")
+            registry.pop("release_requirements")
             write_json(root / ".config/scanner-heal-required-tests.json", registry)
             path = run_dir / "background-target-crash.json"
             oracle = read_json(path)
@@ -1379,6 +1507,7 @@ class SelfTests(unittest.TestCase):
             status = scanner_heal_release_status(root, run_dir)
             self.assertEqual(status["decision"], "blocked")
             self.assertFalse(status["release_approved"])
+            self.assertFalse(status["release_schema_capable"])
             self.assertEqual(status["rejected_cases"], ["background-target-crash"])
             self.assertEqual(status["pending_gates"], [])
 
@@ -1386,7 +1515,10 @@ class SelfTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, run_dir = self.scanner_heal_fixture(Path(tmp))
             registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["schema"] = 1
             registry["release_pending"] = {}
+            registry.pop("release_lanes")
+            registry.pop("release_requirements")
             write_json(root / ".config/scanner-heal-required-tests.json", registry)
             (run_dir / "background-target-crash.json").unlink()
             (run_dir / "execution.json").unlink()

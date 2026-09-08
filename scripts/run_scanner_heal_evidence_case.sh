@@ -103,8 +103,8 @@ import sys
 status = json.loads(pathlib.Path(sys.argv[1]).read_text())
 if status.get("decision") != "blocked" or status.get("release_approved") is not False:
     raise SystemExit("release status did not record a blocked decision")
-if status.get("release_schema_capable") is not False:
-    raise SystemExit("case-only evidence schema unexpectedly became release-capable")
+if not status.get("pending_gates"):
+    raise SystemExit("release status did not retain pending gates")
 PY
 }
 
