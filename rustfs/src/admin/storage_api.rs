@@ -41,6 +41,12 @@ pub(crate) mod ecstore_cluster {
     };
 }
 
+/// Deployment topology. The KMS configure path needs it to tell an operator
+/// that a node-local backend cannot serve a multi-node deployment.
+pub(crate) mod ecstore_topology {
+    pub(crate) use crate::storage::storage_api::is_dist_erasure;
+}
+
 mod ecstore_config {
     pub(crate) use crate::storage::storage_api::ecstore_config::{com, init, storageclass};
 }

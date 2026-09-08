@@ -23,6 +23,7 @@ use crate::admin::runtime_sources::{
     current_or_init_kms_runtime_service_manager,
 };
 use crate::admin::storage_api::config::{read_admin_config, save_admin_config};
+use crate::admin::storage_api::ecstore_topology::is_dist_erasure;
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::storage_api::s3::{S3ErrorCode, error as admin_s3_error};
@@ -639,6 +640,51 @@ fn local_success_with_peer_report(message: &str, unconverged: &[String]) -> (boo
     )
 }
 
+/// What a node-local KMS backend means for a multi-node deployment
+/// (backlog#2369 P7.4).
+///
+/// The Local backend keeps key material on each node's own disk and generates
+/// its KDF salt per node, so two nodes derive different keys from the same
+/// `master_key`. An object encrypted on node A cannot be decrypted on node B:
+/// behind a load balancer that shows up as intermittent 500s on reads that
+/// worked a moment earlier. The product decision to warn rather than refuse
+/// stands; the generic "development only" warning simply never said what
+/// actually goes wrong, so an operator had no way to connect the symptom to
+/// the cause.
+///
+/// Returns the sentence to append to the configure response, or `None` when the
+/// combination does not apply.
+async fn node_local_backend_warning(backend: &rustfs_kms::KmsBackend) -> Option<&'static str> {
+    if !matches!(backend, rustfs_kms::KmsBackend::Local) || !is_dist_erasure().await {
+        return None;
+    }
+
+    warn!(
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_KMS,
+        event = "kms_node_local_backend_in_distributed_deployment",
+        backend = rustfs_kms::KmsBackend::Local.as_str(),
+        "The Local KMS backend stores key material on each node's own disk with a per-node salt, so objects \
+         encrypted on one node cannot be decrypted on another. In a distributed deployment this surfaces as \
+         intermittent 500s on reads behind a load balancer. Use Vault Transit, Vault KV2 or AWS KMS for a \
+         multi-node deployment"
+    );
+
+    Some(
+        "Warning: the Local KMS backend is node-local. Key material and its salt live on each node's own disk, so \
+         objects encrypted on one node cannot be decrypted on another and reads behind a load balancer will fail \
+         intermittently. Use Vault Transit, Vault KV2 or AWS KMS for a distributed deployment",
+    )
+}
+
+/// Append the node-local backend warning to a successful configure message.
+fn with_node_local_backend_warning(message: String, warning: Option<&'static str>) -> String {
+    match warning {
+        Some(warning) => format!("{message}. {warning}"),
+        None => message,
+    }
+}
+
 pub fn register_kms_dynamic_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::POST,
@@ -761,6 +807,7 @@ impl Operation for ConfigureKmsHandler {
         let kms_config = configure_request.to_kms_config();
 
         let persisted_config = kms_config.clone();
+        let node_local_warning = node_local_backend_warning(&kms_config.backend).await;
         let (success, message, status) = match service_manager
             .configure_with_persistence(kms_config, || async move {
                 save_kms_config(&persisted_config)
@@ -783,7 +830,7 @@ impl Operation for ConfigureKmsHandler {
                 let unconverged = broadcast_kms_config_reload().await;
                 let (success, message) = local_success_with_peer_report("KMS configured successfully", &unconverged);
                 audit.finish(KmsAdminOperation::Configure, None, None);
-                (success, message, status)
+                (success, with_node_local_backend_warning(message, node_local_warning), status)
             }
             Err(e) => {
                 let error_msg = format!("Failed to configure KMS: {e}");
@@ -1360,6 +1407,7 @@ impl Operation for ReconfigureKmsHandler {
         let kms_config = configure_request.to_kms_config();
 
         let persisted_config = kms_config.clone();
+        let node_local_warning = node_local_backend_warning(&kms_config.backend).await;
         let (success, message, status) = match service_manager
             .reconfigure_with_persistence(kms_config, || async move {
                 save_kms_config(&persisted_config)
@@ -1383,7 +1431,7 @@ impl Operation for ReconfigureKmsHandler {
                 let (success, message) =
                     local_success_with_peer_report("KMS reconfigured and restarted successfully", &unconverged);
                 audit.finish(KmsAdminOperation::Reconfigure, None, None);
-                (success, message, status)
+                (success, with_node_local_backend_warning(message, node_local_warning), status)
             }
             Err(e) => {
                 let error_msg = format!("Failed to reconfigure KMS: {e}");
@@ -1438,6 +1486,7 @@ mod tests {
         kms_config_fingerprint, kms_config_is_unchanged, kms_configure_actions, kms_reload_is_already_current,
         kms_service_control_actions, load_kms_config_with, local_success_with_peer_report, normalize_configure_request_secrets,
         open_persisted_kms_config, redacted_canonical_config, register_kms_dynamic_route, seal_persisted_kms_config,
+        with_node_local_backend_warning,
     };
     use crate::admin::router::{AdminOperation, S3Router};
     use crate::admin::storage_api::error::StorageError;
@@ -1473,6 +1522,21 @@ mod tests {
                 "reload must reconfigure instead of reporting success from {status:?}"
             );
         }
+    }
+
+    /// backlog#2369 P7.4: the operator has to learn the consequence from the
+    /// response, not just from a log line the configuring client never sees.
+    #[test]
+    fn a_node_local_backend_warning_reaches_the_configure_response() {
+        let plain = with_node_local_backend_warning("KMS configured successfully".to_string(), None);
+        assert_eq!(plain, "KMS configured successfully");
+
+        let warned = with_node_local_backend_warning(
+            "KMS configured successfully".to_string(),
+            Some("Warning: the Local KMS backend is node-local"),
+        );
+        assert!(warned.starts_with("KMS configured successfully."), "{warned}");
+        assert!(warned.contains("node-local"), "{warned}");
     }
 
     fn assert_has_action(actions: &[Action], action: Action) {
