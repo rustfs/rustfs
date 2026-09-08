@@ -75,6 +75,10 @@ struct ScannerRecoveryIntentResponse {
     mode: String,
     intent_id: String,
     state: String,
+    actor_sha256: String,
+    idempotency_key_sha256: String,
+    request_sha256: String,
+    accepted_at_unix_secs: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -332,6 +336,10 @@ fn scanner_recovery_intent_record_response(
         mode: record.mode,
         intent_id: record.intent_id,
         state: record.state,
+        actor_sha256: record.actor_sha256,
+        idempotency_key_sha256: record.idempotency_key_sha256,
+        request_sha256: record.request_sha256,
+        accepted_at_unix_secs: record.accepted_at_unix_secs,
     };
     let body = serde_json::to_vec(&response).map_err(|err| {
         S3Error::with_message(
@@ -371,10 +379,7 @@ fn scanner_recovery_intent_accept_response(
 
 fn scanner_recovery_intent_executor_id(result: &rustfs_scanner::ScannerRecoveryIntentAcceptResult) -> Option<String> {
     match result {
-        rustfs_scanner::ScannerRecoveryIntentAcceptResult::Accepted { record }
-        | rustfs_scanner::ScannerRecoveryIntentAcceptResult::Replayed { record }
-            if matches!(record.state.as_str(), "accepted" | "running") =>
-        {
+        rustfs_scanner::ScannerRecoveryIntentAcceptResult::Accepted { record } if record.state == "accepted" => {
             Some(record.intent_id.clone())
         }
         _ => None,
@@ -673,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn scanner_recovery_intent_executor_only_starts_non_terminal_work() {
+    fn scanner_recovery_intent_executor_starts_only_newly_accepted_work() {
         let mut record = rustfs_scanner::ScannerRecoveryIntentRecord {
             schema_version: 1,
             intent_id: "0".repeat(64),
@@ -699,7 +704,16 @@ mod tests {
                 record: record.clone(),
             })
             .as_deref(),
-            Some(record.intent_id.as_str())
+            None,
+            "a lost-response retry must not start a duplicate executor"
+        );
+        record.state = "accepted".to_string();
+        assert!(
+            scanner_recovery_intent_executor_id(&rustfs_scanner::ScannerRecoveryIntentAcceptResult::Replayed {
+                record: record.clone(),
+            })
+            .is_none(),
+            "replayed accepted records remain durable for startup/control recovery instead of duplicating work"
         );
         record.state = "completed".to_string();
         assert!(
