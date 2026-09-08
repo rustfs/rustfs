@@ -1,0 +1,465 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::super::root_recovery::RootHealRecovery;
+use super::*;
+use crate::heal::RUSTFS_META_BUCKET;
+
+async fn recovery_disk() -> (TempDir, DiskStore) {
+    let temp = TempDir::new().expect("temporary root recovery disk");
+    let endpoint = Endpoint::try_from(temp.path().to_string_lossy().as_ref()).expect("disk endpoint");
+    let disk = new_disk(
+        &endpoint,
+        &DiskOption {
+            cleanup: false,
+            health_check: false,
+        },
+    )
+    .await
+    .expect("local recovery disk");
+    match disk.make_volume(RUSTFS_META_BUCKET).await {
+        Ok(()) | Err(DiskError::VolumeExists) => {}
+        Err(error) => panic!("metadata volume: {error}"),
+    }
+    (temp, disk)
+}
+
+fn recovery_manager(disks: Vec<DiskStore>) -> HealManager {
+    let mut manager = HealManager::new(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            enable_auto_heal: false,
+            ..Default::default()
+        }),
+    );
+    manager.root_recovery = Arc::new(RootHealRecovery::with_disks(disks));
+    manager
+}
+
+fn root_request() -> HealRequest {
+    let mut request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::High);
+    request.source = HealRequestSource::Admin;
+    request
+}
+
+async fn active_root(manager: &HealManager, request: HealRequest) -> Arc<HealTask> {
+    let task = Arc::new(HealTask::from_request(request, manager.storage.clone()));
+    *task.status.write().await = HealTaskStatus::Running;
+    task.progress.write().await.update_object_progress(1, 1, 0, 0, 128);
+    manager.active_heals.lock().await.insert(task.id.clone(), task.clone());
+    task
+}
+
+#[tokio::test]
+async fn root_recovery_shutdown_restart_replays_same_id_and_success_retires_intent() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let mut request = root_request();
+    request.options.recursive = true;
+    let task = active_root(&manager, request.clone()).await;
+    manager.stop().await.expect("durable shutdown handoff");
+    assert!(task.cancel_token.is_cancelled());
+    drop(manager);
+
+    let restarted = recovery_manager(vec![disk]);
+    restarted.replay_root_heals().await.expect("replay durable root");
+    restarted.replay_root_heals().await.expect("replay is idempotent");
+    assert_eq!(restarted.get_queue_length().await, 1);
+    let restored = restarted
+        .heal_queue
+        .lock()
+        .await
+        .requests()
+        .next()
+        .cloned()
+        .expect("restored request");
+    assert_eq!(restored.id, request.id);
+    assert_eq!(restored.options, request.options);
+    assert_eq!(restored.priority, request.priority);
+    assert_eq!(restored.retry_attempts, request.retry_attempts);
+    assert_eq!(restored.created_at, request.created_at);
+
+    process_manager_queue_once(&restarted).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(restarted.get_task_status(&request.id).await, Ok(HealTaskStatus::Completed))
+                && !restarted.active_heals.lock().await.contains_key(&request.id)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("restored root executes successfully");
+    assert!(restarted.root_recovery.pending().await.expect("read completion").is_empty());
+}
+
+#[tokio::test]
+async fn root_recovery_explicit_cancel_covers_active_queued_retrying_and_durable_only() {
+    for state in ["active", "queued", "retrying", "durable_only", "root_path"] {
+        let (_temp, disk) = recovery_disk().await;
+        let manager = recovery_manager(vec![disk.clone()]);
+        let request = root_request();
+        manager.root_recovery.persist(&request).await.expect("durable responsibility");
+        match state {
+            "active" => {
+                active_root(&manager, request.clone()).await;
+            }
+            "queued" => {
+                manager.replay_root_heals().await.expect("queued recovery");
+            }
+            "retrying" => {
+                insert_retrying_request(&manager, request.clone()).await;
+            }
+            _ => {}
+        }
+        if state == "root_path" {
+            assert_eq!(manager.cancel_tasks_for_path("").await.expect("cancel durable root path"), 1);
+        } else {
+            manager.cancel_task(&request.id).await.expect("cancel root responsibility");
+        }
+        drop(manager);
+        let restarted = recovery_manager(vec![disk]);
+        restarted
+            .replay_root_heals()
+            .await
+            .expect("restart after explicit cancellation");
+        assert_eq!(restarted.get_queue_length().await, 0, "state={state}");
+    }
+}
+
+#[tokio::test]
+async fn root_recovery_force_start_cancels_durable_only_responsibility() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let old = root_request();
+    manager
+        .root_recovery
+        .persist(&old)
+        .await
+        .expect("old terminal responsibility");
+    let mut new = root_request();
+    new.force_start = true;
+    assert_eq!(
+        manager
+            .submit_heal_request(new.clone())
+            .await
+            .expect("force start replacement"),
+        HealAdmissionResult::Accepted
+    );
+    assert!(manager.root_recovery.pending().await.expect("old owner retired").is_empty());
+    manager.stop().await.expect("persist new root only");
+    let restarted = recovery_manager(vec![disk]);
+    restarted.replay_root_heals().await.expect("restart replacement");
+    let ids = restarted
+        .heal_queue
+        .lock()
+        .await
+        .requests()
+        .map(|request| request.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, [new.id]);
+}
+
+#[tokio::test]
+async fn root_recovery_force_start_replaces_fresh_queued_and_retrying_admin_roots() {
+    for retrying in [false, true] {
+        let (_temp, disk) = recovery_disk().await;
+        let manager = recovery_manager(vec![disk.clone()]);
+        let old = root_request();
+        if retrying {
+            insert_retrying_request(&manager, old.clone()).await;
+        } else {
+            manager.submit_heal_request(old.clone()).await.expect("queue original root");
+        }
+        assert!(manager.root_recovery.pending().await.expect("not handed off yet").is_empty());
+        let mut new = root_request();
+        new.force_start = true;
+        assert_eq!(
+            manager.submit_heal_request(new.clone()).await.expect("force replacement"),
+            HealAdmissionResult::Accepted
+        );
+        manager.stop().await.expect("handoff only the new responsibility");
+        let restarted = recovery_manager(vec![disk]);
+        restarted.replay_root_heals().await.expect("restart after forceStart");
+        let ids = restarted
+            .heal_queue
+            .lock()
+            .await
+            .requests()
+            .map(|request| request.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [new.id], "retrying={retrying}; old={}", old.id);
+    }
+}
+
+#[tokio::test]
+async fn root_recovery_invalid_records_are_retained_without_partial_replay() {
+    for kind in ["truncated", "schema", "identity", "option", "no_lock"] {
+        let (_temp, disk) = recovery_disk().await;
+        let manager = recovery_manager(vec![disk.clone()]);
+        let valid = root_request();
+        let invalid = root_request();
+        manager.root_recovery.persist(&valid).await.expect("valid root record");
+        manager
+            .root_recovery
+            .persist(&invalid)
+            .await
+            .expect("record before corruption");
+        let path = format!("root-heal-{}.json", invalid.id);
+        let original = disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("read root record");
+        let mut value: serde_json::Value = serde_json::from_slice(&original).expect("record JSON");
+        match kind {
+            "schema" => value["schema"] = 2.into(),
+            "identity" => value["task_id"] = valid.id.clone().into(),
+            "option" => value["options"]["future_delete_mode"] = true.into(),
+            "no_lock" => value["options"]["no_lock"] = true.into(),
+            _ => {}
+        }
+        let bytes = if kind == "truncated" {
+            b"{".to_vec()
+        } else {
+            serde_json::to_vec(&value).expect("modified record")
+        };
+        disk.write_all(RUSTFS_META_BUCKET, &path, bytes.clone().into())
+            .await
+            .expect("inject bad record");
+        assert!(manager.replay_root_heals().await.is_err(), "kind={kind}");
+        assert_eq!(manager.get_queue_length().await, 0, "no partial admission for {kind}");
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, &path)
+                .await
+                .expect("bad record retained")
+                .as_ref(),
+            bytes
+        );
+        let mut forced = root_request();
+        forced.force_start = true;
+        assert!(
+            manager.submit_heal_request(forced).await.is_err(),
+            "forceStart must not discard unknown state"
+        );
+    }
+}
+
+#[tokio::test]
+async fn root_recovery_failed_handoff_keeps_runtime_owner_and_does_not_try_another_disk() {
+    let (_temp, disk) = recovery_disk().await;
+    let (unavailable_temp, unavailable) = recovery_disk().await;
+    std::fs::remove_dir_all(unavailable_temp.path().join(RUSTFS_META_BUCKET)).expect("make owner volume unavailable");
+    let manager = recovery_manager(vec![unavailable, disk.clone()]);
+    let task = active_root(&manager, root_request()).await;
+    assert!(manager.stop().await.is_err());
+    assert!(
+        manager.cancel_task(&task.id).await.is_err(),
+        "missing owner cannot acknowledge cancellation"
+    );
+    assert!(!manager.cancel_token.is_cancelled());
+    assert!(!task.cancel_token.is_cancelled());
+    assert!(manager.active_heals.lock().await.contains_key(&task.id));
+    assert!(
+        RootHealRecovery::with_disks(vec![disk])
+            .pending()
+            .await
+            .expect("other disk remains empty")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_shutdown_fences_new_admission_and_preserves_later_cancellation() {
+    for operation_kind in ["submit", "force_start", "cancel"] {
+        let cancel = operation_kind == "cancel";
+        let (_temp, disk) = recovery_disk().await;
+        let manager = Arc::new(recovery_manager(vec![disk.clone()]));
+        let request = root_request();
+        active_root(&manager, request.clone()).await;
+        let queue = manager.heal_queue.lock().await;
+        let stopping = manager.clone();
+        let stop = tokio::spawn(async move { stopping.stop().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if manager.active_heals.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown owns active lock while waiting for queue");
+        let concurrent = manager.clone();
+        let operation = tokio::spawn(async move {
+            if cancel {
+                concurrent.cancel_task(&request.id).await
+            } else {
+                let mut new = root_request();
+                new.force_start = operation_kind == "force_start";
+                concurrent.submit_heal_request(new).await.map(|_| ())
+            }
+        });
+        drop(queue);
+        stop.await.expect("shutdown task").expect("durable shutdown");
+        let result = operation.await.expect("concurrent operation");
+        assert_eq!(result.is_ok(), cancel, "operation={operation_kind}");
+        let restarted = recovery_manager(vec![disk]);
+        restarted.replay_root_heals().await.expect("read final responsibility");
+        assert_eq!(restarted.get_queue_length().await, usize::from(!cancel));
+    }
+}
+
+#[tokio::test]
+async fn root_recovery_exhausted_timeout_is_not_reset_by_restart() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let mut request = root_request();
+    request.options.timeout = Some(Duration::from_secs(10));
+    let task = active_root(&manager, request.clone()).await;
+    task.set_execution_elapsed_for_test(Duration::from_secs(11)).await;
+    manager.stop().await.expect("persist exhausted execution budget");
+    let restarted = recovery_manager(vec![disk]);
+    restarted.replay_root_heals().await.expect("restore bounded request");
+    assert_eq!(
+        restarted
+            .heal_queue
+            .lock()
+            .await
+            .requests()
+            .next()
+            .expect("restored root")
+            .options
+            .timeout,
+        Some(Duration::ZERO)
+    );
+    process_manager_queue_once(&restarted).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(restarted.get_task_status(&request.id).await, Ok(HealTaskStatus::Timeout)) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("exhausted request stays timed out");
+    restarted
+        .cancel_task(&request.id)
+        .await
+        .expect("timeout responsibility remains cancellable");
+    assert!(restarted.root_recovery.pending().await.expect("retired timeout").is_empty());
+}
+
+#[tokio::test]
+async fn root_recovery_shutdown_preserves_remaining_execution_budget() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let mut request = root_request();
+    request.options.timeout = Some(Duration::from_secs(60));
+    let task = active_root(&manager, request).await;
+    task.set_execution_elapsed_for_test(Duration::from_secs(20)).await;
+    manager.stop().await.expect("handoff with consumed execution time");
+    let restarted = recovery_manager(vec![disk]);
+    restarted.replay_root_heals().await.expect("restore remaining budget");
+    let queue = restarted.heal_queue.lock().await;
+    let remaining = queue
+        .requests()
+        .next()
+        .expect("restored root")
+        .options
+        .timeout
+        .expect("remaining timeout");
+    assert!(remaining <= Duration::from_secs(40), "elapsed execution must not be refunded");
+    assert!(
+        remaining >= Duration::from_secs(30),
+        "shutdown fixture should retain most of its remaining budget"
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_force_start_after_shutdown_does_not_retire_original_owner() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let old = root_request();
+    active_root(&manager, old.clone()).await;
+    manager.stop().await.expect("handoff original root");
+    let mut new = root_request();
+    new.force_start = true;
+    assert!(manager.submit_heal_request(new).await.is_err());
+    let restarted = recovery_manager(vec![disk]);
+    restarted.replay_root_heals().await.expect("original responsibility remains");
+    let ids = restarted
+        .heal_queue
+        .lock()
+        .await
+        .requests()
+        .map(|request| request.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, [old.id]);
+}
+
+#[tokio::test]
+async fn root_recovery_terminal_timeout_updates_only_existing_journal_before_second_restart() {
+    for durable in [false, true] {
+        let (_temp, disk) = recovery_disk().await;
+        let manager = recovery_manager(vec![disk.clone()]);
+        let mut request = root_request();
+        request.options.timeout = Some(Duration::from_nanos(1));
+        if durable {
+            manager
+                .root_recovery
+                .persist(&request)
+                .await
+                .expect("persist nonzero execution budget");
+            manager.replay_root_heals().await.expect("first restart");
+        } else {
+            manager
+                .submit_heal_request(request.clone())
+                .await
+                .expect("first root execution");
+        }
+        process_manager_queue_once(&manager).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(manager.get_task_status(&request.id).await, Ok(HealTaskStatus::Timeout))
+                    && !manager.active_heals.lock().await.contains_key(&request.id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real execution exhausts a nonzero budget");
+        assert!(!manager.active_heals.lock().await.contains_key(&request.id));
+        let restarted = recovery_manager(vec![disk]);
+        restarted
+            .replay_root_heals()
+            .await
+            .expect("second restart after terminal timeout");
+        let queue = restarted.heal_queue.lock().await;
+        if durable {
+            assert_eq!(
+                queue
+                    .requests()
+                    .next()
+                    .expect("remaining timeout responsibility")
+                    .options
+                    .timeout,
+                Some(Duration::ZERO)
+            );
+        } else {
+            assert!(queue.is_empty(), "terminal failure must not create a new durable responsibility");
+        }
+    }
+}

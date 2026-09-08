@@ -20239,6 +20239,56 @@ mod tests {
     }
 
     #[test]
+    fn decommission_target_gate_retry_recognizes_multipart_part_errors() {
+        let wrap = |inner: Error| {
+            data_movement::data_movement_part_stage_error_for_test(
+                "decommission_object",
+                "put_object_part",
+                "bucket-a",
+                "object-a",
+                1,
+                inner,
+            )
+        };
+        let gate_busy_message =
+            format!("{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_PREFIX}7{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_SUFFIX}");
+        let wrapped = wrap(decommission_capacity_blocked_error(&gate_busy_message));
+        assert!(is_decommission_capacity_target_gate_busy(&wrapped));
+        assert_eq!(decommission_capacity_target_gate_busy_index(&wrapped), Some(7));
+        assert_eq!(
+            wrapped.to_string(),
+            Error::other(format!(
+                "decommission_object: put_object_part failed for bucket-a/object-a part 1: {}",
+                decommission_capacity_blocked_error(&gate_busy_message)
+            ))
+            .to_string()
+        );
+
+        for unrelated in [
+            Error::SlowDown,
+            Error::DiskFull,
+            decommission_capacity_blocked_error("target capacity is exhausted"),
+            Error::other(gate_busy_message),
+        ] {
+            let wrapped = wrap(unrelated);
+            assert!(!is_decommission_capacity_target_gate_busy(&wrapped));
+            assert_eq!(decommission_capacity_target_gate_busy_index(&wrapped), None);
+        }
+        for missing_target in [
+            Error::FileNotFound,
+            Error::ObjectNotFound("bucket-a".to_string(), "object-a".to_string()),
+            Error::VersionNotFound("bucket-a".to_string(), "object-a".to_string(), "version-a".to_string()),
+        ] {
+            assert!(is_decommission_copy_cleanup_safe_error(&missing_target));
+            assert!(
+                !is_decommission_copy_cleanup_safe_error(&wrap(missing_target)),
+                "a missing target part must never authorize source cleanup"
+            );
+        }
+        assert!(is_decommission_target_capacity_error(&wrap(Error::DiskFull)));
+    }
+
+    #[test]
     fn decommission_target_capacity_error_accepts_wrapped_capacity_errors() {
         let disk_full = Error::other(format!("decommission_object: put_object failed for bucket/object: {}", Error::DiskFull));
         let storage_full = Error::other(format!(

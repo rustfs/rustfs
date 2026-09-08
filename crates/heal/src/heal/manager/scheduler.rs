@@ -26,6 +26,7 @@ impl HealManager {
         let retrying_heals = self.retrying_heals.clone();
         let mrf_repair_notice_targets = self.mrf_repair_notice_targets.clone();
         let replacement_recovery_anchors = self.replacement_recovery_anchors.clone();
+        let root_recovery = self.root_recovery.clone();
         let cancel_token = self.cancel_token.clone();
         let statistics = self.statistics.clone();
         let storage = self.storage.clone();
@@ -59,6 +60,7 @@ impl HealManager {
                             retrying_heals: &retrying_heals,
                             mrf_repair_notice_targets: &mrf_repair_notice_targets,
                             replacement_recovery_anchors: &replacement_recovery_anchors,
+                            root_recovery: &root_recovery,
                             config: &config,
                             statistics: &statistics,
                             storage: &storage,
@@ -78,6 +80,7 @@ impl HealManager {
                             retrying_heals: &retrying_heals,
                             mrf_repair_notice_targets: &mrf_repair_notice_targets,
                             replacement_recovery_anchors: &replacement_recovery_anchors,
+                            root_recovery: &root_recovery,
                             config: &config,
                             statistics: &statistics,
                             storage: &storage,
@@ -106,6 +109,7 @@ impl HealManager {
             retrying_heals,
             mrf_repair_notice_targets,
             replacement_recovery_anchors,
+            root_recovery,
             config,
             statistics,
             storage,
@@ -117,6 +121,9 @@ impl HealManager {
         let config = config.read().await;
         let mainline_pressure = Self::mainline_throttle_active(&config, workload_provider);
         let mut active_heals_guard = active_heals.lock().await;
+        if cancel_token.is_cancelled() {
+            return;
+        }
         publish_active_heal_count(&active_heals_guard);
 
         // Check if new heal tasks can be started
@@ -206,6 +213,7 @@ impl HealManager {
                 let replacement_recovery_anchors_clone = replacement_recovery_anchors.clone();
                 let statistics_clone = statistics.clone();
                 let notify_clone = notify.clone();
+                let root_recovery_clone = root_recovery.clone();
                 let manager_cancel_token = cancel_token.clone();
                 let task_type_label_for_spawn = task_type_label.clone();
                 let task_set_label_for_spawn = task_set_label.clone();
@@ -294,6 +302,38 @@ impl HealManager {
                     tests::pause_completed_retention_before_publish(&task_id, &completed_status).await;
                     let mut active_heals_guard = active_heals_clone.lock().await;
                     let owns_completion = active_heals_guard.contains_key(&task_id);
+                    if owns_completion
+                        && result.is_ok()
+                        && let Err(error) = root_recovery_clone.remove(&task_id, &task.heal_type, task.source).await
+                    {
+                        // Keep the durable responsibility if retirement fails.
+                        // Replaying a completed traversal is idempotent.
+                        warn!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_SCHEDULER_STATE,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                            task_id,
+                            state = "root_recovery_retirement_failed",
+                            error = %error,
+                            "Failed to retire root heal recovery record"
+                        );
+                    }
+                    if owns_completion
+                        && result.is_err()
+                        && let Err(error) = root_recovery_clone.checkpoint_failed_execution(&task).await
+                    {
+                        warn!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_SCHEDULER_STATE,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                            task_id,
+                            state = "root_recovery_checkpoint_failed",
+                            error = %error,
+                            "Failed to checkpoint root heal recovery execution budget"
+                        );
+                    }
                     let cancelled_completion = if owns_completion {
                         false
                     } else {
