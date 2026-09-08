@@ -507,6 +507,21 @@ pub async fn reload_persisted_kms_config() -> Result<(), String> {
     reload_persisted_kms_config_from_store(store, kms_service_manager_from_context(), "peer_reload").await
 }
 
+/// Whether a reload may return early because this node is already serving
+/// exactly the persisted configuration.
+///
+/// Byte-identical configuration is not sufficient on its own. A node whose KMS
+/// failed to start keeps its configuration and sits in `Error`, so comparing
+/// only the bytes turned the documented recovery call
+/// (`POST /rustfs/admin/v3/kms/reload`) into a no-op that reported success and
+/// left the node down — including on every peer, which reaches this same
+/// function through the reload broadcast (backlog#2369 P1). Any state other
+/// than `Running` falls through to `reconfigure`, which starts the service when
+/// none is running.
+fn kms_reload_is_already_current(status: rustfs_kms::KmsServiceStatus, config_is_unchanged: bool) -> bool {
+    matches!(status, rustfs_kms::KmsServiceStatus::Running) && config_is_unchanged
+}
+
 async fn reload_persisted_kms_config_from_store(
     store: Arc<ECStore>,
     service_manager: Arc<rustfs_kms::KmsServiceManager>,
@@ -525,11 +540,11 @@ async fn reload_persisted_kms_config_from_store(
         return Err("no persisted KMS configuration is available".to_string());
     };
 
-    if service_manager
+    let config_is_unchanged = service_manager
         .get_config()
         .await
-        .is_some_and(|current| kms_config_is_unchanged(&current, &config))
-    {
+        .is_some_and(|current| kms_config_is_unchanged(&current, &config));
+    if kms_reload_is_already_current(service_manager.get_status().await, config_is_unchanged) {
         info!(
             event = "kms_service_state",
             component = LOG_COMPONENT_ADMIN,
@@ -1420,9 +1435,9 @@ impl Operation for ReconfigureKmsHandler {
 mod tests {
     use super::{
         KmsConfigLoadError, decode_persisted_kms_config, ensure_kms_config_persistable, ensure_kms_request_persistable,
-        kms_config_fingerprint, kms_config_is_unchanged, kms_configure_actions, kms_service_control_actions,
-        load_kms_config_with, local_success_with_peer_report, normalize_configure_request_secrets, open_persisted_kms_config,
-        redacted_canonical_config, register_kms_dynamic_route, seal_persisted_kms_config,
+        kms_config_fingerprint, kms_config_is_unchanged, kms_configure_actions, kms_reload_is_already_current,
+        kms_service_control_actions, load_kms_config_with, local_success_with_peer_report, normalize_configure_request_secrets,
+        open_persisted_kms_config, redacted_canonical_config, register_kms_dynamic_route, seal_persisted_kms_config,
     };
     use crate::admin::router::{AdminOperation, S3Router};
     use crate::admin::storage_api::error::StorageError;
@@ -1431,6 +1446,34 @@ mod tests {
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    /// backlog#2369 P1: a node whose KMS failed to start keeps its persisted
+    /// configuration, so an unchanged-bytes comparison made the documented
+    /// recovery call a no-op that still reported success.
+    #[test]
+    fn kms_reload_only_short_circuits_for_a_running_service() {
+        use rustfs_kms::KmsServiceStatus;
+
+        assert!(
+            kms_reload_is_already_current(KmsServiceStatus::Running, true),
+            "a running service on identical configuration has nothing to apply"
+        );
+        assert!(
+            !kms_reload_is_already_current(KmsServiceStatus::Running, false),
+            "changed configuration must always be applied"
+        );
+
+        for status in [
+            KmsServiceStatus::NotConfigured,
+            KmsServiceStatus::Configured,
+            KmsServiceStatus::Error("vault unreachable at startup".to_string()),
+        ] {
+            assert!(
+                !kms_reload_is_already_current(status.clone(), true),
+                "reload must reconfigure instead of reporting success from {status:?}"
+            );
+        }
+    }
 
     fn assert_has_action(actions: &[Action], action: Action) {
         assert!(actions.contains(&action), "expected action list to contain {action:?}");
