@@ -7,6 +7,8 @@
 
 RustFS supports queued multi-pool decommission start requests on multi-pool deployments. The admin handler accepts the MinIO-compatible request shape, including comma-separated pool targets. An empty target list is rejected; single-pool deployments reject decommission because there is no destination pool; on multi-pool deployments one or more valid target pools are accepted as a single queued operation.
 
+Deterministic request rejections (unsupported single-pool operations, missing or terminal targets, an empty start request, removing the last active pool, and clearing unresolved recovery entries) retain the typed `InvalidArgument` error and its actionable reason. Active-operation conflicts retain their existing `InvalidRequest` or `OperationAborted` contract. Storage, quorum, and fleet-proof failures are not converted into argument errors.
+
 ### Request Semantics
 
 `POST /v3/pools/decommission` with comma-separated pool targets is a queue submission:

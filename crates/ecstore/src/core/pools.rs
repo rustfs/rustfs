@@ -840,15 +840,21 @@ fn is_decommission_start_active_pool(pool: &PoolStatus) -> bool {
     decommission_start_pool_state(Some(pool)) == DecommissionStartPoolState::Active
 }
 
+fn invalid_decommission_request(reason: impl Into<String>) -> Error {
+    Error::InvalidArgument("decommission".to_string(), "pool-state".to_string(), reason.into())
+}
+
 fn ensure_decommission_start_allowed(state: DecommissionStartPoolState) -> Result<()> {
     match state {
-        DecommissionStartPoolState::Missing => Err(Error::other("failed to start decommission: target pool was not found")),
+        DecommissionStartPoolState::Missing => {
+            Err(invalid_decommission_request("failed to start decommission: target pool was not found"))
+        }
         DecommissionStartPoolState::Active | DecommissionStartPoolState::Retryable => Ok(()),
         DecommissionStartPoolState::Decommissioning => Err(StorageError::DecommissionAlreadyRunning),
-        DecommissionStartPoolState::Decommissioned => {
-            Err(Error::other("failed to start decommission: target pool is already decommissioned"))
-        }
-        DecommissionStartPoolState::Blocked => Err(Error::other(
+        DecommissionStartPoolState::Decommissioned => Err(invalid_decommission_request(
+            "failed to start decommission: target pool is already decommissioned",
+        )),
+        DecommissionStartPoolState::Blocked => Err(invalid_decommission_request(
             "failed to start decommission: target pool decommission is blocked; clear failed or canceled metadata before starting again",
         )),
     }
@@ -865,7 +871,7 @@ fn ensure_decommission_start_keeps_active_pool(meta: &PoolMeta, indices: &[usize
         .filter(|idx| meta.pools.get(**idx).is_some_and(is_decommission_start_active_pool))
         .count();
     if active_count.saturating_sub(active_target_count) == 0 {
-        return Err(Error::other(
+        return Err(invalid_decommission_request(
             "failed to start decommission: at least one active pool must remain after decommission start",
         ));
     }
@@ -4268,7 +4274,7 @@ fn should_retry_decommission_cancel_reload(changed: bool, already_canceled: bool
 
 fn ensure_decommission_cancel_allowed(pool_present: bool, decommission_present: bool, terminal: bool) -> Result<()> {
     if !pool_present {
-        return Err(Error::other("failed to cancel decommission: target pool was not found"));
+        return Err(invalid_decommission_request("failed to cancel decommission: target pool was not found"));
     }
 
     if !decommission_present || terminal {
@@ -4287,7 +4293,7 @@ fn ensure_decommission_clear_allowed(
     unresolved_entries: usize,
 ) -> Result<()> {
     if !pool_present {
-        return Err(Error::other("failed to clear decommission: target pool was not found"));
+        return Err(invalid_decommission_request("failed to clear decommission: target pool was not found"));
     }
 
     if !decommission_present {
@@ -4303,7 +4309,7 @@ fn ensure_decommission_clear_allowed(
     }
 
     if unresolved_entries > 0 {
-        return Err(Error::other(format!(
+        return Err(invalid_decommission_request(format!(
             "failed to clear decommission: {unresolved_entries} unresolved listing entries must be reconciled by retrying decommission"
         )));
     }
@@ -4313,7 +4319,7 @@ fn ensure_decommission_clear_allowed(
 
 fn ensure_decommission_terminal_operation_supported(single_pool: bool, operation: &str) -> Result<()> {
     if single_pool {
-        return Err(Error::other(format!(
+        return Err(invalid_decommission_request(format!(
             "failed to {operation}: single pool deployments do not support decommission"
         )));
     }
@@ -4323,7 +4329,9 @@ fn ensure_decommission_terminal_operation_supported(single_pool: bool, operation
 
 fn validate_start_decommission_request(indices: &[usize], single_pool: bool) -> Result<()> {
     if indices.is_empty() {
-        return Err(Error::other("failed to start decommission: no target pools were provided"));
+        return Err(invalid_decommission_request(
+            "failed to start decommission: no target pools were provided",
+        ));
     }
 
     ensure_decommission_terminal_operation_supported(single_pool, "start decommission")
@@ -24841,6 +24849,25 @@ mod pools_tests {
         };
 
         assert!(!pool_meta_has_active_decommission(&terminal_meta));
+    }
+
+    #[test]
+    fn test_decommission_request_rejections_preserve_invalid_argument_type() {
+        for result in [
+            ensure_decommission_start_allowed(DecommissionStartPoolState::Missing),
+            ensure_decommission_start_allowed(DecommissionStartPoolState::Decommissioned),
+            ensure_decommission_start_allowed(DecommissionStartPoolState::Blocked),
+            ensure_decommission_cancel_allowed(false, false, false),
+            ensure_decommission_clear_allowed(false, false, false, false, false, 0),
+            ensure_decommission_clear_allowed(true, true, false, true, false, 1),
+            ensure_decommission_terminal_operation_supported(true, "cancel decommission"),
+            validate_start_decommission_request(&[], false),
+            validate_start_decommission_request(&[0], true),
+            ensure_decommission_start_keeps_active_pool(&PoolMeta::default(), &[]),
+        ] {
+            let err = result.expect_err("invalid lifecycle requests must be rejected before mutation");
+            assert!(matches!(&err, Error::InvalidArgument(_, _, reason) if !reason.is_empty()), "{err:?}");
+        }
     }
 
     #[test]
