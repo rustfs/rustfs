@@ -1374,6 +1374,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pending_identity_follower_becomes_write_ready_after_elected_commit() {
+        let deployment_id = Uuid::new_v4();
+        let storage = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let mut elected_writer = PoolMetaWriteState::for_startup(deployment_id, true);
+        establish_pool_meta_bootstrap_identity_if_proven(vec![storage.clone()], &mut elected_writer, true)
+            .await
+            .expect("the elected writer should persist its pending bootstrap identity");
+        let pending_objects = storage
+            .objects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            !pool_meta_identity_initialized_for_test(&pending_objects[POOL_META_IDENTITY_NAME].0)
+                .expect("decode the pending identity")
+        );
+        assert!(!pending_objects.contains_key(POOL_META_NAME));
+
+        let mut follower = PoolMetaWriteState::for_startup(deployment_id, false);
+        let pending_error = load_pool_meta_for_startup(vec![storage.clone()], &mut follower)
+            .await
+            .expect_err("the follower must not initialize metadata using another node's pending identity");
+        assert!(pending_error.to_string().contains("no verified fresh-bootstrap proof"));
+        let blocked = follower
+            .ensure_write_safe("pending identity follower")
+            .expect_err("the pending identity must not authorize follower writes");
+        assert_eq!(blocked.pool_metadata_failure().expect("typed failure").phase, "metadata_absence");
+        assert_eq!(storage.pool_meta_write_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *storage.objects.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            pending_objects,
+            "the rejected follower must leave both metadata objects and CAS tokens untouched"
+        );
+
+        let (initial, replica_state) = load_pool_meta_for_startup(vec![storage.clone()], &mut elected_writer)
+            .await
+            .expect("the elected writer's bootstrap proof should authorize missing metadata");
+        assert!(initial.pools.is_empty());
+        assert!(!replica_state.needs_repair);
+        assert!(replica_state.repair_write_safe);
+        let committed = persist_pool_meta_for_startup_if_safe(
+            &init_test_pool_meta(None),
+            vec![storage.clone()],
+            replica_state,
+            &mut elected_writer,
+            true,
+            true,
+        )
+        .await
+        .expect("the elected writer should finish the normal startup metadata transaction");
+        elected_writer
+            .ensure_write_safe("elected writer after commit")
+            .expect("both metadata CAS phases and the identity commit must complete");
+        assert_eq!(storage.pool_meta_write_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *storage
+                .pool_meta_written_versions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![3, 3]
+        );
+        let committed_objects = storage
+            .objects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            pool_meta_identity_initialized_for_test(&committed_objects[POOL_META_IDENTITY_NAME].0)
+                .expect("decode the committed identity")
+        );
+        assert_eq!(
+            pool_meta_v3_commit_state_for_test(committed_objects[POOL_META_NAME].0.clone())
+                .expect("decode the complete V3 pool metadata"),
+            (1, true)
+        );
+
+        // Retry the same state that observed the pending identity, after normal commit completion.
+        let (reloaded, replica_state) = load_pool_meta_for_startup(vec![storage.clone()], &mut follower)
+            .await
+            .expect("the original follower should validate matching committed identity and metadata");
+        assert!(!replica_state.needs_repair);
+        assert!(replica_state.repair_write_safe);
+        assert_eq!(
+            serde_json::to_value(&reloaded).expect("serialize the reloaded metadata"),
+            serde_json::to_value(&committed).expect("serialize the committed metadata")
+        );
+        persist_pool_meta_for_startup_if_safe(&reloaded, vec![storage.clone()], replica_state, &mut follower, false, false)
+            .await
+            .expect("the non-elected follower must adopt the committed metadata without writing");
+
+        let mut late_follower = PoolMetaWriteState::for_startup(deployment_id, false);
+        load_pool_meta_for_startup(vec![storage.clone()], &mut late_follower)
+            .await
+            .expect("a follower first observing these same committed records must accept them");
+        late_follower
+            .ensure_write_safe("late follower after commit")
+            .expect("the committed records themselves must permit readiness");
+        assert_eq!(storage.pool_meta_write_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *storage.objects.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            committed_objects,
+            "neither follower may rewrite the elected writer's committed bytes or CAS tokens"
+        );
+        follower.ensure_write_safe("original follower after elected commit").expect(
+            "a follower retry must become write-ready after the elected writer commits matching identity and pool metadata",
+        );
+    }
+
+    #[tokio::test]
     async fn test_nonfresh_identity_repair_crash_never_persists_pending_bootstrap_authority() {
         let deployment_id = Uuid::new_v4();
         let initial = init_test_pool_meta(None);
