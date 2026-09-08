@@ -196,7 +196,12 @@
       "lane": "mrf-responsibility",
       "status": "pending",
       "description": "MRF capacity, disk-full and replica-loss matrix",
-      "requires": ["MRF capacity evidence", "disk-full matrix", "replica-loss matrix"]
+      "requires": ["MRF capacity evidence", "disk-full matrix", "replica-loss matrix"],
+      "evidence_fields": [
+        "mrf_capacity_evidence",
+        "disk_full_matrix",
+        "replica_loss_matrix"
+      ]
     },
     {
       "gate": "G09",
