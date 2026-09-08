@@ -1142,17 +1142,47 @@ fn mrf_verified_repair_event_requires_positive_exact_identity() {
     assert_eq!(event.bucket_incarnation_id, incarnation);
     assert_eq!(event.disposition, MrfVerifiedRepairDisposition::Repaired);
 
-    assert!(
-        mrf_verified_repair_event_for_target(
-            &MrfRepairNoticeTarget {
-                kind: MrfKind::DecodeFailure,
-                ..target.clone()
-            },
-            &matching
-        )
-        .is_none(),
-        "only receipt-producing partial-write object heals can publish verified events today"
+    let decode_target = MrfRepairNoticeTarget {
+        kind: MrfKind::DecodeFailure,
+        ..target.clone()
+    };
+    let decode_outcome = HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Decode,
+            ..matching.identity.clone()
+        },
+        ..matching.clone()
+    };
+    let decode_event =
+        mrf_verified_repair_event_for_target(&decode_target, &decode_outcome).expect("decode repairs publish exact proofs");
+    assert_eq!(decode_event.kind, MrfKind::DecodeFailure);
+    assert_eq!(
+        decode_event.scope,
+        Some(MrfScope {
+            pool_index: 1,
+            set_index: 2
+        })
     );
+
+    let metadata_target = MrfRepairNoticeTarget {
+        kind: MrfKind::MetadataCorruption,
+        ..target.clone()
+    };
+    let metadata_outcome = HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Metadata,
+            version_id: None,
+            pool_index: None,
+            set_index: None,
+            ..matching.identity.clone()
+        },
+        ..matching.clone()
+    };
+    let metadata_event =
+        mrf_verified_repair_event_for_target(&metadata_target, &metadata_outcome).expect("metadata repairs publish exact proofs");
+    assert_eq!(metadata_event.kind, MrfKind::MetadataCorruption);
+    assert_eq!(metadata_event.version_id, None);
+    assert_eq!(metadata_event.scope, None);
 
     for rejected in [
         HealObjectOutcome {
