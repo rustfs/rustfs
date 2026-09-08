@@ -8220,7 +8220,7 @@ mod tests {
     }
     mod multipart_transport_tests {
         use super::super::super::replication_filemeta_boundary::ObjectPartInfo;
-        use super::super::super::replication_storage_boundary::{ObjectIO as _, ReadPlan};
+        use super::super::super::replication_storage_boundary::ObjectIO as _;
         use super::*;
         use bytes::Bytes;
         use http_body_util::{BodyExt, Full};
@@ -8229,7 +8229,6 @@ mod tests {
         #[derive(Debug)]
         struct Source {
             body: Bytes,
-            stored: Option<Bytes>,
             info: ObjectInfo,
             ranges: StdMutex<Vec<(i64, i64)>>,
             full_reads: std::sync::atomic::AtomicUsize,
@@ -8258,17 +8257,6 @@ mod tests {
                     self.info.version_id.map(|id| id.to_string()),
                     "every read retains the selected source version"
                 );
-                if let Some(stored) = &self.stored {
-                    if let Some(range) = &range {
-                        self.ranges.lock().expect("range journal lock").push((range.start, range.end));
-                    } else {
-                        self.full_reads.fetch_add(1, Ordering::Relaxed);
-                    }
-                    let plan = ReadPlan::build_for_request(range, &self.info, opts, &HeaderMap::new(), None).await?;
-                    let start = plan.storage_offset();
-                    let end = start + usize::try_from(plan.storage_length()).expect("nonnegative storage length");
-                    return plan.into_object_reader(Box::new(std::io::Cursor::new(stored.slice(start..end))), &self.info);
-                }
                 if range.is_none() {
                     self.full_reads.fetch_add(1, Ordering::Relaxed);
                     return Ok(GetObjectReader {
@@ -8427,7 +8415,6 @@ mod tests {
                     ..Default::default()
                 },
                 body: body.clone(),
-                stored: Some(Bytes::from(stored)),
                 ranges: StdMutex::new(Vec::new()),
                 full_reads: std::sync::atomic::AtomicUsize::new(0),
             });
@@ -8669,7 +8656,6 @@ mod tests {
                     ..Default::default()
                 },
                 body: body.clone(),
-                stored: None,
                 ranges: StdMutex::new(Vec::new()),
                 full_reads: std::sync::atomic::AtomicUsize::new(0),
             });

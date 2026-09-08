@@ -4036,6 +4036,10 @@ impl ManualTransitionRunReport {
             || self.skipped_queue_timeout > 0
     }
 
+    fn has_enqueue_backpressure(&self) -> bool {
+        self.skipped_queue_full > 0 || self.skipped_queue_closed > 0 || self.skipped_queue_timeout > 0
+    }
+
     pub fn was_truncated(&self) -> bool {
         self.truncated_by_limit || self.truncated_by_duration || self.cancelled
     }
@@ -4251,7 +4255,7 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
             }
             report.scanned = report.scanned.saturating_add(1);
             enqueue_transition_with_lifecycle_report(Some(api.clone()), object, &lc, &src, &options, &mut report).await;
-            if report.has_partial_enqueue() {
+            if report.has_enqueue_backpressure() {
                 report.next_marker.clone_from(&previous_marker);
                 report.next_version_idmarker.clone_from(&previous_version_marker);
                 report.continuation_token =
@@ -9950,6 +9954,18 @@ mod tests {
         assert_eq!(report.skipped_queue_closed, 0);
         assert_eq!(report.skipped_queue_timeout, 0);
         assert!(report.has_partial_enqueue());
+        assert!(report.has_enqueue_backpressure());
+    }
+
+    #[test]
+    fn manual_transition_in_flight_skip_does_not_stop_the_scan() {
+        let options = ManualTransitionRunOptions::default();
+        let mut report = ManualTransitionRunReport::new("bucket", &options);
+
+        report.record_enqueue_outcome(TransitionEnqueueOutcome::AlreadyInFlight);
+
+        assert!(report.has_partial_enqueue());
+        assert!(!report.has_enqueue_backpressure());
     }
 
     #[test]

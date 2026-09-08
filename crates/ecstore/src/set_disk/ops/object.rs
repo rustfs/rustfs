@@ -19,6 +19,8 @@
 //! bounds are unchanged, and the impls reach shared primitives through the
 //! SetDisks core (io_primitives) via inherent calls.
 
+use crate::core::pools::DecommissionCapacityAdmission;
+
 #[cfg(test)]
 use super::super::MetadataCacheInvalidationProbe;
 use super::super::{
@@ -3905,6 +3907,7 @@ impl SetDisks {
                         bucket,
                         object,
                         opts.no_lock || object_lock_guard.is_some(),
+                        DecommissionCapacityAdmission::Mutation,
                     )
                     .await?;
                 decommission_object_lock_guard = object_guard;
@@ -4102,7 +4105,7 @@ impl SetDisks {
             {
                 decommission_capacity_guard = Some(
                     store
-                        .acquire_external_decommission_capacity_fence(&[self.pool_index], "mutation")
+                        .acquire_external_decommission_capacity_fence(&[self.pool_index], DecommissionCapacityAdmission::Mutation)
                         .await?,
                 );
             }

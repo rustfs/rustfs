@@ -984,6 +984,24 @@ fn is_superseding_unversioned_data_movement_object(source: &ObjectInfo, target: 
             .is_some_and(|(source_time, target_time)| target_time > source_time)
 }
 
+fn is_equivalent_scanner_backlog_replica(source: &ObjectInfo, target: &ObjectInfo, compare_part_checksums: bool) -> bool {
+    // Scanner publishes this exact payload to surviving sets with CAS. Each
+    // set assigns its own write time; that timestamp is not a ledger generation.
+    // Accept only an identical, known unversioned identity, never a different
+    // record based on timestamp ordering or a similarly named user object.
+    source.bucket == crate::disk::RUSTFS_META_BUCKET
+        && target.bucket == source.bucket
+        && source.name == "buckets/.scanner-pause-backlog.json"
+        && target.name == source.name
+        && is_unversioned_data_movement_object(source)
+        && is_unversioned_data_movement_object(target)
+        && !source.delete_marker
+        && source.mod_time.is_some()
+        && target.mod_time.is_some()
+        && source.etag.as_ref().is_some_and(|etag| !etag.is_empty())
+        && is_equivalent_data_movement_object_identity(source, target, false, compare_part_checksums)
+}
+
 fn is_data_movement_upload_takeover_target(source: &ObjectInfo, target: &ObjectInfo, compare_part_checksums: bool) -> bool {
     let identity = data_movement_upload_identity(source);
     source.mod_time.is_some()
@@ -1453,7 +1471,9 @@ fn resolve_data_movement_overwrite_resume_result_for(
         return Ok(true);
     }
 
-    Ok(matches!(err, Error::PreconditionFailed) && is_superseding_unversioned_data_movement_object(source, &target))
+    Ok(matches!(err, Error::PreconditionFailed)
+        && (is_equivalent_scanner_backlog_replica(source, &target, compare_part_checksums)
+            || is_superseding_unversioned_data_movement_object(source, &target)))
 }
 
 #[derive(Clone, Copy)]
@@ -3286,6 +3306,132 @@ mod tests {
         let source = overwrite_equivalence_source();
 
         assert!(overwrite_resume_for_target(&source, source.clone()));
+    }
+
+    fn scanner_backlog_replica_pair() -> (ObjectInfo, ObjectInfo) {
+        let source = ObjectInfo {
+            bucket: crate::disk::RUSTFS_META_BUCKET.to_string(),
+            name: "buckets/.scanner-pause-backlog.json".to_string(),
+            version_id: None,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND),
+            ..overwrite_equivalence_source()
+        };
+        let target = ObjectInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..source.clone()
+        };
+        (source, target)
+    }
+
+    fn scanner_backlog_precondition_resumes(source: &ObjectInfo, target: ObjectInfo) -> bool {
+        resolve_data_movement_overwrite_resume_result_for(&Error::PreconditionFailed, Ok(Some(target)), source, 0, 1, true)
+            .expect("scanner replica conflict should be adjudicated")
+    }
+
+    #[test]
+    fn test_scanner_backlog_resume_accepts_identical_native_replica_with_older_write_time() {
+        let (source, target) = scanner_backlog_replica_pair();
+        assert!(!is_owned_data_movement_target(&target), "native scanner writes are not migration copies");
+        assert!(!is_equivalent_data_movement_object(&source, &target));
+        assert!(
+            scanner_backlog_precondition_resumes(&source, target),
+            "identical ledger payloads have replica-local write times, not distinct committed generations"
+        );
+    }
+
+    #[test]
+    fn test_scanner_backlog_resume_rejects_changed_payload_or_metadata() {
+        let (source, target) = scanner_backlog_replica_pair();
+        let mut different_etag = target.clone();
+        different_etag.etag = Some("different-ledger-generation".to_string());
+        let mut different_size = target.clone();
+        different_size.size += 1;
+        let mut different_checksum = target.clone();
+        different_checksum.checksum = Some(Bytes::from_static(b"different-checksum"));
+        let mut different_metadata = target.clone();
+        Arc::make_mut(&mut different_metadata.user_defined).insert("x-amz-meta-key".to_string(), "different".to_string());
+        let mut different_tags = target.clone();
+        different_tags.user_tags = Arc::new("tag=changed".to_string());
+        let mut different_parts = target.clone();
+        Arc::make_mut(&mut different_parts.parts)[0].etag = "different-part".to_string();
+        let mut different_tier = target;
+        different_tier.transitioned_object.tier = "different-tier".to_string();
+        for (label, different) in [
+            ("etag", different_etag),
+            ("size", different_size),
+            ("checksum", different_checksum),
+            ("metadata", different_metadata),
+            ("tags", different_tags),
+            ("parts", different_parts),
+            ("tier", different_tier),
+        ] {
+            assert!(
+                !scanner_backlog_precondition_resumes(&source, different),
+                "replica-local timestamps do not authorize a changed {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scanner_backlog_resume_rejects_other_namespaces_and_incomplete_identity() {
+        let (source, target) = scanner_backlog_replica_pair();
+        for (bucket, name) in [
+            ("user-bucket", "buckets/.scanner-pause-backlog.json"),
+            (crate::disk::RUSTFS_META_BUCKET, "buckets/.scanner-pause-backlog.json.bkp"),
+            (crate::disk::RUSTFS_META_BUCKET, "buckets/.usage-cache.bin"),
+        ] {
+            let mut source = source.clone();
+            let mut target = target.clone();
+            for replica in [&mut source, &mut target] {
+                replica.bucket = bucket.to_string();
+                replica.name = name.to_string();
+            }
+            assert!(!scanner_backlog_precondition_resumes(&source, target), "out-of-scope key {bucket}/{name}");
+        }
+        for missing in ["etag", "empty-etag", "source-time", "target-time", "version", "delete-marker"] {
+            let mut source = source.clone();
+            let mut target = target.clone();
+            match missing {
+                "etag" => {
+                    source.etag = None;
+                    target.etag = None;
+                }
+                "empty-etag" => {
+                    source.etag = Some(String::new());
+                    target.etag = Some(String::new());
+                }
+                "source-time" => source.mod_time = None,
+                "target-time" => target.mod_time = None,
+                "version" => {
+                    source.version_id = Some(Uuid::from_u128(1));
+                    target.version_id = source.version_id;
+                }
+                "delete-marker" => {
+                    source.delete_marker = true;
+                    target.delete_marker = true;
+                }
+                _ => unreachable!("all identity variants are enumerated above"),
+            }
+            assert!(!scanner_backlog_precondition_resumes(&source, target), "unsupported identity: {missing}");
+        }
+    }
+
+    #[test]
+    fn test_scanner_backlog_resume_requires_a_cross_pool_precondition_conflict() {
+        let (source, target) = scanner_backlog_replica_pair();
+        for (err, target_pool) in [
+            (Error::PreconditionFailed, 0),
+            (Error::SlowDown, 1),
+            (
+                Error::InvalidUploadID(source.bucket.clone(), source.name.clone(), "upload".to_string()),
+                1,
+            ),
+        ] {
+            assert!(
+                !resolve_data_movement_overwrite_resume_result_for(&err, Ok(Some(target.clone())), &source, 0, target_pool, true)
+                    .expect("non-resumable conflict should return false")
+            );
+        }
     }
 
     #[test]
