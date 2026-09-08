@@ -56,7 +56,8 @@ def fake_adapter():
         baseline = request["comparison"] == "build" and request["leg"].startswith("A")
         result["metrics"].update(p99_ms=10, throughput_ops=100, errors=0, requests=100,
                                  walk_objects=100 if baseline else 20, cold_walk_objects=100 if baseline else 0,
-                                 healed_objects=request["expected_healed_objects"])
+                                 healed_objects=request["expected_healed_objects"],
+                                 heal_duplicate_task_count=0)
         result["convergence"] = {"writes_stopped": True, "last_mutation_observed": True,
                                  "first_complete_publication": True, "last_mutation_time": 1,
                                  "last_mutation_observed_time": 2,
@@ -106,6 +107,10 @@ def fake_adapter():
             result["metrics"]["foreground_pressure_high_samples"] = result["metrics"]["foreground_pressure_samples"] + 1
         elif fault == "attempt-accounting":
             result["metrics"]["heal_attempt_failures"] = result["metrics"]["heal_attempts"] + 1
+        elif fault == "duplicate-heal-task":
+            result["metrics"]["heal_duplicate_task_count"] = 1
+        elif fault == "missing-start-p95":
+            result["metrics"]["heal_start_p95_ms"] = 0
         elif fault == "pacing-benefit" and request["scenario"] == "running-heal" \
                 and request["comparison"] == "build" and request["leg"].startswith("B"):
             result["metrics"].update(p99_ms=9, heal_mainline_throttle_delayed=5)
@@ -365,12 +370,20 @@ class ScannerAbbaTest(unittest.TestCase):
             expected_attempt_cost = [None, 1.0, 1.0, None] if comparison["comparison"] == "background" else [1.0, 1.0, 1.0, 1.0]
             self.assertEqual(w10_w11["attempt_cost_per_healed_object"], expected_attempt_cost)
             self.assertEqual(w10_w11["candidate_attempt_cost_per_healed_object"], 1.0)
+            self.assertEqual(
+                comparison["w09"],
+                {
+                    "heal_start_p95_ms": [10, 10, 10, 10],
+                    "heal_duplicate_task_count": [0, 0, 0, 0],
+                    "heal_lock_hold_p95_ms": [10, 10, 10, 10],
+                },
+            )
 
     def test_fail_closed_adapter_and_data_errors(self):
         for fault in ("measure-exit", "oracle-exit", "missing-oracle", "oracle-mismatch", "zero-samples",
                       "zero-requests", "request-errors", "load-drift", "missing-metric", "incomplete-repair",
                       "zero-pressure-samples", "pressure-sample-order", "attempt-accounting",
-                      "missing-pacing-metric"):
+                      "missing-pacing-metric", "duplicate-heal-task", "missing-start-p95"):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
                 self.root = Path(directory)
                 with self.assertRaises((ValueError, OSError, subprocess.SubprocessError)):
@@ -616,7 +629,8 @@ class ScannerAbbaTest(unittest.TestCase):
         }
         metrics = dict.fromkeys(harness.METRICS, 10)
         metrics.update(p99_ms=10, throughput_ops=100, errors=0, requests=100,
-                       walk_objects=100, cold_walk_objects=20, healed_objects=10)
+                       walk_objects=100, cold_walk_objects=20, healed_objects=10,
+                       heal_duplicate_task_count=0)
         result = {
             "evidence": request["evidence"],
             "fixed": request["fixed"],

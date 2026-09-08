@@ -125,6 +125,32 @@ def require_measured_comparison_evidence(comparison: dict[str, Any], index: int)
     )
     require(candidate_attempt_cost is None or candidate_attempt_cost >= 0,
             f"comparison {index} candidate attempt cost below minimum")
+    w09 = comparison.get("w09")
+    require(isinstance(w09, dict), f"comparison {index} missing W09 evidence")
+    start_p95 = require_metric_series(
+        w09.get("heal_start_p95_ms"),
+        f"comparison {index} heal_start_p95_ms",
+        Decimal("0"),
+    )
+    require(all(item is not None and item > 0 for item in start_p95),
+            f"comparison {index} heal_start_p95_ms must be measured")
+    duplicate_tasks = require_metric_series(
+        w09.get("heal_duplicate_task_count"),
+        f"comparison {index} heal_duplicate_task_count",
+        Decimal("0"),
+        Decimal("0"),
+    )
+    require(all(item is not None and item == 0 for item in duplicate_tasks),
+            f"comparison {index} heal_duplicate_task_count must be measured")
+    lock_hold = require_metric_series(
+        w09.get("heal_lock_hold_p95_ms"),
+        f"comparison {index} heal_lock_hold_p95_ms",
+        Decimal("0"),
+    )
+    require(all(item is not None and item > 0 for item in lock_hold),
+            f"comparison {index} heal_lock_hold_p95_ms must be measured")
+    require(len(start_p95) == len(duplicate_tasks) == len(lock_hold),
+            f"comparison {index} W09 evidence length mismatch")
 
 
 def require_complete_abba_matrix(manifest: dict[str, Any], report: dict[str, Any], comparisons: list[dict[str, Any]]) -> None:
@@ -177,6 +203,9 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
     throughput_losses: list[Decimal] = []
     p1_rows = []
     p2_values: list[Decimal | None] = []
+    start_p95_values: list[Decimal | None] = []
+    duplicate_task_values: list[Decimal | None] = []
+    lock_hold_values: list[Decimal | None] = []
     for index, comparison in enumerate(comparisons):
         require(isinstance(comparison, dict), f"comparison {index} must be an object")
         state = comparison.get("status")
@@ -201,6 +230,14 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
         p2 = comparison.get("p2_post_stop_work_multiples")
         if isinstance(p2, list):
             p2_values.extend(maybe_number(value, "p2_post_stop_work_multiple") for value in p2)
+        w09 = comparison.get("w09")
+        if isinstance(w09, dict):
+            for value in w09.get("heal_start_p95_ms", []):
+                start_p95_values.append(maybe_number(value, "heal_start_p95_ms"))
+            for value in w09.get("heal_duplicate_task_count", []):
+                duplicate_task_values.append(maybe_number(value, "heal_duplicate_task_count"))
+            for value in w09.get("heal_lock_hold_p95_ms", []):
+                lock_hold_values.append(maybe_number(value, "heal_lock_hold_p95_ms"))
 
     measured = report.get("evidence") == "measured"
     passed = report_state in PASS_STATES and performance_state in PASS_STATES and measured
@@ -239,6 +276,9 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
         "worst_p99_regression": None if not p99_regressions else float(max(p99_regressions)),
         "worst_throughput_loss": None if not throughput_losses else float(max(throughput_losses)),
         "p2_worst_post_stop_work_multiple": None if max_decimal(p2_values) is None else float(max_decimal(p2_values)),
+        "w09_worst_heal_start_p95_ms": None if max_decimal(start_p95_values) is None else float(max_decimal(start_p95_values)),
+        "w09_duplicate_task_count": None if max_decimal(duplicate_task_values) is None else float(max_decimal(duplicate_task_values)),
+        "w09_worst_lock_hold_p95_ms": None if max_decimal(lock_hold_values) is None else float(max_decimal(lock_hold_values)),
         "p1_reductions": p1_rows,
         "provenance": {
             "abba_dir": str(abba_dir.resolve()),
@@ -339,6 +379,9 @@ def markdown(summary: dict[str, Any]) -> str:
         f"- worst_p99_regression: {pct(p99)}",
         f"- worst_throughput_loss: {pct(throughput)}",
         f"- p2_worst_post_stop_work_multiple: {ratio(p2)}",
+        f"- w09_worst_heal_start_p95_ms: {abba['w09_worst_heal_start_p95_ms'] if abba['w09_worst_heal_start_p95_ms'] is not None else 'pending'}",
+        f"- w09_duplicate_task_count: {abba['w09_duplicate_task_count'] if abba['w09_duplicate_task_count'] is not None else 'pending'}",
+        f"- w09_worst_lock_hold_p95_ms: {abba['w09_worst_lock_hold_p95_ms'] if abba['w09_worst_lock_hold_p95_ms'] is not None else 'pending'}",
     ]
     if abba.get("completed_cells") is not None:
         lines.append(f"- completed_cells: {abba['completed_cells']}")
