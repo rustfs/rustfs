@@ -173,6 +173,17 @@ def release_evidence_true(value, name):
     require(value is True, f"missing release_evidence.{name}")
 
 
+def release_evidence_exact_set(value, name, expected):
+    require(
+        isinstance(value, list)
+        and all(isinstance(item, str) and item.strip() for item in value),
+        f"invalid release_evidence.{name}",
+    )
+    observed = set(value)
+    require(len(observed) == len(value), f"duplicate release_evidence.{name}")
+    require(observed == set(expected), f"invalid release_evidence.{name}")
+
+
 def validate_release_evidence_manifest(manifest):
     if manifest["evidence"] != "measured":
         return
@@ -210,13 +221,7 @@ def validate_release_evidence_manifest(manifest):
 
     crash = evidence.get("crash_restart")
     require(isinstance(crash, dict), "missing release_evidence.crash_restart")
-    fault_modes = crash.get("fault_modes")
-    require(
-        isinstance(fault_modes, list)
-        and all(mode in fault_modes for mode in RELEASE_FAULT_MODES)
-        and all(isinstance(mode, str) and mode.strip() for mode in fault_modes),
-        "missing release_evidence.crash_restart.fault_modes",
-    )
+    release_evidence_exact_set(crash.get("fault_modes"), "crash_restart.fault_modes", RELEASE_FAULT_MODES)
     release_evidence_true(crash.get("unclean_shutdown_marker"), "crash_restart.unclean_shutdown_marker")
 
     mixed = evidence.get("mixed_version")
@@ -236,13 +241,7 @@ def validate_release_evidence_manifest(manifest):
 
     profile = evidence.get("profile")
     require(isinstance(profile, dict), "missing release_evidence.profile")
-    artifacts = profile.get("required_artifacts")
-    require(
-        isinstance(artifacts, list)
-        and all(item in artifacts for item in RELEASE_PROFILE_ARTIFACTS)
-        and all(isinstance(item, str) and item.strip() for item in artifacts),
-        "missing release_evidence.profile.required_artifacts",
-    )
+    release_evidence_exact_set(profile.get("required_artifacts"), "profile.required_artifacts", RELEASE_PROFILE_ARTIFACTS)
     for key in ("collector_config_sha256", "profiler_config_sha256"):
         require(sha(profile.get(key)), f"invalid release_evidence.profile.{key}")
 

@@ -548,6 +548,12 @@ class ScannerAbbaTest(unittest.TestCase):
             "missing crash": lambda manifest: manifest["release_evidence"]["crash_restart"].update(
                 fault_modes=["process-restart"],
             ),
+            "unknown crash": lambda manifest: manifest["release_evidence"]["crash_restart"].update(
+                fault_modes=["process-restart", "process-crash-restart", "power-cycle"],
+            ),
+            "duplicate crash": lambda manifest: manifest["release_evidence"]["crash_restart"].update(
+                fault_modes=["process-restart", "process-restart", "process-crash-restart"],
+            ),
             "clean crash marker": lambda manifest: manifest["release_evidence"]["crash_restart"].update(
                 unclean_shutdown_marker=False,
             ),
@@ -557,6 +563,12 @@ class ScannerAbbaTest(unittest.TestCase):
             ),
             "missing profile": lambda manifest: manifest["release_evidence"]["profile"].update(
                 required_artifacts=["allocation-profile", "flamegraph", "rss-samples"],
+            ),
+            "unknown profile": lambda manifest: manifest["release_evidence"]["profile"].update(
+                required_artifacts=["allocation-profile", "flamegraph", "rss-samples", "save-frequency", "heap-dump"],
+            ),
+            "duplicate profile": lambda manifest: manifest["release_evidence"]["profile"].update(
+                required_artifacts=["allocation-profile", "flamegraph", "rss-samples", "save-frequency", "flamegraph"],
             ),
             "bad profile hash": lambda manifest: manifest["release_evidence"]["profile"].update(
                 profiler_config_sha256="not-a-sha",
