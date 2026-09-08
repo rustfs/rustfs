@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use crate::cluster::rpc::client::{
-    AuthenticatedChannel, TonicInterceptor, embedded_tonic_status, gen_tonic_signature_interceptor, heal_control_time_out_client,
-    is_network_like_status, message_has_network_needle, node_service_time_out_client, tier_mutation_control_time_out_client,
+    AuthenticatedChannel, TonicInterceptor, clear_peer_replay_state_for_addr, embedded_tonic_status,
+    gen_tonic_signature_interceptor, heal_control_time_out_client, is_network_like_status, message_has_network_needle,
+    node_service_time_out_client, tier_mutation_control_time_out_client,
 };
 use crate::cluster::rpc::{set_tonic_canonical_body_digest, set_tonic_mutation_body_digest, verify_tonic_rpc_response_proof};
 use crate::error::{Error, Result};
@@ -542,6 +543,16 @@ fn validate_heal_control_capability_proof(canonical_ack: &[u8], proof: &[u8]) ->
 fn validate_heal_control_response_proof(canonical_response: &[u8], proof: &[u8]) -> Result<()> {
     verify_tonic_rpc_response_proof(canonical_response, proof)
         .map_err(|_| Error::other("peer returned an invalid heal control response proof"))
+}
+
+fn heal_control_auth_may_need_replay_scope_refresh(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Io(io_err)
+            if embedded_tonic_status(io_err).is_some_and(|status| {
+                status.code() == tonic::Code::Unauthenticated && status.message() == "No valid auth token"
+            })
+    )
 }
 
 fn decode_remote_version_state_capability(expected_member: &str, result: &[u8]) -> Result<Uuid> {
@@ -1720,45 +1731,72 @@ impl PeerRestClient {
             return Err(Error::other("heal control command exceeds size limit"));
         }
         let capability_probe = rustfs_protos::is_heal_control_capability_probe(&command);
-        self.finalize_result(
-            async {
-                let mut client = self
-                    .get_heal_control_client()
-                    .await?
-                    .max_encoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE)
-                    .max_decoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE);
-                let canonical_body = rustfs_protos::canonical_heal_control_request_body(version, &topology_fingerprint, &command)
-                    .map_err(|_| Error::other("heal control request length cannot be represented"))?;
-                let mut request = Request::new(HealControlRequest {
-                    version,
-                    topology_fingerprint: topology_fingerprint.clone(),
-                    command: command.clone().into(),
-                });
-                request.set_timeout(rustfs_protos::heal_control_execution_timeout());
-                set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
-                let response = client.heal_control(request).await?.into_inner();
-                if !response.success {
-                    return Err(Error::other(
-                        response
-                            .error_info
-                            .unwrap_or_else(|| "peer heal control failed without an error".to_string()),
-                    ));
-                }
-                if !capability_probe {
-                    let canonical_response = rustfs_protos::canonical_heal_control_response_body(
-                        version,
-                        &topology_fingerprint,
-                        &command,
-                        &response.result,
-                    )
+        let result = self
+            .heal_control_once(version, &topology_fingerprint, &command, capability_probe)
+            .await;
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(heal_control_auth_may_need_replay_scope_refresh)
+        {
+            self.prepare_heal_control_auth_retry().await;
+            return self
+                .finalize_result(
+                    self.heal_control_once(version, &topology_fingerprint, &command, capability_probe)
+                        .await,
+                )
+                .await;
+        }
+        self.finalize_result(result).await
+    }
+
+    async fn prepare_heal_control_auth_retry(&self) {
+        if let Err(err) = clear_peer_replay_state_for_addr(&self.grid_host) {
+            debug!(
+                peer = %self.grid_host,
+                error = %err,
+                "could not clear heal control replay state before retry"
+            );
+        }
+        self.evict_connection().await;
+    }
+
+    async fn heal_control_once(
+        &self,
+        version: u32,
+        topology_fingerprint: &str,
+        command: &[u8],
+        capability_probe: bool,
+    ) -> Result<Vec<u8>> {
+        let mut client = self
+            .get_heal_control_client()
+            .await?
+            .max_encoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE)
+            .max_decoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE);
+        let canonical_body = rustfs_protos::canonical_heal_control_request_body(version, topology_fingerprint, command)
+            .map_err(|_| Error::other("heal control request length cannot be represented"))?;
+        let mut request = Request::new(HealControlRequest {
+            version,
+            topology_fingerprint: topology_fingerprint.to_string(),
+            command: command.to_vec().into(),
+        });
+        request.set_timeout(rustfs_protos::heal_control_execution_timeout());
+        set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
+        let response = client.heal_control(request).await?.into_inner();
+        if !response.success {
+            return Err(Error::other(
+                response
+                    .error_info
+                    .unwrap_or_else(|| "peer heal control failed without an error".to_string()),
+            ));
+        }
+        if !capability_probe {
+            let canonical_response =
+                rustfs_protos::canonical_heal_control_response_body(version, topology_fingerprint, command, &response.result)
                     .map_err(|_| Error::other("heal control response length cannot be represented"))?;
-                    validate_heal_control_response_proof(&canonical_response, &response.response_proof)?;
-                }
-                Ok(response.result.to_vec())
-            }
-            .await,
-        )
-        .await
+            validate_heal_control_response_proof(&canonical_response, &response.response_proof)?;
+        }
+        Ok(response.result.to_vec())
     }
 
     /// Confirms that a peer supports the current heal-control coordination
@@ -3726,6 +3764,22 @@ mod tests {
                 "an answered application status must not mark the peer offline: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn heal_control_auth_retry_is_limited_to_transport_auth_rejection() {
+        assert!(heal_control_auth_may_need_replay_scope_refresh(&Error::from(
+            tonic::Status::unauthenticated("No valid auth token")
+        )));
+        assert!(!heal_control_auth_may_need_replay_scope_refresh(&Error::from(
+            tonic::Status::permission_denied("bad signature")
+        )));
+        assert!(!heal_control_auth_may_need_replay_scope_refresh(&Error::from(
+            tonic::Status::unauthenticated("application rejected heal control")
+        )));
+        assert!(!heal_control_auth_may_need_replay_scope_refresh(&Error::other(
+            "Io error: code: 'Unauthenticated', message: \"No valid auth token\""
+        )));
     }
 
     #[test]

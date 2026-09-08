@@ -25,6 +25,7 @@ mod data_integrity_movement_test;
 mod expand_decommission_rebalance_test;
 mod extra_test;
 mod harness;
+mod heal_test;
 mod object_lock_test;
 mod observability_test;
 mod replication_quota_test;

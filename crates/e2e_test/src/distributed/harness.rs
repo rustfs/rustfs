@@ -59,6 +59,9 @@ const POOL_META_V3_ENV: [(&str, &str); 2] = [
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DistLayout {
+    /// 3 nodes × 4 drives, one erasure pool. With `EC:4` this is the
+    /// release-evidence EC8+4 geometry.
+    ThreeByFourEc84,
     /// 4 nodes × 4 drives, one erasure pool spanning every endpoint.
     FourByFour,
     /// 4 nodes × 1 drive, one erasure pool (minimum 4-node 4-disk layout).
@@ -94,6 +97,7 @@ impl DistCluster {
 
     pub async fn new_stopped_with_env(layout: DistLayout, extra_env: &[(&str, &str)]) -> TestResult<Self> {
         let topology = match layout {
+            DistLayout::ThreeByFourEc84 => ClusterTopology::single_pool_multidrive(3, DRIVES_PER_NODE),
             DistLayout::FourByFour => ClusterTopology::single_pool_multidrive(NODE_COUNT, DRIVES_PER_NODE),
             DistLayout::FourNodeFourDisk => ClusterTopology::single_pool(NODE_COUNT),
             DistLayout::SingleNodeFourDrive => ClusterTopology::per_node_pools(DRIVES_PER_NODE, vec![vec![0]]),
@@ -101,7 +105,7 @@ impl DistCluster {
         let mut cluster = RustFSTestClusterEnvironment::with_topology(topology).await?;
         let pool_storage_roots = match layout {
             DistLayout::SingleNodeFourDrive => Some(configured_pool_storage_roots()?),
-            DistLayout::FourByFour | DistLayout::FourNodeFourDisk => None,
+            DistLayout::ThreeByFourEc84 | DistLayout::FourByFour | DistLayout::FourNodeFourDisk => None,
         };
         let mut owned_pool_dirs = Vec::new();
         if let Some(roots) = pool_storage_roots.as_deref() {
