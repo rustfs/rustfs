@@ -286,6 +286,8 @@ workflow, builds the current checkout, runs the mixed-version and rollback E2E
 lanes, and fails unless all three raw G09 artifacts are measured, revision-bound,
 and role-bound. Use `--source-binary` for a custom previous-release binary on
 another platform, or `--test mixed-version|rollback` while narrowing a failure.
+It performs a free-space preflight before building so a saturated validation
+host fails before producing partial evidence.
 
 When the real release lanes have produced their dedicated artifacts, validate
 the complete hard-gate bundle with:
