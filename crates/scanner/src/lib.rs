@@ -97,9 +97,11 @@ pub use scanner::{
 pub use scanner_io::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageSnapshot, ScannerDirtyUsageState,
     acknowledge_dirty_usage_generation, acknowledge_scoped_dirty_usage, clear_dirty_usage_bucket, record_dirty_usage_bucket,
-    record_dirty_usage_object, record_scanner_maintenance_change, scanner_activity_epoch, scanner_dirty_usage_snapshot,
-    scanner_dirty_usage_state, scanner_maintenance_generation,
+    record_dirty_usage_bucket_from_producer, record_dirty_usage_object, record_dirty_usage_object_from_producer,
+    record_scanner_maintenance_change, scanner_activity_epoch, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
+    scanner_maintenance_generation,
 };
+pub use segment_invalidation::SegmentInvalidationProducerIdentity;
 pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};
 use std::sync::atomic::{AtomicU64, Ordering};
 pub use storage_api::ScannerReplicationConfig as ReplicationConfig;

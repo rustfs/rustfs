@@ -1175,7 +1175,12 @@ impl DefaultObjectUsecase {
         let manager = get_capacity_manager();
         manager.record_write_operation().await;
         let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_object(&bucket, &key);
+        let producer = if delete_marker && version_id_clone.is_none() {
+            rustfs_scanner::SegmentInvalidationProducerIdentity::DeleteMarker
+        } else {
+            rustfs_scanner::SegmentInvalidationProducerIdentity::DeleteObject
+        };
+        rustfs_scanner::record_dirty_usage_object_from_producer(&bucket, &key, producer);
         result
     }
 }

@@ -22,6 +22,11 @@ pub(super) static DIRTY_USAGE_BUCKETS: LazyLock<StdMutex<DirtyUsageBuckets>> = L
 // matching scope.
 pub(super) static DIRTY_USAGE_BUCKET_SCOPES: LazyLock<StdMutex<DirtyUsageBucketScopes>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
+// Non-authoritative process-local producer coverage. Any future segment reuse
+// activation must bind this to the exact generation window and durable proof.
+pub(super) static DIRTY_USAGE_PRODUCER_IDENTITIES: LazyLock<
+    StdMutex<BTreeSet<crate::segment_invalidation::SegmentInvalidationProducerIdentity>>,
+> = LazyLock::new(|| StdMutex::new(BTreeSet::new()));
 pub(super) static DIRTY_USAGE_BUCKET_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 pub(super) static SCANNER_ACTIVITY_EPOCH: LazyLock<String> = LazyLock::new(|| format!("{:032x}", rand::random::<u128>()));
 pub(super) static SCANNER_MAINTENANCE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -153,6 +158,7 @@ fn apply_scoped_dirty_usage_ack(
 #[cfg(test)]
 mod scoped_dirty_usage_tests {
     use super::*;
+    use crate::segment_invalidation::SegmentInvalidationProducerIdentity;
 
     #[test]
     fn scoped_dirty_usage_preserves_uncovered_newer_and_replayed_generations() {
@@ -213,6 +219,30 @@ mod scoped_dirty_usage_tests {
             assert_eq!(scopes, original_scopes);
         }
     }
+
+    #[test]
+    fn dirty_usage_tracks_known_segment_producer_identities_without_authorizing_unknown_sources() {
+        clear_dirty_usage_buckets_for_tests();
+        record_dirty_usage_object_from_producer("photos", "hot/object", SegmentInvalidationProducerIdentity::PutObject);
+        record_dirty_usage_object_from_producer("photos", "archive/object", SegmentInvalidationProducerIdentity::DeleteObject);
+        record_dirty_usage_bucket_from_producer("photos", SegmentInvalidationProducerIdentity::Unknown);
+
+        assert_eq!(
+            dirty_usage_producer_identities_for_tests(),
+            BTreeSet::from([
+                SegmentInvalidationProducerIdentity::PutObject,
+                SegmentInvalidationProducerIdentity::DeleteObject
+            ])
+        );
+        assert_eq!(
+            dirty_usage_bucket_scopes_for_tests().get("photos"),
+            Some(&DirtyUsageBucketScope::WholeBucket),
+            "an unknown producer keeps the bucket dirty but must not count as producer coverage"
+        );
+
+        clear_dirty_usage_buckets_for_tests();
+        assert!(dirty_usage_producer_identities_for_tests().is_empty());
+    }
 }
 
 pub(super) fn dirty_usage_buckets() -> MutexGuard<'static, DirtyUsageBuckets> {
@@ -221,6 +251,13 @@ pub(super) fn dirty_usage_buckets() -> MutexGuard<'static, DirtyUsageBuckets> {
 
 fn dirty_usage_bucket_scopes() -> MutexGuard<'static, DirtyUsageBucketScopes> {
     DIRTY_USAGE_BUCKET_SCOPES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn dirty_usage_producer_identities()
+-> MutexGuard<'static, BTreeSet<crate::segment_invalidation::SegmentInvalidationProducerIdentity>> {
+    DIRTY_USAGE_PRODUCER_IDENTITIES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -240,6 +277,22 @@ pub fn record_dirty_usage_bucket(bucket: &str) {
         return;
     }
 
+    record_dirty_usage_bucket_inner(bucket);
+}
+
+pub fn record_dirty_usage_bucket_from_producer(
+    bucket: &str,
+    producer: crate::segment_invalidation::SegmentInvalidationProducerIdentity,
+) {
+    if bucket.is_empty() {
+        return;
+    }
+
+    record_segment_invalidation_producer_identity(producer);
+    record_dirty_usage_bucket_inner(bucket);
+}
+
+fn record_dirty_usage_bucket_inner(bucket: &str) {
     let pending_buckets = {
         let mut dirty_buckets = dirty_usage_buckets();
         let mut dirty_scopes = dirty_usage_bucket_scopes();
@@ -263,6 +316,23 @@ pub fn record_dirty_usage_bucket(bucket: &str) {
 /// local: after restart or any unverified distributed path the scanner falls
 /// back to its ordinary bucket scan.
 pub fn record_dirty_usage_object(bucket: &str, object: &str) {
+    record_dirty_usage_object_inner(bucket, object);
+}
+
+pub fn record_dirty_usage_object_from_producer(
+    bucket: &str,
+    object: &str,
+    producer: crate::segment_invalidation::SegmentInvalidationProducerIdentity,
+) {
+    if bucket.is_empty() {
+        return;
+    }
+
+    record_segment_invalidation_producer_identity(producer);
+    record_dirty_usage_object_inner(bucket, object);
+}
+
+fn record_dirty_usage_object_inner(bucket: &str, object: &str) {
     let Some(top_level_entry) = dirty_usage_top_level_entry(object) else {
         record_dirty_usage_bucket(bucket);
         return;
@@ -294,6 +364,17 @@ pub fn record_dirty_usage_object(bucket: &str, object: &str) {
     global_metrics().record_scanner_dirty_usage_pending(usize_to_u64_saturated(pending_buckets));
     crate::prefix_usage::invalidate_prefix_usage_cache(bucket);
     DIRTY_USAGE_BUCKET_NOTIFY.notify_one();
+}
+
+fn record_segment_invalidation_producer_identity(producer: crate::segment_invalidation::SegmentInvalidationProducerIdentity) {
+    if producer.producer().is_some() {
+        dirty_usage_producer_identities().insert(producer);
+    }
+}
+
+#[cfg(test)]
+fn dirty_usage_producer_identities_for_tests() -> BTreeSet<crate::segment_invalidation::SegmentInvalidationProducerIdentity> {
+    dirty_usage_producer_identities().clone()
 }
 
 fn dirty_usage_top_level_entry(object: &str) -> Option<String> {
@@ -577,6 +658,7 @@ pub(super) fn dirty_usage_bucket_count() -> usize {
 pub(crate) fn clear_dirty_usage_buckets_for_tests() {
     dirty_usage_buckets().clear();
     dirty_usage_bucket_scopes().clear();
+    dirty_usage_producer_identities().clear();
 }
 
 #[cfg(test)]
