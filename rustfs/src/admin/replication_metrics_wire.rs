@@ -409,6 +409,26 @@ fn transfer_summaries(stats: &InternalReplicationStats) -> (XferSummaryWire, Tar
     (summary, per_target)
 }
 
+/// Node-level failure counters for `errors`. The sibling `retries` field
+/// stays zero on purpose: it means redeliveries in the minio-go shape, and a
+/// failed object is not retried by an event today (it waits for the scanner's
+/// heal pass), so reporting failures there would claim a redelivery that
+/// never happened.
+fn failure_counters(stats: &InternalReplicationStats) -> CounterSummaryWire {
+    let (total, last1m, last1hr) = stats.stats.values().fold((0i64, 0i64, 0i64), |acc, stat| {
+        (
+            acc.0.saturating_add(stat.fail_stats.count),
+            acc.1.saturating_add(stat.fail_stats.last_minute.count),
+            acc.2.saturating_add(stat.fail_stats.last_hour.count),
+        )
+    });
+    CounterSummaryWire {
+        total: u64::try_from(total.max(0)).unwrap_or_default(),
+        last1m: u64::try_from(last1m.max(0)).unwrap_or_default(),
+        last1hr: u64::try_from(last1hr.max(0)).unwrap_or_default(),
+    }
+}
+
 impl MetricsV2Wire {
     /// Project the aggregated internal stats onto the `MetricsV2` shape.
     ///
@@ -418,6 +438,7 @@ impl MetricsV2Wire {
     /// `queueStats.nodes` and treats an empty list as "no data".
     pub(crate) fn from_stats(bucket_stats: &BucketStats, node_name: &str) -> Self {
         let (xfer_stats, tgt_xfer_stats) = transfer_summaries(&bucket_stats.replication_stats);
+        let failed = failure_counters(&bucket_stats.replication_stats);
         let mut nodes: Vec<ReplQNodeStatsWire> = bucket_stats
             .queue_stats
             .nodes
@@ -436,6 +457,7 @@ impl MetricsV2Wire {
                 q_stats: InQueueMetricWire::from(&bucket_stats.replication_stats.q_stat),
                 xfer_stats: xfer_stats.clone(),
                 tgt_xfer_stats: tgt_xfer_stats.clone(),
+                errors: failed,
                 ..Default::default()
             });
         } else {
@@ -444,6 +466,7 @@ impl MetricsV2Wire {
             if let Some(first) = nodes.first_mut() {
                 first.xfer_stats = xfer_stats.clone();
                 first.tgt_xfer_stats = tgt_xfer_stats.clone();
+                first.errors = failed;
             }
         }
 
@@ -478,6 +501,12 @@ mod tests {
         target.replicated_size = 4096;
         target.failed.count = 3;
         target.failed.size = 900;
+        target.fail_stats.count = 3;
+        target.fail_stats.size = 900;
+        target.fail_stats.last_minute.count = 2;
+        target.fail_stats.last_minute.size = 600;
+        target.fail_stats.last_hour.count = 3;
+        target.fail_stats.last_hour.size = 900;
         target.bandwidth_limit_bytes_per_sec = 1024;
         target.current_bandwidth_bytes_per_sec = 512.5;
         stats
@@ -537,6 +566,10 @@ mod tests {
         assert_eq!(node["queueStats"]["peak"], node["queueStats"]["max"]);
         assert!(node["activeWorkers"].get("curr").is_some());
         assert!(node["transferSummary"].get("Total").is_some());
+        assert_eq!(node["errors"]["total"], 3);
+        assert_eq!(node["errors"]["last1m"], 2);
+        assert_eq!(node["errors"]["last1hr"], 3);
+        assert_eq!(node["retries"]["total"], 0, "failures are not redeliveries; retries must not claim one");
         assert_eq!(json["downtimeInfo"], serde_json::json!({}));
     }
 
