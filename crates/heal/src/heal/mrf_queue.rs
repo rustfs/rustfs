@@ -1137,6 +1137,8 @@ fn tick_action(dirty: bool, depth: usize, journal_on_disk: bool, retain_replay_j
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::heal::manager::HealConfig;
+    use crate::heal::storage::{ECStoreHealStorage, HealStorageAPI};
     use rustfs_common::mrf_channel::{MrfIntent, MrfKind, MrfVerifiedRepairDisposition, MrfVerifiedRepairEvent};
     use serial_test::serial;
     use std::sync::Arc as StdArc;
@@ -1351,6 +1353,147 @@ mod tests {
         );
         assert_eq!(read_journal(MRF_SCOPED_JOURNAL_PATH).await, None);
         assert_eq!(read_journal(MRF_JOURNAL_PATH).await, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn committed_replay_anchor_waits_for_verified_proof_before_idle_cleanup() {
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("rustfs_mrf_replay_proof_cleanup")
+            .build()
+            .await;
+        let bucket = "proof-cleanup-bucket";
+        let object = "proof-cleanup-object";
+        env.make_bucket(bucket, false).await;
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let manager = Arc::new(HealManager::new(
+            storage.clone(),
+            Some(HealConfig {
+                queue_size: 2,
+                heal_interval: Duration::from_secs(3600),
+                enable_auto_heal: false,
+                ..Default::default()
+            }),
+        ));
+        let disks = journal_disks().await;
+        assert!(!disks.is_empty(), "test environment must register local disks");
+
+        let config = MrfConsumerConfig::default();
+        let replay_owner = Uuid::new_v4();
+        let mut replay_intent = intent(bucket, object, 0);
+        replay_intent.kind = MrfKind::PartialWrite;
+        replay_intent.version_id = None;
+        let replay_payload = encoded_payload(&replay_intent);
+        snapshot::publish_committed_snapshot(&disks, replay_owner, 11, &replay_payload, config.journal_max_bytes)
+            .await
+            .expect("publish committed replay checkpoint");
+
+        let mut queue = MrfQueue::new(config.queue_capacity, config.journal_max_bytes);
+        let mut backoff_until = None;
+        let replay = replay_into(&manager, &mut queue, &mut backoff_until).await;
+        assert_eq!(replay.replayed, 1, "the committed replay checkpoint must decode one record");
+        assert_eq!(queue.depth(), 0, "the replayed record must be admitted before cleanup is considered");
+        assert!(backoff_until.is_none(), "the accepted replay must not arm admission backoff");
+        assert_eq!(
+            manager.operations_snapshot().await.queued_by_source.mrf,
+            1,
+            "the replayed record must be visible as an MRF manager request"
+        );
+        assert!(
+            replay.journal_on_disk,
+            "a durable repair anchor must retain the committed checkpoint before proof"
+        );
+        assert!(
+            !replay.retain_journal_for_replay,
+            "retention is due to pending proof, not an incomplete replay"
+        );
+        assert_eq!(
+            replay.durable_replay_anchors.len(),
+            1,
+            "the real bucket incarnation must create a proof anchor"
+        );
+        assert_eq!(
+            replay.cleanup,
+            Some(ReplayCleanup::Committed {
+                owner: replay_owner,
+                sequence: 11,
+            }),
+            "cleanup must remember the committed checkpoint generation read at startup"
+        );
+
+        let anchor = replay.durable_replay_anchors[0].clone();
+        let mut runtime = MrfRuntime {
+            queue,
+            config,
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: replay.next_checkpoint_sequence,
+            new_since_flush: 0,
+            dirty: false,
+            journal_on_disk: replay.journal_on_disk,
+            retain_replay_journal: replay.retain_journal_for_replay,
+            durable_replay_anchors: replay.durable_replay_anchors,
+            replay_cleanup: replay.cleanup,
+            runtime_checkpoint: None,
+            backoff_until,
+        };
+        assert!(runtime.retained_replay_journal(), "proof-bearing replay anchors must block idle cleanup");
+        assert!(
+            snapshot::inspect_local_committed_snapshot(runtime.config.journal_max_bytes)
+                .await
+                .expect("inspect retained committed checkpoint")
+                .is_some(),
+            "the committed replay checkpoint must still be present before proof"
+        );
+
+        rustfs_common::mrf_channel::note_mrf_verified_repair(MrfVerifiedRepairEvent {
+            kind: anchor.kind,
+            bucket: anchor.bucket.clone(),
+            object: anchor.object.clone(),
+            version_id: anchor.version_id,
+            scope: anchor.scope,
+            lease: Some(anchor.lease),
+            bucket_incarnation_id: anchor.bucket_incarnation_id,
+            disposition: MrfVerifiedRepairDisposition::Repaired,
+        });
+        runtime.discharge_durable_replay_anchors();
+        assert!(
+            !runtime.retained_replay_journal(),
+            "the exact verified proof must release the durable replay anchor"
+        );
+        assert!(
+            runtime.delete_idle_recovery_anchors().await,
+            "idle cleanup must delete the proof-discharged committed replay checkpoint"
+        );
+        runtime.journal_on_disk = false;
+        assert!(
+            snapshot::inspect_local_committed_snapshot(runtime.config.journal_max_bytes)
+                .await
+                .expect("inspect committed checkpoints after proof cleanup")
+                .is_none(),
+            "the committed replay checkpoint must be gone after proof-driven cleanup"
+        );
+
+        let restart_manager = Arc::new(HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 2,
+                heal_interval: Duration::from_secs(3600),
+                enable_auto_heal: false,
+                ..Default::default()
+            }),
+        ));
+        assert_eq!(
+            replay_journal_once(&restart_manager).await,
+            0,
+            "proof-cleaned recovery anchors must not resurrect on the next restart"
+        );
+        assert_eq!(
+            restart_manager.operations_snapshot().await.queued_by_source.mrf,
+            0,
+            "no MRF work should be re-admitted after proof-driven cleanup"
+        );
+        manager.stop().await.expect("stop proof cleanup manager");
+        restart_manager.stop().await.expect("stop restart-check manager");
     }
 
     #[test]
