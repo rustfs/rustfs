@@ -3179,12 +3179,10 @@ impl ECStore {
         bucket: &str,
         object: &str,
         no_lock: bool,
+        admission: DecommissionCapacityAdmission,
     ) -> Result<(Option<ObjectLockDiagGuard>, bool, Option<rustfs_lock::NamespaceLockGuard>)> {
         let (capacity_guard, has_active_decommission) = self
-            .acquire_external_decommission_capacity_fence_with_active_source(
-                &[target_pool_idx],
-                DecommissionCapacityAdmission::Mutation,
-            )
+            .acquire_external_decommission_capacity_fence_with_active_source(&[target_pool_idx], admission)
             .await?;
         if !has_active_decommission {
             // Keep the read probe through the staged commit. This closes the

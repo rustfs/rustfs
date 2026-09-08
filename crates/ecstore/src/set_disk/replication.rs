@@ -161,7 +161,13 @@ impl SetDisks {
         let (decommission_object_lock_guard, decommission_target_lock_covered, mut decommission_capacity_guard) =
             if let Some(store) = opts.decommission_capacity_admission.as_ref() {
                 store
-                    .acquire_external_decommission_commit_guards(self.pool_index, bucket, object, opts.no_lock)
+                    .acquire_external_decommission_commit_guards(
+                        self.pool_index,
+                        bucket,
+                        object,
+                        opts.no_lock,
+                        DecommissionCapacityAdmission::Mutation,
+                    )
                     .await?
             } else {
                 (None, false, None)
@@ -265,7 +271,13 @@ impl SetDisks {
         let (decommission_object_lock_guard, decommission_target_lock_covered, mut decommission_capacity_guard) =
             if let Some(store) = opts.decommission_capacity_admission.as_ref() {
                 store
-                    .acquire_external_decommission_commit_guards(self.pool_index, bucket, object, opts.no_lock)
+                    .acquire_external_decommission_commit_guards(
+                        self.pool_index,
+                        bucket,
+                        object,
+                        opts.no_lock,
+                        DecommissionCapacityAdmission::Mutation,
+                    )
                     .await?
             } else {
                 (None, false, None)

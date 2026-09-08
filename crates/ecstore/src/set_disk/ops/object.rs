@@ -3907,6 +3907,7 @@ impl SetDisks {
                         bucket,
                         object,
                         opts.no_lock || object_lock_guard.is_some(),
+                        DecommissionCapacityAdmission::Mutation,
                     )
                     .await?;
                 decommission_object_lock_guard = object_guard;

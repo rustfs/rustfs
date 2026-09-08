@@ -1760,6 +1760,7 @@ fn ensure_decommission_capacity_reservations_available(
 #[derive(Clone, Copy)]
 pub(crate) enum DecommissionCapacityAdmission {
     Mutation,
+    ExistingMultipart,
     BatchDelete,
     Heal,
 }
@@ -1768,6 +1769,7 @@ impl DecommissionCapacityAdmission {
     fn phase(self) -> &'static str {
         match self {
             Self::Mutation => "mutation",
+            Self::ExistingMultipart => "existing_multipart",
             Self::BatchDelete => "batch_delete",
             Self::Heal => "heal",
         }
@@ -1783,10 +1785,16 @@ fn ensure_external_decommission_target_admission(
     // Pool selection may predate retirement or use a stale node-local snapshot.
     // Recheck publication against the fenced durable state. Repair and pure
     // capacity release retain their separate admission contracts.
-    if !matches!(admission, DecommissionCapacityAdmission::Heal) && meta.is_suspended(target_pool_index) {
-        return Err(Error::SlowDown);
+    let active_sources = active_decommission_source_indices(meta);
+    if meta.is_suspended(target_pool_index) {
+        let active_source = active_sources.contains(&target_pool_index);
+        if !matches!(admission, DecommissionCapacityAdmission::Heal)
+            && !(matches!(admission, DecommissionCapacityAdmission::ExistingMultipart) && active_source)
+        {
+            return Err(Error::SlowDown);
+        }
     }
-    if active_decommission_source_indices(meta).into_iter().any(|source_pool_index| {
+    if active_sources.into_iter().any(|source_pool_index| {
         meta.pools
             .get(source_pool_index)
             .and_then(|pool| pool.decommission.as_ref())
@@ -20683,17 +20691,17 @@ mod pools_tests {
         DecommissionStartPoolState, DecommissionTargetConsumption, DecommissionTerminalState, DecommissionUnresolvedEntry,
         ListCallback, POOL_META_GENERATION_VERSION, POOL_META_IDENTITY_NAME, POOL_META_NAME, POOL_META_V1_VERSION,
         POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolMetaCasToken, PoolMetaPersistenceFence, PoolSpaceInfo, PoolStatus,
-        QueuedDecommissionEntry, REBAL_META_NAME, acquire_pool_rebalance_activation_locks, apply_decommission_status_space_info,
-        await_decommission_worker, bind_decommission_cancelers, bind_missing_decommission_cancelers,
-        build_decommission_capacity_reservation, build_decommission_capacity_reservation_with_model,
-        cancel_decommission_canceler, clamp_decommission_entry_concurrency, classify_decommission_terminal_state,
-        count_decommission_item, decommission_cancel_signal_result, decommission_durable_ilm_receipt_path,
-        decommission_durable_ilm_receipt_run_prefix, decommission_durable_ilm_receipt_run_token,
-        decommission_entry_queue_capacity, decommission_item_size, decommission_meta_bucket_options,
-        decommission_physical_pool_capacity, decommission_retry_backoff_delay, decommission_start_pool_state,
-        decommission_unresolved_listing_error, dedup_indices, default_decommission_bucket_concurrency,
-        default_decommission_entry_concurrency, drain_decommission_entry_queue, enqueue_decommission_entry,
-        ensure_decommission_cancel_allowed, ensure_decommission_capacity_reservations_available,
+        QueuedDecommissionEntry, REBAL_META_NAME, acquire_pool_rebalance_activation_locks, active_decommission_source_indices,
+        apply_decommission_status_space_info, await_decommission_worker, bind_decommission_cancelers,
+        bind_missing_decommission_cancelers, build_decommission_capacity_reservation,
+        build_decommission_capacity_reservation_with_model, cancel_decommission_canceler, clamp_decommission_entry_concurrency,
+        classify_decommission_terminal_state, count_decommission_item, decommission_cancel_signal_result,
+        decommission_durable_ilm_receipt_path, decommission_durable_ilm_receipt_run_prefix,
+        decommission_durable_ilm_receipt_run_token, decommission_entry_queue_capacity, decommission_item_size,
+        decommission_meta_bucket_options, decommission_physical_pool_capacity, decommission_retry_backoff_delay,
+        decommission_start_pool_state, decommission_unresolved_listing_error, dedup_indices,
+        default_decommission_bucket_concurrency, default_decommission_entry_concurrency, drain_decommission_entry_queue,
+        enqueue_decommission_entry, ensure_decommission_cancel_allowed, ensure_decommission_capacity_reservations_available,
         ensure_decommission_clear_allowed, ensure_decommission_generation, ensure_decommission_listing_disks_available,
         ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_decommission_start_keeps_active_pool,
         ensure_decommission_start_local_leader, ensure_decommission_start_pool_states,
@@ -25738,6 +25746,17 @@ mod pools_tests {
                 assert!(
                     matches!(ensure_external_decommission_target_admission(&meta, 0, admission), Err(Error::SlowDown)),
                     "{state} source must reject new publication until its decommission metadata is cleared"
+                );
+            }
+            let existing_multipart =
+                ensure_external_decommission_target_admission(&meta, 0, DecommissionCapacityAdmission::ExistingMultipart);
+            if active_decommission_source_indices(&meta).contains(&0) {
+                existing_multipart
+                    .unwrap_or_else(|err| panic!("{state} source must allow an existing multipart upload to drain: {err}"));
+            } else {
+                assert!(
+                    matches!(existing_multipart, Err(Error::SlowDown)),
+                    "{state} terminal source must reject an existing multipart publication"
                 );
             }
             ensure_external_decommission_target_admission(&meta, 0, DecommissionCapacityAdmission::Heal)
