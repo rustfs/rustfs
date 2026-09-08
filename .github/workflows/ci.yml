@@ -16,7 +16,7 @@ name: Continuous Integration
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, release ]
     paths-ignore:
       - "**.md"
       - "docs/**"
@@ -36,7 +36,7 @@ on:
       - "flake.lock"
   pull_request:
     types: [ opened, synchronize, reopened, closed ]
-    branches: [ main ]
+    branches: [ main, release ]
     # Keep this list in sync with the `paths` list in ci-docs-only.yml, which
     # reports the required "Test and Lint" check for PRs skipped here.
     paths-ignore:
@@ -872,13 +872,14 @@ jobs:
     # Merge gate only (backlog#1149 ci-5): the never-automated user-visible
     # suites — KMS, object_lock, multipart_auth, quota, checksum, encryption,
     # security-boundary, ... — via the e2e-full nextest profile. Too heavy for
-    # every PR, so it is gated to main pushes, the merge queue, and manual
+    # every PR, so it is gated to main/release pushes, the merge queue, and manual
     # dispatch. protocols / the 7 cluster suites / replication / #[ignore] are
     # owned by other lanes (see .config/nextest.toml profile.e2e-full).
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'merge_group' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      (github.event_name == 'push' &&
+        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release'))
     needs: [ build-rustfs-debug-binary ]
     runs-on: sm-standard-2
     timeout-minutes: 55
