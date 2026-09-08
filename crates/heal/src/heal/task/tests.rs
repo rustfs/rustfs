@@ -1325,6 +1325,7 @@ struct MockStorage {
     retry_test_events: Mutex<Vec<String>>,
     listed: Mutex<bool>,
     list_each_bucket: bool,
+    pool_metadata_required: bool,
     fail_second_listing_page: bool,
     recoverable_second_page_failures: Mutex<Option<usize>>,
     listing_tokens: Mutex<Vec<Option<String>>>,
@@ -1942,6 +1943,34 @@ impl HealStorageAPI for MockStorage {
                 ..Default::default()
             })
             .collect())
+    }
+
+    async fn heal_pool_metadata(&self, opts: &HealOpts) -> Result<Vec<HealResultItem>> {
+        if !self.pool_metadata_required {
+            return Ok(Vec::new());
+        }
+        let scopes = self.erasure_set_scopes.lock().expect("metadata scopes").clone();
+        let scopes = if scopes.is_empty() {
+            vec![(opts.pool.unwrap_or(0), opts.set.unwrap_or(0))]
+        } else {
+            scopes
+        };
+        let mut results = Vec::new();
+        for (pool, set) in scopes {
+            let scoped_opts = HealOpts {
+                pool: Some(pool),
+                set: Some(set),
+                ..*opts
+            };
+            let (result, error) = self
+                .heal_object(RUSTFS_META_BUCKET, crate::heal::POOL_META_NAME, None, &scoped_opts)
+                .await?;
+            if let Some(error) = error {
+                return Err(error);
+            }
+            results.push(result);
+        }
+        Ok(results)
     }
 
     async fn object_exists(&self, _bucket: &str, object: &str) -> Result<bool> {
@@ -2682,6 +2711,182 @@ async fn test_recursive_bucket_heal_treats_missing_continuation_token_as_end() {
         ["object-a".to_string()],
         "the returned page is healed exactly once and the scan ends"
     );
+}
+
+#[tokio::test]
+async fn root_heal_restores_pool_metadata_without_user_buckets() {
+    let storage = Arc::new(MockStorage {
+        pool_metadata_required: true,
+        listed_buckets: Mutex::new(Some(Vec::new())),
+        ..Default::default()
+    });
+    assert!(storage.pool_metadata_required);
+    let task = HealTask::from_request(
+        HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::Normal),
+        storage.clone(),
+    );
+
+    task.execute().await.expect("root heal should restore required pool metadata");
+
+    assert_eq!(
+        storage.heal_object_calls.lock().expect("heal calls").as_slice(),
+        [crate::heal::POOL_META_NAME]
+    );
+    assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+}
+
+#[tokio::test]
+async fn root_heal_pool_metadata_cannot_hide_a_later_owner_failure() {
+    let storage = Arc::new(MockStorage {
+        pool_metadata_required: true,
+        listed_buckets: Mutex::new(Some(Vec::new())),
+        erasure_set_scopes: Mutex::new(vec![(0, 0), (1, 1)]),
+        ..Default::default()
+    });
+    storage.heal_object_outcomes.lock().expect("metadata outcomes").insert(
+        crate::heal::POOL_META_NAME.to_string(),
+        VecDeque::from([
+            MockHealObjectOutcome::UnavailableDrive(DriveState::Ok),
+            MockHealObjectOutcome::OkWithReadQuorum,
+        ]),
+    );
+    let task = HealTask::from_request(
+        HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::Normal),
+        storage.clone(),
+    );
+
+    let error = task
+        .execute()
+        .await
+        .expect_err("one healthy owner cannot satisfy another owner's recovery");
+
+    assert!(matches!(error, Error::Storage(EcstoreError::InsufficientReadQuorum(_, _))));
+    {
+        let opts = storage.object_heal_opts.lock().expect("owner options");
+        assert_eq!(
+            opts.iter().map(|opts| (opts.pool, opts.set)).collect::<Vec<_>>(),
+            vec![(Some(0), Some(0)), (Some(1), Some(1))]
+        );
+    }
+    assert!(!matches!(task.get_status().await, HealTaskStatus::Completed));
+}
+
+#[tokio::test]
+async fn root_heal_pool_metadata_does_not_inherit_remove_or_no_lock() {
+    let storage = Arc::new(MockStorage {
+        pool_metadata_required: true,
+        listed_buckets: Mutex::new(Some(Vec::new())),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(
+        HealRequest::new(
+            HealType::Cluster,
+            HealOptions {
+                remove_corrupted: true,
+                no_lock: true,
+                dry_run: true,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        ),
+        storage.clone(),
+    );
+
+    task.execute()
+        .await
+        .expect("dry-run metadata inspection should be fenced and non-destructive");
+
+    let opts = storage.object_heal_opts.lock().expect("metadata options");
+    assert_eq!(opts.len(), 1, "an empty user namespace must still inspect metadata");
+    assert!(opts[0].dry_run);
+    assert!(!opts[0].remove);
+    assert!(!opts[0].no_lock);
+}
+
+#[tokio::test]
+async fn root_heal_pool_metadata_failure_does_not_prevent_user_repairs() {
+    let storage = Arc::new(MockStorage {
+        pool_metadata_required: true,
+        ..Default::default()
+    });
+    storage.heal_object_outcomes.lock().expect("metadata outcome").insert(
+        crate::heal::POOL_META_NAME.to_string(),
+        VecDeque::from([MockHealObjectOutcome::OkWithReadQuorum]),
+    );
+    let task = HealTask::from_request(
+        HealRequest::new(
+            HealType::Cluster,
+            HealOptions {
+                recursive: true,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        ),
+        storage.clone(),
+    );
+
+    let error = task
+        .execute()
+        .await
+        .expect_err("unrecovered metadata must still fail root completion");
+
+    assert!(matches!(error, Error::Storage(EcstoreError::InsufficientReadQuorum(_, _))));
+    assert_eq!(
+        storage.heal_object_calls.lock().expect("heal calls").as_slice(),
+        ["object-a", "object-b", crate::heal::POOL_META_NAME]
+    );
+    assert!(!matches!(task.get_status().await, HealTaskStatus::Completed));
+}
+
+#[tokio::test]
+async fn root_heal_pool_metadata_preserves_typed_quorum_failure() {
+    let storage = Arc::new(MockStorage {
+        pool_metadata_required: true,
+        listed_buckets: Mutex::new(Some(Vec::new())),
+        ..Default::default()
+    });
+    storage.heal_object_outcomes.lock().expect("metadata outcome").insert(
+        crate::heal::POOL_META_NAME.to_string(),
+        VecDeque::from([MockHealObjectOutcome::OkWithReadQuorum]),
+    );
+    let task = HealTask::from_request(HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::Normal), storage);
+
+    let error = task
+        .execute()
+        .await
+        .expect_err("metadata quorum failure must prevent root completion");
+
+    assert!(matches!(error, Error::Storage(EcstoreError::InsufficientReadQuorum(_, _))));
+    assert!(!matches!(task.get_status().await, HealTaskStatus::Completed));
+}
+
+#[tokio::test(start_paused = true)]
+async fn root_heal_pool_metadata_obeys_task_timeout() {
+    let storage = Arc::new(MockStorage {
+        pool_metadata_required: true,
+        listed_buckets: Mutex::new(Some(Vec::new())),
+        retry_test_delays: HashMap::from([(crate::heal::POOL_META_NAME.to_string(), Duration::from_secs(10))]),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(
+        HealRequest::new(
+            HealType::Cluster,
+            HealOptions {
+                timeout: Some(Duration::from_millis(10)),
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        ),
+        storage,
+    );
+
+    let error = task
+        .execute()
+        .await
+        .expect_err("metadata work must stay inside the root task budget");
+
+    assert!(matches!(error, Error::TaskTimeout));
+    assert!(!matches!(task.get_status().await, HealTaskStatus::Completed));
 }
 
 #[tokio::test]

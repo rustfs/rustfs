@@ -436,6 +436,15 @@ pub trait HealStorageAPI: Send + Sync {
         Err(Error::other("target-scoped replacement format is unsupported"))
     }
 
+    /// Heal each pool metadata replica owned by the selected live scope.
+    ///
+    /// A successful result requires every applicable owner to finish; an empty
+    /// result is valid only for a known scope with no metadata replica. Backends
+    /// without pool metadata must explicitly implement that empty result.
+    async fn heal_pool_metadata(&self, _opts: &HealOpts) -> Result<Vec<HealResultItem>> {
+        Err(Error::other("pool metadata healing is unsupported"))
+    }
+
     /// Whether the selected replacement set owns the pool metadata replica.
     ///
     /// Only a topology-aware backend may exempt a valid non-owner set. The
@@ -1274,6 +1283,10 @@ impl HealStorageAPI for ECStoreHealStorage {
             .await
             .map(|(result, error)| (result, error.map(Error::Storage)))
             .map_err(Error::Storage)
+    }
+
+    async fn heal_pool_metadata(&self, opts: &HealOpts) -> Result<Vec<HealResultItem>> {
+        self.ecstore.heal_pool_metadata(opts).await.map_err(Error::Storage)
     }
 
     async fn replacement_pool_metadata_applies(&self, opts: &HealOpts) -> Result<bool> {

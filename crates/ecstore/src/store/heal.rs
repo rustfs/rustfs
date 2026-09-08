@@ -18,6 +18,7 @@ use crate::services::rebalance::{REBAL_META_NAME, RebalStatus};
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::heal::HealOperations as _;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+use rustfs_heal_contracts::heal_channel::DriveState;
 use rustfs_lock::NamespaceLockGuard;
 use std::collections::BTreeSet;
 use tracing::trace;
@@ -376,6 +377,58 @@ impl ECStore {
             return Ok((result.0, Some(heal_format_fence_lost_error())));
         }
         Ok(result)
+    }
+
+    /// Heal every pool metadata owner in the selected scope without allowing
+    /// one healthy pool to hide another pool's failed repair.
+    pub async fn heal_pool_metadata(&self, opts: &HealOpts) -> Result<Vec<HealResultItem>> {
+        let scopes = self.heal_erasure_set_scopes(opts).await?;
+        let mut results = Vec::new();
+        for (pool_index, set_index) in scopes {
+            if !self.replacement_pool_metadata_applies(pool_index, set_index)? {
+                continue;
+            }
+            let set = &self.pools[pool_index].disk_set[set_index];
+            let targets = set.set_endpoints.iter().map(ToString::to_string).collect::<Vec<_>>();
+            if targets.is_empty()
+                || targets.len() != set.set_drive_count
+                || targets.iter().collect::<BTreeSet<_>>().len() != targets.len()
+            {
+                return Err(Error::SlowDown);
+            }
+            // Administrative remove/no-lock options apply to user objects,
+            // never to the cluster's authoritative metadata transaction.
+            let metadata_opts = HealOpts {
+                dry_run: opts.dry_run,
+                scan_mode: opts.scan_mode,
+                pool: Some(pool_index),
+                set: Some(set_index),
+                ..Default::default()
+            };
+            let (result, error) = self
+                .handle_heal_object(RUSTFS_META_BUCKET, POOL_META_NAME, "", &metadata_opts)
+                .await?;
+            if let Some(error) = error {
+                return Err(error);
+            }
+            if !opts.dry_run {
+                let ok_state = DriveState::Ok.to_string();
+                let complete = result.after.drives.len() == targets.len()
+                    && targets.iter().all(|target| {
+                        let mut outcomes = result.after.drives.iter().filter(|drive| drive.endpoint == *target);
+                        outcomes.next().is_some_and(|drive| drive.state == ok_state) && outcomes.next().is_none()
+                    });
+                if !complete
+                    || !set
+                        .replacement_targets_have_version(RUSTFS_META_BUCKET, POOL_META_NAME, "", &targets)
+                        .await?
+                {
+                    return Err(Error::SlowDown);
+                }
+            }
+            results.push(result);
+        }
+        Ok(results)
     }
 
     /// Whether this replacement set owns the pool's metadata replica.
@@ -914,6 +967,182 @@ mod tests {
             }
         }
         assert!(store.replacement_pool_metadata_applies(store.pools.len(), 0).is_err());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_pool_metadata_heal_repairs_each_owner_and_preserves_dry_run() {
+        let (_temp_dirs, store, _other_store) = test_two_pool_stores(None).await;
+        let first_missing = remove_pool_meta_shard(&store, 0).await;
+        let second_missing = remove_pool_meta_shard(&store, 1).await;
+        let destructive_options = HealOpts {
+            remove: true,
+            no_lock: true,
+            ..Default::default()
+        };
+        let results = store
+            .heal_pool_metadata(&HealOpts {
+                dry_run: true,
+                ..destructive_options
+            })
+            .await
+            .expect("dry-run should inspect both metadata owners without requiring a commit");
+        assert_eq!(results.len(), 2);
+        assert!(
+            first_missing
+                .read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false)
+                .await
+                .is_err()
+        );
+        assert!(
+            second_missing
+                .read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false)
+                .await
+                .is_err()
+        );
+
+        let lock = store.pools[0]
+            .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
+            .await
+            .expect("metadata namespace lock should be available");
+        let guard = lock
+            .get_read_lock(get_lock_acquire_timeout())
+            .await
+            .expect("a metadata reader should hold the shared fence");
+        let error = temp_env::async_with_vars(
+            [(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))],
+            store.heal_pool_metadata(&destructive_options),
+        )
+        .await
+        .expect_err("administrative no-lock cannot bypass the metadata write fence");
+        assert!(matches!(error, Error::Lock(rustfs_lock::LockError::Timeout { .. })));
+        drop(guard);
+        let results = store
+            .heal_pool_metadata(&destructive_options)
+            .await
+            .expect("every metadata owner should be repaired");
+        assert_eq!(results.len(), 2);
+        assert!(first_missing.read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false).await.is_ok());
+        assert!(
+            second_missing
+                .read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_pool_metadata_heal_does_not_hide_missing_later_pool() {
+        let (_temp_dirs, store, _other_store) = test_two_pool_stores(None).await;
+        delete_config(store.pools[1].clone(), POOL_META_NAME)
+            .await
+            .expect("the second pool metadata replica should be removed");
+
+        let error = store
+            .heal_pool_metadata(&HealOpts::default())
+            .await
+            .expect_err("the healthy first pool must not hide the second owner's missing replica");
+
+        assert!(!matches!(error, Error::NoHealRequired));
+        let second_set = store.pools[1].get_disks_by_key(POOL_META_NAME);
+        for disk in second_set.disks.read().await.iter().flatten() {
+            assert!(disk.read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_pool_metadata_heal_skips_only_valid_non_owner_sets() {
+        let mut store = minimal_heal_store().await;
+        store.ctx = Arc::new(InstanceContext::new());
+        for algorithm in [
+            crate::disk::format::DistributionAlgoVersion::V1,
+            crate::disk::format::DistributionAlgoVersion::V2,
+            crate::disk::format::DistributionAlgoVersion::V3,
+        ] {
+            let mut temp_dirs = Vec::new();
+            for pool_index in 0..store.pools.len() {
+                let (dirs, mut pool) =
+                    crate::core::sets::make_local_two_set_sets_for_pool_with_ctx(Arc::clone(&store.ctx), pool_index).await;
+                temp_dirs.extend(dirs);
+                Arc::get_mut(&mut pool)
+                    .expect("fixture pool should have one owner")
+                    .distribution_algo = algorithm.clone();
+                store.pools[pool_index] = pool;
+            }
+            for pool_index in 0..store.pools.len() {
+                let owner = (0..store.pools[pool_index].disk_set.len())
+                    .find(|set_index| {
+                        store
+                            .replacement_pool_metadata_applies(pool_index, *set_index)
+                            .expect("valid metadata placement")
+                    })
+                    .expect("every pool must have one metadata owner");
+                let non_owner = 1 - owner;
+                assert!(
+                    store
+                        .heal_pool_metadata(&HealOpts {
+                            pool: Some(pool_index),
+                            set: Some(non_owner),
+                            ..Default::default()
+                        })
+                        .await
+                        .expect("valid non-owner should need no metadata write")
+                        .is_empty()
+                );
+                assert!(
+                    store
+                        .heal_pool_metadata(&HealOpts {
+                            pool: Some(pool_index),
+                            set: Some(owner),
+                            ..Default::default()
+                        })
+                        .await
+                        .is_err(),
+                    "an owner with no authoritative metadata must fail"
+                );
+                assert!(
+                    store
+                        .heal_pool_metadata(&HealOpts {
+                            pool: Some(pool_index),
+                            set: Some(2),
+                            ..Default::default()
+                        })
+                        .await
+                        .is_err(),
+                    "invalid sets cannot claim the non-owner exemption"
+                );
+            }
+        }
+        assert!(
+            store
+                .heal_pool_metadata(&HealOpts {
+                    pool: Some(2),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordinary_pool_metadata_heal_requires_every_owner_endpoint() {
+        let (_temp_dirs, store, _other_store) = test_two_pool_stores(None).await;
+        let owner = store.pools[0].get_disks_by_key(POOL_META_NAME);
+        let offline_disk = owner.disks.write().await[0]
+            .take()
+            .expect("fixture owner disk should start online");
+
+        let result = store
+            .heal_pool_metadata(&HealOpts {
+                pool: Some(0),
+                ..Default::default()
+            })
+            .await;
+
+        assert!(result.is_err(), "a surviving metadata shard must not hide an offline owner endpoint");
+        owner.disks.write().await[0] = Some(offline_disk);
     }
 
     async fn remove_pool_meta_shard(store: &ECStore, pool_idx: usize) -> DiskStore {

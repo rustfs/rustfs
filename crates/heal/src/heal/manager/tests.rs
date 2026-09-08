@@ -555,6 +555,10 @@ async fn completed_retention_scheduler_preserves_progress_aliases_and_atomic_han
 
 #[async_trait::async_trait]
 impl HealStorageAPI for MockStorage {
+    async fn heal_pool_metadata(&self, _opts: &HealOpts) -> Result<Vec<HealResultItem>> {
+        Ok(Vec::new())
+    }
+
     async fn get_object_meta(&self, _bucket: &str, _object: &str) -> Result<Option<HealObjectInfo>> {
         Ok(None)
     }

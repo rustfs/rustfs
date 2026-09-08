@@ -842,7 +842,7 @@ impl ErasureSetHealer {
         }
 
         if failed_objects == 0 && skipped_objects == 0 && failed_buckets == 0 {
-            self.heal_replacement_pool_metadata(
+            self.heal_pool_metadata(
                 set_disk_id,
                 &mut ErasureSetPassCounters {
                     processed_objects: &mut processed_objects,
@@ -941,25 +941,40 @@ impl ErasureSetHealer {
         Ok(())
     }
 
-    async fn heal_replacement_pool_metadata(
+    async fn heal_pool_metadata(
         &self,
         set_disk_id: &str,
         counters: &mut ErasureSetPassCounters<'_>,
         resume_manager: &ResumeManager,
         checkpoint_manager: &CheckpointManager,
     ) -> Result<()> {
-        if self.replacement_task_id.is_none() {
-            return Ok(());
-        }
-        if self.target_endpoints.is_empty() {
-            return Err(Error::TaskExecutionFailed {
-                message: "Replacement pool metadata heal requires target endpoints".to_string(),
-            });
-        }
-
-        if !self.storage.replacement_pool_metadata_applies(&self.heal_opts).await? {
-            return Ok(());
-        }
+        let ordinary_opts = if self.replacement_task_id.is_none() {
+            let (pool_index, set_index) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
+            if self.heal_opts.pool.is_some_and(|pool| pool != pool_index)
+                || self.heal_opts.set.is_some_and(|set| set != set_index)
+            {
+                return Err(Error::TaskExecutionFailed {
+                    message: format!("Pool metadata scope does not match resumed set {set_disk_id}"),
+                });
+            }
+            Some(HealOpts {
+                dry_run: self.heal_opts.dry_run,
+                scan_mode: self.heal_opts.scan_mode,
+                pool: Some(pool_index),
+                set: Some(set_index),
+                ..Default::default()
+            })
+        } else {
+            if self.target_endpoints.is_empty() {
+                return Err(Error::TaskExecutionFailed {
+                    message: "Replacement pool metadata heal requires target endpoints".to_string(),
+                });
+            }
+            if !self.storage.replacement_pool_metadata_applies(&self.heal_opts).await? {
+                return Ok(());
+            }
+            None
+        };
 
         let object_key = format!("{RUSTFS_META_BUCKET}/{POOL_META_NAME}");
         let checkpoint_key = compose_key(&object_key, None);
@@ -977,67 +992,88 @@ impl ErasureSetHealer {
             .set_current_item(Some(RUSTFS_META_BUCKET.to_string()), Some(POOL_META_NAME.to_string()))
             .await?;
 
-        let result = match self
-            .storage
-            .heal_object(RUSTFS_META_BUCKET, POOL_META_NAME, None, &self.heal_opts)
-            .await
-        {
-            Ok((result, None)) if target_outcomes_complete(&result, &self.target_endpoints) => {
-                let object_size = result_object_size_u64(&result);
-                match self
-                    .storage
-                    .replacement_targets_have_version(
-                        RUSTFS_META_BUCKET,
-                        POOL_META_NAME,
-                        None,
-                        &self.heal_opts,
-                        &self.target_endpoints,
-                    )
-                    .await
-                {
-                    Ok(true) => (object_size, Ok(())),
-                    Ok(false) => (
-                        object_size,
-                        Err(Error::transient_skip(
-                            "Skipped replacement pool metadata heal because target readback did not confirm the committed version",
-                        )),
-                    ),
-                    Err(err) => (
-                        object_size,
-                        Err(Error::transient_skip(format!(
-                            "Skipped replacement pool metadata heal because target readback failed: {err}"
-                        ))),
-                    ),
+        let result = if let Some(opts) = ordinary_opts {
+            match self.storage.heal_pool_metadata(&opts).await {
+                Ok(results) if results.is_empty() => return Ok(()),
+                Ok(results) => {
+                    let [result] = results.as_slice() else {
+                        return Err(Error::TaskExecutionFailed {
+                            message: format!("Pool metadata returned multiple replicas for set {set_disk_id}"),
+                        });
+                    };
+                    (result_object_size_u64(result), Ok(()))
                 }
+                Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
+                Err(err) => match Self::classify_heal_object_error(&err) {
+                    HealObjectOutcome::Absent | HealObjectOutcome::Transient => {
+                        (0, Err(Error::transient_skip(format!("Pool metadata heal must be retried: {err}"))))
+                    }
+                    HealObjectOutcome::Failed => (0, Err(err)),
+                },
             }
-            Ok((result, None)) => (
-                result_object_size_u64(&result),
-                Err(Error::transient_skip(
-                    "Skipped replacement pool metadata heal because a replacement target was not committed",
-                )),
-            ),
-            Ok((result, Some(err))) => {
-                let object_size = result_object_size_u64(&result);
-                match Self::classify_heal_object_error(&err) {
+        } else {
+            match self
+                .storage
+                .heal_object(RUSTFS_META_BUCKET, POOL_META_NAME, None, &self.heal_opts)
+                .await
+            {
+                Ok((result, None)) if target_outcomes_complete(&result, &self.target_endpoints) => {
+                    let object_size = result_object_size_u64(&result);
+                    match self
+                        .storage
+                        .replacement_targets_have_version(
+                            RUSTFS_META_BUCKET,
+                            POOL_META_NAME,
+                            None,
+                            &self.heal_opts,
+                            &self.target_endpoints,
+                        )
+                        .await
+                    {
+                        Ok(true) => (object_size, Ok(())),
+                        Ok(false) => (
+                            object_size,
+                            Err(Error::transient_skip(
+                                "Skipped replacement pool metadata heal because target readback did not confirm the committed version",
+                            )),
+                        ),
+                        Err(err) => (
+                            object_size,
+                            Err(Error::transient_skip(format!(
+                                "Skipped replacement pool metadata heal because target readback failed: {err}"
+                            ))),
+                        ),
+                    }
+                }
+                Ok((result, None)) => (
+                    result_object_size_u64(&result),
+                    Err(Error::transient_skip(
+                        "Skipped replacement pool metadata heal because a replacement target was not committed",
+                    )),
+                ),
+                Ok((result, Some(err))) => {
+                    let object_size = result_object_size_u64(&result);
+                    match Self::classify_heal_object_error(&err) {
+                        HealObjectOutcome::Absent | HealObjectOutcome::Transient => (
+                            object_size,
+                            Err(Error::transient_skip(format!(
+                                "Skipped replacement pool metadata heal due to transient error: {err}"
+                            ))),
+                        ),
+                        HealObjectOutcome::Failed => (object_size, Err(err)),
+                    }
+                }
+                Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
+                Err(err) => match Self::classify_heal_object_error(&err) {
                     HealObjectOutcome::Absent | HealObjectOutcome::Transient => (
-                        object_size,
+                        0,
                         Err(Error::transient_skip(format!(
                             "Skipped replacement pool metadata heal due to transient error: {err}"
                         ))),
                     ),
-                    HealObjectOutcome::Failed => (object_size, Err(err)),
-                }
+                    HealObjectOutcome::Failed => (0, Err(err)),
+                },
             }
-            Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
-            Err(err) => match Self::classify_heal_object_error(&err) {
-                HealObjectOutcome::Absent | HealObjectOutcome::Transient => (
-                    0,
-                    Err(Error::transient_skip(format!(
-                        "Skipped replacement pool metadata heal due to transient error: {err}"
-                    ))),
-                ),
-                HealObjectOutcome::Failed => (0, Err(err)),
-            },
         };
 
         let (object_size, result) = result;
@@ -1056,7 +1092,7 @@ impl ErasureSetHealer {
                     bucket = RUSTFS_META_BUCKET,
                     object = POOL_META_NAME,
                     state = "healed",
-                    "Replacement pool metadata healed"
+                    "Pool metadata healed"
                 );
                 CheckpointObjectOutcome::Processed
             }
@@ -1073,7 +1109,7 @@ impl ErasureSetHealer {
                     object = POOL_META_NAME,
                     state = "transient_skip",
                     error = %message,
-                    "Replacement pool metadata heal skipped due to transient error"
+                    "Pool metadata heal skipped due to transient error"
                 );
                 CheckpointObjectOutcome::Skipped
             }
@@ -1090,7 +1126,7 @@ impl ErasureSetHealer {
                     object = POOL_META_NAME,
                     state = "failed",
                     error = %err,
-                    "Replacement pool metadata heal failed"
+                    "Pool metadata heal failed"
                 );
                 CheckpointObjectOutcome::Failed
             }
@@ -1531,7 +1567,9 @@ impl ErasureSetHealer {
                         );
                         CheckpointObjectOutcome::Processed
                     }
-                    Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
+                    Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => {
+                        return Err(err);
+                    }
                     Err(Error::TransientSkip { message }) => {
                         telemetry_unknown |= !increment_counter(skipped_objects);
                         telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
@@ -2060,6 +2098,8 @@ mod resume_loop_tests {
         /// Target-specific physical readback evidence per `compose_key`; the
         /// fake models a healthy backend unless a test explicitly revokes it.
         replacement_commit_evidence: Mutex<HashMap<String, ReplacementCommitEvidence>>,
+        ordinary_pool_metadata_required: AtomicBool,
+        ordinary_pool_metadata_opts: Mutex<Vec<HealOpts>>,
         pool_metadata_not_applicable: AtomicBool,
         fail_pool_metadata_scope: AtomicBool,
         lifecycle_expired: Mutex<HashSet<String>>,
@@ -2176,6 +2216,20 @@ mod resume_loop_tests {
         }
         async fn heal_format(&self, _dry: bool) -> Result<(HealResultItem, Option<Error>)> {
             Ok((HealResultItem::default(), None))
+        }
+        async fn heal_pool_metadata(&self, opts: &HealOpts) -> Result<Vec<HealResultItem>> {
+            if !self.ordinary_pool_metadata_required.load(Ordering::SeqCst) {
+                return Ok(Vec::new());
+            }
+            self.ordinary_pool_metadata_opts.lock().expect("metadata options").push(*opts);
+            if !self.replacement_pool_metadata_applies(opts).await? {
+                return Ok(Vec::new());
+            }
+            let (result, error) = self.heal_object(RUSTFS_META_BUCKET, POOL_META_NAME, None, opts).await?;
+            if let Some(error) = error {
+                return Err(error);
+            }
+            Ok(vec![result])
         }
         async fn replacement_pool_metadata_applies(&self, opts: &HealOpts) -> Result<bool> {
             if self.fail_pool_metadata_scope.load(Ordering::SeqCst) {
@@ -2680,6 +2734,115 @@ mod resume_loop_tests {
     }
 
     #[tokio::test]
+    async fn ordinary_set_heals_pool_metadata_without_replacement_generation_or_targets() {
+        let env = make_env().await;
+        env.storage.ordinary_pool_metadata_required.store(true, Ordering::SeqCst);
+        env.storage
+            .set_result(POOL_META_NAME, None, replacement_target_ok_result("metadata-disk", POOL_META_NAME));
+        assert!(env.healer.replacement_task_id.is_none());
+        assert!(env.healer.target_endpoints.is_empty());
+
+        env.healer
+            .execute_heal_with_resume(&[], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect("ordinary set recovery should repair metadata even without user buckets");
+
+        assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
+        {
+            let opts = env.storage.ordinary_pool_metadata_opts.lock().expect("metadata options");
+            assert_eq!(opts.len(), 1);
+            assert_eq!((opts[0].pool, opts[0].set), (Some(0), Some(0)));
+        }
+        let state = env.resume.get_state().await;
+        assert!(state.completed);
+        assert_eq!(state.successful_objects, 1, "metadata must enter durable completion counters");
+    }
+
+    #[tokio::test]
+    async fn ordinary_set_pool_metadata_respects_non_owner_and_dry_run() {
+        let mut env = make_env().await;
+        env.storage.ordinary_pool_metadata_required.store(true, Ordering::SeqCst);
+        env.storage.pool_metadata_not_applicable.store(true, Ordering::SeqCst);
+        env.healer.heal_opts.pool = Some(0);
+        env.healer.heal_opts.set = Some(1);
+        env.healer
+            .execute_heal_with_resume(&[], "pool_0_set_1", &env.resume, &env.checkpoint)
+            .await
+            .expect("a valid non-owner set must not invent a metadata replica");
+        assert!(env.storage.calls().is_empty());
+        assert_eq!(env.resume.get_state().await.successful_objects, 0);
+
+        let mut env = make_env().await;
+        env.storage.ordinary_pool_metadata_required.store(true, Ordering::SeqCst);
+        env.healer.heal_opts.dry_run = true;
+        env.healer.heal_opts.remove = true;
+        env.healer.heal_opts.no_lock = true;
+        env.storage.set_replacement_commit_evidence(POOL_META_NAME, None, false);
+        env.healer
+            .execute_heal_with_resume(&[], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect("ordinary dry-run metadata work must not require a replacement commit");
+        assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
+        let opts = env.storage.ordinary_pool_metadata_opts.lock().expect("metadata options");
+        assert_eq!(opts.len(), 1);
+        assert!(opts[0].dry_run);
+        assert!(!opts[0].remove);
+        assert!(!opts[0].no_lock);
+    }
+
+    #[tokio::test]
+    async fn ordinary_set_missing_pool_metadata_preserves_retry_state() {
+        let env = make_env().await;
+        env.storage.ordinary_pool_metadata_required.store(true, Ordering::SeqCst);
+        env.storage.set_outcome(POOL_META_NAME, None, HealOutcome::FileNotFound);
+
+        let error = env
+            .healer
+            .execute_heal_with_resume(&[], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect_err("missing required pool metadata must prevent ordinary set completion");
+
+        assert!(matches!(error, Error::TransientSkip { .. }));
+        let state = env.resume.get_state().await;
+        assert!(!state.completed);
+        assert_eq!(state.retry_count, 1);
+        assert!(CheckpointManager::has_checkpoint(&env.healer.disk, &env.task_id).await);
+    }
+
+    #[tokio::test]
+    async fn ordinary_set_pool_metadata_timeout_keeps_control_error() {
+        let env = make_env().await;
+        env.storage.ordinary_pool_metadata_required.store(true, Ordering::SeqCst);
+        env.storage.set_outcome(POOL_META_NAME, None, HealOutcome::Timeout);
+
+        let error = env
+            .healer
+            .execute_heal_with_resume(&[], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect_err("metadata timeout must abort the ordinary set pass");
+
+        assert!(matches!(error, Error::TaskTimeout));
+        assert!(!env.resume.get_state().await.completed);
+    }
+
+    #[tokio::test]
+    async fn ordinary_set_pool_metadata_rejects_mismatched_explicit_scope() {
+        let mut env = make_env().await;
+        env.storage.ordinary_pool_metadata_required.store(true, Ordering::SeqCst);
+        env.healer.heal_opts.pool = Some(1);
+
+        let error = env
+            .healer
+            .execute_heal_with_resume(&[], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await
+            .expect_err("explicit metadata scope must agree with the resumed set");
+
+        assert!(matches!(error, Error::TaskExecutionFailed { .. }));
+        assert!(env.storage.calls().is_empty(), "scope mismatch must fail before metadata mutation");
+        assert!(!env.resume.get_state().await.completed);
+    }
+
+    #[tokio::test]
     async fn replacement_completion_keeps_resume_artifacts_until_marker_cleanup() {
         let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
         let replacement_task_id = ResumeUtils::generate_task_id();
@@ -2820,7 +2983,7 @@ mod resume_loop_tests {
         let mut failed_objects = 0;
         let mut skipped_objects = 0;
         let error = healer
-            .heal_replacement_pool_metadata(
+            .heal_pool_metadata(
                 "pool_0_set_0",
                 &mut super::ErasureSetPassCounters {
                     processed_objects: &mut processed_objects,

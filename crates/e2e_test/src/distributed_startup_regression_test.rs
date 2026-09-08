@@ -498,7 +498,9 @@ mod tests {
                 .stderr(log)
                 .spawn()?,
         );
-        let status = tokio::time::timeout(Duration::from_secs(10), async {
+        // macOS evaluates each fresh binary copy before its capability hook can run.
+        let probe_timeout = if cfg!(target_os = "macos") { 60 } else { 10 };
+        let status = tokio::time::timeout(Duration::from_secs(probe_timeout), async {
             loop {
                 if let Some(status) = child.0.try_wait()? {
                     return Ok::<_, std::io::Error>(status);
