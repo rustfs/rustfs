@@ -8,6 +8,7 @@ SOURCE_REPOSITORY="${RUSTFS_UPGRADE_SOURCE_REPOSITORY:-rustfs/rustfs}"
 SOURCE_VERSION="${RUSTFS_UPGRADE_SOURCE_VERSION:-1.0.0-rc.5}"
 SOURCE_ASSET="${RUSTFS_UPGRADE_SOURCE_ASSET:-rustfs-linux-x86_64-gnu-v1.0.0-rc.5.zip}"
 SOURCE_SHA256="${RUSTFS_UPGRADE_SOURCE_SHA256:-3ee8df71e8edcfada533be452c4135868f697bc515460ae97b027313eade7a3d}"
+MIN_FREE_KIB="${RUSTFS_G09_MIN_FREE_KIB:-6291456}"
 
 RUN_DIR=""
 SOURCE_DIR=""
@@ -40,7 +41,9 @@ Options:
   -h, --help         Show this help
 
 The default pinned release asset is Linux x86_64. Use --source-binary when
-running against a custom previous-release binary on another platform.
+running against a custom previous-release binary on another platform. The
+script requires at least 6 GiB free by default; override
+RUSTFS_G09_MIN_FREE_KIB only for a deliberately smaller diagnostic run.
 USAGE
 }
 
@@ -98,6 +101,21 @@ normalize_path() {
     fi
 }
 
+cargo_target_dir() {
+    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        normalize_path "$CARGO_TARGET_DIR"
+    else
+        echo "$ROOT/target"
+    fi
+}
+
+write_rustfs_features_stamp() {
+    local target_dir
+    target_dir="$(cargo_target_dir)"
+    mkdir -p "$target_dir/debug"
+    : > "$target_dir/debug/rustfs.features"
+}
+
 ensure_default_asset_platform() {
     if [[ -n "$SOURCE_BINARY" ]]; then
         return
@@ -119,6 +137,21 @@ verify_sha256() {
         printf '%s  %s\n' "$SOURCE_SHA256" "$archive" | shasum -a 256 --check
     else
         echo "sha256sum or shasum is required to verify $SOURCE_ASSET" >&2
+        exit 1
+    fi
+}
+
+ensure_min_free_space() {
+    local path="$1"
+    local available
+    mkdir -p "$path"
+    available="$(df -Pk "$path" | awk 'NR == 2 { print $4 }')"
+    if [[ -z "$available" ]]; then
+        echo "could not determine free space for $path" >&2
+        exit 1
+    fi
+    if (( available < MIN_FREE_KIB )); then
+        echo "insufficient free space for G09 evidence run at $path: need ${MIN_FREE_KIB} KiB, found ${available} KiB" >&2
         exit 1
     fi
 }
@@ -320,6 +353,7 @@ run_self_test() {
     plan="$("$0" --plan-only --run-dir "$tmp/run" --source-binary "$tmp/rustfs-prev" --test all)"
     [[ "$plan" == *"tests=mixed-version rollback"* ]]
     [[ "$plan" == *"run_dir=$tmp/run"* ]]
+    [[ "$(CARGO_TARGET_DIR=relative-target "$0" --plan-only --run-dir "$tmp/run" --source-binary "$tmp/rustfs-prev")" == *"target_dir=$ROOT/relative-target"* ]]
 
     if "$0" --plan-only --test not-a-case >/dev/null 2>&1; then
         echo "self-test failed: invalid test selection was accepted" >&2
@@ -410,6 +444,7 @@ if [[ "$PLAN_ONLY" == 1 ]]; then
     echo "tests=${CASES[*]}"
     echo "source_repository=$SOURCE_REPOSITORY"
     echo "source_version=$SOURCE_VERSION"
+    echo "min_free_kib=$MIN_FREE_KIB"
     if [[ -n "$SOURCE_BINARY" ]]; then
         echo "source_binary=$(normalize_path "$SOURCE_BINARY")"
     else
@@ -420,6 +455,7 @@ if [[ "$PLAN_ONLY" == 1 ]]; then
         fi
         echo "source_asset=$SOURCE_ASSET"
     fi
+    echo "target_dir=$(cargo_target_dir)"
     exit 0
 fi
 
@@ -433,6 +469,11 @@ if [[ -e "$RUN_DIR" ]]; then
     exit 1
 fi
 mkdir -p "$RUN_DIR/logs"
+if [[ -n "${TMPDIR:-}" ]]; then
+    mkdir -p "$TMPDIR"
+    ensure_min_free_space "$TMPDIR"
+fi
+ensure_min_free_space "$RUN_DIR"
 
 RUN_STARTED_AT="$(utc_now)"
 SOURCE_BINARY="$(resolve_source_binary)"
@@ -442,7 +483,7 @@ mkdir -p "$RUSTFS_E2E_LOG_DIR"
 
 if [[ "$SKIP_BUILD" != 1 ]]; then
     run_logged build-current cargo build --locked -p rustfs --bin rustfs
-    : > "$ROOT/target/debug/rustfs.features"
+    write_rustfs_features_stamp
 fi
 
 SOURCE_REVISION="$(git rev-parse HEAD)"

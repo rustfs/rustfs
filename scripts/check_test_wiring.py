@@ -1982,6 +1982,8 @@ def scanner_heal_release_bundle_gate_status(root: Path, bundle_path: Path, gate:
             "scanner/heal release evidence source revision mismatch")
     raw_gates = bundle.get("gates")
     require(isinstance(raw_gates, dict), "scanner/heal release evidence bundle missing gates")
+    unknown = sorted(set(raw_gates) - set(requirements))
+    require(not unknown, f"scanner/heal release evidence bundle has unknown gates: {', '.join(unknown)}")
 
     gate_errors = validate_scanner_heal_release_bundle_gate(bundle_path, source_revision, requirements, raw_gates, gate)
     verified = not gate_errors
@@ -2763,6 +2765,16 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(status["decision"], "blocked")
             self.assertFalse(status["release_approved"])
             self.assertIn("missing required fields: rollback_payload_evidence", status["rejected_errors"])
+
+    def test_scanner_heal_release_bundle_gate_rejects_unknown_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            data = read_json(bundle)
+            data["gates"] = {"G09": data["gates"]["G09"], "Z99": {"status": "pass"}}
+            write_json(bundle, data)
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                with self.assertRaisesRegex(ValueError, "unknown gates: Z99"):
+                    scanner_heal_release_bundle_gate_status(root, bundle, "G09")
 
     def test_scanner_heal_release_bundle_assembler_rejects_fixture_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
