@@ -4501,6 +4501,174 @@ mod decommission_lock_order_tests {
 
     #[test]
     #[serial_test::serial]
+    fn scanner_backlog_native_replica_reconciles_capacity_and_cleans_source() {
+        run_large_stack_current_thread_async_test("scanner-backlog-reconcile", async || {
+            let (_temp_dirs, store, other_store) =
+                test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
+            let object = "buckets/.scanner-pause-backlog.json";
+            let body = br#"{"schemaVersion":1,"generation":2}"#.to_vec();
+            let old_body = br#"{"schemaVersion":1,"generation":1}"#.to_vec();
+            let source_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+            let target_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10);
+            for (pool_index, payload, mod_time) in [(0, body.clone(), source_time), (2, old_body, target_time)] {
+                store.pools[pool_index]
+                    .put_object(
+                        RUSTFS_META_BUCKET,
+                        object,
+                        &mut PutObjReader::from_vec(payload),
+                        &ObjectOptions {
+                            max_parity: true,
+                            mod_time: Some(mod_time),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("seed native scanner replicas with independent write times");
+            }
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            let target_total = body.len() * 8;
+            let capacities = vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, body.len() * 2, body.len() * 2),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 0, target_total, target_total),
+                DecommissionPoolCapacityInfo::for_test(2, layout, target_total, target_total, 0),
+            ];
+            set_decommission_capacity_info_overrides_for_test(store.id, vec![capacities.clone()]);
+            store
+                .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+                .await
+                .expect("activate the source reservation");
+            let owner = decommission_capacity_owner(&*store.pool_meta.read().await);
+            let source_reader = store.pools[0]
+                .get_object_reader(
+                    RUSTFS_META_BUCKET,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        no_lock: true,
+                        data_movement: true,
+                        raw_data_movement_read: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("read the frozen source replica");
+            let conflict = data_movement::migrate_decommission_object(
+                Arc::clone(&store),
+                0,
+                RUSTFS_META_BUCKET.to_string(),
+                source_reader,
+                None,
+                "scanner_backlog_conflict",
+                Some(owner),
+            )
+            .await
+            .expect_err("a different older native ledger must retain its source and capacity intent");
+            assert!(conflict.to_string().contains("Precondition failed"), "unexpected conflict: {conflict}");
+            let mut persisted = crate::core::pools::PoolMeta::default();
+            persisted
+                .load_no_lock_from_replicas(store.pools.clone())
+                .await
+                .expect("reload the unresolved intent");
+            assert_eq!(
+                persisted.pools[0]
+                    .decommission
+                    .as_ref()
+                    .expect("source state")
+                    .capacity_reservation
+                    .as_ref()
+                    .expect("durable capacity")
+                    .pending_target_physical_bytes,
+                body.len()
+            );
+            let previous = store.pools[2]
+                .get_object_info(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+                .await
+                .expect("read the native writer's CAS revision");
+            let replacement = store.pools[2]
+                .put_object(
+                    RUSTFS_META_BUCKET,
+                    object,
+                    &mut PutObjReader::from_vec(body.clone()),
+                    &ObjectOptions {
+                        max_parity: true,
+                        mod_time: Some(target_time),
+                        http_preconditions: Some(crate::storage_api_contracts::object::HTTPPreconditions {
+                            if_match: previous.etag,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("native scanner CAS converges the payload without a migration marker");
+            assert!(!data_movement::is_owned_data_movement_target(&replacement));
+            *other_store.pool_meta.write().await = persisted;
+            set_decommission_capacity_info_overrides_for_test(other_store.id, vec![capacities]);
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                other_store.decommission_entry_for_test(
+                    0,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    RUSTFS_META_BUCKET.to_string(),
+                    other_store.pools[0].get_disks_by_key(object),
+                ),
+            )
+            .await
+            .expect("replica conflict recovery must be bounded")
+            .expect("identical native replica should finish migration on the reloaded node");
+            let mut reconciled = crate::core::pools::PoolMeta::default();
+            reconciled
+                .load_no_lock_from_replicas(other_store.pools.clone())
+                .await
+                .expect("reload reconciled capacity");
+            let reservation = reconciled.pools[0]
+                .decommission
+                .as_ref()
+                .expect("source state")
+                .capacity_reservation
+                .as_ref()
+                .expect("reconciled capacity");
+            assert_eq!(reservation.pending_target_physical_bytes, 0);
+            assert_eq!(reservation.committed_data_bytes, body.len());
+            assert_eq!(reservation.consumed_target_physical_bytes, body.len());
+            assert!(reservation.targets.iter().all(|target| target.pending_mutation_id.is_none()));
+            assert_eq!(
+                other_store.pool_meta.read().await.pools[0]
+                    .decommission
+                    .as_ref()
+                    .expect("worker progress")
+                    .items_decommission_failed,
+                0
+            );
+            let missing = other_store.pools[0]
+                .get_object_info(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+                .await
+                .expect_err("the source should be cleaned only after equivalent-target capacity reconciliation");
+            assert!(crate::error::is_err_object_not_found(&missing));
+            let mut target_reader = other_store.pools[2]
+                .get_object_reader(RUSTFS_META_BUCKET, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the surviving replica should remain readable");
+            assert_eq!(
+                target_reader.object_info.mod_time,
+                Some(target_time),
+                "recovery must not overwrite the native target"
+            );
+            let mut actual = Vec::new();
+            target_reader
+                .read_to_end(&mut actual)
+                .await
+                .expect("read surviving ledger bytes");
+            assert_eq!(actual, body);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn data_movement_equivalent_target_reconciles_published_capacity_after_restart() {
         run_large_stack_current_thread_async_test(
             "equivalent-target-capacity-restart",

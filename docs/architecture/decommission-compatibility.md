@@ -15,7 +15,8 @@ RustFS supports queued multi-pool decommission start requests on multi-pool depl
 - reject duplicate target pools in the same request;
 - reject active or queued target pools;
 - reject completed decommission targets, because completion means the pool can be removed from the deployment configuration;
-- allow failed or canceled targets to be retried;
+- require failed or canceled targets to be cleared before restarting, except
+  when unresolved listing entries require an explicit recovery retry;
 - persist queued metadata before starting workers;
 - start only the local-leader prefix of the queue on the receiving node.
 
@@ -56,6 +57,13 @@ Cancel separates active and queued behavior:
 
 Cancel requests can be accepted on non-leader nodes as remote cancel intent; the leader observes the pending cancel and applies it to the active worker.
 
+`queuedBuckets` retains the unfinished work inventory after cancellation. It is
+not evidence of active scheduling: `queued` is false and `startTime` is absent.
+Operators and tests must inspect the terminal flags, peer state and progress
+stability instead of requiring the historical inventory to be empty. A normal
+canceled entry remains blocked until clear; unresolved listing entries instead
+retain the explicit retry path that can re-observe or resolve those entries.
+
 ### Status Response Shape
 
 `GET /v3/pools/list` and `GET /v3/pools/status?pool=...` expose per-pool machine-readable decommission state. The `status` field can report `active`, `running`, `queued`, `complete`, `failed`, or `canceled`.
@@ -69,6 +77,21 @@ When decommission metadata is present, `decommissionInfo` includes:
 - `waitingReason`: `queued` for queued entries and `waiting_for_worker` when metadata exists but no worker has started.
 
 This makes queued pools and stalled metadata visible without requiring operators to inspect pool metadata files directly.
+
+### Scanner Backlog Replica Conflicts
+
+The exact internal object `.rustfs.sys/buckets/.scanner-pause-backlog.json` is
+published with CAS to surviving sets. Its replica-local object modification
+times are not scanner ledger generations. A cross-pool migration receiving
+`PreconditionFailed` can therefore accept an existing unversioned replica with
+an identical known ETag, payload identity and metadata even when its write time
+differs. This exception does not apply to other keys, versioned objects, delete
+markers, missing identity evidence, or a different older ledger payload.
+
+The source is still revalidated under its mutation fence before migration.
+Existing capacity-owner and mutation checks reconcile the pending intent before
+source cleanup; the replica exception does not clear an unknown intent, rewrite
+the native target, or change the scanner's committed-membership selection.
 
 ## MinIO Divergence Decisions
 
