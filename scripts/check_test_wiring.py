@@ -1551,16 +1551,26 @@ class SelfTests(unittest.TestCase):
             )
             + "</testsuite></testsuites>"
         )
-        physical = {"has_xl_meta": True, "version_id": None, "data_dir": "data-generation",
-                    "erasure_index": 1, "data_blocks": 2, "parity_blocks": 2, "expected_part_numbers": [1],
-                    "present_part_fingerprints": {"1": {"size": 12, "sha256": "c" * 64}},
-                    "inline_data_fingerprint": None}
-        obj = {"key": "object", "version_id": None, "expected_bytes": 16, "actual_bytes": 16,
-               "expected_sha256": "d" * 64, "actual_sha256": "d" * 64,
-               "expected_physical": physical, "physical": physical}
-        objects = [dict(obj, key=f"object-{index}") for index in range(9)]
-        objects[-1] = dict(objects[-1], expected_physical=None)
+        def oracle_objects(requirement: dict[str, object]) -> list[dict[str, object]]:
+            topology = requirement["topology"]
+            total_blocks = topology["nodes"] * topology["drives_per_node"]
+            parity_blocks = 4 if total_blocks == 12 else total_blocks // 2
+            data_blocks = total_blocks - parity_blocks
+            physical = {"has_xl_meta": True, "version_id": None, "data_dir": "data-generation",
+                        "erasure_index": 1, "data_blocks": data_blocks, "parity_blocks": parity_blocks,
+                        "expected_part_numbers": [1],
+                        "present_part_fingerprints": {"1": {"size": 12, "sha256": "c" * 64}},
+                        "inline_data_fingerprint": None}
+            obj = {"key": "object", "version_id": None, "expected_bytes": 16, "actual_bytes": 16,
+                   "expected_sha256": "d" * 64, "actual_sha256": "d" * 64,
+                   "expected_physical": physical, "physical": physical}
+            count = requirement.get("min_objects", 9)
+            objects = [dict(obj, key=f"object-{index}") for index in range(count)]
+            objects[-1] = dict(objects[-1], expected_physical=None)
+            return objects
+
         for case_id, requirement in requirements.items():
+            objects = oracle_objects(requirement)
             write_json(run_dir / requirement["oracle"], {
                 "schema": 1, "evidence": requirement["evidence"], "case": case_id,
                 "run_id": "a" * 32, "source_revision": "b" * 40,
@@ -1569,7 +1579,7 @@ class SelfTests(unittest.TestCase):
                 "binary_sha256": build["sha256"], "test_binary_sha256": build["sha256"],
                 "topology": requirement["topology"], "pid_before": 10, "pid_after": 11,
                 "unclean_shutdown_marker": requirement["unclean_shutdown_marker"],
-                "objects": objects, "node_listings": [[item["key"] for item in objects]] * 4,
+                "objects": objects, "node_listings": [[item["key"] for item in objects]] * requirement["topology"]["nodes"],
             })
         finish_scanner_heal_receipt(run_dir, 0, root)
         return root, run_dir
@@ -1810,7 +1820,9 @@ class SelfTests(unittest.TestCase):
             registry.pop("release_lanes")
             registry.pop("release_requirements")
             write_json(root / ".config/scanner-heal-required-tests.json", registry)
-            (run_dir / "background-target-crash.json").unlink()
+            for case_id, requirement in registry["cases"].items():
+                if case_id != "background-target-restart":
+                    (run_dir / requirement["oracle"]).unlink()
             (run_dir / "execution.json").unlink()
             finish_scanner_heal_receipt(run_dir, 0, root)
 
@@ -1818,7 +1830,7 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(status["decision"], "blocked")
             self.assertFalse(status["release_approved"])
             self.assertEqual(status["verified_cases"], ["background-target-restart"])
-            self.assertEqual(status["rejected_cases"], ["background-target-crash"])
+            self.assertEqual(status["rejected_cases"], sorted(set(registry["cases"]) - {"background-target-restart"}))
 
     def test_scanner_heal_finish_collects_oracles_from_registry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

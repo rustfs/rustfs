@@ -28,6 +28,20 @@
       "max_objects": 65,
       "topology": {"nodes": 4, "drives_per_node": 1},
       "scope": "Target process killed during partial background rebuild, real unclean-shutdown marker, exact unversioned S3 bodies and replacement-disk shards; not power loss or EC8+4."
+    },
+    "ec84-target-drive-restart": {
+      "gate": "G14",
+      "task": "W20/W21",
+      "lane": "e2e-distributed",
+      "suite": "e2e_test",
+      "name": "distributed::heal_test::three_node_four_drive_ec8_4_root_heal_rebuilds_replaced_drive_after_restart",
+      "oracle": "ec84-target-drive-restart.json",
+      "evidence": "process-restart",
+      "unclean_shutdown_marker": false,
+      "min_objects": 5,
+      "max_objects": 5,
+      "topology": {"nodes": 3, "drives_per_node": 4},
+      "scope": "3-node x 4-drive single-set EC8+4, graceful target restart, preformatted replacement drive, exact unversioned S3 bodies and physical target shards; not mixed-version, multi-pool or long-window ABBA."
     }
   },
   "release_lanes": {
