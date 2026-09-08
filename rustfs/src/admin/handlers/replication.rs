@@ -627,14 +627,30 @@ pub(crate) async fn cluster_replication_stats(bucket: &str, context: Option<Arc<
         .await
 }
 
-async fn notify_remote_target_metadata_reload(bucket: &str, context: Option<Arc<AppContext>>) -> S3Result<()> {
-    if let Some(notification_system) = current_notification_system_for_context(context.as_deref()) {
-        notification_system
-            .load_bucket_metadata(bucket)
-            .await
-            .map_err(ApiError::from)?;
+/// Reload the bucket's metadata on every peer so a follow-up
+/// `put-bucket-replication` on another node does not read a stale target.
+///
+/// Best effort, like every S3 bucket-config write path
+/// (`app::bucket_usecase::notify_bucket_metadata_reload`): the target is
+/// already persisted and live on this node, and the 15-minute refresh closes
+/// the gap, so a peer that cannot be reached must not turn a completed write
+/// into a failed request.
+async fn notify_remote_target_metadata_reload(bucket: &str, context: Option<Arc<AppContext>>, action: &'static str) {
+    let Some(notification_system) = current_notification_system_for_context(context.as_deref()) else {
+        return;
+    };
+    if let Err(err) = notification_system.load_bucket_metadata(bucket).await {
+        warn!(
+            event = EVENT_ADMIN_REMOTE_TARGET_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_REPLICATION,
+            action = action,
+            result = "peer_metadata_reload_failed",
+            bucket = %bucket,
+            error = ?err,
+            "admin remote target state"
+        );
     }
-    Ok(())
 }
 
 fn unique_replication_peers(peer_clients: &[Option<PeerRestClient>]) -> (Vec<&PeerRestClient>, u32) {
@@ -938,7 +954,7 @@ impl Operation for SetRemoteTargetHandler {
         let _targets_guard = lock_bucket_targets_metadata(bucket).await;
         let arn = persist_remote_target_write(bucket, remote_target, incarnation, mode).await?;
         drop(_targets_guard);
-        notify_remote_target_metadata_reload(bucket, app_context).await?;
+        notify_remote_target_metadata_reload(bucket, app_context, "set_remote_target").await;
         let arn_str = serde_json::to_string(&arn)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize target ARN"))?;
 
@@ -1116,7 +1132,7 @@ impl Operation for RemoveRemoteTargetHandler {
             S3Error::with_message(S3ErrorCode::InternalError, format!("remote target removal task failed: {error}"))
         })??;
 
-        notify_remote_target_metadata_reload(&notification_bucket, app_context).await?;
+        notify_remote_target_metadata_reload(&notification_bucket, app_context, "remove_remote_target").await;
 
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
     }
