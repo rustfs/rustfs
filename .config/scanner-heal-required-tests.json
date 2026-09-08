@@ -230,7 +230,16 @@
       "lane": "maintenance-producers",
       "status": "pending",
       "description": "Maintenance and complete producer coverage",
-      "requires": ["maintenance producer matrix", "complete producer inventory"]
+      "requires": [
+        "maintenance producer matrix",
+        "complete producer inventory",
+        "segment activation preflight"
+      ],
+      "evidence_fields": [
+        "maintenance_producer_matrix",
+        "complete_producer_inventory",
+        "segment_activation_preflight"
+      ]
     },
     {
       "gate": "G12",
@@ -254,7 +263,20 @@
       "lane": "ec8-4-multiset",
       "status": "pending",
       "description": "Same-window field evidence with 3x4 EC8+4 and multi-set/pool coverage",
-      "requires": ["same-window field evidence", "3x4 EC8+4 evidence", "multi-set evidence", "multi-pool evidence"]
+      "requires": [
+        "same-window field evidence",
+        "3x4 EC8+4 evidence",
+        "multi-set evidence",
+        "multi-pool evidence",
+        "distributed segment invalidation evidence"
+      ],
+      "evidence_fields": [
+        "same_window_field_evidence",
+        "ec8_4_evidence",
+        "multi_set_evidence",
+        "multi_pool_evidence",
+        "distributed_segment_invalidation_evidence"
+      ]
     },
     {
       "gate": "P1",
@@ -270,7 +292,11 @@
       "lane": "scheduler-pressure",
       "status": "pending",
       "description": "Measured post-stop convergence and cold segment reuse",
-      "requires": ["post-stop convergence measurement", "cold segment reuse measurement"]
+      "requires": ["post-stop convergence measurement", "cold segment reuse measurement"],
+      "evidence_fields": [
+        "post_stop_convergence_measurement",
+        "cold_segment_reuse_measurement"
+      ]
     },
     {
       "gate": "P3",

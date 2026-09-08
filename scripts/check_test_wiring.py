@@ -58,6 +58,22 @@ SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
         "mixed_version_writer_evidence",
         "rollback_payload_evidence",
     ),
+    "G11": (
+        "maintenance_producer_matrix",
+        "complete_producer_inventory",
+        "segment_activation_preflight",
+    ),
+    "G14": (
+        "same_window_field_evidence",
+        "ec8_4_evidence",
+        "multi_set_evidence",
+        "multi_pool_evidence",
+        "distributed_segment_invalidation_evidence",
+    ),
+    "P2": (
+        "post_stop_convergence_measurement",
+        "cold_segment_reuse_measurement",
+    ),
 }
 SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS = {
     "G01": ("root_authority_evidence", "quota_authority_evidence"),
@@ -70,12 +86,12 @@ SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS = {
     "G08": ("mrf_capacity_evidence", "disk_full_matrix", "replica_loss_matrix"),
     "G09": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G09"],
     "G10": ("scheduler_bound_evidence", "pressure_recovery_evidence"),
-    "G11": ("maintenance_producer_matrix", "complete_producer_inventory"),
+    "G11": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G11"],
     "G12": ("reset_quota_path_evidence", "settlement_quota_path_evidence"),
     "G13": ("quorum_minus_one_matrix", "unknown_disk_remount_matrix", "object_lock_dry_run_grace_evidence"),
-    "G14": ("same_window_field_evidence", "ec8_4_evidence", "multi_set_evidence", "multi_pool_evidence"),
+    "G14": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G14"],
     "P1": ("cold_walk_share_measurement", "foreground_latency_throughput_measurement", "profile_evidence"),
-    "P2": ("post_stop_convergence_measurement", "cold_segment_reuse_measurement"),
+    "P2": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P2"],
     "P3": ("two_hour_pressure_measurement", "heal_capacity_measurement", "recovery_window_measurement"),
     "P4": ("mrf_scale_measurement", "mrf_replay_cost_measurement", "retained_responsibility_evidence"),
     "R-E": ("fixed_budget_restart_evidence", "enumeration_evidence", "classification_evidence"),
@@ -100,6 +116,23 @@ SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS = {
     ("P4", "mrf_replay_cost_measurement"),
     ("P4", "retained_responsibility_evidence"),
 }
+SCANNER_HEAL_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS = (
+    "missing_producer_identity",
+    "restart_gap",
+    "generation_gap",
+    "overflow",
+    "missing_cold_zero_walk_oracle",
+    "distributed_without_peer_invalidation",
+)
+SCANNER_HEAL_SEGMENT_ACTIVATION_PROOF_INPUTS = (
+    "source",
+    "bucket_incarnation",
+    "key_format",
+    "baseline_scan_plan_digest",
+    "process_epoch",
+    "generation_window",
+    "producer_identities",
+)
 SCANNER_HEAL_RELEASE_G08_REQUIRED_CASES = {
     "mrf_capacity_evidence": (
         "queue-count-limit",
@@ -1001,6 +1034,17 @@ def evidence_string_list(value: object, name: str) -> list[str]:
     return value
 
 
+def evidence_exact_strings(value: object, expected: tuple[str, ...], name: str) -> list[str]:
+    strings = evidence_string_list(value, name)
+    observed = set(strings)
+    require(len(observed) == len(strings), f"duplicate {name}")
+    missing = sorted(set(expected) - observed)
+    require(not missing, f"missing {name}: {', '.join(missing)}")
+    unknown = sorted(observed - set(expected))
+    require(not unknown, f"unknown {name}: {', '.join(unknown)}")
+    return strings
+
+
 def scanner_heal_registry_schema(registry: dict[str, object]) -> int:
     return evidence_integer(registry.get("schema"), "registry schema", 1, SCANNER_HEAL_REGISTRY_SCHEMA_MAX)
 
@@ -1439,6 +1483,24 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
                 f"{gate}.{field} requires retained MRF responsibility anchors")
         require(evidence.get("successor_snapshot_published") is True,
                 f"{gate}.{field} requires successor snapshot publication evidence")
+    if field == "segment_activation_preflight":
+        require(evidence.get("production_activation") is False,
+                f"{gate}.{field} must keep production activation disabled")
+        require(evidence.get("scanner_segment_reuse_activated") is False,
+                f"{gate}.{field} must prove the runtime activation gate is disabled")
+        evidence_exact_strings(evidence.get("proof_inputs"),
+                               SCANNER_HEAL_SEGMENT_ACTIVATION_PROOF_INPUTS,
+                               f"{gate}.{field}.proof_inputs")
+        evidence_exact_strings(evidence.get("fail_closed_checks"),
+                               SCANNER_HEAL_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS,
+                               f"{gate}.{field}.fail_closed_checks")
+    if field == "cold_segment_reuse_measurement":
+        evidence_integer(evidence.get("hot_walked_segments"), f"{gate}.{field}.hot_walked_segments", 1, 2**63 - 1)
+        evidence_integer(evidence.get("cold_walked_segments"), f"{gate}.{field}.cold_walked_segments", 0, 0)
+        require(evidence.get("full_walk_oracle_equivalent") is True,
+                f"{gate}.{field} requires full-walk oracle equivalence")
+        require(evidence.get("published_root_equivalent") is True,
+                f"{gate}.{field} requires published-root equivalence")
     if gate == "G08":
         case_field = {
             "mrf_capacity_evidence": "capacity_cases",
@@ -1471,6 +1533,16 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
             evidence_integer(evidence.get("sets"), "G14 multi_set_evidence.sets", 2, 1024)
         if field == "multi_pool_evidence":
             evidence_integer(evidence.get("pools"), "G14 multi_pool_evidence.pools", 2, 1024)
+        if field == "distributed_segment_invalidation_evidence":
+            require(evidence.get("invalidation_domain") == "distributed-ec",
+                    "G14.distributed_segment_invalidation_evidence requires distributed EC invalidation")
+            require(evidence.get("distributed_ec_invalidation") is True,
+                    "G14.distributed_segment_invalidation_evidence requires peer invalidation proof")
+            evidence_integer(evidence.get("peer_count"), "G14 distributed_segment_invalidation_evidence.peer_count", 3, 64)
+            require(evidence.get("same_window_remote_proof") is True,
+                    "G14.distributed_segment_invalidation_evidence requires same-window remote proof")
+            require(evidence.get("all_peers_bound_to_generation_window") is True,
+                    "G14.distributed_segment_invalidation_evidence requires peer generation-window binding")
     if field == "profile_evidence":
         evidence_integer(evidence.get("resolved_samples"), f"{gate}.{field}.resolved_samples", 1, 2**63 - 1)
         profile_artifacts = evidence.get("profile_artifacts")
@@ -1899,6 +1971,22 @@ class SelfTests(unittest.TestCase):
                     evidence["sets"] = 2
                 if gate == "G14" and field == "multi_pool_evidence":
                     evidence["pools"] = 2
+                if gate == "G14" and field == "distributed_segment_invalidation_evidence":
+                    evidence["invalidation_domain"] = "distributed-ec"
+                    evidence["distributed_ec_invalidation"] = True
+                    evidence["peer_count"] = 3
+                    evidence["same_window_remote_proof"] = True
+                    evidence["all_peers_bound_to_generation_window"] = True
+                if field == "segment_activation_preflight":
+                    evidence["production_activation"] = False
+                    evidence["scanner_segment_reuse_activated"] = False
+                    evidence["proof_inputs"] = list(SCANNER_HEAL_SEGMENT_ACTIVATION_PROOF_INPUTS)
+                    evidence["fail_closed_checks"] = list(SCANNER_HEAL_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS)
+                if field == "cold_segment_reuse_measurement":
+                    evidence["hot_walked_segments"] = 2
+                    evidence["cold_walked_segments"] = 0
+                    evidence["full_walk_oracle_equivalent"] = True
+                    evidence["published_root_equivalent"] = True
                 if field == "profile_evidence":
                     evidence["resolved_samples"] = 1
                     artifacts = {}
@@ -2009,6 +2097,49 @@ class SelfTests(unittest.TestCase):
             ("mrf-anchor", "G07", "commit_boundary_crash_matrix", lambda item: item.update({"responsibility_anchor_retained": False}), "retained MRF responsibility anchors"),
             ("mrf-successor", "P4", "retained_responsibility_evidence", lambda item: item.pop("successor_snapshot_published"), "successor snapshot"),
             ("same-window-fields", "G14", "same_window_field_evidence", lambda item: item.update({"same_window_fields": ["ec8_4_evidence", "multi_set_evidence"]}), "missing fields"),
+            ("activation-enabled", "G11", "segment_activation_preflight", lambda item: item.update({"production_activation": True}), "production activation disabled"),
+            (
+                "activation-missing-fail-closed",
+                "G11",
+                "segment_activation_preflight",
+                lambda item: item["fail_closed_checks"].remove("overflow"),
+                "missing G11.segment_activation_preflight.fail_closed_checks",
+            ),
+            (
+                "activation-missing-proof-input",
+                "G11",
+                "segment_activation_preflight",
+                lambda item: item["proof_inputs"].remove("process_epoch"),
+                "missing G11.segment_activation_preflight.proof_inputs",
+            ),
+            (
+                "distributed-invalidation",
+                "G14",
+                "distributed_segment_invalidation_evidence",
+                lambda item: item.update({"distributed_ec_invalidation": False}),
+                "peer invalidation proof",
+            ),
+            (
+                "distributed-peer-window",
+                "G14",
+                "distributed_segment_invalidation_evidence",
+                lambda item: item.update({"all_peers_bound_to_generation_window": False}),
+                "peer generation-window binding",
+            ),
+            (
+                "cold-segment-walk",
+                "P2",
+                "cold_segment_reuse_measurement",
+                lambda item: item.update({"cold_walked_segments": 1}),
+                "cold_walked_segments",
+            ),
+            (
+                "cold-segment-oracle",
+                "P2",
+                "cold_segment_reuse_measurement",
+                lambda item: item.update({"full_walk_oracle_equivalent": False}),
+                "full-walk oracle equivalence",
+            ),
         ):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
                 root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
@@ -2208,12 +2339,15 @@ class SelfTests(unittest.TestCase):
             self.assertIn("durable_root_publication_proof", requirements["G03"]["evidence_fields"])
             self.assertIn("disk_full_matrix", requirements["G08"]["evidence_fields"])
             self.assertIn("mixed_version_writer_evidence", requirements["G09"]["evidence_fields"])
+            self.assertIn("segment_activation_preflight", requirements["G11"]["evidence_fields"])
+            self.assertIn("distributed_segment_invalidation_evidence", requirements["G14"]["evidence_fields"])
+            self.assertIn("cold_segment_reuse_measurement", requirements["P2"]["evidence_fields"])
 
     def test_scanner_heal_required_evidence_fields_cannot_be_removed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, run_dir = self.scanner_heal_fixture(Path(tmp))
             registry = read_json(root / ".config/scanner-heal-required-tests.json")
-            for gate in ("G03", "G08", "G09"):
+            for gate in ("G03", "G08", "G09", "G11", "G14", "P2"):
                 for requirement in registry["release_requirements"]:
                     if requirement["gate"] == gate:
                         requirement["evidence_fields"] = []
