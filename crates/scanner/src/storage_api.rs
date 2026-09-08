@@ -355,6 +355,13 @@ pub(crate) trait ScannerStorage:
     async fn list_bucket_for_scanner(&self, opts: &storage_contracts::BucketOptions) -> EcstoreResultType<ScannerBucketListing>;
     fn all_set_disks(&self) -> Vec<Arc<EcstoreSetDisks>>;
     async fn scanner_pause_backlog_writable_set_disks(&self) -> Vec<Arc<EcstoreSetDisks>>;
+    async fn save_scanner_pause_backlog_replica(
+        self: Arc<Self>,
+        pool_index: usize,
+        set_index: usize,
+        data: Vec<u8>,
+        preconditions: storage_contracts::HTTPPreconditions,
+    ) -> EcstoreResultType<()>;
     #[cfg(test)]
     fn scanner_observed_probe_store_key(&self) -> usize;
 }
@@ -415,6 +422,18 @@ impl ScannerStorage for EcstoreStore {
 
     async fn scanner_pause_backlog_writable_set_disks(&self) -> Vec<Arc<EcstoreSetDisks>> {
         EcstoreStore::scanner_pause_backlog_writable_set_disks(self).await
+    }
+
+    async fn save_scanner_pause_backlog_replica(
+        self: Arc<Self>,
+        pool_index: usize,
+        set_index: usize,
+        data: Vec<u8>,
+        preconditions: storage_contracts::HTTPPreconditions,
+    ) -> EcstoreResultType<()> {
+        EcstoreStore::save_scanner_pause_backlog_replica(&self, pool_index, set_index, data, preconditions)
+            .await
+            .map(|_| ())
     }
 
     #[cfg(test)]
@@ -575,6 +594,20 @@ mod tests {
 
         async fn scanner_pause_backlog_writable_set_disks(&self) -> Vec<Arc<EcstoreSetDisks>> {
             Vec::new()
+        }
+
+        async fn save_scanner_pause_backlog_replica(
+            self: Arc<Self>,
+            _pool_index: usize,
+            _set_index: usize,
+            _data: Vec<u8>,
+            _preconditions: storage_contracts::HTTPPreconditions,
+        ) -> EcstoreResultType<()> {
+            Err(EcstoreErrorType::InvalidArgument(
+                "scanner-backlog".into(),
+                "replica".into(),
+                "fake storage has no writable replicas".into(),
+            ))
         }
 
         fn scanner_observed_probe_store_key(&self) -> usize {

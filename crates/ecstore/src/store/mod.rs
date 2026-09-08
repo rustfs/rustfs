@@ -762,13 +762,7 @@ impl ECStore {
         self.pools
             .iter()
             .enumerate()
-            .filter(|(pool_index, _)| {
-                !pool_meta.pools.get(*pool_index).is_some_and(|pool| {
-                    pool.decommission
-                        .as_ref()
-                        .is_some_and(|info| info.has_decommission_state() && !info.failed && !info.canceled)
-                })
-            })
+            .filter(|(pool_index, _)| pool_meta.scanner_pause_backlog_pool_writable(*pool_index))
             .flat_map(|(_, pool)| pool.disk_set.iter().cloned())
             .collect()
     }

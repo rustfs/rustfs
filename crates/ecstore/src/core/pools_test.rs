@@ -570,6 +570,465 @@ mod decommission_lock_order_tests {
             .expect("decommission activation should commit after the probe release");
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn staged_external_put_rechecks_retiring_source_on_another_node() {
+        run_large_stack_current_thread_async_test("staged-retiring-source", || async {
+            let (_temp_dirs, store, other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("staged-source");
+            let object = "selected-before-retirement.bin";
+            let original = b"original source object";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create staged source bucket");
+            store.pools[0]
+                .put_object(&bucket, object, &mut PutObjReader::from_vec(original.to_vec()), &ObjectOptions::default())
+                .await
+                .expect("seed the source selected before retirement");
+
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            set_decommission_capacity_info_overrides_for_test(
+                other_store.id,
+                vec![vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, 1024, 1024),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 4096, 4096, 0),
+                    DecommissionPoolCapacityInfo::for_test(2, layout, 0, 4096, 4096),
+                ]],
+            );
+            let barrier = DecommissionCapacityLockOrderBarrier::install(store.id, store.id);
+            barrier.pause_external_object_commit_phase();
+            let put_store = Arc::clone(&store);
+            let put_bucket = bucket.clone();
+            let put = tokio::spawn(async move {
+                put_store
+                    .put_object(
+                        &put_bucket,
+                        object,
+                        &mut PutObjReader::from_vec(b"must not replace a retiring source".to_vec()),
+                        &ObjectOptions::default(),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_external_object_commit_phase_started())
+                .await
+                .expect("public PUT must stage before its decommission commit probe");
+            assert!(!store.pool_meta.read().await.is_suspended(0));
+            other_store
+                .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+                .await
+                .expect("the other node should activate retirement before the staged PUT commits");
+            assert!(other_store.pool_meta.read().await.is_suspended(0));
+            assert!(
+                !store.pool_meta.read().await.is_suspended(0),
+                "the writer's local snapshot must remain stale to exercise the durable admission probe"
+            );
+            barrier.release_external_object_commit_phase();
+            let result = tokio::time::timeout(Duration::from_secs(30), put)
+                .await
+                .expect("staged PUT must finish after the commit probe is released")
+                .expect("staged PUT must not panic");
+            assert!(
+                matches!(result, Err(crate::error::Error::SlowDown)),
+                "a staged PUT must retry pool selection instead of committing to a newly retiring source: {result:?}"
+            );
+            let mut reader = store.pools[0]
+                .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the original source must remain readable after admission rejects the replacement");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("read the full retained source body");
+            assert_eq!(body, original);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reserved_target_shares_business_io_and_retains_source_after_capacity_loss() {
+        run_large_stack_current_thread_async_test("shared-decommission-capacity", || async {
+            for lose_capacity in [false, true] {
+                let (_temp_dirs, store, other_store) =
+                    test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
+                let bucket = test_bucket("shared-capacity");
+                let object = "migrating-source.bin";
+                let business_object = "business-write.bin";
+                let multipart_object = "business-multipart.bin";
+                let source_body = vec![0x35; 256 * 1024];
+                let business_body = vec![0x57; 64 * 1024];
+                store
+                    .make_bucket(&bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("create shared-capacity bucket");
+                store.pools[0]
+                    .put_object(
+                        &bucket,
+                        object,
+                        &mut PutObjReader::from_vec(source_body.clone()),
+                        &ObjectOptions::default(),
+                    )
+                    .await
+                    .expect("seed the retiring source");
+                store.pools[2]
+                    .put_object(
+                        &bucket,
+                        business_object,
+                        &mut PutObjReader::from_vec(b"previous business value".to_vec()),
+                        &ObjectOptions::default(),
+                    )
+                    .await
+                    .expect("pin the public overwrite to the migration target");
+                let multipart_opts = ObjectOptions {
+                    expected_bucket_incarnation_id: Some(
+                        store
+                            .bucket_incarnation_id(&bucket)
+                            .await
+                            .expect("load the multipart bucket identity"),
+                    ),
+                    ..Default::default()
+                };
+                let routing_upload = new_multipart_upload(&store, 2, &bucket, multipart_object, multipart_opts.clone())
+                    .await
+                    .expect("pin subsequent public multipart creation to the migration target");
+                let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+                let target_total = source_body.len() * 8;
+                let capacities = vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, source_body.len() * 2, source_body.len() * 2),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 0, target_total, target_total),
+                    DecommissionPoolCapacityInfo::for_test(2, layout, target_total, target_total, 0),
+                ];
+                set_decommission_capacity_info_overrides_for_test(store.id, vec![capacities.clone()]);
+                store
+                    .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+                    .await
+                    .expect("activate source retirement");
+                *other_store.pool_meta.write().await = store.pool_meta.read().await.clone();
+                let before = other_store.pool_meta.read().await.clone();
+                let reservation = before.pools[0]
+                    .decommission
+                    .as_ref()
+                    .expect("active source")
+                    .capacity_reservation
+                    .as_ref()
+                    .expect("durable reservation");
+                assert_eq!(
+                    reservation.model_version, 2,
+                    "exercise migration I/O outside the global metadata write lock"
+                );
+                assert_eq!(reservation.targets[0].pool_index, 2);
+
+                let barrier =
+                    crate::set_disk::rename_fanout_barrier::arm(object, 0, crate::set_disk::rename_fanout_barrier::PHASE_RENAME);
+                let migration_store = Arc::clone(&store);
+                let migration_bucket = bucket.clone();
+                let migration = tokio::spawn(async move {
+                    migration_store
+                        .decommission_entry_for_test_with_bucket_incarnation(
+                            0,
+                            MetaCacheEntry {
+                                name: object.to_string(),
+                                ..Default::default()
+                            },
+                            migration_bucket,
+                            migration_store.pools[0].get_disks_by_key(object),
+                        )
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                    .await
+                    .expect("migration must reach target publication");
+                assert!(!migration.is_finished());
+                let mut pending = crate::core::pools::PoolMeta::default();
+                pending
+                    .load_no_lock_from_replicas(other_store.pools.clone())
+                    .await
+                    .expect("read migration intent from the other node");
+                let pending_reservation = pending.pools[0]
+                    .decommission
+                    .as_ref()
+                    .expect("active source")
+                    .capacity_reservation
+                    .as_ref()
+                    .expect("pending reservation")
+                    .clone();
+                assert_eq!(pending_reservation.pending_target_physical_bytes, source_body.len());
+                assert_eq!(pending_reservation.consumed_target_physical_bytes, 0);
+
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    other_store.put_object(
+                        &bucket,
+                        business_object,
+                        &mut PutObjReader::from_vec(business_body.clone()),
+                        &ObjectOptions::default(),
+                    ),
+                )
+                .await
+                .expect("business PUT must finish without waiting for the migration target gate")
+                .expect("a reserved healthy pool must accept ordinary PUT");
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    let upload = other_store
+                        .new_multipart_upload(&bucket, multipart_object, &ObjectOptions::default())
+                        .await
+                        .expect("the reserved target must accept public multipart creation");
+                    assert_ne!(upload.upload_id, routing_upload.upload_id);
+                    let lifecycle_guard = other_store
+                        .acquire_bucket_lifecycle_read_lock(&bucket)
+                        .await
+                        .expect("fence the exact-pool multipart placement check");
+                    let mut lookup_opts = multipart_opts.clone();
+                    lookup_opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
+                    other_store.pools[2]
+                        .get_multipart_info(&bucket, multipart_object, &upload.upload_id, &lookup_opts)
+                        .await
+                        .expect("public multipart creation must actually select the reserved target");
+                    drop(lifecycle_guard);
+                    let mut final_part = None;
+                    for payload in [vec![0x18; business_body.len()], business_body.clone()] {
+                        final_part = Some(
+                            other_store
+                                .put_object_part(
+                                    &bucket,
+                                    multipart_object,
+                                    &upload.upload_id,
+                                    1,
+                                    &mut PutObjReader::from_vec(payload),
+                                    &ObjectOptions::default(),
+                                )
+                                .await
+                                .expect("the reserved target must accept UploadPart and replacement of the same part"),
+                        );
+                    }
+                    let part = final_part.expect("the replacement part must be present");
+                    Arc::clone(&other_store)
+                        .complete_multipart_upload(
+                            &bucket,
+                            multipart_object,
+                            &upload.upload_id,
+                            vec![crate::storage_api_contracts::multipart::CompletePart {
+                                part_num: part.part_num,
+                                etag: part.etag,
+                                ..Default::default()
+                            }],
+                            &ObjectOptions::default(),
+                        )
+                        .await
+                        .expect("the reserved target must accept multipart completion");
+                    other_store
+                        .abort_multipart_upload(&bucket, multipart_object, &routing_upload.upload_id, &ObjectOptions::default())
+                        .await
+                        .expect("ordinary multipart cleanup must not consume the migration's pending intent");
+                })
+                .await
+                .expect("business multipart operations must finish while migration I/O is paused");
+                assert!(!migration.is_finished(), "business publication must overlap paused migration I/O");
+                let mut after_business = crate::core::pools::PoolMeta::default();
+                after_business
+                    .load_no_lock_from_replicas(other_store.pools.clone())
+                    .await
+                    .expect("reload the shared-capacity ledger");
+                assert_eq!(
+                    after_business.pools[0]
+                        .decommission
+                        .as_ref()
+                        .expect("active source")
+                        .capacity_reservation
+                        .as_ref(),
+                    Some(&pending_reservation),
+                    "ordinary PUT and multipart operations must not settle or consume the migration's pending identity"
+                );
+
+                let mut after_capacity = capacities;
+                // Capacity injection is deterministic; the object I/O and durable metadata use real temporary disks.
+                let free = if lose_capacity {
+                    0
+                } else {
+                    target_total - source_body.len() - business_body.len() * 2
+                };
+                after_capacity[2] = DecommissionPoolCapacityInfo::for_test(2, layout, free, target_total, target_total - free);
+                set_decommission_capacity_info_overrides_for_test(store.id, vec![after_capacity]);
+                barrier.release();
+                drop(barrier);
+                let migrated = tokio::time::timeout(Duration::from_secs(30), migration)
+                    .await
+                    .expect("migration must finish after publication resumes")
+                    .expect("migration task must not panic");
+                if lose_capacity {
+                    let err =
+                        migrated.expect_err("capacity loss must prevent source cleanup, even after the target write commits");
+                    assert!(err.to_string().contains("capacity"), "unexpected migration error: {err}");
+                } else {
+                    migrated.expect("shared-capacity migration should finish when space remains sufficient");
+                }
+                let mut persisted = crate::core::pools::PoolMeta::default();
+                persisted
+                    .load_no_lock_from_replicas(other_store.pools.clone())
+                    .await
+                    .expect("reload finalized migration state");
+                let info = persisted.pools[0].decommission.as_ref().expect("source state");
+                let reservation = info.capacity_reservation.as_ref().expect("migration ledger");
+                assert_eq!(reservation.pending_target_physical_bytes, 0);
+                assert_eq!(
+                    reservation.consumed_target_physical_bytes,
+                    source_body.len(),
+                    "foreign writes must not count as committed source bytes"
+                );
+                assert_eq!(reservation.committed_data_bytes, source_body.len());
+                assert_eq!(info.capacity_blocked_reason.is_some(), lose_capacity);
+                for (pool, key, expected) in [
+                    (2, business_object, &business_body),
+                    (2, multipart_object, &business_body),
+                    (2, object, &source_body),
+                ] {
+                    let mut reader = other_store.pools[pool]
+                        .get_object_reader(&bucket, key, None, HeaderMap::new(), &ObjectOptions::default())
+                        .await
+                        .expect("all acknowledged target objects must remain readable");
+                    let mut actual = Vec::new();
+                    reader.read_to_end(&mut actual).await.expect("read the complete target body");
+                    assert_eq!(&actual, expected);
+                }
+                if lose_capacity {
+                    let mut source = other_store.pools[0]
+                        .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                        .await
+                        .expect("capacity-blocked migration must retain its source");
+                    let mut actual = Vec::new();
+                    source
+                        .read_to_end(&mut actual)
+                        .await
+                        .expect("read the complete retained source");
+                    assert_eq!(actual, source_body);
+                    other_store
+                        .put_object(
+                            &bucket,
+                            business_object,
+                            &mut PutObjReader::from_vec(business_body.clone()),
+                            &ObjectOptions::default(),
+                        )
+                        .await
+                        .expect("a capacity-blocked migration must not itself make the healthy target read-only");
+                } else {
+                    let err = other_store.pools[0]
+                        .get_object_info(&bucket, object, &ObjectOptions::default())
+                        .await
+                        .expect_err("successful migration must clean the exact source");
+                    assert!(crate::error::is_err_object_not_found(&err));
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mixed_batch_delete_admits_only_marker_destinations_during_retirement() {
+        run_large_stack_current_thread_async_test("batch-marker-admission", || async {
+            use crate::storage_api_contracts::object::ObjectToDelete;
+
+            for marker_target in [1, 2] {
+                let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+                let bucket = test_bucket("batch-marker");
+                store
+                    .make_bucket(
+                        &bucket,
+                        &MakeBucketOptions {
+                            versioning_enabled: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("create a versioned batch-delete bucket");
+                let source_version = uuid::Uuid::new_v4();
+                for (pool, object, version) in [
+                    (0, "purge-source", source_version),
+                    (marker_target, "mark-active", uuid::Uuid::new_v4()),
+                ] {
+                    store.pools[pool]
+                        .put_object(
+                            &bucket,
+                            object,
+                            &mut PutObjReader::from_vec(b"version to delete".to_vec()),
+                            &ObjectOptions {
+                                versioned: true,
+                                version_id: Some(version.to_string()),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("seed each exact batch-delete destination");
+                }
+                let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+                set_decommission_capacity_info_overrides_for_test(
+                    store.id,
+                    vec![vec![
+                        DecommissionPoolCapacityInfo::for_test(0, layout, 0, 1024, 1024),
+                        DecommissionPoolCapacityInfo::for_test(1, layout, 4096, 4096, 0),
+                        DecommissionPoolCapacityInfo::for_test(2, layout, 0, 4096, 4096),
+                    ]],
+                );
+                store
+                    .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+                    .await
+                    .expect("reserve pool 1 while pool 0 retires and pool 2 remains unreserved");
+                let (deleted, errors) = store
+                    .delete_objects(
+                        &bucket,
+                        vec![
+                            ObjectToDelete {
+                                object_name: "mark-active".to_string(),
+                                ..Default::default()
+                            },
+                            ObjectToDelete {
+                                object_name: "purge-source".to_string(),
+                                version_id: Some(source_version),
+                                ..Default::default()
+                            },
+                        ],
+                        ObjectOptions::default(),
+                    )
+                    .await;
+                assert_eq!(errors.len(), 2);
+                assert!(
+                    errors.iter().all(Option::is_none),
+                    "the unrelated retiring/reserved pools must not reject marker admission: {errors:?}"
+                );
+                assert_eq!(deleted.len(), 2);
+                assert_eq!(deleted[0].object_name, "mark-active");
+                assert!(deleted[0].delete_marker);
+                assert!(
+                    deleted[0].version_id.is_none(),
+                    "a latest-version delete does not request an explicit version"
+                );
+                assert!(
+                    deleted[0].delete_marker_version_id.is_some(),
+                    "the newly created marker must have its own version identity"
+                );
+                assert_eq!(deleted[1].object_name, "purge-source");
+                assert!(!deleted[1].delete_marker);
+                assert_eq!(deleted[1].version_id, Some(source_version));
+                assert!(
+                    matches!(
+                        store.pools[0]
+                            .get_object_info(
+                                &bucket,
+                                "purge-source",
+                                &ObjectOptions {
+                                    version_id: Some(source_version.to_string()),
+                                    ..Default::default()
+                                },
+                            )
+                            .await,
+                        Err(crate::error::Error::ObjectNotFound(..) | crate::error::Error::VersionNotFound(..))
+                    ),
+                    "an exact source deletion must retain its capacity-release path"
+                );
+            }
+        });
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn public_upload_part_holds_decommission_capacity_until_rename() {
@@ -4497,6 +4956,470 @@ mod decommission_lock_order_tests {
                 .expect_err("the exact version should be absent after reconciliation and delete");
             assert!(crate::error::is_err_object_not_found(&err) || crate::error::is_err_version_not_found(&err));
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scanner_backlog_cas_keeps_fences_after_waiter_cancellation_until_rename_drains() {
+        run_large_stack_current_thread_async_test("scanner-backlog-canceled-waiter", async || {
+            temp_env::async_with_vars([(crate::set_disk::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+                let (_temp_dirs, writer, other) =
+                    test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
+                let object = "buckets/.scanner-pause-backlog.json";
+                let set_index = 1;
+                let body = vec![0x37; 1024];
+                assert!(
+                    !writer.pools[0].disk_set[0]
+                        .shares_namespace_lock_domain(&writer.pools[0].disk_set[set_index])
+                        .await
+                );
+                let rename_tasks = crate::set_disk::rename_fanout_barrier::observe_tasks(object);
+                let tail =
+                    crate::set_disk::rename_fanout_barrier::arm(object, 0, crate::set_disk::rename_fanout_barrier::PHASE_RENAME);
+                let put_store = Arc::clone(&writer);
+                let put_body = body.clone();
+                let mut put = tokio::spawn(async move {
+                    put_store
+                        .save_scanner_pause_backlog_replica(0, set_index, put_body, Default::default())
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), tail.wait_until_paused())
+                    .await
+                    .expect("the native write must reach its held rename");
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while rename_tasks.running() != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the other disks must reach quorum before canceling the waiter");
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), &mut put).await.is_err(),
+                    "native replica publication must await the entire rename tail"
+                );
+                put.abort();
+                assert!(put.await.expect_err("the scanner waiter must be canceled").is_cancelled());
+
+                let capacity_lock = other
+                    .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
+                    .await
+                    .expect("capacity lock probe");
+                let object_lock = other
+                    .new_ns_lock(RUSTFS_META_BUCKET, object)
+                    .await
+                    .expect("fixed object lock probe");
+                let mut capacity_probe = tokio::spawn(async move { capacity_lock.get_write_lock(Duration::from_secs(30)).await });
+                let mut object_probe = tokio::spawn(async move { object_lock.get_write_lock(Duration::from_secs(30)).await });
+                for (label, probe) in [("capacity", &mut capacity_probe), ("fixed object", &mut object_probe)] {
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), probe).await.is_err(),
+                        "canceling the scanner waiter must retain its {label} fence while rename is pending"
+                    );
+                }
+                tail.release();
+                drop(tail);
+                for probe in [capacity_probe, object_probe] {
+                    drop(
+                        tokio::time::timeout(Duration::from_secs(30), probe)
+                            .await
+                            .expect("publication fence must drain after rename")
+                            .expect("lock probe must not panic")
+                            .expect("publication fence must eventually be released"),
+                    );
+                }
+                let mut reader = writer.pools[0].disk_set[set_index]
+                    .get_object_reader(RUSTFS_META_BUCKET, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("canceled waiter must leave the committed replica readable");
+                let mut actual = Vec::new();
+                reader
+                    .read_to_end(&mut actual)
+                    .await
+                    .expect("read the full native replica after tail drain");
+                assert_eq!(actual, body);
+            })
+            .await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scanner_backlog_cas_rejects_lost_capacity_lease_before_publication() {
+        run_large_stack_current_thread_async_test("scanner-backlog-lease-loss", async || {
+            let (_temp_dirs, writer, other) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let object = "buckets/.scanner-pause-backlog.json";
+            let body = b"native source before lease loss".to_vec();
+            let original = writer
+                .save_scanner_pause_backlog_replica(2, 1, body.clone(), Default::default())
+                .await
+                .expect("seed the exact native replica set");
+            let (lossy, refresh_calls) = store_with_capacity_lease_loss(&other).await;
+            let barrier = PutObjectCommitBarrier::install(RUSTFS_META_BUCKET, object, PutObjectCommitPause::BeforeQuotaRename);
+            let put = tokio::spawn(async move {
+                lossy
+                    .save_scanner_pause_backlog_replica(
+                        2,
+                        1,
+                        b"must not commit after lease loss".to_vec(),
+                        crate::storage_api_contracts::object::HTTPPreconditions {
+                            if_match: original.etag,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                .await
+                .expect("native CAS must reach its commit barrier");
+            tokio::time::pause();
+            tokio::task::yield_now().await;
+            refresh_calls.arm();
+            tokio::time::advance(Duration::from_secs(11)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                refresh_calls.load(Ordering::Acquire) > 0,
+                "the durable metadata lease must lose refresh quorum"
+            );
+            barrier.release();
+            tokio::time::resume();
+            let err = tokio::time::timeout(Duration::from_secs(30), put)
+                .await
+                .expect("native CAS must finish after the barrier release")
+                .expect("native CAS task must not panic")
+                .expect_err("a lost outer capacity lease must reject native publication");
+            assert!(
+                matches!(err, crate::error::Error::NamespaceLockQuorumUnavailable { .. }),
+                "unexpected lease error: {err}"
+            );
+            drop(barrier);
+            let mut reader = writer.pools[2].disk_set[1]
+                .get_object_reader(RUSTFS_META_BUCKET, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the preexisting replica must survive lease loss");
+            let mut actual = Vec::new();
+            reader.read_to_end(&mut actual).await.expect("read the full retained replica");
+            assert_eq!(actual, body);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scanner_backlog_cas_rejects_a_retiring_source_on_a_stale_node() {
+        run_large_stack_current_thread_async_test("scanner-backlog-source-fence", async || {
+            let (_temp_dirs, store, writer) = test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
+            let object = "buckets/.scanner-pause-backlog.json";
+            let body = b"frozen native scanner replica".to_vec();
+            let source_set_index = (writer.pools[0].get_disks_by_key(object).set_index + 1) % writer.pools[0].disk_set.len();
+            assert_ne!(
+                source_set_index,
+                writer.pools[0].get_disks_by_key(object).set_index,
+                "exercise a non-routed native set"
+            );
+            let original = writer
+                .save_scanner_pause_backlog_replica(
+                    0,
+                    source_set_index,
+                    body.clone(),
+                    crate::storage_api_contracts::object::HTTPPreconditions {
+                        if_none_match: Some("*".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed a native scanner replica before retirement");
+            assert!(
+                writer
+                    .scanner_pause_backlog_writable_set_disks()
+                    .await
+                    .iter()
+                    .any(|set| set.pool_index == 0)
+            );
+
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            let target_total = body.len() * 8;
+            set_decommission_capacity_info_overrides_for_test(
+                store.id,
+                vec![vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, body.len() * 2, body.len() * 2),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 0, target_total, target_total),
+                    DecommissionPoolCapacityInfo::for_test(2, layout, target_total, target_total, 0),
+                ]],
+            );
+            store
+                .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+                .await
+                .expect("another node durably retires the selected source");
+            assert!(
+                writer.pool_meta.read().await.pools[0].decommission.is_none(),
+                "the writer must retain a stale snapshot"
+            );
+            assert!(
+                writer
+                    .scanner_pause_backlog_writable_set_disks()
+                    .await
+                    .iter()
+                    .any(|set| set.pool_index == 0)
+            );
+
+            let result = writer
+                .save_scanner_pause_backlog_replica(
+                    0,
+                    source_set_index,
+                    b"late native scanner update".to_vec(),
+                    crate::storage_api_contracts::object::HTTPPreconditions {
+                        if_match: original.etag.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                matches!(result, Err(crate::error::Error::SlowDown)),
+                "late native source publication must fail: {result:?}"
+            );
+            let mut source = writer.pools[0].disk_set[source_set_index]
+                .get_object_reader(RUSTFS_META_BUCKET, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the original source must remain readable");
+            assert_eq!(source.object_info.etag, original.etag);
+            let mut actual = Vec::new();
+            source
+                .read_to_end(&mut actual)
+                .await
+                .expect("read the entire retained source");
+            assert_eq!(actual, body);
+
+            for set in &writer.pools[2].disk_set {
+                let target_body = format!("surviving native scanner set {}", set.set_index).into_bytes();
+                let committed = writer
+                    .save_scanner_pause_backlog_replica(
+                        2,
+                        set.set_index,
+                        target_body.clone(),
+                        crate::storage_api_contracts::object::HTTPPreconditions {
+                            if_none_match: Some("*".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("every reserved healthy target set must still accept scanner replicas");
+                let conflict = writer
+                    .save_scanner_pause_backlog_replica(
+                        2,
+                        set.set_index,
+                        b"must not bypass CAS".to_vec(),
+                        crate::storage_api_contracts::object::HTTPPreconditions {
+                            if_match: Some("stale-native-revision".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect_err("capacity admission must retain the native writer's CAS");
+                assert!(matches!(conflict, crate::error::Error::PreconditionFailed));
+                let mut target = set
+                    .get_object_reader(RUSTFS_META_BUCKET, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("read the actual replica set, not the hash-routed set");
+                assert_eq!(target.object_info.etag, committed.etag);
+                let mut actual = Vec::new();
+                target
+                    .read_to_end(&mut actual)
+                    .await
+                    .expect("read the complete native target");
+                assert_eq!(actual, target_body);
+            }
+            for (pool_index, set_index) in [(writer.pools.len(), 0), (0, writer.pools[0].disk_set.len())] {
+                assert!(matches!(
+                    writer
+                        .save_scanner_pause_backlog_replica(pool_index, set_index, Vec::new(), Default::default())
+                        .await,
+                    Err(crate::error::Error::InvalidArgument(_, _, _))
+                ));
+            }
+            store
+                .decommission_cancel(0)
+                .await
+                .expect("cancel retirement before restoring native membership");
+            writer
+                .save_scanner_pause_backlog_replica(
+                    0,
+                    source_set_index,
+                    b"canceled source membership repair".to_vec(),
+                    crate::storage_api_contracts::object::HTTPPreconditions {
+                        if_match: original.etag,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("cancel must retain scanner's existing native membership repair contract");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scanner_backlog_native_replica_reconciles_capacity_and_cleans_source() {
+        run_large_stack_current_thread_async_test("scanner-backlog-reconcile", async || {
+            let (_temp_dirs, store, other_store) =
+                test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
+            let object = "buckets/.scanner-pause-backlog.json";
+            let body = br#"{"schemaVersion":1,"generation":2}"#.to_vec();
+            let old_body = br#"{"schemaVersion":1,"generation":1}"#.to_vec();
+            let source_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(20);
+            let target_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10);
+            for (pool_index, payload, mod_time) in [(0, body.clone(), source_time), (2, old_body, target_time)] {
+                store.pools[pool_index]
+                    .put_object(
+                        RUSTFS_META_BUCKET,
+                        object,
+                        &mut PutObjReader::from_vec(payload),
+                        &ObjectOptions {
+                            max_parity: true,
+                            mod_time: Some(mod_time),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("seed native scanner replicas with independent write times");
+            }
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            let target_total = body.len() * 8;
+            let capacities = vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, body.len() * 2, body.len() * 2),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 0, target_total, target_total),
+                DecommissionPoolCapacityInfo::for_test(2, layout, target_total, target_total, 0),
+            ];
+            set_decommission_capacity_info_overrides_for_test(store.id, vec![capacities.clone()]);
+            store
+                .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+                .await
+                .expect("activate the source reservation");
+            let owner = decommission_capacity_owner(&*store.pool_meta.read().await);
+            let source_reader = store.pools[0]
+                .get_object_reader(
+                    RUSTFS_META_BUCKET,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        no_lock: true,
+                        data_movement: true,
+                        raw_data_movement_read: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("read the frozen source replica");
+            let conflict = data_movement::migrate_decommission_object(
+                Arc::clone(&store),
+                0,
+                RUSTFS_META_BUCKET.to_string(),
+                source_reader,
+                None,
+                "scanner_backlog_conflict",
+                Some(owner),
+            )
+            .await
+            .expect_err("a different older native ledger must retain its source and capacity intent");
+            assert!(conflict.to_string().contains("Precondition failed"), "unexpected conflict: {conflict}");
+            let mut persisted = crate::core::pools::PoolMeta::default();
+            persisted
+                .load_no_lock_from_replicas(store.pools.clone())
+                .await
+                .expect("reload the unresolved intent");
+            assert_eq!(
+                persisted.pools[0]
+                    .decommission
+                    .as_ref()
+                    .expect("source state")
+                    .capacity_reservation
+                    .as_ref()
+                    .expect("durable capacity")
+                    .pending_target_physical_bytes,
+                body.len()
+            );
+            let previous = store.pools[2]
+                .get_object_info(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+                .await
+                .expect("read the native writer's CAS revision");
+            let replacement = store.pools[2]
+                .put_object(
+                    RUSTFS_META_BUCKET,
+                    object,
+                    &mut PutObjReader::from_vec(body.clone()),
+                    &ObjectOptions {
+                        max_parity: true,
+                        mod_time: Some(target_time),
+                        http_preconditions: Some(crate::storage_api_contracts::object::HTTPPreconditions {
+                            if_match: previous.etag,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("native scanner CAS converges the payload without a migration marker");
+            assert!(!data_movement::is_owned_data_movement_target(&replacement));
+            *other_store.pool_meta.write().await = persisted;
+            set_decommission_capacity_info_overrides_for_test(other_store.id, vec![capacities]);
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                other_store.decommission_entry_for_test(
+                    0,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    RUSTFS_META_BUCKET.to_string(),
+                    other_store.pools[0].get_disks_by_key(object),
+                ),
+            )
+            .await
+            .expect("replica conflict recovery must be bounded")
+            .expect("identical native replica should finish migration on the reloaded node");
+            let mut reconciled = crate::core::pools::PoolMeta::default();
+            reconciled
+                .load_no_lock_from_replicas(other_store.pools.clone())
+                .await
+                .expect("reload reconciled capacity");
+            let reservation = reconciled.pools[0]
+                .decommission
+                .as_ref()
+                .expect("source state")
+                .capacity_reservation
+                .as_ref()
+                .expect("reconciled capacity");
+            assert_eq!(reservation.pending_target_physical_bytes, 0);
+            assert_eq!(reservation.committed_data_bytes, body.len());
+            assert_eq!(reservation.consumed_target_physical_bytes, body.len());
+            assert!(reservation.targets.iter().all(|target| target.pending_mutation_id.is_none()));
+            assert_eq!(
+                other_store.pool_meta.read().await.pools[0]
+                    .decommission
+                    .as_ref()
+                    .expect("worker progress")
+                    .items_decommission_failed,
+                0
+            );
+            let missing = other_store.pools[0]
+                .get_object_info(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+                .await
+                .expect_err("the source should be cleaned only after equivalent-target capacity reconciliation");
+            assert!(crate::error::is_err_object_not_found(&missing));
+            let mut target_reader = other_store.pools[2]
+                .get_object_reader(RUSTFS_META_BUCKET, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the surviving replica should remain readable");
+            assert_eq!(
+                target_reader.object_info.mod_time,
+                Some(target_time),
+                "recovery must not overwrite the native target"
+            );
+            let mut actual = Vec::new();
+            target_reader
+                .read_to_end(&mut actual)
+                .await
+                .expect("read surviving ledger bytes");
+            assert_eq!(actual, body);
+        });
     }
 
     #[test]
