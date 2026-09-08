@@ -837,7 +837,13 @@ impl StorageReplicationStatsHandle {
 
     pub(crate) async fn site_metrics_snapshot(&self) -> ReplicationSiteMetricsSnapshot {
         let metrics = self.inner.get_sr_metrics_for_node().await;
-        let bucket_stats = self.inner.get_all().await;
+        // Aggregate under the read lock rather than through `get_all`: that
+        // clones every bucket's stats, and `FailStats.recent` is bounded only
+        // by the one-hour window, so an unreachable target under load - the
+        // very case an operator polls this for - makes the copy large. The
+        // windows come from the live samples; the serialized `last_minute` /
+        // `last_hour` snapshots are stamped onto per-bucket clones elsewhere
+        // and stay zero in this node-local cache.
         let (
             failed_count,
             failed_bytes,
@@ -845,27 +851,25 @@ impl StorageReplicationStatsHandle {
             failed_last_minute_bytes,
             failed_last_hour_count,
             failed_last_hour_bytes,
-        ) = bucket_stats.values().flat_map(|bucket| bucket.stats.values()).fold(
-            (0i64, 0i64, 0i64, 0i64, 0i64, 0i64),
-            |totals, stat| {
-                let sampled_minute = stat.fail_stats.recent_since(Duration::from_secs(60));
-                let sampled_hour = stat.fail_stats.recent_since(Duration::from_secs(3600));
-                (
-                    totals.0.saturating_add(stat.fail_stats.count),
-                    totals.1.saturating_add(stat.fail_stats.size),
-                    totals
-                        .2
-                        .saturating_add(sampled_minute.count.max(stat.fail_stats.last_minute.count)),
-                    totals
-                        .3
-                        .saturating_add(sampled_minute.size.max(stat.fail_stats.last_minute.size)),
-                    totals
-                        .4
-                        .saturating_add(sampled_hour.count.max(stat.fail_stats.last_hour.count)),
-                    totals.5.saturating_add(sampled_hour.size.max(stat.fail_stats.last_hour.size)),
-                )
-            },
-        );
+        ) = {
+            let cache = self.inner.cache.read().await;
+            cache
+                .values()
+                .flat_map(|bucket| bucket.stats.values())
+                .fold((0i64, 0i64, 0i64, 0i64, 0i64, 0i64), |totals, stat| {
+                    let (minute, hour) = stat
+                        .fail_stats
+                        .recent_windows(Duration::from_secs(60), Duration::from_secs(3600));
+                    (
+                        totals.0.saturating_add(stat.fail_stats.count),
+                        totals.1.saturating_add(stat.fail_stats.size),
+                        totals.2.saturating_add(minute.count),
+                        totals.3.saturating_add(minute.size),
+                        totals.4.saturating_add(hour.count),
+                        totals.5.saturating_add(hour.size),
+                    )
+                })
+        };
         ReplicationSiteMetricsSnapshot {
             uptime: metrics.uptime,
             queued_curr_count: metrics.queued.curr.count,
