@@ -1796,6 +1796,13 @@ fn ensure_external_decommission_target_admission(
         metrics::counter!(METRIC_DECOMMISSION_CAPACITY_CONFLICTS_TOTAL, "phase" => phase).increment(1);
         return Err(Error::SlowDown);
     }
+    // Migration reservations budget the mover, not exclusive ownership of a
+    // healthy pool. Foreground publication shares its actual disk capacity;
+    // migration must retain the source if its capacity or target write fails.
+    // Repair keeps its separate, conservative reservation admission contract.
+    if !matches!(admission, DecommissionCapacityAdmission::Heal) {
+        return Ok(());
+    }
     let reserved = active_decommission_target_reservations(meta)
         .get(&target_pool_index)
         .copied()
@@ -25603,7 +25610,7 @@ mod pools_tests {
     }
 
     #[test]
-    fn ordinary_write_admission_cannot_race_into_a_reserved_target() {
+    fn ordinary_write_admission_shares_a_reserved_target_without_becoming_its_owner() {
         let now = OffsetDateTime::UNIX_EPOCH + Duration::minutes(2);
         let layout = DecommissionErasureLayout { data: 1, parity: 0 };
         let capacity_infos = vec![
@@ -25627,13 +25634,17 @@ mod pools_tests {
         )
         .expect("the decommission reservation should fit");
 
-        assert!(
-            matches!(
-                ensure_external_decommission_target_admission(&meta, 1, DecommissionCapacityAdmission::Mutation),
-                Err(Error::SlowDown)
-            ),
-            "an ordinary write must not consume a target reservation"
-        );
+        for admission in [
+            DecommissionCapacityAdmission::Mutation,
+            DecommissionCapacityAdmission::BatchDelete,
+        ] {
+            ensure_external_decommission_target_admission(&meta, 1, admission)
+                .expect("a healthy target must remain writable while sharing capacity with migration");
+        }
+        assert!(matches!(
+            ensure_external_decommission_target_admission(&meta, 1, DecommissionCapacityAdmission::Heal),
+            Err(Error::SlowDown)
+        ));
         let rebalance_opts = ObjectOptions {
             data_movement: true,
             src_pool_idx: 0,
@@ -25660,6 +25671,21 @@ mod pools_tests {
         let mut decommission_opts = rebalance_opts;
         expected_owner.apply_to(&mut decommission_opts);
         assert_eq!(DecommissionCapacityOwner::from_options(&decommission_opts), Some(expected_owner));
+
+        meta.pools[0]
+            .decommission
+            .as_mut()
+            .expect("active source")
+            .capacity_reservation = None;
+        for admission in [
+            DecommissionCapacityAdmission::Mutation,
+            DecommissionCapacityAdmission::BatchDelete,
+        ] {
+            assert!(
+                matches!(ensure_external_decommission_target_admission(&meta, 1, admission), Err(Error::SlowDown)),
+                "shared capacity must not bypass an active source's missing durable ledger"
+            );
+        }
     }
 
     #[test]

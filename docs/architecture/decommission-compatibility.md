@@ -74,6 +74,14 @@ Running, queued, failed, canceled, and completed decommission states all exclude
 
 For mixed batch deletes, only the pools selected to receive new delete markers are publication targets. Exact-version deletions on other pools remain protected by the same pool metadata read fence, without treating the retiring source or an unrelated reserved target as a destination for those markers.
 
+### Shared Capacity On Healthy Targets
+
+Ordinary publication into a healthy target is not rejected solely because that pool has an active decommission reservation. This follows the MinIO decommission write-routing contract: the retiring source stops accepting new writes, while the remaining pools share physical capacity between foreground requests and migration. A reservation remains a migration budget and recovery ledger, not an exclusive foreground-write quota. Repair retains its existing conservative reservation admission policy.
+
+The existing durable metadata fence, valid active reservation checks, owner/mutation identity, pending-intent recovery, target write quorum and source-cleanup preflight remain required. Foreground writes do not acquire the mover's target I/O lock or settle its pending intent. Capacity estimates, including filesystem free-space deltas observed during migration, may include concurrent unrelated I/O; they are not proof of exclusive space or of a committed target object. Actual write failures and identity/quorum checks remain authoritative. Space loss can stop migration with the source retained, including after a target copy has committed. Capacity exhaustion can also fail foreground writes; this policy does not guarantee foreground priority or success. RustFS retains its existing capacity-blocked state and recovery behavior rather than changing terminal-state or retry semantics here.
+
+The native regression overlaps public PUT and multipart create/part replacement/complete/abort operations with a paused target rename on another node context, checks that foreground publication leaves the pending migration ledger unchanged, and then checks both sufficient-capacity cleanup and injected capacity loss with byte-for-byte retained source and target data. Mixed batch deletion covers marker publication on both reserved and unreserved healthy targets together with exact-version removal on the retiring source. Capacity is injected deterministically; the object and metadata operations use real temporary disks, not a physical disk-exhaustion test.
+
 ### Status Response Shape
 
 `GET /v3/pools/list` and `GET /v3/pools/status?pool=...` expose per-pool machine-readable decommission state. The `status` field can report `active`, `running`, `queued`, `complete`, `failed`, or `canceled`.
