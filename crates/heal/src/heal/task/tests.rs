@@ -1117,6 +1117,7 @@ struct MockStorage {
     heal_object_outcomes: Mutex<HashMap<String, VecDeque<MockHealObjectOutcome>>>,
     heal_object_receipts: Mutex<HashMap<String, VecDeque<HealObjectReceipt>>>,
     bucket_incarnation_id: Mutex<Option<Uuid>>,
+    bucket_incarnation_after_object_heal: Mutex<Option<Uuid>>,
     format_no_heal_required: Mutex<bool>,
     format_error: Mutex<Option<Error>>,
     global_format_calls: Mutex<u32>,
@@ -1271,6 +1272,39 @@ async fn object_heal_records_matching_positive_storage_receipt() {
     assert_eq!(object.identity.version_id.as_deref(), Some("version-a"));
     assert!(object.identity.bucket_incarnation_id.is_some());
     assert_eq!(object.disposition, HealObjectDisposition::Repaired);
+}
+
+#[tokio::test]
+async fn object_heal_latches_expected_incarnation_before_repair() {
+    let original_incarnation = Uuid::new_v4();
+    let successor_incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            VecDeque::from([object_receipt(
+                "object-a",
+                Some("version-a"),
+                HealObjectDisposition::VerifiedHealthy,
+                original_incarnation,
+            )]),
+        )])),
+        bucket_incarnation_id: Mutex::new(Some(original_incarnation)),
+        bucket_incarnation_after_object_heal: Mutex::new(Some(successor_incarnation)),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), Some("version-a".to_string())),
+        storage,
+    );
+
+    task.execute().await.expect("mock object heal should complete");
+
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.counters.unchanged, 1);
+    assert_eq!(outcome.counters.unknown, 0);
+    let object = outcome.objects.front().expect("latched receipt should be recorded");
+    assert_eq!(object.identity.bucket_incarnation_id, Some(original_incarnation));
+    assert_eq!(object.disposition, HealObjectDisposition::VerifiedHealthy);
 }
 
 #[tokio::test]
@@ -1586,6 +1620,9 @@ impl HealStorageAPI for MockStorage {
             return Ok((HealResultItem::default(), Some(Error::Disk(DiskError::FileNotFound))));
         }
         self.healed_objects.lock().unwrap().push(object.to_string());
+        if let Some(bucket_incarnation_id) = self.bucket_incarnation_after_object_heal.lock().unwrap().take() {
+            *self.bucket_incarnation_id.lock().unwrap() = Some(bucket_incarnation_id);
+        }
         Ok((
             HealResultItem {
                 object_size: 1,
