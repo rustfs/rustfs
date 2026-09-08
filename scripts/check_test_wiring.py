@@ -1689,6 +1689,42 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
             require(duration >= 7200, f"{gate}.{field} requires at least two hours")
     elif "duration_seconds" in evidence:
         evidence_integer(evidence.get("duration_seconds"), f"{gate}.{field}.duration_seconds", 1, 86400)
+    if gate == "G10":
+        if field == "scheduler_bound_evidence":
+            evidence_integer(evidence.get("max_deferred_items"), f"{gate}.{field}.max_deferred_items", 1, 2**31 - 1)
+            evidence_integer(evidence.get("max_deferred_bytes"), f"{gate}.{field}.max_deferred_bytes", 1, 2**63 - 1)
+            evidence_integer(evidence.get("max_retry_age_seconds"), f"{gate}.{field}.max_retry_age_seconds", 1, 86400)
+            evidence_integer(evidence.get("duplicate_task_count"), f"{gate}.{field}.duplicate_task_count", 0, 0)
+        if field == "pressure_recovery_evidence":
+            require(evidence.get("pressure_pacing_engaged") is True,
+                    f"{gate}.{field} requires pressure pacing engagement")
+            evidence_integer(evidence.get("recovery_window_seconds"), f"{gate}.{field}.recovery_window_seconds", 1, 86400)
+            evidence_integer(evidence.get("lock_hold_p95_ms"), f"{gate}.{field}.lock_hold_p95_ms", 0, 2**31 - 1)
+            evidence_integer(evidence.get("foreground_latency_p95_ms"),
+                             f"{gate}.{field}.foreground_latency_p95_ms", 1, 2**31 - 1)
+    if gate == "P1" and field == "foreground_latency_throughput_measurement":
+        evidence_integer(evidence.get("foreground_latency_p95_ms"),
+                         f"{gate}.{field}.foreground_latency_p95_ms", 1, 2**31 - 1)
+        evidence_integer(evidence.get("foreground_latency_p99_ms"),
+                         f"{gate}.{field}.foreground_latency_p99_ms", 1, 2**31 - 1)
+        evidence_integer(evidence.get("throughput_ops_per_second"),
+                         f"{gate}.{field}.throughput_ops_per_second", 1, 2**31 - 1)
+        evidence_integer(evidence.get("error_count"), f"{gate}.{field}.error_count", 0, 0)
+    if gate == "P3":
+        if field == "two_hour_pressure_measurement":
+            require(evidence.get("fixed_offered_load") is True, f"{gate}.{field} requires fixed offered load")
+            evidence_integer(evidence.get("foreground_latency_p99_ms"),
+                             f"{gate}.{field}.foreground_latency_p99_ms", 1, 2**31 - 1)
+            evidence_integer(evidence.get("attempt_cost_samples"),
+                             f"{gate}.{field}.attempt_cost_samples", 1, 2**63 - 1)
+        if field == "heal_capacity_measurement":
+            evidence_integer(evidence.get("completed_heal_objects"),
+                             f"{gate}.{field}.completed_heal_objects", 1, 2**63 - 1)
+            evidence_integer(evidence.get("duplicate_task_count"), f"{gate}.{field}.duplicate_task_count", 0, 0)
+        if field == "recovery_window_measurement":
+            evidence_integer(evidence.get("pressure_recovery_window_seconds"),
+                             f"{gate}.{field}.pressure_recovery_window_seconds", 1, 86400)
+            evidence_integer(evidence.get("lock_hold_p95_ms"), f"{gate}.{field}.lock_hold_p95_ms", 0, 2**31 - 1)
     if gate in ("G03", "G09", "R-L"):
         versions = evidence.get("versions")
         require(isinstance(versions, list) and
@@ -1842,6 +1878,8 @@ def scanner_heal_release_bundle_status(root: Path, bundle_path: Path) -> dict[st
     require(release_schema_capable, "scanner/heal release bundle requires schema 2 registry")
     bundle_path = bundle_path.resolve()
     bundle = read_json(bundle_path)
+    for marker in ("fixture_only", "dry_run", "synthetic"):
+        require(bundle.get(marker) is not True, f"scanner/heal release evidence bundle is {marker}")
     require(bundle.get("schema") == 1, "unsupported scanner/heal release evidence bundle schema")
     require(bundle.get("evidence") == "measured", "scanner/heal release evidence bundle must be measured")
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
@@ -1882,6 +1920,10 @@ def scanner_heal_release_bundle_status(root: Path, bundle_path: Path) -> dict[st
             if not isinstance(evidence, dict):
                 gate_errors.append(f"{field} must be an object")
                 continue
+            for marker in ("fixture_only", "dry_run", "synthetic"):
+                if evidence.get(marker) is True:
+                    gate_errors.append(f"{field} is {marker}")
+                    continue
             try:
                 field_windows[field] = validate_release_bundle_artifact(bundle_path, source_revision, gate, field, evidence)
             except (OSError, KeyError, TypeError, ValueError) as error:
@@ -1910,6 +1952,142 @@ def scanner_heal_release_bundle_status(root: Path, bundle_path: Path) -> dict[st
         "pending_gates": [] if approved else sorted(gate for gate in requirements if gate not in verified),
         "pending_lanes": [] if approved else pending_lanes,
     }
+
+
+def write_scanner_heal_release_bundle_fixture(root: Path, directory: Path) -> Path:
+    """Write a non-approvable release bundle shape fixture for dry-run validation."""
+    bundle_dir = directory.resolve()
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir = bundle_dir / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    registry = read_json(root / ".config/scanner-heal-required-tests.json")
+    requirements, release_schema_capable, _ = scanner_heal_release_requirements(registry)
+    require(release_schema_capable, "scanner/heal release bundle fixture requires schema 2 registry")
+    source_revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    baseline_revision = "0" * 39 + "1"
+    require(baseline_revision != source_revision, "scanner/heal release bundle fixture needs a distinct baseline")
+    started = datetime.now(timezone.utc).replace(microsecond=0)
+    gates = {}
+    for gate, requirement in requirements.items():
+        fields = {}
+        for field in SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate]:
+            artifact = artifact_dir / f"{gate}-{field}.json"
+            write_json(artifact, {
+                "schema": 1,
+                "fixture_only": True,
+                "gate": gate,
+                "field": field,
+                "source_revision": source_revision,
+            })
+            duration = 60
+            evidence = {
+                "fixture_only": True,
+                "artifact": artifact.relative_to(bundle_dir).as_posix(),
+                "sha256": digest(artifact),
+                "evidence_type": "measured",
+                "source_revision": source_revision,
+                "run_id": f"{gate.lower()}-{field.replace('_', '-')}-fixture-run",
+                "measurement_window_id": f"{gate.lower()}-fixture-window",
+                "started_at": started.isoformat().replace("+00:00", "Z"),
+                "command": ["fixture-only", "scanner-heal-release-bundle", gate, field],
+                "artifact_format": "json",
+                "summary": f"fixture-only parser sample for {gate}.{field}; not release evidence",
+            }
+            if gate.startswith("P"):
+                duration = 900
+                evidence["duration_seconds"] = duration
+            if gate == "P3" and field == "two_hour_pressure_measurement":
+                duration = 7200
+                evidence["duration_seconds"] = duration
+            evidence["finished_at"] = (started + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z")
+            if gate == "G10" and field == "scheduler_bound_evidence":
+                evidence.update({
+                    "max_deferred_items": 256,
+                    "max_deferred_bytes": 262144,
+                    "max_retry_age_seconds": 30,
+                    "duplicate_task_count": 0,
+                })
+            if gate == "G10" and field == "pressure_recovery_evidence":
+                evidence.update({
+                    "pressure_pacing_engaged": True,
+                    "recovery_window_seconds": 5,
+                    "lock_hold_p95_ms": 0,
+                    "foreground_latency_p95_ms": 10,
+                })
+            if gate == "P1" and field == "foreground_latency_throughput_measurement":
+                evidence.update({
+                    "foreground_latency_p95_ms": 10,
+                    "foreground_latency_p99_ms": 20,
+                    "throughput_ops_per_second": 100,
+                    "error_count": 0,
+                })
+            if gate == "P3" and field == "two_hour_pressure_measurement":
+                evidence.update({
+                    "fixed_offered_load": True,
+                    "foreground_latency_p99_ms": 20,
+                    "attempt_cost_samples": 1,
+                })
+            if gate == "P3" and field == "heal_capacity_measurement":
+                evidence.update({"completed_heal_objects": 1, "duplicate_task_count": 0})
+            if gate == "P3" and field == "recovery_window_measurement":
+                evidence.update({"pressure_recovery_window_seconds": 5, "lock_hold_p95_ms": 0})
+            if gate in ("G03", "G09", "R-L"):
+                evidence["versions"] = [baseline_revision, source_revision]
+                evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
+            if gate in ("G04", "G07", "R-E", "R-L"):
+                evidence["crash_points"] = ["fixture-before-commit"]
+            if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
+                evidence["replayed_records"] = 1
+                evidence["responsibility_anchor_retained"] = True
+                evidence["successor_snapshot_published"] = True
+            if gate == "G14" and field == "ec8_4_evidence":
+                evidence["topology"] = {"erasure": "EC8+4", "nodes": 3, "drives_per_node": 4}
+            if gate == "G14" and field == "same_window_field_evidence":
+                evidence["same_window_fields"] = [
+                    item
+                    for item in SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS["G14"]
+                    if item != "same_window_field_evidence"
+                ]
+            if gate == "G14" and field == "multi_set_evidence":
+                evidence["sets"] = 2
+            if gate == "G14" and field == "multi_pool_evidence":
+                evidence["pools"] = 2
+            if field == "profile_evidence":
+                evidence["resolved_samples"] = 1
+                artifacts = {}
+                for artifact_kind in RELEASE_PROFILE_ARTIFACTS:
+                    profile_artifact = artifact_dir / f"{gate}-{field}-{artifact_kind}.json"
+                    write_json(profile_artifact, {
+                        "schema": 1,
+                        "fixture_only": True,
+                        "gate": gate,
+                        "field": field,
+                        "artifact": artifact_kind,
+                        "source_revision": source_revision,
+                    })
+                    artifacts[artifact_kind] = {
+                        "artifact": profile_artifact.relative_to(bundle_dir).as_posix(),
+                        "sha256": digest(profile_artifact),
+                        "artifact_format": "json",
+                        "measurement_window_id": evidence["measurement_window_id"],
+                    }
+                evidence["profile_artifacts"] = artifacts
+            fields[field] = evidence
+        gates[gate] = {
+            "status": "pass",
+            "lane": requirement["lane"],
+            "evidence_type": "measured",
+            "evidence_fields": fields,
+        }
+    bundle = bundle_dir / "release-evidence.fixture.json"
+    write_json(bundle, {
+        "schema": 1,
+        "fixture_only": True,
+        "evidence": "measured",
+        "source_revision": source_revision,
+        "gates": gates,
+    })
+    return bundle
 
 
 def validate(root: Path) -> list[str]:
@@ -2183,6 +2361,37 @@ class SelfTests(unittest.TestCase):
                     duration = 7200
                     evidence["duration_seconds"] = duration
                 evidence["finished_at"] = (started + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z")
+                if gate == "G10" and field == "scheduler_bound_evidence":
+                    evidence.update({
+                        "max_deferred_items": 256,
+                        "max_deferred_bytes": 262144,
+                        "max_retry_age_seconds": 30,
+                        "duplicate_task_count": 0,
+                    })
+                if gate == "G10" and field == "pressure_recovery_evidence":
+                    evidence.update({
+                        "pressure_pacing_engaged": True,
+                        "recovery_window_seconds": 5,
+                        "lock_hold_p95_ms": 0,
+                        "foreground_latency_p95_ms": 10,
+                    })
+                if gate == "P1" and field == "foreground_latency_throughput_measurement":
+                    evidence.update({
+                        "foreground_latency_p95_ms": 10,
+                        "foreground_latency_p99_ms": 20,
+                        "throughput_ops_per_second": 100,
+                        "error_count": 0,
+                    })
+                if gate == "P3" and field == "two_hour_pressure_measurement":
+                    evidence.update({
+                        "fixed_offered_load": True,
+                        "foreground_latency_p99_ms": 20,
+                        "attempt_cost_samples": 1,
+                    })
+                if gate == "P3" and field == "heal_capacity_measurement":
+                    evidence.update({"completed_heal_objects": 1, "duplicate_task_count": 0})
+                if gate == "P3" and field == "recovery_window_measurement":
+                    evidence.update({"pressure_recovery_window_seconds": 5, "lock_hold_p95_ms": 0})
                 write_json(artifact, {
                     "schema": 1,
                     "evidence_type": "measured",
@@ -2360,6 +2569,17 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(status["pending_gates"], [])
             self.assertEqual(status["pending_lanes"], [])
 
+    def test_scanner_heal_release_bundle_fixture_writer_is_not_release_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self.scanner_heal_fixture(Path(tmp))
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                bundle = write_scanner_heal_release_bundle_fixture(root, Path(tmp) / "bundle")
+                with self.assertRaisesRegex(ValueError, "fixture_only"):
+                    scanner_heal_release_bundle_status(root, bundle)
+            data = read_json(bundle)
+            self.assertTrue(data["fixture_only"])
+            self.assertEqual(data["source_revision"], "b" * 40)
+
     def test_scanner_heal_release_bundle_rejects_synthetic_or_missing_fields(self) -> None:
         for fault in ("synthetic", "missing-field", "hash", "empty-artifact"):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
@@ -2528,6 +2748,9 @@ class SelfTests(unittest.TestCase):
                 lambda item: item.pop("verified_proof_discharge_observed"),
                 "verified_proof_discharge_observed",
             ),
+            ("scheduler-duplicates", "G10", "scheduler_bound_evidence", lambda item: item.pop("duplicate_task_count"), "duplicate_task_count"),
+            ("p1-throughput", "P1", "foreground_latency_throughput_measurement", lambda item: item.pop("throughput_ops_per_second"), "throughput_ops_per_second"),
+            ("p3-fixed-load", "P3", "two_hour_pressure_measurement", lambda item: item.update({"fixed_offered_load": False}), "fixed offered load"),
         ):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
                 root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
@@ -3796,7 +4019,8 @@ def main() -> int:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTests)
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
     if sys.argv[1:2] in (["--begin-scanner-heal"], ["--finish-scanner-heal"], ["--check-scanner-heal"],
-                         ["--check-scanner-heal-release"], ["--check-scanner-heal-release-bundle"]):
+                         ["--check-scanner-heal-release"], ["--check-scanner-heal-release-bundle"],
+                         ["--write-scanner-heal-release-bundle-fixture"]):
         try:
             if len(sys.argv) == 5 and sys.argv[1] == "--begin-scanner-heal":
                 begin_scanner_heal_receipt(ROOT, Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]))
@@ -3829,7 +4053,11 @@ def main() -> int:
                     return 2
                 print(json.dumps(status, sort_keys=True, separators=(",", ":")))
                 return 0 if status["release_approved"] else 1
-            raise ValueError("expected --begin-scanner-heal DIR BINARY TEST_BINARY, --finish-scanner-heal DIR EXIT, --check-scanner-heal DIR CASE|release, --check-scanner-heal-release DIR, or --check-scanner-heal-release-bundle FILE")
+            if len(sys.argv) == 3 and sys.argv[1] == "--write-scanner-heal-release-bundle-fixture":
+                bundle = write_scanner_heal_release_bundle_fixture(ROOT, Path(sys.argv[2]))
+                print(bundle)
+                return 0
+            raise ValueError("expected --begin-scanner-heal DIR BINARY TEST_BINARY, --finish-scanner-heal DIR EXIT, --check-scanner-heal DIR CASE|release, --check-scanner-heal-release DIR, --check-scanner-heal-release-bundle FILE, or --write-scanner-heal-release-bundle-fixture DIR")
         except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
             print(f"ERROR: {error}", file=sys.stderr)
             return 1
@@ -3856,7 +4084,8 @@ def main() -> int:
     if sys.argv[1:]:
         print(
             "usage: check_test_wiring.py [--self-test | --check-core LISTING | --check-profile PROFILE LISTING | "
-            "--update-profile PROFILE LISTING PLATFORM | --check-scanner-heal-release-bundle FILE]",
+            "--update-profile PROFILE LISTING PLATFORM | --check-scanner-heal-release-bundle FILE | "
+            "--write-scanner-heal-release-bundle-fixture DIR]",
             file=sys.stderr,
         )
         return 2
