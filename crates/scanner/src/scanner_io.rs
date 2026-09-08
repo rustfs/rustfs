@@ -516,6 +516,7 @@ fn scanner_segment_reuse_activation_preflight_from_proof(
 
 fn scanner_segment_reuse_activation_preflight_for_cycle(
     dirty_usage_snapshot: &DirtyUsageSnapshot,
+    distributed: bool,
     distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
     cold_zero_walk_oracle: bool,
 ) -> ScannerSegmentReuseActivationPreflight {
@@ -528,7 +529,7 @@ fn scanner_segment_reuse_activation_preflight_for_cycle(
             && dirty_usage_snapshot.generation != u64::MAX,
         overflow_absent: dirty_usage_snapshot.covers_all_pending,
         cold_zero_walk_oracle,
-        distributed_peer_invalidation: distributed_segment_invalidation_evidence.is_some(),
+        distributed_peer_invalidation: !distributed || distributed_segment_invalidation_evidence.is_some(),
     })
 }
 
@@ -595,6 +596,7 @@ pub struct ScannerBucketScanPlan {
     bucket_failures: ScannerBucketFailureState,
     pending_maintenance_work: Arc<AtomicBool>,
     cache_cycle_floor: Arc<AtomicU64>,
+    cold_zero_walk_reuse_observed: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
@@ -725,6 +727,25 @@ fn scanner_bucket_scan_status(has_failed: bool, has_partial: bool, has_namespace
     } else {
         ScannerBucketScanStatus::Complete
     }
+}
+
+fn scanner_cycle_cold_zero_walk_oracle(
+    scan_scope: &ScannerBucketScanScope,
+    all_buckets: &[BucketInfo],
+    completed_all_sets: bool,
+    scan_scope_matches: bool,
+    bucket_scan_status: ScannerBucketScanStatus,
+    cold_zero_walk_reuse_observed: bool,
+) -> bool {
+    let Some(selected_buckets) = scan_scope.selected_buckets.as_deref() else {
+        return false;
+    };
+    cold_zero_walk_reuse_observed
+        && !selected_buckets.is_empty()
+        && completed_all_sets
+        && scan_scope_matches
+        && bucket_scan_status == ScannerBucketScanStatus::Complete
+        && all_buckets.iter().any(|bucket| !selected_buckets.contains(&bucket.name))
 }
 
 fn classify_nsscanner_cycle(

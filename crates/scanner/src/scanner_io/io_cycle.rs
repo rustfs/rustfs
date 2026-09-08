@@ -410,11 +410,6 @@ where
     .await;
     let remote_dirty_usage_acknowledgements = scope_resolution.remote_dirty_usage_acknowledgements;
     let distributed_segment_invalidation_evidence = scope_resolution.distributed_segment_invalidation_evidence;
-    let segment_reuse_activation_preflight = scanner_segment_reuse_activation_preflight_for_cycle(
-        &dirty_usage_snapshot,
-        distributed_segment_invalidation_evidence,
-        false,
-    );
     let scan_scope = scope_resolution.scope;
     #[cfg(test)]
     if let Some(observer) = resolved_scope_observer {
@@ -472,6 +467,8 @@ where
         } else {
             Vec::new()
         };
+        let segment_reuse_activation_preflight =
+            scanner_segment_reuse_activation_preflight_for_cycle(&dirty_usage_snapshot, distributed, None, false);
         return Ok(ScannerCycleResult::new(status, dirty_usage_clear)
             .with_publication_epoch(publication_epoch)
             .with_activity_digest(activity_digest)
@@ -503,6 +500,7 @@ where
     );
     let bucket_failures = ScannerBucketFailureState::default();
     let pending_maintenance_work = Arc::new(AtomicBool::new(false));
+    let cold_zero_walk_reuse_observed = Arc::new(AtomicBool::new(false));
     record_set_scan_concurrency_limit(set_scan_limit);
     debug!(
         target: "rustfs::scanner::io",
@@ -596,6 +594,7 @@ where
             bucket_failures: bucket_failures.clone(),
             pending_maintenance_work: pending_maintenance_work.clone(),
             cache_cycle_floor: cache_cycle_floor.clone(),
+            cold_zero_walk_reuse_observed: cold_zero_walk_reuse_observed.clone(),
         };
         // Spawn task to run the scanner
         let scanner_fut = tokio::spawn(async move {
@@ -698,6 +697,20 @@ where
         !failed_buckets.is_empty(),
         scan_scope_matches && !partial_buckets.is_empty(),
         scan_scope_matches && !namespace_not_found_buckets.is_empty(),
+    );
+    let cold_zero_walk_oracle = scanner_cycle_cold_zero_walk_oracle(
+        &scan_scope,
+        &all_buckets,
+        completed_all_sets,
+        scan_scope_matches,
+        bucket_scan_status,
+        cold_zero_walk_reuse_observed.load(Ordering::Acquire),
+    );
+    let segment_reuse_activation_preflight = scanner_segment_reuse_activation_preflight_for_cycle(
+        &dirty_usage_snapshot,
+        distributed,
+        distributed_segment_invalidation_evidence,
+        cold_zero_walk_oracle,
     );
     let pending_maintenance_work = pending_maintenance_work_for_cycle(&pending_maintenance_work, &results);
     let observed_cycle_floor = cache_cycle_floor.load(Ordering::Acquire);
