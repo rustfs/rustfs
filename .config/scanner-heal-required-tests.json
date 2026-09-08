@@ -100,7 +100,13 @@
       "lane": "mixed-version-rollback",
       "status": "pending",
       "description": "Exact scoped ACK with durable publication and mixed peers",
-      "requires": ["durable scoped ACK publication", "mixed-peer evidence"]
+      "requires": ["durable scoped ACK publication", "mixed-peer evidence"],
+      "evidence_fields": [
+        "durable_root_publication_proof",
+        "scoped_ack_request_identity",
+        "participating_peer_capability_snapshot",
+        "mixed_peer_ack_fallback_oracle"
+      ]
     },
     {
       "gate": "G04",
@@ -148,7 +154,12 @@
       "lane": "mixed-version-rollback",
       "status": "pending",
       "description": "Actual mixed-version reader/writer and rollback payloads",
-      "requires": ["mixed-version reader evidence", "mixed-version writer evidence", "rollback payload evidence"]
+      "requires": ["mixed-version reader evidence", "mixed-version writer evidence", "rollback payload evidence"],
+      "evidence_fields": [
+        "mixed_version_reader_evidence",
+        "mixed_version_writer_evidence",
+        "rollback_payload_evidence"
+      ]
     },
     {
       "gate": "G10",
