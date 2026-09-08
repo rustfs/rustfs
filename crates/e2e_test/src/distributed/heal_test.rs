@@ -46,6 +46,18 @@ struct ScannerHealEvidenceContext {
     run: Value,
 }
 
+struct ScannerHealEvidencePayload<'a> {
+    dist: &'a DistCluster,
+    bucket: &'a str,
+    expected: &'a [ExpectedShard],
+    outage_key: &'a str,
+    outage_body: &'a [u8],
+    replaced_drive: &'a Path,
+    pid_before: u32,
+    pid_after: u32,
+    node_listings: Vec<Vec<String>>,
+}
+
 fn file_sha256(path: &Path) -> TestResult<String> {
     let mut file = std::fs::File::open(path)?;
     let mut digest = Sha256::new();
@@ -130,23 +142,12 @@ fn assert_ec84_geometry(census: &VersionShardCensus, key: &str) -> TestResult {
     Ok(())
 }
 
-async fn write_scanner_heal_evidence(
-    context: ScannerHealEvidenceContext,
-    dist: &DistCluster,
-    bucket: &str,
-    expected: &[ExpectedShard],
-    outage_key: &str,
-    outage_body: &[u8],
-    replaced_drive: &Path,
-    pid_before: u32,
-    pid_after: u32,
-    node_listings: Vec<Vec<String>>,
-) -> TestResult {
-    let verifier = dist.client(0)?;
+async fn write_scanner_heal_evidence(context: ScannerHealEvidenceContext, payload: ScannerHealEvidencePayload<'_>) -> TestResult {
+    let verifier = payload.dist.client(0)?;
     let mut objects = Vec::new();
-    for item in expected {
-        let actual = get_object_bytes(&verifier, bucket, &item.key).await?;
-        let physical = census_object_version_on_disk(replaced_drive, bucket, &item.key, None)?;
+    for item in payload.expected {
+        let actual = get_object_bytes(&verifier, payload.bucket, &item.key).await?;
+        let physical = census_object_version_on_disk(payload.replaced_drive, payload.bucket, &item.key, None)?;
         objects.push(serde_json::json!({
             "key": item.key,
             "version_id": null,
@@ -158,14 +159,14 @@ async fn write_scanner_heal_evidence(
             "physical": physical,
         }));
     }
-    let actual = get_object_bytes(&verifier, bucket, outage_key).await?;
-    let physical = census_object_version_on_disk(replaced_drive, bucket, outage_key, None)?;
+    let actual = get_object_bytes(&verifier, payload.bucket, payload.outage_key).await?;
+    let physical = census_object_version_on_disk(payload.replaced_drive, payload.bucket, payload.outage_key, None)?;
     objects.push(serde_json::json!({
-        "key": outage_key,
+        "key": payload.outage_key,
         "version_id": null,
-        "expected_bytes": outage_body.len(),
+        "expected_bytes": payload.outage_body.len(),
         "actual_bytes": actual.len(),
-        "expected_sha256": sha256_hex(outage_body),
+        "expected_sha256": sha256_hex(payload.outage_body),
         "actual_sha256": sha256_hex(&actual),
         "expected_physical": null,
         "physical": physical,
@@ -181,11 +182,11 @@ async fn write_scanner_heal_evidence(
         "binary_sha256": string_field(&context.run, "binary.sha256")?,
         "test_binary_sha256": string_field(&context.run, "test_binary.sha256")?,
         "topology": {"nodes": EC84_NODE_COUNT, "drives_per_node": EC84_DRIVES_PER_NODE},
-        "pid_before": pid_before,
-        "pid_after": pid_after,
+        "pid_before": payload.pid_before,
+        "pid_after": payload.pid_after,
         "unclean_shutdown_marker": false,
         "objects": objects,
-        "node_listings": node_listings,
+        "node_listings": payload.node_listings,
     });
     let data = serde_json::to_vec(&evidence)?;
     if data.len() > 1024 * 1024 {
@@ -347,15 +348,17 @@ async fn three_node_four_drive_ec8_4_root_heal_rebuilds_replaced_drive_after_res
     if let Some(context) = evidence_context {
         write_scanner_heal_evidence(
             context,
-            &dist,
-            &bucket,
-            &expected,
-            outage_key,
-            &outage_body,
-            &replaced_drive,
-            target_pid_before,
-            target_pid_after,
-            node_listings,
+            ScannerHealEvidencePayload {
+                dist: &dist,
+                bucket: &bucket,
+                expected: &expected,
+                outage_key,
+                outage_body: &outage_body,
+                replaced_drive: &replaced_drive,
+                pid_before: target_pid_before,
+                pid_after: target_pid_after,
+                node_listings,
+            },
         )
         .await?;
     }
