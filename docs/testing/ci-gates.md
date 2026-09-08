@@ -302,6 +302,12 @@ per-artifact window is declared. Missing, synthetic, stale, tampered, undersized
 or topology-mismatched evidence returns a compact blocked or invalid JSON result
 and a nonzero exit.
 
+The scheduler-pressure lane must also carry the numbers needed to close W09,
+W10, and W11: bounded deferred item/byte/age limits, zero duplicate tasks,
+pressure pacing engagement, recovery and lock-hold timings, fixed offered load,
+foreground p95/p99 latency, throughput, error count, attempt-cost samples, and
+completed heal object counts.
+
 This command validates the evidence package; it does not create evidence. A
 handwritten JSON file, a synthetic harness pass, a single focused case, or a
 local unit fixture still cannot satisfy the distributed, mixed-version,
@@ -310,3 +316,16 @@ crash-restart, durable MRF replay, EC8+4, ABBA, or profiling gates.
 Run parser/receipt regressions with
 `scripts/python_bin.sh scripts/check_test_wiring.py --self-test`. Those fixtures
 validate the checker only and produce no runtime or performance evidence.
+
+For local bundle-shape dry runs, generate a task-owned fixture directory with:
+
+```bash
+scripts/python_bin.sh scripts/check_test_wiring.py \
+  --write-scanner-heal-release-bundle-fixture /path/to/fixture-dir
+```
+
+The generated file is marked `fixture_only` and is intentionally rejected by the
+release bundle checker. Use it to rehearse field names, artifact paths, hashes,
+profile artifact membership, mixed-version roles, and same-window provenance
+before copying the shape into a real measured bundle. It is not ABBA, profile,
+mixed-version, crash-restart, or release approval evidence.
