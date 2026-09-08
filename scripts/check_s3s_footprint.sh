@@ -55,8 +55,11 @@ cd "$(dirname "$0")/.."
 # now reports an unreadable configuration as a plain string instead of raising
 # an S3 error per arm (24 invocation lines removed from
 # rustfs/src/admin/handlers/bucket_meta.rs; measured after merging the two).
+# 1589 -> 1588 on 2026-09-08: the GA blocker set (rustfs/backlog#2366) added
+# three invocation lines to the endpoint-refresh paths and folded the five
+# copies of the concurrent-change error into one constructor, netting -1.
 S3S_IMPORT_FILES_BASELINE=213
-S3_ERROR_LINES_BASELINE=1589
+S3_ERROR_LINES_BASELINE=1588
 # ecstore-scoped ratchet (rustfs/backlog#1842): the storage engine must not
 # know S3 wire/DTO types (ARCHITECTURE.md invariant 4). The S3-*consuming*
 # client was extracted to crates/s3-client, where s3s usage is legitimate;

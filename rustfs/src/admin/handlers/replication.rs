@@ -627,6 +627,32 @@ pub(crate) async fn cluster_replication_stats(bucket: &str, context: Option<Arc<
         .await
 }
 
+/// Reload the bucket's metadata on every peer so a follow-up
+/// `put-bucket-replication` on another node does not read a stale target.
+///
+/// Best effort, like every S3 bucket-config write path
+/// (`app::bucket_usecase::notify_bucket_metadata_reload`): the target is
+/// already persisted and live on this node, and the 15-minute refresh closes
+/// the gap, so a peer that cannot be reached must not turn a completed write
+/// into a failed request.
+async fn notify_remote_target_metadata_reload(bucket: &str, context: Option<Arc<AppContext>>, action: &'static str) {
+    let Some(notification_system) = current_notification_system_for_context(context.as_deref()) else {
+        return;
+    };
+    if let Err(err) = notification_system.load_bucket_metadata(bucket).await {
+        warn!(
+            event = EVENT_ADMIN_REMOTE_TARGET_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_REPLICATION,
+            action = action,
+            result = "peer_metadata_reload_failed",
+            bucket = %bucket,
+            error = ?err,
+            "admin remote target state"
+        );
+    }
+}
+
 fn unique_replication_peers(peer_clients: &[Option<PeerRestClient>]) -> (Vec<&PeerRestClient>, u32) {
     let mut seen_grid_hosts = HashSet::new();
     let peers: Vec<_> = peer_clients
@@ -699,6 +725,7 @@ pub struct SetRemoteTargetHandler {}
 impl Operation for SetRemoteTargetHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
+        let app_context = app_context_from_req(&req);
 
         let queries = extract_query_params(&req.uri);
 
@@ -926,6 +953,8 @@ impl Operation for SetRemoteTargetHandler {
             .map_err(map_bucket_target_error)?;
         let _targets_guard = lock_bucket_targets_metadata(bucket).await;
         let arn = persist_remote_target_write(bucket, remote_target, incarnation, mode).await?;
+        drop(_targets_guard);
+        notify_remote_target_metadata_reload(bucket, app_context, "set_remote_target").await;
         let arn_str = serde_json::to_string(&arn)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize target ARN"))?;
 
@@ -1006,6 +1035,7 @@ pub struct RemoveRemoteTargetHandler {}
 impl Operation for RemoveRemoteTargetHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
+        let app_context = app_context_from_req(&req);
 
         debug!("remove remote target called");
         let queries = extract_query_params(&req.uri);
@@ -1081,6 +1111,7 @@ impl Operation for RemoveRemoteTargetHandler {
         }
         let json_targets = serde_json::to_vec(&targets)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets"))?;
+        let notification_bucket = bucket.clone();
         let bucket = bucket.clone();
         let arn = arn_str.clone();
         // The pool cancellation owns a detached task. Both outer guards must
@@ -1100,6 +1131,8 @@ impl Operation for RemoveRemoteTargetHandler {
         .map_err(|error| {
             S3Error::with_message(S3ErrorCode::InternalError, format!("remote target removal task failed: {error}"))
         })??;
+
+        notify_remote_target_metadata_reload(&notification_bucket, app_context, "remove_remote_target").await;
 
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
     }
@@ -1785,6 +1818,25 @@ mod tests {
 
     fn query_map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn remote_target_writes_notify_peer_metadata_caches() {
+        let source = include_str!("replication.rs");
+        for (start, end) in [
+            ("impl Operation for SetRemoteTargetHandler", "pub struct ListRemoteTargetHandler"),
+            ("impl Operation for RemoveRemoteTargetHandler", "async fn cancel_active_resync_intent"),
+        ] {
+            let body = source
+                .split(start)
+                .nth(1)
+                .and_then(|rest| rest.split(end).next())
+                .expect(start);
+            assert!(
+                body.contains("notify_remote_target_metadata_reload"),
+                "{start} must notify every node before returning success"
+            );
+        }
     }
 
     #[test]

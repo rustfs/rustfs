@@ -38,6 +38,42 @@ Counts ignore blank lines and comments; compute them from the files. The lifecyc
 
 "Supported" for the SSE row means RustFS encrypts and decrypts its own objects. MinIO SSE objects (SSE-S3, SSE-KMS, SSE-C) are not readable in default builds; see [minio-file-format-compat.md Part C](minio-file-format-compat.md#part-c--server-side-encryption-sse) for the `rio-v2` migration build.
 
+## Replication Support Boundary
+
+Site replication and bucket replication are not the same compatibility claim.
+Site replication requires RustFS-compatible peer admin APIs and coordinates
+IAM, topology, buckets, and metadata. A generic S3-compatible service can only
+be a bucket-replication data target.
+
+For a generic S3 target, RustFS supports object PUT/HEAD/DELETE, multipart
+uploads, tags, version deletes, and Object Lock mutations when the target
+implements the corresponding S3 APIs and has versioning enabled. Targets that
+mint their own version IDs are supported through a per-target version ledger;
+pre-ledger replicas are adopted only when exact key and ETag identify one
+unambiguous target version. `NoSuchVersion` for an already absent addressed
+replica is treated as converged.
+
+The following are capability boundaries, not universal S3 claims:
+
+- `GET /BUCKET?replication-check` must pass the phases required by the intended
+  workload. `VersionFidelity` may report a minting target as mismatched even
+  though ledger-addressed delete and Object Lock phases succeed.
+- A target that rejects standard multipart constraints, required Object Lock
+  integrity headers, or the configured checksum framing is unsupported until
+  its transport settings are made compatible.
+- SSE-S3 and SSE-KMS are decrypted at the source and re-encrypted by the
+  destination's KMS. SSE-C uses ciphertext passthrough and requires target
+  evidence. Unsupported or ambiguous encryption metadata fails closed.
+- ACL authorization is intentionally unsupported, and generic targets never
+  receive RustFS IAM/site-control-plane state.
+- RustFS does not guess between multiple target versions with the same key and
+  ETag. The mutation remains failed and retryable until repair establishes an
+  unambiguous mapping.
+
+See [site replication operations](../operations/site-replication-operations.md)
+for health, recovery, and upgrade rules and [replication outbound transport](../operations/replication-outbound-transport.md)
+for the tested target classes and knobs.
+
 ## Not Yet Passing
 
 Standard S3 areas that must not be described as complete:
