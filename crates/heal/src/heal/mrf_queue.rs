@@ -521,6 +521,8 @@ async fn submit_mrf_heal_request(manager: &HealManager, intent: &MrfIntent) -> c
 struct MrfRuntime {
     queue: MrfQueue,
     config: MrfConsumerConfig,
+    checkpoint_owner: Uuid,
+    next_checkpoint_sequence: u64,
     new_since_flush: usize,
     /// True while the in-memory pending set has changed since the last
     /// journal flush (push, pop, or an attempts bump that alters the encoded
@@ -537,6 +539,12 @@ struct MrfRuntime {
     /// Partial-write responsibilities accepted from replay and waiting for an
     /// exact storage-owned proof before the startup journal can be deleted.
     durable_replay_anchors: Vec<MrfDurableRepairAnchor>,
+    /// Startup replay source to remove after the retained replay
+    /// responsibilities are discharged. `None` means the runtime only needs
+    /// the legacy journal cleanup path for snapshots it wrote itself.
+    replay_cleanup: Option<ReplayCleanup>,
+    /// Last committed checkpoint published by this runtime flush path.
+    runtime_checkpoint: Option<(Uuid, u64)>,
     /// Earliest instant a full-admission retry may proceed.
     backoff_until: Option<tokio::time::Instant>,
 }
@@ -560,6 +568,34 @@ impl MrfRuntime {
 
     async fn flush(&mut self) {
         let (authoritative, legacy) = self.snapshot();
+        let (committed_persisted, committed_on_disk) = if authoritative.is_empty() {
+            (true, false)
+        } else {
+            match snapshot::publish_committed_snapshot(
+                &journal_disks().await,
+                self.checkpoint_owner,
+                self.next_checkpoint_sequence,
+                &authoritative,
+                self.config.journal_max_bytes,
+            )
+            .await
+            {
+                Ok(publication) => {
+                    self.runtime_checkpoint = Some((publication.owner, publication.sequence));
+                    self.next_checkpoint_sequence = publication.sequence.saturating_add(1);
+                    (true, true)
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "rustfs::heal::mrf",
+                        error = %err,
+                        sequence = self.next_checkpoint_sequence,
+                        "MRF committed checkpoint publish failed; retaining previous replay anchor"
+                    );
+                    (false, false)
+                }
+            }
+        };
         let authoritative_persisted = write_journal(MRF_SCOPED_JOURNAL_PATH, &authoritative).await;
         if !authoritative.is_empty() {
             counter!("rustfs_heal_mrf_journal_fsync_total").increment(1);
@@ -570,10 +606,10 @@ impl MrfRuntime {
         // old reader from observing a newer epoch that a new reader cannot
         // see when the canonical write is unavailable.
         let legacy_persisted = authoritative_persisted && write_journal(MRF_JOURNAL_PATH, &legacy).await;
-        // Keep dirty until both the authoritative snapshot and its
-        // compatibility mirror have been accepted; otherwise a one-sided
-        // failure would never retry the missing file.
-        let persisted = authoritative_persisted && legacy_persisted;
+        // Keep dirty until the committed checkpoint, authoritative snapshot,
+        // and compatibility mirror have all been accepted; otherwise a
+        // one-sided failure would never retry the missing recovery anchor.
+        let persisted = committed_persisted && authoritative_persisted && legacy_persisted;
         self.new_since_flush = 0;
         // Keep the dirty flag when every disk write failed: a clean backlog
         // would otherwise never rewrite, losing the periodic persist retry a
@@ -581,7 +617,7 @@ impl MrfRuntime {
         if persisted {
             self.dirty = false;
         }
-        self.journal_on_disk |= authoritative_persisted || legacy_persisted;
+        self.journal_on_disk |= committed_on_disk || authoritative_persisted || legacy_persisted;
     }
 
     /// Drain pending intents into the heal manager until it is full, the
@@ -637,6 +673,45 @@ impl MrfRuntime {
 
     fn retained_replay_journal(&self) -> bool {
         self.retain_replay_journal || !self.durable_replay_anchors.is_empty()
+    }
+
+    fn replay_cleanup_to_delete(&self) -> Option<ReplayCleanup> {
+        if self.journal_on_disk && !self.retained_replay_journal() {
+            Some(self.replay_cleanup.unwrap_or(ReplayCleanup::Legacy))
+        } else {
+            None
+        }
+    }
+
+    async fn delete_idle_recovery_anchors(&mut self) -> bool {
+        let runtime_deleted = match self.runtime_checkpoint {
+            Some((owner, sequence)) => {
+                match snapshot::delete_committed_snapshots_through(owner, sequence, self.config.journal_max_bytes).await {
+                    Ok(deleted) => deleted,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "rustfs::heal::mrf",
+                            error = %err,
+                            sequence,
+                            "MRF runtime checkpoint cleanup failed"
+                        );
+                        false
+                    }
+                }
+            }
+            None => true,
+        };
+        let replay_deleted = match self.replay_cleanup_to_delete() {
+            Some(cleanup) => delete_replay_source(cleanup, self.config.journal_max_bytes).await,
+            None => true,
+        };
+        if runtime_deleted && replay_deleted {
+            self.runtime_checkpoint = None;
+            self.replay_cleanup = None;
+            true
+        } else {
+            false
+        }
     }
 
     fn discharge_durable_replay_anchors(&mut self) {
@@ -708,6 +783,8 @@ struct ReplayOutcome {
     journal_on_disk: bool,
     retain_journal_for_replay: bool,
     durable_replay_anchors: Vec<MrfDurableRepairAnchor>,
+    cleanup: Option<ReplayCleanup>,
+    next_checkpoint_sequence: u64,
 }
 
 fn replay_must_retain_journal(
@@ -719,7 +796,7 @@ fn replay_must_retain_journal(
     rearm_incomplete || pending_depth > 0 || accepted_without_durable_anchor || durable_replay_anchors > 0
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReplayCleanup {
     Legacy,
     Committed { owner: Uuid, sequence: u64 },
@@ -793,6 +870,8 @@ async fn replay_into(
                 journal_on_disk: false,
                 retain_journal_for_replay: false,
                 durable_replay_anchors: Vec::new(),
+                cleanup: None,
+                next_checkpoint_sequence: 1,
             };
         }
         Err(err) => {
@@ -806,10 +885,16 @@ async fn replay_into(
                 journal_on_disk: true,
                 retain_journal_for_replay: true,
                 durable_replay_anchors: Vec::new(),
+                cleanup: None,
+                next_checkpoint_sequence: 1,
             };
         }
     };
     let cleanup = source.cleanup;
+    let next_checkpoint_sequence = match cleanup {
+        ReplayCleanup::Legacy => 1,
+        ReplayCleanup::Committed { sequence, .. } => sequence.saturating_add(1),
+    };
     let data = source.data;
     let (decoded, truncated) = decode_journal(&data);
     let replayed = decoded.len();
@@ -913,6 +998,8 @@ async fn replay_into(
         journal_on_disk,
         retain_journal_for_replay,
         durable_replay_anchors,
+        cleanup: journal_on_disk.then_some(cleanup),
+        next_checkpoint_sequence,
     }
 }
 
@@ -923,11 +1010,15 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
     let mut runtime = MrfRuntime {
         queue: MrfQueue::new(config.queue_capacity, config.journal_max_bytes),
         config: config.clone(),
+        checkpoint_owner: Uuid::new_v4(),
+        next_checkpoint_sequence: 1,
         new_since_flush: 0,
         dirty: false,
         journal_on_disk: false,
         retain_replay_journal: false,
         durable_replay_anchors: Vec::new(),
+        replay_cleanup: None,
+        runtime_checkpoint: None,
         backoff_until: None,
     };
 
@@ -937,6 +1028,8 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
     runtime.journal_on_disk = replay.journal_on_disk;
     runtime.retain_replay_journal = replay.retain_journal_for_replay;
     runtime.durable_replay_anchors = replay.durable_replay_anchors;
+    runtime.replay_cleanup = replay.cleanup;
+    runtime.next_checkpoint_sequence = replay.next_checkpoint_sequence;
     // Anything still pending (e.g. the manager was full and backoff armed)
     // must be re-persisted by the next flush before replay can delete the
     // startup anchor.
@@ -1001,7 +1094,7 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
                     TickAction::DeleteJournal => {
                         // All replayed intents have either been accepted,
                         // merged, or replaced by a pending successor snapshot.
-                        if delete_journals().await {
+                        if runtime.delete_idle_recovery_anchors().await {
                             runtime.journal_on_disk = false;
                             gauge!("rustfs_heal_mrf_journal_bytes").set(0.0);
                         }
@@ -1117,14 +1210,23 @@ mod tests {
         let bucket_incarnation_id = uuid::Uuid::new_v4();
         let anchor = rustfs_common::mrf_channel::MrfDurableRepairAnchor::from_intent(&intent, bucket_incarnation_id)
             .expect("fresh replay lease and bucket incarnation build a durable anchor");
+        let cleanup_owner = uuid::Uuid::new_v4();
+        let cleanup = ReplayCleanup::Committed {
+            owner: cleanup_owner,
+            sequence: 17,
+        };
         let mut runtime = MrfRuntime {
             queue: MrfQueue::new(2, usize::MAX),
             config: MrfConsumerConfig::default(),
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: 1,
             new_since_flush: 0,
             dirty: false,
             journal_on_disk: true,
             retain_replay_journal: false,
             durable_replay_anchors: vec![anchor],
+            replay_cleanup: Some(cleanup),
+            runtime_checkpoint: None,
             backoff_until: None,
         };
         rustfs_common::mrf_channel::note_mrf_verified_repair(MrfVerifiedRepairEvent {
@@ -1142,12 +1244,46 @@ mod tests {
             runtime.retained_replay_journal(),
             "anchor must retain the startup journal before proof is consumed"
         );
+        assert_eq!(
+            runtime.replay_cleanup_to_delete(),
+            None,
+            "the committed replay source must not be reclaimed before the exact proof"
+        );
         runtime.discharge_durable_replay_anchors();
         assert!(
             !runtime.retained_replay_journal(),
             "matching verified proof discharges the durable replay anchor"
         );
+        assert_eq!(
+            runtime.replay_cleanup_to_delete(),
+            Some(cleanup),
+            "proof discharge must preserve the committed owner/sequence cleanup target"
+        );
         rustfs_common::mrf_channel::release_mrf_intent(&intent);
+    }
+
+    #[test]
+    fn runtime_cleanup_defaults_to_legacy_for_runtime_written_journals() {
+        let runtime = MrfRuntime {
+            queue: MrfQueue::new(2, usize::MAX),
+            config: MrfConsumerConfig::default(),
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: 1,
+            new_since_flush: 0,
+            dirty: false,
+            journal_on_disk: true,
+            retain_replay_journal: false,
+            durable_replay_anchors: Vec::new(),
+            replay_cleanup: None,
+            runtime_checkpoint: None,
+            backoff_until: None,
+        };
+
+        assert_eq!(
+            runtime.replay_cleanup_to_delete(),
+            Some(ReplayCleanup::Legacy),
+            "journals written by the runtime still use the legacy cleanup path"
+        );
     }
 
     #[test]
