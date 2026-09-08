@@ -27,10 +27,10 @@ pub mod task;
 pub mod utils;
 
 use storage_api::owner::{
-    ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_HEALING_MARKER_PATH, ECSTORE_RUSTFS_META_BUCKET,
-    EcstoreConditionalFileUpdate, EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskOption,
-    EcstoreDiskResult, EcstoreDiskStore, EcstoreEndpoint, EcstoreErrorType, EcstoreStorageError, EcstoreStore, ObjectIO,
-    ObjectOperations, ecstore_local_disk_map_read, ecstore_new_disk,
+    ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_HEALING_MARKER_PATH, ECSTORE_POOL_META_NAME,
+    ECSTORE_RUSTFS_META_BUCKET, EcstoreConditionalFileUpdate, EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes,
+    EcstoreDiskError, EcstoreDiskOption, EcstoreDiskResult, EcstoreDiskStore, EcstoreEndpoint, EcstoreErrorType,
+    EcstoreStorageError, EcstoreStore, ObjectIO, ObjectOperations, ecstore_local_disk_map_read, ecstore_new_disk,
 };
 
 pub use erasure_healer::ErasureSetHealer;
@@ -41,6 +41,7 @@ pub use task::{HealOptions, HealPriority, HealRequest, HealTask, HealType};
 pub(crate) const DATA_USAGE_CACHE_NAME: &str = ECSTORE_DATA_USAGE_CACHE_NAME;
 pub(crate) const BUCKET_META_PREFIX: &str = ECSTORE_BUCKET_META_PREFIX;
 pub(crate) const RUSTFS_META_BUCKET: &str = ECSTORE_RUSTFS_META_BUCKET;
+pub(crate) const POOL_META_NAME: &str = ECSTORE_POOL_META_NAME;
 
 /// Marker written to every local disk while the process runs; removed by
 /// [`clear_unclean_shutdown_markers`] on graceful shutdown. Finding it at
