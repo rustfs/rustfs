@@ -168,7 +168,7 @@ ensure_default_asset_platform() {
 
 verify_sha256() {
     local archive="$1"
-    if command -v sha256sum >/dev/null 2>&1; then
+    if command -v sha256sum >/dev/null 2>&1 && [[ "$(sha256sum --help 2>&1)" == *"--check"* ]]; then
         printf '%s  %s\n' "$SOURCE_SHA256" "$archive" | sha256sum --check --strict
     elif command -v shasum >/dev/null 2>&1; then
         printf '%s  %s\n' "$SOURCE_SHA256" "$archive" | shasum -a 256 --check
@@ -232,7 +232,7 @@ resolve_source_binary() {
     local archive="$SOURCE_DIR/$SOURCE_ASSET"
     curl --fail --location --retry 3 --output "$archive" \
         "https://github.com/$SOURCE_REPOSITORY/releases/download/$SOURCE_VERSION/$SOURCE_ASSET"
-    verify_sha256 "$archive"
+    verify_sha256 "$archive" >&2
     unzip -q "$archive" -d "$SOURCE_DIR"
     chmod +x "$binary"
     test -x "$binary"
@@ -422,6 +422,18 @@ run_self_test() {
     fi
 
     mkdir -p "$tmp/run/mixed-version-upgrade" "$tmp/run/bucket-config-rollback"
+    mkdir -p "$tmp/source"
+    local archive checksum checksum_output
+    archive="$tmp/source/$SOURCE_ASSET"
+    printf 'not a real archive\n' >"$archive"
+    if command -v shasum >/dev/null 2>&1; then
+        checksum="$(shasum -a 256 "$archive" | awk '{print $1}')"
+    else
+        checksum="$(sha256sum "$archive" | awk '{print $1}')"
+    fi
+    checksum_output="$(SOURCE_SHA256="$checksum" verify_sha256 "$archive")"
+    [[ "$checksum_output" == *"OK"* ]]
+
     local current previous
     current="$(git rev-parse HEAD)"
     previous="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
