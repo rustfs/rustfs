@@ -409,6 +409,11 @@ fn transfer_summaries(stats: &InternalReplicationStats) -> (XferSummaryWire, Tar
     (summary, per_target)
 }
 
+/// Node-level failure counters for `errors`. The sibling `retries` field
+/// stays zero on purpose: it means redeliveries in the minio-go shape, and a
+/// failed object is not retried by an event today (it waits for the scanner's
+/// heal pass), so reporting failures there would claim a redelivery that
+/// never happened.
 fn failure_counters(stats: &InternalReplicationStats) -> CounterSummaryWire {
     let (total, last1m, last1hr) = stats.stats.values().fold((0i64, 0i64, 0i64), |acc, stat| {
         (
@@ -453,7 +458,6 @@ impl MetricsV2Wire {
                 xfer_stats: xfer_stats.clone(),
                 tgt_xfer_stats: tgt_xfer_stats.clone(),
                 errors: failed,
-                retries: failed,
                 ..Default::default()
             });
         } else {
@@ -463,7 +467,6 @@ impl MetricsV2Wire {
                 first.xfer_stats = xfer_stats.clone();
                 first.tgt_xfer_stats = tgt_xfer_stats.clone();
                 first.errors = failed;
-                first.retries = failed;
             }
         }
 
@@ -566,7 +569,7 @@ mod tests {
         assert_eq!(node["errors"]["total"], 3);
         assert_eq!(node["errors"]["last1m"], 2);
         assert_eq!(node["errors"]["last1hr"], 3);
-        assert_eq!(node["retries"]["total"], 3);
+        assert_eq!(node["retries"]["total"], 0, "failures are not redeliveries; retries must not claim one");
         assert_eq!(json["downtimeInfo"], serde_json::json!({}));
     }
 

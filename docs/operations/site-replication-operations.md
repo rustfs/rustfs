@@ -51,7 +51,8 @@ locally valid view.
 | `RetryStats` | Durable control-plane retry backlog and escalation count. |
 | `Metrics.replMetrics` | Per-destination online state, downtime, replicated counts/bytes, and `failed` totals/windows. |
 | `Metrics.queued` / `Metrics.inProgress` | Object work waiting or active on the responding node. |
-| `Metrics.errors` / `Metrics.retries` | Node-level object-replication failures. When only queue statistics are available, RustFS synthesizes a node entry and preserves these failure counters rather than reporting zero. |
+| `Metrics.errors` | Node-level object-replication failures. When only queue statistics are available, RustFS synthesizes a node entry and preserves this counter rather than reporting zero. |
+| `Metrics.retries` | Redeliveries. Always zero today: a failed object is not retried by an event, it waits for the scanner pass described below. Read `errors` instead. |
 
 Healthy means: the same topology is visible on all sites, no pending operation,
 no peer error, no failed retry escalation, required bucket/IAM state is in sync,
