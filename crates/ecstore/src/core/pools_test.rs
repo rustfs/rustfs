@@ -4960,6 +4960,302 @@ mod decommission_lock_order_tests {
 
     #[test]
     #[serial_test::serial]
+    fn scanner_backlog_cas_keeps_fences_after_waiter_cancellation_until_rename_drains() {
+        run_large_stack_current_thread_async_test("scanner-backlog-canceled-waiter", async || {
+            temp_env::async_with_vars([(crate::set_disk::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+                let (_temp_dirs, writer, other) =
+                    test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
+                let object = "buckets/.scanner-pause-backlog.json";
+                let set_index = 1;
+                let body = vec![0x37; 1024];
+                assert!(
+                    !writer.pools[0].disk_set[0]
+                        .shares_namespace_lock_domain(&writer.pools[0].disk_set[set_index])
+                        .await
+                );
+                let rename_tasks = crate::set_disk::rename_fanout_barrier::observe_tasks(object);
+                let tail =
+                    crate::set_disk::rename_fanout_barrier::arm(object, 0, crate::set_disk::rename_fanout_barrier::PHASE_RENAME);
+                let put_store = Arc::clone(&writer);
+                let put_body = body.clone();
+                let mut put = tokio::spawn(async move {
+                    put_store
+                        .save_scanner_pause_backlog_replica(0, set_index, put_body, Default::default())
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), tail.wait_until_paused())
+                    .await
+                    .expect("the native write must reach its held rename");
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while rename_tasks.running() != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the other disks must reach quorum before canceling the waiter");
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), &mut put).await.is_err(),
+                    "native replica publication must await the entire rename tail"
+                );
+                put.abort();
+                assert!(put.await.expect_err("the scanner waiter must be canceled").is_cancelled());
+
+                let capacity_lock = other
+                    .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
+                    .await
+                    .expect("capacity lock probe");
+                let object_lock = other
+                    .new_ns_lock(RUSTFS_META_BUCKET, object)
+                    .await
+                    .expect("fixed object lock probe");
+                let mut capacity_probe = tokio::spawn(async move { capacity_lock.get_write_lock(Duration::from_secs(30)).await });
+                let mut object_probe = tokio::spawn(async move { object_lock.get_write_lock(Duration::from_secs(30)).await });
+                for (label, probe) in [("capacity", &mut capacity_probe), ("fixed object", &mut object_probe)] {
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), probe).await.is_err(),
+                        "canceling the scanner waiter must retain its {label} fence while rename is pending"
+                    );
+                }
+                tail.release();
+                drop(tail);
+                for probe in [capacity_probe, object_probe] {
+                    drop(
+                        tokio::time::timeout(Duration::from_secs(30), probe)
+                            .await
+                            .expect("publication fence must drain after rename")
+                            .expect("lock probe must not panic")
+                            .expect("publication fence must eventually be released"),
+                    );
+                }
+                let mut reader = writer.pools[0].disk_set[set_index]
+                    .get_object_reader(RUSTFS_META_BUCKET, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("canceled waiter must leave the committed replica readable");
+                let mut actual = Vec::new();
+                reader
+                    .read_to_end(&mut actual)
+                    .await
+                    .expect("read the full native replica after tail drain");
+                assert_eq!(actual, body);
+            })
+            .await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scanner_backlog_cas_rejects_lost_capacity_lease_before_publication() {
+        run_large_stack_current_thread_async_test("scanner-backlog-lease-loss", async || {
+            let (_temp_dirs, writer, other) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let object = "buckets/.scanner-pause-backlog.json";
+            let body = b"native source before lease loss".to_vec();
+            let original = writer
+                .save_scanner_pause_backlog_replica(2, 1, body.clone(), Default::default())
+                .await
+                .expect("seed the exact native replica set");
+            let (lossy, refresh_calls) = store_with_capacity_lease_loss(&other).await;
+            let barrier = PutObjectCommitBarrier::install(RUSTFS_META_BUCKET, object, PutObjectCommitPause::BeforeQuotaRename);
+            let put = tokio::spawn(async move {
+                lossy
+                    .save_scanner_pause_backlog_replica(
+                        2,
+                        1,
+                        b"must not commit after lease loss".to_vec(),
+                        crate::storage_api_contracts::object::HTTPPreconditions {
+                            if_match: original.etag,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                .await
+                .expect("native CAS must reach its commit barrier");
+            tokio::time::pause();
+            tokio::task::yield_now().await;
+            refresh_calls.arm();
+            tokio::time::advance(Duration::from_secs(11)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                refresh_calls.load(Ordering::Acquire) > 0,
+                "the durable metadata lease must lose refresh quorum"
+            );
+            barrier.release();
+            tokio::time::resume();
+            let err = tokio::time::timeout(Duration::from_secs(30), put)
+                .await
+                .expect("native CAS must finish after the barrier release")
+                .expect("native CAS task must not panic")
+                .expect_err("a lost outer capacity lease must reject native publication");
+            assert!(
+                matches!(err, crate::error::Error::NamespaceLockQuorumUnavailable { .. }),
+                "unexpected lease error: {err}"
+            );
+            drop(barrier);
+            let mut reader = writer.pools[2].disk_set[1]
+                .get_object_reader(RUSTFS_META_BUCKET, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the preexisting replica must survive lease loss");
+            let mut actual = Vec::new();
+            reader.read_to_end(&mut actual).await.expect("read the full retained replica");
+            assert_eq!(actual, body);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scanner_backlog_cas_rejects_a_retiring_source_on_a_stale_node() {
+        run_large_stack_current_thread_async_test("scanner-backlog-source-fence", async || {
+            let (_temp_dirs, store, writer) = test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
+            let object = "buckets/.scanner-pause-backlog.json";
+            let body = b"frozen native scanner replica".to_vec();
+            let source_set_index = (writer.pools[0].get_disks_by_key(object).set_index + 1) % writer.pools[0].disk_set.len();
+            assert_ne!(
+                source_set_index,
+                writer.pools[0].get_disks_by_key(object).set_index,
+                "exercise a non-routed native set"
+            );
+            let original = writer
+                .save_scanner_pause_backlog_replica(
+                    0,
+                    source_set_index,
+                    body.clone(),
+                    crate::storage_api_contracts::object::HTTPPreconditions {
+                        if_none_match: Some("*".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed a native scanner replica before retirement");
+            assert!(
+                writer
+                    .scanner_pause_backlog_writable_set_disks()
+                    .await
+                    .iter()
+                    .any(|set| set.pool_index == 0)
+            );
+
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            let target_total = body.len() * 8;
+            set_decommission_capacity_info_overrides_for_test(
+                store.id,
+                vec![vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, body.len() * 2, body.len() * 2),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 0, target_total, target_total),
+                    DecommissionPoolCapacityInfo::for_test(2, layout, target_total, target_total, 0),
+                ]],
+            );
+            store
+                .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+                .await
+                .expect("another node durably retires the selected source");
+            assert!(
+                writer.pool_meta.read().await.pools[0].decommission.is_none(),
+                "the writer must retain a stale snapshot"
+            );
+            assert!(
+                writer
+                    .scanner_pause_backlog_writable_set_disks()
+                    .await
+                    .iter()
+                    .any(|set| set.pool_index == 0)
+            );
+
+            let result = writer
+                .save_scanner_pause_backlog_replica(
+                    0,
+                    source_set_index,
+                    b"late native scanner update".to_vec(),
+                    crate::storage_api_contracts::object::HTTPPreconditions {
+                        if_match: original.etag.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                matches!(result, Err(crate::error::Error::SlowDown)),
+                "late native source publication must fail: {result:?}"
+            );
+            let mut source = writer.pools[0].disk_set[source_set_index]
+                .get_object_reader(RUSTFS_META_BUCKET, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the original source must remain readable");
+            assert_eq!(source.object_info.etag, original.etag);
+            let mut actual = Vec::new();
+            source
+                .read_to_end(&mut actual)
+                .await
+                .expect("read the entire retained source");
+            assert_eq!(actual, body);
+
+            for set in &writer.pools[2].disk_set {
+                let target_body = format!("surviving native scanner set {}", set.set_index).into_bytes();
+                let committed = writer
+                    .save_scanner_pause_backlog_replica(
+                        2,
+                        set.set_index,
+                        target_body.clone(),
+                        crate::storage_api_contracts::object::HTTPPreconditions {
+                            if_none_match: Some("*".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("every reserved healthy target set must still accept scanner replicas");
+                let conflict = writer
+                    .save_scanner_pause_backlog_replica(
+                        2,
+                        set.set_index,
+                        b"must not bypass CAS".to_vec(),
+                        crate::storage_api_contracts::object::HTTPPreconditions {
+                            if_match: Some("stale-native-revision".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect_err("capacity admission must retain the native writer's CAS");
+                assert!(matches!(conflict, crate::error::Error::PreconditionFailed));
+                let mut target = set
+                    .get_object_reader(RUSTFS_META_BUCKET, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("read the actual replica set, not the hash-routed set");
+                assert_eq!(target.object_info.etag, committed.etag);
+                let mut actual = Vec::new();
+                target
+                    .read_to_end(&mut actual)
+                    .await
+                    .expect("read the complete native target");
+                assert_eq!(actual, target_body);
+            }
+            for (pool_index, set_index) in [(writer.pools.len(), 0), (0, writer.pools[0].disk_set.len())] {
+                assert!(matches!(
+                    writer
+                        .save_scanner_pause_backlog_replica(pool_index, set_index, Vec::new(), Default::default())
+                        .await,
+                    Err(crate::error::Error::InvalidArgument(_, _, _))
+                ));
+            }
+            store
+                .decommission_cancel(0)
+                .await
+                .expect("cancel retirement before restoring native membership");
+            writer
+                .save_scanner_pause_backlog_replica(
+                    0,
+                    source_set_index,
+                    b"canceled source membership repair".to_vec(),
+                    crate::storage_api_contracts::object::HTTPPreconditions {
+                        if_match: original.etag,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("cancel must retain scanner's existing native membership repair contract");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn scanner_backlog_native_replica_reconciles_capacity_and_cleans_source() {
         run_large_stack_current_thread_async_test("scanner-backlog-reconcile", async || {
             let (_temp_dirs, store, other_store) =

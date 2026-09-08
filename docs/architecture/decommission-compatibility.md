@@ -68,9 +68,9 @@ retain the explicit retry path that can re-observe or resolve those entries.
 
 ### Publication On Retiring Pools
 
-Ordinary publication rechecks the selected pool against the durable pool metadata under its existing read fence. Selection may have happened before retirement, or on a node whose local pool state has not been refreshed. A staged PUT or multipart commit must return `SlowDown` instead of publishing into a pool that has since become suspended. The staged input is not automatically replayed into another pool.
+Ordinary publication rechecks the selected pool against the durable pool metadata under its existing read fence. Selection may have happened before retirement, or on a node whose local pool state has not been refreshed. A staged new PUT must return `SlowDown` instead of publishing into a pool that has since become suspended. The staged input is not automatically replayed into another pool.
 
-Running, queued, failed, canceled, and completed decommission states all exclude the source from ordinary publication. Failed and canceled entries become writable only after an allowed clear operation removes that state. This check does not change repair admission or the separate fence for operations that only release capacity.
+Running, queued, failed, canceled, and completed decommission states exclude the source from new ordinary publication, including new multipart uploads. Previously created multipart uploads retain their drain path while the source remains non-terminal; terminal source states reject further multipart publication. Failed and canceled entries become writable for new ordinary publication only after an allowed clear operation removes that state. This check does not change repair admission or the separate fence for operations that only release capacity.
 
 For mixed batch deletes, only the pools selected to receive new delete markers are publication targets. Exact-version deletions on other pools remain protected by the same pool metadata read fence, without treating the retiring source or an unrelated reserved target as a destination for those markers.
 
@@ -97,6 +97,25 @@ When decommission metadata is present, `decommissionInfo` includes:
 This makes queued pools and stalled metadata visible without requiring operators to inspect pool metadata files directly.
 
 ### Scanner Backlog Replica Conflicts
+
+Native scanner CAS publication uses the storage-owned replica write path, not a
+direct write to a set selected from node-local pool state. On multi-pool stores,
+the fixed object namespace precedes the durable pool metadata read fence and
+the actual replica-set namespace. Admission excludes running, queued and
+completed sources; failed/canceled sources retain the scanner's existing
+membership-repair behavior. Missing pool metadata does not authorize a replica.
+Healthy reserved targets remain writable under the shared-capacity contract.
+
+The replica writer retains both outer guards in an owned task and waits for the
+rename tail, including when its caller is canceled. Lock-loss signals remain
+attached to the set commit. This does not require every disk to succeed or alter
+write quorum/fsync policy. Replica writes for this one internal key serialize
+through its fixed namespace; ordinary PUT/GET do not enter this writer. The
+scanner still requires CAS success on every surviving set before acknowledging
+a ledger generation, and retains its partial-commit recovery protocol.
+Older scanner writers still use direct set CAS; this source-publication fence
+requires updating every scanner-capable node. No new on-disk or wire format is
+introduced.
 
 The exact internal object `.rustfs.sys/buckets/.scanner-pause-backlog.json` is
 published with CAS to surviving sets. Its replica-local object modification

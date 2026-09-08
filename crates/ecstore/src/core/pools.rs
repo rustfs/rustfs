@@ -1761,6 +1761,7 @@ fn ensure_decommission_capacity_reservations_available(
 pub(crate) enum DecommissionCapacityAdmission {
     Mutation,
     ExistingMultipart,
+    ScannerBacklog,
     BatchDelete,
     Heal,
 }
@@ -1770,6 +1771,7 @@ impl DecommissionCapacityAdmission {
         match self {
             Self::Mutation => "mutation",
             Self::ExistingMultipart => "existing_multipart",
+            Self::ScannerBacklog => "scanner_backlog",
             Self::BatchDelete => "batch_delete",
             Self::Heal => "heal",
         }
@@ -1785,11 +1787,18 @@ fn ensure_external_decommission_target_admission(
     // Pool selection may predate retirement or use a stale node-local snapshot.
     // Recheck publication against the fenced durable state. Repair and pure
     // capacity release retain their separate admission contracts.
+    if matches!(admission, DecommissionCapacityAdmission::ScannerBacklog)
+        && !meta.scanner_pause_backlog_pool_writable(target_pool_index)
+    {
+        return Err(Error::SlowDown);
+    }
     let active_sources = active_decommission_source_indices(meta);
     if meta.is_suspended(target_pool_index) {
         let active_source = active_sources.contains(&target_pool_index);
-        if !matches!(admission, DecommissionCapacityAdmission::Heal)
-            && !(matches!(admission, DecommissionCapacityAdmission::ExistingMultipart) && active_source)
+        if !matches!(
+            admission,
+            DecommissionCapacityAdmission::Heal | DecommissionCapacityAdmission::ScannerBacklog
+        ) && !(matches!(admission, DecommissionCapacityAdmission::ExistingMultipart) && active_source)
         {
             return Err(Error::SlowDown);
         }
@@ -6800,6 +6809,15 @@ impl PoolMeta {
             .get(idx)
             .and_then(|pool| pool.decommission.as_ref())
             .is_some_and(is_decommission_suspended)
+    }
+
+    pub(crate) fn scanner_pause_backlog_pool_writable(&self, idx: usize) -> bool {
+        self.pools.get(idx).is_some_and(|pool| {
+            !pool
+                .decommission
+                .as_ref()
+                .is_some_and(|info| info.has_decommission_state() && !info.failed && !info.canceled)
+        })
     }
 
     fn mark_decommission_progress_saved(&mut self) {
@@ -25645,6 +25663,7 @@ mod pools_tests {
         for admission in [
             DecommissionCapacityAdmission::Mutation,
             DecommissionCapacityAdmission::BatchDelete,
+            DecommissionCapacityAdmission::ScannerBacklog,
         ] {
             ensure_external_decommission_target_admission(&meta, 1, admission)
                 .expect("a healthy target must remain writable while sharing capacity with migration");
@@ -25688,6 +25707,7 @@ mod pools_tests {
         for admission in [
             DecommissionCapacityAdmission::Mutation,
             DecommissionCapacityAdmission::BatchDelete,
+            DecommissionCapacityAdmission::ScannerBacklog,
         ] {
             assert!(
                 matches!(ensure_external_decommission_target_admission(&meta, 1, admission), Err(Error::SlowDown)),
@@ -25761,10 +25781,36 @@ mod pools_tests {
             }
             ensure_external_decommission_target_admission(&meta, 0, DecommissionCapacityAdmission::Heal)
                 .unwrap_or_else(|err| panic!("{state} source repair must retain its capacity-only admission: {err}"));
+            let scanner_result =
+                ensure_external_decommission_target_admission(&meta, 0, DecommissionCapacityAdmission::ScannerBacklog);
+            assert_eq!(
+                meta.scanner_pause_backlog_pool_writable(0),
+                failed || canceled,
+                "{state} scanner selection"
+            );
+            if failed || canceled {
+                scanner_result.unwrap_or_else(|err| panic!("{state} scanner membership repair must remain writable: {err}"));
+            } else {
+                assert!(
+                    matches!(scanner_result, Err(Error::SlowDown)),
+                    "{state} scanner publication must reject its source"
+                );
+            }
             meta.pools[0].decommission = None;
             ensure_external_decommission_target_admission(&meta, 0, DecommissionCapacityAdmission::Mutation)
                 .unwrap_or_else(|err| panic!("cleared {state} source must become writable again: {err}"));
+            ensure_external_decommission_target_admission(&meta, 0, DecommissionCapacityAdmission::ScannerBacklog)
+                .unwrap_or_else(|err| panic!("cleared {state} scanner source must rejoin membership: {err}"));
         }
+        assert!(!active.scanner_pause_backlog_pool_writable(active.pools.len()));
+        assert!(matches!(
+            ensure_external_decommission_target_admission(
+                &active,
+                active.pools.len(),
+                DecommissionCapacityAdmission::ScannerBacklog
+            ),
+            Err(Error::SlowDown)
+        ));
     }
 
     #[test]
