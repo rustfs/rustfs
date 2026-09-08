@@ -1201,6 +1201,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manifest_cas_failure_after_payload_write_keeps_previous_anchor() {
+        let root = TempDir::new().expect("test directory");
+        let store = disk(&root, "disk").await;
+        let owner = Uuid::new_v4();
+        let old = payload("old");
+        let next = payload("next");
+        let damaged_manifest = b"damaged successor manifest".to_vec();
+        commit(&store, 0, owner, 1, &old).await;
+
+        let expected_manifest = EcstoreDiskAPI::read_all(store.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[1])
+            .await
+            .ok();
+        assert_eq!(
+            cas_replace(&store, PAYLOAD_PATHS[1], &next, 4096)
+                .await
+                .expect("successor payload CAS"),
+            EcstoreConditionalFileUpdate::Updated
+        );
+        install(&store, MANIFEST_PATHS[1], &damaged_manifest).await;
+
+        let manifest_update = cas_replace_expected(&store, MANIFEST_PATHS[1], expected_manifest, &manifest(owner, 2, &next))
+            .await
+            .expect("successor manifest CAS");
+        assert_eq!(manifest_update, EcstoreConditionalFileUpdate::Mismatch);
+
+        let reopened = disk(&root, "disk").await;
+        let recovered = read_committed(std::slice::from_ref(&reopened), 4096)
+            .await
+            .expect("read committed snapshot after failed successor CAS")
+            .expect("previous committed anchor");
+        assert_eq!(recovered.sequence(), 1);
+        assert_eq!(recovered.slot(), 0);
+        assert_eq!(recovered.payload(), old.as_slice());
+        assert_eq!(
+            EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, PAYLOAD_PATHS[1])
+                .await
+                .expect("successor payload remains non-authoritative")
+                .as_ref(),
+            next.as_slice()
+        );
+        assert_eq!(
+            EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[1])
+                .await
+                .expect("failed successor manifest retained")
+                .as_ref(),
+            damaged_manifest.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn torn_successor_on_one_replica_does_not_hide_previous_anchor_on_peer() {
+        let root = TempDir::new().expect("test directory");
+        let first = disk(&root, "first").await;
+        let second = disk(&root, "second").await;
+        let owner = Uuid::new_v4();
+        let old = payload("old");
+        let next = payload("next");
+        let damaged_manifest = b"damaged successor manifest".to_vec();
+        commit(&first, 0, owner, 1, &old).await;
+        commit(&second, 0, owner, 1, &old).await;
+        install(&first, PAYLOAD_PATHS[1], &next).await;
+        install(&first, MANIFEST_PATHS[1], &damaged_manifest).await;
+
+        let mut stats = SnapshotReadStats::default();
+        let recovered = read_committed_with_stats(&[first, second], 4096, Some(&mut stats))
+            .await
+            .expect("read committed snapshot across torn successor")
+            .expect("previous committed anchor");
+
+        assert_eq!(recovered.sequence(), 1);
+        assert_eq!(recovered.payload(), old.as_slice());
+        assert_eq!(stats.file_reads, 5);
+        assert_eq!(stats.bytes_read, (MANIFEST_LEN * 2) + (old.len() * 2) + damaged_manifest.len());
+        assert_eq!(stats.peak_file_bytes, old.len().max(next.len()).max(MANIFEST_LEN));
+    }
+
+    #[tokio::test]
     async fn manifest_cas_publication_transitions_from_legacy_without_losing_anchor() {
         let root = TempDir::new().expect("test directory");
         let store = disk(&root, "disk").await;
