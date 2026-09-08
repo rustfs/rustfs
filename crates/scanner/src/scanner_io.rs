@@ -181,11 +181,24 @@ struct ScannerPeerDirtyUsageExpectation {
 struct VerifiedRemoteDirtyUsage {
     dirty_buckets: HashSet<String>,
     acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+    peer_count: usize,
+    dirty_peer_count: usize,
 }
 
 struct ScannerBucketScopeResolutionResult {
     scope: ScannerBucketScanScope,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+    distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DistributedSegmentInvalidationEvidence {
+    pub(crate) invalidation_domain: crate::segment_invalidation::SegmentInvalidationDomain,
+    pub(crate) distributed_ec_invalidation: bool,
+    pub(crate) peer_count: usize,
+    pub(crate) dirty_peer_count: usize,
+    pub(crate) same_window_remote_proof: bool,
+    pub(crate) all_peers_bound_to_generation_window: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -209,6 +222,7 @@ pub(crate) struct ScannerSegmentReuseActivationPreflight {
 }
 
 impl ScannerSegmentReuseActivationPreflight {
+    #[cfg(test)]
     pub(crate) fn fail_closed_blockers(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.fail_closed_blockers.iter().filter_map(|blocker| *blocker)
     }
@@ -235,6 +249,7 @@ fn verified_remote_dirty_usage(
             || !snapshot.complete
             || snapshot.pending_bucket_count != u64::try_from(snapshot.buckets.len()).unwrap_or(u64::MAX)
             || (expected.pending && snapshot.pending_bucket_count == 0)
+            || (!expected.pending && snapshot.pending_bucket_count != 0)
         {
             return None;
         }
@@ -260,9 +275,13 @@ fn verified_remote_dirty_usage(
         }
     }
 
+    let peer_count = received_peers.len();
+    let dirty_peer_count = acknowledgements.len();
     (received_peers.len() == expected_peers.len()).then_some(VerifiedRemoteDirtyUsage {
         dirty_buckets,
         acknowledgements,
+        peer_count,
+        dirty_peer_count,
     })
 }
 
@@ -288,8 +307,11 @@ fn resolve_remote_dirty_usage_scope(
     let default_result = |scope: ScannerBucketScanScope| ScannerBucketScopeResolutionResult {
         scope,
         remote_dirty_usage_acknowledgements: Vec::new(),
+        distributed_segment_invalidation_evidence: None,
     };
 
+    let peer_count = remote_dirty_usage.peer_count;
+    let dirty_peer_count = remote_dirty_usage.dirty_peer_count;
     dirty_buckets.extend(remote_dirty_usage.dirty_buckets);
     // Peer snapshots contribute bucket names only; the local prefix scopes
     // would narrow a bucket a peer dirtied elsewhere, so the merged scope
@@ -327,10 +349,21 @@ fn resolve_remote_dirty_usage_scope(
     if scanner_scoped_dirty_usage_ack_exceeds_cost_threshold(&scoped_acknowledgements) {
         return default_result(ScannerBucketScanScope::default());
     }
+    let has_scoped_acknowledgements = !scoped_acknowledgements.is_empty();
 
     ScannerBucketScopeResolutionResult {
         scope,
         remote_dirty_usage_acknowledgements: scoped_acknowledgements,
+        distributed_segment_invalidation_evidence: (dirty_peer_count > 0 && has_scoped_acknowledgements).then_some(
+            DistributedSegmentInvalidationEvidence {
+                invalidation_domain: crate::segment_invalidation::SegmentInvalidationDomain::DistributedEc,
+                distributed_ec_invalidation: true,
+                peer_count,
+                dirty_peer_count,
+                same_window_remote_proof: true,
+                all_peers_bound_to_generation_window: true,
+            },
+        ),
     }
 }
 
@@ -1129,6 +1162,7 @@ pub(crate) struct ScannerCycleResult {
     observational_snapshot_published: bool,
     dirty_usage_clear: Option<DirtyUsageBuckets>,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+    distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
     remote_publication_lease_targets: Vec<(String, String, u64)>,
     failed_dirty_usage: bool,
     pending_maintenance_work: bool,
@@ -1145,6 +1179,7 @@ impl ScannerCycleResult {
             observational_snapshot_published: false,
             dirty_usage_clear,
             remote_dirty_usage_acknowledgements: Vec::new(),
+            distributed_segment_invalidation_evidence: None,
             remote_publication_lease_targets: Vec::new(),
             failed_dirty_usage: false,
             pending_maintenance_work: false,
@@ -1207,6 +1242,15 @@ impl ScannerCycleResult {
     ) -> Self {
         self.publication_expectation = None;
         self.remote_dirty_usage_acknowledgements = acknowledgements;
+        self
+    }
+
+    fn with_distributed_segment_invalidation_evidence(
+        mut self,
+        evidence: Option<DistributedSegmentInvalidationEvidence>,
+    ) -> Self {
+        self.publication_expectation = None;
+        self.distributed_segment_invalidation_evidence = evidence;
         self
     }
 
