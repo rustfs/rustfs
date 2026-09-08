@@ -8220,7 +8220,7 @@ mod tests {
     }
     mod multipart_transport_tests {
         use super::super::super::replication_filemeta_boundary::ObjectPartInfo;
-        use super::super::super::replication_storage_boundary::ObjectIO as _;
+        use super::super::super::replication_storage_boundary::{ObjectIO as _, ReadPlan};
         use super::*;
         use bytes::Bytes;
         use http_body_util::{BodyExt, Full};
@@ -8264,8 +8264,7 @@ mod tests {
                     } else {
                         self.full_reads.fetch_add(1, Ordering::Relaxed);
                     }
-                    let plan =
-                        crate::object_api::ReadPlan::build_for_request(range, &self.info, opts, &HeaderMap::new(), None).await?;
+                    let plan = ReadPlan::build_for_request(range, &self.info, opts, &HeaderMap::new(), None).await?;
                     let start = plan.storage_offset();
                     let end = start + usize::try_from(plan.storage_length()).expect("nonnegative storage length");
                     return plan.into_object_reader(Box::new(std::io::Cursor::new(stored.slice(start..end))), &self.info);

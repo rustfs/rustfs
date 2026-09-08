@@ -610,6 +610,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manifest_cas_publication_transitions_from_legacy_without_losing_anchor() {
+        let root = TempDir::new().expect("test directory");
+        let store = disk(&root, "disk").await;
+        let owner = Uuid::new_v4();
+        let legacy = payload("legacy");
+        let committed = payload("committed");
+        let successor = payload("successor");
+
+        EcstoreDiskAPI::write_all(store.as_ref(), RUSTFS_META_BUCKET, MRF_SCOPED_JOURNAL_PATH, legacy.clone().into())
+            .await
+            .expect("legacy fixture");
+        assert!(
+            matches!(read_recovery_snapshot(std::slice::from_ref(&store), 4096).await.expect("legacy read"), Some(RecoverySnapshot::Legacy(data)) if data == legacy),
+            "complete legacy journal remains the fallback before committed publication"
+        );
+
+        install(&store, PAYLOAD_PATHS[0], &committed).await;
+        assert!(
+            matches!(read_recovery_snapshot(std::slice::from_ref(&store), 4096).await.expect("payload-only read"), Some(RecoverySnapshot::Legacy(data)) if data == legacy),
+            "payload-only successor is not a committed snapshot"
+        );
+
+        install(&store, MANIFEST_PATHS[0], &manifest(owner, 1, &committed)).await;
+        let recovered = read_recovery_snapshot(std::slice::from_ref(&store), 4096)
+            .await
+            .expect("committed read")
+            .expect("committed snapshot");
+        assert!(
+            matches!(recovered, RecoverySnapshot::Committed(snapshot) if snapshot.sequence() == 1 && snapshot.payload() == committed),
+            "manifest CAS completion promotes the committed snapshot above legacy"
+        );
+
+        let stale_manifest = manifest(owner, 2, &successor);
+        let result = EcstoreDiskAPI::compare_and_update_file(
+            store.as_ref(),
+            RUSTFS_META_BUCKET,
+            MANIFEST_PATHS[0],
+            None,
+            Some(EcstoreDiskBytes::copy_from_slice(&stale_manifest)),
+        )
+        .await
+        .expect("stale CAS call");
+        assert_eq!(result, EcstoreConditionalFileUpdate::Mismatch);
+        install(&store, PAYLOAD_PATHS[1], &successor).await;
+        install(&store, MANIFEST_PATHS[1], &stale_manifest[..20]).await;
+
+        let reopened = disk(&root, "disk").await;
+        let recovered = read_recovery_snapshot(std::slice::from_ref(&reopened), 4096)
+            .await
+            .expect("committed anchor after stale successor")
+            .expect("committed snapshot");
+        assert!(
+            matches!(recovered, RecoverySnapshot::Committed(snapshot) if snapshot.sequence() == 1 && snapshot.payload() == committed),
+            "failed or torn successor publication must not fall back to legacy"
+        );
+        assert_eq!(
+            EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[0])
+                .await
+                .expect("old manifest retained")
+                .as_ref(),
+            manifest(owner, 1, &committed)
+        );
+        assert_eq!(
+            EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, MRF_SCOPED_JOURNAL_PATH)
+                .await
+                .expect("legacy bytes retained")
+                .as_ref(),
+            legacy
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_import_requires_complete_consistent_replicas() {
         let root = TempDir::new().expect("test directory");
         let first = disk(&root, "first").await;
