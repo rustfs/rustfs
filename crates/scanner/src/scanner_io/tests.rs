@@ -270,6 +270,8 @@ fn complete_process_local_producer_evidence() -> DirtyUsageProducerEvidence {
         durable_producer_identity: false,
         restart_gap_absent: false,
         generation_window_bound: true,
+        generation_start: 7,
+        generation_end: 7,
     }
 }
 
@@ -1557,6 +1559,12 @@ async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers
 
     let ctx = CancellationToken::new();
     let empty_execution = DataUsageScanPlanDigest([5; 32]);
+    let segment_invalidation_proof = crate::DataUsageSegmentInvalidationProof {
+        process_epoch: scanner_activity_epoch().to_string(),
+        generation_start: 8,
+        generation_end: 8,
+        producer_identity_coverage_complete: true,
+    };
     set.nsscanner_cache(
         ctx.clone(),
         ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default()),
@@ -1577,6 +1585,7 @@ async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers
             pending_maintenance_work: Arc::new(AtomicBool::new(false)),
             cache_cycle_floor: Arc::new(AtomicU64::new(8)),
             cold_zero_walk_reuse_observed: Arc::new(AtomicBool::new(false)),
+            segment_invalidation_proof: Some(segment_invalidation_proof.clone()),
         },
         tx,
         8,
@@ -1586,6 +1595,7 @@ async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers
     .expect("empty set scope should replace its prior nonempty cache");
     let empty = rx.try_recv().expect("empty set snapshot should be published");
     assert_eq!(empty.info.scan_execution_digest, Some(empty_execution));
+    assert_eq!(empty.info.segment_invalidation_proof, Some(segment_invalidation_proof));
     assert!(empty.info.snapshot_complete);
     let root = empty.checked_flatten(DATA_USAGE_ROOT).expect("complete empty root");
     assert_eq!((root.size, root.objects), (0, 0));

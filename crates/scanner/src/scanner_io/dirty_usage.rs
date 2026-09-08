@@ -73,6 +73,21 @@ pub(super) struct DirtyUsageProducerEvidence {
     pub(super) durable_producer_identity: bool,
     pub(super) restart_gap_absent: bool,
     pub(super) generation_window_bound: bool,
+    pub(super) generation_start: u64,
+    pub(super) generation_end: u64,
+}
+
+impl DirtyUsageProducerEvidence {
+    pub(super) fn segment_invalidation_proof(self) -> Option<crate::DataUsageSegmentInvalidationProof> {
+        (self.generation_window_bound && self.producer_identity_coverage_complete).then(|| {
+            crate::DataUsageSegmentInvalidationProof {
+                process_epoch: scanner_activity_epoch().to_string(),
+                generation_start: self.generation_start,
+                generation_end: self.generation_end,
+                producer_identity_coverage_complete: true,
+            }
+        })
+    }
 }
 
 /// A point-in-time view of the local dirty bucket generations.
@@ -727,6 +742,8 @@ pub(super) fn dirty_usage_producer_evidence(snapshot: &DirtyUsageSnapshot) -> Di
         durable_producer_identity: false,
         restart_gap_absent: false,
         generation_window_bound,
+        generation_start: snapshot.generation,
+        generation_end: snapshot.generation,
     }
 }
 

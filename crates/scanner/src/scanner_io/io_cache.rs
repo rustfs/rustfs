@@ -173,6 +173,7 @@ impl ScannerIOCache for SetDisks {
             pending_maintenance_work,
             cache_cycle_floor,
             cold_zero_walk_reuse_observed,
+            segment_invalidation_proof,
         } = scan_plan;
         let scan_plan_digest = scanner_bucket_work_digest(scan_plan_digest, scan_mode, requires_full_scan);
         let bucket_work_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
@@ -243,6 +244,7 @@ impl ScannerIOCache for SetDisks {
                             scan_plan_digest: Some(scan_plan_digest),
                             scan_coverage_digest: Some(bucket_coverage_digest),
                             cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+                            segment_invalidation_proof: segment_invalidation_proof.clone(),
                             scan_bucket_incarnations: current_bucket_incarnations.clone().unwrap_or_default(),
                             ..Default::default()
                         },
@@ -258,6 +260,7 @@ impl ScannerIOCache for SetDisks {
             cache.info.last_update = Some(now);
             cache.info.snapshot_complete = true;
             cache.info.scan_execution_digest = Some(execution_digest);
+            cache.info.segment_invalidation_proof = segment_invalidation_proof.clone();
             cache.info.lkg_snapshot_complete = false;
             cache.info.lkg_next_cycle = None;
             cache.info.lkg_last_update = None;
@@ -539,6 +542,7 @@ impl ScannerIOCache for SetDisks {
                     lkg_last_update: old_cache.info.lkg_last_update,
                     lkg_leader_epoch: old_cache.info.lkg_leader_epoch,
                     lkg_scan_plan_digest: old_cache.info.lkg_scan_plan_digest,
+                    segment_invalidation_proof: None,
                     scan_bucket_incarnations: current_bucket_incarnations.clone().unwrap_or_default(),
                     ..Default::default()
                 },
@@ -1465,6 +1469,7 @@ impl ScannerIOCache for SetDisks {
                 cache.info.last_update.get_or_insert_with(SystemTime::now);
                 cache.info.snapshot_complete = true;
                 cache.info.scan_execution_digest = Some(execution_digest);
+                cache.info.segment_invalidation_proof = segment_invalidation_proof.clone();
                 cache.info.lkg_snapshot_complete = false;
                 cache.info.lkg_next_cycle = None;
                 cache.info.lkg_last_update = None;
@@ -1493,6 +1498,7 @@ impl ScannerIOCache for SetDisks {
             incomplete_scope.info.tier_registry_generation = Some(tier_registry_generation);
             incomplete_scope.info.source = Some(source);
             incomplete_scope.info.snapshot_complete = false;
+            incomplete_scope.info.segment_invalidation_proof = None;
             incomplete_scope.info.scan_plan_digest = Some(scan_plan_digest);
             incomplete_scope.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT;
             if let Err(e) = updates.send(incomplete_scope).await {

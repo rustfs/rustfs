@@ -603,6 +603,7 @@ pub struct ScannerBucketScanPlan {
     pending_maintenance_work: Arc<AtomicBool>,
     cache_cycle_floor: Arc<AtomicU64>,
     cold_zero_walk_reuse_observed: Arc<AtomicBool>,
+    segment_invalidation_proof: Option<crate::DataUsageSegmentInvalidationProof>,
 }
 
 #[derive(Clone, Default)]
