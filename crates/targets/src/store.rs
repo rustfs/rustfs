@@ -919,6 +919,22 @@ where
             }
         }
 
+        // The filename's item count is untrusted. Reject a payload that contains
+        // more items than advertised instead of returning success and allowing the
+        // caller to delete the entry with trailing events still in the file.
+        match deserializer.next() {
+            None => {}
+            Some(Ok(_)) => {
+                return Err(StoreError::Deserialization(format!(
+                    "Batch for key {key} contains more than {} items",
+                    key.item_count
+                )));
+            }
+            Some(Err(e)) => {
+                return Err(StoreError::Deserialization(format!("Failed to deserialize trailing batch item: {e}")));
+            }
+        }
+
         if items.is_empty() && key.item_count > 0 {
             return Err(StoreError::Deserialization("No items found".to_string()));
         }
@@ -1377,6 +1393,39 @@ mod tests {
         // Because get_multiple failed, the batch entry is still on disk for the caller
         // to retry — the missing events are not silently discarded.
         assert!(store.file_path(&key).exists());
+
+        let _ = store.delete();
+    }
+
+    #[test]
+    fn get_multiple_errors_on_batch_with_trailing_items_instead_of_partial_success() {
+        let dir = temp_store_dir("trailing-batch-items");
+        let store = QueueStore::<String>::new_with_compression(&dir, 8, ".test", false);
+        store.open().unwrap();
+
+        let items = vec!["aa".to_string(), "bb".to_string(), "cc".to_string()];
+        let original_key = store.put_multiple(items).unwrap();
+        assert_eq!(original_key.item_count, 3);
+
+        // Keep the three-item payload but make its filename claim that it contains
+        // only two items, simulating a corrupt or otherwise untrusted queue key.
+        let original_path = store.file_path(&original_key);
+        let advertised_key = Key {
+            item_count: 2,
+            ..original_key
+        };
+        let advertised_path = store.file_path(&advertised_key);
+        std::fs::rename(&original_path, &advertised_path).unwrap();
+
+        let err = store.get_multiple(&advertised_key).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Deserialization(_)),
+            "expected Deserialization error, got {err:?}"
+        );
+
+        // Because get_multiple failed, the batch entry remains available for
+        // inspection or recovery instead of being silently discarded.
+        assert!(advertised_path.exists());
 
         let _ = store.delete();
     }
