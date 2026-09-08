@@ -1367,6 +1367,26 @@ def release_bundle_artifact_path(bundle_path: Path, raw_path: object, gate: str,
     return resolved
 
 
+def is_json_artifact_format(value: str) -> bool:
+    normalized = value.lower()
+    return normalized == "json" or normalized.endswith("+json")
+
+
+def validate_release_bundle_json_artifact_payload(path: Path, source_revision: str, gate: str, field: str,
+                                                 run_id: str, window_id: str,
+                                                 artifact_kind: str | None = None) -> None:
+    payload = read_json(path)
+    prefix = f"{gate}.{field}"
+    require(payload.get("evidence_type") == "measured", f"{prefix} JSON artifact must be measured")
+    require(payload.get("source_revision") == source_revision, f"{prefix} JSON artifact source revision mismatch")
+    require(payload.get("run_id") == run_id, f"{prefix} JSON artifact run_id mismatch")
+    require(payload.get("measurement_window_id") == window_id, f"{prefix} JSON artifact measurement window mismatch")
+    require(payload.get("gate") == gate, f"{prefix} JSON artifact gate mismatch")
+    require(payload.get("field") == field, f"{prefix} JSON artifact field mismatch")
+    if artifact_kind is not None:
+        require(payload.get("artifact_kind") == artifact_kind, f"{prefix} JSON artifact kind mismatch")
+
+
 def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, gate: str, field: str,
                                      evidence: dict[str, object]) -> str:
     require(evidence.get("evidence_type") == "measured", f"{gate}.{field} must be measured evidence")
@@ -1382,10 +1402,12 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
     require(isinstance(command, list) and command and
             all(isinstance(part, str) and part.strip() for part in command),
             f"{gate}.{field} missing command provenance")
-    evidence_string(evidence.get("artifact_format"), f"{gate}.{field}.artifact_format",
-                    r"[A-Za-z0-9][A-Za-z0-9._+:-]{1,63}")
+    artifact_format = evidence_string(evidence.get("artifact_format"), f"{gate}.{field}.artifact_format",
+                                      r"[A-Za-z0-9][A-Za-z0-9._+:-]{1,63}")
     artifact = release_bundle_artifact_path(bundle_path, evidence.get("artifact"), gate, field)
     require(sha(evidence.get("sha256")) and digest(artifact) == evidence["sha256"], f"{gate}.{field} artifact hash mismatch")
+    if is_json_artifact_format(artifact_format):
+        validate_release_bundle_json_artifact_payload(artifact, source_revision, gate, field, run_id, window_id)
     summary = evidence.get("summary")
     require(isinstance(summary, str) and summary.strip(), f"{gate}.{field} missing human summary")
     if gate.startswith("P"):
@@ -1466,11 +1488,21 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
             artifact_path = release_bundle_artifact_path(bundle_path, item.get("artifact"), gate, artifact_field)
             require(sha(item.get("sha256")) and digest(artifact_path) == item["sha256"],
                     f"{gate}.{artifact_field} artifact hash mismatch")
-            evidence_string(item.get("artifact_format"), f"{gate}.{artifact_field}.artifact_format",
-                            r"[A-Za-z0-9][A-Za-z0-9._+:-]{1,63}")
+            artifact_format = evidence_string(item.get("artifact_format"), f"{gate}.{artifact_field}.artifact_format",
+                                              r"[A-Za-z0-9][A-Za-z0-9._+:-]{1,63}")
             if "measurement_window_id" in item:
                 require(item["measurement_window_id"] == window_id,
                         f"{gate}.{artifact_field} measurement window mismatch")
+            if is_json_artifact_format(artifact_format):
+                validate_release_bundle_json_artifact_payload(
+                    artifact_path,
+                    source_revision,
+                    gate,
+                    field,
+                    run_id,
+                    window_id,
+                    artifact_kind,
+                )
             if "resolved_samples" in item:
                 evidence_integer(item.get("resolved_samples"), f"{gate}.{artifact_field}.resolved_samples",
                                  0, 2**63 - 1)
@@ -1807,15 +1839,15 @@ class SelfTests(unittest.TestCase):
             fields = {}
             for field in SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate]:
                 artifact = artifact_dir / f"{gate}-{field}.json"
-                write_json(artifact, {"gate": gate, "field": field, "fixture": True})
+                run_id = f"{gate.lower()}-{field.replace('_', '-')}-run"
+                window_id = f"{gate.lower()}-window"
                 duration = 60
                 evidence = {
                     "artifact": artifact.relative_to(bundle_dir).as_posix(),
-                    "sha256": digest(artifact),
                     "evidence_type": "measured",
                     "source_revision": source_revision,
-                    "run_id": f"{gate.lower()}-{field.replace('_', '-')}-run",
-                    "measurement_window_id": f"{gate.lower()}-window",
+                    "run_id": run_id,
+                    "measurement_window_id": window_id,
                     "started_at": started.isoformat().replace("+00:00", "Z"),
                     "command": ["cargo", "nextest", "run", requirement["description"]],
                     "artifact_format": "json",
@@ -1828,6 +1860,17 @@ class SelfTests(unittest.TestCase):
                     duration = 7200
                     evidence["duration_seconds"] = duration
                 evidence["finished_at"] = (started + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z")
+                write_json(artifact, {
+                    "schema": 1,
+                    "evidence_type": "measured",
+                    "source_revision": source_revision,
+                    "run_id": run_id,
+                    "measurement_window_id": window_id,
+                    "gate": gate,
+                    "field": field,
+                    "fixture": True,
+                })
+                evidence["sha256"] = digest(artifact)
                 if gate in ("G03", "G09", "R-L"):
                     evidence["versions"] = ["a" * 40, source_revision]
                     evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
@@ -1861,7 +1904,17 @@ class SelfTests(unittest.TestCase):
                     artifacts = {}
                     for artifact_kind in RELEASE_PROFILE_ARTIFACTS:
                         artifact = artifact_dir / f"{gate}-{field}-{artifact_kind}.json"
-                        write_json(artifact, {"gate": gate, "field": field, "artifact": artifact_kind})
+                        write_json(artifact, {
+                            "schema": 1,
+                            "evidence_type": "measured",
+                            "source_revision": source_revision,
+                            "run_id": run_id,
+                            "measurement_window_id": window_id,
+                            "gate": gate,
+                            "field": field,
+                            "artifact_kind": artifact_kind,
+                            "fixture": True,
+                        })
                         artifacts[artifact_kind] = {
                             "artifact": artifact.relative_to(bundle_dir).as_posix(),
                             "sha256": digest(artifact),
@@ -2011,12 +2064,71 @@ class SelfTests(unittest.TestCase):
                 self.assertFalse(status["release_approved"])
                 self.assertTrue(any(expected in error for error in status["rejected_gates"]["G01"]), fault)
 
+    def test_scanner_heal_release_bundle_requires_json_artifact_provenance(self) -> None:
+        for fault, mutation, evidence_path, expected in (
+            (
+                "summary-window",
+                lambda payload: payload.update({"measurement_window_id": "p1-stale-window"}),
+                ("P1", "profile_evidence"),
+                "JSON artifact measurement window mismatch",
+            ),
+            (
+                "summary-source",
+                lambda payload: payload.update({"source_revision": "c" * 40}),
+                ("G09", "mixed_version_reader_evidence"),
+                "JSON artifact source revision mismatch",
+            ),
+            (
+                "profile-kind",
+                lambda payload: payload.update({"artifact_kind": "flamegraph"}),
+                ("P1", "profile_evidence", "allocation-profile"),
+                "JSON artifact kind mismatch",
+            ),
+            (
+                "profile-run",
+                lambda payload: payload.update({"run_id": "p1-different-profile-run"}),
+                ("P1", "profile_evidence", "rss-samples"),
+                "JSON artifact run_id mismatch",
+            ),
+        ):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+                data = read_json(bundle)
+                gate, field, *artifact_kind = evidence_path
+                evidence = data["gates"][gate]["evidence_fields"][field]
+                if artifact_kind:
+                    item = evidence["profile_artifacts"][artifact_kind[0]]
+                else:
+                    item = evidence
+                artifact = bundle.parent / item["artifact"]
+                payload = read_json(artifact)
+                mutation(payload)
+                write_json(artifact, payload)
+                item["sha256"] = digest(artifact)
+                write_json(bundle, data)
+
+                with mock.patch("subprocess.check_output", return_value="b" * 40):
+                    status = scanner_heal_release_bundle_status(root, bundle)
+                self.assertEqual(status["decision"], "blocked")
+                self.assertFalse(status["release_approved"])
+                self.assertTrue(any(expected in error for error in status["rejected_gates"][gate]), fault)
+
     def test_scanner_heal_release_bundle_requires_same_gate_measurement_window(self) -> None:
         for gate, field in (("G14", "multi_pool_evidence"), ("P1", "profile_evidence"), ("P3", "heal_capacity_measurement")):
             with self.subTest(gate=gate), tempfile.TemporaryDirectory() as tmp:
                 root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
                 data = read_json(bundle)
-                data["gates"][gate]["evidence_fields"][field]["measurement_window_id"] = f"{gate.lower()}-different-window"
+                evidence = data["gates"][gate]["evidence_fields"][field]
+                evidence["measurement_window_id"] = f"{gate.lower()}-different-window"
+                artifacts = [evidence]
+                if "profile_artifacts" in evidence:
+                    artifacts.extend(evidence["profile_artifacts"].values())
+                for item in artifacts:
+                    artifact = bundle.parent / item["artifact"]
+                    payload = read_json(artifact)
+                    payload["measurement_window_id"] = evidence["measurement_window_id"]
+                    write_json(artifact, payload)
+                    item["sha256"] = digest(artifact)
                 write_json(bundle, data)
 
                 with mock.patch("subprocess.check_output", return_value="b" * 40):
