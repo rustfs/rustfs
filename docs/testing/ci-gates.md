@@ -274,14 +274,23 @@ The bundle checker is intentionally stricter than the case checker. It requires
 schema 2 registry metadata, `evidence: measured`, the current checkout revision,
 all G01-G14/P1-P4/R-E/R-D/R-L gates, per-gate `status: pass`, lane identity,
 relative artifact paths, matching SHA256 hashes, and non-empty summaries. It
-also binds the hard evidence shape for the release claims: mixed-version gates
-must name at least two participating versions, crash/durable replay gates must
-include crash-boundary evidence, G14 must record EC8+4 with at least three nodes
-and four drives per node plus multi-set and multi-pool evidence, performance
-gates need measured durations, P3's pressure run needs at least two hours, and
-P1 needs a symbolized profile summary with resolved samples. Missing, synthetic,
-stale, tampered, undersized, or topology-mismatched evidence returns a compact
-blocked or invalid JSON result and a nonzero exit.
+also binds each evidence field to its own run provenance: `source_revision`,
+`run_id`, `measurement_window_id`, timezone-qualified `started_at` and
+`finished_at`, command arguments, and artifact format. The field
+`source_revision` must match the bundle revision, and measured performance
+duration cannot exceed the recorded run window.
+
+The hard evidence shape remains claim-specific: mixed-version gates must name at
+least two participating versions, crash/durable replay gates must include
+crash-boundary evidence, G14 must record EC8+4 with at least three nodes and four
+drives per node plus multi-set and multi-pool evidence, performance gates need
+measured durations, P3's pressure run needs at least two hours, and P1 needs a
+symbolized profile summary with resolved samples. Every G14 field and every
+performance gate's fields must also share one `measurement_window_id`, so EC8+4,
+multi-set/multi-pool, ABBA, throughput, and profiling artifacts cannot be
+stitched together from unrelated runs. Missing, synthetic, stale, tampered,
+undersized, or topology-mismatched evidence returns a compact blocked or invalid
+JSON result and a nonzero exit.
 
 This command validates the evidence package; it does not create evidence. A
 handwritten JSON file, a synthetic harness pass, a single focused case, or a
