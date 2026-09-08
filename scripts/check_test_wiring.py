@@ -1340,9 +1340,12 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
         evidence_integer(evidence.get("duration_seconds"), f"{gate}.{field}.duration_seconds", 1, 86400)
     if gate in ("G03", "G09", "R-L"):
         versions = evidence.get("versions")
-        require(isinstance(versions, list) and
-                len({version for version in versions if isinstance(version, str) and version.strip()}) >= 2,
-                f"{gate}.{field} requires mixed-version evidence")
+        revisions = {
+            version for version in versions
+            if isinstance(version, str) and re.fullmatch(r"[0-9a-f]{40}", version) is not None
+        } if isinstance(versions, list) else set()
+        require(len(revisions) >= 2, f"{gate}.{field} requires at least two 40-hex mixed-version revisions")
+        require(source_revision in revisions, f"{gate}.{field} must include the tested source revision")
     if gate in ("G04", "G07", "R-E", "R-L"):
         crash_points = evidence.get("crash_points")
         require(isinstance(crash_points, list) and crash_points,
@@ -1717,7 +1720,7 @@ class SelfTests(unittest.TestCase):
                     evidence["duration_seconds"] = duration
                 evidence["finished_at"] = (started + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z")
                 if gate in ("G03", "G09", "R-L"):
-                    evidence["versions"] = ["previous", "candidate"]
+                    evidence["versions"] = ["a" * 40, source_revision]
                 if gate in ("G04", "G07", "R-E", "R-L"):
                     evidence["crash_points"] = ["before-commit"]
                 if gate == "G14" and field == "ec8_4_evidence":
@@ -1782,6 +1785,8 @@ class SelfTests(unittest.TestCase):
             ("duration", "P3", "two_hour_pressure_measurement", lambda item: item.update({"duration_seconds": 7199}), "two hours"),
             ("profile", "P1", "profile_evidence", lambda item: item.pop("resolved_samples"), "resolved_samples"),
             ("versions", "G09", "mixed_version_reader_evidence", lambda item: item.update({"versions": [1, 2]}), "mixed-version"),
+            ("placeholder-versions", "G09", "mixed_version_writer_evidence", lambda item: item.update({"versions": ["previous", "candidate"]}), "40-hex"),
+            ("missing-tested-revision", "R-L", "migration_gap_evidence", lambda item: item.update({"versions": ["a" * 40, "c" * 40]}), "tested source revision"),
         ):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
                 root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
