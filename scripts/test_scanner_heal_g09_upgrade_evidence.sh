@@ -25,7 +25,7 @@ fi
 rg -q -- "--sha256 must be a 64-character lowercase hex digest" "$TMP_DIR/bad-sha.err"
 
 VALID_SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-bash "$RUNNER" \
+env -u CARGO_TARGET_DIR bash "$RUNNER" \
   --dry-run \
   --out-dir "$TMP_DIR/evidence" \
   --source-dir "$TMP_DIR/source" \

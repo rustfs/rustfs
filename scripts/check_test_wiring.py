@@ -1517,11 +1517,63 @@ def is_json_artifact_format(value: str) -> bool:
     return normalized == "json" or normalized.endswith("+json")
 
 
+def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple[str, ...]:
+    fields: list[str] = []
+    if gate in ("G03", "G09", "R-L"):
+        fields.extend(("versions", "mixed_version_role"))
+    if gate in ("G04", "G07", "R-E", "R-L"):
+        fields.append("crash_points")
+    if gate == "G03":
+        fields.append("scoped_ack_cases")
+        if field == "durable_root_publication_proof":
+            fields.extend(("root_cas_observed", "root_readback_observed"))
+        if field == "scoped_ack_request_identity":
+            fields.append("whole_cycle_fallback_observed")
+    if gate == "G04" and field == "root_floor_intent_crash_evidence":
+        fields.extend(("durable_intent_cases", "persist_failure_blocks_acceptance"))
+    if gate == "G07":
+        fields.append({
+            "mrf_responsibility_oracle": "mrf_responsibility_cases",
+            "commit_boundary_crash_matrix": "commit_crash_cases",
+        }[field])
+    if gate == "G08":
+        fields.append({
+            "mrf_capacity_evidence": "capacity_cases",
+            "disk_full_matrix": "disk_full_cases",
+            "replica_loss_matrix": "replica_loss_cases",
+        }[field])
+    if gate == "G09":
+        fields.append("mixed_version_cases")
+        if field == "rollback_payload_evidence":
+            fields.append("rollback_payload_replayed")
+    if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
+        fields.extend(("replayed_records", "responsibility_anchor_retained", "successor_snapshot_published"))
+    if gate == "P4" and field == "retained_responsibility_evidence":
+        fields.extend((
+            "duration_seconds",
+            "retained_responsibility_cases",
+            "retention_window_seconds",
+            "idle_cleanup_observed",
+            "verified_proof_discharge_observed",
+        ))
+    if gate == "P4" and field == "mrf_cleanup_gc_soak_evidence":
+        fields.extend((
+            "duration_seconds",
+            "cleanup_gc_cases",
+            "verified_idle_gc_observed",
+            "pending_responsibilities_after_gc",
+            "stale_journals_after_gc",
+        ))
+    return tuple(dict.fromkeys(fields))
+
+
 def validate_release_bundle_json_artifact_payload(path: Path, source_revision: str, gate: str, field: str,
                                                  run_id: str, window_id: str,
                                                  artifact_kind: str | None = None) -> None:
     payload = read_json(path)
     prefix = f"{gate}.{field}"
+    for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
+        require(payload.get(marker) is not True, f"{prefix} JSON artifact is {marker}")
     require(payload.get("evidence_type") == "measured", f"{prefix} JSON artifact must be measured")
     require(payload.get("source_revision") == source_revision, f"{prefix} JSON artifact source revision mismatch")
     require(payload.get("run_id") == run_id, f"{prefix} JSON artifact run_id mismatch")
@@ -1530,6 +1582,62 @@ def validate_release_bundle_json_artifact_payload(path: Path, source_revision: s
     require(payload.get("field") == field, f"{prefix} JSON artifact field mismatch")
     if artifact_kind is not None:
         require(payload.get("artifact_kind") == artifact_kind, f"{prefix} JSON artifact kind mismatch")
+    mirror_fields = release_bundle_json_artifact_mirrored_fields(gate, field)
+    for mirror_field in mirror_fields:
+        require(mirror_field in payload, f"{prefix} JSON artifact missing {mirror_field}")
+    if not mirror_fields:
+        return
+    validate_release_bundle_domain_evidence(gate, field, payload)
+    if gate in ("G03", "G09", "R-L"):
+        versions = payload.get("versions")
+        require(isinstance(versions, list) and
+                len(set(versions)) >= 2 and
+                all(isinstance(version, str) and re.fullmatch(r"[0-9a-f]{40}", version) is not None
+                    for version in versions),
+                f"{prefix} JSON artifact requires mixed-version evidence")
+        require(source_revision in versions, f"{prefix} JSON artifact versions omit tested source revision")
+        expected_role = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
+        require(payload.get("mixed_version_role") == expected_role,
+                f"{prefix} JSON artifact mixed-version role must be {expected_role}")
+    if gate in ("G04", "G07", "R-E", "R-L"):
+        crash_points = payload.get("crash_points")
+        require(isinstance(crash_points, list) and crash_points,
+                f"{prefix} JSON artifact requires crash-boundary evidence")
+    if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
+        evidence_integer(payload.get("replayed_records"), f"{prefix} JSON artifact replayed_records", 1, 2**63 - 1)
+        require(payload.get("responsibility_anchor_retained") is True,
+                f"{prefix} JSON artifact requires retained MRF responsibility anchors")
+        require(payload.get("successor_snapshot_published") is True,
+                f"{prefix} JSON artifact requires successor snapshot publication evidence")
+    if gate == "P4" and field == "mrf_cleanup_gc_soak_evidence":
+        release_bundle_exact_strings(
+            payload.get("cleanup_gc_cases"),
+            SCANNER_HEAL_RELEASE_MRF_CLEANUP_GC_SOAK_CASES,
+            f"{prefix} JSON artifact cleanup_gc_cases",
+        )
+        require(payload.get("verified_idle_gc_observed") is True,
+                f"{prefix} JSON artifact requires verified idle GC evidence")
+        require(payload.get("pending_responsibilities_after_gc") == 0,
+                f"{prefix} JSON artifact requires zero pending responsibilities after GC")
+        require(payload.get("stale_journals_after_gc") == 0,
+                f"{prefix} JSON artifact requires zero stale journals after GC")
+    if gate == "G07":
+        case_field = {
+            "mrf_responsibility_oracle": "mrf_responsibility_cases",
+            "commit_boundary_crash_matrix": "commit_crash_cases",
+        }[field]
+        cases = evidence_string_list(payload.get(case_field), f"{prefix} JSON artifact {case_field}")
+        missing_cases = sorted(set(SCANNER_HEAL_RELEASE_G07_REQUIRED_CASES[field]) - set(cases))
+        require(not missing_cases, f"{prefix} JSON artifact missing cases: {', '.join(missing_cases)}")
+    if gate == "G08":
+        case_field = {
+            "mrf_capacity_evidence": "capacity_cases",
+            "disk_full_matrix": "disk_full_cases",
+            "replica_loss_matrix": "replica_loss_cases",
+        }[field]
+        cases = evidence_string_list(payload.get(case_field), f"{prefix} JSON artifact {case_field}")
+        missing_cases = sorted(set(SCANNER_HEAL_RELEASE_G08_REQUIRED_CASES[field]) - set(cases))
+        require(not missing_cases, f"{prefix} JSON artifact missing cases: {', '.join(missing_cases)}")
 
 
 def release_bundle_bool_true(value: object, name: str) -> None:
@@ -2548,17 +2656,6 @@ class SelfTests(unittest.TestCase):
                     evidence.update({"completed_heal_objects": 1, "duplicate_task_count": 0})
                 if gate == "P3" and field == "recovery_window_measurement":
                     evidence.update({"pressure_recovery_window_seconds": 5, "lock_hold_p95_ms": 0})
-                write_json(artifact, {
-                    "schema": 1,
-                    "evidence_type": "measured",
-                    "source_revision": source_revision,
-                    "run_id": run_id,
-                    "measurement_window_id": window_id,
-                    "gate": gate,
-                    "field": field,
-                    "fixture": True,
-                })
-                evidence["sha256"] = digest(artifact)
                 if gate in ("G03", "G09", "R-L"):
                     evidence["versions"] = ["a" * 40, source_revision]
                     evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
@@ -2659,8 +2756,8 @@ class SelfTests(unittest.TestCase):
                     evidence["saved_bytes"] = 2048
                     artifacts = {}
                     for artifact_kind in RELEASE_PROFILE_ARTIFACTS:
-                        artifact = artifact_dir / f"{gate}-{field}-{artifact_kind}.json"
-                        write_json(artifact, {
+                        profile_artifact = artifact_dir / f"{gate}-{field}-{artifact_kind}.json"
+                        write_json(profile_artifact, {
                             "schema": 1,
                             "evidence_type": "measured",
                             "source_revision": source_revision,
@@ -2669,11 +2766,10 @@ class SelfTests(unittest.TestCase):
                             "gate": gate,
                             "field": field,
                             "artifact_kind": artifact_kind,
-                            "fixture": True,
                         })
                         artifacts[artifact_kind] = {
-                            "artifact": artifact.relative_to(bundle_dir).as_posix(),
-                            "sha256": digest(artifact),
+                            "artifact": profile_artifact.relative_to(bundle_dir).as_posix(),
+                            "sha256": digest(profile_artifact),
                             "artifact_format": "json",
                         }
                     evidence["profile_artifacts"] = artifacts
@@ -2703,6 +2799,19 @@ class SelfTests(unittest.TestCase):
                     evidence["fault_modes"] = ["process-restart", "process-crash-restart"]
                     evidence["recovery_p95_ms"] = 500.0
                     evidence["recovery_p99_ms"] = 1000.0
+                artifact_payload = {
+                    "schema": 1,
+                    "evidence_type": "measured",
+                    "source_revision": source_revision,
+                    "run_id": run_id,
+                    "measurement_window_id": window_id,
+                    "gate": gate,
+                    "field": field,
+                }
+                for mirror_field in release_bundle_json_artifact_mirrored_fields(gate, field):
+                    artifact_payload[mirror_field] = evidence[mirror_field]
+                write_json(artifact, artifact_payload)
+                evidence["sha256"] = digest(artifact)
                 fields[field] = evidence
             gates[gate] = {
                 "status": "pass",
@@ -3062,6 +3171,24 @@ class SelfTests(unittest.TestCase):
                 lambda payload: payload.update({"run_id": "p1-different-profile-run"}),
                 ("P1", "profile_evidence", "rss-samples"),
                 "JSON artifact run_id mismatch",
+            ),
+            (
+                "fixture-marker",
+                lambda payload: payload.update({"fixture": True}),
+                ("G08", "disk_full_matrix"),
+                "JSON artifact is fixture",
+            ),
+            (
+                "g08-case-mirror",
+                lambda payload: payload["disk_full_cases"].remove("manifest-write-enospc"),
+                ("G08", "disk_full_matrix"),
+                "JSON artifact missing cases",
+            ),
+            (
+                "p4-gc-mirror",
+                lambda payload: payload.update({"pending_responsibilities_after_gc": 1}),
+                ("P4", "mrf_cleanup_gc_soak_evidence"),
+                "JSON artifact requires zero pending responsibilities",
             ),
         ):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
