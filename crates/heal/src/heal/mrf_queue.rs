@@ -294,7 +294,11 @@ fn decode_one(data: &[u8]) -> Option<(MrfIntent, usize)> {
     };
     let attempts = data[3];
     let enqueued_at_ms = u64::from_le_bytes(data[4..12].try_into().ok()?);
-    let has_version = data[12] != 0;
+    let has_version = match data[12] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     let mut cursor = MRF_RECORD_FIXED_HEAD;
     let version_id = if has_version {
         if data.len() < cursor + 16 {
@@ -718,7 +722,7 @@ fn replay_must_retain_journal(
 #[derive(Clone, Copy)]
 enum ReplayCleanup {
     Legacy,
-    Committed { sequence: u64 },
+    Committed { owner: Uuid, sequence: u64 },
 }
 
 struct ReplaySource {
@@ -731,6 +735,7 @@ async fn read_replay_source(max_bytes: usize) -> Result<Option<ReplaySource>, sn
         return Ok(Some(ReplaySource {
             data: committed.payload().to_vec(),
             cleanup: ReplayCleanup::Committed {
+                owner: committed.owner(),
                 sequence: committed.sequence(),
             },
         }));
@@ -754,18 +759,20 @@ async fn read_replay_source(max_bytes: usize) -> Result<Option<ReplaySource>, sn
 async fn delete_replay_source(cleanup: ReplayCleanup, max_bytes: usize) -> bool {
     let committed_deleted = match cleanup {
         ReplayCleanup::Legacy => true,
-        ReplayCleanup::Committed { sequence } => match snapshot::delete_committed_snapshots_through(sequence, max_bytes).await {
-            Ok(deleted) => deleted,
-            Err(err) => {
-                tracing::warn!(
-                    target: "rustfs::heal::mrf",
-                    error = %err,
-                    sequence,
-                    "MRF committed replay checkpoint cleanup failed"
-                );
-                false
+        ReplayCleanup::Committed { owner, sequence } => {
+            match snapshot::delete_committed_snapshots_through(owner, sequence, max_bytes).await {
+                Ok(deleted) => deleted,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "rustfs::heal::mrf",
+                        error = %err,
+                        sequence,
+                        "MRF committed replay checkpoint cleanup failed"
+                    );
+                    false
+                }
             }
-        },
+        }
     };
     committed_deleted && delete_journals().await
 }
@@ -1342,6 +1349,25 @@ mod tests {
         let (decoded, truncated) = decode_journal(&corrupt);
         assert!(decoded.is_empty());
         assert_eq!(truncated, corrupt.len());
+    }
+
+    #[test]
+    fn journal_rejects_unknown_version_presence_flag_even_with_valid_crc() {
+        let mut versioned = intent("rollback-bucket", "object", 0);
+        versioned.version_id = Some([9; 16]);
+        let mut buf = Vec::new();
+        assert!(encode_intent(&versioned, &mut buf));
+
+        buf[12] = 2;
+        let crc_offset = buf.len() - 4;
+        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+        hasher.update(&buf[..crc_offset]);
+        let checksum = u32::try_from(hasher.finalize()).expect("CRC32 fits");
+        buf[crc_offset..].copy_from_slice(&checksum.to_le_bytes());
+
+        let (decoded, truncated) = decode_journal(&buf);
+        assert!(decoded.is_empty(), "unknown boolean encodings are not rollback-compatible payloads");
+        assert_eq!(truncated, buf.len());
     }
 
     #[test]
