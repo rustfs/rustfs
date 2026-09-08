@@ -42,6 +42,11 @@ SCANNER_HEAL_RELEASE_REQUIRED_GATES = (
     "P1", "P2", "P3", "P4", "R-E", "R-D", "R-L",
 )
 SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
+    "G08": (
+        "mrf_capacity_evidence",
+        "disk_full_matrix",
+        "replica_loss_matrix",
+    ),
     "G03": (
         "durable_root_publication_proof",
         "scoped_ack_request_identity",
@@ -94,6 +99,23 @@ SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS = {
     ("G07", "commit_boundary_crash_matrix"),
     ("P4", "mrf_replay_cost_measurement"),
     ("P4", "retained_responsibility_evidence"),
+}
+SCANNER_HEAL_RELEASE_G08_REQUIRED_CASES = {
+    "mrf_capacity_evidence": (
+        "queue-count-limit",
+        "journal-byte-limit",
+        "committed-payload-byte-limit",
+    ),
+    "disk_full_matrix": (
+        "payload-write-enospc",
+        "manifest-write-enospc",
+        "journal-write-enospc",
+    ),
+    "replica_loss_matrix": (
+        "single-replica-loss",
+        "quorum-minus-one",
+        "all-replicas-unavailable",
+    ),
 }
 SCHEDULED_ALERT_WORKFLOWS = tuple(
     item["workflow"]
@@ -971,6 +993,14 @@ def evidence_timestamp(value: object, name: str) -> datetime:
     return parsed
 
 
+def evidence_string_list(value: object, name: str) -> list[str]:
+    require(
+        isinstance(value, list) and value and all(isinstance(item, str) and item.strip() for item in value),
+        f"{name} must be a non-empty string list",
+    )
+    return value
+
+
 def scanner_heal_registry_schema(registry: dict[str, object]) -> int:
     return evidence_integer(registry.get("schema"), "registry schema", 1, SCANNER_HEAL_REGISTRY_SCHEMA_MAX)
 
@@ -1387,6 +1417,15 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
                 f"{gate}.{field} requires retained MRF responsibility anchors")
         require(evidence.get("successor_snapshot_published") is True,
                 f"{gate}.{field} requires successor snapshot publication evidence")
+    if gate == "G08":
+        case_field = {
+            "mrf_capacity_evidence": "capacity_cases",
+            "disk_full_matrix": "disk_full_cases",
+            "replica_loss_matrix": "replica_loss_cases",
+        }[field]
+        cases = evidence_string_list(evidence.get(case_field), f"{gate}.{field}.{case_field}")
+        missing_cases = sorted(set(SCANNER_HEAL_RELEASE_G08_REQUIRED_CASES[field]) - set(cases))
+        require(not missing_cases, f"{gate}.{field} missing cases: {', '.join(missing_cases)}")
     if gate == "G14":
         if field == "same_window_field_evidence":
             required_fields = set(SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS["G14"]) - {field}
@@ -1798,6 +1837,13 @@ class SelfTests(unittest.TestCase):
                     evidence["replayed_records"] = 2
                     evidence["responsibility_anchor_retained"] = True
                     evidence["successor_snapshot_published"] = True
+                if gate == "G08":
+                    case_field = {
+                        "mrf_capacity_evidence": "capacity_cases",
+                        "disk_full_matrix": "disk_full_cases",
+                        "replica_loss_matrix": "replica_loss_cases",
+                    }[field]
+                    evidence[case_field] = list(SCANNER_HEAL_RELEASE_G08_REQUIRED_CASES[field])
                 if gate == "G14" and field == "ec8_4_evidence":
                     evidence["topology"] = {"erasure": "EC8+4", "nodes": 3, "drives_per_node": 4}
                 if gate == "G14" and field == "same_window_field_evidence":
@@ -1903,6 +1949,9 @@ class SelfTests(unittest.TestCase):
             ),
             ("versions", "G09", "mixed_version_reader_evidence", lambda item: item.update({"versions": [1, 2]}), "mixed-version"),
             ("stale-versions", "G09", "mixed_version_writer_evidence", lambda item: item.update({"versions": ["a" * 40, "c" * 40]}), "tested source revision"),
+            ("g08-capacity-cases", "G08", "mrf_capacity_evidence", lambda item: item.update({"capacity_cases": ["queue-count-limit"]}), "missing cases"),
+            ("g08-disk-full-cases", "G08", "disk_full_matrix", lambda item: item.pop("disk_full_cases"), "non-empty string list"),
+            ("g08-replica-loss-cases", "G08", "replica_loss_matrix", lambda item: item.update({"replica_loss_cases": ["single-replica-loss"]}), "missing cases"),
             ("mrf-records", "G07", "mrf_responsibility_oracle", lambda item: item.pop("replayed_records"), "replayed_records"),
             ("mrf-anchor", "G07", "commit_boundary_crash_matrix", lambda item: item.update({"responsibility_anchor_retained": False}), "retained MRF responsibility anchors"),
             ("mrf-successor", "P4", "retained_responsibility_evidence", lambda item: item.pop("successor_snapshot_published"), "successor snapshot"),
@@ -2045,13 +2094,14 @@ class SelfTests(unittest.TestCase):
             self.assertIn("scheduler-pressure", status["pending_lanes"])
             requirements, _, _ = scanner_heal_release_requirements(read_json(root / ".config/scanner-heal-required-tests.json"))
             self.assertIn("durable_root_publication_proof", requirements["G03"]["evidence_fields"])
+            self.assertIn("disk_full_matrix", requirements["G08"]["evidence_fields"])
             self.assertIn("mixed_version_writer_evidence", requirements["G09"]["evidence_fields"])
 
     def test_scanner_heal_required_evidence_fields_cannot_be_removed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, run_dir = self.scanner_heal_fixture(Path(tmp))
             registry = read_json(root / ".config/scanner-heal-required-tests.json")
-            for gate in ("G03", "G09"):
+            for gate in ("G03", "G08", "G09"):
                 for requirement in registry["release_requirements"]:
                     if requirement["gate"] == gate:
                         requirement["evidence_fields"] = []
