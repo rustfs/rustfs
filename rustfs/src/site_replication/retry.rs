@@ -396,7 +396,15 @@ pub(crate) async fn enqueue_site_replication_retry_event_for_generation(
     }
 }
 
-pub(crate) fn record_iam_snapshot_retries(state: &mut SiteReplicationState, local_peer: &PeerInfo, reason: &str) -> S3Result<()> {
+/// Returns the number of peers whose snapshot entry is escalated and therefore
+/// will not carry this scheduling: the marker records a deletion that a
+/// snapshot cannot replay, and only a repair settles it, so clearing it to make
+/// the entry drainable again would drop that liability.
+pub(crate) fn record_iam_snapshot_retries(
+    state: &mut SiteReplicationState,
+    local_peer: &PeerInfo,
+    reason: &str,
+) -> S3Result<usize> {
     let peers = state
         .peers
         .values()
@@ -405,10 +413,18 @@ pub(crate) fn record_iam_snapshot_retries(state: &mut SiteReplicationState, loca
         })
         .cloned()
         .collect::<Vec<_>>();
+    let mut escalated = 0usize;
     for peer in peers {
+        if state.retry_queue.iter().any(|event| {
+            retry_event_matches(event, &peer, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH)
+                && event.last_error == SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER
+        }) {
+            escalated += 1;
+            continue;
+        }
         ensure_site_replication_retry_event(&mut state.retry_queue, &peer, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH, reason)?;
     }
-    Ok(())
+    Ok(escalated)
 }
 
 /// Schedule one collapsed full-IAM snapshot per remote peer after a bulk
@@ -420,7 +436,18 @@ pub(crate) async fn enqueue_site_replication_iam_snapshot(reason: &str) -> S3Res
     }
     let local_peer = current_local_runtime_peer(&state);
     let reason = reason.to_string();
-    update_site_replication_state(move |state| record_iam_snapshot_retries(state, &local_peer, &reason)).await
+    let escalated = update_site_replication_state(move |state| record_iam_snapshot_retries(state, &local_peer, &reason)).await?;
+    if escalated > 0 {
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            escalated,
+            result = "iam_snapshot_not_scheduled_for_escalated_peer",
+            "site replication peers hold an escalated IAM entry; the snapshot waits for a repair"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) const SITE_REPLICATION_PEER_IAM_ITEM_WIRE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/iam-item";
