@@ -3054,6 +3054,13 @@ fn peer_endpoint_refresh_requested(state: &SiteReplicationState, incoming: &Peer
 /// them. Re-running without the flag keeps the pinned value - that is the
 /// documented way to redrive a stuck refresh - but a re-run that asks for a
 /// different value must be rejected rather than accepted and ignored.
+/// The one construction of the concurrent-change error: every writer of a
+/// pending refresh re-checks the journal inside its own transaction and
+/// reports the same condition when it no longer owns it.
+fn endpoint_refresh_state_changed() -> S3Error {
+    s3_error!(InvalidRequest, "endpoint target refresh state changed during update")
+}
+
 fn endpoint_refresh_ilm_override_conflicts(persisted: &PendingEndpointRefresh, requested: Option<bool>) -> bool {
     requested.is_some() && requested != persisted.ilm_expiry_override
 }
@@ -3068,7 +3075,7 @@ fn merge_pending_endpoint_refresh(
             || latest.peer.deployment_id != candidate.peer.deployment_id
             || !peer_connection_settings_match(&latest.peer, &candidate.peer)
         {
-            return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
+            return Err(endpoint_refresh_state_changed());
         }
         latest
     } else {
@@ -5312,7 +5319,7 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
         // every round, and the writes below are bucket metadata, not state.
         let state = load_site_replication_state().await?;
         let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
-            return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
+            return Err(endpoint_refresh_state_changed());
         };
         let target_state = endpoint_refresh_target_state(&state, &pending);
         let local_peer = current_local_runtime_peer(&target_state);
@@ -5354,7 +5361,7 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
             }
         }
         if postwrite != EndpointRefreshPostwriteState::Current {
-            return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
+            return Err(endpoint_refresh_state_changed());
         }
     }
 
@@ -7704,7 +7711,7 @@ impl Operation for SiteReplicationEditHandler {
                 let acked_pending_id = pending_id.clone();
                 let service_account_access_key = update_site_replication_state(move |state| {
                     let Some(pending) = pending_endpoint_refresh(state).filter(|pending| pending.id == acked_pending_id) else {
-                        return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
+                        return Err(endpoint_refresh_state_changed());
                     };
                     let pending = merge_pending_endpoint_refresh(state, &pending, acked_deployment_ids)?;
                     set_pending_endpoint_refresh(state, pending)?;
@@ -7718,7 +7725,7 @@ impl Operation for SiteReplicationEditHandler {
                 refresh_bucket_targets_after_endpoint_edit(&pending_id, &service_account_secret_key).await?;
                 update_site_replication_state(move |state| {
                     let Some(pending) = pending_endpoint_refresh(state).filter(|pending| pending.id == pending_id) else {
-                        return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
+                        return Err(endpoint_refresh_state_changed());
                     };
                     *state = edit_state(std::mem::take(state), pending.peer, pending.ilm_expiry_override);
                     clear_pending_endpoint_refresh(state);
