@@ -1474,6 +1474,62 @@ mod tests {
     }
 
     #[test]
+    fn rollback_legacy_payload_omits_scoped_only_responsibilities() {
+        let mut scoped = intent("rollback-bucket", "scoped-only-object", 0);
+        scoped.kind = MrfKind::PartialWrite;
+        scoped.scope = Some(rustfs_common::mrf_channel::MrfScope {
+            pool_index: 3,
+            set_index: 7,
+        });
+        let compat = intent("rollback-bucket", "v1-compatible-object", 0);
+
+        let mut runtime = MrfRuntime {
+            queue: MrfQueue::new(4, usize::MAX),
+            config: MrfConsumerConfig::default(),
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: 1,
+            new_since_flush: 0,
+            dirty: true,
+            journal_on_disk: false,
+            retain_replay_journal: false,
+            durable_replay_anchors: Vec::new(),
+            replay_cleanup: None,
+            runtime_checkpoint: None,
+            backoff_until: None,
+        };
+        assert_eq!(runtime.queue.try_push_typed(scoped.clone()), MrfQueuePushResult::Enqueued);
+        assert_eq!(runtime.queue.try_push_typed(compat.clone()), MrfQueuePushResult::Enqueued);
+
+        let (authoritative, legacy) = runtime.snapshot();
+        let (authoritative_decoded, authoritative_truncated) = decode_journal(&authoritative);
+        assert_eq!(authoritative_truncated, 0);
+        assert_eq!(authoritative_decoded.len(), 2);
+        assert!(
+            authoritative_decoded
+                .iter()
+                .any(|intent| intent.object.as_ref() == "scoped-only-object" && intent.scope == scoped.scope),
+            "new readers must retain the scoped partial-write responsibility"
+        );
+
+        let (legacy_decoded, legacy_truncated) = decode_journal(&legacy);
+        assert_eq!(legacy_truncated, 0);
+        assert_eq!(legacy_decoded.len(), 1, "rollback payload must contain one v1-compatible record");
+        let legacy_record = legacy_decoded.first().expect("one rollback-compatible record");
+        assert_eq!(legacy_record.bucket, compat.bucket);
+        assert_eq!(legacy_record.object, compat.object);
+        assert_eq!(legacy_record.version_id, compat.version_id);
+        assert_eq!(legacy_record.kind, compat.kind);
+        assert_eq!(legacy_record.scope, None);
+        assert_eq!(legacy_record.attempts, compat.attempts);
+        assert!(
+            !legacy
+                .windows(b"scoped-only-object".len())
+                .any(|window| window == b"scoped-only-object"),
+            "legacy rollback bytes must not disguise a scoped-only responsibility as an unscoped record"
+        );
+    }
+
+    #[test]
     fn mrf_dedupe_failure_releases_key_for_retry() {
         let mut queue = MrfQueue::new(1, usize::MAX);
         assert_eq!(queue.try_push_typed(intent("bucket", "object", 0)), MrfQueuePushResult::Enqueued);
