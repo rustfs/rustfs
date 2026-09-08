@@ -410,6 +410,11 @@ where
     .await;
     let remote_dirty_usage_acknowledgements = scope_resolution.remote_dirty_usage_acknowledgements;
     let distributed_segment_invalidation_evidence = scope_resolution.distributed_segment_invalidation_evidence;
+    let segment_reuse_activation_preflight = scanner_segment_reuse_activation_preflight_for_cycle(
+        &dirty_usage_snapshot,
+        distributed_segment_invalidation_evidence,
+        false,
+    );
     let scan_scope = scope_resolution.scope;
     #[cfg(test)]
     if let Some(observer) = resolved_scope_observer {
@@ -473,6 +478,7 @@ where
             .with_observational_snapshot_published(observational_snapshot_published)
             .with_remote_publication_lease_targets(remote_publication_lease_targets)
             .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
+            .with_segment_reuse_activation_preflight(segment_reuse_activation_preflight)
             .with_publication_expectation(publication_expectation));
     }
 
@@ -786,6 +792,7 @@ where
         .with_remote_publication_lease_targets(remote_publication_lease_targets)
         .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
         .with_distributed_segment_invalidation_evidence(distributed_segment_invalidation_evidence)
+        .with_segment_reuse_activation_preflight(segment_reuse_activation_preflight)
         .with_failed_dirty_usage(!failed_buckets.is_empty())
         .with_pending_maintenance_work(pending_maintenance_work)
         .with_required_cycle_floor(required_cycle_floor)

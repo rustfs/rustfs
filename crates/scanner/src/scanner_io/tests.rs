@@ -149,6 +149,70 @@ fn scanner_segment_reuse_activation_requires_every_preflight_proof() {
     assert_segment_reuse_activation_blocked_by(missing_distributed_invalidation, "distributed_without_peer_invalidation");
 }
 
+#[test]
+fn scanner_segment_reuse_activation_preflight_for_cycle_reports_cycle_inputs_without_activation() {
+    let dirty_usage_snapshot = DirtyUsageSnapshot {
+        buckets: Arc::new(DirtyUsageBuckets::from([("photos".to_string(), 7)])),
+        scopes: Arc::new(DirtyUsageBucketScopes::default()),
+        generation: 7,
+        covers_all_pending: true,
+    };
+    let distributed_evidence = DistributedSegmentInvalidationEvidence {
+        invalidation_domain: crate::segment_invalidation::SegmentInvalidationDomain::DistributedEc,
+        distributed_ec_invalidation: true,
+        peer_count: 2,
+        dirty_peer_count: 1,
+        same_window_remote_proof: true,
+        all_peers_bound_to_generation_window: true,
+    };
+
+    let preflight = scanner_segment_reuse_activation_preflight_for_cycle(&dirty_usage_snapshot, Some(distributed_evidence), true);
+
+    assert!(!preflight.production_activation);
+    assert!(!preflight.scanner_segment_reuse_activated);
+    assert_eq!(
+        preflight.fail_closed_blockers().collect::<Vec<_>>(),
+        vec!["missing_producer_identity", "restart_gap"]
+    );
+}
+
+#[test]
+fn scanner_segment_reuse_activation_preflight_for_cycle_blocks_unbounded_inputs() {
+    let dirty_usage_snapshot = DirtyUsageSnapshot {
+        buckets: Arc::new(DirtyUsageBuckets::default()),
+        scopes: Arc::new(DirtyUsageBucketScopes::default()),
+        generation: u64::MAX,
+        covers_all_pending: false,
+    };
+
+    let preflight = scanner_segment_reuse_activation_preflight_for_cycle(&dirty_usage_snapshot, None, false);
+
+    assert!(!preflight.production_activation);
+    assert!(!preflight.scanner_segment_reuse_activated);
+    assert_eq!(
+        preflight.fail_closed_blockers().collect::<Vec<_>>(),
+        SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS
+    );
+}
+
+#[test]
+fn scanner_cycle_result_returns_segment_reuse_activation_preflight() {
+    let proof = ScannerSegmentReuseActivationProof {
+        production_activation: true,
+        durable_producer_identity: true,
+        restart_gap_absent: true,
+        generation_window_bound: true,
+        overflow_absent: true,
+        cold_zero_walk_oracle: true,
+        distributed_peer_invalidation: true,
+    };
+    let preflight = scanner_segment_reuse_activation_preflight_from_proof(proof);
+
+    let result = ScannerCycleResult::new(ScannerCycleStatus::Complete, None).with_segment_reuse_activation_preflight(preflight);
+
+    assert_eq!(result.segment_reuse_activation_preflight, preflight);
+}
+
 fn assert_segment_reuse_activation_blocked_by(proof: ScannerSegmentReuseActivationProof, blocker: &'static str) {
     let preflight = scanner_segment_reuse_activation_preflight_from_proof(proof);
 
