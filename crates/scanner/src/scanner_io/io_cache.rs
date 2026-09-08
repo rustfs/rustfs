@@ -172,6 +172,7 @@ impl ScannerIOCache for SetDisks {
             bucket_failures,
             pending_maintenance_work,
             cache_cycle_floor,
+            cold_zero_walk_reuse_observed,
         } = scan_plan;
         let scan_plan_digest = scanner_bucket_work_digest(scan_plan_digest, scan_mode, requires_full_scan);
         let bucket_work_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
@@ -219,6 +220,9 @@ impl ScannerIOCache for SetDisks {
             },
             current_bucket_incarnations.as_ref(),
         );
+        let cold_zero_walk_reuse_candidate = scoped_scan.as_ref().is_some_and(|prepared| {
+            old_cache.info.next_cycle < want_cycle && !prepared.buckets.is_empty() && prepared.buckets.len() < all_buckets.len()
+        });
         let mut scoped_cache = scoped_scan.map(|mut prepared| {
             buckets = prepared.buckets;
             prepared.cache.info.scan_coverage_digest = Some(bucket_coverage_digest);
@@ -1466,6 +1470,9 @@ impl ScannerIOCache for SetDisks {
                 cache.info.lkg_last_update = None;
                 cache.info.lkg_leader_epoch = None;
                 cache.info.lkg_scan_plan_digest = None;
+                if cold_zero_walk_reuse_candidate {
+                    cold_zero_walk_reuse_observed.store(true, Ordering::Release);
+                }
                 cache.clone()
             };
             let _ = persist_and_publish_cache_snapshot(
