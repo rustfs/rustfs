@@ -99,6 +99,11 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
                 "attempt_cost_per_healed_object": [None, 1.2, 1.3, None],
                 "candidate_attempt_cost_per_healed_object": 1.3,
             },
+            "w09": {
+                "heal_start_p95_ms": [42.0, 40.0, 41.0, 43.0],
+                "heal_duplicate_task_count": [0, 0, 0, 0],
+                "heal_lock_hold_p95_ms": [7.0, 6.0, 6.5, 7.5],
+            },
         }
         self.report = {
             "status": "pass",
@@ -150,6 +155,8 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         result = summary.build_summary(args)
         self.assertEqual(result["verdict"], "PASS")
         self.assertEqual(result["abba"]["provenance"]["manifest_sha256"], sha(self.abba / "manifest.json"))
+        self.assertEqual(result["abba"]["w09_duplicate_task_count"], 0.0)
+        self.assertEqual(result["abba"]["w09_worst_heal_start_p95_ms"], 43.0)
         self.assertEqual(result["cache_cost"]["max_save_body_amplification"], 2.0)
 
     def test_synthetic_report_fails_as_performance_conclusion(self):
@@ -265,6 +272,32 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
                     "markdown_out": None,
                 })
                 with self.assertRaisesRegex(ValueError, "W10/W11|performance evidence|length mismatch|above maximum"):
+                    summary.build_summary(args)
+
+    def test_passing_abba_report_requires_w09_evidence(self):
+        cases = {
+            "missing": lambda row: row.pop("w09"),
+            "start": lambda row: row["w09"].pop("heal_start_p95_ms"),
+            "zero start": lambda row: row["w09"].update(heal_start_p95_ms=[0, 40.0, 41.0, 43.0]),
+            "duplicates": lambda row: row["w09"].update(heal_duplicate_task_count=[0, 1, 0, 0]),
+            "unknown duplicates": lambda row: row["w09"].update(heal_duplicate_task_count=[None, 0, 0, 0]),
+            "lock": lambda row: row["w09"].pop("heal_lock_hold_p95_ms"),
+            "zero lock": lambda row: row["w09"].update(heal_lock_hold_p95_ms=[0, 6.0, 6.5, 7.5]),
+            "length": lambda row: row["w09"].update(heal_lock_hold_p95_ms=[1]),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(fault=name):
+                self.setUp()
+                mutate(self.report["comparisons"][0])
+                self.write_inputs()
+                args = type("Args", (), {
+                    "abba_dir": self.abba,
+                    "cache_cost_log": None,
+                    "require_cache_cost": False,
+                    "json_out": None,
+                    "markdown_out": None,
+                })
+                with self.assertRaisesRegex(ValueError, "W09|performance evidence|above maximum|length mismatch|must be measured"):
                     summary.build_summary(args)
 
     def test_passing_measured_report_requires_release_evidence_manifest(self):

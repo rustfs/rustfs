@@ -26,6 +26,7 @@ METRICS = (
     "heal_mainline_throttle_delayed",
     "heal_lock_wait_p99_ms", "heal_attempts", "heal_attempt_failures",
     "heal_retry_attempts",
+    "heal_start_p95_ms", "heal_duplicate_task_count", "heal_lock_hold_p95_ms",
 )
 REPEATABILITY_LIMIT = Decimal("0.05")
 P2_WORK_MULTIPLE_LIMIT = Decimal("1.2")
@@ -382,6 +383,9 @@ def validate_result(result, request, expected):
             "foreground pressure high samples exceed samples")
     require(metrics["heal_attempt_failures"] <= metrics["heal_attempts"], "heal failures exceed attempts")
     require(metrics["heal_retry_attempts"] <= metrics["heal_attempts"], "heal retries exceed attempts")
+    require(metrics["heal_duplicate_task_count"] == 0, "duplicate heal task admission")
+    require(metrics["heal_start_p95_ms"] > 0, "zero heal start p95")
+    require(metrics["heal_lock_hold_p95_ms"] > 0, "zero heal lock hold p95")
     require(metrics["errors"] == 0, "workload request errors")
     require(metrics["cold_walk_objects"] <= metrics["walk_objects"], "cold walk exceeds total walk")
     require(result.get("oracle") == expected, "object/version/byte oracle mismatch")
@@ -550,6 +554,17 @@ def evaluate(cells):
                                 "candidate_attempt_cost_per_healed_object": (
                                     None if not candidate_attempt_costs else float(max(candidate_attempt_costs))
                                 ),
+                            },
+                            "w09": {
+                                "heal_start_p95_ms": [
+                                    cell["result"]["metrics"]["heal_start_p95_ms"] for cell in group
+                                ],
+                                "heal_duplicate_task_count": [
+                                    cell["result"]["metrics"]["heal_duplicate_task_count"] for cell in group
+                                ],
+                                "heal_lock_hold_p95_ms": [
+                                    cell["result"]["metrics"]["heal_lock_hold_p95_ms"] for cell in group
+                                ],
                             }})
     return ("fail" if failed else "inconclusive" if inconclusive else "pass"), comparisons
 
