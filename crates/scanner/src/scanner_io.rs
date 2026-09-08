@@ -98,6 +98,24 @@ const METRIC_SCANNER_SET_SCANS_QUEUED: &str = "rustfs_scanner_set_scans_queued";
 const METRIC_SCANNER_DISK_BUCKET_SCANS_ACTIVE: &str = "rustfs_scanner_disk_bucket_scans_active";
 const METRIC_SCANNER_DISK_BUCKET_SCANS_QUEUED: &str = "rustfs_scanner_disk_bucket_scans_queued";
 
+pub(crate) const SCANNER_SEGMENT_ACTIVATION_PROOF_INPUTS: [&str; 7] = [
+    "source",
+    "bucket_incarnation",
+    "key_format",
+    "baseline_scan_plan_digest",
+    "process_epoch",
+    "generation_window",
+    "producer_identities",
+];
+pub(crate) const SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS: [&str; 6] = [
+    "missing_producer_identity",
+    "restart_gap",
+    "generation_gap",
+    "overflow",
+    "missing_cold_zero_walk_oracle",
+    "distributed_without_peer_invalidation",
+];
+
 pub type DirtyUsageBuckets = HashMap<String, u64>;
 
 #[derive(Clone, Debug)]
@@ -168,6 +186,32 @@ struct VerifiedRemoteDirtyUsage {
 struct ScannerBucketScopeResolutionResult {
     scope: ScannerBucketScanScope,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScannerSegmentReuseActivationProof {
+    pub(crate) production_activation: bool,
+    pub(crate) durable_producer_identity: bool,
+    pub(crate) restart_gap_absent: bool,
+    pub(crate) generation_window_bound: bool,
+    pub(crate) overflow_absent: bool,
+    pub(crate) cold_zero_walk_oracle: bool,
+    pub(crate) distributed_peer_invalidation: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScannerSegmentReuseActivationPreflight {
+    pub(crate) production_activation: bool,
+    pub(crate) scanner_segment_reuse_activated: bool,
+    pub(crate) proof_inputs: &'static [&'static str],
+    pub(crate) fail_closed_checks: &'static [&'static str],
+    pub(crate) fail_closed_blockers: [Option<&'static str>; 6],
+}
+
+impl ScannerSegmentReuseActivationPreflight {
+    pub(crate) fn fail_closed_blockers(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.fail_closed_blockers.iter().filter_map(|blocker| *blocker)
+    }
 }
 
 fn verified_remote_dirty_usage(
@@ -406,10 +450,39 @@ fn scoped_scan_scope_from_dirty_buckets(
     ScannerBucketScanScope::from_dirty_buckets(selected_buckets, selected_bucket_prefixes, baseline_scan_plan_digest)
 }
 
-fn scanner_segment_reuse_activated() -> bool {
+fn scanner_segment_reuse_activation_preflight() -> ScannerSegmentReuseActivationPreflight {
     // Production segment reuse stays disabled until a durable mutation-stream
     // proof satisfies the segment invalidation contract.
-    false
+    scanner_segment_reuse_activation_preflight_from_proof(ScannerSegmentReuseActivationProof::default())
+}
+
+fn scanner_segment_reuse_activation_preflight_from_proof(
+    proof: ScannerSegmentReuseActivationProof,
+) -> ScannerSegmentReuseActivationPreflight {
+    ScannerSegmentReuseActivationPreflight {
+        production_activation: proof.production_activation,
+        scanner_segment_reuse_activated: proof.production_activation
+            && proof.durable_producer_identity
+            && proof.restart_gap_absent
+            && proof.generation_window_bound
+            && proof.overflow_absent
+            && proof.cold_zero_walk_oracle
+            && proof.distributed_peer_invalidation,
+        proof_inputs: &SCANNER_SEGMENT_ACTIVATION_PROOF_INPUTS,
+        fail_closed_checks: &SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS,
+        fail_closed_blockers: [
+            (!proof.durable_producer_identity).then_some("missing_producer_identity"),
+            (!proof.restart_gap_absent).then_some("restart_gap"),
+            (!proof.generation_window_bound).then_some("generation_gap"),
+            (!proof.overflow_absent).then_some("overflow"),
+            (!proof.cold_zero_walk_oracle).then_some("missing_cold_zero_walk_oracle"),
+            (!proof.distributed_peer_invalidation).then_some("distributed_without_peer_invalidation"),
+        ],
+    }
+}
+
+fn scanner_segment_reuse_activated() -> bool {
+    scanner_segment_reuse_activation_preflight().scanner_segment_reuse_activated
 }
 
 pub(crate) fn is_scanner_metadata_corrupt_error(err: &StorageError) -> bool {

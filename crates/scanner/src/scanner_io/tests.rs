@@ -85,6 +85,78 @@ fn scanner_activity_preflight_defers_a_temporarily_offline_peer() {
     }
 }
 
+#[test]
+fn scanner_segment_reuse_activation_preflight_reports_release_gate_inputs() {
+    let preflight = scanner_segment_reuse_activation_preflight();
+
+    assert!(!preflight.production_activation);
+    assert!(!preflight.scanner_segment_reuse_activated);
+    assert!(!scanner_segment_reuse_activated());
+    assert_eq!(preflight.proof_inputs, SCANNER_SEGMENT_ACTIVATION_PROOF_INPUTS);
+    assert_eq!(preflight.fail_closed_checks, SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS);
+    assert_eq!(
+        preflight.fail_closed_blockers().collect::<Vec<_>>(),
+        SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS
+    );
+}
+
+#[test]
+fn scanner_segment_reuse_activation_requires_every_preflight_proof() {
+    let complete_proof = ScannerSegmentReuseActivationProof {
+        production_activation: true,
+        durable_producer_identity: true,
+        restart_gap_absent: true,
+        generation_window_bound: true,
+        overflow_absent: true,
+        cold_zero_walk_oracle: true,
+        distributed_peer_invalidation: true,
+    };
+
+    let mut production_disabled = complete_proof;
+    production_disabled.production_activation = false;
+    let preflight = scanner_segment_reuse_activation_preflight_from_proof(production_disabled);
+    assert!(!preflight.production_activation);
+    assert!(!preflight.scanner_segment_reuse_activated);
+    assert_eq!(preflight.fail_closed_blockers().collect::<Vec<_>>(), Vec::<&str>::new());
+
+    let preflight = scanner_segment_reuse_activation_preflight_from_proof(complete_proof);
+    assert!(preflight.production_activation);
+    assert!(preflight.scanner_segment_reuse_activated);
+    assert_eq!(preflight.fail_closed_blockers().collect::<Vec<_>>(), Vec::<&str>::new());
+
+    let mut missing_identity = complete_proof;
+    missing_identity.durable_producer_identity = false;
+    assert_segment_reuse_activation_blocked_by(missing_identity, "missing_producer_identity");
+
+    let mut restart_gap = complete_proof;
+    restart_gap.restart_gap_absent = false;
+    assert_segment_reuse_activation_blocked_by(restart_gap, "restart_gap");
+
+    let mut generation_gap = complete_proof;
+    generation_gap.generation_window_bound = false;
+    assert_segment_reuse_activation_blocked_by(generation_gap, "generation_gap");
+
+    let mut overflow = complete_proof;
+    overflow.overflow_absent = false;
+    assert_segment_reuse_activation_blocked_by(overflow, "overflow");
+
+    let mut missing_cold_oracle = complete_proof;
+    missing_cold_oracle.cold_zero_walk_oracle = false;
+    assert_segment_reuse_activation_blocked_by(missing_cold_oracle, "missing_cold_zero_walk_oracle");
+
+    let mut missing_distributed_invalidation = complete_proof;
+    missing_distributed_invalidation.distributed_peer_invalidation = false;
+    assert_segment_reuse_activation_blocked_by(missing_distributed_invalidation, "distributed_without_peer_invalidation");
+}
+
+fn assert_segment_reuse_activation_blocked_by(proof: ScannerSegmentReuseActivationProof, blocker: &'static str) {
+    let preflight = scanner_segment_reuse_activation_preflight_from_proof(proof);
+
+    assert!(preflight.production_activation);
+    assert!(!preflight.scanner_segment_reuse_activated);
+    assert_eq!(preflight.fail_closed_blockers().collect::<Vec<_>>(), vec![blocker]);
+}
+
 async fn setup_two_pool_scanner_store() -> (tempfile::TempDir, Arc<ECStore>) {
     init_ecstore_config_for_scanner_tests();
     let temp_dir = tempfile::tempdir().expect("multi-pool scanner test directory should be created");
