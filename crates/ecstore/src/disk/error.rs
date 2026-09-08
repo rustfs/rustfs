@@ -1265,6 +1265,49 @@ mod tests {
         assert!(!bad_request.is_retryable_internode_write_failure());
     }
 
+    #[test]
+    fn test_internode_http_clone_preserves_retryability_status_and_context() {
+        use http::StatusCode;
+        use rustfs_rio::InternodeHttpErrorKind::{ConnectionRefused, ConnectionReset, HttpStatus, Unknown};
+
+        for (kind, retryable) in [
+            (ConnectionRefused, true),
+            (ConnectionReset, true),
+            (HttpStatus(StatusCode::TOO_MANY_REQUESTS), true),
+            (HttpStatus(StatusCode::SERVICE_UNAVAILABLE), true),
+            (HttpStatus(StatusCode::CONFLICT), true),
+            (Unknown, false),
+            (HttpStatus(StatusCode::BAD_REQUEST), false),
+            (HttpStatus(StatusCode::INTERNAL_SERVER_ERROR), false),
+        ] {
+            let original = DiskError::from(rustfs_rio::new_test_internode_http_io_error(kind));
+            assert_eq!(original.internode_http_error_kind(), Some(kind));
+            assert_eq!(original.is_retryable_internode_write_failure(), retryable);
+
+            let cloned = original.clone();
+            assert_eq!(cloned, original, "clone must preserve the error bucket for {kind:?}");
+            assert_eq!(
+                cloned.is_retryable_internode_write_failure(),
+                retryable,
+                "clone changed retryability for {kind:?}"
+            );
+            assert_eq!(cloned.internode_http_error_kind(), Some(kind));
+            if let HttpStatus(status) = kind {
+                assert!(cloned.is_internode_http_status(status.as_u16()));
+            }
+            let DiskError::Io(io_error) = &cloned else {
+                panic!("unmarked internode error must remain Io: {cloned:?}");
+            };
+            let source = io_error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                .expect("clone must retain the structured internode error");
+            assert_eq!(source.context().method(), "PUT");
+            assert_eq!(source.context().target(), "/rustfs/rpc/put_file_stream");
+            assert_eq!(source.context().operation(), Some(INTERNODE_OPERATION_PUT_FILE_STREAM));
+        }
+    }
+
     #[tokio::test]
     async fn read_stream_conflict_is_not_a_retryable_put_file_failure() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1309,9 +1352,55 @@ mod tests {
                 !error.is_retryable_internode_write_failure(),
                 "read-operation 409 must not trigger put-file retry"
             );
+            let cloned = error.clone();
+            let reduced = crate::disk::error_reduce::reduce_write_quorum_errs(&[Some(error)], &[], 1)
+                .expect("the read conflict must remain the dominant error");
+            for preserved in [&cloned, &reduced] {
+                assert!(
+                    !preserved.is_retryable_internode_write_failure(),
+                    "cloning or reducing a read conflict must not turn it into a PUT retry"
+                );
+                assert!(preserved.is_internode_http_status(409));
+                let DiskError::Io(io_error) = preserved else {
+                    panic!("read conflict must remain Io: {preserved:?}");
+                };
+                let source = io_error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                    .expect("read conflict must retain its request context");
+                assert_eq!(source.context().method(), "GET");
+                assert_eq!(source.context().target(), "/rustfs/rpc/read_file_stream");
+                assert_eq!(
+                    source.context().operation(),
+                    Some(rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_READ_FILE_STREAM)
+                );
+            }
         })
         .await
         .expect("isolated read-conflict test must finish within its budget");
+    }
+
+    #[test]
+    fn test_internode_http_clone_preserves_outer_io_kind_and_message() {
+        let source = rustfs_rio::new_test_internode_http_io_error(InternodeHttpErrorKind::ConnectionReset)
+            .into_inner()
+            .expect("the internode helper must provide a typed source");
+        let original_io = io::Error::new(io::ErrorKind::InvalidData, source);
+        let message = original_io.to_string();
+        let original = DiskError::from(original_io);
+        assert_eq!(original.internode_http_error_kind(), Some(InternodeHttpErrorKind::ConnectionReset));
+        assert!(original.is_retryable_internode_write_failure());
+
+        let cloned = original.clone();
+        let reduced = crate::disk::error_reduce::reduce_write_quorum_errs(&[Some(original)], &[], 1)
+            .expect("the wrapped internode error must remain the dominant error");
+        for preserved in [&cloned, &reduced] {
+            let DiskError::Io(io_error) = preserved else {
+                panic!("the wrapped error must remain Io: {preserved:?}");
+            };
+            assert_eq!(io_error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(io_error.to_string(), message);
+        }
     }
 
     #[test]
@@ -1325,6 +1414,17 @@ mod tests {
         assert_eq!(file_missing, DiskError::FileNotFound);
         assert_eq!(volume_missing, DiskError::VolumeNotFound);
         assert!(matches!(unmarked_server_error, DiskError::Io(_)));
+        for missing in [file_missing, volume_missing] {
+            assert_eq!(missing.clone(), missing);
+            assert_eq!(
+                crate::disk::error_reduce::reduce_write_quorum_errs(
+                    &[Some(missing.clone()), Some(missing.clone()), None],
+                    &[],
+                    2
+                ),
+                Some(missing)
+            );
+        }
     }
 
     #[test]
