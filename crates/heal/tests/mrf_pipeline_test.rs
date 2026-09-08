@@ -29,6 +29,7 @@ use rustfs_heal::heal::{
     storage::{ECStoreHealStorage, HealStorageAPI},
 };
 use serial_test::serial;
+use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::{
     fs::{File, OpenOptions},
@@ -48,6 +49,10 @@ use storage_api::endpoint_index::{Endpoint, EndpointServerPools, Endpoints, Pool
 const META_BUCKET: &str = ".rustfs.sys";
 const JOURNAL_REL: &str = "buckets/.heal/mrf/journal.bin";
 const SCOPED_JOURNAL_REL: &str = "buckets/.heal/mrf/journal-scoped.bin";
+const COMMITTED_PAYLOAD_REL: &str = ".heal-mrf-snapshot.0.bin";
+const COMMITTED_MANIFEST_REL: &str = ".heal-mrf-commit.0.bin";
+const COMMITTED_MAGIC: &[u8; 8] = b"RFMRFC01";
+const COMMITTED_MANIFEST_LEN: usize = 8 + 1 + 16 + 8 + 8 + 32 + 32;
 
 async fn heal_env() -> (Vec<std::path::PathBuf>, Arc<dyn HealStorageAPI>) {
     heal_env_at(None).await
@@ -195,6 +200,29 @@ fn write_journal_to_disks(disk_paths: &[std::path::PathBuf], data: &[u8]) {
     write_journal_path_to_disks(disk_paths, JOURNAL_REL, data);
 }
 
+fn committed_manifest(owner: uuid::Uuid, sequence: u64, payload: &[u8]) -> Vec<u8> {
+    let mut manifest = Vec::with_capacity(COMMITTED_MANIFEST_LEN);
+    manifest.extend_from_slice(COMMITTED_MAGIC);
+    manifest.push(1);
+    manifest.extend_from_slice(owner.as_bytes());
+    manifest.extend_from_slice(&sequence.to_le_bytes());
+    manifest.extend_from_slice(
+        &u64::try_from(payload.len())
+            .expect("fixture payload length fits")
+            .to_le_bytes(),
+    );
+    manifest.extend_from_slice(&Sha256::digest(payload));
+    manifest.extend_from_slice(&Sha256::digest(&manifest));
+    assert_eq!(manifest.len(), COMMITTED_MANIFEST_LEN, "committed fixture manifest length");
+    manifest
+}
+
+fn write_committed_snapshot_to_disks(disk_paths: &[std::path::PathBuf], sequence: u64, payload: &[u8]) {
+    let manifest = committed_manifest(uuid::Uuid::new_v4(), sequence, payload);
+    write_journal_path_to_disks(disk_paths, COMMITTED_PAYLOAD_REL, payload);
+    write_journal_path_to_disks(disk_paths, COMMITTED_MANIFEST_REL, &manifest);
+}
+
 fn journal_exists_on_all_disks(disk_paths: &[std::path::PathBuf], relative_path: &str) -> bool {
     disk_paths
         .iter()
@@ -255,11 +283,12 @@ async fn decode_failure_intent_maps_to_urgent_mrf_heal_request() {
 }
 
 /// A journal left behind by a previous process must be replayed into the
-/// manager queue and then removed, and a torn tail must not block replay of
-/// the intact records.
+/// manager queue, and a torn tail must not block replay of the intact records.
+/// The partial-write record keeps the legacy journal as the durable anchor
+/// until an exact verified repair proof can discharge it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn journal_replay_arms_intents_and_deletes_the_file() {
+async fn journal_replay_arms_intents_and_retains_unproven_partial_write_anchor() {
     let (disk_paths, storage) = heal_env().await;
 
     // The journal reader resolves disks through the process-local disk map;
@@ -285,19 +314,89 @@ async fn journal_replay_arms_intents_and_deletes_the_file() {
     assert!(
         disk_paths
             .iter()
-            .all(|path| !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()),
-        "the journal file must be removed after a successful replay"
+            .all(|path| Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()),
+        "partial-write replay must retain the legacy journal until durable proof"
     );
     assert!(
         disk_paths
             .iter()
             .all(|path| !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()),
-        "the authoritative journal file must also be removed after replay"
+        "missing authoritative journal remains absent"
     );
 
     let snapshot = manager.operations_snapshot().await;
     assert_eq!(snapshot.queued_by_priority.urgent, 1, "the decode-failure record must replay as Urgent");
     assert!(snapshot.queued_by_priority.normal >= 1, "the partial-write record must replay as Normal");
+}
+
+/// A committed checkpoint published by the new two-slot writer is the
+/// authoritative startup snapshot. Legacy mirrors are fallback-only and must
+/// not be merged with or preferred over the committed epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn committed_snapshot_replay_takes_precedence_over_stale_legacy_mirror() {
+    let (disk_paths, storage) = heal_env().await;
+    register_local_disks(&disk_paths, "mrf-committed-replay-test").await;
+
+    let committed = scoped_journal_record(3, "committed-bucket", "committed-object", Some([9u8; 16]), 0, 0, 0);
+    let stale_legacy = journal_record(1, "legacy-bucket", "legacy-object", None, 0);
+    write_committed_snapshot_to_disks(&disk_paths, 7, &committed);
+    write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &stale_legacy);
+    write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &stale_legacy);
+
+    let manager = make_manager(storage);
+    let replayed = mrf_queue::replay_journal_once(&manager).await;
+    assert_eq!(replayed, 1, "only the committed snapshot epoch may replay");
+
+    let snapshot = manager.operations_snapshot().await;
+    assert_eq!(snapshot.queued_by_source.mrf, 1);
+    assert_eq!(
+        snapshot.queued_by_priority.normal, 1,
+        "the committed partial-write record must replay instead of the stale legacy decode-failure"
+    );
+    assert_eq!(
+        snapshot.queued_by_priority.urgent, 0,
+        "stale legacy decode-failure records must not be mixed into committed replay"
+    );
+    assert!(
+        journal_exists_on_all_disks(&disk_paths, COMMITTED_MANIFEST_REL),
+        "the committed checkpoint remains until the accepted partial-write has proof"
+    );
+}
+
+/// A damaged committed checkpoint is ambiguous: replay must not fall back to
+/// older legacy bytes or delete any recovery anchor until another process can
+/// publish a valid successor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn damaged_committed_snapshot_blocks_legacy_fallback_and_retains_anchors() {
+    let (disk_paths, storage) = heal_env().await;
+    register_local_disks(&disk_paths, "mrf-damaged-committed-replay-test").await;
+
+    let committed = scoped_journal_record(3, "damaged-committed-bucket", "committed-object", Some([8u8; 16]), 0, 0, 0);
+    let stale_legacy = journal_record(1, "damaged-legacy-bucket", "legacy-object", None, 0);
+    write_journal_path_to_disks(&disk_paths, COMMITTED_PAYLOAD_REL, &committed);
+    let mut manifest = committed_manifest(uuid::Uuid::new_v4(), 9, &committed);
+    manifest[25] ^= 1;
+    write_journal_path_to_disks(&disk_paths, COMMITTED_MANIFEST_REL, &manifest);
+    write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &stale_legacy);
+    write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &stale_legacy);
+
+    let manager = make_manager(storage);
+    let replayed = mrf_queue::replay_journal_once(&manager).await;
+    assert_eq!(replayed, 0, "damaged committed state must fail closed");
+    assert_eq!(
+        manager.operations_snapshot().await.queued_by_source.mrf,
+        0,
+        "stale legacy bytes must not be replayed when committed state is ambiguous"
+    );
+    assert!(
+        journal_exists_on_all_disks(&disk_paths, COMMITTED_MANIFEST_REL)
+            && journal_exists_on_all_disks(&disk_paths, COMMITTED_PAYLOAD_REL)
+            && journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &stale_legacy)
+            && journal_matches_on_all_disks(&disk_paths, JOURNAL_REL, &stale_legacy),
+        "all recovery anchors must remain after a fail-closed committed read"
+    );
 }
 
 /// A canonical snapshot and its compatibility mirror may differ after a
@@ -322,21 +421,24 @@ async fn authoritative_journal_is_not_merged_with_legacy_mirror() {
     assert_eq!(snapshot.queued_by_source.mrf, 1);
     assert!(
         disk_paths.iter().all(|path| {
-            !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-                && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+            Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+                && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
         }),
-        "replay cleanup must remove both journal paths"
+        "accepted replay responsibilities remain anchored until a verified repair proof"
     );
 
     // A scoped-only snapshot is valid during a rollout where no legacy
     // compatibility mirror was written. Missing legacy files must not leave
     // the runtime in a permanent cleanup-retry state.
+    let (disk_paths, storage) = heal_env().await;
+    register_local_disks(&disk_paths, "mrf-scoped-authoritative-test").await;
+    let manager = make_manager(storage);
     let scoped_only = journal_record(1, "scoped-only-bucket", "scoped-only-object", None, 0);
     write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &scoped_only);
     assert_eq!(mrf_queue::replay_journal_once(&manager).await, 1);
     assert!(disk_paths.iter().all(|path| {
         !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-            && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+            && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
     }));
 
     let scoped_v2 = scoped_journal_record(1, "scoped-v2-bucket", "scoped-v2-object", None, 0, 3, 7);
@@ -350,12 +452,12 @@ async fn authoritative_journal_is_not_merged_with_legacy_mirror() {
     );
     assert_eq!(
         manager.operations_snapshot().await.queued_by_source.mrf,
-        3,
-        "only the three authoritative/scoped-only epochs should have reached the manager"
+        2,
+        "only the scoped-only and scoped-v2 authoritative epochs should have reached the manager"
     );
     assert!(disk_paths.iter().all(|path| {
-        !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-            && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+        Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+            && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
     }));
 }
 
@@ -400,10 +502,13 @@ async fn authoritative_journal_replay_preserves_kind_and_scope_identity() {
         snapshot.queued_by_priority.urgent, 1,
         "decode-failure repair must not merge with object repair responsibility"
     );
-    assert!(disk_paths.iter().all(|path| {
-        !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-            && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
-    }));
+    assert!(
+        disk_paths.iter().all(|path| {
+            Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+                && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+        }),
+        "partial-write responsibilities keep both replay anchors until proof"
+    );
 }
 
 /// If replay reaches a full heal-manager queue, the old journal remains the
@@ -698,10 +803,10 @@ async fn journal_replay_survives_successor_flush_before_delete() {
     );
     assert!(
         disk_paths.iter().all(|path| {
-            !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-                && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+            Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+                && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
         }),
-        "a fully consumed successor snapshot may be deleted after restart replay"
+        "the accepted successor remains anchored until a verified repair proof"
     );
 }
 
@@ -751,10 +856,10 @@ async fn journal_replay_survives_service_kill_after_successor_flush() {
     );
     assert!(
         disk_paths.iter().all(|path| {
-            !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-                && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+            Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+                && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
         }),
-        "a fully consumed successor snapshot may be deleted after service-kill restart replay"
+        "the accepted successor remains anchored until a verified repair proof after service-kill restart"
     );
 }
 
@@ -814,9 +919,9 @@ async fn journal_replay_survives_sigkill_after_authoritative_successor_fsync_bef
     );
     assert!(
         disk_paths.iter().all(|path| {
-            !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
-                && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+            Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+                && Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
         }),
-        "a fully consumed authoritative successor may clean both epochs after restart replay"
+        "the accepted authoritative successor remains anchored until a verified repair proof"
     );
 }

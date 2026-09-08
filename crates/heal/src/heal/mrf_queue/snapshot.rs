@@ -17,11 +17,13 @@
 //! Each of two slots has a payload and a commit manifest. The manifest binds
 //! the writer identity, persistent sequence, length and whole-payload digest.
 //! Replacing the inactive slot must leave the previous committed slot intact.
-//! Production publication and reclamation are deliberately not enabled here.
+//! Production publication is deliberately reader-first; reclamation only
+//! removes manifest entries after the owning replay path has discharged every
+//! responsibility through a newer durable snapshot or a verified repair proof.
 //! An unreadable commit path cannot prove that only legacy data exists. This
 //! explicit inspection API fails closed and never mutates recovery anchors.
-//! It is not wired into the legacy consumer: that transition requires the
-//! ownership-aware replay and producer handoff before writer activation.
+//! It is wired into the replay reader before writer activation, but the writer
+//! remains gated on ownership-aware handoff.
 //! One surviving committed replica supports process restart recovery only;
 //! this reader does not establish a replication quorum or a power-loss policy.
 
@@ -540,6 +542,91 @@ async fn read_legacy(disks: &[EcstoreDiskStore], path: &str, limit: usize) -> Re
 /// ownership and mixed-version activation checks.
 pub async fn inspect_local_recovery_snapshot(max_bytes: usize) -> Result<Option<RecoverySnapshot>, SnapshotError> {
     read_recovery_snapshot(&super::journal_disks().await, max_bytes).await
+}
+
+/// Inspect only committed MRF checkpoints.
+///
+/// The legacy replay path keeps its historical torn-tail behavior, so startup
+/// replay uses this narrower API to avoid turning a legacy torn tail into a
+/// committed-format failure. A corrupt or conflicting committed checkpoint is
+/// still authoritative: callers must fail closed instead of falling back to a
+/// stale legacy mirror.
+pub async fn inspect_local_committed_snapshot(max_bytes: usize) -> Result<Option<CommittedSnapshot>, SnapshotError> {
+    read_committed(&super::journal_disks().await, max_bytes).await
+}
+
+/// Remove committed manifests whose sequence is no newer than
+/// `committed_through`.
+///
+/// Payload files are intentionally left as orphans after their manifest is
+/// removed. Readers cannot discover a payload without its matching manifest,
+/// and deleting manifests first prevents an older retained slot from becoming
+/// visible again after the newest replay has been fully discharged.
+pub async fn delete_committed_snapshots_through(committed_through: u64, max_bytes: usize) -> Result<bool, SnapshotError> {
+    let disks = super::journal_disks().await;
+    delete_committed_snapshots_through_on(&disks, committed_through, max_bytes).await
+}
+
+async fn delete_committed_snapshots_through_on(
+    disks: &[EcstoreDiskStore],
+    committed_through: u64,
+    max_bytes: usize,
+) -> Result<bool, SnapshotError> {
+    if disks.is_empty() {
+        return Err(SnapshotError::NoWritableReplica);
+    }
+    let mut any_changed = false;
+    let mut first_error = None;
+    for disk in disks {
+        for path in MANIFEST_PATHS {
+            let existing = match read_bounded(disk, path, MANIFEST_LEN).await {
+                Ok(Some(existing)) => existing,
+                Ok(None) => continue,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            };
+            let manifest = match Manifest::decode(&existing, max_bytes) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            };
+            if manifest.sequence > committed_through {
+                continue;
+            }
+            match EcstoreDiskAPI::compare_and_update_file(
+                disk.as_ref(),
+                RUSTFS_META_BUCKET,
+                path,
+                Some(EcstoreDiskBytes::from(existing)),
+                None,
+            )
+            .await
+            {
+                Ok(EcstoreConditionalFileUpdate::Updated) => any_changed = true,
+                Ok(EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch) => {}
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(SnapshotError::Disk(error));
+                    }
+                }
+            }
+        }
+    }
+    if any_changed {
+        Ok(true)
+    } else if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(true)
+    }
 }
 
 async fn read_recovery_snapshot(disks: &[EcstoreDiskStore], limit: usize) -> Result<Option<RecoverySnapshot>, SnapshotError> {
@@ -1183,6 +1270,44 @@ mod tests {
                 .as_ref(),
             legacy
         );
+    }
+
+    #[tokio::test]
+    async fn committed_cleanup_removes_only_manifests_at_or_below_sequence() {
+        let root = TempDir::new().expect("test directory");
+        let disk = disk(&root, "disk").await;
+        let owner = Uuid::new_v4();
+        let older = payload("older");
+        let newer = payload("newer");
+        commit(&disk, 0, owner, 3, &older).await;
+        commit(&disk, 1, owner, 4, &newer).await;
+
+        assert!(
+            delete_committed_snapshots_through_on(std::slice::from_ref(&disk), 3, 4096)
+                .await
+                .expect("delete old manifest"),
+            "old committed manifest should be removed"
+        );
+        assert!(
+            matches!(
+                EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[0]).await,
+                Err(EcstoreDiskError::FileNotFound | EcstoreDiskError::VolumeNotFound)
+            ),
+            "old manifest is gone, so the old payload cannot become visible again"
+        );
+        assert_eq!(
+            EcstoreDiskAPI::read_all(disk.as_ref(), RUSTFS_META_BUCKET, PAYLOAD_PATHS[0])
+                .await
+                .expect("old payload orphan may remain")
+                .as_ref(),
+            older
+        );
+        let recovered = read_committed(std::slice::from_ref(&disk), 4096)
+            .await
+            .expect("read newer commit")
+            .expect("newer commit remains visible");
+        assert_eq!(recovered.sequence(), 4);
+        assert_eq!(recovered.payload(), newer);
     }
 
     #[tokio::test]

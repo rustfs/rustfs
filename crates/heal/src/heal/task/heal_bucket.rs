@@ -403,6 +403,7 @@ impl HealTask {
         };
 
         for (set_disk_id, heal_opts) in listing_scopes {
+            let bucket_incarnation_id = self.outcome_bucket_incarnation_id(bucket, heal_opts.dry_run).await?;
             let mut continuation_token: Option<String> = None;
             let mut deferred = DeferredWindow::default();
             let mut inline_retry: Option<DeferredObject> = None;
@@ -501,13 +502,15 @@ impl HealTask {
                     let retry_attempt = item.attempt;
                     let mut telemetry_unknown = false;
                     let object = item.name.as_str();
-                    let identity =
+                    let mut identity =
                         self.outcome_identity(bucket, object, item.version_id.as_deref(), heal_opts.pool, heal_opts.set);
+                    identity.bucket_incarnation_id = bucket_incarnation_id;
                     let mut disposition = if heal_opts.dry_run {
                         HealObjectDisposition::DryRunObserved
                     } else {
                         HealObjectDisposition::Unknown
                     };
+                    let mut recorded_authoritative_outcome = false;
                     let mut detail = None;
                     {
                         let mut progress = self.progress.write().await;
@@ -520,23 +523,37 @@ impl HealTask {
                         Some(Error::other("heal object retry age exhausted"))
                     } else {
                         match self
-                            .await_with_control(
-                                self.storage
-                                    .heal_object(bucket, object, item.version_id.as_deref(), &heal_opts),
-                            )
+                            .await_with_control(self.storage.heal_object_with_receipt(
+                                bucket,
+                                object,
+                                item.version_id.as_deref(),
+                                &heal_opts,
+                            ))
                             .await
                         {
-                            Ok((result, None)) => match unavailable_recreate_error(&result, &heal_opts) {
-                                Some(error) => Some(error),
-                                None => {
-                                    telemetry_unknown |= !increment_counter(&mut healed);
-                                    telemetry_unknown |=
-                                        !add_bytes(&mut bytes, u64::try_from(result.object_size).unwrap_or(u64::MAX));
-                                    self.record_result_item(result).await;
-                                    None
+                            Ok(storage_result) if storage_result.error.is_none() => {
+                                match unavailable_recreate_error(&storage_result.item, &heal_opts) {
+                                    Some(error) => Some(error),
+                                    None => {
+                                        telemetry_unknown |= !increment_counter(&mut healed);
+                                        telemetry_unknown |= !add_bytes(
+                                            &mut bytes,
+                                            u64::try_from(storage_result.item.object_size).unwrap_or(u64::MAX),
+                                        );
+                                        recorded_authoritative_outcome = self
+                                            .record_verified_storage_receipt(identity.clone(), storage_result.receipt)
+                                            .await;
+                                        self.record_result_item(storage_result.item).await;
+                                        None
+                                    }
                                 }
-                            },
-                            Ok((_, Some(err))) if is_missing_object_dir_heal_result(object, &err) => {
+                            }
+                            Ok(storage_result)
+                                if storage_result
+                                    .error
+                                    .as_ref()
+                                    .is_some_and(|err| is_missing_object_dir_heal_result(object, err)) =>
+                            {
                                 telemetry_unknown |= !increment_counter(&mut healed);
                                 debug!(
                                     target: "rustfs::heal::task",
@@ -551,7 +568,8 @@ impl HealTask {
                                 );
                                 None
                             }
-                            Ok((_, Some(err))) | Err(err) => Some(err),
+                            Ok(storage_result) => storage_result.error,
+                            Err(err) => Some(err),
                         }
                     };
 
@@ -674,11 +692,13 @@ impl HealTask {
                         continue;
                     }
 
-                    self.outcome.write().await.record(HealObjectOutcome {
-                        identity,
-                        disposition,
-                        detail,
-                    });
+                    if !recorded_authoritative_outcome {
+                        self.outcome.write().await.record(HealObjectOutcome {
+                            identity,
+                            disposition,
+                            detail,
+                        });
+                    }
 
                     let mut progress = self.progress.write().await;
                     progress.update_object_progress(
