@@ -56,6 +56,7 @@ their issue closes.
 | `probe.sh` | dev-tool | Probe-style e2e run | `make probe-e2e` |
 | `run_scanner_validation_harness.sh` | dev-tool | Scanner validation harness | `docs/operations/scanner-benchmark-runbook.md` |
 | `run_scanner_heal_evidence_case.sh` | dev-tool | Runs one Scanner/Heal release-evidence registry case and checks the produced receipt/oracle | `.config/scanner-heal-required-tests.json`; `check_test_wiring.py --check-scanner-heal` |
+| `run_scanner_heal_g09_upgrade_evidence.sh` | dev-tool | Runs the G09 mixed-version and rollback upgrade E2E lanes against a pinned previous release and verifies the raw evidence artifacts | `docs/testing/ci-gates.md`; `.github/workflows/e2e-upgrade.yml` |
 | `test_scanner_validation_harness.sh` | dev-tool | Self-test for the scanner validation harness | — |
 | `scanner_abba.py` | dev-tool | Scanner/heal ABBA orchestration and evidence gates via `run_scanner_validation_harness.sh --abba` | `docs/operations/scanner-benchmark-runbook.md` |
 | `test_scanner_abba.py` | dev-tool | Synthetic ABBA adapter and failure-path tests | `test_scanner_validation_harness.sh` |
