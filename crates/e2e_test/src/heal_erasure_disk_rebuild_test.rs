@@ -1047,6 +1047,8 @@ mod tests {
         let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
         cluster.set_env("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", "true");
         cluster.set_env("RUSTFS_HEAL_ENABLED", "true");
+        // Capture physical baselines after the PUT rename fanout has drained.
+        cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
         // Heal control uses the first lexicographically sorted grid host.
         // Keep that coordinator distinct from the remote target at index 1.
         cluster.nodes.sort_by(|left, right| left.url.cmp(&right.url));
