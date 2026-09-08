@@ -37,25 +37,6 @@ on:
   pull_request:
     types: [ opened, synchronize, reopened, closed ]
     branches: [ main ]
-    # Keep this list in sync with the `paths` list in ci-docs-only.yml, which
-    # reports the required "Test and Lint" check for PRs skipped here.
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "deploy/**"
-      - "scripts/dev_*.sh"
-      - "scripts/probe.sh"
-      - "LICENSE*"
-      - ".gitignore"
-      - ".dockerignore"
-      - "README*"
-      - "**/*.png"
-      - "**/*.jpg"
-      - "**/*.svg"
-      - ".github/workflows/build.yml"
-      - ".github/workflows/docker.yml"
-      - ".github/workflows/audit.yml"
-      - "flake.lock"
   merge_group:
     types: [ checks_requested ]
   schedule:
@@ -88,6 +69,32 @@ jobs:
       - name: Explain cancellation run
         run: echo "PR closed; this run only cancels older runs in the same concurrency group."
 
+  classify-changes:
+    name: Select CI scope
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      mode: ${{ steps.scope.outputs.mode }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Select scope using the base revision's policy
+        id: scope
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
+            printf '%s\n' 'mode=full' >> "$GITHUB_OUTPUT"
+          elif [[ "$CI_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] && git show "$CI_BASE_SHA:scripts/ci_gate.py" > "$RUNNER_TEMP/ci-gate-base.py"; then
+            python3 -I "$RUNNER_TEMP/ci-gate-base.py" select
+          else
+            printf '%s\n' 'mode=full' >> "$GITHUB_OUTPUT"
+            echo "Base CI policy unavailable; running the full matrix."
+          fi
+
   typos:
     name: Typos
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
@@ -100,7 +107,7 @@ jobs:
       - name: Typos check with custom config file
         uses: crate-ci/typos@37bb98842b0d8c4ffebdb75301a13db0267cef89 # master
 
-  # Fail early with compile-free checks shared with docs-only CI.
+  # Fail early with compile-free checks for every pull request.
   quick-checks:
     name: Quick Checks
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
@@ -116,9 +123,9 @@ jobs:
         uses: ./.github/actions/quick-checks
 
   test-and-lint:
-    name: Test and Lint
-    if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    needs: [ quick-checks ]
+    name: Workspace Test and Lint
+    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
     env:
@@ -289,45 +296,6 @@ jobs:
       - name: Run rebalance/decommission migration proofs
         run: ./scripts/check_migration_gate_count.sh
 
-      # Record the reason before this job completes as FAILURE. A separate
-      # dependent job cancels sibling lanes only after GitHub has preserved this
-      # required check's failure verdict.
-      - name: Annotate early-stop reason
-        if: >-
-          failure() && github.event_name == 'pull_request'
-          && github.event.pull_request.head.repo.full_name == github.repository
-        run: |
-          {
-            echo "## CI early-stop"
-            echo "Job \`${GITHUB_JOB}\` (Test and Lint) failed; a follow-up job will cancel sibling lanes to free runners."
-            echo "Sibling jobs showing **cancelled** were stopped by the early-stop follow-up, not by their own failure."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # Preserve the required Test and Lint FAILURE verdict before stopping sibling
-  # lanes. Cancelling from inside test-and-lint changed its own conclusion to
-  # CANCELLED and hid the actionable failure in the PR checks UI.
-  cancel-after-test-and-lint-failure:
-    name: Cancel siblings after Test and Lint failure
-    if: >-
-      failure() && needs.test-and-lint.result == 'failure'
-      && github.event_name == 'pull_request'
-      && github.event.pull_request.head.repo.full_name == github.repository
-    needs: [ test-and-lint ]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      actions: write
-    steps:
-      - name: Cancel remaining jobs
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          curl -fsS -X POST \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/cancel"
-
   # Dedicated serial lane for the ILM / lifecycle integration tests. These tests
   # drive the object layer through process-global singletons (the GLOBAL_ENV
   # ECStore, the global tier-config manager, background-expiry workers) and bind
@@ -340,8 +308,8 @@ jobs:
   # See rustfs/backlog#1148 (ilm-1) and #1155.
   test-ilm-integration-serial:
     name: ILM Integration (serial)
-    if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    needs: [ quick-checks ]
+    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
     env:
@@ -408,8 +376,8 @@ jobs:
 
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
-    if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    needs: [ quick-checks ]
+    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
     env:
@@ -449,8 +417,8 @@ jobs:
 
   connect-short-credential-boundary:
     name: Connect Short Credential Boundary
-    if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    needs: [ quick-checks ]
+    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 60
     env:
@@ -507,8 +475,8 @@ jobs:
 
   test-and-lint-protocols:
     name: "Test and Lint (${{ matrix.features.name }})"
-    if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    needs: [ quick-checks ]
+    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
     strategy:
@@ -561,8 +529,8 @@ jobs:
 
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary
-    if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    needs: [ quick-checks ]
+    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 30
     env:
@@ -687,8 +655,8 @@ jobs:
     # job had neither, so each closed/merged PR really ran the whole io_uring
     # suite (measured 4m17s / 7m19s / 7m31s on runs 30678272341 / 30678117601 /
     # 30662728539) and kept the cancellation run in progress for minutes.
-    if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    needs: [ quick-checks ]
+    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    needs: [ quick-checks, classify-changes ]
     # GitHub-hosted ubuntu-latest runs a recent kernel with io_uring and, unlike
     # a container, applies no seccomp filter that would block io_uring_setup — so
     # the probe succeeds and the tests exercise the real UringBackend/FdCache/
@@ -1216,9 +1184,44 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
+  required-checks:
+    name: Test and Lint
+    if: always() && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    needs:
+      - classify-changes
+      - typos
+      - quick-checks
+      - test-and-lint
+      - test-ilm-integration-serial
+      - test-and-lint-rio-v2
+      - connect-short-credential-boundary
+      - test-and-lint-protocols
+      - build-rustfs-debug-binary
+      - uring-integration
+      - e2e-tests
+      - s3-implemented-tests
+      - s3-lifecycle-behavior-tests
+      - build-rustfs-debug-binary-rio-v2
+      - e2e-tests-rio-v2
+      - e2e-full
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Require the expected result of every CI lane
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        shell: bash
+        run: python3 scripts/ci_gate.py verify
+
   alert-on-failure:
     name: Alert on scheduled failure
     needs:
+      - classify-changes
+      - connect-short-credential-boundary
+      - required-checks
       - typos
       - quick-checks
       - test-and-lint
