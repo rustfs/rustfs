@@ -23,7 +23,8 @@ usage() {
 Usage: scripts/run_scanner_heal_g09_upgrade_evidence.sh [OPTIONS]
 
 Build the current checkout, run the Scanner/Heal G09 upgrade compatibility
-lanes, and validate the raw mixed-version/rollback evidence artifacts.
+lanes, validate the raw mixed-version/rollback evidence artifacts, and write a
+bundle-ready G09 release-evidence descriptor for full runs.
 
 Options:
   --run-dir DIR       New evidence directory (default: target/scanner-heal-g09-evidence/TIMESTAMP)
@@ -171,6 +172,10 @@ run_logged() {
     echo "PASS: $label"
 }
 
+utc_now() {
+    date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
 validate_artifacts() {
     local source_revision="$1"
     "$PYTHON_BIN" - "$RUN_DIR" "$source_revision" "$TEST_SELECTION" <<'PY'
@@ -230,6 +235,82 @@ print("PASS: G09 raw evidence artifacts verified")
 PY
 }
 
+write_g09_release_descriptor() {
+    local source_revision="$1"
+    local started_at="$2"
+    local finished_at="$3"
+    "$PYTHON_BIN" - "$ROOT" "$RUN_DIR" "$source_revision" "$started_at" "$finished_at" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+run_dir = pathlib.Path(sys.argv[2])
+source_revision = sys.argv[3]
+started_at = sys.argv[4]
+finished_at = sys.argv[5]
+descriptor = run_dir / "release-bundle-g09.json"
+registry = json.loads((root / ".config/scanner-heal-required-tests.json").read_text())
+requirements = {item["gate"]: item for item in registry["release_requirements"]}
+artifacts = {
+    "mixed_version_reader_evidence": run_dir / "mixed-version-upgrade" / "G09-mixed_version_reader_evidence.json",
+    "mixed_version_writer_evidence": run_dir / "mixed-version-upgrade" / "G09-mixed_version_writer_evidence.json",
+    "rollback_payload_evidence": run_dir / "bucket-config-rollback" / "G09-rollback_payload_evidence.json",
+}
+
+def digest(path: pathlib.Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+def relative_to_descriptor(path: pathlib.Path) -> str:
+    return path.resolve(strict=True).relative_to(descriptor.parent.resolve()).as_posix()
+
+fields = {}
+for field, artifact in artifacts.items():
+    payload = json.loads(artifact.read_text())
+    if payload.get("source_revision") != source_revision or payload.get("current_revision") != source_revision:
+        raise SystemExit(f"{field}: source revision does not match this checkout")
+    evidence = {
+        "artifact": relative_to_descriptor(artifact),
+        "sha256": digest(artifact),
+        "evidence_type": "measured",
+        "source_revision": source_revision,
+        "run_id": payload["run_id"],
+        "measurement_window_id": payload["measurement_window_id"],
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "command": ["scripts/run_scanner_heal_g09_upgrade_evidence.sh", "--test", "all"],
+        "artifact_format": "json",
+        "summary": f"Measured Scanner/Heal G09 {field} from the pinned previous release binary and current PR binary.",
+        "versions": payload["versions"],
+        "mixed_version_role": payload["mixed_version_role"],
+        "mixed_version_cases": payload["mixed_version_cases"],
+    }
+    if field == "rollback_payload_evidence":
+        evidence["rollback_payload_replayed"] = payload.get("rollback_payload_replayed")
+    fields[field] = evidence
+
+descriptor.write_text(json.dumps({
+    "schema": 1,
+    "evidence": "measured",
+    "source_revision": source_revision,
+    "gates": {
+        "G09": {
+            "status": "pass",
+            "lane": requirements["G09"]["lane"],
+            "evidence_type": "measured",
+            "evidence_fields": fields,
+        },
+    },
+}, indent=2, sort_keys=True) + "\n")
+print(descriptor)
+PY
+}
+
 run_self_test() {
     local tmp
     tmp="$(mktemp -d "${TMPDIR:-/tmp}/rustfs-g09-evidence-self-test.XXXXXX")"
@@ -247,18 +328,21 @@ run_self_test() {
 
     mkdir -p "$tmp/run/mixed-version-upgrade" "$tmp/run/bucket-config-rollback"
     local current previous
-    current="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    current="$(git rev-parse HEAD)"
     previous="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     cat >"$tmp/run/mixed-version-upgrade/G09-mixed_version_reader_evidence.json" <<JSON
-{"schema":1,"evidence_type":"measured","artifact_kind":"upgrade-compatibility-e2e","gate":"G09","field":"mixed_version_reader_evidence","mixed_version_role":"mixed-version-reader","current_revision":"$current","previous_revision":"$previous","versions":["$previous","$current"]}
+{"schema":1,"evidence_type":"measured","artifact_kind":"upgrade-compatibility-e2e","source_revision":"$current","run_id":"g09-reader-self-test-run","measurement_window_id":"g09-reader-self-test-window","gate":"G09","field":"mixed_version_reader_evidence","mixed_version_role":"mixed-version-reader","mixed_version_cases":["old-writer-new-reader","new-writer-old-reader"],"current_revision":"$current","previous_revision":"$previous","versions":["$previous","$current"]}
 JSON
     cat >"$tmp/run/mixed-version-upgrade/G09-mixed_version_writer_evidence.json" <<JSON
-{"schema":1,"evidence_type":"measured","artifact_kind":"upgrade-compatibility-e2e","gate":"G09","field":"mixed_version_writer_evidence","mixed_version_role":"mixed-version-writer","current_revision":"$current","previous_revision":"$previous","versions":["$previous","$current"]}
+{"schema":1,"evidence_type":"measured","artifact_kind":"upgrade-compatibility-e2e","source_revision":"$current","run_id":"g09-writer-self-test-run","measurement_window_id":"g09-writer-self-test-window","gate":"G09","field":"mixed_version_writer_evidence","mixed_version_role":"mixed-version-writer","mixed_version_cases":["old-reader-new-writer","new-reader-old-writer"],"current_revision":"$current","previous_revision":"$previous","versions":["$previous","$current"]}
 JSON
     cat >"$tmp/run/bucket-config-rollback/G09-rollback_payload_evidence.json" <<JSON
-{"schema":1,"evidence_type":"measured","artifact_kind":"upgrade-compatibility-e2e","gate":"G09","field":"rollback_payload_evidence","mixed_version_role":"rollback-payload","current_revision":"$current","previous_revision":"$previous","versions":["$previous","$current"],"rollback_payload_replayed":true}
+{"schema":1,"evidence_type":"measured","artifact_kind":"upgrade-compatibility-e2e","source_revision":"$current","run_id":"g09-rollback-self-test-run","measurement_window_id":"g09-rollback-self-test-window","gate":"G09","field":"rollback_payload_evidence","mixed_version_role":"rollback-payload","mixed_version_cases":["rollback-to-old","rollback-to-new","unknown-field-retained"],"current_revision":"$current","previous_revision":"$previous","versions":["$previous","$current"],"rollback_payload_replayed":true}
 JSON
     RUN_DIR="$tmp/run" TEST_SELECTION="all" validate_artifacts "$current" >/dev/null
+    local descriptor
+    descriptor="$(RUN_DIR="$tmp/run" write_g09_release_descriptor "$current" "$(utc_now)" "$(utc_now)")"
+    "$PYTHON_BIN" "$ROOT/scripts/check_test_wiring.py" --check-scanner-heal-release-bundle-gate "$descriptor" G09 >/dev/null
 }
 
 while [[ $# -gt 0 ]]; do
@@ -350,6 +434,7 @@ if [[ -e "$RUN_DIR" ]]; then
 fi
 mkdir -p "$RUN_DIR/logs"
 
+RUN_STARTED_AT="$(utc_now)"
 SOURCE_BINARY="$(resolve_source_binary)"
 export RUSTFS_UPGRADE_SOURCE_BINARY="$SOURCE_BINARY"
 export RUSTFS_E2E_LOG_DIR="${RUSTFS_E2E_LOG_DIR:-$RUN_DIR/server-logs}"
@@ -378,4 +463,10 @@ for case_name in "${CASES[@]}"; do
 done
 
 validate_artifacts "$SOURCE_REVISION"
+if [[ "$TEST_SELECTION" == "all" ]]; then
+    RUN_FINISHED_AT="$(utc_now)"
+    DESCRIPTOR="$(write_g09_release_descriptor "$SOURCE_REVISION" "$RUN_STARTED_AT" "$RUN_FINISHED_AT")"
+    "$PYTHON_BIN" "$ROOT/scripts/check_test_wiring.py" --check-scanner-heal-release-bundle-gate "$DESCRIPTOR" G09
+    echo "Scanner/Heal G09 release descriptor verified: $DESCRIPTOR"
+fi
 echo "Scanner/Heal G09 evidence verified: $RUN_DIR"
