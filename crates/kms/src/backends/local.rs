@@ -1233,6 +1233,9 @@ impl LocalKmsClient {
     async fn decode_stored_key(&self, key_id: &str) -> Result<(StoredMasterKey, Vec<u8>)> {
         let key_path = self.master_key_path(key_id)?;
         if !fs::try_exists(&key_path).await? {
+            // Only an accessible key store can establish that a single key is
+            // missing; a directory outage must retain its filesystem error.
+            let _ = fs::read_dir(&self.config.key_dir).await?;
             return Err(KmsError::key_not_found(key_id));
         }
 
