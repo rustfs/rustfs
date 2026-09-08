@@ -1318,7 +1318,23 @@ impl Operation for ImportIam {
             failed,
         };
 
-        crate::site_replication::enqueue_site_replication_iam_snapshot("IAM import snapshot pending").await?;
+        // The entities are already imported locally. A snapshot that cannot be
+        // scheduled is a convergence delay the reconcile pass still closes, so
+        // it must not turn a completed import into a failed request - the same
+        // best-effort contract every other site-replication hook here follows.
+        if let Err(err) =
+            crate::site_replication::enqueue_site_replication_iam_snapshot("iam import scheduled a full snapshot").await
+        {
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_USER,
+                event = EVENT_ADMIN_USER_STATE,
+                action = "import_iam",
+                result = "site_replication_snapshot_not_scheduled",
+                error = ?err,
+                "admin user state"
+            );
+        }
 
         let body = serde_json::to_vec(&ret).map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 

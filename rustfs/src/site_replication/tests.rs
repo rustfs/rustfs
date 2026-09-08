@@ -693,6 +693,38 @@ fn test_record_iam_deletion_marks_newest_wins_and_expires_by_age_only() {
     );
 }
 
+/// Scheduling a snapshot is not a delivery failure. Repeated imports - the
+/// normal way a bulk IAM migration is done, one archive at a time - must not
+/// walk the peer's entry up to the escalation threshold and report a healthy
+/// site as `retryStats.failed` with the scheduling note as its `lastError`.
+#[test]
+fn repeated_iam_import_snapshots_do_not_escalate_a_healthy_peer() {
+    let local = PeerInfo {
+        deployment_id: "local-dep".to_string(),
+        ..peer("local", "https://local.example.com")
+    };
+    let remote = PeerInfo {
+        deployment_id: "remote-a".to_string(),
+        ..peer("remote-a", "https://a.example.com")
+    };
+    let mut state = SiteReplicationState {
+        peers: BTreeMap::from([
+            (local.deployment_id.clone(), local.clone()),
+            (remote.deployment_id.clone(), remote),
+        ]),
+        ..Default::default()
+    };
+
+    for _ in 0..(SITE_REPLICATION_RETRY_FAILED_AFTER + 2) {
+        record_iam_snapshot_retries(&mut state, &local, "iam import scheduled a full snapshot").expect("record snapshot");
+    }
+
+    assert_eq!(state.retry_queue.len(), 1);
+    let event = &state.retry_queue[0];
+    assert_eq!(event.retry_count, 1, "a schedule must not count as a delivery attempt");
+    assert!(!event.failed, "a scheduled snapshot must not report as an escalated failure");
+}
+
 #[test]
 fn iam_import_snapshot_retry_is_recorded_once_per_remote_peer() {
     let local = PeerInfo {

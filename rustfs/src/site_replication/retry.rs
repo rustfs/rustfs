@@ -217,6 +217,26 @@ pub(crate) fn settle_observed_site_replication_retry_event(
     before.saturating_sub(queue.len())
 }
 
+/// Make sure `peer` has a collapsed entry for `path` without counting the
+/// call as a delivery failure. A bulk local mutation (`import-iam`) needs the
+/// entry to exist so the next drain sends the snapshot; routing it through
+/// [`upsert_site_replication_retry_event`] would raise `retry_count` on every
+/// import and escalate a healthy peer to `failed` after
+/// [`SITE_REPLICATION_RETRY_FAILED_AFTER`] of them, with the scheduling note
+/// shown to operators as `lastError`.
+pub(crate) fn ensure_site_replication_retry_event(
+    queue: &mut Vec<SiteReplicationRetryEvent>,
+    peer: &PeerInfo,
+    path: &str,
+    reason: &str,
+) -> S3Result<Vec<SiteReplicationRetryEvent>> {
+    let path = collapsed_retry_queue_path(path).unwrap_or(path);
+    if queue.iter().any(|event| retry_event_matches(event, peer, path)) {
+        return Ok(Vec::new());
+    }
+    push_site_replication_retry_event(queue, peer, path, summarize_peer_error_detail(reason), false, None)
+}
+
 pub(crate) fn upsert_site_replication_retry_event(
     queue: &mut Vec<SiteReplicationRetryEvent>,
     peer: &PeerInfo,
@@ -244,6 +264,17 @@ pub(crate) fn upsert_site_replication_retry_event(
         return Ok(Vec::new());
     }
 
+    push_site_replication_retry_event(queue, peer, path, detail, peer_unreachable, generation)
+}
+
+fn push_site_replication_retry_event(
+    queue: &mut Vec<SiteReplicationRetryEvent>,
+    peer: &PeerInfo,
+    path: &str,
+    detail: String,
+    peer_unreachable: bool,
+    generation: Option<u64>,
+) -> S3Result<Vec<SiteReplicationRetryEvent>> {
     let slots_needed = queue
         .len()
         .saturating_add(1)
@@ -274,7 +305,7 @@ pub(crate) fn upsert_site_replication_retry_event(
         retry_count: 1,
         failed: false,
         last_error: detail,
-        updated_at: Some(now),
+        updated_at: Some(OffsetDateTime::now_utc()),
         edit_generation: generation,
         peer_unreachable,
         deletions_recorded: false,
@@ -375,13 +406,7 @@ pub(crate) fn record_iam_snapshot_retries(state: &mut SiteReplicationState, loca
         .cloned()
         .collect::<Vec<_>>();
     for peer in peers {
-        upsert_site_replication_retry_event(
-            &mut state.retry_queue,
-            &peer,
-            SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
-            reason,
-            None,
-        )?;
+        ensure_site_replication_retry_event(&mut state.retry_queue, &peer, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH, reason)?;
     }
     Ok(())
 }
