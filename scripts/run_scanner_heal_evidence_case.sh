@@ -74,6 +74,40 @@ print("test(/^" + re.escape(case["name"]) + "$/)")
 PY
 }
 
+runtime_profile_for() {
+    local case_id="$1"
+    case "$case_id" in
+        background-target-crash|background-target-restart)
+            echo "background-4x1"
+            ;;
+        background-target-crash-ec8-4|background-target-restart-ec8-4)
+            echo "background-ec8-4"
+            ;;
+        ec84-target-drive-restart)
+            echo "distributed-ec8-4"
+            ;;
+        *)
+            echo "default"
+            ;;
+    esac
+}
+
+apply_runtime_profile() {
+    local case_id="$1"
+    case "$(runtime_profile_for "$case_id")" in
+        background-4x1)
+            export RUSTFS_HEAL_CHAOS_OBJECT_COUNT="${RUSTFS_HEAL_CHAOS_OBJECT_COUNT:-64}"
+            export RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES="${RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES:-16777216}"
+            export RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS="${RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS:-120}"
+            ;;
+        background-ec8-4)
+            export RUSTFS_HEAL_CHAOS_OBJECT_COUNT="${RUSTFS_HEAL_CHAOS_OBJECT_COUNT:-32}"
+            export RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES="${RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES:-8388608}"
+            export RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS="${RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS:-180}"
+            ;;
+    esac
+}
+
 test_binary_from_listing() {
     local listing="$1"
     local case_id="$2"
@@ -130,9 +164,11 @@ run_self_test() {
         local expected_filter expected_profile plan
         expected_filter="$(test_filter_for "$case_id")"
         expected_profile="$(case_field "$case_id" lane)"
+        expected_runtime_profile="$(runtime_profile_for "$case_id")"
         plan="$("$0" --case "$case_id" --plan-only)"
         if [[ "$plan" != *"case=$case_id"* ]] ||
             [[ "$plan" != *"profile=$expected_profile"* ]] ||
+            [[ "$plan" != *"runtime_profile=$expected_runtime_profile"* ]] ||
             [[ "$plan" != *"filter=$expected_filter"* ]] ||
             [[ "$plan" != *"run_dir=$ROOT/target/scanner-heal-evidence/$case_id-"* ]]; then
             echo "self-test failed: registry case plan mismatch for $case_id" >&2
@@ -185,13 +221,7 @@ TEST_FILTER="$(test_filter_for "$CASE_ID")"
 if [[ -z "$PROFILE" ]]; then
     PROFILE="$(case_field "$CASE_ID" lane)"
 fi
-case "$CASE_ID" in
-  background-target-crash|background-target-restart)
-    export RUSTFS_HEAL_CHAOS_OBJECT_COUNT="${RUSTFS_HEAL_CHAOS_OBJECT_COUNT:-64}"
-    export RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES="${RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES:-16777216}"
-    export RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS="${RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS:-120}"
-    ;;
-esac
+apply_runtime_profile "$CASE_ID"
 if [[ -z "$RUN_DIR" ]]; then
     RUN_DIR="$ROOT/target/scanner-heal-evidence/${CASE_ID}-$(date -u +%Y%m%dT%H%M%SZ)"
 elif [[ "$RUN_DIR" != /* ]]; then
@@ -201,6 +231,7 @@ fi
 if [[ "$PLAN_ONLY" == 1 ]]; then
     echo "case=$CASE_ID"
     echo "profile=$PROFILE"
+    echo "runtime_profile=$(runtime_profile_for "$CASE_ID")"
     echo "filter=$TEST_FILTER"
     echo "run_dir=$RUN_DIR"
     exit 0
