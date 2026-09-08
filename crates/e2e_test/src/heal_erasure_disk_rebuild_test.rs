@@ -16,7 +16,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::chaos::{VersionShardCensus, census_object_version_on_disk, sha256_hex, signed_admin_post};
+    use crate::chaos::{
+        VersionShardCensus, census_object_version_on_disk, sha256_hex, signed_admin_post,
+        wait_for_complete_physical_shard_on_disk,
+    };
     use crate::common::{
         ClusterTopology, FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request,
         init_logging, rustfs_binary_path,
@@ -1210,6 +1213,8 @@ mod tests {
                 attempt_count += 1;
                 continue;
             }
+            let shard_census =
+                wait_for_complete_physical_shard_on_disk(&replaced_disk, bucket, &key, None, Duration::from_secs(10)).await?;
             assert!(
                 shard_census.is_complete(),
                 "node 1 should hold a complete baseline shard for {key}: {shard_census:?}"

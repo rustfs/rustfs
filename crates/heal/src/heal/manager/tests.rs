@@ -1869,7 +1869,7 @@ async fn test_submit_heal_request_returns_merged_for_duplicate() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
     let manager = HealManager::new(storage, None);
 
-    let request = HealRequest::new(
+    let mut request = HealRequest::new(
         HealType::Object {
             bucket: "bucket".to_string(),
             object: "object".to_string(),
@@ -1886,6 +1886,7 @@ async fn test_submit_heal_request_returns_merged_for_duplicate() {
             .expect("first request should be accepted"),
         HealAdmissionResult::Accepted
     );
+    request.id = uuid::Uuid::new_v4().to_string();
     assert_eq!(
         manager
             .submit_heal_request(request)
@@ -3725,7 +3726,7 @@ async fn test_submit_heal_request_returns_merged_before_full_for_duplicate() {
         }),
     );
 
-    let request = HealRequest::new(
+    let mut request = HealRequest::new(
         HealType::Object {
             bucket: "bucket".to_string(),
             object: "object".to_string(),
@@ -3742,6 +3743,7 @@ async fn test_submit_heal_request_returns_merged_before_full_for_duplicate() {
             .expect("first request should be accepted"),
         HealAdmissionResult::Accepted
     );
+    request.id = uuid::Uuid::new_v4().to_string();
     assert_eq!(
         manager
             .submit_heal_request(request)

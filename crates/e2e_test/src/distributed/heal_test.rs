@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use super::harness::{DistCluster, DistLayout, TestResult, assert_inventory, payload_for, put_object, unique_bucket, wait_until};
-use crate::chaos::{VersionShardCensus, census_object_version_on_disk, signed_admin_post};
+use crate::chaos::{
+    VersionShardCensus, census_object_version_on_disk, signed_admin_post, wait_for_complete_physical_shard_on_disk,
+};
 use crate::common::init_logging;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
@@ -110,7 +112,8 @@ async fn three_node_four_drive_ec8_4_root_heal_rebuilds_replaced_drive_after_res
     let replaced_drive = PathBuf::from(&dist.cluster.nodes[replaced_node].data_dirs[replaced_drive_index]);
 
     for item in &mut expected {
-        item.baseline = census_object_version_on_disk(&replaced_drive, &bucket, &item.key, None)?;
+        item.baseline =
+            wait_for_complete_physical_shard_on_disk(&replaced_drive, &bucket, &item.key, None, Duration::from_secs(10)).await?;
         assert_ec84_geometry(&item.baseline, &item.key)?;
     }
 

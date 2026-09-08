@@ -16,7 +16,7 @@ name: Security Audit
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, release ]
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
@@ -32,7 +32,7 @@ on:
       - 'scripts/security/check_workflow_pins.sh'
   pull_request:
     types: [ opened, synchronize, reopened, closed ]
-    branches: [ main ]
+    branches: [ main, release ]
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'

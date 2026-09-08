@@ -43,7 +43,8 @@ Promotion rule: never promote a report-only lane to required from one green run.
 | PR, non-doc change | `End-to-End Tests` | `ci.yml` `e2e-tests` | Report-only | `cargo nextest run --profile e2e-smoke -p e2e_test`, then `./scripts/e2e-run.sh ./target/debug/rustfs <data-dir>`; membership guards `scripts/check_test_wiring.py --check-profile e2e-smoke <listing.json>` and `scripts/check_security_smoke_count.sh check <listing.json>` |
 | PR, non-doc change | `S3 Implemented Tests` | `ci.yml` `s3-implemented-tests` | Report-only | build `rustfs`, then `scripts/s3-tests/run.sh` with the job's `DEPLOY_MODE` / `TEST_MODE` / `MAXFAIL` env |
 | PR, non-doc change | `S3 Lifecycle Behavior Tests` | `ci.yml` `s3-lifecycle-behavior-tests` | Report-only | `scripts/s3-tests/run.sh` with the job's accelerated-scanner env |
-| PR touching `paths` in `audit.yml` | `Cargo Deny`, `Workflow Pin Report`, `Dependency Review` | `audit.yml` `cargo-deny`, `workflow-pin-report`, `dependency-review` | Report-only | `cargo deny check`; `scripts/security/check_workflow_pins.sh` |
+| PR to `main` or `release` touching `paths` in `audit.yml` | `Cargo Deny`, `Workflow Pin Report`, `Dependency Review` | `audit.yml` `cargo-deny`, `workflow-pin-report`, `dependency-review` | Report-only | `cargo deny check`; `scripts/security/check_workflow_pins.sh` |
+| Push to `main` or `release` touching `paths` in `audit.yml` | `Cargo Deny`, `Workflow Pin Report` | `audit.yml` `cargo-deny`, `workflow-pin-report` | Report-only | `cargo deny check`; `scripts/security/check_workflow_pins.sh` |
 | PR touching `paths` in `architecture-migration-rules.yml` | `Architecture Migration Rules` | `architecture-migration-rules.yml` `architecture-migration-rules` | Report-only | `scripts/check_architecture_migration_rules.sh` |
 | PR touching `paths` in `nix.yml` | `Nix Build & Check` | `nix.yml` `nix-validation` | Report-only | `nix flake check` |
 | PR touching `paths` in `fuzz.yml` | `Build Fuzz Harness`, `Smoke / <target>` | `fuzz.yml` `fuzz-build`, `pr-fuzz-smoke` | Report-only | `MAX_TOTAL_TIME=60 ./scripts/fuzz/run.sh` |
@@ -53,7 +54,7 @@ Promotion rule: never promote a report-only lane to required from one green run.
 | PR touching `paths` in `oidc-keycloak.yml` | `OIDC Keycloak live gate` | `oidc-keycloak.yml` `oidc-keycloak-live` | Report-only | `cargo build --locked -p rustfs --bin rustfs`, then `bash scripts/test/oidc_keycloak_live.sh ./target/debug/rustfs` |
 | PR touching `paths` in `targets-integration.yml` | `PostgreSQL, MySQL, AMQP, and NATS` | `targets-integration.yml` `targets-live` | Report-only | start the containers as in the job, export the `RUSTFS_TEST_*` DSNs, then the job's `cargo test --locked -p rustfs-targets --test <name> -- --ignored --test-threads=1` commands |
 | PR limited to main-CI-excluded paths | `Quick Checks`, `Test and Lint` | `ci-docs-only.yml` `quick-checks`, `test-and-lint` | Required | `git diff --check`; `make doc-paths-check`; `scripts/check_no_planning_docs.sh` |
-| `merge_group`; push to `main` | `End-to-End Tests (full merge gate)` | `ci.yml` `e2e-full` | Report-only | `cargo nextest run --profile e2e-full -p e2e_test` |
+| `merge_group`; push to `main` or `release` | `End-to-End Tests (full merge gate)` | `ci.yml` `e2e-full` | Report-only | `cargo nextest run --profile e2e-full -p e2e_test` |
 
 e2e filters live in `.config/nextest.toml`; extend a profile instead of adding a second selector. Before a profile runs, `scripts/check_test_wiring.py` compares its listing to the committed digest in `.config/e2e-<profile>-selection.txt`, so a silent test drop fails closed.
 
@@ -62,7 +63,7 @@ cost. `data_usage_test` runs in the PR `e2e-smoke` lane so changes that affect
 authoritative scanner usage publication, quota-visible usage, or admin usage
 snapshots get an end-to-end signal before merge review. `heal_erasure_disk_rebuild_test`
 runs in `e2e-full` so core erasure heal rebuild regressions are caught no later
-than the merge queue or `main` push lane; it also remains in `e2e-nightly` with
+than the merge queue or `main`/`release` push lane; it also remains in `e2e-nightly` with
 the serialized cluster fault-domain suites for scheduled soak signal.
 
 ## Scheduled validation

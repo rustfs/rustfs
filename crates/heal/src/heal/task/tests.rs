@@ -1339,6 +1339,10 @@ struct MockStorage {
     heal_object_outcomes: Mutex<HashMap<String, VecDeque<MockHealObjectOutcome>>>,
     heal_object_receipts: Mutex<HashMap<String, VecDeque<HealObjectReceipt>>>,
     bucket_incarnation_id: Mutex<Option<Uuid>>,
+    bucket_incarnation_calls: AtomicU64,
+    bucket_incarnation_error: Mutex<Option<Error>>,
+    block_bucket_incarnation: bool,
+    bucket_incarnation_started: tokio::sync::Notify,
     bucket_incarnation_after_object_heal: Mutex<Option<Uuid>>,
     bucket_incarnation_unavailable: Mutex<bool>,
     format_no_heal_required: Mutex<bool>,
@@ -1482,7 +1486,7 @@ async fn object_heal_records_matching_positive_storage_receipt() {
     });
     let task = HealTask::from_request(
         HealRequest::object("bucket-a".to_string(), "object-a".to_string(), Some("version-a".to_string())),
-        storage,
+        storage.clone(),
     );
 
     task.execute().await.expect("mock object heal should complete");
@@ -1495,6 +1499,114 @@ async fn object_heal_records_matching_positive_storage_receipt() {
     assert_eq!(object.identity.version_id.as_deref(), Some("version-a"));
     assert!(object.identity.bucket_incarnation_id.is_some());
     assert_eq!(object.disposition, HealObjectDisposition::Repaired);
+    assert_eq!(
+        storage.bucket_incarnation_calls.load(Ordering::Relaxed),
+        1,
+        "latch the owner exactly once before repair"
+    );
+}
+
+#[tokio::test]
+async fn object_heal_owner_lookup_failure_preserves_unverified_repair() {
+    let storage = Arc::new(MockStorage {
+        bucket_incarnation_error: Mutex::new(Some(Error::other("owner metadata unavailable"))),
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            VecDeque::from([object_receipt(
+                "object-a",
+                None,
+                HealObjectDisposition::Repaired,
+                Uuid::new_v4(),
+            )]),
+        )])),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(HealRequest::object("bucket-a".to_string(), "object-a".to_string(), None), storage.clone());
+
+    task.execute().await.expect("missing receipt owner must not prevent repair");
+
+    assert_eq!(storage.heal_object_calls.lock().expect("heal calls").as_slice(), ["object-a"]);
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.counters.healed, 0);
+    assert_eq!(outcome.counters.unknown, 1);
+    assert_eq!(
+        outcome.objects.front().expect("unverified outcome").disposition,
+        HealObjectDisposition::Unknown
+    );
+}
+
+#[tokio::test]
+async fn object_heal_dry_run_skips_owner_lookup_and_positive_receipts() {
+    let storage = Arc::new(MockStorage {
+        bucket_incarnation_error: Mutex::new(Some(Error::other("dry-run must not query the receipt owner"))),
+        heal_object_receipts: Mutex::new(HashMap::from([(
+            "object-a".to_string(),
+            VecDeque::from([object_receipt(
+                "object-a",
+                None,
+                HealObjectDisposition::Repaired,
+                Uuid::new_v4(),
+            )]),
+        )])),
+        ..Default::default()
+    });
+    let mut request = HealRequest::object("bucket-a".to_string(), "object-a".to_string(), None);
+    request.options.dry_run = true;
+    let task = HealTask::from_request(request, storage.clone());
+
+    task.execute().await.expect("dry-run should complete without owner metadata");
+
+    assert!(storage.object_heal_opts.lock().expect("heal options")[0].dry_run);
+    assert_eq!(storage.bucket_incarnation_calls.load(Ordering::Relaxed), 0);
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.counters.healed, 0);
+    assert_eq!(outcome.counters.unknown, 0);
+    assert_eq!(outcome.counters.skipped, 1);
+    assert_eq!(
+        outcome.objects.front().expect("dry-run outcome").disposition,
+        HealObjectDisposition::DryRunObserved
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn object_heal_owner_lookup_obeys_task_timeout() {
+    let storage = Arc::new(MockStorage {
+        block_bucket_incarnation: true,
+        ..Default::default()
+    });
+    let mut request = HealRequest::object("bucket-a".to_string(), "object-a".to_string(), None);
+    request.options.timeout = Some(Duration::from_secs(5));
+    let task = HealTask::from_request(request, storage.clone());
+
+    let result = tokio::time::timeout(Duration::from_secs(60), task.execute())
+        .await
+        .expect("owner lookup must honor the task deadline");
+
+    assert!(matches!(result, Err(Error::TaskTimeout)));
+    assert!(storage.heal_object_calls.lock().expect("heal calls").is_empty());
+}
+
+#[tokio::test]
+async fn object_heal_owner_lookup_obeys_cancellation() {
+    let storage = Arc::new(MockStorage {
+        block_bucket_incarnation: true,
+        ..Default::default()
+    });
+    let mut request = HealRequest::object("bucket-a".to_string(), "object-a".to_string(), None);
+    request.options.timeout = None;
+    let task = HealTask::from_request(request, storage.clone());
+
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(task.execute(), async {
+            storage.bucket_incarnation_started.notified().await;
+            task.cancel().await.expect("cancel pending owner lookup");
+        })
+    })
+    .await
+    .expect("cancellation must interrupt owner lookup");
+
+    assert!(matches!(result, Err(Error::TaskCancelled)));
+    assert!(storage.heal_object_calls.lock().expect("heal calls").is_empty());
 }
 
 #[tokio::test]
@@ -1844,6 +1956,14 @@ impl HealStorageAPI for MockStorage {
     }
 
     async fn bucket_incarnation_id(&self, _bucket: &str) -> Result<Option<Uuid>> {
+        self.bucket_incarnation_calls.fetch_add(1, Ordering::Relaxed);
+        self.bucket_incarnation_started.notify_one();
+        if self.block_bucket_incarnation {
+            std::future::pending::<()>().await;
+        }
+        if let Some(error) = self.bucket_incarnation_error.lock().expect("owner lookup error").take() {
+            return Err(error);
+        }
         if *self.bucket_incarnation_unavailable.lock().unwrap() {
             return Err(Error::Other("bucket incarnation unavailable".to_string()));
         }

@@ -626,7 +626,8 @@ fn mrf_successor_flush_child_process_fixture() {
             }),
         ));
         mrf_queue::spawn_mrf_consumer(manager.clone());
-        let expected_successor = journal_record(1, "successor-bucket", "second-object", None, 2);
+        let mut expected_successor = journal_record(1, "successor-bucket", "second-object", None, 2);
+        expected_successor.extend(journal_record(1, "successor-bucket", "first-object", None, 0));
         let flushed = wait_until(Duration::from_secs(10), || async {
             manager.operations_snapshot().await.queued_by_source.mrf == 1
                 && journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &expected_successor)
@@ -673,7 +674,8 @@ fn mrf_successor_flush_waiting_child_process_fixture() {
             }),
         ));
         mrf_queue::spawn_mrf_consumer(manager.clone());
-        let expected_successor = journal_record(1, "service-kill-bucket", "second-object", None, 2);
+        let mut expected_successor = journal_record(1, "service-kill-bucket", "second-object", None, 2);
+        expected_successor.extend(journal_record(1, "service-kill-bucket", "first-object", None, 0));
         let flushed = wait_until(Duration::from_secs(10), || async {
             manager.operations_snapshot().await.queued_by_source.mrf == 1
                 && journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &expected_successor)
@@ -713,7 +715,8 @@ fn mrf_authoritative_fsync_waiting_child_process_fixture() {
         write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &startup);
         write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &startup);
 
-        let successor = journal_record(1, "fsync-kill-bucket", "second-object", None, 2);
+        let mut successor = journal_record(1, "fsync-kill-bucket", "second-object", None, 2);
+        successor.extend(journal_record(1, "fsync-kill-bucket", "first-object", None, 0));
         write_journal_path_to_disks_synced(&disk_paths, SCOPED_JOURNAL_REL, &successor);
         assert!(
             journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &successor)
@@ -770,9 +773,8 @@ async fn journal_replay_retains_child_process_anchor_when_manager_is_full() {
     );
 }
 
-/// If a process crashes after flushing a smaller successor snapshot but before
-/// deleting the startup anchor, the restarted process must replay the
-/// successor tail rather than losing it or merging it with stale records.
+/// A successor flush must preserve both pending work and accepted work whose
+/// repair has not been proven when the process restarts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn journal_replay_survives_successor_flush_before_delete() {
@@ -787,7 +789,8 @@ async fn journal_replay_survives_successor_flush_before_delete() {
     assert_eq!(status.code(), Some(78), "child process did not reach the successor flush boundary");
 
     let (disk_paths, storage) = heal_env_at(Some(temp_dir.path())).await;
-    let expected_successor = journal_record(1, "successor-bucket", "second-object", None, 2);
+    let mut expected_successor = journal_record(1, "successor-bucket", "second-object", None, 2);
+    expected_successor.extend(journal_record(1, "successor-bucket", "first-object", None, 0));
     assert!(
         journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &expected_successor),
         "restarted process must see the pending successor snapshot"
@@ -795,11 +798,11 @@ async fn journal_replay_survives_successor_flush_before_delete() {
 
     let restarted = make_manager(storage);
     let replayed = mrf_queue::replay_journal_once(&restarted).await;
-    assert_eq!(replayed, 1, "restart after successor flush must replay only the still-pending tail");
+    assert_eq!(replayed, 2, "restart must replay both the admitted and pending responsibilities");
     assert_eq!(
         restarted.operations_snapshot().await.queued_by_source.mrf,
-        1,
-        "the successor tail must be accepted after restart"
+        2,
+        "both unproven successor responsibilities must be accepted after restart"
     );
     assert!(
         disk_paths.iter().all(|path| {
@@ -811,8 +814,8 @@ async fn journal_replay_survives_successor_flush_before_delete() {
 }
 
 /// A service-style hard kill after successor flush must be equivalent to a
-/// crash at the flush-before-delete boundary: restart may replay the smaller
-/// successor snapshot, but must not lose or merge stale startup records.
+/// crash at the flush-before-delete boundary: restart must recover every
+/// unproven responsibility from the successor snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 #[cfg(unix)]
@@ -840,7 +843,8 @@ async fn journal_replay_survives_service_kill_after_successor_flush() {
     assert!(!status.success(), "child fixture must be terminated instead of exiting cleanly");
 
     let (disk_paths, storage) = heal_env_at(Some(temp_dir.path())).await;
-    let expected_successor = journal_record(1, "service-kill-bucket", "second-object", None, 2);
+    let mut expected_successor = journal_record(1, "service-kill-bucket", "second-object", None, 2);
+    expected_successor.extend(journal_record(1, "service-kill-bucket", "first-object", None, 0));
     assert!(
         journal_matches_on_all_disks(&disk_paths, SCOPED_JOURNAL_REL, &expected_successor),
         "restarted process must see the successor snapshot produced before the kill"
@@ -848,11 +852,11 @@ async fn journal_replay_survives_service_kill_after_successor_flush() {
 
     let restarted = make_manager(storage);
     let replayed = mrf_queue::replay_journal_once(&restarted).await;
-    assert_eq!(replayed, 1, "restart after service kill must replay only the still-pending tail");
+    assert_eq!(replayed, 2, "service-kill restart must preserve every unproven responsibility");
     assert_eq!(
         restarted.operations_snapshot().await.queued_by_source.mrf,
-        1,
-        "the successor tail must be accepted after service kill restart"
+        2,
+        "both unproven responsibilities must be accepted after service kill restart"
     );
     assert!(
         disk_paths.iter().all(|path| {
@@ -864,9 +868,9 @@ async fn journal_replay_survives_service_kill_after_successor_flush() {
 }
 
 /// A hard kill between the authoritative successor fsync and the legacy mirror
-/// rewrite must prefer the canonical successor tail over the stale legacy
-/// startup epoch. This models the mixed-version boundary conservatively: new
-/// readers must not merge epochs, while the old mirror remains crash-visible.
+/// rewrite must prefer the canonical successor over the stale legacy startup
+/// epoch while retaining every unproven responsibility. New readers must not
+/// merge epochs, while the old mirror remains crash-visible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 #[cfg(unix)]
@@ -894,7 +898,8 @@ async fn journal_replay_survives_sigkill_after_authoritative_successor_fsync_bef
     assert!(!status.success(), "child fixture must be terminated instead of exiting cleanly");
 
     let (disk_paths, storage) = heal_env_at(Some(temp_dir.path())).await;
-    let expected_successor = journal_record(1, "fsync-kill-bucket", "second-object", None, 2);
+    let mut expected_successor = journal_record(1, "fsync-kill-bucket", "second-object", None, 2);
+    expected_successor.extend(journal_record(1, "fsync-kill-bucket", "first-object", None, 0));
     let stale_startup = {
         let mut startup = journal_record(1, "fsync-kill-bucket", "first-object", None, 0);
         startup.extend(journal_record(1, "fsync-kill-bucket", "second-object", None, 0));
@@ -911,11 +916,11 @@ async fn journal_replay_survives_sigkill_after_authoritative_successor_fsync_bef
 
     let restarted = make_manager(storage);
     let replayed = mrf_queue::replay_journal_once(&restarted).await;
-    assert_eq!(replayed, 1, "new reader must replay only the authoritative successor tail");
+    assert_eq!(replayed, 2, "new reader must recover every responsibility in the authoritative successor");
     assert_eq!(
         restarted.operations_snapshot().await.queued_by_source.mrf,
-        1,
-        "the successor tail must be accepted after the fsync-boundary restart"
+        2,
+        "both responsibilities must be accepted after the fsync-boundary restart"
     );
     assert!(
         disk_paths.iter().all(|path| {

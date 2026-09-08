@@ -1233,6 +1233,8 @@ impl LocalKmsClient {
     async fn decode_stored_key(&self, key_id: &str) -> Result<(StoredMasterKey, Vec<u8>)> {
         let key_path = self.master_key_path(key_id)?;
         if !fs::try_exists(&key_path).await? {
+            // A missing key is a caller error only while its storage directory is available.
+            let _ = fs::read_dir(&self.config.key_dir).await?;
             return Err(KmsError::key_not_found(key_id));
         }
 
@@ -2095,11 +2097,7 @@ impl KmsBackend for LocalKmsBackend {
         let _write_guard = self.client.lock_key_for_write(key_id).await;
 
         // First, load the key from disk to get the master key
-        let mut master_key = self
-            .client
-            .load_master_key(key_id)
-            .await
-            .map_err(|_| KmsError::key_not_found(format!("Key {key_id} not found")))?;
+        let mut master_key = self.client.load_master_key(key_id).await?;
 
         let (deletion_date_str, deletion_date_dt) = if request.force_immediate.unwrap_or(false) {
             // Tombstone first: mark the record Deleted before removing the
@@ -2202,11 +2200,7 @@ impl KmsBackend for LocalKmsBackend {
         let _write_guard = self.client.lock_key_for_write(key_id).await;
 
         // Load the key from disk to get the master key
-        let mut master_key = self
-            .client
-            .load_master_key(key_id)
-            .await
-            .map_err(|_| KmsError::key_not_found(format!("Key {key_id} not found")))?;
+        let mut master_key = self.client.load_master_key(key_id).await?;
 
         if master_key.status != KeyStatus::PendingDeletion {
             return Err(KmsError::invalid_key_state(format!("Key {key_id} is not pending deletion")));
@@ -2963,6 +2957,146 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, KmsError::InvalidKey { .. }));
+    }
+
+    #[tokio::test]
+    async fn delete_key_preserves_directory_io_error() {
+        let (client, temp_dir) = create_dev_mode_client().await;
+        client.create_key("existing-key", "AES_256", None).await.expect("create key");
+        let backend = LocalKmsBackend { client };
+        let offline_dir = TempDir::new().expect("create offline directory");
+        let offline_key_dir = offline_dir.path().join("keys");
+        fs::rename(temp_dir.path(), &offline_key_dir)
+            .await
+            .expect("move key directory offline");
+        fs::write(temp_dir.path(), b"not a directory")
+            .await
+            .expect("replace key directory with a file");
+
+        let error = backend
+            .delete_key(DeleteKeyRequest {
+                key_id: "existing-key".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("unreadable storage must prevent scheduling deletion");
+
+        fs::remove_file(temp_dir.path()).await.expect("remove replacement file");
+        fs::rename(&offline_key_dir, temp_dir.path())
+            .await
+            .expect("restore key directory");
+        assert!(matches!(error, KmsError::IoError { .. }), "got {error:?}");
+        let key = backend
+            .client
+            .load_master_key("existing-key")
+            .await
+            .expect("read retained key");
+        assert_eq!(key.status, KeyStatus::Active, "failed deletion must not mutate key state");
+    }
+
+    #[tokio::test]
+    async fn cancel_key_deletion_preserves_directory_io_error() {
+        let (client, temp_dir) = create_dev_mode_client().await;
+        client.create_key("existing-key", "AES_256", None).await.expect("create key");
+        let backend = LocalKmsBackend { client };
+        backend
+            .delete_key(DeleteKeyRequest {
+                key_id: "existing-key".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("schedule key deletion");
+        let offline_dir = TempDir::new().expect("create offline directory");
+        let offline_key_dir = offline_dir.path().join("keys");
+        fs::rename(temp_dir.path(), &offline_key_dir)
+            .await
+            .expect("move key directory offline");
+        fs::write(temp_dir.path(), b"not a directory")
+            .await
+            .expect("replace key directory with a file");
+
+        let error = backend
+            .cancel_key_deletion(CancelKeyDeletionRequest {
+                key_id: "existing-key".to_string(),
+            })
+            .await
+            .expect_err("unreadable storage must prevent cancelling deletion");
+
+        fs::remove_file(temp_dir.path()).await.expect("remove replacement file");
+        fs::rename(&offline_key_dir, temp_dir.path())
+            .await
+            .expect("restore key directory");
+        assert!(matches!(error, KmsError::IoError { .. }), "got {error:?}");
+        let key = backend
+            .client
+            .load_master_key("existing-key")
+            .await
+            .expect("read retained key");
+        assert_eq!(
+            key.status,
+            KeyStatus::PendingDeletion,
+            "failed cancellation must retain the deletion state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_master_key_missing_key_remains_not_found() {
+        let (client, _temp_dir) = create_dev_mode_client().await;
+
+        let error = client
+            .load_master_key("missing-key")
+            .await
+            .expect_err("missing key must fail");
+
+        assert!(matches!(error, KmsError::KeyNotFound { key_id } if key_id == "missing-key"));
+    }
+
+    #[tokio::test]
+    async fn test_load_master_key_unavailable_directory_is_io_error() {
+        let (client, temp_dir) = create_dev_mode_client().await;
+        client.create_key("existing-key", "AES_256", None).await.expect("create key");
+        let offline_dir = TempDir::new().expect("create offline directory");
+        let offline_key_dir = offline_dir.path().join("keys");
+        fs::rename(temp_dir.path(), &offline_key_dir)
+            .await
+            .expect("move key directory offline");
+
+        let error = client
+            .load_master_key("existing-key")
+            .await
+            .expect_err("unavailable key directory must fail");
+
+        fs::rename(&offline_key_dir, temp_dir.path())
+            .await
+            .expect("restore key directory");
+        assert!(matches!(error, KmsError::IoError { .. }), "got {error:?}");
+        let key = client.load_master_key("existing-key").await.expect("read restored key");
+        assert_eq!(key.key_id, "existing-key");
+    }
+
+    #[tokio::test]
+    async fn test_load_master_key_directory_replaced_by_file_is_io_error() {
+        let (client, temp_dir) = create_dev_mode_client().await;
+        client.create_key("existing-key", "AES_256", None).await.expect("create key");
+        let offline_dir = TempDir::new().expect("create offline directory");
+        let offline_key_dir = offline_dir.path().join("keys");
+        fs::rename(temp_dir.path(), &offline_key_dir)
+            .await
+            .expect("move key directory offline");
+        fs::write(temp_dir.path(), b"not a directory")
+            .await
+            .expect("replace key directory with a file");
+
+        let error = client
+            .load_master_key("existing-key")
+            .await
+            .expect_err("a file in place of the key directory must fail");
+
+        fs::remove_file(temp_dir.path()).await.expect("remove replacement file");
+        fs::rename(&offline_key_dir, temp_dir.path())
+            .await
+            .expect("restore key directory");
+        assert!(matches!(error, KmsError::IoError { .. }), "got {error:?}");
     }
 
     #[tokio::test]

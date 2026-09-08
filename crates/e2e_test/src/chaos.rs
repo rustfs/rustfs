@@ -44,6 +44,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use tokio::time::{Duration, Instant, sleep};
 use tracing::info;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -374,6 +375,33 @@ pub(crate) fn census_object_version_on_disk(
     })
 }
 
+/// Wait for the background PUT tail to commit every physical part on one disk.
+/// Invalid metadata remains an immediate error instead of a retryable absence.
+pub(crate) async fn wait_for_complete_physical_shard_on_disk(
+    disk: &Path,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    timeout: Duration,
+) -> ChaosResult<VersionShardCensus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let census = census_object_version_on_disk(disk, bucket, key, version_id)?;
+        if census.is_complete() && !census.expected_part_numbers.is_empty() {
+            return Ok(census);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "physical shard for {bucket}/{key}@{version_id:?} on {} did not become complete within {timeout:?}: {census:?}",
+                disk.display()
+            )
+            .into());
+        }
+        sleep(remaining.min(Duration::from_millis(50))).await;
+    }
+}
+
 /// `POST` a signed (SigV4, service `s3`) admin request without relying on the
 /// external `awscurl` binary. Mirrors the admin heal calls used by the heal
 /// regression suite.
@@ -450,5 +478,31 @@ mod tests {
         changed.inline_data_fingerprint = Some(shard_fingerprint(b"changed").unwrap());
         assert!(expected.matches_manifest(&expected));
         assert!(!changed.matches_manifest(&expected));
+    }
+
+    #[tokio::test]
+    async fn physical_shard_readiness_fails_closed_with_last_census() {
+        let disk = tempfile::tempdir().expect("temporary disk");
+        let error = wait_for_complete_physical_shard_on_disk(disk.path(), "bucket", "missing", None, Duration::ZERO)
+            .await
+            .expect_err("missing physical shards must fail the baseline gate");
+        assert!(error.to_string().contains("has_xl_meta: false"));
+        assert!(error.to_string().contains("bucket/missing"));
+    }
+
+    #[tokio::test]
+    async fn physical_shard_readiness_does_not_retry_invalid_metadata() {
+        let disk = tempfile::tempdir().expect("temporary disk");
+        let object = disk.path().join("bucket").join("corrupt");
+        std::fs::create_dir_all(&object).expect("object directory");
+        std::fs::write(object.join("xl.meta"), b"invalid metadata").expect("corrupt metadata fixture");
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_complete_physical_shard_on_disk(disk.path(), "bucket", "corrupt", None, Duration::from_secs(30)),
+        )
+        .await
+        .expect("corrupt metadata must fail immediately")
+        .expect_err("invalid metadata must not be accepted as a complete baseline");
+        assert!(!error.to_string().contains("did not become complete"));
     }
 }
