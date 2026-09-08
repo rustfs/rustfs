@@ -18,7 +18,7 @@ use crate::bucket::metadata_sys::get_replication_config;
 use crate::bucket::remote_s3_client::{
     PathStyle, REPLICATION_TARGET_RETRY_POLICY, RemoteCredentials, RemoteS3EndpointSpec, build_remote_s3_client,
 };
-use crate::bucket::replication::{ObjectLockIntegrity, object_lock_put_integrity};
+use crate::bucket::replication::{ObjectLockIntegrity, object_lock_put_integrity, replication_etags_match};
 use crate::bucket::replication::{ReplicationStatusType, ReplicationTargetConfigBridge};
 use crate::bucket::target::ARN;
 use crate::bucket::target::BucketTargetType;
@@ -33,6 +33,8 @@ use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
 use aws_sdk_s3::operation::get_object_tagging::{GetObjectTaggingError, GetObjectTaggingOutput};
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_sdk_s3::operation::put_object_legal_hold::{PutObjectLegalHoldError, PutObjectLegalHoldOutput};
+use aws_sdk_s3::operation::put_object_retention::{PutObjectRetentionError, PutObjectRetentionOutput};
 use aws_sdk_s3::operation::put_object_tagging::{PutObjectTaggingError, PutObjectTaggingOutput};
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
 use aws_sdk_s3::primitives::ByteStream;
@@ -42,6 +44,7 @@ use aws_sdk_s3::types::{
     ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
     ServerSideEncryption,
 };
+use aws_sdk_s3::types::{ObjectLockLegalHold, ObjectLockRetention};
 use aws_sdk_s3::{Client as S3Client, operation::head_object::HeadObjectOutput};
 use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
 use futures::{StreamExt, stream};
@@ -126,6 +129,25 @@ impl From<&BucketTarget> for RemoteS3EndpointSpec {
 }
 
 pub type HeadObjectSdkError = Box<SdkError<HeadObjectError>>;
+
+/// Whether an edited bucket target still addresses the same remote service
+/// (endpoint, bucket, path style, TLS and identity), so a verdict learned
+/// about that service stays valid across the edit.
+fn same_replication_service(edited: &BucketTarget, previous: &BucketTarget) -> bool {
+    let access_key = |target: &BucketTarget| target.credentials.as_ref().map(|credentials| credentials.access_key.clone());
+    edited.endpoint == previous.endpoint
+        && edited.target_bucket == previous.target_bucket
+        && edited.secure == previous.secure
+        && edited.path == previous.path
+        && access_key(edited) == access_key(previous)
+}
+
+/// Page size and page budget for [`TargetClient::locate_replica_by_etag`].
+const FIND_VERSION_BY_ETAG_PAGE_SIZE: i32 = 1000;
+const FIND_VERSION_BY_ETAG_MAX_PAGES: usize = 8;
+/// Candidate cap for [`TargetClient::replica_candidates_by_etag`]: more than
+/// this many same-content versions of one key is ambiguity by any measure.
+const FIND_VERSION_BY_ETAG_MAX_MATCHES: usize = 16;
 pub type GetObjectSdkError = Box<SdkError<GetObjectError>>;
 pub type GetObjectTaggingSdkError = Box<SdkError<GetObjectTaggingError>>;
 pub type PutObjectTaggingSdkError = Box<SdkError<PutObjectTaggingError>>;
@@ -349,6 +371,13 @@ struct TargetClientBuildProbe {
 /// their import path while the verdict vocabulary lives with the
 /// replication decision logic.
 pub use crate::bucket::replication::SsecPassthroughCapability;
+/// Version-identity verdicts (see the enum's own docs in
+/// `rustfs-replication`) are cached here per target ARN and follow the same
+/// `arn_remotes_map` lifecycle. They carry no TTL: the verdict is refreshed
+/// by every replication write's response, so it can only go stale on a
+/// target that receives no writes — and a stale `MintsOwn` costs one extra
+/// content-identity lookup before a PUT, never a lost replica.
+pub use crate::bucket::replication::VersionIdentityCapability;
 
 /// How long an audited SSE-C passthrough verdict stays authoritative.
 ///
@@ -375,6 +404,11 @@ pub struct BucketTargetSys {
     /// SSE-C passthrough capability verdicts keyed by target ARN. See
     /// [`SsecPassthroughCapability`]; reset alongside `arn_remotes_map`.
     ssec_passthrough_map: Arc<RwLock<HashMap<String, SsecPassthroughRecord>>>,
+    /// Version-identity verdicts keyed by target ARN. See
+    /// [`VersionIdentityCapability`]; reset alongside `arn_remotes_map`. A std
+    /// lock (never held across an await) so the replication worker can record
+    /// a verdict from inside its synchronous PUT-response audit.
+    version_identity_map: Arc<std::sync::RwLock<HashMap<String, VersionIdentityCapability>>>,
     pub targets_map: Arc<RwLock<HashMap<String, Vec<BucketTarget>>>>,
     /// Buckets whose persisted `bucket-targets.json` exists but cannot be
     /// decoded (rustfs/backlog#2282). Written under the bucket's update mutex
@@ -423,6 +457,7 @@ impl BucketTargetSys {
         Self {
             arn_remotes_map: Arc::new(RwLock::new(HashMap::new())),
             ssec_passthrough_map: Arc::new(RwLock::new(HashMap::new())),
+            version_identity_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
             targets_map: Arc::new(RwLock::new(HashMap::new())),
             unreadable_targets: Arc::new(RwLock::new(HashSet::new())),
             h_mutex: Arc::new(RwLock::new(HashMap::new())),
@@ -746,8 +781,38 @@ impl BucketTargetSys {
                 arn_remotes_map.remove(&target.arn);
                 health_map.remove(&target.arn);
                 ssec_map.remove(&target.arn);
+                self.forget_version_identity_capability(&target.arn);
             }
         }
+    }
+
+    /// Cached version-identity verdict for a target ARN; `Unknown` until a
+    /// replication write or a replication-check VersionFidelity probe judged
+    /// it since the target was built.
+    pub fn version_identity_capability(&self, arn: &str) -> VersionIdentityCapability {
+        self.version_identity_map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(arn)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Record a version-identity verdict for a target ARN. Written by the
+    /// replication worker after every PutObject / CompleteMultipartUpload
+    /// response and by the replication-check VersionFidelity phase.
+    pub fn record_version_identity_capability(&self, arn: &str, capability: VersionIdentityCapability) {
+        self.version_identity_map
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(arn.to_string(), capability);
+    }
+
+    fn forget_version_identity_capability(&self, arn: &str) {
+        self.version_identity_map
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(arn);
     }
 
     /// Cached SSE-C passthrough capability for a target ARN, plus whether the
@@ -794,15 +859,22 @@ impl BucketTargetSys {
     ) -> Result<BucketTargets, BucketTargetError> {
         self.validate_target(bucket, target).await?;
 
-        let mut bucket_targets = match self.list_bucket_targets(bucket).await {
-            Ok(targets) => targets,
-            Err(BucketTargetError::BucketRemoteTargetNotFound { .. }) => BucketTargets::default(),
-            Err(err) => return Err(err),
-        };
+        let mut bucket_targets = self.targets_base_for_write(bucket).await?;
 
         Self::upsert_target_entry(&mut bucket_targets.targets, target, update)?;
 
         Ok(bucket_targets)
+    }
+
+    /// Ordinary writes must not turn an unreadable cached snapshot into an
+    /// empty configuration. Explicit repair belongs to the metadata transaction
+    /// that can inspect the current persisted state.
+    async fn targets_base_for_write(&self, bucket: &str) -> Result<BucketTargets, BucketTargetError> {
+        match self.list_bucket_targets(bucket).await {
+            Ok(targets) => Ok(targets),
+            Err(BucketTargetError::BucketRemoteTargetNotFound { .. }) => Ok(BucketTargets::default()),
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn validate_target(&self, bucket: &str, target: &BucketTarget) -> Result<(), BucketTargetError> {
@@ -863,7 +935,9 @@ impl BucketTargetSys {
         Ok(())
     }
 
-    fn upsert_target_entry(
+    /// Merge a validated target into a caller-owned snapshot. The caller must
+    /// protect that snapshot through persistence.
+    pub fn upsert_target_entry(
         bucket_targets: &mut Vec<BucketTarget>,
         target: &BucketTarget,
         update: bool,
@@ -1153,12 +1227,32 @@ impl BucketTargetSys {
         // Remove existing targets
         if let Some(existing_targets) = targets_map.remove(bucket) {
             let mut ssec_map = self.ssec_passthrough_map.write().await;
+            let unchanged_service: HashMap<&str, &BucketTarget> = targets
+                .map(|new_targets| {
+                    new_targets
+                        .targets
+                        .iter()
+                        .map(|target| (target.arn.as_str(), target))
+                        .collect()
+                })
+                .unwrap_or_default();
             for target in existing_targets {
                 arn_remotes_map.remove(&target.arn);
                 health_map.remove(&target.arn);
                 // A rebuilt/edited target may point at a different service:
                 // the SSE-C passthrough verdict must be re-audited from Unknown.
                 ssec_map.remove(&target.arn);
+                // The version-identity verdict survives an edit that keeps the
+                // same remote service (a resync start or a bandwidth change
+                // rewrites the entry in place): forgetting it there would make
+                // the very resync that follows re-drive every object as a
+                // duplicate on a target that mints its own version ids.
+                if unchanged_service
+                    .get(target.arn.as_str())
+                    .is_none_or(|edited| !same_replication_service(edited, &target))
+                {
+                    self.forget_version_identity_capability(&target.arn);
+                }
                 self.update_bandwidth_limit(bucket, &target.arn, 0);
             }
         }
@@ -1227,25 +1321,27 @@ impl BucketTargetSys {
             return (String::new(), false);
         };
 
-        {
-            let targets_map = self.targets_map.read().await;
-            if let Some(targets) = targets_map.get(bucket) {
-                for tgt in targets {
-                    if tgt.target_type == target.target_type
-                        && tgt.target_bucket == target.target_bucket
-                        && target.endpoint == tgt.endpoint
-                        && tgt
-                            .credentials
-                            .as_ref()
-                            .map(|c| {
-                                let default_creds = Credentials::default();
-                                c.access_key == target.credentials.as_ref().unwrap_or(&default_creds).access_key
-                            })
-                            .unwrap_or(false)
-                    {
-                        return (tgt.arn.clone(), true);
-                    }
-                }
+        let targets_map = self.targets_map.read().await;
+        let targets = targets_map.get(bucket).map(Vec::as_slice).unwrap_or_default();
+        Self::remote_arn_for_targets(targets, target, depl_id)
+    }
+
+    /// Resolve create idempotency against the snapshot the caller will persist.
+    pub fn remote_arn_for_targets(targets: &[BucketTarget], target: &BucketTarget, depl_id: &str) -> (String, bool) {
+        for tgt in targets {
+            if tgt.target_type == target.target_type
+                && tgt.target_bucket == target.target_bucket
+                && target.endpoint == tgt.endpoint
+                && tgt
+                    .credentials
+                    .as_ref()
+                    .map(|c| {
+                        let default_creds = Credentials::default();
+                        c.access_key == target.credentials.as_ref().unwrap_or(&default_creds).access_key
+                    })
+                    .unwrap_or(false)
+            {
+                return (tgt.arn.clone(), true);
             }
         }
 
@@ -1273,6 +1369,7 @@ fn generate_arn(t: &BucketTarget, depl_id: &str) -> String {
     arn.to_string()
 }
 
+#[derive(Debug, Clone)]
 pub struct RemoveObjectOptions {
     pub force_delete: bool,
     pub governance_bypass: bool,
@@ -1328,7 +1425,12 @@ fn build_remove_object_headers(version_id: Option<&str>, opts: &RemoveObjectOpti
 /// and silently creates a delete marker instead of removing the version, while
 /// the source stamps `VersionPurgeStatus=Complete` (backlog#799 B8 / #857).
 /// Non-replication callers always pass the version through unchanged.
-fn resolve_delete_api_version_id(version_id: Option<String>, opts: &RemoveObjectOptions) -> Option<String> {
+/// The `versionId` a replicated DELETE puts on the wire: none for a
+/// delete-marker creation (the target mints the marker; the source version
+/// travels in the internal headers for RustFS peers), the addressed version
+/// otherwise. A generic S3 target given the version id on a marker-creation
+/// DELETE would permanently delete that version instead.
+pub fn resolve_delete_api_version_id(version_id: Option<String>, opts: &RemoveObjectOptions) -> Option<String> {
     if opts.replication_request && opts.replication_delete_marker {
         None
     } else {
@@ -1881,6 +1983,125 @@ impl TargetClient {
             .map_err(Box::new)
     }
 
+    /// Candidate replicas by content identity on a target that mints its own
+    /// version ids: page `ListObjectVersions` under the exact key and report
+    /// the live versions whose ETag matches `source_etag`, newest first.
+    /// Delete markers and prefix siblings never match. Bounded to
+    /// [`FIND_VERSION_BY_ETAG_MAX_PAGES`] pages and
+    /// [`FIND_VERSION_BY_ETAG_MAX_MATCHES`] candidates so a key with a very
+    /// deep history cannot turn one convergence check into an unbounded scan;
+    /// a replica beyond that window reads as missing, which only costs a
+    /// re-PUT (today's behaviour), never a lost object.
+    ///
+    /// Content identity is not version identity: two source generations with
+    /// the same bytes have the same ETag. Callers drop the candidates other
+    /// source versions already claim through their ledgers and refuse an
+    /// [`ReplicaLocation::Ambiguous`] remainder before mutating or deleting.
+    pub async fn replica_candidates_by_etag(
+        &self,
+        bucket: &str,
+        object: &str,
+        source_etag: &str,
+    ) -> Result<Vec<String>, Box<SdkError<aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError>>> {
+        let mut key_marker: Option<String> = None;
+        let mut version_id_marker: Option<String> = None;
+        let mut matches: Vec<String> = Vec::new();
+        for _ in 0..FIND_VERSION_BY_ETAG_MAX_PAGES {
+            let page = self
+                .client
+                .list_object_versions()
+                .bucket(bucket)
+                .prefix(object)
+                .max_keys(FIND_VERSION_BY_ETAG_PAGE_SIZE)
+                .set_key_marker(key_marker.take())
+                .set_version_id_marker(version_id_marker.take())
+                .send()
+                .await
+                .map_err(Box::new)?;
+            matches.extend(
+                page.versions()
+                    .iter()
+                    .filter(|version| {
+                        version.key() == Some(object)
+                            && version.version_id().is_some_and(|id| !id.is_empty())
+                            && replication_etags_match(Some(source_etag), version.e_tag())
+                    })
+                    .filter_map(|version| version.version_id().map(str::to_string)),
+            );
+            // A listing that moved past the exact key (every listed key is >=
+            // the prefix), ended, or already filled the candidate cap decides.
+            if matches.len() >= FIND_VERSION_BY_ETAG_MAX_MATCHES
+                || page
+                    .versions()
+                    .iter()
+                    .any(|version| version.key().is_some_and(|key| key > object))
+                || !page.is_truncated().unwrap_or(false)
+            {
+                break;
+            }
+            key_marker = page.next_key_marker().map(str::to_string);
+            version_id_marker = page.next_version_id_marker().map(str::to_string);
+            if key_marker.is_none() {
+                break;
+            }
+        }
+        matches.truncate(FIND_VERSION_BY_ETAG_MAX_MATCHES);
+        Ok(matches)
+    }
+
+    /// PutObjectRetention against a replica version on a target that does not
+    /// take retention through the replication PUT's own headers (it mints its
+    /// own version ids, so a re-PUT would create another version instead of
+    /// updating this one). Anti-loop marker always added.
+    pub async fn put_object_retention(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        mode: ObjectLockRetentionMode,
+        retain_until: aws_sdk_s3::primitives::DateTime,
+    ) -> Result<PutObjectRetentionOutput, Box<SdkError<PutObjectRetentionError>>> {
+        let headers = proxy_outbound_headers(HeaderMap::new());
+        self.client
+            .put_object_retention()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .retention(
+                ObjectLockRetention::builder()
+                    .mode(mode)
+                    .retain_until_date(retain_until)
+                    .build(),
+            )
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
+            .send()
+            .await
+            .map_err(Box::new)
+    }
+
+    /// PutObjectLegalHold counterpart of [`Self::put_object_retention`].
+    pub async fn put_object_legal_hold(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        status: ObjectLockLegalHoldStatus,
+    ) -> Result<PutObjectLegalHoldOutput, Box<SdkError<PutObjectLegalHoldError>>> {
+        let headers = proxy_outbound_headers(HeaderMap::new());
+        self.client
+            .put_object_legal_hold()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .legal_hold(ObjectLockLegalHold::builder().status(status).build())
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
+            .send()
+            .await
+            .map_err(Box::new)
+    }
+
     /// HEAD used by the read-proxy path (GET/HEAD of an object not yet
     /// replicated locally, MinIO `proxyHeadToRepTarget`).
     ///
@@ -2053,7 +2274,15 @@ impl TargetClient {
             }
         }
 
-        match builder
+        // A forwarded source checksum is this PUT's integrity header. In
+        // streaming-checksum mode (`RUSTFS_REPLICATION_STREAMING_CHECKSUMS`)
+        // the SDK would still add its default CRC32 trailer, and a target that
+        // receives both keeps the trailer's algorithm: a forwarded SHA256
+        // vanished from the replica while the source reported COMPLETED. Pin
+        // this request to WhenRequired so nothing is sent beside the source's
+        // own checksum.
+        let forwards_source_checksum = headers.keys().any(|name| name.as_str().starts_with("x-amz-checksum-"));
+        let mut operation = builder
             .bucket(bucket)
             .key(object)
             .content_length(size)
@@ -2073,10 +2302,14 @@ impl TargetClient {
                 }
 
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
-            })
-            .send()
-            .await
-        {
+            });
+        if forwards_source_checksum {
+            operation = operation.config_override(
+                aws_sdk_s3::config::Builder::new()
+                    .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired),
+            );
+        }
+        match operation.send().await {
             Ok(output) => {
                 // Under SSE-KMS/DSSE or SSE-C the target's ETag is not the MD5
                 // of the stored plaintext, so it cannot be compared against the
@@ -2320,6 +2553,45 @@ impl TargetClient {
     }
 }
 
+/// Where a replica stands on a target that mints its own version ids, by
+/// content identity (exact key + ETag) after the candidates other source
+/// versions claim were removed. See
+/// [`TargetClient::replica_candidates_by_etag`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplicaLocation {
+    /// No live version under the key carries the source ETag.
+    Missing,
+    /// Exactly one live version carries it: safe to address.
+    Unique(String),
+    /// More than one live version carries it (same bytes replicated for
+    /// several source generations). `newest` is the most recently listed
+    /// one — good enough to prove the replica exists, never good enough to
+    /// pick which one to mutate or delete.
+    Ambiguous { newest: String },
+}
+
+impl ReplicaLocation {
+    /// `matches` newest first, as the target listed them.
+    pub fn from_matches(mut matches: Vec<String>) -> Self {
+        match matches.len() {
+            0 => Self::Missing,
+            1 => Self::Unique(matches.remove(0)),
+            _ => Self::Ambiguous {
+                newest: matches.remove(0),
+            },
+        }
+    }
+
+    /// The version to read for existence/ETag checks, where an ambiguous
+    /// match is still a located replica.
+    pub fn any_version_id(&self) -> Option<&str> {
+        match self {
+            Self::Missing => None,
+            Self::Unique(version_id) | Self::Ambiguous { newest: version_id } => Some(version_id),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum BucketTargetError {
     BucketRemoteTargetNotFound {
@@ -2496,13 +2768,21 @@ mod tests {
     }
 
     fn header_recording_target_client(response_headers: Vec<(String, String)>) -> (TargetClient, RecordedHeaders) {
+        header_recording_target_client_with_checksums(response_headers, replication_request_checksum_calculation())
+    }
+
+    fn header_recording_target_client_with_checksums(
+        response_headers: Vec<(String, String)>,
+        checksums: RequestChecksumCalculation,
+    ) -> (TargetClient, RecordedHeaders) {
         let request_headers: RecordedHeaders = Arc::new(std::sync::Mutex::new(Vec::new()));
         let connector = SharedHttpConnector::new(RecordingHeaderConnector {
             request_headers: Arc::clone(&request_headers),
             response_headers,
         });
         let http_client = http_client_fn(move |_settings, _components| connector.clone());
-        let client = s3_client_for_test(443, Some(http_client));
+        let client =
+            s3_client_for_endpoint_test_with_checksums("https://localhost:443".to_string(), Some(http_client), checksums);
         (
             TargetClient {
                 endpoint: "https://localhost:443".to_string(),
@@ -2667,6 +2947,47 @@ mod tests {
                 "{label}: the SDK must announce a CRC32 checksum; headers: {headers:?}"
             );
         }
+    }
+
+    /// With streaming checksums enabled the SDK adds a CRC32 trailer to every
+    /// upload. A PUT that forwards the source's checksum must not get that
+    /// second algorithm: a target that receives both keeps the trailer's and
+    /// the forwarded SHA256 never reaches the replica (rustfs/backlog#2340).
+    #[tokio::test]
+    async fn streaming_put_object_with_forwarded_checksum_sends_no_sdk_checksum() {
+        let (client, recorded) =
+            header_recording_target_client_with_checksums(Vec::new(), RequestChecksumCalculation::WhenSupported);
+        let mut forwarded = PutObjectOptions::default();
+        forwarded.user_metadata.insert(
+            "x-amz-checksum-sha256".to_string(),
+            "OoJ3yNhRwv3wwtZoGqEIPrPX9xwTnfLl+ka0wStN1g0=".to_string(),
+        );
+        client
+            .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &forwarded)
+            .await
+            .expect("recorded put_object should succeed");
+        client
+            .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &PutObjectOptions::default())
+            .await
+            .expect("recorded put_object should succeed");
+        let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+        let with_forwarded = &recorded[0];
+        assert_eq!(
+            recorded_header(with_forwarded, "x-amz-checksum-sha256"),
+            Some("OoJ3yNhRwv3wwtZoGqEIPrPX9xwTnfLl+ka0wStN1g0=")
+        );
+        assert_eq!(
+            recorded_header(with_forwarded, "x-amz-trailer"),
+            None,
+            "the SDK must not add a trailer checksum"
+        );
+        assert_eq!(recorded_header(with_forwarded, "x-amz-sdk-checksum-algorithm"), None);
+        // Control: the same client still streams a trailer when nothing is forwarded.
+        let without_forwarded = &recorded[1];
+        assert!(
+            recorded_header(without_forwarded, "x-amz-trailer").is_some(),
+            "streaming mode must still apply to uploads without a forwarded checksum: {without_forwarded:?}"
+        );
     }
 
     /// A forwarded source checksum already satisfies the rule; nothing is added.
@@ -3034,6 +3355,14 @@ mod tests {
     }
 
     fn s3_client_for_endpoint_test(endpoint: String, http_client: Option<SharedHttpClient>) -> S3Client {
+        s3_client_for_endpoint_test_with_checksums(endpoint, http_client, replication_request_checksum_calculation())
+    }
+
+    fn s3_client_for_endpoint_test_with_checksums(
+        endpoint: String,
+        http_client: Option<SharedHttpClient>,
+        checksums: RequestChecksumCalculation,
+    ) -> S3Client {
         let credentials = SdkCredentials::builder()
             .access_key_id("test-access")
             .secret_access_key("test-secret")
@@ -3047,7 +3376,7 @@ mod tests {
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             // Mirror the production remote-target builder so recorded requests
             // exercise the same checksum/framing behavior (#6853).
-            .request_checksum_calculation(replication_request_checksum_calculation());
+            .request_checksum_calculation(checksums);
         if let Some(http_client) = http_client {
             config = config.http_client(http_client);
         }
@@ -3208,6 +3537,64 @@ mod tests {
         assert!(message.contains(REDACTED_CREDENTIAL));
         assert!(!message.contains("sensitive-access-key"));
         assert!(message.contains("connection refused"));
+    }
+
+    #[test]
+    fn same_replication_service_ignores_resync_and_bandwidth_edits() {
+        let base = BucketTarget {
+            endpoint: "target.example:9000".to_string(),
+            target_bucket: "replica".to_string(),
+            secure: true,
+            path: "on".to_string(),
+            arn: "arn:rustfs:replication:us-east-1:bucket:same".to_string(),
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resync_edit = BucketTarget {
+            reset_id: "reset-1".to_string(),
+            bandwidth_limit: 1024,
+            ..base.clone()
+        };
+        assert!(same_replication_service(&resync_edit, &base));
+        for moved in [
+            BucketTarget {
+                endpoint: "other.example:9000".to_string(),
+                ..base.clone()
+            },
+            BucketTarget {
+                target_bucket: "other".to_string(),
+                ..base.clone()
+            },
+            BucketTarget {
+                secure: false,
+                ..base.clone()
+            },
+            BucketTarget {
+                credentials: Some(Credentials {
+                    access_key: "rotated".to_string(),
+                    ..Default::default()
+                }),
+                ..base.clone()
+            },
+        ] {
+            assert!(!same_replication_service(&moved, &base));
+        }
+    }
+
+    #[test]
+    fn version_identity_verdict_is_per_arn_and_forgotten_with_the_target() {
+        let sys = BucketTargetSys::default();
+        let arn = "arn:rustfs:replication:us-east-1:bucket:identity";
+        assert_eq!(sys.version_identity_capability(arn), VersionIdentityCapability::Unknown);
+        sys.record_version_identity_capability(arn, VersionIdentityCapability::MintsOwn);
+        assert_eq!(sys.version_identity_capability(arn), VersionIdentityCapability::MintsOwn);
+        assert_eq!(sys.version_identity_capability("other"), VersionIdentityCapability::Unknown);
+        // A rebuilt target may point at a different service.
+        sys.forget_version_identity_capability(arn);
+        assert_eq!(sys.version_identity_capability(arn), VersionIdentityCapability::Unknown);
     }
 
     #[test]
@@ -4312,5 +4699,42 @@ mod tests {
     fn last_minute_latency_empty_window_is_zero() {
         let window = LastMinuteLatency::new();
         assert_eq!(window.get_total().avg, Duration::from_secs(0));
+    }
+
+    fn repair_target(bucket: &str, id: &str) -> BucketTarget {
+        BucketTarget {
+            source_bucket: bucket.to_string(),
+            endpoint: "remote.example.com".to_string(),
+            target_bucket: "remote".to_string(),
+            arn: format!("arn:rustfs:replication:us-east-1:{bucket}:{id}"),
+            target_type: BucketTargetType::ReplicationService,
+            region: "us-east-1".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_target_set_refuses_cached_writes() {
+        let sys = BucketTargetSys::default();
+        let bucket = "targets-repair-opt-in";
+        sys.mark_targets_unreadable(bucket).await;
+        assert!(matches!(
+            sys.targets_base_for_write(bucket).await,
+            Err(BucketTargetError::BucketRemoteTargetsUnreadable { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_readable_target_set_remains_the_write_base() {
+        let sys = BucketTargetSys::default();
+        let bucket = "targets-repair-readable";
+        let existing = repair_target(bucket, "keep");
+        sys.targets_map
+            .write()
+            .await
+            .insert(bucket.to_string(), vec![existing.clone()]);
+        let base = sys.targets_base_for_write(bucket).await.expect("read targets");
+        assert_eq!(base.targets.len(), 1);
+        assert_eq!(base.targets[0].arn, existing.arn);
     }
 }

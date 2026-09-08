@@ -120,18 +120,10 @@ impl TransitionClient {
 
         let h = resp.headers().clone();
 
-        let mut body = resp.into_body();
         let body_vec = if let Some(limit) = max_response_bytes {
-            collect_response_body(body, limit).await?
+            self.collect_response_body(resp.into_body(), limit).await?
         } else {
-            let mut body_vec = Vec::new();
-            while let Some(frame) = body.frame().await {
-                let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-                if let Some(data) = frame.data_ref() {
-                    body_vec.extend_from_slice(data);
-                }
-            }
-            body_vec
+            self.collect_response_body_unbounded(resp.into_body()).await?
         };
         Ok((object_stat, h, BufReader::new(Cursor::new(body_vec))))
     }
@@ -143,7 +135,7 @@ mod bounded_response_tests {
     use crate::{
         api_get_options::GetObjectOptions,
         credentials::{Credentials, SignatureType, Static, Value},
-        transition_api::{BucketLookupType, Options, TransitionClient, collect_response_body},
+        transition_api::{BucketLookupType, Options, TransitionClient, TransitionClientTimeouts, collect_response_body},
     };
     use http_body_util::Full;
     use hyper::body::Bytes;
@@ -175,7 +167,31 @@ mod bounded_response_tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
-    async fn bounded_get_fixture(body: &'static [u8]) -> Option<(TransitionClient, tokio::task::JoinHandle<String>)> {
+    fn test_options() -> Options {
+        Options {
+            creds: Credentials::new(Static(Value {
+                access_key_id: "access-key".to_string(),
+                secret_access_key: "secret-key".to_string(),
+                signer_type: SignatureType::SignatureV4,
+                ..Default::default()
+            })),
+            region: "us-east-1".to_string(),
+            bucket_lookup: BucketLookupType::BucketLookupPath,
+            max_retries: 1,
+            ..Default::default()
+        }
+    }
+
+    async fn client_for_endpoint(endpoint: &str, timeouts: TransitionClientTimeouts) -> TransitionClient {
+        TransitionClient::new_with_timeouts(endpoint, test_options(), "", timeouts)
+            .await
+            .expect("fixture client should build")
+    }
+
+    async fn bounded_get_fixture_with_timeouts(
+        body: &'static [u8],
+        timeouts: TransitionClientTimeouts,
+    ) -> Option<(TransitionClient, tokio::task::JoinHandle<String>)> {
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
@@ -209,25 +225,12 @@ mod bounded_response_tests {
             stream.write_all(body).await.expect("fixture should write response body");
             request
         });
-        let client = TransitionClient::new(
-            &endpoint,
-            Options {
-                creds: Credentials::new(Static(Value {
-                    access_key_id: "access-key".to_string(),
-                    secret_access_key: "secret-key".to_string(),
-                    signer_type: SignatureType::SignatureV4,
-                    ..Default::default()
-                })),
-                region: "us-east-1".to_string(),
-                bucket_lookup: BucketLookupType::BucketLookupPath,
-                max_retries: 1,
-                ..Default::default()
-            },
-            "",
-        )
-        .await
-        .expect("fixture client should build");
+        let client = client_for_endpoint(&endpoint, timeouts).await;
         Some((client, request))
+    }
+
+    async fn bounded_get_fixture(body: &'static [u8]) -> Option<(TransitionClient, tokio::task::JoinHandle<String>)> {
+        bounded_get_fixture_with_timeouts(body, TransitionClientTimeouts::default()).await
     }
 
     #[tokio::test]
@@ -292,24 +295,7 @@ mod bounded_response_tests {
             .local_addr()
             .expect("listener local address should be available")
             .to_string();
-        let client = TransitionClient::new(
-            &endpoint,
-            Options {
-                creds: Credentials::new(Static(Value {
-                    access_key_id: "access-key".to_string(),
-                    secret_access_key: "secret-key".to_string(),
-                    signer_type: SignatureType::SignatureV4,
-                    ..Default::default()
-                })),
-                region: "us-east-1".to_string(),
-                bucket_lookup: BucketLookupType::BucketLookupPath,
-                max_retries: 1,
-                ..Default::default()
-            },
-            "",
-        )
-        .await
-        .expect("fixture client should build");
+        let client = client_for_endpoint(&endpoint, TransitionClientTimeouts::default()).await;
         let mut opts = GetObjectOptions::default();
         opts.headers
             .insert("range".to_string(), "bytes=0-18446744073709551615".to_string());
@@ -325,6 +311,176 @@ mod bounded_response_tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn connection_refused_returns_without_waiting_for_the_request_timeout() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let endpoint = listener
+            .local_addr()
+            .expect("listener local address should be available")
+            .to_string();
+        drop(listener);
+
+        let client = client_for_endpoint(
+            &endpoint,
+            TransitionClientTimeouts::new(Duration::from_secs(1), Duration::from_secs(5), Duration::from_secs(1)),
+        )
+        .await;
+        let mut opts = GetObjectOptions::default();
+        opts.set_range(0, 6).expect("the probe range should be valid");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), client.get_object_inner("bucket", "probe", &opts))
+            .await
+            .expect("connection refused should return before the broader request timeout");
+
+        assert!(result.is_err(), "connection refused must fail instead of hanging");
+    }
+
+    #[tokio::test]
+    async fn response_header_stall_returns_timed_out() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let endpoint = listener
+            .local_addr()
+            .expect("listener local address should be available")
+            .to_string();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("fixture should accept one GET");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.expect("fixture should read request headers");
+                assert_ne!(read, 0, "connection closed before request headers were received");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let client = client_for_endpoint(
+            &endpoint,
+            TransitionClientTimeouts::new(Duration::from_secs(1), Duration::from_millis(50), Duration::from_secs(1)),
+        )
+        .await;
+        let mut opts = GetObjectOptions::default();
+        opts.set_range(0, 6).expect("the probe range should be valid");
+
+        let err = client
+            .get_object_inner("bucket", "probe", &opts)
+            .await
+            .expect_err("response header stalls must be bounded");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        fixture.await.expect("fixture should join");
+    }
+
+    #[tokio::test]
+    async fn response_body_idle_stall_returns_timed_out() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let endpoint = listener
+            .local_addr()
+            .expect("listener local address should be available")
+            .to_string();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("fixture should accept one GET");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.expect("fixture should read request headers");
+                assert_ne!(read, 0, "connection closed before request headers were received");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 7\r\nConnection: close\r\n\r\nRu")
+                .await
+                .expect("fixture should write the first body chunk");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let client = client_for_endpoint(
+            &endpoint,
+            TransitionClientTimeouts::new(Duration::from_secs(1), Duration::from_secs(1), Duration::from_millis(50)),
+        )
+        .await;
+        let mut opts = GetObjectOptions::default();
+        opts.set_range(0, 6).expect("the probe range should be valid");
+
+        let err = client
+            .get_object_inner("bucket", "probe", &opts)
+            .await
+            .expect_err("body stalls after partial progress must be bounded");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        fixture.await.expect("fixture should join");
+    }
+
+    #[tokio::test]
+    async fn response_body_idle_timer_resets_on_progress() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let endpoint = listener
+            .local_addr()
+            .expect("listener local address should be available")
+            .to_string();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("fixture should accept one GET");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.expect("fixture should read request headers");
+                assert_ne!(read, 0, "connection closed before request headers were received");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 7\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("fixture should write response headers");
+            for byte in b"RustFS!" {
+                stream.write_all(&[*byte]).await.expect("fixture should write body progress");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let client = client_for_endpoint(
+            &endpoint,
+            TransitionClientTimeouts::new(Duration::from_millis(10), Duration::from_secs(1), Duration::from_millis(100)),
+        )
+        .await;
+        let mut opts = GetObjectOptions::default();
+        opts.set_range(0, 6).expect("the probe range should be valid");
+
+        let (_, _, mut reader) = client
+            .get_object_inner("bucket", "probe", &opts)
+            .await
+            .expect("continuous body progress must not be killed by the idle timer");
+        let mut body = Vec::new();
+        reader
+            .read_to_end(&mut body)
+            .await
+            .expect("bounded response should be readable");
+
+        assert_eq!(body, b"RustFS!");
+        fixture.await.expect("fixture should join");
     }
 }
 

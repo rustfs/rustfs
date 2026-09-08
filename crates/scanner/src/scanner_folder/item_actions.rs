@@ -15,7 +15,7 @@
 use super::*;
 #[cfg(test)]
 use rustfs_filemeta::MetadataResolutionParams;
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 
 /// Cached folder information for scanning
 #[derive(Clone, Debug)]
@@ -1036,12 +1036,19 @@ impl ScannerItem {
             return;
         }
 
-        let Some(replication) = self.replication.clone() else {
-            return;
+        let replication = match self.replication.clone() {
+            Some(replication) => (*replication).clone(),
+            // No active rules or targets, but a purge the bucket still owes
+            // must reach the heal path: the delete worker settles it against
+            // the current configuration (abandoned when the target is gone,
+            // rustfs/backlog#2340) so the hidden version stops blocking
+            // DeleteBucket.
+            None if !oi.version_purge_status.is_empty() => ReplicationConfig::new(None, None),
+            None => return,
         };
 
         let done_replication = Metrics::time(Metric::CheckReplication);
-        let replication_result = queue_replication_heal(&oi.bucket, oi.clone(), (*replication).clone(), 0).await;
+        let replication_result = queue_replication_heal(&oi.bucket, oi.clone(), replication, 0).await;
         done_replication();
         let roi = replication_result.object_info;
         record_scanner_replication_admission(global_metrics(), &roi, replication_result.admission);

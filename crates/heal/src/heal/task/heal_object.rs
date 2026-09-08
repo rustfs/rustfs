@@ -163,7 +163,7 @@ impl HealTask {
             set: self.options.set_index,
         };
 
-        let heal_fut = self.storage.heal_object(bucket, object, version_id, &heal_opts);
+        let heal_fut = self.storage.heal_object_with_receipt(bucket, object, version_id, &heal_opts);
         let heal_result = if self.source == HealRequestSource::ReadRepair {
             let result = heal_fut.await;
             if self.cancel_token.is_cancelled() {
@@ -176,7 +176,9 @@ impl HealTask {
         };
 
         match heal_result {
-            Ok((result, error)) => {
+            Ok(storage_result) => {
+                let result = storage_result.item;
+                let error = storage_result.error;
                 if let Some(e) = error {
                     if self.skip_dangling_delete_grace_error(bucket, object, &e).await {
                         return Ok(());
@@ -264,6 +266,10 @@ impl HealTask {
                     let mut progress = self.progress.write().await;
                     progress.update_object_progress(1, 1, 0, 0, object_size);
                 }
+                let expected_identity =
+                    self.outcome_identity(bucket, object, version_id, self.options.pool_index, self.options.set_index);
+                self.record_verified_storage_receipt(expected_identity, storage_result.receipt)
+                    .await;
                 self.record_result_item(result).await;
                 Ok(())
             }

@@ -41,7 +41,7 @@ use http::{
     request::{Builder, Request},
 };
 use http_body::Body;
-use http_body_util::{BodyExt, LengthLimitError, Limited};
+use http_body_util::BodyExt;
 use hyper::body::Bytes;
 use hyper::body::Incoming;
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
@@ -67,10 +67,12 @@ use s3s::dto::Owner;
 use s3s::dto::ReplicationStatus;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::error::Error as StdError;
 use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration as StdDuration;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -79,28 +81,108 @@ use time::Duration;
 use time::OffsetDateTime;
 use tokio::io::BufReader;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
 const C_USER_AGENT: &str = "RustFS (linux; x86)";
 pub const MAX_S3_ERROR_RESPONSE_SIZE: usize = 64 * 1024;
+const EVENT_TIER_REMOTE_TRANSPORT: &str = "tier_remote_transport";
+const LOG_COMPONENT_S3_CLIENT: &str = "s3_client";
+const LOG_SUBSYSTEM_TIER: &str = "tier";
 
 const SUCCESS_STATUS: [StatusCode; 3] = [StatusCode::OK, StatusCode::NO_CONTENT, StatusCode::PARTIAL_CONTENT];
+
+fn response_body_exceeds_limit_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, "remote tier response body exceeds limit")
+}
+
+fn remote_tier_timeout_error(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, message)
+}
+
+fn source_chain_has_io_kind(error: &(dyn StdError + 'static), kind: std::io::ErrorKind) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == kind)
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn transition_transport_error(err: hyper_util::client::legacy::Error) -> std::io::Error {
+    if source_chain_has_io_kind(&err, std::io::ErrorKind::TimedOut) {
+        return remote_tier_timeout_error("remote tier connection timed out");
+    }
+    std::io::Error::other(err)
+}
+
+async fn next_response_body_data<B>(
+    mut body: Pin<&mut B>,
+    idle_timeout: Option<StdDuration>,
+) -> Result<Option<Bytes>, std::io::Error>
+where
+    B: Body<Data = Bytes>,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    let next_nonempty_data = async {
+        loop {
+            let Some(frame) = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await else {
+                return Ok(None);
+            };
+            let frame = frame.map_err(std::io::Error::other)?;
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            if !data.is_empty() {
+                return Ok(Some(data));
+            }
+        }
+    };
+
+    if let Some(idle_timeout) = idle_timeout {
+        tokio::time::timeout(idle_timeout, next_nonempty_data)
+            .await
+            .map_err(|_| remote_tier_timeout_error("remote tier response body stalled"))?
+    } else {
+        next_nonempty_data.await
+    }
+}
+
+async fn collect_response_body_inner<B>(
+    body: B,
+    limit: Option<usize>,
+    idle_timeout: Option<StdDuration>,
+) -> Result<Vec<u8>, std::io::Error>
+where
+    B: Body<Data = Bytes>,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    let mut body_vec = Vec::new();
+    let mut body = std::pin::pin!(body);
+    while let Some(data) = next_response_body_data(body.as_mut(), idle_timeout).await? {
+        let Some(new_len) = body_vec.len().checked_add(data.len()) else {
+            return Err(response_body_exceeds_limit_error());
+        };
+        if limit.is_some_and(|limit| new_len > limit) {
+            return Err(response_body_exceeds_limit_error());
+        }
+        body_vec.extend_from_slice(&data);
+    }
+    Ok(body_vec)
+}
 
 pub async fn collect_response_body<B>(body: B, limit: usize) -> Result<Vec<u8>, std::io::Error>
 where
     B: Body<Data = Bytes>,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
-    let body = Limited::new(body, limit).collect().await.map_err(|err| {
-        if err.is::<LengthLimitError>() {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "remote tier response body exceeds limit")
-        } else {
-            std::io::Error::other(err)
-        }
-    })?;
-    Ok(body.to_bytes().to_vec())
+    collect_response_body_inner(body, Some(limit), None).await
 }
 
 const C_UNKNOWN: i32 = -1;
@@ -196,6 +278,62 @@ pub struct TransitionClient {
     pub trailing_header_support: bool,
     pub max_retries: i64,
     pub tier_type: String,
+    pub timeouts: TransitionClientTimeouts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransitionClientTimeouts {
+    pub connect_timeout: StdDuration,
+    pub request_timeout: StdDuration,
+    pub response_body_idle_timeout: StdDuration,
+}
+
+impl TransitionClientTimeouts {
+    pub const fn new(
+        connect_timeout: StdDuration,
+        request_timeout: StdDuration,
+        response_body_idle_timeout: StdDuration,
+    ) -> Self {
+        Self {
+            connect_timeout,
+            request_timeout,
+            response_body_idle_timeout,
+        }
+    }
+
+    fn validate(self) -> Result<Self, std::io::Error> {
+        if self.connect_timeout.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "remote tier connect timeout must be greater than zero",
+            ));
+        }
+        if self.request_timeout.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "remote tier request timeout must be greater than zero",
+            ));
+        }
+        if self.response_body_idle_timeout.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "remote tier response body idle timeout must be greater than zero",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+impl Default for TransitionClientTimeouts {
+    fn default() -> Self {
+        Self {
+            connect_timeout: StdDuration::from_secs(rustfs_config::DEFAULT_TIER_REMOTE_CONNECT_TIMEOUT_SECS),
+            request_timeout: StdDuration::from_secs(rustfs_config::DEFAULT_TIER_REMOTE_REQUEST_TIMEOUT_SECS),
+            response_body_idle_timeout: StdDuration::from_secs(
+                rustfs_config::DEFAULT_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS,
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -288,12 +426,28 @@ async fn build_tls_config() -> Result<rustls::ClientConfig, std::io::Error> {
 
 impl TransitionClient {
     pub async fn new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
-        let client = Self::private_new(endpoint, opts, tier_type).await?;
-
-        Ok(client)
+        Self::private_new(endpoint, opts, tier_type, TransitionClientTimeouts::default()).await
     }
 
-    async fn private_new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
+    /// Builds a transition client with explicit transport timeout budgets.
+    ///
+    /// [`Self::new`] keeps the historical constructor surface and uses the
+    /// production defaults from [`TransitionClientTimeouts::default`].
+    pub async fn new_with_timeouts(
+        endpoint: &str,
+        opts: Options,
+        tier_type: &str,
+        timeouts: TransitionClientTimeouts,
+    ) -> Result<TransitionClient, std::io::Error> {
+        Self::private_new(endpoint, opts, tier_type, timeouts).await
+    }
+
+    async fn private_new(
+        endpoint: &str,
+        opts: Options,
+        tier_type: &str,
+        timeouts: TransitionClientTimeouts,
+    ) -> Result<TransitionClient, std::io::Error> {
         if rustls::crypto::CryptoProvider::get_default().is_none() {
             // No default provider is set yet; try to install aws-lc-rs.
             // `install_default` can only fail if another thread races us and installs a provider
@@ -306,15 +460,19 @@ impl TransitionClient {
         }
 
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
+        let timeouts = timeouts.validate()?;
 
         let tls = build_tls_config().await?;
 
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
+        http.set_connect_timeout(Some(timeouts.connect_timeout));
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(tls)
             .https_or_http()
             .enable_http1()
             .enable_http2()
-            .build();
+            .wrap_connector(http);
         let http_client = Client::builder(TokioExecutor::new()).build(https);
 
         let mut client = TransitionClient {
@@ -337,6 +495,7 @@ impl TransitionClient {
             trailing_header_support: opts.trailing_headers,
             max_retries: opts.max_retries,
             tier_type: tier_type.to_string(),
+            timeouts,
         };
 
         {
@@ -501,29 +660,43 @@ impl TransitionClient {
     }
 
     pub async fn doit(&self, req: Request<s3s::Body>) -> Result<Response<Incoming>, std::io::Error> {
-        let req_method;
-        let req_uri;
-        let resp;
         let http_client = self.http_client.clone();
-        {
-            req_method = req.method().clone();
-            req_uri = req.uri().clone();
-
-            debug!("endpoint_url: {}", self.endpoint_url.as_str().to_string());
-            resp = http_client.request(req);
-        }
-        let resp = resp.await;
-        debug!("http_client url: {} {}", req_method, req_uri);
-        if let Err(err) = resp {
-            error!("http_client call error: {:?}", err);
-            return Err(std::io::Error::other(err));
-        }
-
+        let req_method = req.method().clone();
+        let resp = tokio::time::timeout(self.timeouts.request_timeout, http_client.request(req)).await;
         let resp = match resp {
-            Ok(r) => r,
-            Err(_) => return Err(std::io::Error::other("Unexpected error in response")),
+            Ok(Ok(resp)) => resp,
+            Ok(Err(err)) => {
+                let err = transition_transport_error(err);
+                error!(
+                    event = EVENT_TIER_REMOTE_TRANSPORT,
+                    component = LOG_COMPONENT_S3_CLIENT,
+                    subsystem = LOG_SUBSYSTEM_TIER,
+                    method = %req_method,
+                    error_kind = ?err.kind(),
+                    "remote tier request failed"
+                );
+                return Err(err);
+            }
+            Err(_) => {
+                warn!(
+                    event = EVENT_TIER_REMOTE_TRANSPORT,
+                    component = LOG_COMPONENT_S3_CLIENT,
+                    subsystem = LOG_SUBSYSTEM_TIER,
+                    method = %req_method,
+                    timeout_ms = self.timeouts.request_timeout.as_millis(),
+                    "remote tier request timed out before response headers"
+                );
+                return Err(remote_tier_timeout_error("remote tier request timed out before response headers"));
+            }
         };
-        debug!(status = %resp.status(), "remote tier response received");
+        trace!(
+            event = EVENT_TIER_REMOTE_TRANSPORT,
+            component = LOG_COMPONENT_S3_CLIENT,
+            subsystem = LOG_SUBSYSTEM_TIER,
+            method = %req_method,
+            status = %resp.status(),
+            "remote tier response received"
+        );
 
         //let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
         //debug!("http_resp_body: {}", String::from_utf8(b).unwrap());
@@ -537,7 +710,15 @@ impl TransitionClient {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_string();
-            warn!(status = %status, request_id, "remote tier request rejected");
+            warn!(
+                event = EVENT_TIER_REMOTE_TRANSPORT,
+                component = LOG_COMPONENT_S3_CLIENT,
+                subsystem = LOG_SUBSYSTEM_TIER,
+                method = %req_method,
+                status = %status,
+                request_id,
+                "remote tier request rejected"
+            );
         }
         Ok(resp)
     }
@@ -581,7 +762,9 @@ impl TransitionClient {
             let resp_status = resp.status();
             let h = resp.headers().clone();
 
-            let body_vec = collect_response_body(resp.into_body(), MAX_S3_ERROR_RESPONSE_SIZE).await?;
+            let body_vec = self
+                .collect_response_body(resp.into_body(), MAX_S3_ERROR_RESPONSE_SIZE)
+                .await?;
             let parsed_error =
                 http_resp_to_error_response(resp_status, &h, body_vec, &metadata.bucket_name, &metadata.object_name);
             let routing_region = parsed_error.region;
@@ -633,6 +816,22 @@ impl TransitionClient {
         }
 
         Err(std::io::Error::other("remote tier request did not produce a response"))
+    }
+
+    pub async fn collect_response_body<B>(&self, body: B, limit: usize) -> Result<Vec<u8>, std::io::Error>
+    where
+        B: Body<Data = Bytes>,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        collect_response_body_inner(body, Some(limit), Some(self.timeouts.response_body_idle_timeout)).await
+    }
+
+    pub async fn collect_response_body_unbounded<B>(&self, body: B) -> Result<Vec<u8>, std::io::Error>
+    where
+        B: Body<Data = Bytes>,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        collect_response_body_inner(body, None, Some(self.timeouts.response_body_idle_timeout)).await
     }
 
     async fn new_request(
@@ -1504,12 +1703,17 @@ pub struct CreateBucketConfiguration {
 mod tests {
     use super::{
         MAX_S3_CLIENT_RESPONSE_SIZE, MAX_S3_ERROR_RESPONSE_SIZE, SignatureType, build_tls_config, collect_response_body,
-        signer_error_to_io_error, to_object_info_for_provider, validate_header_values, with_rustls_init_guard,
+        collect_response_body_inner, signer_error_to_io_error, to_object_info_for_provider, validate_header_values,
+        with_rustls_init_guard,
     };
     use crate::provider_versions::{BucketVersioningState, ProviderVersionCapabilities, RemoteVersion};
-    use http::{HeaderMap, HeaderValue};
-    use http_body_util::Full;
+    use futures::stream;
+    use http::{HeaderMap, HeaderValue, Request};
+    use http_body::Frame;
+    use http_body_util::{Full, StreamBody};
     use hyper::body::Bytes;
+    use std::time::Duration as StdDuration;
+    use tokio::net::TcpListener;
     use uuid::Uuid;
 
     #[tokio::test]
@@ -1538,6 +1742,77 @@ mod tests {
         .await
         .expect_err("oversized S3 error response must use the smaller error limit");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn empty_data_frames_do_not_reset_the_body_idle_timeout() {
+        let frames = stream::unfold((), |_| async {
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+            Some((Ok::<_, std::io::Error>(Frame::data(Bytes::new())), ()))
+        });
+        let body = StreamBody::new(Box::pin(frames));
+
+        let err = tokio::time::timeout(
+            StdDuration::from_millis(200),
+            collect_response_body_inner(body, Some(1), Some(StdDuration::from_millis(50))),
+        )
+        .await
+        .expect("the collector should enforce its own body idle timeout")
+        .expect_err("empty frames must not count as body progress");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn public_body_collector_accepts_non_unpin_bodies() {
+        let body = StreamBody::new(stream::once(async { Ok::<_, std::io::Error>(Frame::data(Bytes::from_static(b"ok"))) }));
+
+        let collected = collect_response_body(body, 2)
+            .await
+            .expect("the public collector should pin non-Unpin bodies internally");
+
+        assert_eq!(collected, b"ok");
+    }
+
+    #[tokio::test]
+    async fn https_endpoints_reach_the_transport_connector() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let endpoint = listener
+            .local_addr()
+            .expect("listener local address should be available")
+            .to_string();
+        let accepted = tokio::spawn(async move {
+            let (stream, _) = tokio::time::timeout(StdDuration::from_secs(1), listener.accept())
+                .await
+                .expect("HTTPS connector should reach the TCP listener")
+                .expect("fixture should accept the HTTPS connection");
+            drop(stream);
+        });
+        let client = super::TransitionClient::new_with_timeouts(
+            &endpoint,
+            super::Options {
+                secure: true,
+                ..Default::default()
+            },
+            "",
+            super::TransitionClientTimeouts::new(StdDuration::from_secs(1), StdDuration::from_secs(1), StdDuration::from_secs(1)),
+        )
+        .await
+        .expect("fixture client should build");
+        let request = Request::builder()
+            .uri(format!("https://{endpoint}/"))
+            .body(s3s::Body::empty())
+            .expect("fixture request should build");
+
+        client
+            .doit(request)
+            .await
+            .expect_err("the fixture closes before completing the TLS handshake");
+        accepted.await.expect("fixture should join");
     }
 
     #[test]
@@ -1571,6 +1846,18 @@ mod tests {
             // If a default is already present, the branch above is simply skipped.
         });
         assert!(outcome.is_ok(), "provider install guard must not panic when a provider is already set");
+    }
+
+    #[test]
+    fn transition_timeouts_reject_zero_budgets() {
+        for timeouts in [
+            super::TransitionClientTimeouts::new(StdDuration::ZERO, StdDuration::from_secs(1), StdDuration::from_secs(1)),
+            super::TransitionClientTimeouts::new(StdDuration::from_secs(1), StdDuration::ZERO, StdDuration::from_secs(1)),
+            super::TransitionClientTimeouts::new(StdDuration::from_secs(1), StdDuration::from_secs(1), StdDuration::ZERO),
+        ] {
+            let err = timeouts.validate().expect_err("zero timeout budgets must fail closed");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
     }
 
     #[test]

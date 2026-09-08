@@ -20,6 +20,8 @@
 //! contract stays implemented `for SetDisks`, so its associated-type bounds are
 //! unchanged; method bodies are moved verbatim and runtime behavior is the same.
 
+use crate::core::pools::DecommissionCapacityAdmission;
+
 #[cfg(test)]
 use super::super::GetObjectMetadataCacheKey;
 #[cfg(test)]
@@ -1809,7 +1811,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let decommission_capacity_guard = if let Some(store) = opts.decommission_capacity_admission.as_ref() {
                 Some(
                     store
-                        .acquire_external_decommission_capacity_fence(&[self.pool_index], "mutation")
+                        .acquire_external_decommission_capacity_fence(
+                            &[self.pool_index],
+                            DecommissionCapacityAdmission::ExistingMultipart,
+                        )
                         .await?,
                 )
             } else {
@@ -2345,6 +2350,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     bucket,
                     object,
                     opts.no_lock || object_lock_guard.is_some(),
+                    DecommissionCapacityAdmission::ExistingMultipart,
                 )
                 .await?;
             decommission_object_lock_guard = object_guard;
@@ -2452,10 +2458,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let write_quorum = fi.write_quorum(self.default_write_quorum());
         let read_quorum = fi.read_quorum(self.default_read_quorum());
 
-        let disks = self.disks.read().await;
-
-        let disks = disks.clone();
-        // let disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
+        // Release the registry guard before recovery and cleanup read it again:
+        // a queued topology writer would otherwise deadlock those nested reads.
+        let disks = self.get_disks_internal().await;
 
         let part_path = format!("{}/{}/", upload_id_path, fi.data_dir.unwrap_or(Uuid::nil()));
         self.recover_part_transactions(&part_path, read_quorum, write_quorum)
@@ -3111,7 +3116,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         {
             decommission_capacity_guard = Some(
                 store
-                    .acquire_external_decommission_capacity_fence(&[self.pool_index], "mutation")
+                    .acquire_external_decommission_capacity_fence(
+                        &[self.pool_index],
+                        DecommissionCapacityAdmission::ExistingMultipart,
+                    )
                     .await?,
             );
         }
@@ -3302,13 +3310,18 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             // (rustfs/backlog#1009): CompleteMultipartUpload keeps its pre-commit
             // `get_object_info` lookup, so the backfill has no consumer here yet.
             Self::assign_rename_data_indexes(&mut parts_metadatas);
-            let mut rename_result = SetDisks::rename_data_owned(
+            // Disk deadlines can expire before physical publication or failure undo drains.
+            let mut rename_result = SetDisks::rename_data_owned_with_fence(
                 &commit_disks,
                 (RUSTFS_META_MULTIPART_BUCKET, &commit_upload_id_path),
                 parts_metadatas,
                 (&commit_bucket, &commit_object),
-                write_quorum,
                 commit_allows_early_ack,
+                crate::set_disk::core::io_primitives::RenameDataFenceOptions::new(write_quorum, None)
+                    .with_namespace_commit_guard(
+                        (!crate::bucket::utils::is_meta_bucketname(&commit_bucket))
+                            .then(|| commit_set.ctx.begin_namespace_commit()),
+                    ),
             )
             .await;
             if let Ok(rename_commit) = rename_result.as_mut() {
@@ -4051,6 +4064,7 @@ mod tests {
             let _ = drain_global_dirty_scopes();
 
             let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let rename_tasks = rename_fanout_barrier::observe_tasks(object);
             let complete_store = Arc::clone(&set_disks);
             let mut complete = tokio::spawn(async move {
                 let mut opts = ObjectOptions::default();
@@ -4062,16 +4076,6 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())
                 .await
                 .expect("multipart completion should pause one tail disk during rename");
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), &mut complete).await.is_err(),
-                "multipart completion must not publish success while a tail rename is still paused"
-            );
-
-            let initial = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
-            assert!(
-                initial.is_empty(),
-                "capacity must not be marked as committed before the full multipart rename finishes"
-            );
 
             let abort_store = Arc::clone(&set_disks);
             let abort = tokio::spawn(async move {
@@ -4080,21 +4084,46 @@ mod tests {
                     .await
             });
             signaling.wait_for_attempts(2).await;
-            assert!(!abort.is_finished(), "the in-flight completion must retain the multipart upload guard");
 
-            let retained_staging = futures::future::join_all(
-                disk_stores
-                    .iter()
-                    .map(|disk| disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &staged_part)),
-            )
+            // A paused rename does not establish that the other disks reached quorum.
+            let retained_staging = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let mut retained = 0;
+                    for result in futures::future::join_all(
+                        disk_stores
+                            .iter()
+                            .map(|disk| disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &staged_part)),
+                    )
+                    .await
+                    {
+                        match result {
+                            Ok(_) => retained += 1,
+                            Err(DiskError::FileNotFound) => {}
+                            Err(error) => panic!("staged rename source lookup failed: {error}"),
+                        }
+                    }
+                    if retained <= 1 && rename_tasks.running() == 1 {
+                        break retained;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
             .await
-            .into_iter()
-            .filter(|result| result.is_ok())
-            .count();
+            .expect("unpaused multipart renames should finish before the tail is released");
             assert_eq!(
                 retained_staging, 1,
                 "only the paused tail disk should still retain the multipart rename source"
             );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut complete).await.is_err(),
+                "multipart completion must not publish success while a tail rename is still paused"
+            );
+            let initial = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+            assert!(
+                initial.is_empty(),
+                "capacity must not be marked as committed before the full multipart rename finishes"
+            );
+            assert!(!abort.is_finished(), "the in-flight completion must retain the multipart upload guard");
 
             signaling.set_target(rustfs_lock::ObjectKey::new(bucket, object));
             let object_attempt = signaling.attempts.load(Ordering::Acquire) + 1;
@@ -6741,6 +6770,382 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    #[serial(capacity_dirty_scope)]
+    async fn complete_multipart_advances_namespace_generation_after_commit() {
+        let (dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-namespace-commit";
+        let object = "completed-object";
+        let body = vec![0x65; 4096];
+        make_bucket_on_all(&disks, bucket).await;
+        let before = set_disks.ctx.namespace_commit_generation();
+        let (upload_id, parts) =
+            stage_upload_with_create_opts(&set_disks, bucket, object, &body, &ObjectOptions::default()).await;
+        assert_eq!(set_disks.ctx.namespace_commit_generation(), before, "staging is not publication");
+        assert!(!set_disks.ctx.namespace_commits_pending());
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload_id, parts, &ObjectOptions::default()),
+        )
+        .await
+        .expect("completion must finish")
+        .expect("the four real shards must commit");
+        let mut reader = tokio::time::timeout(
+            Duration::from_secs(5),
+            set_disks.get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default()),
+        )
+        .await
+        .expect("GET after completion must finish")
+        .expect("a successful completion must be immediately readable");
+        let mut actual = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.stream.read_to_end(&mut actual))
+            .await
+            .expect("the completed body stream must finish")
+            .expect("read completed body");
+        assert_eq!(actual, body);
+        let upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+        for dir in &dirs {
+            assert!(!dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&upload_path).exists());
+        }
+        assert!(matches!(
+            set_disks.check_upload_id_exists(bucket, object, &upload_id, false).await,
+            Err(StorageError::InvalidUploadID(..))
+        ));
+        assert!(!set_disks.ctx.namespace_commits_pending());
+        assert_eq!(
+            set_disks.ctx.namespace_commit_generation(),
+            before + 2,
+            "one completed MPU must invalidate snapshots at namespace admission and physical retirement"
+        );
+    }
+
+    #[cfg(not(windows))]
+    async fn assert_complete_multipart_physical_namespace_owner(undo: bool) {
+        use crate::disk::os::{self, prepared_publication_test_hooks as hooks};
+        use crate::set_disk::core::io_primitives::rename_fault_injection;
+        use futures::FutureExt;
+
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60"))], async {
+            let (dirs, disks, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "multipart-physical-namespace";
+            let object = if undo { "undo-tail" } else { "publication-tail" };
+            let old_body = vec![0x41; 1024];
+            let new_body = vec![0x62; 4096];
+            make_bucket_on_all(&disks, bucket).await;
+            let old = set_disks
+                .put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(old_body.clone()),
+                    &ObjectOptions {
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed a real readable old version");
+            let old_etag = old.etag.expect("the committed old object must have an ETag");
+            let before = set_disks.ctx.namespace_commit_generation();
+            assert!(!set_disks.ctx.namespace_commits_pending());
+            let (upload_id, parts) =
+                stage_upload_with_create_opts(&set_disks, bucket, object, &new_body, &ObjectOptions::default()).await;
+            let new_etag = get_complete_multipart_md5(&parts);
+            let upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+            for dir in &dirs {
+                assert!(dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&upload_path).exists());
+            }
+            assert_eq!(set_disks.ctx.namespace_commit_generation(), before);
+            let _fault = undo.then(|| rename_fault_injection::fail_rename_on(object, &[2, 3]));
+            let stage = if undo {
+                hooks::Stage::Rename
+            } else {
+                hooks::Stage::PreparedRename
+            };
+            let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut hooks = Vec::new();
+            let mut releases = Vec::new();
+            let mut mutation_paths = Vec::new();
+            for (index, disk) in disks.iter().enumerate() {
+                let disk::Disk::Local(local) = disk.as_ref() else {
+                    panic!("physical MPU fixture requires local disks");
+                };
+                let destination = local
+                    .get_disk()
+                    .get_object_path_for_io(bucket, object)
+                    .expect("leased IO path");
+                let entered_tx = entered_tx.clone();
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                hooks.push(hooks::install_at(stage, &destination.join(STORAGE_FORMAT_FILE), move || {
+                    let _ = entered_tx.send(index);
+                    // Dropping senders releases every syscall on assertion failure, too.
+                    let _ = release_rx.recv();
+                }));
+                releases.push(release_tx);
+                // Canonical rename serializes the object directory; backup restore
+                // serializes its xl.meta destination. Drain the actual executor key.
+                mutation_paths.push(if undo {
+                    destination.join(STORAGE_FORMAT_FILE)
+                } else {
+                    destination
+                });
+            }
+            drop(entered_tx);
+            let complete_set = set_disks.clone();
+            let complete_upload = upload_id.clone();
+            let mut complete = tokio::spawn(async move {
+                complete_set
+                    .complete_multipart_upload(bucket, object, &complete_upload, parts, &ObjectOptions::default())
+                    .await
+            });
+            let mut complete_joined = false;
+            let mut observed_counts = None;
+            let observations = std::panic::AssertUnwindSafe(async {
+                let expected_publishers = if undo { 2 } else { 4 };
+                let entered = tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut entered = HashSet::new();
+                    while entered.len() < expected_publishers {
+                        tokio::select! {
+                            index = entered_rx.recv() => {
+                                assert!(entered.insert(index.expect("physical publisher must signal entry")));
+                            }
+                            result = &mut complete => {
+                                complete_joined = true;
+                                panic!("completion returned before physical entry: {result:?}");
+                            }
+                        }
+                    }
+                    entered
+                })
+                .await
+                .expect("all expected physical metadata operations must enter");
+                let pending_at_entry = set_disks.ctx.namespace_commits_pending();
+                let generation_at_entry = set_disks.ctx.namespace_commit_generation();
+                for &index in &entered {
+                    let metadata = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        disks[index].read_version("", bucket, object, "", &ReadOptions::default()),
+                    )
+                    .await
+                    .expect("metadata observation must finish while publication is paused")
+                    .expect("metadata before the paused physical action must be readable");
+                    assert_eq!(
+                        metadata.metadata.get("etag"),
+                        Some(if undo { &new_etag } else { &old_etag }),
+                        "undo must follow actual publication; prepared rename must precede publication"
+                    );
+                }
+
+                // The entry signals run inside the real blocking closures, after each
+                // wrapper installed its normal deadline. No quota/external guard disables it.
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(61)).await;
+                tokio::time::resume();
+                let joined = tokio::time::timeout(Duration::from_secs(5), &mut complete).await;
+                complete_joined = joined.is_ok();
+                let result = joined
+                    .expect("ordinary MPU disk/undo deadlines must still return before physical drain")
+                    .expect("completion task must not panic");
+                assert!(result.is_err(), "a timed-out or two-shard commit cannot acknowledge success");
+                let pending_after_timeout = set_disks.ctx.namespace_commits_pending();
+                let generation_after_timeout = set_disks.ctx.namespace_commit_generation();
+                observed_counts = Some((pending_at_entry, generation_at_entry, pending_after_timeout, generation_after_timeout));
+                for &index in &entered {
+                    assert!(
+                        os::acquire_rename_data_mutation_lease(&disks[index].path(), bucket, &mutation_paths[index])
+                            .now_or_never()
+                            .is_none(),
+                        "timed-out physical work must still own its object serialization"
+                    );
+                }
+                for dir in &dirs {
+                    assert!(
+                        dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&upload_path).exists(),
+                        "failed completion must not clean the upload staging"
+                    );
+                }
+            })
+            .catch_unwind()
+            .await;
+
+            // Release even after a failed observation, then finish dispatch before
+            // draining every physical key. No per-disk assertion may skip a later drain.
+            drop(releases);
+            drop(hooks);
+            let coordinator_drained = complete_joined
+                || tokio::time::timeout(Duration::from_secs(10), &mut complete).await.is_ok();
+            if !coordinator_drained {
+                complete.abort();
+                let _ = tokio::time::timeout(Duration::from_secs(5), &mut complete).await;
+            }
+            let drains = futures::future::join_all(disks.iter().zip(&mutation_paths).map(|(disk, destination)| async move {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    os::acquire_rename_data_mutation_lease(&disk.path(), bucket, destination),
+                )
+                .await
+                .map(drop)
+            }))
+            .await;
+            let owner_drained = tokio::time::timeout(Duration::from_secs(5), async {
+                while set_disks.ctx.namespace_commits_pending() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let physical_drained = drains.iter().all(|drain| drain.is_ok());
+            if !coordinator_drained || !physical_drained || owner_drained.is_err() {
+                // A bounded cleanup failure cannot justify deleting roots that a
+                // detached executor might still use. Keep them for diagnosis.
+                let retained = dirs.into_iter().map(TempDir::keep).collect::<Vec<_>>();
+                eprintln!("MPU cleanup incomplete: coordinator={coordinator_drained}, physical={physical_drained}, retained={retained:?}");
+                if let Err(panic) = observations {
+                    std::panic::resume_unwind(panic);
+                }
+                panic!("MPU cleanup did not drain: coordinator={coordinator_drained}, physical={physical_drained}, retained={retained:?}");
+            }
+            if let Err(panic) = observations {
+                std::panic::resume_unwind(panic);
+            }
+            // Preserve the original drain checks after collecting every result.
+            for drained in drains {
+                drained.expect("released physical MPU work must drain");
+            }
+            owner_drained.expect("physical retirement must finish its namespace counter decrement");
+            for disk in &disks {
+                let metadata = disk
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .expect("all disks must expose the expected final metadata");
+                assert_eq!(metadata.metadata.get("etag"), Some(if undo { &old_etag } else { &new_etag }));
+            }
+            let (pending_at_entry, generation_at_entry, pending_after_timeout, generation_after_timeout) =
+                observed_counts.expect("successful observations must record namespace counters");
+            let mut reader = tokio::time::timeout(
+                Duration::from_secs(5),
+                set_disks.get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default()),
+            )
+            .await
+            .expect("GET after physical drain must finish")
+            .expect("the real final object must be readable");
+            let mut actual = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), reader.stream.read_to_end(&mut actual))
+                .await
+                .expect("the final object stream must finish")
+                .expect("read final object bytes");
+            assert_eq!(actual, if undo { old_body } else { new_body });
+            assert!(
+                pending_at_entry && pending_after_timeout,
+                "physical MPU work outlived namespace accounting: undo={undo}"
+            );
+            assert_eq!(generation_at_entry, before + 1);
+            assert_eq!(
+                generation_after_timeout, generation_at_entry,
+                "the blocked physical owner cannot retire early"
+            );
+            assert_eq!(set_disks.ctx.namespace_commit_generation(), before + 2);
+            assert!(!set_disks.ctx.namespace_commits_pending());
+
+        })
+        .await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial(capacity_dirty_scope)]
+    async fn complete_multipart_timeout_keeps_namespace_owner_until_physical_publication() {
+        assert_complete_multipart_physical_namespace_owner(false).await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial(capacity_dirty_scope)]
+    async fn complete_multipart_failed_quorum_keeps_namespace_owner_until_physical_undo() {
+        assert_complete_multipart_physical_namespace_owner(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn complete_multipart_releases_disk_snapshot_before_cleanup() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-topology-lock-bucket";
+        let object = "object";
+        let body = vec![0x65; 4096];
+        make_bucket_on_all(&disk_stores, bucket).await;
+        let (upload_id, parts) =
+            stage_upload_with_create_opts(&set_disks, bucket, object, &body, &ObjectOptions::default()).await;
+        let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+        for dir in &temp_dirs {
+            assert!(
+                dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&upload_id_path).exists(),
+                "the test must create real upload staging on every disk"
+            );
+        }
+        let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::AfterObjectPublication);
+        let complete_store = set_disks.clone();
+        let complete_upload_id = upload_id.clone();
+        let complete = tokio::spawn(async move {
+            complete_store
+                .complete_multipart_upload(bucket, object, &complete_upload_id, parts, &ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+
+        // Hold a separate read gate so the real writer queues even when completion
+        // correctly releases its snapshot guard. Polling Pending proves admission
+        // to Tokio's write-preferring queue before the cleanup attempts another read.
+        let read_gate = set_disks.disks.read().await;
+        let writer = set_disks.disks.write();
+        tokio::pin!(writer);
+        assert!(matches!(
+            futures::poll!(tokio::task::unconstrained(writer.as_mut())),
+            std::task::Poll::Pending
+        ));
+        assert!(
+            set_disks.disks.try_read().is_err(),
+            "the pending writer must already block new readers before the cleanup resumes"
+        );
+        drop(read_gate);
+        barrier.release();
+
+        let writer_guard = tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("a queued topology writer must not deadlock with multipart cleanup's disk snapshot");
+        // A reconnect can publish the same handles; this test isolates admission
+        // order without changing the disks that contain the committed object.
+        drop(writer_guard);
+        tokio::time::timeout(Duration::from_secs(10), complete)
+            .await
+            .expect("multipart cleanup must finish after the topology writer releases")
+            .expect("completion task should not panic")
+            .expect("completion should preserve the successful object commit");
+
+        let mut reader = tokio::time::timeout(
+            Duration::from_secs(10),
+            set_disks.get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default()),
+        )
+        .await
+        .expect("GET should finish after completion")
+        .expect("the completed object should remain readable");
+        let mut observed_body = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), reader.stream.read_to_end(&mut observed_body))
+            .await
+            .expect("the completed object body should finish streaming")
+            .expect("the completed object body should be readable");
+        assert_eq!(observed_body, body);
+        assert!(matches!(
+            set_disks.check_upload_id_exists(bucket, object, &upload_id, false).await,
+            Err(StorageError::InvalidUploadID(..))
+        ));
+        for dir in &temp_dirs {
+            assert!(
+                !dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&upload_id_path).exists(),
+                "successful completion must remove its upload staging from every disk"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

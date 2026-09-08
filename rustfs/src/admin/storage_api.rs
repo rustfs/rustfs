@@ -20,8 +20,8 @@ use time::OffsetDateTime;
 
 mod ecstore_bucket {
     pub(crate) use crate::storage::storage_api::ecstore_bucket::{
-        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, object_lock, on_demand_migration, quota,
-        remote_s3_client, replication, target, utils, versioning, versioning_sys,
+        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, object_lock, quota, remote_s3_client,
+        replication, target, utils, versioning, versioning_sys,
     };
 }
 
@@ -204,6 +204,7 @@ pub(crate) mod bandwidth {
 
 pub(crate) mod bucket_target_sys {
     pub(crate) use super::ecstore_bucket::bucket_target_sys::append_version_id_query;
+    pub(crate) use super::ecstore_bucket::bucket_target_sys::resolve_delete_api_version_id;
     pub(crate) type AdvancedPutOptions = super::ecstore_bucket::bucket_target_sys::AdvancedPutOptions;
     pub(crate) type BucketTargetError = super::ecstore_bucket::bucket_target_sys::BucketTargetError;
     pub(crate) type BucketTargetSys = super::ecstore_bucket::bucket_target_sys::BucketTargetSys;
@@ -211,6 +212,7 @@ pub(crate) mod bucket_target_sys {
     pub(crate) type RemoveObjectOptions = super::ecstore_bucket::bucket_target_sys::RemoveObjectOptions;
     pub(crate) type S3ClientError = super::ecstore_bucket::bucket_target_sys::S3ClientError;
     pub(crate) type SsecPassthroughCapability = super::ecstore_bucket::bucket_target_sys::SsecPassthroughCapability;
+    pub(crate) type VersionIdentityCapability = super::ecstore_bucket::bucket_target_sys::VersionIdentityCapability;
     pub(crate) type TargetClient = super::ecstore_bucket::bucket_target_sys::TargetClient;
 }
 
@@ -232,9 +234,21 @@ pub(crate) mod lifecycle {
     pub(crate) type ManualTransitionRunOptions =
         super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunOptions;
     pub(crate) type ManualTransitionRunReport = super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunReport;
+    pub(crate) use super::ecstore_bucket::lifecycle::recovery_control::{
+        IlmRecoveryClassification, IlmRecoveryControlView, IlmRecoveryProtocol, inspect_recovery_control, list_recovery_controls,
+    };
+    pub(crate) use super::ecstore_bucket::lifecycle::recovery_disposition::{
+        IlmRecoveryDispositionExecutionOutcome, IlmRecoveryDispositionReasonCode, IlmRecoveryDispositionState,
+        dry_run_recovery_disposition, execute_recovery_disposition,
+    };
+    pub(crate) use super::ecstore_bucket::lifecycle::recovery_export::{
+        IlmRecoveryExportObservation, create_recovery_export, inspect_recovery_export_observation, load_recovery_export,
+    };
     pub(crate) use super::ecstore_bucket::lifecycle::transition_transaction::{
-        TransitionOperatorDeleteResult, TransitionOperatorError, delete_transition_candidate_for_operator,
-        finalize_missing_transition_transaction_for_operator, inspect_transition_transaction_for_operator,
+        TransitionOperatorDeleteResult, TransitionOperatorError, TransitionRecoveryRetryResult, TransitionRecoveryRetryStatus,
+        delete_transition_candidate_for_operator, finalize_missing_transition_transaction_for_operator,
+        inspect_transition_recovery_retry_for_operator, inspect_transition_transaction_for_operator,
+        retry_transition_recovery_for_operator,
     };
 
     pub(crate) async fn enqueue_transition_for_existing_objects_scoped(
@@ -284,34 +298,6 @@ pub(crate) mod durability {
     pub(crate) type BucketDurabilityConfig = super::ecstore_bucket::durability::BucketDurabilityConfig;
 }
 
-pub(crate) mod on_demand_migration {
-    pub(crate) type OdmBucketSnapshot = super::ecstore_bucket::on_demand_migration::OdmBucketSnapshot;
-    pub(crate) type OnDemandMigrationConfig = super::ecstore_bucket::on_demand_migration::OnDemandMigrationConfig;
-    pub(crate) type OnDemandMigrationConfigError = super::ecstore_bucket::on_demand_migration::OnDemandMigrationConfigError;
-    pub(crate) type OnDemandMigrationSys = super::ecstore_bucket::on_demand_migration::OnDemandMigrationSys;
-    pub(crate) type PathStyle = super::ecstore_bucket::on_demand_migration::PathStyle;
-    pub(crate) type Provider = super::ecstore_bucket::on_demand_migration::Provider;
-    pub(crate) type ValidationContext<'a> = super::ecstore_bucket::on_demand_migration::ValidationContext<'a>;
-
-    pub(crate) mod backfill {
-        pub(crate) type BackfillCheckpoint = super::super::ecstore_bucket::on_demand_migration::backfill::BackfillCheckpoint;
-        pub(crate) type BackfillError = super::super::ecstore_bucket::on_demand_migration::backfill::BackfillError;
-        pub(crate) type BackfillRequest = super::super::ecstore_bucket::on_demand_migration::backfill::BackfillRequest;
-        pub(crate) type BackfillState = super::super::ecstore_bucket::on_demand_migration::backfill::BackfillState;
-        pub(crate) type SkipExisting = super::super::ecstore_bucket::on_demand_migration::backfill::SkipExisting;
-        pub(crate) use super::super::ecstore_bucket::on_demand_migration::backfill::global_backfill_runner;
-    }
-
-    pub(crate) mod source_client {
-        pub(crate) type SourceClient = super::super::ecstore_bucket::on_demand_migration::source_client::SourceClient;
-        pub(crate) type SourceClientSpec = super::super::ecstore_bucket::on_demand_migration::source_client::SourceClientSpec;
-        pub(crate) type SourceError = super::super::ecstore_bucket::on_demand_migration::source_client::SourceError;
-        pub(crate) type SourceProbe = super::super::ecstore_bucket::on_demand_migration::source_client::SourceProbe;
-        pub(crate) type SourceProvider = super::super::ecstore_bucket::on_demand_migration::source_client::SourceProvider;
-        pub(crate) type SourceTimeouts = super::super::ecstore_bucket::on_demand_migration::source_client::SourceTimeouts;
-    }
-}
-
 pub(crate) mod remote_s3_client {
     pub(crate) type PathStyle = super::ecstore_bucket::remote_s3_client::PathStyle;
     pub(crate) type RemoteCredentials = super::ecstore_bucket::remote_s3_client::RemoteCredentials;
@@ -320,13 +306,12 @@ pub(crate) mod remote_s3_client {
 }
 
 pub(crate) mod metadata_sys {
+    #[cfg(test)]
+    pub(crate) use super::ecstore_bucket::metadata_sys::ConfigWriteLockProbe;
     use std::sync::Arc;
 
     use rustfs_policy::policy::BucketPolicy;
-    use s3s::dto::{
-        BucketLifecycleConfiguration, NotificationConfiguration, ObjectLockConfiguration, ServerSideEncryptionConfiguration,
-        Tagging, VersioningConfiguration,
-    };
+    use s3s::dto::{ObjectLockConfiguration, ServerSideEncryptionConfiguration, VersioningConfiguration};
     use time::OffsetDateTime;
 
     use super::Result;
@@ -340,8 +325,16 @@ pub(crate) mod metadata_sys {
         super::ecstore_bucket::metadata_sys::get(bucket).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn update(bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
         crate::storage::storage_api::update_bucket_metadata_config(bucket, config_file, data).await
+    }
+
+    pub(crate) async fn update_config_with<F>(bucket: &str, config_file: &str, mutate: F) -> Result<OffsetDateTime>
+    where
+        F: FnOnce(&BucketMetadata) -> Result<Vec<u8>> + Send,
+    {
+        super::ecstore_bucket::metadata_sys::update_config_with(bucket, config_file, mutate).await
     }
 
     pub(crate) async fn update_if_incarnation(
@@ -353,6 +346,25 @@ pub(crate) mod metadata_sys {
         super::ecstore_bucket::metadata_sys::update_if_incarnation(bucket, config_file, data, expected_incarnation_id).await
     }
 
+    /// [`update_if_incarnation`] stamping the config with a replicated edit's
+    /// source `updated_at` instead of the local clock (backlog#2292).
+    pub(crate) async fn update_if_incarnation_at(
+        bucket: &str,
+        config_file: &str,
+        data: Vec<u8>,
+        expected_incarnation_id: uuid::Uuid,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::update_if_incarnation_at(
+            bucket,
+            config_file,
+            data,
+            expected_incarnation_id,
+            updated_at,
+        )
+        .await
+    }
+
     pub(crate) async fn update_quota_if_incarnation(
         bucket: &str,
         data: Vec<u8>,
@@ -360,6 +372,25 @@ pub(crate) mod metadata_sys {
         proof: &super::ecstore_notification::CrossPoolFenceFleetProofToken,
     ) -> Result<OffsetDateTime> {
         super::ecstore_bucket::metadata_sys::update_quota_if_incarnation(bucket, data, expected_incarnation_id, proof).await
+    }
+
+    /// [`update_quota_if_incarnation`] stamping the quota with a replicated
+    /// edit's source `updated_at` instead of the local clock (backlog#2292).
+    pub(crate) async fn update_quota_if_incarnation_at(
+        bucket: &str,
+        data: Vec<u8>,
+        expected_incarnation_id: uuid::Uuid,
+        proof: &super::ecstore_notification::CrossPoolFenceFleetProofToken,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::update_quota_if_incarnation_at(
+            bucket,
+            data,
+            expected_incarnation_id,
+            proof,
+            updated_at,
+        )
+        .await
     }
 
     pub(crate) async fn capture_bucket_metadata_incarnation(bucket: &str) -> Result<uuid::Uuid> {
@@ -416,6 +447,18 @@ pub(crate) mod metadata_sys {
         super::ecstore_bucket::metadata_sys::delete_if_incarnation(bucket, config_file, expected_incarnation_id).await
     }
 
+    /// [`delete_if_incarnation`] stamping the cleared config with a replicated
+    /// deletion's source `updated_at` instead of the local clock (backlog#2292).
+    pub(crate) async fn delete_if_incarnation_at(
+        bucket: &str,
+        config_file: &str,
+        expected_incarnation_id: uuid::Uuid,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::delete_if_incarnation_at(bucket, config_file, expected_incarnation_id, updated_at)
+            .await
+    }
+
     pub(crate) async fn get_bucket_policy(bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
         super::ecstore_bucket::metadata_sys::get_bucket_policy(bucket).await
     }
@@ -436,14 +479,6 @@ pub(crate) mod metadata_sys {
         serde_json::from_slice(&metadata.bucket_targets_config_json).map_err(super::Error::other)
     }
 
-    pub(crate) async fn get_lifecycle_config(bucket: &str) -> Result<(BucketLifecycleConfiguration, OffsetDateTime)> {
-        super::ecstore_bucket::metadata_sys::get_lifecycle_config(bucket).await
-    }
-
-    pub(crate) async fn get_notification_config(bucket: &str) -> Result<Option<NotificationConfiguration>> {
-        super::ecstore_bucket::metadata_sys::get_notification_config(bucket).await
-    }
-
     pub(crate) async fn get_object_lock_config(bucket: &str) -> Result<(ObjectLockConfiguration, OffsetDateTime)> {
         super::ecstore_bucket::metadata_sys::get_object_lock_config(bucket).await
     }
@@ -452,12 +487,6 @@ pub(crate) mod metadata_sys {
         bucket: &str,
     ) -> Result<(Option<super::durability::BucketDurabilityConfig>, OffsetDateTime)> {
         super::ecstore_bucket::metadata_sys::get_durability_config(bucket).await
-    }
-
-    pub(crate) async fn get_on_demand_migration_config(
-        bucket: &str,
-    ) -> Result<Option<(super::on_demand_migration::OnDemandMigrationConfig, OffsetDateTime)>> {
-        super::ecstore_bucket::metadata_sys::get_on_demand_migration_config(bucket).await
     }
 
     pub(crate) async fn get_quota_config(bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
@@ -470,10 +499,6 @@ pub(crate) mod metadata_sys {
 
     pub(crate) async fn get_sse_config(bucket: &str) -> Result<(ServerSideEncryptionConfiguration, OffsetDateTime)> {
         super::ecstore_bucket::metadata_sys::get_sse_config(bucket).await
-    }
-
-    pub(crate) async fn get_tagging_config(bucket: &str) -> Result<(Tagging, OffsetDateTime)> {
-        super::ecstore_bucket::metadata_sys::get_tagging_config(bucket).await
     }
 
     pub(crate) async fn get_versioning_config(bucket: &str) -> Result<(VersioningConfiguration, OffsetDateTime)> {
@@ -706,7 +731,7 @@ pub(crate) mod replication {
 }
 
 pub(crate) mod target {
-    pub(crate) use super::ecstore_bucket::target::duration_from_secs_or_nanos;
+    pub(crate) use super::ecstore_bucket::target::{ARN, duration_from_secs_or_nanos};
     pub(crate) type BucketTarget = super::ecstore_bucket::target::BucketTarget;
     pub(crate) type BucketTargetType = super::ecstore_bucket::target::BucketTargetType;
     pub(crate) type BucketTargets = super::ecstore_bucket::target::BucketTargets;
@@ -912,7 +937,6 @@ pub(crate) mod bucket {
     pub(crate) use super::lifecycle;
     pub(crate) use super::metadata;
     pub(crate) use super::metadata_sys;
-    pub(crate) use super::on_demand_migration;
     pub(crate) use super::quota;
     pub(crate) use super::remote_s3_client;
     pub(crate) use super::replication;

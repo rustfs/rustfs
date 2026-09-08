@@ -237,18 +237,13 @@ struct HealStartSuccess {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HealTaskStatus {
-    summary: String,
+    #[serde(flatten)]
+    payload: HealTaskStatusPayload,
     #[serde(rename = "detail")]
     failure_detail: String,
     start_time: String,
     #[serde(rename = "settings")]
     heal_settings: HealOpts,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    truncated: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    progress: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -344,6 +339,19 @@ fn add_source_counts(total: &mut rustfs_heal::HealSourceCounts, next: rustfs_hea
     total.mrf = total.mrf.saturating_add(next.mrf);
 }
 
+fn add_admission_telemetry(total: &mut rustfs_heal::HealAdmissionTelemetry, next: rustfs_heal::HealAdmissionTelemetry) {
+    total.accepted = total.accepted.saturating_add(next.accepted);
+    total.merged = total.merged.saturating_add(next.merged);
+    total.full = total.full.saturating_add(next.full);
+    total.dropped = total.dropped.saturating_add(next.dropped);
+    total.duplicate = total.duplicate.saturating_add(next.duplicate);
+    total.overlap_rejected = total.overlap_rejected.saturating_add(next.overlap_rejected);
+    total.displaced = total.displaced.saturating_add(next.displaced);
+    total.force_start = total.force_start.saturating_add(next.force_start);
+    total.max_start_duration_micros = total.max_start_duration_micros.max(next.max_start_duration_micros);
+    total.max_lock_phase_micros = total.max_lock_phase_micros.max(next.max_lock_phase_micros);
+}
+
 fn add_operations(total: &mut rustfs_heal::HealOperationsSnapshot, next: rustfs_heal::HealOperationsSnapshot) {
     total.queue_length = total.queue_length.saturating_add(next.queue_length);
     total.active_tasks = total.active_tasks.saturating_add(next.active_tasks);
@@ -354,6 +362,7 @@ fn add_operations(total: &mut rustfs_heal::HealOperationsSnapshot, next: rustfs_
     add_source_counts(&mut total.queued_by_source, next.queued_by_source);
     add_source_counts(&mut total.active_by_source, next.active_by_source);
     add_source_counts(&mut total.retrying_by_source, next.retrying_by_source);
+    add_admission_telemetry(&mut total.admission, next.admission);
 }
 
 fn aggregate_cluster_heal_status(snapshots: Vec<NodeHealStatusSnapshot>) -> ClusterHealStatusSnapshot {
@@ -1055,15 +1064,23 @@ async fn submit_cluster_heal_channel_command(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct HealTaskStatusPayload {
+    #[serde(skip)]
+    adapted_detail: Option<String>,
     summary: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     truncated: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     progress: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcome: Option<serde_json::Value>,
+    #[serde(default, rename = "nextSeq", alias = "next_seq", skip_serializing_if = "Option::is_none")]
+    next_seq: Option<u64>,
+    #[serde(default, rename = "minSeq", alias = "min_seq", skip_serializing_if = "Option::is_none")]
+    min_seq: Option<u64>,
 }
 
 #[cfg(test)]
@@ -1103,21 +1120,16 @@ fn encode_heal_start_success(client_token: String, client_address: String) -> S3
 }
 
 fn encode_heal_task_status(
-    summary: String,
+    mut payload: HealTaskStatusPayload,
     failure_detail: String,
     heal_settings: HealOpts,
-    items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
-    truncated: bool,
-    progress: Option<serde_json::Value>,
 ) -> S3Result<Vec<u8>> {
+    let failure_detail = payload.adapted_detail.take().unwrap_or(failure_detail);
     encode_json(&HealTaskStatus {
-        summary,
+        payload,
         failure_detail,
         start_time: current_rfc3339_time()?,
         heal_settings,
-        items,
-        truncated,
-        progress,
     })
 }
 
@@ -1162,42 +1174,63 @@ fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
 
 fn heal_channel_response_status(
     response: &rustfs_heal_contracts::heal_channel::HealChannelResponse,
-) -> (String, Vec<rustfs_madmin::heal_commands::HealResultItem>, bool, Option<serde_json::Value>) {
+) -> S3Result<HealTaskStatusPayload> {
     let Some(data) = response.data.as_deref() else {
-        return ("running".to_string(), Vec::new(), false, None);
+        return Ok(HealTaskStatusPayload {
+            summary: "running".to_string(),
+            ..Default::default()
+        });
     };
 
-    if let Ok(payload) = serde_json::from_slice::<HealTaskStatusPayload>(data)
-        && !payload.summary.is_empty()
+    if let Ok(mut payload) = serde_json::from_slice::<HealTaskStatusPayload>(data)
+        && matches!(payload.summary.as_str(), "running" | "finished" | "stopped" | "notFound")
     {
-        return (payload.summary, payload.items, payload.truncated, payload.progress);
+        let adapted = payload
+            .outcome
+            .as_ref()
+            .map(|outcome| {
+                rustfs_heal::heal::outcome::legacy_wire_status(&payload.summary, outcome, payload.truncated)
+                    .map(|(summary, detail)| (summary.to_string(), detail))
+            })
+            .transpose();
+        if let Ok(adapted) = adapted {
+            if let Some((summary, detail)) = adapted {
+                payload.summary = summary;
+                payload.adapted_detail = detail;
+            }
+            return Ok(payload);
+        }
     }
 
-    let summary = std::str::from_utf8(data)
-        .ok()
-        .filter(|summary| !summary.is_empty())
-        .unwrap_or("running")
-        .to_string();
-    (summary, Vec::new(), false, None)
+    if let Ok(summary @ ("running" | "finished" | "stopped" | "notFound")) = std::str::from_utf8(data) {
+        return Ok(HealTaskStatusPayload {
+            summary: summary.to_string(),
+            ..Default::default()
+        });
+    }
+    Err(s3s::S3Error::with_message(
+        s3s::S3ErrorCode::InternalError,
+        "invalid heal status payload or unsupported summary",
+    ))
 }
 
 #[cfg(test)]
 fn heal_channel_response_summary(response: &rustfs_heal_contracts::heal_channel::HealChannelResponse) -> String {
-    heal_channel_response_status(response).0
+    heal_channel_response_status(response).expect("valid status fixture").summary
 }
 
 #[cfg(test)]
 fn heal_channel_response_items(
     response: &rustfs_heal_contracts::heal_channel::HealChannelResponse,
 ) -> Vec<rustfs_madmin::heal_commands::HealResultItem> {
-    heal_channel_response_status(response).1
+    heal_channel_response_status(response).expect("valid status fixture").items
 }
 
 #[cfg(test)]
 fn heal_channel_response_progress(
     response: &rustfs_heal_contracts::heal_channel::HealChannelResponse,
 ) -> Option<serde_json::Value> {
-    heal_channel_response_status(response).3
+    heal_channel_response_status(response).expect("valid status fixture").progress
 }
 
 fn encode_background_heal_status(
@@ -1385,15 +1418,8 @@ impl Operation for HealHandler {
                     response.error.unwrap_or_else(|| "query heal status failed".to_string())
                 ));
             }
-            let (summary, items, truncated, progress) = heal_channel_response_status(&response);
-            let body = encode_heal_task_status(
-                summary,
-                response.error.unwrap_or_default(),
-                HealOpts::default(),
-                items,
-                truncated,
-                progress,
-            )?;
+            let payload = heal_channel_response_status(&response)?;
+            let body = encode_heal_task_status(payload, response.error.unwrap_or_default(), HealOpts::default())?;
             info!(
                 event = EVENT_ADMIN_RESPONSE_EMITTED,
                 component = LOG_COMPONENT_ADMIN_API,
@@ -1430,8 +1456,8 @@ impl Operation for HealHandler {
             let body = if client_token.is_empty() {
                 encode_heal_start_success(response.request_id, client_address)?
             } else {
-                let (summary, items, truncated, progress) = heal_channel_response_status(&response);
-                encode_heal_task_status(summary, response.error.unwrap_or_default(), hip.hs, items, truncated, progress)?
+                let payload = heal_channel_response_status(&response)?;
+                encode_heal_task_status(payload, response.error.unwrap_or_default(), hip.hs)?
             };
             info!(
                 event = EVENT_ADMIN_RESPONSE_EMITTED,
@@ -1636,6 +1662,44 @@ mod tests {
         assert!(executed.load(Ordering::SeqCst));
     }
 
+    #[tokio::test]
+    async fn heal_start_retry_preflight_failures_do_not_create_request_identities() {
+        let hip = HealInitParams {
+            bucket: "bucket".to_string(),
+            ..Default::default()
+        };
+        let mut request_ids = Vec::new();
+        for attempt in 0..3 {
+            let executed_ids = &mut request_ids;
+            let request_params = &hip;
+            let result = execute_after_heal_control_capability(
+                || async {
+                    if attempt < 2 {
+                        Err(super::cluster_heal_control_unavailable("test_capability_failure"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || async move {
+                    let request = build_heal_channel_request(request_params);
+                    executed_ids.push(request.id);
+                    Ok(())
+                },
+            )
+            .await;
+            if attempt < 2 {
+                assert!(result.is_err(), "failed capability checks must not start a heal");
+                assert!(
+                    request_ids.is_empty(),
+                    "preflight failure must precede request construction and admission"
+                );
+            } else {
+                result.expect("restored capabilities allow the first execution");
+                assert_eq!(request_ids.len(), 1);
+            }
+        }
+    }
+
     #[test]
     fn replacement_recovery_status_response_reports_cluster_proof() {
         let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
@@ -1741,6 +1805,21 @@ mod tests {
         .expect("missing rpc should not be a transport failure");
 
         assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn heal_start_retry_conflicts_keep_actionable_public_reasons() {
+        for (reason, label) in [
+            (HealAdmissionDropReason::AlreadyRunning, "already_running"),
+            (HealAdmissionDropReason::OverlappingPaths, "overlapping_paths"),
+        ] {
+            let error = reject_heal_admission(HealAdmissionResult::Dropped(reason));
+            assert_eq!(error.code(), &S3ErrorCode::OperationAborted);
+            assert!(
+                error.to_string().contains(label),
+                "the caller must distinguish conflicts from transient coordination failure"
+            );
+        }
     }
 
     #[test]
@@ -2242,6 +2321,10 @@ mod tests {
         assert!(json["healOperations"]["queuedBySource"]["admin"].is_u64());
         assert!(json["healOperations"]["queuedByPriority"]["low"].is_u64());
         assert!(json["healOperations"]["queuedByPriority"]["high"].is_u64());
+        assert!(json["healOperations"]["admission"]["accepted"].is_u64());
+        assert!(json["healOperations"]["admission"]["duplicate"].is_u64());
+        assert!(json["healOperations"]["admission"]["forceStart"].is_u64());
+        assert!(json["healOperations"]["admission"]["maxLockPhaseMicros"].is_u64());
         assert_eq!(json["state"], "active");
         assert_eq!(json["clusterStatusComplete"], true);
         assert!(json["progress"].is_null());
@@ -2421,6 +2504,18 @@ mod tests {
             queued_by_source: sources(value),
             active_by_source: sources(value),
             retrying_by_source: sources(value),
+            admission: rustfs_heal::HealAdmissionTelemetry {
+                accepted: value,
+                merged: value,
+                full: value,
+                dropped: value,
+                duplicate: value,
+                overlap_rejected: value,
+                displaced: value,
+                force_start: value,
+                max_start_duration_micros: value,
+                max_lock_phase_micros: value,
+            },
         };
         let progress = |value| NodeHealProgress {
             objects_scanned: value,
@@ -2708,12 +2803,12 @@ mod tests {
     #[test]
     fn test_encode_heal_task_status_uses_client_wire_shape() {
         let encoded = encode_heal_task_status(
-            "Heal status query accepted".to_string(),
+            super::HealTaskStatusPayload {
+                summary: "Heal status query accepted".to_string(),
+                ..Default::default()
+            },
             String::new(),
             HealOpts::default(),
-            Vec::new(),
-            false,
-            None,
         )
         .expect("status response should serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
@@ -2730,12 +2825,13 @@ mod tests {
     #[test]
     fn test_encode_heal_task_status_reports_truncated_items() {
         let encoded = encode_heal_task_status(
-            "running".to_string(),
+            super::HealTaskStatusPayload {
+                summary: "running".to_string(),
+                truncated: true,
+                ..Default::default()
+            },
             "heal result items were truncated".to_string(),
             HealOpts::default(),
-            Vec::new(),
-            true,
-            None,
         )
         .expect("truncated status response should serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
@@ -2751,17 +2847,92 @@ mod tests {
             "currentObject": "bucket-a/object-a"
         });
         let encoded = encode_heal_task_status(
-            "running".to_string(),
+            super::HealTaskStatusPayload {
+                summary: "running".to_string(),
+                progress: Some(progress.clone()),
+                ..Default::default()
+            },
             String::new(),
             HealOpts::default(),
-            Vec::new(),
-            false,
-            Some(progress.clone()),
         )
         .expect("status response should serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
 
         assert_eq!(json["progress"], progress);
+    }
+
+    #[test]
+    fn outcome_v3_admin_forwards_outcome_cursors_and_progress_without_recounting() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../crates/madmin/tests/fixtures/heal-outcome-v3.json"))
+                .expect("shared fixtures");
+        for case in cases.as_array().expect("cases") {
+            let expected = &case["response"];
+            let mut channel_payload = case.get("remoteResponse").unwrap_or(expected).clone();
+            let payload = channel_payload.as_object_mut().expect("payload");
+            let next_seq = payload.remove("nextSeq").expect("cursor");
+            let min_seq = payload.remove("minSeq").expect("cursor");
+            payload.insert("next_seq".to_string(), next_seq);
+            payload.insert("min_seq".to_string(), min_seq);
+            let response = rustfs_heal_contracts::heal_channel::HealChannelResponse {
+                request_id: "token".into(),
+                success: true,
+                data: Some(serde_json::to_vec(&channel_payload).expect("channel bytes")),
+                error: None,
+            };
+            let payload = super::heal_channel_response_status(&response).expect("valid owner payload");
+            let encoded =
+                encode_heal_task_status(payload, expected["detail"].as_str().expect("detail").into(), HealOpts::default())
+                    .expect("public response");
+            let actual: serde_json::Value = serde_json::from_slice(&encoded).expect("public JSON");
+            for key in ["summary", "detail", "outcome", "progress", "truncated", "nextSeq", "minSeq"] {
+                assert_eq!(actual[key], expected[key], "{}: {key}", case["name"]);
+            }
+            assert_eq!(actual["progress"]["objectsHealed"], 7);
+            assert_eq!(actual["outcome"]["counters"]["healed"], 0);
+        }
+    }
+
+    #[test]
+    fn outcome_v3_rejects_corrupt_status_without_inventing_a_terminal() {
+        for data in [
+            br#"{"summary":"future_state"}"#.as_slice(),
+            br#"{"summary":"finished","nextSeq":9,"next_seq":8}"#.as_slice(),
+            br#"{"outcome":{"execution":{"state":"completed"}}}"#.as_slice(),
+            b"future_state".as_slice(),
+        ] {
+            let response = rustfs_heal_contracts::heal_channel::HealChannelResponse {
+                request_id: "token".into(),
+                success: true,
+                data: Some(data.to_vec()),
+                error: None,
+            };
+            assert!(super::heal_channel_response_status(&response).is_err());
+        }
+    }
+
+    #[test]
+    fn outcome_v3_admin_preserves_future_nonterminal_without_validating_success() {
+        let outcome = serde_json::json!({
+            "execution": {"state": "future_execution", "extension": {"value": 7}},
+            "futureCounter": 9
+        });
+        let mut wire = serde_json::json!({"summary": "running", "outcome": outcome, "next_seq": 9, "min_seq": 4});
+        let mut response = rustfs_heal_contracts::heal_channel::HealChannelResponse {
+            request_id: "token".into(),
+            success: true,
+            data: Some(serde_json::to_vec(&wire).expect("future running wire")),
+            error: None,
+        };
+        let payload = super::heal_channel_response_status(&response).expect("future nonterminal is opaque");
+        let bytes = encode_heal_task_status(payload, String::new(), HealOpts::default()).expect("public nonterminal");
+        let public: serde_json::Value = serde_json::from_slice(&bytes).expect("public JSON");
+        assert_eq!(public["summary"], "running");
+        assert_eq!(public["outcome"], outcome);
+        assert_eq!((public["nextSeq"].as_u64(), public["minSeq"].as_u64()), (Some(9), Some(4)));
+        wire["summary"] = serde_json::json!("finished");
+        response.data = Some(serde_json::to_vec(&wire).expect("unprovable success wire"));
+        assert!(super::heal_channel_response_status(&response).is_err());
     }
 
     #[test]

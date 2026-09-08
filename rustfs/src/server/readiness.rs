@@ -16,6 +16,7 @@ use crate::server::runtime_sources;
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
 use crate::storage_api::cluster::control_plane::ClusterControlPlane;
+use crate::storage_api::error::StorageError;
 use crate::storage_api::server::readiness::contract::admin::StorageAdminApi;
 use crate::storage_api::server::readiness::{Endpoint, EndpointServerPools, is_dist_erasure};
 #[cfg(test)]
@@ -256,7 +257,35 @@ pub async fn publish_ready_when_runtime_ready(
 #[derive(Debug, Clone, Copy)]
 struct StorageReadinessCacheEntry {
     captured_at: Instant,
-    storage_ready: bool,
+    status: StorageWriteReadinessStatus,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StorageWriteReadinessStatus {
+    ready: bool,
+    pool_metadata_reason: Option<ReadinessDegradedReason>,
+}
+
+fn pool_metadata_write_readiness(result: Result<(), StorageError>) -> StorageWriteReadinessStatus {
+    match result {
+        Ok(()) => StorageWriteReadinessStatus {
+            ready: true,
+            pool_metadata_reason: None,
+        },
+        Err(error) => {
+            let pool_metadata_reason = if error.pool_metadata_failure().is_some() {
+                Some(ReadinessDegradedReason::PoolMetaWriteBlocked)
+            } else if matches!(error, StorageError::Timeout) {
+                Some(ReadinessDegradedReason::PoolMetadataCheckTimeout)
+            } else {
+                None
+            };
+            StorageWriteReadinessStatus {
+                ready: false,
+                pool_metadata_reason,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -356,7 +385,7 @@ async fn reset_cluster_health_report_caches() {
     *cluster_read_health_report_cache().lock().await = None;
 }
 
-async fn load_cached_storage_readiness() -> Option<bool> {
+async fn load_cached_storage_readiness() -> Option<StorageWriteReadinessStatus> {
     let ttl = health_readiness_cache_ttl();
     if ttl.is_zero() {
         return None;
@@ -365,7 +394,7 @@ async fn load_cached_storage_readiness() -> Option<bool> {
     let cache = storage_readiness_cache().lock().await;
     let entry = cache.as_ref()?;
     if entry.captured_at.elapsed() <= ttl {
-        return Some(entry.storage_ready);
+        return Some(entry.status);
     }
 
     None
@@ -398,7 +427,7 @@ async fn update_cluster_health_report_cache(kind: ClusterHealthProbeKind, report
     });
 }
 
-async fn update_storage_readiness_cache(storage_ready: bool) {
+async fn update_storage_readiness_cache(status: StorageWriteReadinessStatus) {
     if health_readiness_cache_ttl().is_zero() {
         return;
     }
@@ -406,7 +435,7 @@ async fn update_storage_readiness_cache(storage_ready: bool) {
     let mut cache = storage_readiness_cache().lock().await;
     *cache = Some(StorageReadinessCacheEntry {
         captured_at: Instant::now(),
-        storage_ready,
+        status,
     });
 }
 
@@ -608,7 +637,11 @@ where
 }
 
 fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
-    storage_ready_from_runtime_state_with_quorum(info, pool_write_quorum)
+    storage_ready_from_runtime_state_with_pool_meta(info, true)
+}
+
+fn storage_ready_from_runtime_state_with_pool_meta(info: &StorageInfo, pool_meta_ready: bool) -> bool {
+    pool_meta_ready && storage_ready_from_runtime_state_with_quorum(info, pool_write_quorum)
 }
 
 fn storage_read_ready_from_runtime_state(info: &StorageInfo) -> bool {
@@ -665,6 +698,18 @@ fn degraded_reasons(readiness: DependencyReadiness) -> Vec<ReadinessDegradedReas
     reasons
 }
 
+fn degraded_reasons_with_pool_meta_status(
+    readiness: DependencyReadiness,
+    pool_metadata_reason: Option<ReadinessDegradedReason>,
+) -> Vec<ReadinessDegradedReason> {
+    let mut reasons = degraded_reasons(readiness);
+    if let Some(reason) = pool_metadata_reason {
+        reasons.retain(|reason| *reason != ReadinessDegradedReason::StorageQuorumUnavailable);
+        reasons.insert(0, reason);
+    }
+    reasons
+}
+
 fn record_readiness_report(report: &DependencyReadinessReport) {
     let ready = report.readiness.storage_ready
         && report.readiness.iam_ready
@@ -688,24 +733,34 @@ fn dependency_readiness_report_from_readiness(readiness: DependencyReadiness) ->
     }
 }
 
+fn dependency_readiness_report_from_write_status(
+    readiness: DependencyReadiness,
+    storage: StorageWriteReadinessStatus,
+) -> DependencyReadinessReport {
+    DependencyReadinessReport {
+        degraded_reasons: degraded_reasons_with_pool_meta_status(readiness, storage.pool_metadata_reason),
+        readiness,
+    }
+}
+
 pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport {
     let iam_ready_raw = runtime_sources::current_iam_ready();
-    let storage_ready = if let Some(cached) = load_cached_storage_readiness().await {
+    let storage = if let Some(cached) = load_cached_storage_readiness().await {
         cached
     } else {
-        let computed = collect_storage_readiness_uncached().await;
+        let computed = collect_storage_write_readiness_uncached().await;
         update_storage_readiness_cache(computed).await;
         computed
     };
     let lock_quorum_status = collect_lock_quorum_status().await;
 
     let readiness = DependencyReadiness {
-        storage_ready,
+        storage_ready: storage.ready,
         iam_ready: iam_ready_raw,
         lock_quorum_ready: lock_quorum_status.ready,
         peer_health_ready: collect_peer_health_readiness(),
     };
-    let report = dependency_readiness_report_from_readiness(readiness);
+    let report = dependency_readiness_report_from_write_status(readiness, storage);
     record_readiness_report(&report);
     report
 }
@@ -719,13 +774,14 @@ pub async fn collect_cluster_read_health_report() -> DependencyReadinessReport {
 }
 
 pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
+    let storage = node_pool_meta_write_readiness().await;
     let readiness = DependencyReadiness {
-        storage_ready: runtime_sources::current_object_store_handle().is_some(),
+        storage_ready: storage.ready,
         iam_ready: runtime_sources::current_iam_ready(),
         lock_quorum_ready: collect_lock_quorum_status().await.ready,
         peer_health_ready: collect_peer_health_readiness(),
     };
-    let report = dependency_readiness_report_from_readiness(readiness);
+    let report = dependency_readiness_report_from_write_status(readiness, storage);
     record_readiness_report(&report);
     report
 }
@@ -788,14 +844,15 @@ pub async fn collect_cluster_read_dependency_readiness_report() -> DependencyRea
 }
 
 pub(crate) async fn snapshot_dependency_readiness_report() -> DependencyReadinessReport {
+    let storage = collect_storage_write_readiness_uncached().await;
     let readiness = DependencyReadiness {
-        storage_ready: collect_storage_readiness_uncached().await,
+        storage_ready: storage.ready,
         iam_ready: runtime_sources::current_iam_ready(),
         lock_quorum_ready: collect_lock_quorum_status_uncached().await.ready,
         peer_health_ready: collect_peer_health_readiness(),
     };
 
-    dependency_readiness_report_from_readiness(readiness)
+    dependency_readiness_report_from_write_status(readiness, storage)
 }
 
 async fn collect_lock_quorum_status() -> LockQuorumStatus {
@@ -808,12 +865,27 @@ async fn collect_lock_quorum_status() -> LockQuorumStatus {
     }
 }
 
-async fn collect_storage_readiness_uncached() -> bool {
+async fn node_pool_meta_write_readiness() -> StorageWriteReadinessStatus {
     if let Some(store) = runtime_sources::current_object_store_handle() {
+        return pool_metadata_write_readiness(store.pool_meta_write_status().await);
+    }
+
+    StorageWriteReadinessStatus::default()
+}
+
+async fn collect_storage_write_readiness_uncached() -> StorageWriteReadinessStatus {
+    if let Some(store) = runtime_sources::current_object_store_handle() {
+        let metadata = pool_metadata_write_readiness(store.pool_meta_write_status().await);
+        if !metadata.ready {
+            return metadata;
+        }
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
-        storage_ready_from_runtime_state(&storage_info)
+        StorageWriteReadinessStatus {
+            ready: storage_ready_from_runtime_state(&storage_info),
+            pool_metadata_reason: None,
+        }
     } else {
-        false
+        StorageWriteReadinessStatus::default()
     }
 }
 
@@ -1324,6 +1396,7 @@ mod tests {
                 ..Default::default()
             },
             disks: Vec::new(),
+            ..Default::default()
         };
 
         assert_eq!(pool_erasure_layout(&info, 0, 4), Some((2, 2)));
@@ -1344,6 +1417,7 @@ mod tests {
                 ..Default::default()
             },
             disks: Vec::new(),
+            ..Default::default()
         };
 
         assert_eq!(pool_write_quorum(&info, 0, 8), Some(6));
@@ -1362,6 +1436,7 @@ mod tests {
                 ..Default::default()
             },
             disks: online_readiness_disks(0, 8),
+            ..Default::default()
         };
 
         assert_eq!(pool_erasure_layout(&info, 0, 8), Some((6, 2)));
@@ -1380,6 +1455,7 @@ mod tests {
                 ..Default::default()
             },
             disks: online_readiness_disks(0, 8),
+            ..Default::default()
         };
 
         assert_eq!(pool_erasure_layout(&info, 0, 8), None);
@@ -1396,6 +1472,7 @@ mod tests {
                 ..Default::default()
             },
             disks: Vec::new(),
+            ..Default::default()
         };
 
         assert_eq!(pool_erasure_layout(&info, 0, 4), Some((3, 1)));
@@ -1411,6 +1488,7 @@ mod tests {
                 ..Default::default()
             },
             disks: online_readiness_disks(0, 3),
+            ..Default::default()
         };
 
         assert_eq!(pool_erasure_layout(&info, 0, 3), Some((2, 1)));
@@ -1430,10 +1508,12 @@ mod tests {
         let three_online = StorageInfo {
             backend: backend.clone(),
             disks: online_readiness_disks(0, 3),
+            ..Default::default()
         };
         let two_online = StorageInfo {
             backend,
             disks: online_readiness_disks(0, 2),
+            ..Default::default()
         };
 
         assert!(storage_read_ready_from_runtime_state(&three_online));
@@ -1453,6 +1533,7 @@ mod tests {
                 ..Default::default()
             },
             disks: online_readiness_disks(0, 3),
+            ..Default::default()
         };
 
         assert!(!storage_read_ready_from_runtime_state(&info));
@@ -1468,6 +1549,7 @@ mod tests {
                 ..Default::default()
             },
             disks: online_readiness_disks(0, 3),
+            ..Default::default()
         };
 
         assert!(!storage_read_ready_from_runtime_state(&info));
@@ -1483,6 +1565,7 @@ mod tests {
                 ..Default::default()
             },
             disks: online_readiness_disks(0, 3),
+            ..Default::default()
         };
 
         assert!(!storage_read_ready_from_runtime_state(&info));
@@ -1509,6 +1592,7 @@ mod tests {
                 ..Default::default()
             },
             disks,
+            ..Default::default()
         };
 
         assert!(!storage_ready_from_runtime_state(&info));
@@ -1531,6 +1615,7 @@ mod tests {
                 runtime_state: Some("offline".to_string()),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         assert!(!storage_ready_from_runtime_state(&info));
@@ -1552,9 +1637,11 @@ mod tests {
                 runtime_state: Some("online".to_string()),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         assert!(storage_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state_with_pool_meta(&info, false));
     }
 
     #[test]
@@ -1579,10 +1666,45 @@ mod tests {
                 ..Default::default()
             },
             disks,
+            ..Default::default()
         };
 
         assert!(storage_read_ready_from_runtime_state(&info));
         assert!(!storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn unknown_inventory_does_not_supply_quorum_evidence() {
+        let mut info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![2],
+                total_sets: vec![1],
+                drives_per_set: vec![4],
+                ..Default::default()
+            },
+            disks: (0..4)
+                .map(|disk_index| Disk {
+                    endpoint: format!("node-{disk_index}"),
+                    pool_index: 0,
+                    set_index: 0,
+                    disk_index,
+                    state: "ok".to_string(),
+                    runtime_state: Some("online".to_string()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(storage_ready_from_runtime_state(&info));
+        for disk in &mut info.disks[2..] {
+            disk.state = rustfs_madmin::ITEM_UNKNOWN.to_string();
+            disk.runtime_state = Some(rustfs_madmin::ITEM_UNKNOWN.to_string());
+        }
+        assert!(storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
+        assert_eq!(pool_read_quorum(&info, 0, 4), Some(2));
+        assert_eq!(pool_write_quorum(&info, 0, 4), Some(3));
+        assert!(info.disks.iter().all(|disk| disk.state != rustfs_madmin::ITEM_OFFLINE));
     }
 
     #[test]
@@ -1605,6 +1727,7 @@ mod tests {
                 ..Default::default()
             },
             disks: vec![duplicate_disk.clone(), duplicate_disk],
+            ..Default::default()
         };
 
         assert!(!storage_ready_from_runtime_state(&info), "duplicate rows must not satisfy write quorum");
@@ -1661,6 +1784,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
 
         assert!(
@@ -1788,6 +1912,82 @@ mod tests {
         assert_eq!(
             base_degraded_reasons(false, false, false),
             vec![ReadinessDegradedReason::StorageIamAndLockUnavailable]
+        );
+    }
+
+    fn blocked_pool_metadata_status() -> StorageWriteReadinessStatus {
+        use crate::storage_api::error::{PoolMetadataError, PoolMetadataFailure};
+        pool_metadata_write_readiness(Err(StorageError::other(PoolMetadataError {
+            kind: PoolMetadataFailure::TransactionUnknown,
+            operation: "private operation".to_owned(),
+            phase: "prepare_cas",
+            since: time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed block time"),
+            source: Some(Arc::new(StorageError::other("private replica failure"))),
+        })))
+    }
+
+    #[test]
+    fn pool_metadata_observation_distinguishes_block_timeout_and_unavailable() {
+        let blocked = blocked_pool_metadata_status();
+        assert!(!blocked.ready);
+        assert_eq!(blocked.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetaWriteBlocked));
+        assert!(!format!("{blocked:?}").contains("private"));
+        let writable = pool_metadata_write_readiness(Ok(()));
+        assert!(writable.ready);
+        assert_eq!(writable.pool_metadata_reason, None);
+        let timed_out = pool_metadata_write_readiness(Err(StorageError::Timeout));
+        assert!(!timed_out.ready);
+        assert_eq!(timed_out.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetadataCheckTimeout));
+        let unavailable = pool_metadata_write_readiness(Err(StorageError::other("pool metadata writes remain blocked")));
+        assert!(!unavailable.ready);
+        assert_eq!(
+            unavailable.pool_metadata_reason, None,
+            "error text alone must not be interpreted as a typed write block"
+        );
+
+        let readiness = DependencyReadiness {
+            storage_ready: false,
+            iam_ready: true,
+            lock_quorum_ready: true,
+            peer_health_ready: true,
+        };
+        let report = dependency_readiness_report_from_write_status(readiness, timed_out);
+        assert!(!report.readiness.storage_ready, "inspection timeout must remain fail-closed");
+        assert_eq!(report.degraded_reasons, vec![ReadinessDegradedReason::PoolMetadataCheckTimeout]);
+        assert_eq!(report.degraded_reasons[0].as_str(), "pool_metadata_check_timeout");
+    }
+
+    #[test]
+    fn degraded_reasons_report_pool_meta_write_blocked() {
+        let readiness = DependencyReadiness {
+            storage_ready: false,
+            iam_ready: true,
+            lock_quorum_ready: true,
+            peer_health_ready: true,
+        };
+
+        assert_eq!(
+            degraded_reasons_with_pool_meta_status(readiness, blocked_pool_metadata_status().pool_metadata_reason),
+            vec![ReadinessDegradedReason::PoolMetaWriteBlocked]
+        );
+    }
+
+    #[test]
+    fn degraded_reasons_keep_pool_meta_source_with_other_failures() {
+        let readiness = DependencyReadiness {
+            storage_ready: false,
+            iam_ready: true,
+            lock_quorum_ready: false,
+            peer_health_ready: false,
+        };
+
+        assert_eq!(
+            degraded_reasons_with_pool_meta_status(readiness, blocked_pool_metadata_status().pool_metadata_reason),
+            vec![
+                ReadinessDegradedReason::PoolMetaWriteBlocked,
+                ReadinessDegradedReason::StorageAndLockUnavailable,
+                ReadinessDegradedReason::PeerHealthUnavailable,
+            ]
         );
     }
 

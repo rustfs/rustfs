@@ -167,6 +167,13 @@ pub struct HealTaskStatus {
     /// Live progress snapshot; the exact shape is owned by the heal runtime.
     #[serde(default)]
     pub progress: Option<serde_json::Value>,
+    /// Canonical heal-owner result. Missing or future states are not repair proof.
+    #[serde(default)]
+    pub outcome: Option<serde_json::Value>,
+    #[serde(default, alias = "next_seq")]
+    pub next_seq: Option<u64>,
+    #[serde(default, alias = "min_seq")]
+    pub min_seq: Option<u64>,
 }
 
 /// `POST /v3/background-heal/status` response. Known top-level fields are
@@ -221,6 +228,61 @@ pub struct ScannerStatus {
     pub freshness: Option<ScannerFreshness>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `POST /v3/scanner/cycle-state/reset` response for the legacy synchronous
+/// full-rescan reset path.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScannerCycleResetResponse {
+    pub status: String,
+    pub mode: String,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `POST /v3/scanner/usage-state/reset` response for the legacy synchronous
+/// full-rebuild reset path.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScannerUsageStateResetResponse {
+    pub status: String,
+    pub mode: String,
+    pub usage_state: String,
+    pub leader_epoch: u64,
+    pub next_cycle: u64,
+    pub reset_paths: Vec<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Durable scanner usage-state recovery intent response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScannerUsageRecoveryIntentResponse {
+    /// `accepted`, `replayed`, or `found`.
+    pub status: String,
+    pub action: String,
+    pub mode: String,
+    pub intent_id: String,
+    pub state: String,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScannerCycleResetRequest<'a> {
+    mode: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct ScannerUsageStateResetRequest<'a> {
+    mode: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct ScannerUsageStateAsyncResetRequest<'a> {
+    mode: &'a str,
+    #[serde(rename = "async")]
+    async_intent: bool,
+    idempotency_key: &'a str,
 }
 
 /// Freshness block of the scanner status response.
@@ -358,8 +420,22 @@ impl AdminClient {
         prefix: Option<&str>,
         client_token: &str,
     ) -> Result<HealTaskStatus, AdminClientError> {
-        self.post_json(&heal_path(bucket, prefix), &[("clientToken", client_token.to_string())], Vec::new())
-            .await
+        self.heal_status_since(bucket, prefix, client_token, None).await
+    }
+
+    /// Query a retained result window. Missing cursors and outcome remain unknown.
+    pub async fn heal_status_since(
+        &self,
+        bucket: Option<&str>,
+        prefix: Option<&str>,
+        client_token: &str,
+        since_seq: Option<u64>,
+    ) -> Result<HealTaskStatus, AdminClientError> {
+        let mut query = vec![("clientToken", client_token.to_string())];
+        if let Some(since_seq) = since_seq {
+            query.push(("sinceSeq", since_seq.to_string()));
+        }
+        self.post_json(&heal_path(bucket, prefix), &query, Vec::new()).await
     }
 
     /// Stop a heal: with a `client_token` only that task is cancelled and its
@@ -378,7 +454,7 @@ impl AdminClient {
         match client_token {
             Some(_) => {
                 let status: HealTaskStatus = self.post_json(&heal_path(bucket, prefix), &query, Vec::new()).await?;
-                Ok(HealStopOutcome::Stopped(status))
+                Ok(HealStopOutcome::Stopped(Box::new(status)))
             }
             None => {
                 let success: HealStartSuccess = self.post_json(&heal_path(bucket, prefix), &query, Vec::new()).await?;
@@ -396,6 +472,57 @@ impl AdminClient {
     /// Data scanner status (enabled state, freshness, runtime config).
     pub async fn scanner_status(&self) -> Result<ScannerStatus, AdminClientError> {
         self.get_json("/v3/scanner/status").await
+    }
+
+    /// Request a legacy synchronous scanner cycle reset (`full-rescan`).
+    pub async fn scanner_cycle_state_reset_full_rescan(&self) -> Result<ScannerCycleResetResponse, AdminClientError> {
+        let body =
+            serde_json::to_vec(&ScannerCycleResetRequest { mode: "full-rescan" }).map_err(|err| AdminClientError::Decode {
+                message: err.to_string(),
+            })?;
+        self.post_json("/v3/scanner/cycle-state/reset", &[], body).await
+    }
+
+    /// Request a legacy synchronous scanner usage reset (`full-rebuild`).
+    pub async fn scanner_usage_state_reset_full_rebuild(&self) -> Result<ScannerUsageStateResetResponse, AdminClientError> {
+        let body = serde_json::to_vec(&ScannerUsageStateResetRequest { mode: "full-rebuild" }).map_err(|err| {
+            AdminClientError::Decode {
+                message: err.to_string(),
+            }
+        })?;
+        self.post_json("/v3/scanner/usage-state/reset", &[], body).await
+    }
+
+    /// Accept a durable asynchronous scanner usage-state full-rebuild intent.
+    ///
+    /// The caller owns `idempotency_key`; replaying the same key on the same
+    /// server-side actor returns the same accepted intent instead of starting
+    /// the legacy synchronous reset path.
+    pub async fn scanner_usage_state_accept_full_rebuild_intent(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<ScannerUsageRecoveryIntentResponse, AdminClientError> {
+        let body = serde_json::to_vec(&ScannerUsageStateAsyncResetRequest {
+            mode: "full-rebuild",
+            async_intent: true,
+            idempotency_key,
+        })
+        .map_err(|err| AdminClientError::Decode {
+            message: err.to_string(),
+        })?;
+        self.post_json("/v3/scanner/usage-state/reset", &[], body).await
+    }
+
+    /// Query a durable asynchronous scanner usage-state recovery intent.
+    pub async fn scanner_usage_state_recovery_intent_status(
+        &self,
+        intent_id: &str,
+    ) -> Result<ScannerUsageRecoveryIntentResponse, AdminClientError> {
+        self.get_json(&format!(
+            "/v3/scanner/usage-state/recovery-intents/{}",
+            percent_encode_path_segment(intent_id)
+        ))
+        .await
     }
 
     /// ILM expiry worker status. The payload is owned by the expiry
@@ -533,7 +660,7 @@ impl AdminClient {
 /// start-success-shaped receipt.
 #[derive(Debug, Clone)]
 pub enum HealStopOutcome {
-    Stopped(HealTaskStatus),
+    Stopped(Box<HealTaskStatus>),
     PathStopped(HealStartSuccess),
 }
 
@@ -566,7 +693,8 @@ pub(crate) fn percent_encode_path_segment(segment: &str) -> String {
 mod tests {
     use super::{
         AdminClient, AdminClientError, BackgroundHealStatus, HealOpts, HealScanMode, HealStartSuccess, HealTaskStatus,
-        ScannerStatus, heal_path, percent_encode_path_segment,
+        ScannerCycleResetResponse, ScannerStatus, ScannerUsageRecoveryIntentResponse, ScannerUsageStateResetResponse, heal_path,
+        percent_encode_path_segment,
     };
     use crate::test_support::TestServer;
     use serde_json::json;
@@ -636,6 +764,24 @@ mod tests {
     }
 
     #[test]
+    fn outcome_v3_decoder_preserves_canonical_unknown_and_future_fields() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/heal-outcome-v3.json")).expect("shared fixtures");
+        for case in cases.as_array().expect("cases") {
+            let status: HealTaskStatus = serde_json::from_value(case["response"].clone()).expect("optional outcome response");
+            assert_eq!(status.outcome.as_ref(), Some(&case["response"]["outcome"]));
+            assert_eq!((status.next_seq, status.min_seq), (Some(9), Some(4)));
+            assert!(status.truncated);
+        }
+        let old: HealTaskStatus = serde_json::from_value(json!({"summary":"finished"})).expect("legacy response");
+        assert!(old.outcome.is_none() && old.next_seq.is_none() && old.min_seq.is_none());
+        let future = json!({"execution":{"state":"future_state"},"newField":7});
+        let status: HealTaskStatus =
+            serde_json::from_value(json!({"summary":"running","outcome":future})).expect("future outcome remains opaque");
+        assert_eq!(status.outcome, Some(future));
+    }
+
+    #[test]
     fn background_heal_status_types_known_fields_and_passes_the_rest_through() {
         let raw = json!({
             "state": "active",
@@ -692,6 +838,49 @@ mod tests {
     }
 
     #[test]
+    fn scanner_reset_responses_preserve_future_fields() {
+        let cycle: ScannerCycleResetResponse =
+            serde_json::from_value(json!({"status": "reset", "mode": "full-rescan", "future": true})).unwrap();
+        assert_eq!(cycle.status, "reset");
+        assert_eq!(cycle.mode, "full-rescan");
+        assert_eq!(cycle.extra["future"], true);
+
+        let usage: ScannerUsageStateResetResponse = serde_json::from_value(json!({
+            "status": "reset",
+            "mode": "full-rebuild",
+            "usage_state": "bootstrap-pending",
+            "leader_epoch": 11,
+            "next_cycle": 42,
+            "reset_paths": [".usage.json"],
+            "future": {"accepted": false}
+        }))
+        .unwrap();
+        assert_eq!(usage.status, "reset");
+        assert_eq!(usage.mode, "full-rebuild");
+        assert_eq!(usage.usage_state, "bootstrap-pending");
+        assert_eq!(usage.leader_epoch, 11);
+        assert_eq!(usage.next_cycle, 42);
+        assert_eq!(usage.reset_paths, [".usage.json"]);
+        assert_eq!(usage.extra["future"]["accepted"], false);
+
+        let intent: ScannerUsageRecoveryIntentResponse = serde_json::from_value(json!({
+            "status": "accepted",
+            "action": "usage-full-rebuild",
+            "mode": "full-rebuild",
+            "intent_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "state": "accepted",
+            "future": {"worker": "pending"}
+        }))
+        .unwrap();
+        assert_eq!(intent.status, "accepted");
+        assert_eq!(intent.action, "usage-full-rebuild");
+        assert_eq!(intent.mode, "full-rebuild");
+        assert_eq!(intent.intent_id, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        assert_eq!(intent.state, "accepted");
+        assert_eq!(intent.extra["future"]["worker"], "pending");
+    }
+
+    #[test]
     fn invalid_endpoint_is_rejected_without_io() {
         let err = AdminClient::new("not a url", "ak", "sk").unwrap_err();
         assert!(matches!(err, AdminClientError::InvalidEndpoint(_)));
@@ -734,6 +923,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scanner_cycle_reset_posts_legacy_full_rescan_request() {
+        let server = TestServer::spawn(r#"{"status":"reset","mode":"full-rescan"}"#, 200).await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+
+        let reset = client
+            .scanner_cycle_state_reset_full_rescan()
+            .await
+            .expect("cycle reset response decodes");
+
+        assert_eq!(reset.status, "reset");
+        assert_eq!(reset.mode, "full-rescan");
+        let request = server.recorded();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/rustfs/admin/v3/scanner/cycle-state/reset");
+        assert_eq!(request.query, "");
+        assert!(request.body.contains("\"mode\":\"full-rescan\""));
+    }
+
+    #[tokio::test]
+    async fn scanner_usage_reset_posts_legacy_full_rebuild_request() {
+        let server = TestServer::spawn(
+            r#"{"status":"reset","mode":"full-rebuild","usage_state":"bootstrap-pending","leader_epoch":11,"next_cycle":42,"reset_paths":[".usage.json"]}"#,
+            200,
+        )
+        .await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+
+        let reset = client
+            .scanner_usage_state_reset_full_rebuild()
+            .await
+            .expect("usage reset response decodes");
+
+        assert_eq!(reset.status, "reset");
+        assert_eq!(reset.mode, "full-rebuild");
+        assert_eq!(reset.usage_state, "bootstrap-pending");
+        assert_eq!(reset.leader_epoch, 11);
+        assert_eq!(reset.next_cycle, 42);
+        assert_eq!(reset.reset_paths, [".usage.json"]);
+        let request = server.recorded();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/rustfs/admin/v3/scanner/usage-state/reset");
+        assert_eq!(request.query, "");
+        assert!(request.body.contains("\"mode\":\"full-rebuild\""));
+    }
+
+    #[tokio::test]
+    async fn scanner_usage_async_reset_posts_explicit_intent_contract() {
+        let server = TestServer::spawn(
+            r#"{"status":"accepted","action":"usage-full-rebuild","mode":"full-rebuild","intent_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"accepted"}"#,
+            202,
+        )
+        .await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+
+        let accepted = client
+            .scanner_usage_state_accept_full_rebuild_intent("intent-key-1")
+            .await
+            .expect("async recovery intent response decodes");
+
+        assert_eq!(accepted.status, "accepted");
+        assert_eq!(accepted.mode, "full-rebuild");
+        assert_eq!(accepted.state, "accepted");
+        let request = server.recorded();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/rustfs/admin/v3/scanner/usage-state/reset");
+        assert_eq!(request.query, "");
+        assert!(request.body.contains("\"mode\":\"full-rebuild\""));
+        assert!(request.body.contains("\"async\":true"));
+        assert!(request.body.contains("\"idempotency_key\":\"intent-key-1\""));
+    }
+
+    #[tokio::test]
+    async fn scanner_usage_recovery_intent_status_gets_encoded_intent_id() {
+        let server = TestServer::spawn(
+            r#"{"status":"found","action":"usage-full-rebuild","mode":"full-rebuild","intent_id":"id%2Fwith%20space","state":"accepted"}"#,
+            200,
+        )
+        .await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+
+        let status = client
+            .scanner_usage_state_recovery_intent_status("id/with space")
+            .await
+            .expect("recovery intent status response decodes");
+
+        assert_eq!(status.status, "found");
+        assert_eq!(status.action, "usage-full-rebuild");
+        let request = server.recorded();
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/rustfs/admin/v3/scanner/usage-state/recovery-intents/id%2Fwith%20space");
+        assert_eq!(request.query, "");
+        assert_eq!(request.body, "");
+    }
+
+    #[tokio::test]
     async fn query_sends_client_token_on_the_same_path() {
         let body = r#"{"summary":"running","detail":"","settings":{"recursive":false},"items":[],"truncated":false}"#;
         let server = TestServer::spawn(body, 200).await;
@@ -751,6 +1035,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outcome_v3_since_query_preserves_cursor_and_never_sends_force_start() {
+        let server = TestServer::spawn(
+            r#"{"summary":"running","nextSeq":9,"minSeq":4,"truncated":true,"outcome":{"execution":{"state":"future_state"}}}"#,
+            200,
+        )
+        .await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").expect("test client");
+        let status = client
+            .heal_status_since(Some("bucket"), None, "token-1", Some(3))
+            .await
+            .expect("window response");
+        assert_eq!((status.next_seq, status.min_seq), (Some(9), Some(4)));
+        assert!(status.truncated);
+        assert_eq!(status.outcome.expect("future state is preserved")["execution"]["state"], "future_state");
+        let request = server.recorded();
+        assert!(request.query.contains("sinceSeq=3") && request.query.contains("clientToken=token-1"));
+        assert!(!request.query.contains("forceStart") && !request.query.contains("forceStop"));
+    }
+
+    #[tokio::test]
     async fn stop_without_token_takes_the_path_cancel_branch() {
         let server = TestServer::spawn(r#"{"clientToken":"path","clientAddress":"c","startTime":"t"}"#, 200).await;
         let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
@@ -760,6 +1064,25 @@ mod tests {
         let request = server.recorded();
         assert!(request.query.contains("forceStop=true"));
         assert!(!request.query.contains("clientToken"));
+    }
+
+    #[tokio::test]
+    async fn stop_with_token_decodes_boxed_task_status() {
+        let body = r#"{"summary":"stopped","detail":"","settings":{"recursive":false},"items":[],"truncated":false}"#;
+        let server = TestServer::spawn(body, 200).await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+
+        let outcome = client
+            .heal_stop(Some("bucket"), None, Some("token-1"))
+            .await
+            .expect("token stop decodes");
+        let super::HealStopOutcome::Stopped(status) = outcome else {
+            panic!("token stop should return task status");
+        };
+        assert_eq!(status.summary, "stopped");
+        let request = server.recorded();
+        assert!(request.query.contains("forceStop=true"));
+        assert!(request.query.contains("clientToken=token-1"));
     }
 
     #[tokio::test]

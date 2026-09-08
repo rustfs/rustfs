@@ -15,17 +15,16 @@
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
 
 use crate::error::is_err_bucket_not_found;
+#[cfg(feature = "gcs")]
+use crate::services::tier::warm_backend_gcs::WarmBackendGCS;
 use crate::services::tier::{
     tier::{ERR_TIER_BACKEND_IN_USE, ERR_TIER_INVALID_CONFIG, ERR_TIER_TYPE_UNSUPPORTED},
     tier_config::{TierConfig, TierType},
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_NOT_FOUND, ERR_TIER_PERM_ERR},
     warm_backend_aliyun::WarmBackendAliyun,
     warm_backend_azure::WarmBackendAzure,
-    warm_backend_gcs::WarmBackendGCS,
     warm_backend_huaweicloud::WarmBackendHuaweicloud,
     warm_backend_minio::WarmBackendMinIO,
     warm_backend_r2::WarmBackendR2,
@@ -37,7 +36,7 @@ use crate::services::tier::{
 use bytes::Bytes;
 use http::StatusCode;
 use rustfs_s3_client::credentials::{Credentials, SignatureType, Static, Value};
-use rustfs_s3_client::transition_api::{BucketLookupType, Options, TransitionClient, TransitionCore};
+use rustfs_s3_client::transition_api::{BucketLookupType, Options, TransitionClient, TransitionClientTimeouts, TransitionCore};
 use rustfs_s3_client::{
     admin_handler_utils::AdminError,
     api_error_response::to_error_response,
@@ -320,6 +319,27 @@ pub(crate) fn endpoint_authority(url: &url::Url) -> Result<String, std::io::Erro
     }
 }
 
+fn transition_timeout_from_env(env_key: &str, default_secs: u64) -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(env_key, default_secs))
+}
+
+pub(crate) fn transition_client_timeouts_from_env() -> TransitionClientTimeouts {
+    TransitionClientTimeouts::new(
+        transition_timeout_from_env(
+            rustfs_config::ENV_TIER_REMOTE_CONNECT_TIMEOUT_SECS,
+            rustfs_config::DEFAULT_TIER_REMOTE_CONNECT_TIMEOUT_SECS,
+        ),
+        transition_timeout_from_env(
+            rustfs_config::ENV_TIER_REMOTE_REQUEST_TIMEOUT_SECS,
+            rustfs_config::DEFAULT_TIER_REMOTE_REQUEST_TIMEOUT_SECS,
+        ),
+        transition_timeout_from_env(
+            rustfs_config::ENV_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS,
+            rustfs_config::DEFAULT_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS,
+        ),
+    )
+}
+
 /// Build the [`WarmBackendS3`] shared by the S3-compatible warm backend providers.
 ///
 /// Credential, bucket, and endpoint validation run in this order because the
@@ -350,6 +370,7 @@ pub(crate) async fn new_s3_compatible_warm_backend(
         signer_type: SignatureType::SignatureV4,
         ..Default::default()
     }));
+    let timeouts = transition_client_timeouts_from_env();
     let opts = Options {
         creds,
         secure: u.scheme() == "https",
@@ -362,7 +383,7 @@ pub(crate) async fn new_s3_compatible_warm_backend(
     // Run the SSRF guard after the host-presence check so a host-less endpoint
     // keeps this constructor's stable error text.
     (params.validate_endpoint)(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
-    let client = TransitionClient::new(&endpoint, opts, params.provider_tag).await?;
+    let client = TransitionClient::new_with_timeouts(&endpoint, opts, params.provider_tag, timeouts).await?;
 
     let client = Arc::new(client);
     let core = TransitionCore(Arc::clone(&client));
@@ -696,17 +717,7 @@ async fn check_warm_backend_with_deadlines(
     if !matches!(cleanup_result, Ok(Ok(()))) {
         return Err(probe_cleanup_incomplete_error());
     }
-    if let Err(err) = read_result {
-        //if is_err_bucket_not_found(&err) {
-        //    return Err(ERR_TIER_BUCKET_NOT_FOUND);
-        //}
-        /*else if is_err_signature_does_not_match(err) {
-            return Err(ERR_TIER_MISSING_CREDENTIALS);
-        }*/
-        //else {
-        return Err(err);
-        //}
-    }
+    read_result?;
     Ok(())
 }
 
@@ -736,7 +747,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -777,7 +788,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -797,7 +808,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -817,7 +828,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -837,7 +848,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -857,7 +868,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -877,7 +888,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -890,6 +901,15 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                 });
             }
         }
+        #[cfg(not(feature = "gcs"))]
+        TierType::GCS => {
+            return Err(AdminError {
+                code: ERR_TIER_TYPE_UNSUPPORTED.code.clone(),
+                message: "This build does not include the GCS backend; rebuild with the gcs feature".to_string(),
+                status_code: StatusCode::NOT_IMPLEMENTED,
+            });
+        }
+        #[cfg(feature = "gcs")]
         TierType::GCS => {
             if let Some(gcs_config) = tier.gcs.as_ref() {
                 let dd = WarmBackendGCS::new(gcs_config, &tier.name).await;
@@ -897,7 +917,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -917,7 +937,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                     warn!("{}", err);
                     return Err(AdminError {
                         code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {}", err.to_string()),
+                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
                         status_code: StatusCode::BAD_REQUEST,
                     });
                 }
@@ -1005,6 +1025,27 @@ mod tests {
     };
 
     const PROBE_VERSION: &str = "remote-v2";
+
+    #[cfg(not(feature = "gcs"))]
+    #[tokio::test]
+    async fn gcs_backend_not_compiled_preserves_config() {
+        let json = r#"{"name":"ARCHIVE","type":"gcs","gcs":{"bucket":"archive","creds":"secret"}}"#;
+        let tier: TierConfig = serde_json::from_str(json).expect("GCS config remains readable without the backend");
+        assert_eq!(tier.tier_type, TierType::GCS);
+        let encoded = serde_json::to_vec(&tier).expect("GCS config remains writable");
+        let restored: TierConfig = serde_json::from_slice(&encoded).expect("GCS config round trips");
+        assert_eq!(restored.tier_type, TierType::GCS);
+        let restored_gcs = restored.gcs.as_ref().expect("GCS settings preserved");
+        assert_eq!(restored_gcs.bucket, "archive");
+        assert_eq!(restored_gcs.creds, "secret");
+        assert_eq!(tier.redacted().gcs.expect("redacted GCS settings").creds, "REDACTED");
+        let error = match new_warm_backend(&tier, false).await {
+            Ok(_) => panic!("an excluded GCS backend cannot be constructed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ERR_TIER_TYPE_UNSUPPORTED.code);
+        assert_eq!(error.status_code, StatusCode::NOT_IMPLEMENTED);
+    }
 
     struct CountingBackend {
         put_result: fn() -> Result<String, std::io::Error>,

@@ -166,8 +166,9 @@ jobs:
       # e.g. https://dl.rustfs.com/artifacts/rustfs/packages/nightly/... .
       # Skipped when the R2 secrets are not configured (artifact-only mode).
       - name: Upload DEB to Cloudflare R2
-        if: env.R2_ACCESS_KEY_ID != ''
+        id: publish
         env:
+          DEB_FILE: ${{ steps.deb.outputs.deb_file }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
@@ -182,27 +183,69 @@ jobs:
             exit 0
           fi
 
-          if ! command -v aws >/dev/null 2>&1; then
-            sudo apt-get update && sudo apt-get install -y -qq awscli
-          fi
-
           export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
           export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
           export AWS_DEFAULT_REGION="auto"
 
-          DEB_FILE="${{ steps.deb.outputs.deb_file }}"
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          if [[ "${SOURCE_SHA}" != "${GITHUB_SHA}" ]]; then
+            echo "Checkout SHA does not match the nightly build run" >&2
+            exit 1
+          fi
+          DEB_SHA256="$(sha256sum "${DEB_FILE}" | cut -d ' ' -f 1)"
+          CANDIDATE_KEY="artifacts/rustfs/packages/nightly/runs/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${DEB_SHA256}/rustfs.deb"
+          CANDIDATE_URL="https://dl.rustfs.com/${CANDIDATE_KEY}"
+
+          # Old AWS CLI models lack conditional PutObject support. Never fall
+          # back to an overwriting upload for a candidate.
+          AWS_CLI=aws
+          if ! "${AWS_CLI}" s3api put-object --generate-cli-skeleton input | jq -e 'has("IfNoneMatch")' >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y -qq python3-venv
+            AWS_CLI_DIR="$(mktemp -d "${RUNNER_TEMP}/nightly-awscli.XXXXXX")"
+            trap 'rm -rf "${AWS_CLI_DIR}"' EXIT
+            python3 -m venv "${AWS_CLI_DIR}"
+            "${AWS_CLI_DIR}/bin/python" -m pip install --disable-pip-version-check 'awscli==1.44.79'
+            AWS_CLI="${AWS_CLI_DIR}/bin/aws"
+          fi
+          "${AWS_CLI}" s3api put-object --generate-cli-skeleton input | jq -e 'has("IfNoneMatch")' >/dev/null
+          "${AWS_CLI}" --version
+          "${AWS_CLI}" s3api put-object --bucket "${R2_BUCKET}" --key "${CANDIDATE_KEY}" \
+            --body "${DEB_FILE}" --if-none-match '*' --endpoint-url "${R2_ENDPOINT}"
+          PUBLISHED_SHA256="$(curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 "${CANDIDATE_URL}" | sha256sum | cut -d ' ' -f 1)"
+          if [[ "${PUBLISHED_SHA256}" != "${DEB_SHA256}" ]]; then
+            echo "Published candidate checksum does not match the built package" >&2
+            exit 1
+          fi
+
           R2_PREFIX="s3://${R2_BUCKET}/artifacts/rustfs/packages/nightly/"
 
           echo "📤 Uploading ${DEB_FILE} to ${R2_PREFIX}"
-          aws s3 cp "${DEB_FILE}" "${R2_PREFIX}" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+          "${AWS_CLI}" s3 cp "${DEB_FILE}" "${R2_PREFIX}" --endpoint-url "$R2_ENDPOINT" --only-show-errors
 
           # Stable "latest" alias so tests can fetch the newest nightly
           # without knowing today's date.
           echo "📤 Uploading latest alias"
-          aws s3 cp "${DEB_FILE}" "${R2_PREFIX}rustfs-nightly-latest.deb" \
+          "${AWS_CLI}" s3 cp "${DEB_FILE}" "${R2_PREFIX}rustfs-nightly-latest.deb" \
             --endpoint-url "$R2_ENDPOINT" --only-show-errors
 
           echo "✅ R2 upload complete"
+
+          CANDIDATE_FILE="${RUNNER_TEMP}/nightly-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          jq -n --arg source_sha "${SOURCE_SHA}" \
+            --argjson build_run_id "${GITHUB_RUN_ID}" --argjson build_run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg package_url "${CANDIDATE_URL}" --arg package_sha256 "${DEB_SHA256}" \
+            '{schema: 1, source_sha: $source_sha, build_run_id: $build_run_id, build_run_attempt: $build_run_attempt, package_url: $package_url, package_sha256: $package_sha256}' \
+            > "${CANDIDATE_FILE}"
+          echo "candidate_file=${CANDIDATE_FILE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload nightly candidate manifest
+        if: ${{ steps.publish.outputs.candidate_file != '' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: nightly-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.publish.outputs.candidate_file }}
+          if-no-files-found: error
 
   # Live-Vault lane for the rustfs-kms suite (rustfs/backlog#1774).
   #

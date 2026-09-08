@@ -121,6 +121,22 @@ jobs:
           create_latest=false
           source_ref="$GITHUB_SHA"
 
+          # Pre-GA policy: until the first stable (vX.Y.Z) tag exists, every
+          # prerelease (alpha/beta/rc) also moves `latest`, so users pulling
+          # `latest` get the newest test build. Once a stable tag is published
+          # this returns false and `latest` follows stable releases only.
+          prerelease_moves_latest() {
+            local stable_tags
+            stable_tags=$(git ls-remote --tags --refs origin 2>/dev/null \
+              | awk '{print $2}' \
+              | grep -E '^refs/tags/v?[0-9]+\.[0-9]+\.[0-9]+$' || true)
+            if [[ -z "$stable_tags" ]]; then
+              return 0
+            fi
+            echo "ℹ️  Stable release tag(s) already exist; prereleases no longer update latest"
+            return 1
+          }
+
           if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
             # Triggered by build workflow completion
             echo "🔗 Triggered by build workflow completion"
@@ -184,8 +200,8 @@ jobs:
                 if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
                   build_type="prerelease"
                   is_prerelease=true
-                  # Current policy: create latest tags for stable releases and selected prereleases (alpha/beta).
-                  if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]]; then
+                  # Pre-GA policy: prereleases update latest until the first stable tag exists.
+                  if prerelease_moves_latest; then
                     create_latest=true
                     echo "🧪 Building Docker image for prerelease: $version (creating latest tag)"
                   else
@@ -243,8 +259,8 @@ jobs:
               v*alpha*|v*beta*|v*rc*|*alpha*|*beta*|*rc*)
                 build_type="prerelease"
                 is_prerelease=true
-                # Current policy: create latest tags for stable releases and selected prereleases (alpha/beta).
-                if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]]; then
+                # Pre-GA policy: prereleases update latest until the first stable tag exists.
+                if prerelease_moves_latest; then
                   create_latest=true
                   echo "🧪 Building with prerelease version: $input_version (creating latest tag)"
                 else
@@ -394,11 +410,13 @@ jobs:
           TAG_BASE="${VERSION}${VARIANT_SUFFIX}"
           TAGS="${{ env.REGISTRY_DOCKERHUB }}:$TAG_BASE,${{ env.REGISTRY_GHCR }}:$TAG_BASE,${{ env.REGISTRY_QUAY }}:$TAG_BASE"
 
-          # Add channel tags for prereleases and latest for stable
+          # Add latest when requested (stable releases, and prereleases before GA)
           if [[ "$CREATE_LATEST" == "true" ]]; then
-            # Create latest tags for stable releases and selected prereleases when CREATE_LATEST=true.
             TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest${VARIANT_SUFFIX},${{ env.REGISTRY_GHCR }}:latest${VARIANT_SUFFIX},${{ env.REGISTRY_QUAY }}:latest${VARIANT_SUFFIX}"
-          elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
+          fi
+
+          # Always add the channel tag for prereleases, independent of latest
+          if [[ "$BUILD_TYPE" == "prerelease" ]]; then
             # Prerelease channel tags (alpha, beta, rc)
             if [[ "$VERSION" == *"alpha"* ]]; then
               CHANNEL="alpha"
@@ -555,7 +573,7 @@ jobs:
             "prerelease")
               echo "🧪 Prerelease Docker image has been built with ${VERSION} tags"
               echo "⚠️  This is a prerelease image - use with caution"
-              # Create latest tags for stable releases and selected prereleases when CREATE_LATEST=true.
+              # Prereleases move latest until the first stable tag exists (pre-GA policy).
               if [[ "$CREATE_LATEST" == "true" ]]; then
                 echo "🏷️  Latest tag has been created for prerelease: $VERSION"
               else

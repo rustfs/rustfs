@@ -93,6 +93,10 @@ pub const SUFFIX_TIER_SKIP_FV_ID: &str = "tier-skip-fvid";
 
 /// Per-target delete-marker version ids are stored one key per target ARN.
 pub const SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX: &str = "replication-delete-marker-version-";
+/// Per-target data-version ids, one key per target ARN: the version a
+/// replication target that mints its own ids assigned to this object version
+/// (rustfs/backlog#2340). Absent on targets that adopt the source id.
+pub const SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX: &str = "replication-target-version-";
 
 // On-demand migration provenance. Written by the migration write-back onto
 // every pulled object so operators and later tooling can tell a migrated
@@ -314,6 +318,17 @@ pub fn strip_internal_prefix_preserving_case(key: &str) -> Option<&str> {
 /// Reads the bounded per-target delete-marker version map in one metadata scan.
 /// The boolean is set when matching metadata is malformed or compatibility keys disagree.
 pub fn target_delete_marker_versions(map: &HashMap<String, String>) -> (HashMap<String, String>, bool) {
+    internal_versions_by_arn(map, SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX)
+}
+
+/// Reads the bounded per-target data-version ledger (the id each drifting
+/// target assigned to this object version) in one metadata scan. Same
+/// bounds and corruption reporting as [`target_delete_marker_versions`].
+pub fn replication_target_versions(map: &HashMap<String, String>) -> (HashMap<String, String>, bool) {
+    internal_versions_by_arn(map, SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX)
+}
+
+fn internal_versions_by_arn(map: &HashMap<String, String>, arn_prefix: &str) -> (HashMap<String, String>, bool) {
     const MAX_ENTRIES: usize = 1_000;
     const MAX_ARN_LEN: usize = 1_024;
     const MAX_VERSION_ID_LEN: usize = 1_024;
@@ -324,13 +339,13 @@ pub fn target_delete_marker_versions(map: &HashMap<String, String>) -> (HashMap<
         let Some(suffix) = strip_internal_prefix_preserving_case(key) else {
             continue;
         };
-        let Some(prefix) = suffix.get(..SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX.len()) else {
+        let Some(prefix) = suffix.get(..arn_prefix.len()) else {
             continue;
         };
-        if !prefix.eq_ignore_ascii_case(SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX) {
+        if !prefix.eq_ignore_ascii_case(arn_prefix) {
             continue;
         }
-        let arn = &suffix[SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX.len()..];
+        let arn = &suffix[arn_prefix.len()..];
         if !arn.starts_with("arn:") || arn.len() > MAX_ARN_LEN || value.is_empty() || value.len() > MAX_VERSION_ID_LEN {
             corrupt = true;
             continue;
@@ -700,6 +715,37 @@ mod tests {
         metadata.insert(format!("{MINIO_INTERNAL_PREFIX}{suffix}"), "other-version".to_string());
         let (versions, corrupt) = target_delete_marker_versions(&metadata);
         assert!(versions.is_empty());
+        assert!(corrupt);
+    }
+
+    #[test]
+    fn replication_target_versions_are_keyed_apart_from_delete_marker_versions() {
+        let arn = "arn:rustfs:replication::target";
+        let mut metadata = HashMap::new();
+        insert_str(
+            &mut metadata,
+            &format!("{SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX}{arn}"),
+            "data-version".to_string(),
+        );
+        insert_str(
+            &mut metadata,
+            &format!("{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}{arn}"),
+            "marker-version".to_string(),
+        );
+
+        let (data_versions, corrupt) = replication_target_versions(&metadata);
+        assert!(!corrupt);
+        assert_eq!(data_versions.get(arn).map(String::as_str), Some("data-version"));
+        let (marker_versions, corrupt) = target_delete_marker_versions(&metadata);
+        assert!(!corrupt);
+        assert_eq!(marker_versions.get(arn).map(String::as_str), Some("marker-version"));
+
+        metadata.insert(
+            format!("{MINIO_INTERNAL_PREFIX}{SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX}{arn}"),
+            "other-version".to_string(),
+        );
+        let (data_versions, corrupt) = replication_target_versions(&metadata);
+        assert!(data_versions.is_empty());
         assert!(corrupt);
     }
 

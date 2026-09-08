@@ -23,17 +23,59 @@ use s3s::S3ErrorCode;
 pub type Error = StorageError;
 pub type Result<T> = core::result::Result<T, Error>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolMetadataFailure {
+    ReadUnavailable,
+    RecoveryRequired,
+    TransactionUnknown,
+    FenceLost,
+}
+
+impl PoolMetadataFailure {
+    fn recovery_hint(self) -> &'static str {
+        match self {
+            Self::ReadUnavailable => "read unavailable; retry after the replicas are readable",
+            Self::TransactionUnknown => "writes remain blocked pending fenced transaction recovery",
+            Self::RecoveryRequired | Self::FenceLost => {
+                "writes remain blocked after a recovery-required replica state; restart after all replicas are readable and consistent, with compatible formats"
+            }
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadUnavailable => "read_unavailable",
+            Self::RecoveryRequired => "recovery_required",
+            Self::TransactionUnknown => "transaction_unknown",
+            Self::FenceLost => "fence_lost",
+        }
+    }
+}
+
+/// Local control-plane context. Keep the existing storage error wire codes;
+/// the HTTP boundary recognizes this typed source, not an error-message prefix.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{operation}: pool metadata {hint} ({reason}, {phase}): {detail}", hint = kind.recovery_hint(), reason = kind.as_str(), detail = source.as_ref().map(ToString::to_string).unwrap_or_default())]
+pub struct PoolMetadataError {
+    pub kind: PoolMetadataFailure,
+    pub operation: String,
+    pub phase: &'static str,
+    pub since: time::OffsetDateTime,
+    #[source]
+    pub source: Option<std::sync::Arc<StorageError>>,
+}
+
 /// Keeps high-cardinality diagnostic detail in the error source while making
 /// the rendered `io::Error` stable for quorum aggregation.
 #[derive(Debug)]
 struct StableIoContextError {
-    message: &'static str,
+    message: std::borrow::Cow<'static, str>,
     source: Box<dyn std::error::Error + Send + Sync>,
 }
 
 impl std::fmt::Display for StableIoContextError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.message)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -48,7 +90,7 @@ where
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     std::io::Error::other(StableIoContextError {
-        message,
+        message: message.into(),
         source: source.into(),
     })
 }
@@ -203,6 +245,19 @@ pub enum StorageError {
     NotFirstDisk,
     #[error("first disk wait")]
     FirstDiskWait,
+    #[error(
+        "unsupported pool expansion: an existing single-node single-drive (SNSD) deployment cannot be expanded in place (configured {configured_drives} drive endpoints); restart with the original single local path, or create a new multi-drive deployment and migrate data through S3"
+    )]
+    UnsupportedSnsdExpansion { configured_drives: usize },
+    #[error(
+        "pool topology mismatch: stored {stored_drives} drives with {stored_set_drive_count} drives per erasure set, configured {configured_drives} drives with {configured_set_drive_count} drives per erasure set; an existing pool's drive count and erasure set width cannot be changed in place; restore its original endpoints and RUSTFS_ERASURE_SET_DRIVE_COUNT setting; to expand a multi-drive deployment, append a new pool with at least 2 drive endpoints"
+    )]
+    PoolTopologyMismatch {
+        stored_drives: usize,
+        stored_set_drive_count: usize,
+        configured_drives: usize,
+        configured_set_drive_count: usize,
+    },
 
     // ── Operational ──────────────────────────────────────────────────
     #[error("Storage reached its minimum free drive threshold.")]
@@ -287,6 +342,22 @@ impl From<crate::erasure::coding::ErasureConstructionError> for StorageError {
 }
 
 impl StorageError {
+    pub fn pool_metadata_failure(&self) -> Option<&PoolMetadataError> {
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(self);
+        while let Some(error) = current {
+            if let Some(context) = error.downcast_ref::<PoolMetadataError>() {
+                return Some(context);
+            }
+            // io::Error::source skips its boxed context itself.
+            current = if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                io.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static))
+            } else {
+                error.source()
+            };
+        }
+        None
+    }
+
     pub fn other<E>(error: E) -> Self
     where
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -517,6 +588,7 @@ impl From<rustfs_filemeta::Error> for StorageError {
             rustfs_filemeta::Error::FileVersionNotFound => StorageError::FileVersionNotFound,
             rustfs_filemeta::Error::FileCorrupt => StorageError::FileCorrupt,
             rustfs_filemeta::Error::Unexpected => StorageError::Unexpected,
+            rustfs_filemeta::Error::MaxVersionsExceeded => StorageError::MaxVersionsExceeded,
             rustfs_filemeta::Error::Io(io_error) => io_error.into(),
             _ => StorageError::Io(std::io::Error::other(e)),
         }
@@ -535,7 +607,19 @@ impl PartialEq for StorageError {
 impl Clone for StorageError {
     fn clone(&self) -> Self {
         match self {
-            StorageError::Io(e) => StorageError::Io(std::io::Error::new(e.kind(), e.to_string())),
+            StorageError::Io(e) => {
+                if let Some(context) = self.pool_metadata_failure() {
+                    Self::Io(std::io::Error::new(
+                        e.kind(),
+                        StableIoContextError {
+                            message: e.to_string().into(),
+                            source: Box::new(context.clone()),
+                        },
+                    ))
+                } else {
+                    StorageError::Io(std::io::Error::new(e.kind(), e.to_string()))
+                }
+            }
             StorageError::FaultyDisk => StorageError::FaultyDisk,
             StorageError::DiskFull => StorageError::DiskFull,
             StorageError::VolumeNotFound => StorageError::VolumeNotFound,
@@ -629,6 +713,20 @@ impl Clone for StorageError {
             StorageError::ErasureWriteQuorum => StorageError::ErasureWriteQuorum,
             StorageError::NotFirstDisk => StorageError::NotFirstDisk,
             StorageError::FirstDiskWait => StorageError::FirstDiskWait,
+            StorageError::UnsupportedSnsdExpansion { configured_drives } => StorageError::UnsupportedSnsdExpansion {
+                configured_drives: *configured_drives,
+            },
+            StorageError::PoolTopologyMismatch {
+                stored_drives,
+                stored_set_drive_count,
+                configured_drives,
+                configured_set_drive_count,
+            } => StorageError::PoolTopologyMismatch {
+                stored_drives: *stored_drives,
+                stored_set_drive_count: *stored_set_drive_count,
+                configured_drives: *configured_drives,
+                configured_set_drive_count: *configured_set_drive_count,
+            },
             StorageError::TooManyOpenFiles => StorageError::TooManyOpenFiles,
             StorageError::NoHealRequired => StorageError::NoHealRequired,
             StorageError::Lock(e) => StorageError::Lock(e.clone()),
@@ -662,7 +760,8 @@ impl Clone for StorageError {
 }
 
 impl StorageError {
-    fn code(&self) -> StorageErrorCode {
+    /// Stable classification without error payloads or storage paths.
+    pub fn code(&self) -> StorageErrorCode {
         match self {
             StorageError::Io(_) => StorageErrorCode::Io,
             StorageError::FaultyDisk => StorageErrorCode::FaultyDisk,
@@ -735,6 +834,11 @@ impl StorageError {
             StorageError::ErasureWriteQuorum => StorageErrorCode::ErasureWriteQuorum,
             StorageError::NotFirstDisk => StorageErrorCode::NotFirstDisk,
             StorageError::FirstDiskWait => StorageErrorCode::FirstDiskWait,
+            // Topology diagnostics reuse the existing wire code; they are
+            // not disk errors and must retain their local identity for retry classification.
+            StorageError::UnsupportedSnsdExpansion { .. } | StorageError::PoolTopologyMismatch { .. } => {
+                StorageErrorCode::InvalidArgument
+            }
             StorageError::ConfigNotFound => StorageErrorCode::ConfigNotFound,
             StorageError::TooManyOpenFiles => StorageErrorCode::TooManyOpenFiles,
             StorageError::NoHealRequired => StorageErrorCode::NoHealRequired,
@@ -1214,6 +1318,29 @@ mod conversion_roundtrip_tests;
 mod tests {
     use super::*;
     use std::io::{Error as IoError, ErrorKind};
+
+    #[test]
+    fn startup_topology_errors_preserve_identity_and_guidance() {
+        for error in [
+            StorageError::UnsupportedSnsdExpansion { configured_drives: 4 },
+            StorageError::PoolTopologyMismatch {
+                stored_drives: 4,
+                stored_set_drive_count: 4,
+                configured_drives: 8,
+                configured_set_drive_count: 8,
+            },
+        ] {
+            let io_error: IoError = error.clone().into();
+            let restored = StorageError::from(io_error);
+            assert_eq!(std::mem::discriminant(&restored), std::mem::discriminant(&error));
+            assert_eq!(restored.to_string(), error.to_string());
+            assert_eq!(restored.code(), StorageErrorCode::InvalidArgument);
+            assert!(
+                restored.narrow_to_disk().is_err(),
+                "startup diagnostics must not become disk/quorum errors"
+            );
+        }
+    }
 
     #[test]
     fn other_preserves_erasure_construction_source_chain() {

@@ -62,6 +62,51 @@ pub fn record_contention_event() {
     counter!("rustfs_lock_contentions").increment(1);
 }
 
+/// Record a remote lock RPC that exceeded its caller's deadline.
+#[inline(always)]
+pub fn record_remote_lock_rpc_timeout(peer: &str, op: &'static str) {
+    use metrics::counter;
+    counter!("rustfs_remote_lock_rpc_timeouts_total", "peer" => peer.to_string(), "op" => op).increment(1);
+}
+
+/// Record the cached lock channel to `peer` being evicted after an RPC failure.
+#[inline(always)]
+pub fn record_remote_lock_channel_eviction(peer: &str, trigger: &'static str) {
+    use metrics::counter;
+    counter!("rustfs_remote_lock_channel_evictions_total", "peer" => peer.to_string(), "trigger" => trigger).increment(1);
+}
+
+/// Record an RPC failure that did not evict the cached lock channel to `peer`
+/// because the peer recently served a request or was re-dialed too recently.
+#[inline(always)]
+pub fn record_remote_lock_channel_eviction_suppressed(peer: &str, verdict: &'static str) {
+    use metrics::counter;
+    counter!("rustfs_remote_lock_channel_evictions_suppressed_total", "peer" => peer.to_string(), "verdict" => verdict)
+        .increment(1);
+}
+
+/// Record a timed-out lock RPC that was left running (`detached`) or cancelled
+/// because the per-peer detached budget was exhausted (`aborted`).
+#[inline(always)]
+pub fn record_remote_lock_rpc_detached(op: &'static str, outcome: &'static str) {
+    use metrics::counter;
+    counter!("rustfs_remote_lock_rpc_detached_total", "op" => op, "outcome" => outcome).increment(1);
+}
+
+/// Record how a detached lock RPC eventually ended.
+#[inline(always)]
+pub fn record_remote_lock_rpc_late_completion(op: &'static str, outcome: &'static str) {
+    use metrics::counter;
+    counter!("rustfs_remote_lock_rpc_late_completions_total", "op" => op, "outcome" => outcome).increment(1);
+}
+
+/// Record the release of a lock that was granted after its caller timed out.
+#[inline(always)]
+pub fn record_remote_lock_late_release(outcome: &'static str) {
+    use metrics::counter;
+    counter!("rustfs_remote_lock_late_releases_total", "outcome" => outcome).increment(1);
+}
+
 /// Record object namespace lock diagnostics being enabled.
 #[inline(always)]
 pub fn record_object_lock_diag_enabled(enabled: bool) {
@@ -183,6 +228,12 @@ mod tests {
             record_lock_hold_time(Duration::from_millis(100));
             record_early_release();
             record_contention_event();
+            record_remote_lock_rpc_timeout("http://peer:9000", "lock");
+            record_remote_lock_channel_eviction("http://peer:9000", "timeout");
+            record_remote_lock_channel_eviction_suppressed("http://peer:9000", "peer_recently_served");
+            record_remote_lock_rpc_detached("lock", "detached");
+            record_remote_lock_rpc_late_completion("lock", "success");
+            record_remote_lock_late_release("released");
         });
 
         let emitted: std::collections::HashSet<String> = snapshotter
@@ -199,6 +250,12 @@ mod tests {
             "rustfs_lock_hold_time_secs",
             "rustfs_lock_early_releases",
             "rustfs_lock_contentions",
+            "rustfs_remote_lock_rpc_timeouts_total",
+            "rustfs_remote_lock_channel_evictions_total",
+            "rustfs_remote_lock_channel_evictions_suppressed_total",
+            "rustfs_remote_lock_rpc_detached_total",
+            "rustfs_remote_lock_rpc_late_completions_total",
+            "rustfs_remote_lock_late_releases_total",
         ] {
             assert!(emitted.contains(expected), "{expected} must be emitted by its record helper");
         }

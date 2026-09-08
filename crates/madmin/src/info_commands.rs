@@ -188,6 +188,30 @@ pub enum BackendByte {
 pub struct StorageInfo {
     pub disks: Vec<Disk>,
     pub backend: BackendInfo,
+    /// Missing observations from older nodes are unknown, never proof of health.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<StorageInfoObservation>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageInfoProbeStatus {
+    Succeeded,
+    Failed,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StorageInfoObservation {
+    pub endpoint: String,
+    pub status: StorageInfoProbeStatus,
+    pub cached: bool,
+    pub last_success_unix_millis: Option<u64>,
+    pub snapshot_age_seconds: Option<u64>,
+    pub error_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -879,11 +903,46 @@ mod tests {
                 },
             ],
             backend: BackendInfo::default(),
+            ..Default::default()
         };
 
         assert_eq!(storage_info.disks.len(), 2);
         assert_eq!(storage_info.disks[0].endpoint, "node1:9000");
         assert_eq!(storage_info.disks[1].state, "offline");
+    }
+
+    #[test]
+    fn storage_info_observation_is_additive_and_unknown_for_old_peers() {
+        #[derive(Serialize, Deserialize)]
+        struct LegacyStorageInfo {
+            disks: Vec<Disk>,
+            backend: BackendInfo,
+        }
+        let old = LegacyStorageInfo {
+            disks: Vec::new(),
+            backend: BackendInfo::default(),
+        };
+        let encoded = rmp_serde::to_vec_named(&old).expect("legacy map");
+        let decoded: StorageInfo = rmp_serde::from_slice(&encoded).expect("old peer response");
+        assert!(decoded.observations.is_empty());
+        let mut new = decoded;
+        new.observations.push(StorageInfoObservation {
+            endpoint: "node2:9000".into(),
+            status: StorageInfoProbeStatus::Failed,
+            cached: true,
+            last_success_unix_millis: Some(1_700_000_000_000),
+            snapshot_age_seconds: Some(5),
+            error_code: Some("Timeout".into()),
+        });
+        let encoded = rmp_serde::to_vec_named(&new).expect("new map");
+        let legacy: LegacyStorageInfo = rmp_serde::from_slice(&encoded).expect("old reader ignores new fields");
+        assert!(legacy.disks.is_empty());
+        let roundtrip: StorageInfo = rmp_serde::from_slice(&encoded).expect("new reader preserves observation");
+        assert_eq!(roundtrip.observations, new.observations);
+        let unknown: StorageInfoObservation =
+            serde_json::from_str(r#"{"endpoint":"node2","status":"future_state"}"#).expect("future state remains unknown");
+        assert_eq!(unknown.status, StorageInfoProbeStatus::Unknown);
+        assert_eq!(unknown.snapshot_age_seconds, None);
     }
 
     #[test]
@@ -1391,6 +1450,7 @@ mod tests {
         let storage_info = StorageInfo {
             disks: vec![],
             backend: BackendInfo::default(),
+            ..Default::default()
         };
         let backend_info = BackendInfo::default();
         let mem_stats = MemStats::default();

@@ -12,10 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_api::error::contract::range::HTTPRangeError;
-use crate::storage_api::error::{QuotaError, StorageError};
+use crate::storage_api::error::contract::{StorageErrorCode, range::HTTPRangeError};
+use crate::storage_api::error::{PoolMetadataError, QuotaError, StorageError};
+use http::StatusCode;
 use rustfs_kms::KmsUnavailableError;
 use s3s::{S3Error, S3ErrorCode};
+
+const MAX_VERSIONS_EXCEEDED_CODE: &str = "MaxVersionsExceeded";
+const MAX_VERSIONS_EXCEEDED_MESSAGE: &str = "You've exceeded the limit on the number of versions you can create on this object";
+
+/// S3 error code for a request that names a KMS key the KMS does not hold.
+pub const KMS_KEY_NOT_FOUND_ERROR_CODE: &str = "KMS.NotFoundException";
+
+/// HTTP status of the error codes s3s cannot derive on its own.
+///
+/// s3s answers `None` for every `Custom` code, which the response layer turns
+/// into a 500; a code that means "your request named something that does not
+/// exist" has to say so itself.
+fn custom_error_status(code: &S3ErrorCode) -> Option<StatusCode> {
+    match code {
+        S3ErrorCode::Custom(custom) if &**custom == KMS_KEY_NOT_FOUND_ERROR_CODE || &**custom == MAX_VERSIONS_EXCEEDED_CODE => {
+            Some(StatusCode::BAD_REQUEST)
+        }
+        _ => None,
+    }
+}
 
 /// Marks a request body that exceeded a presigned upload size capability.
 ///
@@ -73,9 +94,71 @@ impl std::fmt::Display for ApiError {
     }
 }
 
-impl std::error::Error for ApiError {}
+impl std::error::Error for ApiError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_deref().map(|source| source as _)
+    }
+}
+
+/// Only bounded classifications are safe to include in routine diagnostics.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ApiErrorDiagnostic {
+    pub storage_code: Option<StorageErrorCode>,
+    pub io_kind: Option<std::io::ErrorKind>,
+    pub rpc_code: Option<tonic::Code>,
+    pub pool_metadata: Option<PoolMetadataDiagnostic>,
+    pub truncated: bool,
+}
+
+/// Safe projection of local metadata failure context, without operation text or sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PoolMetadataDiagnostic {
+    pub reason: &'static str,
+    pub phase: &'static str,
+    pub since_unix_secs: i64,
+}
+
+impl From<&PoolMetadataError> for PoolMetadataDiagnostic {
+    fn from(context: &PoolMetadataError) -> Self {
+        Self {
+            reason: context.kind.as_str(),
+            phase: context.phase,
+            since_unix_secs: context.since.unix_timestamp(),
+        }
+    }
+}
 
 impl ApiError {
+    pub(crate) fn diagnostic(&self) -> ApiErrorDiagnostic {
+        let mut diagnostic = ApiErrorDiagnostic::default();
+        let mut current = std::error::Error::source(self);
+        for _ in 0..16 {
+            let Some(error) = current else {
+                return diagnostic;
+            };
+            if let Some(storage) = error.downcast_ref::<StorageError>() {
+                diagnostic.storage_code = Some(storage.code());
+            }
+            if let Some(status) = error.downcast_ref::<tonic::Status>() {
+                diagnostic.rpc_code = Some(status.code());
+            }
+            if diagnostic.pool_metadata.is_none()
+                && let Some(context) = error.downcast_ref::<PoolMetadataError>()
+            {
+                diagnostic.pool_metadata = Some(context.into());
+            }
+            current = if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                diagnostic.io_kind = Some(io.kind());
+                // io::Error::source can skip the wrapped error itself.
+                io.get_ref().map(|source| source as &(dyn std::error::Error + 'static))
+            } else {
+                error.source()
+            };
+        }
+        diagnostic.truncated = current.is_some();
+        diagnostic
+    }
+
     /// Access-denied error with the exact message emitted by the authorization
     /// paths in `storage::access`; callers there match on the code only.
     pub fn access_denied() -> Self {
@@ -246,6 +329,9 @@ impl ApiError {
             S3ErrorCode::EvaluatorBindingDoesNotExist => "A column name or a path provided does not exist in the SQL expression".to_string(),
             S3ErrorCode::InvalidColumnIndex => "The column index is invalid. Please check the service documentation and try again.".to_string(),
             S3ErrorCode::UnsupportedFunction => "Encountered an unsupported SQL function.".to_string(),
+            S3ErrorCode::Custom(code) if &**code == MAX_VERSIONS_EXCEEDED_CODE => {
+                MAX_VERSIONS_EXCEEDED_MESSAGE.to_string()
+            }
             _ => code.as_str().to_string(),
         }
     }
@@ -323,7 +409,11 @@ fn error_chain_s3s_body_stream_error(err: &(dyn std::error::Error + 'static)) ->
 
 impl From<ApiError> for S3Error {
     fn from(err: ApiError) -> Self {
+        let status = custom_error_status(&err.code);
         let mut s3e = S3Error::with_message(err.code, err.message);
+        if let Some(status) = status {
+            s3e.set_status_code(status);
+        }
         if let Some(source) = err.source {
             s3e.set_source(source);
         }
@@ -333,6 +423,13 @@ impl From<ApiError> for S3Error {
 
 impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
+        if err.pool_metadata_failure().is_some() {
+            return ApiError {
+                code: S3ErrorCode::ServiceUnavailable,
+                message: ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
+                source: Some(Box::new(err)),
+            };
+        }
         if let StorageError::Io(ref io_err) = err
             && let Some(inner) = io_err.get_ref()
         {
@@ -387,6 +484,19 @@ impl From<StorageError> for ApiError {
                     source: Some(Box::new(err)),
                 };
             }
+
+            // A request header or bucket default naming a key the KMS does not
+            // hold is the caller's mistake to correct, and S3 reports it as
+            // 400 `KMS.NotFoundException`. Left to the fallthrough it became a
+            // 500 whose generic message hid which key was missing.
+            if let Some(rustfs_kms::KmsError::KeyNotFound { key_id }) = inner.downcast_ref::<rustfs_kms::KmsError>() {
+                let message = format!("KMS key not found: {key_id}");
+                return ApiError {
+                    code: S3ErrorCode::Custom(KMS_KEY_NOT_FOUND_ERROR_CODE.into()),
+                    message,
+                    source: Some(Box::new(err)),
+                };
+            }
         }
 
         let code = match &err {
@@ -410,6 +520,7 @@ impl From<StorageError> for ApiError {
             | StorageError::InsufficientWriteQuorum(_, _) => S3ErrorCode::ServiceUnavailable,
             StorageError::NamespaceLockQuorumUnavailable { .. } => S3ErrorCode::ServiceUnavailable,
             StorageError::QuotaExceeded { .. } => S3ErrorCode::InvalidRequest,
+            StorageError::MaxVersionsExceeded => S3ErrorCode::Custom(MAX_VERSIONS_EXCEEDED_CODE.into()),
             StorageError::Lock(_) => S3ErrorCode::ServiceUnavailable,
             StorageError::DecommissionNotStarted => S3ErrorCode::InvalidRequest,
             StorageError::DecommissionAlreadyRunning => S3ErrorCode::InvalidRequest,
@@ -440,7 +551,9 @@ impl From<StorageError> for ApiError {
 
         let message = if matches!(&err, StorageError::QuotaExceeded { .. }) {
             err.to_string()
-        } else if code == S3ErrorCode::InternalError && matches!(&err, StorageError::Io(_)) {
+        } else if matches!(&err, StorageError::MaxVersionsExceeded)
+            || (code == S3ErrorCode::InternalError && matches!(&err, StorageError::Io(_)))
+        {
             ApiError::error_code_to_message(&code)
         } else if code == S3ErrorCode::InternalError {
             err.to_string()
@@ -561,6 +674,51 @@ mod tests {
     use super::*;
     use s3s::{S3Error, S3ErrorCode};
     use std::io::{Error as IoError, ErrorKind};
+
+    #[test]
+    fn api_error_diagnostic_preserves_typed_cause_without_sensitive_payload() {
+        let error = ApiError::from(StorageError::Io(IoError::new(ErrorKind::TimedOut, "secret=do-not-log")));
+        let diagnostic = error.diagnostic();
+        assert_eq!(diagnostic.storage_code, Some(StorageErrorCode::Io));
+        assert_eq!(diagnostic.io_kind, Some(ErrorKind::TimedOut));
+        assert!(!diagnostic.truncated);
+        assert!(!format!("{diagnostic:?}").contains("do-not-log"));
+        assert!(std::error::Error::source(&error).is_some());
+
+        let error = ApiError::from(StorageError::Io(IoError::other(StorageError::ErasureWriteQuorum)));
+        assert_eq!(error.diagnostic().storage_code, Some(StorageErrorCode::ErasureWriteQuorum));
+
+        let mut status = tonic::Status::unavailable("secret RPC message");
+        status
+            .metadata_mut()
+            .insert("authorization", "secret-token".parse().expect("metadata value"));
+        let error = ApiError::from(StorageError::from(status));
+        assert_eq!(error.diagnostic().rpc_code, Some(tonic::Code::Unavailable));
+        assert!(!format!("{:?}", error.diagnostic()).contains("secret"));
+    }
+
+    #[test]
+    fn api_error_diagnostic_bounds_cyclic_error_chains() {
+        #[derive(Debug)]
+        struct Cycle;
+        impl std::fmt::Display for Cycle {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("secret cycle")
+            }
+        }
+        impl std::error::Error for Cycle {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(self)
+            }
+        }
+        let error = ApiError {
+            code: S3ErrorCode::InternalError,
+            message: "safe".into(),
+            source: Some(Box::new(Cycle)),
+        };
+        assert!(error.diagnostic().truncated);
+        assert!(!format!("{:?}", error.diagnostic()).contains("secret"));
+    }
 
     #[derive(Debug)]
     enum MockUploadStreamError {
@@ -849,6 +1007,67 @@ mod tests {
     }
 
     #[test]
+    fn pool_metadata_failures_map_to_503_and_preserve_typed_private_context() {
+        use crate::storage_api::error::{PoolMetadataError, PoolMetadataFailure};
+        let since = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed failure time");
+        for kind in [
+            PoolMetadataFailure::ReadUnavailable,
+            PoolMetadataFailure::RecoveryRequired,
+            PoolMetadataFailure::TransactionUnknown,
+            PoolMetadataFailure::FenceLost,
+        ] {
+            let error = StorageError::other(PoolMetadataError {
+                kind,
+                operation: "private operation path".to_owned(),
+                phase: "prepare_cas",
+                since,
+                source: Some(std::sync::Arc::new(StorageError::other("private disk failure"))),
+            });
+            let error = StorageError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, error));
+            let cloned = error.clone();
+            assert_eq!(cloned, error, "cloning must preserve the outer I/O kind and message");
+            assert_eq!(cloned.pool_metadata_failure().unwrap().kind, kind);
+            let api = ApiError::from(cloned);
+            assert_eq!(api.code, S3ErrorCode::ServiceUnavailable);
+            assert_eq!(api.message, "The service is unavailable. Please retry.");
+            assert!(!api.message.contains("private"));
+            let source = api.source.as_ref().unwrap().downcast_ref::<StorageError>().unwrap();
+            assert_eq!(source.pool_metadata_failure().unwrap().kind, kind);
+            let diagnostic = api.diagnostic();
+            assert_eq!(
+                diagnostic.pool_metadata,
+                Some(PoolMetadataDiagnostic {
+                    reason: kind.as_str(),
+                    phase: "prepare_cas",
+                    since_unix_secs: since.unix_timestamp(),
+                })
+            );
+            assert!(!diagnostic.truncated);
+            assert!(!format!("{diagnostic:?}").contains("private"));
+            assert_eq!(api.diagnostic(), diagnostic, "inspection must preserve the original failure time");
+        }
+    }
+
+    #[test]
+    fn test_kms_key_not_found_maps_to_bad_request_kms_not_found_exception() {
+        let api_error = ApiError::from(StorageError::other(rustfs_kms::KmsError::key_not_found("no-such-key")));
+
+        assert_eq!(api_error.code, S3ErrorCode::Custom(KMS_KEY_NOT_FOUND_ERROR_CODE.into()));
+        assert_eq!(api_error.message, "KMS key not found: no-such-key");
+
+        // s3s knows no status for a custom code; the conversion has to supply it.
+        let s3_error = S3Error::from(api_error);
+        assert_eq!(s3_error.status_code(), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn test_generated_error_codes_keep_their_own_status() {
+        let s3_error = S3Error::from(ApiError::from(StorageError::other(rustfs_kms::KmsError::backend_error("down"))));
+
+        assert_eq!(s3_error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
     fn test_unknown_authoritative_quota_usage_maps_to_retryable_error() {
         let api_error = ApiError::from(QuotaError::UsageUnavailable {
             bucket: "bucket".to_string(),
@@ -1071,6 +1290,19 @@ mod tests {
     }
 
     #[test]
+    fn max_versions_exceeded_maps_to_minio_compatible_s3_error() {
+        let api_error: ApiError = StorageError::MaxVersionsExceeded.into();
+
+        assert_eq!(api_error.code, S3ErrorCode::Custom(MAX_VERSIONS_EXCEEDED_CODE.into()));
+        assert_eq!(api_error.message, MAX_VERSIONS_EXCEEDED_MESSAGE);
+
+        let s3_error: S3Error = api_error.into();
+        assert_eq!(s3_error.code(), &S3ErrorCode::Custom(MAX_VERSIONS_EXCEEDED_CODE.into()));
+        assert_eq!(s3_error.message(), Some(MAX_VERSIONS_EXCEEDED_MESSAGE));
+        assert_eq!(s3_error.status_code(), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
     fn test_api_error_to_s3_error_without_source() {
         let api_error = ApiError {
             code: S3ErrorCode::InvalidArgument,
@@ -1158,8 +1390,12 @@ mod tests {
         // Test that it implements std::error::Error
         let error: &dyn std::error::Error = &api_error;
         assert_eq!(error.to_string(), "Test error");
-        // ApiError doesn't implement Error::source() properly, so this would be None
-        // This is expected because ApiError is not a typical Error implementation
-        assert!(error.source().is_none());
+        let source = error
+            .source()
+            .expect("typed source must remain reachable through the error trait");
+        let source = source.downcast_ref::<IoError>().expect("original I/O error");
+        assert_eq!(source.kind(), ErrorKind::Other);
+        assert_eq!(source.to_string(), "source error");
+        assert!(std::error::Error::source(&ApiError::access_denied()).is_none());
     }
 }

@@ -15,12 +15,13 @@
 use crate::{Error, Result};
 use async_trait::async_trait;
 use base64_simd::URL_SAFE_NO_PAD;
-use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
+use rustfs_heal_contracts::heal_channel::{DriveState, HealOpts, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
+use super::outcome::{HealObjectDisposition, HealObjectIdentity, HealObjectKind, HealObjectReceipt};
 use super::progress::stable_generation;
 use super::storage_api::owner::{EcstoreHealLifecycleExpiryContext, ecstore_load_admin_data_usage_from_backend_cached};
 use super::storage_api::storage::{
@@ -63,6 +64,23 @@ impl HealLifecycleExpiryContext {
     pub(crate) fn test() -> Self {
         Self {
             inner: HealLifecycleExpiryContextInner::Test,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct HealStorageObjectResult {
+    pub item: HealResultItem,
+    pub error: Option<Error>,
+    pub receipt: Option<HealObjectReceipt>,
+}
+
+impl From<(HealResultItem, Option<Error>)> for HealStorageObjectResult {
+    fn from((item, error): (HealResultItem, Option<Error>)) -> Self {
+        Self {
+            item,
+            error,
+            receipt: None,
         }
     }
 }
@@ -373,6 +391,16 @@ pub trait HealStorageAPI: Send + Sync {
         version_id: Option<&str>,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)>;
+
+    async fn heal_object_with_receipt(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        self.heal_object(bucket, object, version_id, opts).await.map(Into::into)
+    }
 
     /// Heal bucket using ecstore
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem>;
@@ -1060,6 +1088,50 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Err(Error::Storage(e))
             }
         }
+    }
+
+    async fn heal_object_with_receipt(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        opts: &HealOpts,
+    ) -> Result<HealStorageObjectResult> {
+        let (item, error) = self.heal_object(bucket, object, version_id, opts).await?;
+        let receipt = if error.is_none() && !opts.dry_run {
+            let ok_drive_state = DriveState::Ok.to_string();
+            let all_after_drives_ok = item.after.drives.iter().all(|drive| drive.state == ok_drive_state);
+            match (
+                self.ecstore.bucket_incarnation_id(bucket).await,
+                item.drives_reported(),
+                item.drives_healed(),
+                all_after_drives_ok,
+            ) {
+                (Ok(bucket_incarnation_id), Some(_), Some(drives_healed), true) => {
+                    let disposition = if drives_healed > 0 {
+                        HealObjectDisposition::Repaired
+                    } else {
+                        HealObjectDisposition::VerifiedHealthy
+                    };
+                    Some(HealObjectReceipt {
+                        identity: HealObjectIdentity {
+                            kind: HealObjectKind::Object,
+                            bucket: bucket.to_string(),
+                            object: object.to_string(),
+                            version_id: version_id.map(ToOwned::to_owned),
+                            bucket_incarnation_id: Some(bucket_incarnation_id),
+                            pool_index: opts.pool,
+                            set_index: opts.set,
+                        },
+                        disposition,
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Ok(HealStorageObjectResult { item, error, receipt })
     }
 
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {

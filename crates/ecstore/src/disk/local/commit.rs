@@ -17,13 +17,14 @@
 
 #[cfg(all(test, windows))]
 use super::run_destination_commit_directory_preparation;
+#[cfg(any(not(windows), test))]
+use super::should_fail_local_inline_rollback_hardlink;
 use super::{
     EVENT_DISK_LOCAL_ACCESS_FAILED, EVENT_DISK_LOCAL_HEAL_PURGE_FAILED, EVENT_DISK_LOCAL_RENAME_REJECTED, LOG_COMPONENT_ECSTORE,
     LOG_SUBSYSTEM_DISK_LOCAL, LocalDisk, SyncMode, effective_durability, inline_metadata_rollback_dir, observe_old_current_size,
     remove_dir_all_if_exists, remove_dst_base_before_commit, remove_file_if_exists, rename_data_versions_signature,
     run_inline_preparation_before_backup, should_fail_after_metadata_commit, should_fail_before_old_metadata_backup,
-    should_fail_commit_rename, should_fail_local_inline_rollback_hardlink, should_remove_staged_meta_before_commit,
-    skip_access_checks,
+    should_fail_commit_rename, should_remove_staged_meta_before_commit, skip_access_checks,
 };
 #[cfg(test)]
 use super::{run_inline_before_file_sync_admission, run_owned_file_write_before_open, run_rename_data_after_first_publication};
@@ -33,7 +34,7 @@ use crate::disk::{
     error::{DiskError, Result},
     error_conv::{to_access_error, to_file_error},
     os,
-    os::{check_path_length, rename_all},
+    os::check_path_length,
 };
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, FileMeta};
@@ -73,6 +74,8 @@ fn rollback_inline_metadata_commit_std(
     rollback_data_dir: Option<Uuid>,
     local_rollback_path: Option<&Path>,
 ) -> std::io::Result<()> {
+    #[cfg(all(test, not(windows)))]
+    os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Rollback, dst_file_path);
     if let Some(backup_path) = local_rollback_path {
         // The commit immediately before this rollback renamed the staged
         // xl.meta from the same directory as `backup_path` onto
@@ -86,6 +89,7 @@ fn rollback_inline_metadata_commit_std(
     Ok(())
 }
 
+#[cfg(any(not(windows), test))]
 pub(super) fn create_local_inline_rollback_backup(
     dst_file_path: &Path,
     staging_file_path: &Path,
@@ -231,6 +235,12 @@ async fn restore_published_data_source(
 #[derive(Debug)]
 pub(in crate::disk) struct LocalRenamePreflightRejection(());
 
+#[derive(Default)]
+pub(super) struct RenameDataState {
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+    preflight_rejection: Option<LocalRenamePreflightRejection>,
+}
+
 impl LocalDisk {
     #[tracing::instrument(name = "rename_data", target = "rustfs_ecstore::disk::local", level = "trace", skip_all)]
     pub(super) async fn rename_data_inner(
@@ -240,7 +250,7 @@ impl LocalDisk {
         fi: FileInfo,
         dst_volume: &str,
         dst_path: &str,
-        preflight_rejection: &mut Option<LocalRenamePreflightRejection>,
+        state: &mut RenameDataState,
     ) -> Result<RenameDataResp> {
         crate::hp_guard!("LocalDisk::rename_data");
         let mut fi = fi;
@@ -269,7 +279,13 @@ impl LocalDisk {
             Some(token) => Some(self.claim_quota_mutation_fence(dst_volume, dst_path, token).await?),
             None => None,
         };
-        let mutation_lease = os::acquire_rename_data_mutation_lease(&self.root, dst_volume, &destination_object_path).await;
+        let mutation_lease = os::acquire_rename_data_mutation_lease_with_owner(
+            &self.root,
+            dst_volume,
+            &destination_object_path,
+            state.namespace_owner.take(),
+        )
+        .await;
         if let Some(claim) = quota_fence_claim {
             mutation_lease.attach_external_guard(claim);
         }
@@ -302,7 +318,7 @@ impl LocalDisk {
                 error = %e,
                 "Disk local access check failed"
             );
-            *preflight_rejection = Some(LocalRenamePreflightRejection(()));
+            state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
@@ -320,7 +336,7 @@ impl LocalDisk {
                 error = %e,
                 "Disk local access check failed"
             );
-            *preflight_rejection = Some(LocalRenamePreflightRejection(()));
+            state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
@@ -528,7 +544,9 @@ impl LocalDisk {
             // rename below.
             if fi_healing
                 && let Some((_, dst_data_path)) = has_data_dir_path.as_ref()
-                && let Err(err) = self.move_to_trash(dst_data_path, true, false).await
+                && let Err(err) = self
+                    .move_to_trash_with_namespace_owner(dst_data_path, true, false, Some(mutation_lease.clone()))
+                    .await
             {
                 warn!(
                     target: "rustfs_ecstore::disk::local",
@@ -755,7 +773,7 @@ impl LocalDisk {
                 && let Some(parent) = dst_file_path.parent()
             {
                 let fsync_started = rustfs_io_metrics::put_stage_timer();
-                if let Err(err) = os::fsync_dst_dir_group_commit(parent).await {
+                if let Err(err) = os::fsync_dst_dir_group_commit(parent, Some(mutation_lease.clone())).await {
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
                         fsync_started,
@@ -793,7 +811,7 @@ impl LocalDisk {
                         break;
                     }
                     let fsync_started = rustfs_io_metrics::put_stage_timer();
-                    if let Err(err) = os::fsync_dir(dir).await {
+                    if let Err(err) = os::fsync_dir_with_owner(dir, Some(mutation_lease.clone())).await {
                         rustfs_io_metrics::record_put_object_stage_duration_from(
                             rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
                             fsync_started,
@@ -1024,7 +1042,15 @@ impl LocalDisk {
                 // rename_all acquires the backup path's namespace lease. Do not
                 // hold a disk admission while acquiring another namespace lock.
                 drop(file_sync_admission.take());
-                if let Err(err) = rename_all(staged_backup, &backup_path, &dst_volume_dir, &self.publication_root).await {
+                if let Err(err) = os::rename_all_with_owner(
+                    staged_backup,
+                    &backup_path,
+                    &dst_volume_dir,
+                    &self.publication_root,
+                    Some(mutation_lease.clone()),
+                )
+                .await
+                {
                     let _ = remove_file_if_exists(staged_backup);
                     return Err(err);
                 }
@@ -1220,14 +1246,18 @@ impl LocalDisk {
         fi: &FileInfo,
         dst_volume: &str,
         dst_path: &str,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> super::super::RenameDataObservation {
-        let mut preflight_rejection = None;
+        let mut state = RenameDataState {
+            namespace_owner,
+            ..Default::default()
+        };
         let result = self
-            .rename_data_inner(src_volume, src_path, fi.clone(), dst_volume, dst_path, &mut preflight_rejection)
+            .rename_data_inner(src_volume, src_path, fi.clone(), dst_volume, dst_path, &mut state)
             .await;
         super::super::RenameDataObservation {
             result,
-            preflight_rejection,
+            preflight_rejection: state.preflight_rejection,
         }
     }
 }

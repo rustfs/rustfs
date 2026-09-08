@@ -187,7 +187,7 @@ values = {}
 for element in root.iter():
     values[element.tag.rsplit("}", 1)[-1]] = element.text or ""
 for field in ("AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration", "SubjectFromWebIdentityToken"):
-    assert values.get(field), values
+    assert values.get(field), f"missing required STS field: {field}"
 print("\t".join(values[field] for field in ("AccessKeyId", "SecretAccessKey", "SessionToken")))
 PY
 )
@@ -218,7 +218,6 @@ TAMPERED_STATUS="$(curl --noproxy '*' -sS \
   --data-urlencode DurationSeconds=900 \
   --data-urlencode "WebIdentityToken=${TAMPERED_TOKEN}")"
 [[ "${TAMPERED_STATUS}" == 403 ]] || {
-  cat "${WORK_DIR}/sts-tampered.xml" >&2
   echo "expected tampered token to return HTTP 403, got ${TAMPERED_STATUS}" >&2
   exit 1
 }
@@ -235,7 +234,6 @@ BAD_STATUS="$(curl --noproxy '*' -sS \
   --data-urlencode DurationSeconds=900 \
   --data-urlencode "WebIdentityToken=${BAD_TOKEN}")"
 [[ "${BAD_STATUS}" == 403 ]] || {
-  cat "${WORK_DIR}/sts-bad.xml" >&2
   echo "expected wrong-audience token to return HTTP 403, got ${BAD_STATUS}" >&2
   exit 1
 }

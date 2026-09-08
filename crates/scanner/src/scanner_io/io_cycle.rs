@@ -72,6 +72,11 @@ where
         scan_mode,
         scan_scope: ScannerBucketScanScope::default(),
         persisted_usage_baseline: None,
+        observed_usage_candidate: None,
+        requires_full_scan: true,
+        service_cohort: None,
+        #[cfg(test)]
+        resolved_scope_observer: None,
     };
     nsscanner_with_storage_status_scoped(store, request).await
 }
@@ -85,44 +90,79 @@ pub(crate) struct ScannerCycleRequest {
     pub(crate) scan_mode: HealScanMode,
     pub(crate) scan_scope: ScannerBucketScanScope,
     pub(crate) persisted_usage_baseline: Option<Bytes>,
+    pub(crate) observed_usage_candidate: Option<Bytes>,
+    /// Scheduled maintenance must visit clean buckets even with a valid dirty scope.
+    pub(crate) requires_full_scan: bool,
+    pub(crate) service_cohort: Option<Arc<StdMutex<ScannerServiceCohort>>>,
+    #[cfg(test)]
+    pub(crate) resolved_scope_observer: Option<tokio::sync::oneshot::Sender<ScannerBucketScanScope>>,
 }
 
-struct ScannerBucketScopeResolution<'a> {
-    requested_scope: ScannerBucketScanScope,
-    baseline_proof: ScannerCacheBaselineProof<'a>,
-    activity_before: &'a crate::scanner::ScannerActivitySnapshot,
-    dirty_usage_snapshot: &'a DirtyUsageSnapshot,
-    all_buckets: &'a [BucketInfo],
+pub(super) struct ScannerBucketScopeResolution<'a> {
+    pub(super) requested_scope: ScannerBucketScanScope,
+    pub(super) baseline_proof: ScannerCacheBaselineProof<'a>,
+    pub(super) activity_before: &'a crate::scanner::ScannerActivitySnapshot,
+    pub(super) dirty_usage_snapshot: &'a DirtyUsageSnapshot,
+    pub(super) all_buckets: &'a [BucketInfo],
+    pub(super) requires_full_scan: bool,
+    #[cfg(test)]
+    pub(super) test_peer_snapshots: Option<Vec<(String, crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot)>>,
+    #[cfg(test)]
+    pub(super) test_scoped_dirty_usage_capability: Option<bool>,
 }
 
 async fn resolve_scanner_bucket_scan_scope<S>(
     store: &S,
     distributed: bool,
     resolution: ScannerBucketScopeResolution<'_>,
-) -> ScannerBucketScanScope
+) -> ScannerBucketScopeResolutionResult
 where
     S: ScannerStorage,
 {
+    let default_result = |scope: ScannerBucketScanScope| ScannerBucketScopeResolutionResult {
+        scope,
+        remote_dirty_usage_acknowledgements: Vec::new(),
+    };
+    if resolution.requires_full_scan {
+        return default_result(ScannerBucketScanScope::default());
+    }
     if !resolution.requested_scope.is_default()
         || !resolution.dirty_usage_snapshot.covers_all_pending
         || resolution.dirty_usage_snapshot.generation == u64::MAX
         || resolution.dirty_usage_snapshot.buckets.len() > crate::SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES
     {
-        return resolution.requested_scope;
+        return default_result(resolution.requested_scope);
     }
 
-    let mut dirty_buckets = resolution
+    let dirty_buckets = resolution
         .dirty_usage_snapshot
         .buckets
         .keys()
         .cloned()
         .collect::<HashSet<_>>();
     if distributed {
-        let Some(notification_system) = store.scanner_notification_system() else {
-            return resolution.requested_scope;
+        let notification_system = store.scanner_notification_system();
+        #[cfg(test)]
+        let peer_snapshots = if let Some(peer_snapshots) = resolution.test_peer_snapshots.clone() {
+            peer_snapshots
+        } else {
+            let Some(notification_system) = notification_system.as_ref() else {
+                return default_result(resolution.requested_scope);
+            };
+            let Ok(peer_snapshots) = notification_system.scanner_dirty_usage_snapshots().await else {
+                return default_result(resolution.requested_scope);
+            };
+            peer_snapshots
         };
-        let Ok(peer_snapshots) = notification_system.scanner_dirty_usage_snapshots().await else {
-            return resolution.requested_scope;
+        #[cfg(not(test))]
+        let peer_snapshots = {
+            let Some(notification_system) = notification_system.as_ref() else {
+                return default_result(resolution.requested_scope);
+            };
+            let Ok(peer_snapshots) = notification_system.scanner_dirty_usage_snapshots().await else {
+                return default_result(resolution.requested_scope);
+            };
+            peer_snapshots
         };
         let mut expected_peers = HashMap::new();
         for (host, lease_instance_id, _) in crate::scanner::scanner_activity_publication_lease_targets(resolution.activity_before)
@@ -130,10 +170,10 @@ where
             let Some((activity_instance_id, generation, pending)) =
                 crate::scanner::scanner_activity_dirty_usage_state_for_host(resolution.activity_before, &host)
             else {
-                return resolution.requested_scope;
+                return default_result(resolution.requested_scope);
             };
             if activity_instance_id != lease_instance_id || expected_peers.contains_key(&host) {
-                return resolution.requested_scope;
+                return default_result(resolution.requested_scope);
             }
             expected_peers.insert(
                 host,
@@ -144,19 +184,83 @@ where
                 },
             );
         }
-        let Some(remote_dirty_buckets) = verified_remote_dirty_usage_buckets(&expected_peers, peer_snapshots) else {
-            return resolution.requested_scope;
+        let Some(remote_dirty_usage) = verified_remote_dirty_usage(&expected_peers, peer_snapshots) else {
+            return default_result(resolution.requested_scope);
         };
-        dirty_buckets.extend(remote_dirty_buckets);
+        let remote_resolution = resolve_remote_dirty_usage_scope(
+            resolution.requested_scope,
+            dirty_buckets,
+            remote_dirty_usage,
+            resolution.all_buckets,
+            resolution.baseline_proof,
+        );
+        if !remote_resolution.remote_dirty_usage_acknowledgements.is_empty() {
+            #[cfg(test)]
+            let capability_supported = if let Some(capability_supported) = resolution.test_scoped_dirty_usage_capability {
+                capability_supported
+            } else {
+                let Some(notification_system) = notification_system.as_ref() else {
+                    return default_result(ScannerBucketScanScope::default());
+                };
+                let capability_acknowledgements = remote_resolution
+                    .remote_dirty_usage_acknowledgements
+                    .clone()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect::<Vec<crate::storage_api::EcstoreScannerDirtyUsageAcknowledgement>>();
+                matches!(
+                    notification_system
+                        .scanner_scoped_dirty_usage_capabilities(capability_acknowledgements)
+                        .await,
+                    Ok(true)
+                )
+            };
+            #[cfg(not(test))]
+            let capability_supported = {
+                let Some(notification_system) = notification_system.as_ref() else {
+                    return default_result(ScannerBucketScanScope::default());
+                };
+                let capability_acknowledgements = remote_resolution
+                    .remote_dirty_usage_acknowledgements
+                    .clone()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect::<Vec<crate::storage_api::EcstoreScannerDirtyUsageAcknowledgement>>();
+                matches!(
+                    notification_system
+                        .scanner_scoped_dirty_usage_capabilities(capability_acknowledgements)
+                        .await,
+                    Ok(true)
+                )
+            };
+            if !capability_supported {
+                return default_result(ScannerBucketScanScope::default());
+            }
+        }
+        return remote_resolution;
     }
 
-    scoped_scan_scope_from_dirty_buckets(
+    default_result(scoped_scan_scope_from_dirty_buckets(
         resolution.requested_scope,
         dirty_buckets,
+        (!distributed).then_some(resolution.dirty_usage_snapshot.scopes.as_ref()),
         true,
+        scanner_segment_reuse_activated(),
         resolution.all_buckets,
         resolution.baseline_proof,
-    )
+    ))
+}
+
+#[cfg(test)]
+pub(super) async fn resolve_scanner_bucket_scan_scope_for_tests<S>(
+    store: &S,
+    distributed: bool,
+    resolution: ScannerBucketScopeResolution<'_>,
+) -> ScannerBucketScopeResolutionResult
+where
+    S: ScannerStorage,
+{
+    resolve_scanner_bucket_scan_scope(store, distributed, resolution).await
 }
 
 pub(crate) async fn nsscanner_with_storage_status_scoped<S>(store: &S, request: ScannerCycleRequest) -> Result<ScannerCycleResult>
@@ -172,6 +276,11 @@ where
         scan_mode,
         scan_scope,
         persisted_usage_baseline,
+        observed_usage_candidate,
+        requires_full_scan,
+        service_cohort,
+        #[cfg(test)]
+        resolved_scope_observer,
     } = request;
     let child_token = ctx.child_token();
     let _tier_cycle_guard = begin_tier_registry_cycle(want_cycle, leader_epoch);
@@ -180,7 +289,7 @@ where
     // canceled decommission remains suspended after its worker exits, so
     // starting a scan in that state could build a snapshot that cannot be
     // routed to the authoritative metadata object.
-    if store.scanner_data_usage_publication_blocked().await {
+    if store.scanner_data_movement_pause_status().await.paused {
         debug!(
             target: "rustfs::scanner::io",
             event = EVENT_SCANNER_SET_STATE,
@@ -260,27 +369,50 @@ where
         }
     }
     bucket_plan_complete &= buckets_by_source.keys().copied().collect::<HashSet<_>>() == *expected_sources;
-    let scan_plan_digest =
+    bucket_plan_complete &= scanner_bucket_inventory_is_complete(&all_buckets, &buckets_by_source);
+    if bucket_plan_complete && let Some(cohort) = &service_cohort {
+        cohort
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .refresh(&buckets_by_source);
+    }
+    let structural_scan_plan_digest =
         scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_structural_digest(&activity_before));
+    let scan_plan_digest = scanner_bucket_work_digest(structural_scan_plan_digest, scan_mode, requires_full_scan);
+    let activity_digest = crate::scanner::scanner_activity_snapshot_digest(&activity_before);
+    let bucket_coverage_digest = scanner_bucket_plan_digest(&all_buckets, activity_digest);
+    let execution_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
     let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets(&all_buckets, dirty_generation_before_bucket_list));
-    let scan_scope = resolve_scanner_bucket_scan_scope(
+    let scope_resolution = resolve_scanner_bucket_scan_scope(
         store,
         distributed,
         ScannerBucketScopeResolution {
             requested_scope: scan_scope,
             baseline_proof: ScannerCacheBaselineProof {
-                data: persisted_usage_baseline.as_ref(),
+                authoritative_data: persisted_usage_baseline.as_ref(),
+                observed_candidate_data: observed_usage_candidate.as_ref(),
                 expected_sources: &expected_sources,
                 leader_epoch,
                 want_cycle,
-                scan_plan_digest,
+                scan_plan_digest: structural_scan_plan_digest,
             },
             activity_before: &activity_before,
             dirty_usage_snapshot: &dirty_usage_snapshot,
             all_buckets: &all_buckets,
+            requires_full_scan: requires_full_scan || scan_mode == HealScanMode::Deep,
+            #[cfg(test)]
+            test_peer_snapshots: None,
+            #[cfg(test)]
+            test_scoped_dirty_usage_capability: None,
         },
     )
     .await;
+    let remote_dirty_usage_acknowledgements = scope_resolution.remote_dirty_usage_acknowledgements;
+    let scan_scope = scope_resolution.scope;
+    #[cfg(test)]
+    if let Some(observer) = resolved_scope_observer {
+        let _ = observer.send(scan_scope.clone());
+    }
     let cache_cycle_floor = Arc::new(AtomicU64::new(want_cycle));
     let tier_registry = runtime_tier_registry_for_cycle(want_cycle, leader_epoch).await;
     let tier_registry_generation = tier_registry.generation;
@@ -301,12 +433,21 @@ where
             dirty_usage_status,
             activity_status,
         );
-        let empty_usage = DataUsageInfo {
-            last_update: Some(SystemTime::now()),
-            scanner_cycle: Some(want_cycle),
-            usage_snapshot_complete: true,
-            ..Default::default()
+        let Some(candidate) = empty_namespace_usage_candidate(
+            &all_buckets,
+            &expected_sources,
+            &buckets_by_source,
+            ScannerSnapshotIdentity {
+                cycle: want_cycle,
+                leader_epoch,
+                plan_digest: scan_plan_digest,
+                coverage_digest: bucket_coverage_digest,
+                tier_registry_generation: Some(tier_registry_generation),
+            },
+        ) else {
+            return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_publication_epoch(publication_epoch));
         };
+        let (empty_usage, publication_expectation) = candidate.prepare(status);
         let observational_snapshot_published = if should_publish_observational_snapshot(status) {
             publish_observational_snapshot(&updates, empty_usage).await?
         } else {
@@ -326,9 +467,11 @@ where
         };
         return Ok(ScannerCycleResult::new(status, dirty_usage_clear)
             .with_publication_epoch(publication_epoch)
+            .with_activity_digest(activity_digest)
             .with_observational_snapshot_published(observational_snapshot_published)
             .with_remote_publication_lease_targets(remote_publication_lease_targets)
-            .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements));
+            .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
+            .with_publication_expectation(publication_expectation));
     }
 
     let total_results = expected_sources.len();
@@ -374,7 +517,32 @@ where
     let first_err_mutex: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
     let mut wait_futs = Vec::new();
 
-    for (results_index, set) in set_disks.iter().enumerate() {
+    let set_order = service_cohort.as_ref().map_or_else(
+        || (0..set_disks.len()).collect::<Vec<_>>(),
+        |cohort| {
+            cohort
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .order_set_indices(&set_disks)
+        },
+    );
+    for results_index in set_order {
+        let set = &set_disks[results_index];
+        // Acquire in dispatch order, not in independently scheduled tasks.
+        // A whole set still shares the existing parent budget; this is not
+        // a per-bucket quantum or a cross-source completion guarantee.
+        let permit_wait_start = Instant::now();
+        let permit = tokio::select! {
+            biased;
+            _ = child_token.cancelled() => break,
+            permit = set_scan_semaphore.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+        };
+        if child_token.is_cancelled() || budget.budget_elapsed() {
+            break;
+        }
         let results_index_clone = results_index;
         // Clone the Arc to move it into the spawned task
         let set_clone: Arc<SetDisks> = Arc::clone(set);
@@ -389,7 +557,6 @@ where
         let scan_mode_clone = scan_mode;
         let results_mutex_clone = results_mutex.clone();
         let first_err_mutex_clone = first_err_mutex.clone();
-        let set_scan_semaphore_clone = set_scan_semaphore.clone();
         let queued_set_scans_clone = queued_set_scans.clone();
         let active_set_scans_clone = active_set_scans.clone();
 
@@ -409,7 +576,11 @@ where
             buckets: set_buckets,
             all_buckets: Arc::clone(&all_buckets),
             scope: scan_scope.clone(),
-            digest: scan_plan_digest,
+            digest: structural_scan_plan_digest,
+            bucket_coverage_digest,
+            requires_full_scan,
+            service_cohort: service_cohort.clone(),
+            execution_digest,
             leader_epoch,
             tier_registry_generation,
             publication_epoch,
@@ -420,15 +591,10 @@ where
         };
         // Spawn task to run the scanner
         let scanner_fut = tokio::spawn(async move {
-            let permit_wait = child_token_clone.clone();
-            let permit_wait_start = Instant::now();
-            let _permit = tokio::select! {
-                permit = set_scan_semaphore_clone.acquire_owned() => match permit {
-                    Ok(permit) => permit,
-                    Err(_) => return,
-                },
-                _ = permit_wait.cancelled() => return,
-            };
+            let _permit = permit;
+            if child_token_clone.is_cancelled() || budget_clone.budget_elapsed() {
+                return;
+            }
             metrics::histogram!(
                 METRIC_SCANNER_SET_SCAN_WAIT_SECONDS,
                 "pool" => pool_label.clone(),
@@ -534,10 +700,19 @@ where
     let (activity_status, remote_publication_lease_targets) =
         scanner_cycle_activity_status(store, distributed, &activity_before).await;
     let all_bucket_names = all_buckets.iter().map(|bucket| bucket.name.clone()).collect::<Vec<_>>();
-    let completed_usage = completed_data_usage_info(
+    let completed_usage = completed_usage_candidate(
         &results,
-        &expected_sources,
-        &all_bucket_names,
+        &ScannerSnapshotScope {
+            sources: &expected_sources,
+            buckets: &all_bucket_names,
+            identity: ScannerSnapshotIdentity {
+                cycle: want_cycle,
+                leader_epoch,
+                plan_digest: scan_plan_digest,
+                coverage_digest: bucket_coverage_digest,
+                tier_registry_generation: Some(tier_registry_generation),
+            },
+        },
         &tier_registry.names,
         bucket_plan_complete,
         budget_elapsed,
@@ -566,7 +741,10 @@ where
         dirty_usage_status,
         activity_status,
     );
-    let observational_snapshot_published = if let Some((data_usage_info, _)) = completed_usage {
+    let mut publication_expectation = None;
+    let observational_snapshot_published = if let Some(candidate) = completed_usage {
+        let (data_usage_info, expectation) = candidate.prepare(cycle_status);
+        publication_expectation = expectation;
         if should_publish_observational_snapshot(cycle_status) {
             publish_observational_snapshot(&updates, data_usage_info).await?
         } else {
@@ -591,17 +769,22 @@ where
     if cycle_status == ScannerCycleStatus::Complete {
         complete_tier_registry_cycle(want_cycle, leader_epoch);
     }
-    let remote_dirty_usage_acknowledgements = if cycle_status == ScannerCycleStatus::Complete {
-        crate::scanner::scanner_dirty_usage_acknowledgements(&activity_before)
-    } else {
-        Vec::new()
-    };
+    let remote_dirty_usage_acknowledgements =
+        if cycle_status == ScannerCycleStatus::Complete && !remote_dirty_usage_acknowledgements.is_empty() {
+            remote_dirty_usage_acknowledgements
+        } else if cycle_status == ScannerCycleStatus::Complete && scan_scope.is_default() {
+            crate::scanner::scanner_dirty_usage_acknowledgements(&activity_before)
+        } else {
+            Vec::new()
+        };
     Ok(ScannerCycleResult::new(cycle_status, dirty_usage_clear)
         .with_publication_epoch(publication_epoch)
+        .with_activity_digest(activity_digest)
         .with_observational_snapshot_published(observational_snapshot_published)
         .with_remote_publication_lease_targets(remote_publication_lease_targets)
         .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
         .with_failed_dirty_usage(!failed_buckets.is_empty())
         .with_pending_maintenance_work(pending_maintenance_work)
-        .with_required_cycle_floor(required_cycle_floor))
+        .with_required_cycle_floor(required_cycle_floor)
+        .with_publication_expectation(publication_expectation))
 }

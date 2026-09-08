@@ -18,6 +18,7 @@ use super::*;
 
 use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, parse_presigned_put_max_content_length};
 use crate::error::UploadLimitExceeded;
+static PUT_FAILURE_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
 
 const DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES: i64 = 32 * 1024 * 1024;
 
@@ -949,7 +950,12 @@ pub(super) enum PutObjectOrigin<'a> {
     /// request and no credential: managed-SSE authorization treats the write
     /// as internal, and the creation event, when requested, names
     /// `principal_id` instead of an access key.
-    Internal { principal_id: &'static str, emit_events: bool },
+    Internal {
+        principal_id: &'static str,
+        emit_events: bool,
+        preserve_delete_marker: bool,
+        expected_bucket_incarnation_id: Option<Uuid>,
+    },
 }
 
 impl PutObjectOrigin<'_> {
@@ -963,7 +969,13 @@ impl PutObjectOrigin<'_> {
     fn apply_bucket_generation_guard(&self, bucket: &str, opts: &mut ObjectOptions) -> S3Result<()> {
         match self {
             Self::S3 { req, .. } => apply_bucket_generation_guard(req, bucket, opts),
-            Self::Internal { .. } => Ok(()),
+            Self::Internal {
+                expected_bucket_incarnation_id,
+                ..
+            } => {
+                opts.expected_bucket_incarnation_id = *expected_bucket_incarnation_id;
+                Ok(())
+            }
         }
     }
 
@@ -1603,6 +1615,12 @@ impl DefaultObjectUsecase {
         if let Some(etag) = preserve_etag {
             opts.preserve_etag = Some(etag);
         }
+        if let PutObjectOrigin::Internal {
+            preserve_delete_marker, ..
+        } = &origin
+        {
+            opts.preserve_delete_marker = *preserve_delete_marker;
+        }
         if let Some(quota_check) = quota_check.as_ref() {
             apply_quota_admission(&mut opts, quota_check)?;
         }
@@ -1664,7 +1682,16 @@ impl DefaultObjectUsecase {
         };
         rustfs_io_metrics::record_put_object_stage_duration_from("app_prelookup", prelookup_stage_start);
 
-        let actual_size = size;
+        // A compressed SSE-C passthrough body is the source's stored bytes:
+        // its logical length is the plaintext size restored from the
+        // transport headers (backlog#2363). The body itself is still read
+        // at its wire size.
+        let body_size = size;
+        let actual_size = if ciphertext_passthrough {
+            passthrough_compressed_actual_size(&opts.user_defined).unwrap_or(size)
+        } else {
+            size
+        };
         if !ciphertext_passthrough && let Some(quota_check) = quota_check.as_ref() {
             ensure_object_size_within_quota(
                 quota_check,
@@ -1716,17 +1743,17 @@ impl DefaultObjectUsecase {
         } else {
             if use_zero_copy_eager_put_path {
                 let zero_copy_start = std::time::Instant::now();
-                let eager_body = read_zero_copy_put_body_exact(body, actual_size as usize).await?;
-                rustfs_io_metrics::record_zero_copy_write(actual_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
+                let eager_body = read_zero_copy_put_body_exact(body, body_size as usize).await?;
+                rustfs_io_metrics::record_zero_copy_write(body_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
                 HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
             } else if use_empty_or_small_eager_put_path {
-                if (actual_size as usize) <= POOL_BYPASS_MAX_SIZE {
+                if (body_size as usize) <= POOL_BYPASS_MAX_SIZE {
                     // Bypass BytesPool for very small objects to avoid Small-tier
                     // Mutex contention under high concurrency. Direct allocation
                     // for ≤4KiB is negligible cost.
                     let eager_body = read_small_put_body_exact_direct(
                         StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
-                        actual_size as usize,
+                        body_size as usize,
                     )
                     .await?;
                     HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
@@ -1734,11 +1761,11 @@ impl DefaultObjectUsecase {
                     let pool = get_concurrency_manager().bytes_pool();
                     let eager_body = read_small_put_body_exact_pooled(
                         StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
-                        actual_size as usize,
+                        body_size as usize,
                         pool.as_ref(),
                     )
                     .await?;
-                    let eager_reader = PooledBufferReader::new(eager_body, actual_size as usize);
+                    let eager_reader = PooledBufferReader::new(eager_body, body_size as usize);
                     HashReader::from_stream(eager_reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
                 }
             } else {
@@ -1769,6 +1796,7 @@ impl DefaultObjectUsecase {
             PutObjectOrigin::Internal {
                 principal_id,
                 emit_events,
+                ..
             } => {
                 let principal_id = *principal_id;
                 let request_context = request_context::RequestContext::fallback();
@@ -1949,21 +1977,32 @@ impl DefaultObjectUsecase {
                     Err(err) => {
                         store_put_watchdog.cancel();
                         rustfs_io_metrics::record_put_object_stage_duration_from("app_store_put", store_put_stage_start);
-                        warn!(
-                            target: "rustfs::app::object_usecase",
-                            event = EVENT_PUT_OBJECT_STORE_RETURNED,
-                            component = LOG_COMPONENT_APP,
-                            subsystem = LOG_SUBSYSTEM_OBJECT,
-                            request_id = %request_id,
-                            bucket = %bucket,
-                            key = %key,
-                            put_path = %put_path,
-                            object_size = actual_size,
-                            duration_ms = start_time.elapsed().as_millis() as u64,
-                            result = "error",
-                            error = %err,
-                            "PutObject store write returned"
-                        );
+                        if let Some(suppressed_errors) = PUT_FAILURE_LOGS.claim() {
+                            let diagnostic = err.diagnostic();
+                            warn!(
+                                target: "rustfs::app::object_usecase",
+                                event = EVENT_PUT_OBJECT_STORE_RETURNED,
+                                component = LOG_COMPONENT_APP,
+                                subsystem = LOG_SUBSYSTEM_OBJECT,
+                                request_id = %request_id,
+                                bucket = %bucket,
+                                key = %key,
+                                put_path = %put_path,
+                                object_size = actual_size,
+                                duration_ms = start_time.elapsed().as_millis() as u64,
+                                result = "error",
+                                error_code = %err.code.as_str(),
+                                storage_error_code = ?diagnostic.storage_code,
+                                io_error_kind = ?diagnostic.io_kind,
+                                rpc_error_code = ?diagnostic.rpc_code,
+                                pool_metadata_reason = diagnostic.pool_metadata.map(|context| context.reason),
+                                pool_metadata_phase = diagnostic.pool_metadata.map(|context| context.phase),
+                                pool_metadata_since_unix_secs = diagnostic.pool_metadata.map(|context| context.since_unix_secs),
+                                source_chain_truncated = diagnostic.truncated,
+                                suppressed_errors,
+                                "PutObject store write returned"
+                            );
+                        }
                         return Err(err.into());
                     }
                 };
@@ -2015,7 +2054,7 @@ impl DefaultObjectUsecase {
                     schedule_object_replication(obj_info.clone(), store, dsc).await;
                 }
 
-                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                rustfs_scanner::record_dirty_usage_object(&bucket, &key);
                 rustfs_io_metrics::record_put_object_stage_duration_from("app_post_store_bookkeeping", post_store_stage_start);
 
                 let capacity_update_stage_start = put_stage_metrics_enabled.then(Instant::now);
@@ -2085,6 +2124,18 @@ pub(super) fn previous_current_size_from_backfill(backfill: Option<OldCurrentSiz
         OldCurrentSize::Present(size) => Some(size.max(0) as u64),
         OldCurrentSize::Absent => None,
     })
+}
+
+/// Plaintext size of a compressed SSE-C passthrough body, restored from the
+/// replication transport headers into the object metadata (backlog#2363).
+fn passthrough_compressed_actual_size(user_defined: &HashMap<String, String>) -> Option<i64> {
+    if !rustfs_utils::http::contains_key_str(user_defined, SUFFIX_COMPRESSION) {
+        return None;
+    }
+    rustfs_utils::http::get_str(user_defined, SUFFIX_ACTUAL_SIZE)?
+        .parse::<i64>()
+        .ok()
+        .filter(|size| *size >= 0)
 }
 
 #[cfg(test)]

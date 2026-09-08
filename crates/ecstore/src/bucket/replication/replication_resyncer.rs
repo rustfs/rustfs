@@ -22,7 +22,8 @@ use super::replication_filemeta_boundary::ReplicationGenerationSnapshot;
 use super::replication_filemeta_boundary::{
     REPLICATE_EXISTING, ReplicateDecision, ReplicateObjectInfo, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction,
     ReplicationState, ReplicationStatusType, ReplicationType, VersionPurgeStatusType, get_replication_state,
-    parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
+    parse_replicate_decision, replicate_decision_for_admitted_targets, replication_statuses_map, target_reset_header,
+    version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_logging::{EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION_RESYNC};
@@ -32,11 +33,11 @@ use super::replication_msgp_boundary::ReplicationMsgpCodec;
 use super::replication_object_config::{ReplicationConfig, get_replication_config, must_replicate};
 use super::replication_object_decision_boundary::{
     MustReplicateOptions, ReplicationMultipartPartInput, delete_marker_purge_mrf_entry, delete_marker_purge_version_id,
-    delete_replication_creates_marker, heal_uses_delete_replication_path, is_object_lock_denied_delete,
-    is_retryable_delete_replication_head_error, is_version_delete_replication, replicate_delete_outcome, replication_etags_match,
-    replication_multipart_complete_actual_size, replication_multipart_part_plan, replication_single_put_size_error,
-    resync_existing_delete_replication_info, should_retry_delete_marker_purge, single_part_replica_etag_mismatch,
-    target_delete_version_id,
+    delete_replication_creates_marker, delete_replication_target_version_id, heal_uses_delete_replication_path,
+    is_object_lock_denied_delete, is_retryable_delete_replication_head_error, is_version_delete_replication,
+    replicate_delete_outcome, replication_etags_match, replication_multipart_complete_actual_size,
+    replication_multipart_part_plan, replication_single_put_size_error, resync_existing_delete_replication_info,
+    should_retry_delete_marker_purge, single_part_replica_etag_mismatch,
 };
 use super::replication_queue_boundary::{DeletedObjectReplicationInfo, ReplicationQueueAdmission};
 use super::replication_resync_boundary::ResyncStatusType;
@@ -56,21 +57,23 @@ use super::replication_storage_boundary::{
 };
 #[cfg(test)]
 use super::replication_storage_boundary::{NamespaceLockFence, NamespaceLockSignalTestFence, ReplicationDeletedObject};
+use super::replication_tagging_boundary::ReplicationTagFilter;
 use super::replication_target_boundary::{
     ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED, HeadObjectSdkError, PutObjectOptions, PutObjectPartOptions,
-    RemotePutObjectResponse, ReplicationTargetStore, S3ClientError, SsecPassthroughCapability, SsecPassthroughGate, TargetClient,
-    is_replication_target_offline_error, replication_action_for_target_head, replication_complete_multipart_options,
-    replication_delete_marker_purge_remove_options, replication_delete_remove_options, replication_force_delete_remove_options,
-    replication_object_is_ssec_encrypted, replication_put_object_header_size, replication_put_object_options,
-    replication_target_head_is_newer_null_version, resolve_read_api_version_id, ssec_passthrough_evidence_present,
-    ssec_passthrough_gate, version_identity_drifted,
+    RemotePutObjectResponse, ReplicaLocation, ReplicationTargetStore, S3ClientError, SsecPassthroughCapability,
+    SsecPassthroughGate, TargetClient, VersionIdentityCapability, is_replication_target_offline_error,
+    replication_action_for_target_head, replication_complete_multipart_options, replication_delete_marker_purge_remove_options,
+    replication_delete_remove_options, replication_force_delete_remove_options, replication_object_is_ssec_encrypted,
+    replication_put_object_header_size, replication_put_object_options, replication_target_head_is_newer_null_version,
+    resolve_read_api_version_id, ssec_passthrough_evidence_present, ssec_passthrough_gate, version_identity_capability_from_put,
+    version_identity_drifted,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::CompletedPart;
+use aws_sdk_s3::types::{CompletedPart, ObjectLockLegalHoldStatus, ObjectLockRetentionMode, Tag, Tagging};
 use aws_smithy_types::body::SdkBody;
 use futures::future::join_all;
 use futures::stream::StreamExt;
@@ -82,20 +85,23 @@ use metrics::counter;
 use rmp_serde;
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, AMZ_TAGGING_DIRECTIVE, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS,
-    has_internal_suffix, insert_str,
+    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
+    AMZ_TAGGING_DIRECTIVE, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX,
+    has_internal_suffix, insert_str, replication_target_versions,
 };
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, get_env_usize, sip_hash};
 #[cfg(test)]
 use s3s::dto::ReplicationConfiguration;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::task::{Context, Poll};
 use std::time::Instant;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Duration as TokioDuration;
@@ -123,8 +129,14 @@ const EVENT_DELETE_MARKER_PURGE_FAILED: &str = "replication_delete_marker_purge_
 const EVENT_DELETE_MARKER_PURGE_MRF: &str = "replication_delete_marker_purge_mrf";
 const METRIC_DELETE_MARKER_PURGE_TOTAL: &str = "rustfs_replication_delete_marker_purge_total";
 const EVENT_REPLICATION_VERSION_IDENTITY_DRIFT: &str = "replication_version_identity_drift";
+const EVENT_REPLICATION_DRIFTED_REPLICA_LOCATED: &str = "replication_drifted_replica_located";
 const EVENT_REPLICATION_OBJECT_FAILED: &str = "replication_object_failed";
 const EVENT_REPLICATION_PURGE_OBJECT_LOCK_DENIED: &str = "replication_purge_object_lock_denied";
+const EVENT_REPLICATION_PURGE_REPLICA_UNRESOLVED: &str = "replication_purge_replica_unresolved";
+const EVENT_REPLICATION_PURGE_ABANDONED: &str = "replication_purge_abandoned";
+const METRIC_VERSION_PURGE_ABANDONED_TOTAL: &str = "rustfs_replication_version_purge_abandoned_total";
+const EVENT_REPLICATION_DRIFTED_REPLICA_METADATA_SYNCED: &str = "replication_drifted_replica_metadata_synced";
+const METRIC_VERSION_PURGE_REPLICA_TOTAL: &str = "rustfs_replication_version_purge_replica_total";
 
 #[allow(
     dead_code,
@@ -210,30 +222,39 @@ const VERSION_IDENTITY_DRIFT_LOG_INTERVAL: TokioDuration = TokioDuration::from_s
 static VERSION_IDENTITY_WARNED_ARNS: LazyLock<StdMutex<HashMap<String, Instant>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-/// Version purges the peer denied under object lock (#6850). A RustFS peer
-/// with the replicated-purge GOVERNANCE exemption
-/// (`replication_delete_may_bypass_governance`) no longer produces this for
-/// governance retention, but COMPLIANCE retention, legal hold, and targets
-/// without the exemption (older RustFS, MinIO, generic S3) still deny — and
-/// such a purge cannot succeed until the lock on the replica lapses, so
-/// retrying every heal cycle only burns bandwidth and failure counters.
-/// Entries suppress heal requeues for the backoff window; after it expires
-/// one probe runs again, so the purge still converges on its own once
-/// retention ends. In-process only: a restart costs at most one extra probe
-/// per entry.
-const OBJECT_LOCK_DENIED_PURGE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-const OBJECT_LOCK_DENIED_PURGE_CACHE_MAX: usize = 4096;
-type ObjectLockDeniedPurgeKey = (String, String, String);
+/// Version purges a target refused for a reason a retry cannot change on its
+/// own. Two shapes today:
+///
+/// - the peer denied the purge under object lock (#6850). A RustFS peer with
+///   the replicated-purge GOVERNANCE exemption
+///   (`replication_delete_may_bypass_governance`) no longer produces this for
+///   governance retention, but COMPLIANCE retention, legal hold, and targets
+///   without the exemption (older RustFS, MinIO, generic S3) still deny — and
+///   such a purge cannot succeed until the lock on the replica lapses;
+/// - the replica cannot be identified on a target that mints its own
+///   version ids (rustfs/backlog#2340): no ledger entry and more than one
+///   target version carries the source ETag, so any pick could destroy a
+///   live generation. Only an operator (or the ledger catching up through
+///   heal) changes that.
+///
+/// Retrying either every heal cycle only burns bandwidth and failure
+/// counters. Entries suppress heal requeues for the backoff window; after it
+/// expires one probe runs again, so the purge still converges on its own
+/// once the condition lifts. In-process only: a restart costs at most one
+/// extra probe per entry.
+const PURGE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const PURGE_BACKOFF_CACHE_MAX: usize = 4096;
+type PurgeBackoffKey = (String, String, String);
 
-struct ObjectLockDeniedPurge {
-    denied_at: std::time::Instant,
-    denied_arns: HashSet<String>,
+struct DeferredPurge {
+    deferred_at: std::time::Instant,
+    deferred_arns: HashSet<String>,
 }
 
-static OBJECT_LOCK_DENIED_PURGES: LazyLock<StdMutex<HashMap<ObjectLockDeniedPurgeKey, ObjectLockDeniedPurge>>> =
+static DEFERRED_PURGES: LazyLock<StdMutex<HashMap<PurgeBackoffKey, DeferredPurge>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-fn object_lock_denied_purge_key(dobj: &DeletedObjectReplicationInfo) -> ObjectLockDeniedPurgeKey {
+fn purge_backoff_key(dobj: &DeletedObjectReplicationInfo) -> PurgeBackoffKey {
     let version_id = dobj
         .delete_object
         .delete_marker_version_id
@@ -242,42 +263,38 @@ fn object_lock_denied_purge_key(dobj: &DeletedObjectReplicationInfo) -> ObjectLo
     (dobj.bucket.clone(), dobj.delete_object.object_name.clone(), version_id.to_string())
 }
 
-fn record_object_lock_denied_purge(dobj: &DeletedObjectReplicationInfo, arn: &str) {
-    let mut denied = OBJECT_LOCK_DENIED_PURGES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if denied.len() >= OBJECT_LOCK_DENIED_PURGE_CACHE_MAX {
-        denied.retain(|_, entry| entry.denied_at.elapsed() < OBJECT_LOCK_DENIED_PURGE_BACKOFF);
+fn record_purge_backoff(dobj: &DeletedObjectReplicationInfo, arn: &str) {
+    let mut deferred = DEFERRED_PURGES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if deferred.len() >= PURGE_BACKOFF_CACHE_MAX {
+        deferred.retain(|_, entry| entry.deferred_at.elapsed() < PURGE_BACKOFF);
     }
-    let key = object_lock_denied_purge_key(dobj);
-    if denied.len() < OBJECT_LOCK_DENIED_PURGE_CACHE_MAX || denied.contains_key(&key) {
-        let entry = denied.entry(key).or_insert_with(|| ObjectLockDeniedPurge {
-            denied_at: std::time::Instant::now(),
-            denied_arns: HashSet::new(),
+    let key = purge_backoff_key(dobj);
+    if deferred.len() < PURGE_BACKOFF_CACHE_MAX || deferred.contains_key(&key) {
+        let entry = deferred.entry(key).or_insert_with(|| DeferredPurge {
+            deferred_at: std::time::Instant::now(),
+            deferred_arns: HashSet::new(),
         });
-        entry.denied_at = std::time::Instant::now();
-        entry.denied_arns.insert(arn.to_string());
+        entry.deferred_at = std::time::Instant::now();
+        entry.deferred_arns.insert(arn.to_string());
     }
     // Still full after dropping expired entries: skip recording — the purge
     // then simply keeps retrying, which is the pre-#6850 behavior.
 }
 
-/// Whether a heal requeue of this delete can only reach targets that denied
-/// it under object lock within the backoff window. A target the entry does
-/// not cover (another peer, or one whose denial expired) keeps the requeue
-/// flowing — suppressing it would delay a purge that could succeed there.
-pub(crate) fn object_lock_denied_purge_backoff_active(dobj: &DeletedObjectReplicationInfo) -> bool {
-    let key = object_lock_denied_purge_key(dobj);
-    let mut denied = OBJECT_LOCK_DENIED_PURGES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match denied.get(&key) {
-        Some(entry) if entry.denied_at.elapsed() < OBJECT_LOCK_DENIED_PURGE_BACKOFF => {
+/// Whether a heal requeue of this delete can only reach targets that
+/// deferred it within the backoff window. A target the entry does not cover
+/// (another peer, or one whose deferral expired) keeps the requeue flowing —
+/// suppressing it would delay a purge that could succeed there.
+pub(crate) fn purge_backoff_active(dobj: &DeletedObjectReplicationInfo) -> bool {
+    let key = purge_backoff_key(dobj);
+    let mut deferred = DEFERRED_PURGES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match deferred.get(&key) {
+        Some(entry) if entry.deferred_at.elapsed() < PURGE_BACKOFF => {
             let admitted = dobj.admitted_target_arns();
-            !admitted.is_empty() && admitted.iter().all(|arn| entry.denied_arns.contains(arn))
+            !admitted.is_empty() && admitted.iter().all(|arn| entry.deferred_arns.contains(arn))
         }
         Some(_) => {
-            denied.remove(&key);
+            deferred.remove(&key);
             false
         }
         None => false,
@@ -332,6 +349,12 @@ fn verify_single_part_replica(
 const REPLICA_ETAG_MISMATCH_ERROR: &str = "replica etag mismatch: the target persisted different bytes than were sent";
 
 fn audit_target_version_identity(tgt_client: &TargetClient, source_version_id: &str, assigned_version_id: Option<&str>) {
+    // Every write refreshes the cached verdict, so the convergence fallback
+    // below (`replica_head_fallback`) knows whether a 404 on a
+    // version-addressed HEAD can mean "replica missing" on this target.
+    if let Some(capability) = version_identity_capability_from_put(source_version_id, assigned_version_id) {
+        ReplicationTargetStore::record_version_identity_capability(&tgt_client.arn, capability);
+    }
     if !version_identity_drifted(source_version_id, assigned_version_id) {
         return;
     }
@@ -401,11 +424,417 @@ async fn mark_replication_target_offline_if_needed(target_client: &Arc<TargetCli
 async fn head_object_fallback(
     tgt_client: &TargetClient,
     object: &str,
-) -> std::result::Result<Option<HeadObjectOutput>, HeadObjectSdkError> {
+) -> std::result::Result<Option<LocatedReplica>, HeadObjectSdkError> {
     match head_object_for_worker(tgt_client, &tgt_client.bucket, object, None).await {
-        Ok(oi) => Ok(Some(oi)),
-        Err(e) if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) => Ok(None),
+        Ok(head) => Ok(Some(LocatedReplica {
+            version_id: head.version_id.clone(),
+            head,
+        })),
+        Err(e) if head_object_not_found(&e) => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// A replica reached through [`replica_head_fallback`], with the version id
+/// it was addressed by: the ledger or located id on a drifting target, or
+/// whatever the current-version HEAD reported. Kept apart from the HEAD
+/// output because a target may withhold `x-amz-version-id` on HEAD.
+struct LocatedReplica {
+    head: HeadObjectOutput,
+    version_id: Option<String>,
+}
+
+fn head_object_not_found(err: &HeadObjectSdkError) -> bool {
+    err.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(err, 404)
+}
+
+/// Target version ids other versions of the same source key already claim
+/// through their ledgers, for one target. Content identity alone cannot tell
+/// two same-bytes generations apart on a target that mints its own ids; the
+/// sibling ledgers can — a candidate a sibling recorded is that sibling's
+/// replica, never this version's.
+#[async_trait::async_trait]
+pub(crate) trait SiblingLedger: Send + Sync {
+    async fn claimed_target_versions(&self, bucket: &str, object: &str, exclude: Option<Uuid>, arn: &str) -> HashSet<String>;
+}
+
+/// No sibling knowledge: every content match stays a candidate. For paths
+/// that only count replicas and never mutate them (resync verification), and
+/// for tests.
+pub(crate) struct NoSiblingLedger;
+
+#[async_trait::async_trait]
+impl SiblingLedger for NoSiblingLedger {
+    async fn claimed_target_versions(&self, _bucket: &str, _object: &str, _exclude: Option<Uuid>, _arn: &str) -> HashSet<String> {
+        HashSet::new()
+    }
+}
+
+/// Source-side sibling ledgers: one listing of the exact key. Bounded to a
+/// page; a key with more generations than that keeps every candidate, which
+/// only ever makes the caller refuse (ambiguous), never guess.
+const SIBLING_LEDGER_MAX_VERSIONS: i32 = 1000;
+
+#[async_trait::async_trait]
+impl<S: ReplicationStorage> SiblingLedger for Arc<S> {
+    async fn claimed_target_versions(&self, bucket: &str, object: &str, exclude: Option<Uuid>, arn: &str) -> HashSet<String> {
+        let listed = match self
+            .clone()
+            .list_object_versions(bucket, object, None, None, None, SIBLING_LEDGER_MAX_VERSIONS)
+            .await
+        {
+            Ok(listed) => listed,
+            Err(error) => {
+                debug!(
+                    event = EVENT_RESYNC_RUNTIME_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket,
+                    object,
+                    error = %error,
+                    reason = "sibling_ledger_listing_failed",
+                    "Could not list sibling versions for the target-version ledger"
+                );
+                return HashSet::new();
+            }
+        };
+        listed
+            .objects
+            .iter()
+            .filter(|info| info.name == object && info.version_id != exclude)
+            .filter_map(|info| ledger_target_version_id(&info.user_defined, arn))
+            .collect()
+    }
+}
+
+/// The version id a drifting target assigned to this object version, as the
+/// source's persisted ledger records it for `arn` (see
+/// `SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX`). `None` when nothing is
+/// recorded or the record is inconsistent across the dual internal prefixes
+/// (callers then fall back to content identity, never to a guess).
+fn ledger_target_version_id(user_defined: &HashMap<String, String>, arn: &str) -> Option<String> {
+    let (ledger, corrupt) = replication_target_versions(user_defined);
+    if corrupt {
+        return None;
+    }
+    ledger.get(arn).cloned()
+}
+
+/// Second look at a replica whose version-addressed HEAD failed, for the two
+/// target shapes where that failure is not a verdict on the replica:
+///
+/// - AWS-style 400/403 (the RustFS uuid is rejected as malformed): HEAD the
+///   current version without a version id; callers compare ETags.
+/// - 404 on a target that mints its own version ids (the Wasabi shape,
+///   rustfs/backlog#2340): the source id never existed there. HEAD the id
+///   the source ledger recorded for this target when it has one; otherwise,
+///   once the target is known to mint ids, locate the replica by exact key
+///   and ETag through ListObjectVersions and HEAD the id the target assigned.
+///   Without this, every heal, MRF retry and existing-object resync re-drive
+///   PUTs the object again and mints one more target version.
+///
+/// `content_identity` is the sibling-ledger view used to disown candidates
+/// other source versions already claim; `None` disables content identity
+/// altogether — a fresh write (`ReplicationType::Object`) has no replica to
+/// find, and a same-bytes older generation would be mistaken for one.
+///
+/// `None` when the error stands as-is: a real miss on an adopting target, or
+/// a target whose identity contract is still unknown. A failed lookup is
+/// returned as a HEAD-shaped error so callers keep their "target operation
+/// failed" handling (retry later) instead of re-driving the PUT.
+/// The source side of a replica lookup: which version is being matched and
+/// what the source already recorded about it on this target.
+struct ReplicaSource<'a> {
+    bucket: &'a str,
+    object: &'a str,
+    version_id: Option<Uuid>,
+    etag: Option<&'a str>,
+    ledger_version_id: Option<&'a str>,
+}
+
+async fn replica_head_fallback(
+    tgt_client: &TargetClient,
+    source: ReplicaSource<'_>,
+    content_identity: Option<&dyn SiblingLedger>,
+    err: &HeadObjectSdkError,
+) -> Option<std::result::Result<Option<LocatedReplica>, HeadObjectSdkError>> {
+    let ReplicaSource {
+        bucket: source_bucket,
+        object,
+        version_id: source_version_id,
+        etag: source_etag,
+        ledger_version_id,
+    } = source;
+    if is_version_id_format_mismatch(err) {
+        return Some(head_object_fallback(tgt_client, object).await);
+    }
+    if !head_object_not_found(err) {
+        return None;
+    }
+    if let Some(ledger_version_id) = ledger_version_id {
+        // A ledger entry is direct evidence of the identity contract; it
+        // survives a restart while the runtime verdict cache does not.
+        ReplicationTargetStore::record_version_identity_capability(&tgt_client.arn, VersionIdentityCapability::MintsOwn);
+        match head_object_for_worker(tgt_client, &tgt_client.bucket, object, Some(ledger_version_id.to_string())).await {
+            Ok(head) => {
+                return Some(Ok(Some(LocatedReplica {
+                    head,
+                    version_id: Some(ledger_version_id.to_string()),
+                })));
+            }
+            // The recorded version is gone: fall through to content identity
+            // before concluding that the replica is missing.
+            Err(e) if head_object_not_found(&e) => {}
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    if !ReplicationTargetStore::version_identity_capability(&tgt_client.arn).version_addressing_unreliable() {
+        return None;
+    }
+    let siblings = content_identity?;
+    let etag = source_etag.filter(|etag| !etag.trim().is_empty())?;
+    Some(match tgt_client.replica_candidates_by_etag(&tgt_client.bucket, object, etag).await {
+        Ok(candidates) => {
+            let location =
+                disowned_replica_location(siblings, &tgt_client.arn, source_bucket, object, source_version_id, candidates).await;
+            match location.any_version_id() {
+                Some(assigned_version_id) => {
+                    debug!(
+                        event = EVENT_REPLICATION_DRIFTED_REPLICA_LOCATED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                        bucket = %tgt_client.bucket,
+                        object = %object,
+                        arn = %tgt_client.arn,
+                        assigned_version_id = %assigned_version_id,
+                        ambiguous = matches!(location, ReplicaLocation::Ambiguous { .. }),
+                        "Located replica by content identity on a target that mints its own version ids"
+                    );
+                    match head_object_for_worker(tgt_client, &tgt_client.bucket, object, Some(assigned_version_id.to_string()))
+                        .await
+                    {
+                        Ok(head) => Ok(Some(LocatedReplica {
+                            head,
+                            version_id: Some(assigned_version_id.to_string()),
+                        })),
+                        // The located version disappeared between LIST and HEAD.
+                        Err(e) if head_object_not_found(&e) => Ok(None),
+                        Err(e) => Err(e),
+                    }
+                }
+                None => Ok(None),
+            }
+        }
+        Err(list_err) => Err(Box::new(SdkError::construction_failure(*list_err))),
+    })
+}
+
+/// Content-identity candidates minus those other source versions of the key
+/// already claim through their ledgers. The sibling listing is only paid for
+/// when there is a candidate to disown.
+async fn disowned_replica_location(
+    siblings: &dyn SiblingLedger,
+    arn: &str,
+    source_bucket: &str,
+    object: &str,
+    source_version_id: Option<Uuid>,
+    mut candidates: Vec<String>,
+) -> ReplicaLocation {
+    if candidates.is_empty() {
+        return ReplicaLocation::Missing;
+    }
+    let claimed = siblings
+        .claimed_target_versions(source_bucket, object, source_version_id, arn)
+        .await;
+    candidates.retain(|candidate| !claimed.contains(candidate));
+    ReplicaLocation::from_matches(candidates)
+}
+
+/// The id the target assigned to a located replica when it is not the source
+/// id, i.e. the ledger entry this replica needs. `None` on an adopting target
+/// (nothing to record) or when no version id is known.
+fn drifted_replica_version_id(replica: &LocatedReplica, source_version_id: Option<Uuid>) -> Option<&str> {
+    let assigned = replica.version_id.as_deref().filter(|id| !id.is_empty())?;
+    let source_version_id = source_version_id.map(|version_id| version_id.to_string());
+    (source_version_id.as_deref() != Some(assigned)).then_some(assigned)
+}
+
+/// One failed metadata-only operation against a located replica, named by
+/// the S3 operation so same-cause failures bucket together downstream.
+#[derive(Debug)]
+struct ReplicaMetadataSyncError {
+    operation: &'static str,
+    source: String,
+}
+
+impl ReplicaMetadataSyncError {
+    fn io(operation: &'static str, source: impl Display) -> std::io::Error {
+        std::io::Error::other(Self {
+            operation,
+            source: source.to_string(),
+        })
+    }
+}
+
+impl Display for ReplicaMetadataSyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} failed: {}", self.operation, self.source)
+    }
+}
+
+impl std::error::Error for ReplicaMetadataSyncError {}
+
+fn user_defined_value<'a>(user_defined: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    user_defined
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+        .filter(|value| !value.is_empty())
+}
+
+/// Bring a located replica's tags and Object Lock state in line with the
+/// source version through the metadata-only S3 operations, addressing the
+/// version the target assigned.
+///
+/// The regular metadata transport re-PUTs the object with the source version
+/// id, which an id-adopting target applies in place. A target that mints its
+/// own ids would answer that PUT with one more version (and keep the old
+/// one), so the replica's tags never changed and the target grew a duplicate
+/// per update (rustfs/backlog#2340). A `Metadata` attempt always applies the
+/// source tags; retention and legal hold are applied when the HEAD shows a
+/// difference (retention is only ever extended here — shortening or clearing
+/// it needs a governance bypass the replication client does not hold, so the
+/// replica keeps its longer window and the difference is logged). Heal and
+/// resync attempts only touch what the HEAD proves diverged.
+async fn sync_drifted_replica_metadata(
+    tgt_client: &TargetClient,
+    object: &str,
+    source: &ObjectInfo,
+    located: &LocatedReplica,
+    op_type: ReplicationType,
+) -> std::io::Result<ReplicationAction> {
+    let version_id = located.version_id.clone();
+    let replica = &located.head;
+    let mut applied = false;
+
+    let source_tags = ReplicationTagFilter::decode_tags_to_map(&source.user_tags);
+    let source_tag_count = i32::try_from(source_tags.len()).unwrap_or(i32::MAX);
+    if op_type == ReplicationType::Metadata || replica.tag_count.unwrap_or_default() != source_tag_count {
+        if source_tags.is_empty() {
+            if replica.tag_count.unwrap_or_default() > 0 {
+                tgt_client
+                    .delete_object_tagging(&tgt_client.bucket, object, version_id.clone())
+                    .await
+                    .map_err(|e| ReplicaMetadataSyncError::io("delete_object_tagging", e))?;
+                applied = true;
+            }
+        } else {
+            let mut tag_set: Vec<(String, String)> = source_tags.into_iter().collect();
+            tag_set.sort();
+            let tagging = Tagging::builder()
+                .set_tag_set(Some(
+                    tag_set
+                        .into_iter()
+                        .map(|(key, value)| Tag::builder().key(key).value(value).build())
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(|e| ReplicaMetadataSyncError::io("build_tag", e))?,
+                ))
+                .build()
+                .map_err(|e| ReplicaMetadataSyncError::io("build_tag_set", e))?;
+            tgt_client
+                .put_object_tagging(&tgt_client.bucket, object, version_id.clone(), tagging)
+                .await
+                .map_err(|e| ReplicaMetadataSyncError::io("put_object_tagging", e))?;
+            applied = true;
+        }
+    }
+
+    let source_mode = user_defined_value(&source.user_defined, AMZ_OBJECT_LOCK_MODE);
+    let source_retain_until = user_defined_value(&source.user_defined, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE)
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
+    match (source_mode, source_retain_until) {
+        (Some(mode), Some(retain_until)) => {
+            let replica_mode = replica.object_lock_mode.as_ref().map(|mode| mode.as_str());
+            let replica_retain_until = replica.object_lock_retain_until_date.as_ref().map(|date| date.secs());
+            let retention_differs = !replica_mode.is_some_and(|replica_mode| replica_mode.eq_ignore_ascii_case(mode))
+                || replica_retain_until != Some(retain_until.unix_timestamp());
+            if retention_differs {
+                if replica_retain_until.is_some_and(|current| current > retain_until.unix_timestamp()) {
+                    debug!(
+                        event = EVENT_REPLICATION_DRIFTED_REPLICA_METADATA_SYNCED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                        bucket = %tgt_client.bucket,
+                        object = %object,
+                        arn = %tgt_client.arn,
+                        reason = "retention_shortening_requires_bypass",
+                        "Replica retention is longer than the source's; left unchanged"
+                    );
+                } else {
+                    let mode = ObjectLockRetentionMode::from(mode.to_ascii_uppercase().as_str());
+                    tgt_client
+                        .put_object_retention(
+                            &tgt_client.bucket,
+                            object,
+                            version_id.clone(),
+                            mode,
+                            aws_sdk_s3::primitives::DateTime::from_secs(retain_until.unix_timestamp()),
+                        )
+                        .await
+                        .map_err(|e| ReplicaMetadataSyncError::io("put_object_retention", e))?;
+                    applied = true;
+                }
+            }
+        }
+        _ => {
+            if replica.object_lock_mode.is_some() {
+                debug!(
+                    event = EVENT_REPLICATION_DRIFTED_REPLICA_METADATA_SYNCED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = %tgt_client.bucket,
+                    object = %object,
+                    arn = %tgt_client.arn,
+                    reason = "retention_clear_requires_bypass",
+                    "Replica retention has no source counterpart; left unchanged"
+                );
+            }
+        }
+    }
+
+    let source_legal_hold = user_defined_value(&source.user_defined, AMZ_OBJECT_LOCK_LEGAL_HOLD)
+        .is_some_and(|value| value.eq_ignore_ascii_case("ON"));
+    let replica_legal_hold = replica
+        .object_lock_legal_hold_status
+        .as_ref()
+        .is_some_and(|status| status.as_str().eq_ignore_ascii_case("ON"));
+    if source_legal_hold != replica_legal_hold {
+        let status = if source_legal_hold {
+            ObjectLockLegalHoldStatus::On
+        } else {
+            ObjectLockLegalHoldStatus::Off
+        };
+        tgt_client
+            .put_object_legal_hold(&tgt_client.bucket, object, version_id.clone(), status)
+            .await
+            .map_err(|e| ReplicaMetadataSyncError::io("put_object_legal_hold", e))?;
+        applied = true;
+    }
+
+    if applied {
+        debug!(
+            event = EVENT_REPLICATION_DRIFTED_REPLICA_METADATA_SYNCED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+            bucket = %tgt_client.bucket,
+            object = %object,
+            arn = %tgt_client.arn,
+            assigned_version_id = version_id.as_deref().unwrap_or("<none>"),
+            "Synced replica metadata in place on a target that mints its own version ids"
+        );
+        Ok(ReplicationAction::Metadata)
+    } else {
+        Ok(ReplicationAction::None)
     }
 }
 
@@ -1400,30 +1829,38 @@ async fn verify_resync_head_result(
                 (0, None)
             }
         }
-        Err(err) if is_version_id_format_mismatch(&err) => {
-            // AWS-style target rejects the RustFS UUID versionId
-            // (400). Re-verify without the versionId before
-            // concluding the object failed to replicate, instead
-            // of counting a well-replicated object as failed.
-            match head_object_fallback(target_client.as_ref(), &roi.name).await {
-                Ok(Some(_)) => {
+        Err(err) => {
+            // A version-addressed HEAD is not the last word on every target:
+            // re-verify through the fallback before counting a well-replicated
+            // object as failed (see `replica_head_fallback`).
+            match replica_head_fallback(
+                target_client.as_ref(),
+                ReplicaSource {
+                    bucket: &roi.bucket,
+                    object: &roi.name,
+                    version_id: roi.version_id,
+                    etag: roi.etag.as_deref(),
+                    ledger_version_id: None,
+                },
+                Some(&NoSiblingLedger),
+                &err,
+            )
+            .await
+            {
+                Some(Ok(Some(_))) => {
                     st.replicated_count += 1;
                     st.replicated_size += roi.size;
                     (roi.size, None)
                 }
-                Ok(None) => {
+                Some(Ok(None)) | None => {
                     st.failed_count += 1;
                     (0, Some(err))
                 }
-                Err(e2) => {
+                Some(Err(e2)) => {
                     st.failed_count += 1;
                     (0, Some(e2))
                 }
             }
-        }
-        Err(err) => {
-            st.failed_count += 1;
-            (0, Some(err))
         }
     }
 }
@@ -1620,6 +2057,26 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
 
     let target_statuses = replication_statuses_map(&oi.replication_status_internal.clone().unwrap_or_default());
     let target_purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal.clone().unwrap_or_default());
+    // A version purge is owed to the targets its purge state names, whatever
+    // the configuration says now: the decision string is not persisted, so a
+    // heal after restart (or after the configuration was removed or edited)
+    // would otherwise never revisit the purge and the hidden version would
+    // block DeleteBucket forever (rustfs/backlog#2340). The delete worker
+    // settles a target the configuration no longer names as abandoned.
+    let dsc = if delete_path && !dsc.replicate_any() {
+        let owed: Vec<String> = target_purge_statuses
+            .iter()
+            .filter(|(_, status)| matches!(status, VersionPurgeStatusType::Pending | VersionPurgeStatusType::Failed))
+            .map(|(arn, _)| arn.clone())
+            .collect();
+        if owed.is_empty() {
+            dsc
+        } else {
+            replicate_decision_for_admitted_targets(&owed)
+        }
+    } else {
+        dsc
+    };
     let existing_obj_resync = if delete_path && !has_stored_delete_decision && !delete_state.0 && !delete_state.1 {
         Default::default()
     } else {
@@ -1975,6 +2432,13 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
         targets: Vec::with_capacity(dsc.targets_map.len()),
     };
 
+    let purge_source = version_purge_source(&storage, &bucket, &dobj, &dsc).await.map(Arc::new);
+    let configured_arns = if is_version_delete_replication(&dobj.delete_object) {
+        configured_replication_arns(&bucket).await
+    } else {
+        None
+    };
+
     let mut join_set = JoinSet::new();
 
     // Process each target
@@ -1995,6 +2459,17 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
             continue;
         }
 
+        // The bucket no longer replicates to this target: nothing can ever
+        // confirm the purge remotely, so finish it locally as abandoned.
+        if let Some(configured) = configured_arns.as_ref()
+            && !configured.contains(&tgt_entry.arn)
+        {
+            rinfos
+                .targets
+                .push(abandoned_purge_target_info(&bucket, &dobj, &tgt_entry.arn));
+            continue;
+        }
+
         // Get the remote target client
         let Some(tgt_client) = ReplicationTargetStore::remote_target_client(&bucket, &tgt_entry.arn).await else {
             debug!(
@@ -2011,9 +2486,10 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
         };
 
         let dobj_clone = dobj.clone();
+        let purge_source = purge_source.clone();
 
         // Spawn task in the join set
-        join_set.spawn(async move { replicate_delete_to_target(&dobj_clone, tgt_client.clone()).await });
+        join_set.spawn(async move { replicate_delete_to_target(&dobj_clone, tgt_client.clone(), purge_source).await });
     }
 
     // Collect all results
@@ -2051,7 +2527,11 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
 
     let is_version_purge = is_version_delete_replication(&dobj.delete_object);
 
-    let requires_delayed_purge = should_retry_delete_marker_purge(&dobj.delete_object);
+    // The watcher exists to purge a replicated marker once the SOURCE marker
+    // vanishes. A version purge is that purge already (its failures reach the
+    // journal as a purge entry), so it must not spawn a second watcher that
+    // journals a duplicate intent (backlog#2290).
+    let requires_delayed_purge = should_retry_delete_marker_purge(&dobj.delete_object) && !is_version_purge;
 
     let (replication_status, prev_status) = if !is_version_purge {
         (
@@ -2760,13 +3240,181 @@ fn unavailable_delete_target_info(dobj: &DeletedObjectReplicationInfo, arn: &str
     rinfo
 }
 
-async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
-    let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
-        version_id.to_owned()
-    } else {
-        dobj.delete_object.version_id.unwrap_or_default()
-    };
+/// The target ARNs the bucket's replication configuration still names, or
+/// `None` when that cannot be decided right now (unreadable/invalid
+/// configuration): a purge is only abandoned on positive evidence. No
+/// configuration at all names no target.
+async fn configured_replication_arns(bucket: &str) -> Option<HashSet<String>> {
+    match get_replication_config(bucket).await {
+        Ok(Some(config)) => Some(config.configured_target_arns()),
+        Ok(None) => Some(HashSet::new()),
+        Err(_) => None,
+    }
+}
 
+/// Finish a version purge locally for a target the bucket no longer
+/// replicates to (the rule or the whole configuration was removed).
+///
+/// The source keeps a purged version in xl.meta, hidden from listings, until
+/// every target confirms the purge — and once the operator removed the
+/// target nothing ever will: the version stayed PENDING forever, blocking
+/// `DeleteBucket` with a residue the client could neither see nor remove
+/// (rustfs/backlog#2340). Reporting the purge as complete lets the normal
+/// writeback drop the version. The replica, if any, stays on the former
+/// target: that is the operator's data now, and this event is the record.
+fn abandoned_purge_target_info(bucket: &str, dobj: &DeletedObjectReplicationInfo, arn: &str) -> ReplicatedTargetInfo {
+    let mut rinfo = dobj
+        .delete_object
+        .replication_state
+        .clone()
+        .unwrap_or_default()
+        .target_state(arn);
+    rinfo.op_type = dobj.op_type;
+    if rinfo.version_purge_status == VersionPurgeStatusType::Complete {
+        return rinfo;
+    }
+    warn!(
+        event = EVENT_REPLICATION_PURGE_ABANDONED,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+        bucket,
+        object = dobj.delete_object.object_name,
+        version_id = ?dobj.delete_object.version_id.or(dobj.delete_object.delete_marker_version_id),
+        arn,
+        reason = "target_not_configured",
+        "Replicated version purge abandoned: the bucket no longer replicates to this target, so the version is purged locally"
+    );
+    counter!(METRIC_VERSION_PURGE_ABANDONED_TOTAL).increment(1);
+    rinfo.version_purge_status = VersionPurgeStatusType::Complete;
+    rinfo.error = None;
+    rinfo
+}
+
+/// What the source still knows about a data version being purged, read once
+/// per delete: the version stays in xl.meta with a PENDING purge status until
+/// every target confirms, so its ETag and target-version ledger are available
+/// to resolve the replica on a target that mints its own version ids.
+struct VersionPurgeSource {
+    etag: Option<String>,
+    ledger: HashMap<String, String>,
+    ledger_corrupt: bool,
+    /// Target versions other generations of the key claim, per target ARN:
+    /// never a candidate for this version's purge.
+    claimed_by_siblings: HashMap<String, HashSet<String>>,
+}
+
+async fn version_purge_source<S: ReplicationStorage>(
+    storage: &Arc<S>,
+    bucket: &str,
+    dobj: &DeletedObjectReplicationInfo,
+    dsc: &ReplicateDecision,
+) -> Option<VersionPurgeSource> {
+    // Delete-marker purges resolve through the marker ledger recorded when
+    // the marker was created (`delete_replication_target_version_id`).
+    if dobj.delete_object.delete_marker || dobj.delete_object.delete_marker_version_id.is_some() {
+        return None;
+    }
+    let version_id = dobj.delete_object.version_id.filter(|version_id| !version_id.is_nil())?;
+    let object_name = &dobj.delete_object.object_name;
+    let info = storage
+        .get_object_info(
+            bucket,
+            object_name,
+            &ObjectOptions {
+                version_id: Some(version_id.to_string()),
+                versioned: ReplicationVersioningStore::prefix_enabled(bucket, object_name).await,
+                version_suspended: ReplicationVersioningStore::prefix_suspended(bucket, object_name).await,
+                ..Default::default()
+            },
+        )
+        .await
+        .ok()?;
+    let (ledger, ledger_corrupt) = replication_target_versions(&info.user_defined);
+    // Only a target without a ledger entry falls back to content identity,
+    // and only then are the sibling ledgers worth a listing.
+    let mut claimed_by_siblings = HashMap::new();
+    for target in dsc.targets_map.values() {
+        if target.replicate && !ledger.contains_key(&target.arn) {
+            let claimed = storage
+                .claimed_target_versions(bucket, object_name, Some(version_id), &target.arn)
+                .await;
+            claimed_by_siblings.insert(target.arn.clone(), claimed);
+        }
+    }
+    Some(VersionPurgeSource {
+        etag: info.etag,
+        ledger,
+        ledger_corrupt,
+        claimed_by_siblings,
+    })
+}
+
+/// Which version a data-version purge addresses on `arn` once the source
+/// ledger and, failing that, content identity have been consulted.
+enum PurgeReplicaResolution {
+    /// Address the version the caller already derived (id-adopting target).
+    SourceVersion,
+    /// Address the version the target assigned.
+    Resolved(String),
+    /// The target holds no live version with the source content: the purge
+    /// goal is already met there.
+    Absent,
+    /// Refuse: no ledger entry and more than one target version carries the
+    /// source ETag, so any pick could destroy a live generation.
+    Ambiguous,
+    /// Refuse: the persisted ledger is inconsistent.
+    LedgerCorrupt,
+    /// The content-identity lookup itself failed (transport/service).
+    LookupFailed(String),
+}
+
+/// `force_lookup` consults content identity even on a target whose identity
+/// contract is unknown: used after a source-id DELETE answered
+/// NoSuchVersion, where "already gone" and "never had that id" (Wasabi
+/// after a restart, before any PUT re-taught the verdict) look the same.
+async fn resolve_purge_replica(
+    tgt_client: &TargetClient,
+    object: &str,
+    source: &VersionPurgeSource,
+    force_lookup: bool,
+) -> PurgeReplicaResolution {
+    if source.ledger_corrupt {
+        return PurgeReplicaResolution::LedgerCorrupt;
+    }
+    if let Some(assigned) = source.ledger.get(&tgt_client.arn) {
+        ReplicationTargetStore::record_version_identity_capability(&tgt_client.arn, VersionIdentityCapability::MintsOwn);
+        return PurgeReplicaResolution::Resolved(assigned.clone());
+    }
+    if !force_lookup && !ReplicationTargetStore::version_identity_capability(&tgt_client.arn).version_addressing_unreliable() {
+        return PurgeReplicaResolution::SourceVersion;
+    }
+    let Some(etag) = source.etag.as_deref().filter(|etag| !etag.trim().is_empty()) else {
+        return PurgeReplicaResolution::SourceVersion;
+    };
+    match tgt_client.replica_candidates_by_etag(&tgt_client.bucket, object, etag).await {
+        Ok(mut candidates) => {
+            if let Some(claimed) = source.claimed_by_siblings.get(&tgt_client.arn) {
+                candidates.retain(|candidate| !claimed.contains(candidate));
+            }
+            match ReplicaLocation::from_matches(candidates) {
+                ReplicaLocation::Unique(assigned) => PurgeReplicaResolution::Resolved(assigned),
+                ReplicaLocation::Missing => PurgeReplicaResolution::Absent,
+                ReplicaLocation::Ambiguous { .. } => PurgeReplicaResolution::Ambiguous,
+            }
+        }
+        Err(error) => PurgeReplicaResolution::LookupFailed(error.to_string()),
+    }
+}
+
+fn purge_target_already_clean(error: &S3ClientError) -> bool {
+    matches!(error.code.as_deref(), Some("NoSuchKey" | "NoSuchVersion"))
+}
+
+async fn replicate_delete_to_target(
+    dobj: &DeletedObjectReplicationInfo,
+    tgt_client: Arc<TargetClient>,
+    purge_source: Option<Arc<VersionPurgeSource>>,
+) -> ReplicatedTargetInfo {
     let mut rinfo = dobj
         .delete_object
         .replication_state
@@ -2799,7 +3447,96 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         return rinfo;
     }
 
-    let version_id = target_delete_version_id(version_id, is_version_purge);
+    // Purging a replicated delete marker addresses the version the target
+    // assigned (recorded when the marker was created there); see
+    // `delete_replication_target_version_id`. A corrupt record is a failure,
+    // not a guess: the entry stays visible until the metadata is repaired.
+    let Some(mut version_id) = delete_replication_target_version_id(&dobj.delete_object, &tgt_client.arn) else {
+        warn!(
+            event = EVENT_DELETE_MARKER_PURGE_FAILED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+            bucket = tgt_client.bucket,
+            object = dobj.delete_object.object_name,
+            arn = %tgt_client.arn,
+            reason = "recorded_target_version_inconsistent",
+            "Replicated version purge refused: recorded target delete-marker version metadata is inconsistent"
+        );
+        rinfo.version_purge_status = VersionPurgeStatusType::Failed;
+        rinfo.error = Some("recorded target delete-marker version metadata is inconsistent".to_string());
+        return rinfo;
+    };
+
+    // A data-version purge on a target that mints its own version ids must
+    // address the id the target assigned: the source uuid answers
+    // NoSuchVersion there forever (rustfs/backlog#2340). The ledger recorded
+    // at replication time is exact; content identity is the fallback for
+    // replicas written before the ledger existed, and it refuses to guess.
+    let mut addressed_source_version = true;
+    if let Some(source) = purge_source.as_deref() {
+        let object = &dobj.delete_object.object_name;
+        let refuse = |rinfo: &mut ReplicatedTargetInfo, reason: &str, detail: String, backoff: bool| {
+            if backoff {
+                record_purge_backoff(dobj, &tgt_client.arn);
+            }
+            warn!(
+                event = EVENT_REPLICATION_PURGE_REPLICA_UNRESOLVED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = tgt_client.bucket,
+                object = %object,
+                arn = %tgt_client.arn,
+                reason,
+                detail = %detail,
+                "Replicated version purge could not resolve the replica on a target that mints its own version ids"
+            );
+            counter!(METRIC_VERSION_PURGE_REPLICA_TOTAL, "resolution" => reason.to_string()).increment(1);
+            rinfo.version_purge_status = VersionPurgeStatusType::Failed;
+            rinfo.error = Some(detail);
+        };
+        match resolve_purge_replica(&tgt_client, object, source, false).await {
+            PurgeReplicaResolution::SourceVersion => {}
+            PurgeReplicaResolution::Resolved(assigned) => {
+                counter!(METRIC_VERSION_PURGE_REPLICA_TOTAL, "resolution" => "resolved").increment(1);
+                version_id = Some(assigned);
+                addressed_source_version = false;
+            }
+            PurgeReplicaResolution::Absent => {
+                debug!(
+                    bucket = tgt_client.bucket,
+                    object = %object,
+                    arn = %tgt_client.arn,
+                    "replicate_delete_to_target: no replica with the source content on the target; purge already satisfied"
+                );
+                counter!(METRIC_VERSION_PURGE_REPLICA_TOTAL, "resolution" => "absent").increment(1);
+                rinfo.version_purge_status = VersionPurgeStatusType::Complete;
+                return rinfo;
+            }
+            PurgeReplicaResolution::Ambiguous => {
+                refuse(
+                    &mut rinfo,
+                    "ambiguous",
+                    "replica identity is ambiguous on the target: several versions carry the source content and no target version is recorded".to_string(),
+                    true,
+                );
+                return rinfo;
+            }
+            PurgeReplicaResolution::LedgerCorrupt => {
+                refuse(
+                    &mut rinfo,
+                    "ledger_corrupt",
+                    "recorded target version metadata is inconsistent".to_string(),
+                    true,
+                );
+                return rinfo;
+            }
+            PurgeReplicaResolution::LookupFailed(error) => {
+                refuse(&mut rinfo, "lookup_failed", format!("replica lookup failed: {error}"), false);
+                mark_replication_target_offline_if_needed(&tgt_client, &error).await;
+                return rinfo;
+            }
+        }
+    }
 
     if dobj.delete_object.delete_marker && dobj.delete_object.delete_marker_version_id.is_some() {
         match head_object_for_worker(
@@ -2829,22 +3566,66 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         }
     }
 
-    match tgt_client
+    let remove_options = replication_delete_remove_options(
+        delete_replication_creates_marker(&dobj.delete_object),
+        dobj.delete_object.delete_marker_mtime,
+    );
+    // A version purge must keep the versionId on the DELETE even when the
+    // purged version is a delete marker: marker-creation semantics would drop
+    // it and a generic S3 target would mint a fresh marker on every retry
+    // (rustfs#6823).
+    let mut removed = tgt_client
         .remove_object(
             &tgt_client.bucket,
             &dobj.delete_object.object_name,
             version_id.clone(),
-            // A version purge must keep the versionId on the DELETE even when
-            // the purged version is a delete marker: marker-creation semantics
-            // would drop it and a generic S3 target would mint a fresh marker
-            // on every retry (rustfs#6823).
-            replication_delete_remove_options(
-                delete_replication_creates_marker(&dobj.delete_object),
-                dobj.delete_object.delete_marker_mtime,
-            ),
+            remove_options.clone(),
         )
-        .await
+        .await;
+    // NoSuchVersion for the SOURCE id on a target whose identity contract is
+    // not known: "already gone" and "never had that id" look the same, so
+    // resolve by content identity once before concluding either.
+    if is_version_purge
+        && addressed_source_version
+        && removed.as_ref().is_err_and(purge_target_already_clean)
+        && let Some(source) = purge_source.as_deref()
     {
+        let object = &dobj.delete_object.object_name;
+        match resolve_purge_replica(&tgt_client, object, source, true).await {
+            PurgeReplicaResolution::Resolved(assigned) => {
+                ReplicationTargetStore::record_version_identity_capability(&tgt_client.arn, VersionIdentityCapability::MintsOwn);
+                counter!(METRIC_VERSION_PURGE_REPLICA_TOTAL, "resolution" => "resolved").increment(1);
+                version_id = Some(assigned);
+                removed = tgt_client
+                    .remove_object(&tgt_client.bucket, object, version_id.clone(), remove_options)
+                    .await;
+            }
+            PurgeReplicaResolution::Ambiguous => {
+                record_purge_backoff(dobj, &tgt_client.arn);
+                warn!(
+                    event = EVENT_REPLICATION_PURGE_REPLICA_UNRESOLVED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = tgt_client.bucket,
+                    object = %object,
+                    arn = %tgt_client.arn,
+                    reason = "ambiguous",
+                    "Replicated version purge could not resolve the replica on a target that mints its own version ids"
+                );
+                counter!(METRIC_VERSION_PURGE_REPLICA_TOTAL, "resolution" => "ambiguous").increment(1);
+                rinfo.version_purge_status = VersionPurgeStatusType::Failed;
+                rinfo.error = Some(
+                    "replica identity is ambiguous on the target: several versions carry the source content and no target version is recorded"
+                        .to_string(),
+                );
+                return rinfo;
+            }
+            // Missing, a lookup failure, a corrupt ledger or no content
+            // identity to compare: the NoSuchVersion answer stands.
+            _ => {}
+        }
+    }
+    match removed {
         Ok(assigned_version_id) => {
             debug!(
                 bucket = tgt_client.bucket,
@@ -2868,6 +3649,19 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
                 rinfo.version_purge_status = VersionPurgeStatusType::Complete;
             }
         }
+        // The version is already gone on the target: the purge goal is met.
+        // Strict S3 targets answer NoSuchVersion here (RustFS/MinIO answer
+        // 204); failing would retry a delete that can never do more.
+        Err(e) if is_version_purge && purge_target_already_clean(&e) => {
+            debug!(
+                bucket = tgt_client.bucket,
+                object = dobj.delete_object.object_name,
+                version_id = ?version_id,
+                error = %e,
+                "replicate_delete_to_target: version already absent on the target"
+            );
+            rinfo.version_purge_status = VersionPurgeStatusType::Complete;
+        }
         Err(e) => {
             let object_lock_denied = is_version_purge && is_object_lock_denied_delete(e.code.as_deref(), e.message.as_deref());
             if object_lock_denied {
@@ -2878,7 +3672,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
                 // lock on the replica lapses. Surface it loudly instead of
                 // letting a silent failed counter and a hot heal-retry loop
                 // stand in for the divergence.
-                record_object_lock_denied_purge(dobj, &tgt_client.arn);
+                record_purge_backoff(dobj, &tgt_client.arn);
                 error!(
                     event = EVENT_REPLICATION_PURGE_OBJECT_LOCK_DENIED,
                     component = LOG_COMPONENT_ECSTORE,
@@ -3001,11 +3795,22 @@ fn replication_status_writeback_options(
     roi: &ReplicateObjectInfo,
     replication_lock_guard: &rustfs_lock::NamespaceLockGuard,
     new_replication_internal: Option<&String>,
+    target_version_ledger: &[(String, String)],
     mode: ReplicationStatusWritebackMode,
 ) -> ObjectOptions {
     let mut eval_metadata = HashMap::new();
     if let Some(status) = new_replication_internal {
         insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, status.clone());
+    }
+    // One durable key per drifting target: the version id it assigned to this
+    // object version, so a later purge, tag or lock update addresses that id
+    // instead of the source uuid the target never had.
+    for (arn, assigned_version_id) in target_version_ledger {
+        insert_str(
+            &mut eval_metadata,
+            &format!("{SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX}{arn}"),
+            assigned_version_id.clone(),
+        );
     }
     let mut write_opts = ObjectOptions {
         version_id: roi.version_id.map(|version_id| version_id.to_string()),
@@ -3029,10 +3834,12 @@ async fn persist_replication_state_if_current<S: ReplicationStorage>(
     storage: &Arc<S>,
     replication_lock_guard: &rustfs_lock::NamespaceLockGuard,
     new_replication_internal: Option<&String>,
+    target_version_ledger: &[(String, String)],
     mode: ReplicationStatusWritebackMode,
     object_info: &mut ObjectInfo,
 ) -> Result<ReplicationStatePersistOutcome> {
-    let write_opts = replication_status_writeback_options(roi, replication_lock_guard, new_replication_internal, mode);
+    let write_opts =
+        replication_status_writeback_options(roi, replication_lock_guard, new_replication_internal, target_version_ledger, mode);
     match storage.put_object_metadata(&roi.bucket, &roi.name, &write_opts).await {
         Ok(updated) => {
             *object_info = updated;
@@ -3185,7 +3992,15 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
     let mut object_info = roi.to_object_info();
     let mut disposition = ReplicationAttemptDisposition::Persisted;
     let mut suppress_terminal_publication = false;
-    let state_update_needed = roi.replication_status_internal != new_replication_internal || rinfos.replication_resynced();
+    let target_version_ledger: Vec<(String, String)> = rinfos
+        .targets
+        .iter()
+        .filter(|target| !target.is_empty())
+        .filter_map(|target| Some((target.arn.clone(), target.target_version_id.clone()?)))
+        .collect();
+    let state_update_needed = roi.replication_status_internal != new_replication_internal
+        || rinfos.replication_resynced()
+        || !target_version_ledger.is_empty();
     let writeback_mode = replication_status_writeback_mode(state_update_needed);
 
     match persist_replication_state_if_current(
@@ -3193,6 +4008,7 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
         &storage,
         &obj_lock_guard,
         new_replication_internal.as_ref(),
+        &target_version_ledger,
         writeback_mode,
         &mut object_info,
     )
@@ -3393,8 +4209,7 @@ trait ReplicateObjectInfoExt {
         storage: Arc<S>,
         tgt_client: Arc<TargetClient>,
     ) -> ReplicatedTargetInfo;
-    async fn replicate_all<S: ReplicationObjectIO>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>)
-    -> ReplicatedTargetInfo;
+    async fn replicate_all<S: ReplicationStorage>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo;
     fn to_object_info(&self) -> ObjectInfo;
 }
 
@@ -3581,16 +4396,39 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 }
             }
             Err(e) => {
-                if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) {
-                    // Object not on target yet → fall through to PUT.
-                } else if is_version_id_format_mismatch(&e) {
-                    // Version-ID format mismatch: retry without versionId and compare ETags.
-                    match head_object_fallback(&tgt_client, &object).await {
-                        Ok(Some(oi)) if replication_etags_match(object_info.etag.as_deref(), oi.e_tag.as_deref()) => {
+                let ledger_version_id = ledger_target_version_id(&object_info.user_defined, &tgt_client.arn);
+                // A fresh write has no replica to find by content: an older
+                // generation with the same bytes would be mistaken for one.
+                // Only the ledger (a lost response of this very version) and
+                // the AWS-style format fallback apply here.
+                if let Some(fallback) = replica_head_fallback(
+                    &tgt_client,
+                    ReplicaSource {
+                        bucket: &bucket,
+                        object: &object,
+                        version_id: self.version_id,
+                        etag: object_info.etag.as_deref(),
+                        ledger_version_id: ledger_version_id.as_deref(),
+                    },
+                    None,
+                    &e,
+                )
+                .await
+                {
+                    match fallback {
+                        Ok(Some(located))
+                            if replication_etags_match(object_info.etag.as_deref(), located.head.e_tag.as_deref()) =>
+                        {
                             if ssec_audit_required
-                                && !settle_ssec_passthrough_evidence(&oi, &tgt_client, &bucket, &object, &mut rinfo).await
+                                && !settle_ssec_passthrough_evidence(&located.head, &tgt_client, &bucket, &object, &mut rinfo)
+                                    .await
                             {
                                 return rinfo;
+                            }
+                            if let Some(assigned) = drifted_replica_version_id(&located, self.version_id)
+                                && ledger_version_id.as_deref() != Some(assigned)
+                            {
+                                rinfo.target_version_id = Some(assigned.to_string());
                             }
                             rinfo.replication_status = ReplicationStatusType::Completed;
                             rinfo.replication_resynced = true;
@@ -3615,6 +4453,8 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                             return rinfo;
                         }
                     }
+                } else if head_object_not_found(&e) {
+                    // Object not on target yet → fall through to PUT.
                 } else {
                     rinfo.error = Some(e.to_string());
                     warn!(
@@ -3696,9 +4536,9 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        if let Some(err) = if is_multipart {
-            drop(gr);
-            let result = replicate_object_with_multipart(MultipartReplicationContext {
+        let source_version_id = self.version_id;
+        let assigned_version_id = if is_multipart {
+            replicate_object_with_multipart(MultipartReplicationContext {
                 storage: storage.clone(),
                 cli: tgt_client.clone(),
                 src_bucket: &bucket,
@@ -3708,13 +4548,13 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 obj_opts: &obj_opts,
                 arn: &rinfo.arn,
                 put_opts,
+                full_stream: Some(gr.stream),
             })
-            .await;
-            result.err()
+            .await
         } else {
             gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
             let byte_stream = async_read_to_bytestream(gr.stream);
-            let result = tgt_client
+            tgt_client
                 .put_object(&tgt_client.bucket, &object, transfer_size, byte_stream, &put_opts)
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))
@@ -3725,27 +4565,32 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         response.version_id.as_deref(),
                     );
                     verify_single_part_replica(&object_info, &response, obj_opts.raw_data_movement_read)
-                });
-            result.err()
-        } {
-            rinfo.replication_status = ReplicationStatusType::Failed;
-            rinfo.error = Some(err.to_string());
-            warn!(
-                event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %bucket,
-                target_bucket = %tgt_client.bucket,
-                arn = %tgt_client.arn,
-                object = %object,
-                operation = "put_object",
-                error = ?err,
-                "Replication target operation failed"
-            );
+                        .map(|()| response.version_id)
+                })
+        };
+        let assigned_version_id = match assigned_version_id {
+            Ok(assigned_version_id) => assigned_version_id,
+            Err(err) => {
+                rinfo.replication_status = ReplicationStatusType::Failed;
+                rinfo.error = Some(err.to_string());
+                warn!(
+                    event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = %bucket,
+                    target_bucket = %tgt_client.bucket,
+                    arn = %tgt_client.arn,
+                    object = %object,
+                    operation = "put_object",
+                    error = ?err,
+                    "Replication target operation failed"
+                );
 
-            mark_replication_target_offline_if_needed(&tgt_client, &err).await;
-            return rinfo;
-        }
+                mark_replication_target_offline_if_needed(&tgt_client, &err).await;
+                return rinfo;
+            }
+        };
+        rinfo.target_version_id = assigned_target_version_id(assigned_version_id, source_version_id);
 
         // First SSE-C passthrough PUT against this target: verify the replica
         // kept its decryption material before reporting COMPLETED.
@@ -3761,11 +4606,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         rinfo
     }
 
-    async fn replicate_all<S: ReplicationObjectIO>(
-        &self,
-        storage: Arc<S>,
-        tgt_client: Arc<TargetClient>,
-    ) -> ReplicatedTargetInfo {
+    async fn replicate_all<S: ReplicationStorage>(&self, storage: Arc<S>, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
         let start_time = OffsetDateTime::now_utc();
 
         let bucket = self.bucket.clone();
@@ -3833,6 +4674,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
 
         let Some((replication_action, object_info)) = resolve_replicate_all_action(
             ReplicateAllActionContext {
+                siblings: &storage,
                 roi: self,
                 tgt_client: &tgt_client,
                 bucket: &bucket,
@@ -3877,7 +4719,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             }
         };
 
-        if let Some(err) = replicate_all_payload_to_target(
+        match replicate_all_payload_to_target(
             ReplicateAllPayloadContext {
                 storage: &storage,
                 tgt_client: &tgt_client,
@@ -3894,8 +4736,13 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         )
         .await
         {
-            fail_replicate_all_put_object(&mut rinfo, &tgt_client, &bucket, &object, &err, start_time).await;
-            return rinfo;
+            Ok(assigned_version_id) => {
+                rinfo.target_version_id = assigned_target_version_id(assigned_version_id, self.version_id);
+            }
+            Err(err) => {
+                fail_replicate_all_put_object(&mut rinfo, &tgt_client, &bucket, &object, &err, start_time).await;
+                return rinfo;
+            }
         }
 
         // First SSE-C passthrough PUT against this target: verify the replica
@@ -4128,6 +4975,9 @@ fn apply_replication_resync_timestamp(rinfo: &mut ReplicatedTargetInfo, reset_id
 
 /// Borrowed inputs for [`resolve_replicate_all_action`].
 struct ReplicateAllActionContext<'a> {
+    /// Sibling ledgers of the source key, to disown content-identity
+    /// candidates other generations already claim.
+    siblings: &'a dyn SiblingLedger,
     roi: &'a ReplicateObjectInfo,
     tgt_client: &'a Arc<TargetClient>,
     bucket: &'a str,
@@ -4149,6 +4999,7 @@ async fn resolve_replicate_all_action(
     rinfo: &mut ReplicatedTargetInfo,
 ) -> Option<(ReplicationAction, ObjectInfo)> {
     let ReplicateAllActionContext {
+        siblings,
         roi,
         tgt_client,
         bucket,
@@ -4214,27 +5065,76 @@ async fn resolve_replicate_all_action(
             }
         }
         Err(e) => {
-            if is_version_id_format_mismatch(&e) {
-                // Version-ID format mismatch: retry without versionId and compare ETags.
-                match head_object_fallback(tgt_client, object).await {
-                    Ok(Some(oi)) => {
+            let ledger_version_id = ledger_target_version_id(&object_info.user_defined, &tgt_client.arn);
+            if let Some(fallback) = replica_head_fallback(
+                tgt_client,
+                ReplicaSource {
+                    bucket,
+                    object,
+                    version_id: roi.version_id,
+                    etag: object_info.etag.as_deref(),
+                    ledger_version_id: ledger_version_id.as_deref(),
+                },
+                Some(siblings),
+                &e,
+            )
+            .await
+            {
+                match fallback {
+                    Ok(Some(located)) => {
+                        let oi = &located.head;
                         let etags_match = replication_etags_match(object_info.etag.as_deref(), oi.e_tag.as_deref());
                         if require_existing_target && !etags_match {
                             rinfo.error = Some("replica metadata target does not contain matching object data".to_string());
                             rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
                             return None;
                         }
-                        replication_action = if etags_match {
-                            if ssec_audit_required
-                                && !settle_ssec_passthrough_evidence(&oi, tgt_client, bucket, object, rinfo).await
+                        if etags_match
+                            && ssec_audit_required
+                            && !settle_ssec_passthrough_evidence(oi, tgt_client, bucket, object, rinfo).await
+                        {
+                            rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+                            return None;
+                        }
+                        if etags_match && let Some(assigned) = drifted_replica_version_id(&located, roi.version_id) {
+                            // The replica lives under an id the target minted:
+                            // record it (the ledger every later mutation
+                            // resolves through) and apply metadata in place —
+                            // the PUT transport below would mint another
+                            // version instead of updating this one.
+                            if ledger_version_id.as_deref() != Some(assigned) {
+                                rinfo.target_version_id = Some(assigned.to_string());
+                            }
+                            if let Err(err) =
+                                sync_drifted_replica_metadata(tgt_client, object, &object_info, &located, roi.op_type).await
                             {
+                                rinfo.replication_status = ReplicationStatusType::Failed;
+                                rinfo.error = Some(err.to_string());
+                                warn!(
+                                    event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                                    bucket = %bucket,
+                                    object = %object,
+                                    arn = %tgt_client.arn,
+                                    operation = "sync_replica_metadata",
+                                    error = %err,
+                                    "Replication target operation failed"
+                                );
+                                mark_replication_target_offline_if_needed(tgt_client, &err).await;
                                 rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
                                 return None;
                             }
-                            ReplicationAction::None
+                            // Converged in place: the caller's `None` branch
+                            // records the sync without running the PUT.
+                            replication_action = ReplicationAction::None;
                         } else {
-                            ReplicationAction::All
-                        };
+                            replication_action = if etags_match {
+                                ReplicationAction::None
+                            } else {
+                                ReplicationAction::All
+                            };
+                        }
                     }
                     Ok(None) => {
                         if require_existing_target {
@@ -4268,7 +5168,7 @@ async fn resolve_replicate_all_action(
                         return None;
                     }
                 }
-            } else if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) {
+            } else if head_object_not_found(&e) {
                 if require_existing_target {
                     rinfo.error = Some("replica metadata target does not contain this object version".to_string());
                     rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
@@ -4358,24 +5258,34 @@ struct ReplicateAllPayloadContext<'a, S: ReplicationObjectIO> {
     put_opts: PutObjectOptions,
 }
 
+/// The ledger entry a successful write leaves behind: the id the target
+/// answered with when it is not the source id. Adopting targets record
+/// nothing, so the ledger only ever grows on drifting targets.
+fn assigned_target_version_id(assigned_version_id: Option<String>, source_version_id: Option<Uuid>) -> Option<String> {
+    let source_version_id = source_version_id.map(|version_id| version_id.to_string());
+    assigned_version_id
+        .filter(|assigned| !assigned.is_empty())
+        .filter(|assigned| source_version_id.as_deref() != Some(assigned.as_str()))
+}
+
 /// Ship the object payload to the replication target over the multipart or
-/// single-put transport, returning the transport error when the upload fails.
+/// single-put transport. Returns the version id the target assigned (when it
+/// reported one), or the transport error when the upload fails.
 async fn replicate_all_payload_to_target<S: ReplicationObjectIO>(
     ctx: ReplicateAllPayloadContext<'_, S>,
     mut gr: GetObjectReader,
-) -> Option<std::io::Error> {
+) -> std::io::Result<Option<String>> {
     // Fail before streaming a body the target is required to reject: an S3
     // PutObject caps at 5 GiB, and this route is chosen by the source object's
     // storage shape rather than its size (rustfs#6825).
     if let Some(reason) = replication_single_put_size_error(ctx.is_multipart, ctx.transfer_size, ctx.object_info.etag.as_deref())
     {
         drop(gr);
-        return Some(std::io::Error::other(reason));
+        return Err(std::io::Error::other(reason));
     }
 
     if ctx.is_multipart {
-        drop(gr);
-        let result = replicate_object_with_multipart(MultipartReplicationContext {
+        replicate_object_with_multipart(MultipartReplicationContext {
             storage: ctx.storage.clone(),
             cli: ctx.tgt_client.clone(),
             src_bucket: ctx.bucket,
@@ -4385,14 +5295,13 @@ async fn replicate_all_payload_to_target<S: ReplicationObjectIO>(
             obj_opts: ctx.obj_opts,
             arn: ctx.arn,
             put_opts: ctx.put_opts,
+            full_stream: Some(gr.stream),
         })
-        .await;
-        result.err()
+        .await
     } else {
         gr.stream = wrap_with_bandwidth_monitor(gr.stream, &ctx.put_opts, ctx.bucket, ctx.arn);
         let byte_stream = async_read_to_bytestream(gr.stream);
-        let result = ctx
-            .tgt_client
+        ctx.tgt_client
             .put_object(&ctx.tgt_client.bucket, ctx.object, ctx.transfer_size, byte_stream, &ctx.put_opts)
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))
@@ -4403,8 +5312,8 @@ async fn replicate_all_payload_to_target<S: ReplicationObjectIO>(
                     response.version_id.as_deref(),
                 );
                 verify_single_part_replica(ctx.object_info, &response, ctx.obj_opts.raw_data_movement_read)
-            });
-        result.err()
+                    .map(|()| response.version_id)
+            })
     }
 }
 
@@ -4458,9 +5367,15 @@ struct MultipartReplicationContext<'a, S: ReplicationObjectIO> {
     obj_opts: &'a ObjectOptions,
     arn: &'a str,
     put_opts: PutObjectOptions,
+    full_stream: Option<Box<dyn AsyncRead + Unpin + Send + Sync>>,
 }
 
-async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartReplicationContext<'_, S>) -> std::io::Result<()> {
+async fn replicate_object_with_multipart<S: ReplicationObjectIO>(
+    mut ctx: MultipartReplicationContext<'_, S>,
+) -> std::io::Result<Option<String>> {
+    if ctx.obj_opts.raw_data_movement_read || !ctx.object_info.is_compressed() {
+        ctx.full_stream = None;
+    }
     let mut attempts = 1;
     let upload_id = loop {
         match ctx
@@ -4603,15 +5518,15 @@ fn target_upload_already_removed(err: &S3ClientError) -> bool {
 /// invisible incomplete upload on the target that keeps billing for its parts.
 /// The abort outcome never replaces the transfer error: an abort failure is
 /// only logged and `result` is returned as-is.
-async fn abort_multipart_on_failure<F, Fut, R>(
-    result: std::io::Result<()>,
+async fn abort_multipart_on_failure<F, Fut, R, T>(
+    result: std::io::Result<T>,
     dst_bucket: &str,
     object: &str,
     upload_id: &str,
     arn: &str,
     abort: F,
     schedule_abort_retry: R,
-) -> std::io::Result<()>
+) -> std::io::Result<T>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<(), S3ClientError>>,
@@ -4640,10 +5555,77 @@ where
     result
 }
 
+#[derive(Debug)]
+struct MultipartReplicationReadPlan {
+    part_number: i32,
+    part_size: i64,
+    range: Option<HTTPRangeSpec>,
+    next_offset: i64,
+}
+
+#[derive(Clone)]
+struct SharedReplicationReader(Arc<StdMutex<Box<dyn AsyncRead + Unpin + Send + Sync>>>);
+
+impl AsyncRead for SharedReplicationReader {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        // UploadPart owns its body, but successive parts consume one source.
+        // The mutex only covers polling; no guard survives an await.
+        let mut reader = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("replication source stream lock poisoned"))?;
+        Pin::new(&mut **reader).poll_read(cx, buf)
+    }
+}
+
+fn multipart_replication_read_plan(
+    object_info: &ObjectInfo,
+    obj_opts: &ObjectOptions,
+    mut input: ReplicationMultipartPartInput,
+    stored_size: usize,
+    is_last: bool,
+) -> std::io::Result<MultipartReplicationReadPlan> {
+    let empty_last_part = is_last && input.part_size == 0 && stored_size == 0;
+    // Raw reads address stored bytes. Only untransformed legacy parts may
+    // substitute their stored size for a missing logical size.
+    if obj_opts.raw_data_movement_read || (input.part_size == 0 && !object_info.is_compressed() && !object_info.is_encrypted()) {
+        input.part_size = i64::try_from(stored_size).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "multipart replication stored part size exceeds i64")
+        })?;
+    }
+    if empty_last_part {
+        if input.offset < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "empty multipart replication part has a negative offset",
+            ));
+        }
+        let part_number = i32::try_from(input.part_number)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "multipart replication part number exceeds i32"))?;
+        return Ok(MultipartReplicationReadPlan {
+            part_number,
+            part_size: 0,
+            range: None,
+            next_offset: input.offset,
+        });
+    }
+    let plan = replication_multipart_part_plan(input).map_err(std::io::Error::other)?;
+    Ok(MultipartReplicationReadPlan {
+        part_number: plan.part_number,
+        part_size: plan.part_size,
+        range: Some(HTTPRangeSpec {
+            is_suffix_length: false,
+            start: plan.range.start,
+            end: plan.range.end,
+        }),
+        next_offset: plan.next_offset,
+    })
+}
+
 async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
     ctx: MultipartReplicationContext<'_, S>,
     upload_id: &str,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<String>> {
     let MultipartReplicationContext {
         storage,
         cli,
@@ -4654,41 +5636,56 @@ async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
         obj_opts,
         arn,
         put_opts,
+        full_stream,
     } = ctx;
 
+    let full_stream = full_stream.map(|reader| SharedReplicationReader(Arc::new(StdMutex::new(reader))));
     let mut uploaded_parts: Vec<CompletedPart> = Vec::new();
 
     let mut header_size = replication_put_object_header_size(&put_opts);
     let mut offset: i64 = 0;
-    for part_info in object_info.parts.iter() {
-        // Ciphertext passthrough (raw read) ranges over the stored part
-        // bytes; decrypted reads range over the logical plaintext parts.
-        let part_size = if obj_opts.raw_data_movement_read {
-            part_info.size as i64
-        } else {
-            part_info.actual_size
-        };
-        let part_plan = replication_multipart_part_plan(ReplicationMultipartPartInput {
-            offset,
-            part_number: part_info.number,
-            part_size,
-        })
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
-        let range_spec = HTTPRangeSpec {
-            is_suffix_length: false,
-            start: part_plan.range.start,
-            end: part_plan.range.end,
-        };
+    for (index, part_info) in object_info.parts.iter().enumerate() {
+        let part_plan = multipart_replication_read_plan(
+            object_info,
+            obj_opts,
+            ReplicationMultipartPartInput {
+                offset,
+                part_number: part_info.number,
+                part_size: part_info.actual_size,
+            },
+            part_info.size,
+            index + 1 == object_info.parts.len(),
+        )?;
         offset = part_plan.next_offset;
 
-        let part_reader = storage
-            .get_object_reader(src_bucket, object, Some(range_spec), HeaderMap::new(), obj_opts)
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        let part_stream = wrap_with_bandwidth_monitor_with_header(part_reader.stream, src_bucket, arn, header_size);
+        let byte_stream = if let Some(reader) = &full_stream {
+            let limit = u64::try_from(part_plan.part_size)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "negative multipart replication part size"))?;
+            let part_stream =
+                wrap_with_bandwidth_monitor_with_header(Box::new(reader.clone().take(limit)), src_bucket, arn, header_size);
+            async_read_to_bytestream(part_stream)
+        } else if let Some(range_spec) = part_plan.range {
+            let part_reader = storage
+                .get_object_reader(src_bucket, object, Some(range_spec), HeaderMap::new(), obj_opts)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let part_stream = wrap_with_bandwidth_monitor_with_header(part_reader.stream, src_bucket, arn, header_size);
+            async_read_to_bytestream(part_stream)
+        } else {
+            ByteStream::from_static(b"")
+        };
         header_size = 0;
-        let byte_stream = async_read_to_bytestream(part_stream);
+
+        // Passthrough parts are the stored bytes; the replica learns each
+        // part's plaintext length from this header (backlog#2363).
+        let mut part_options = PutObjectPartOptions::default();
+        if obj_opts.raw_data_movement_read && part_info.actual_size > 0 {
+            rustfs_utils::http::insert_header(
+                &mut part_options.custom_header,
+                rustfs_utils::http::SUFFIX_REPLICATION_PART_ACTUAL_SIZE,
+                part_info.actual_size.to_string(),
+            );
+        }
 
         let object_part = cli
             .put_object_part(
@@ -4698,7 +5695,7 @@ async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
                 part_plan.part_number,
                 part_plan.part_size,
                 byte_stream,
-                &PutObjectPartOptions { ..Default::default() },
+                &part_options,
             )
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -4711,6 +5708,25 @@ async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
                 .e_tag(etag)
                 .build(),
         );
+    }
+
+    if let Some(mut reader) = full_stream {
+        // Range planning also trusts the recorded logical part boundaries.
+        // A full decoded stream avoids repeating or skipping bytes when those
+        // boundaries are stale, and its EOF must precede publication.
+        let expected_size = object_info
+            .get_actual_size()
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        let mut remaining = [0_u8; 1];
+        if offset != expected_size || reader.read(&mut remaining).await? != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compressed replication part lengths do not cover the complete source",
+            ));
+        }
+        // Releasing the reader also releases the source read lock, before
+        // CompleteMultipartUpload or replication status writes can run.
+        drop(reader);
     }
 
     let actual_size = replication_multipart_complete_actual_size(&object_info.user_defined);
@@ -4738,12 +5754,179 @@ async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
     // a version that never existed.
     audit_target_version_identity(&cli, &put_opts.internal.source_version_id, completed.version_id());
 
-    Ok(())
+    Ok(completed.version_id().map(str::to_string))
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::replication_filemeta_boundary::ReplicateTargetDecision;
+    use super::super::replication_object_decision_boundary::ReplicationMultipartPlanError;
+
+    #[test]
+    fn multipart_read_plan_preserves_legacy_plain_part_ranges() {
+        const MIB: usize = 1024 * 1024;
+        let object_info = ObjectInfo {
+            etag: Some("0123456789abcdef0123456789abcdef".to_string()),
+            size: 6 * 1024 * 1024,
+            ..Default::default()
+        };
+        let mut offset = 0;
+        for (part_number, stored_size, start, end) in [
+            (1, 5 * MIB, 0, 5 * 1024 * 1024 - 1),
+            (2, MIB, 5 * 1024 * 1024, 6 * 1024 * 1024 - 1),
+        ] {
+            let plan = multipart_replication_read_plan(
+                &object_info,
+                &ObjectOptions::default(),
+                ReplicationMultipartPartInput {
+                    offset,
+                    part_number,
+                    part_size: 0,
+                },
+                stored_size,
+                part_number == 2,
+            )
+            .expect("legacy plain parts must use their stored sizes");
+            assert_eq!(plan.part_number, i32::try_from(part_number).expect("part number fits"));
+            assert_eq!(plan.part_size, i64::try_from(stored_size).expect("stored size fits"));
+            let range = plan.range.expect("a nonempty part must read a range");
+            assert!(!range.is_suffix_length);
+            assert_eq!((range.start, range.end), (start, end));
+            assert_eq!(plan.next_offset, end + 1);
+            offset = plan.next_offset;
+        }
+        assert_eq!(offset, object_info.size);
+    }
+
+    #[test]
+    fn multipart_read_plan_distinguishes_transformed_and_raw_sizes() {
+        for metadata in [
+            HashMap::from([("x-rustfs-internal-compression".to_string(), "klauspost/compress/s2".to_string())]),
+            HashMap::from([("x-amz-server-side-encryption".to_string(), "AES256".to_string())]),
+        ] {
+            let object_info = ObjectInfo {
+                user_defined: Arc::new(metadata),
+                ..Default::default()
+            };
+            assert!(object_info.is_compressed() || object_info.is_encrypted());
+            for raw in [false, true] {
+                for actual_size in [-1, 0, 5] {
+                    let result = multipart_replication_read_plan(
+                        &object_info,
+                        &ObjectOptions {
+                            raw_data_movement_read: raw,
+                            ..Default::default()
+                        },
+                        ReplicationMultipartPartInput {
+                            offset: 7,
+                            part_number: 2,
+                            part_size: actual_size,
+                        },
+                        9,
+                        true,
+                    );
+                    if !raw && actual_size <= 0 {
+                        let err = result.expect_err("transformed reads cannot substitute physical bytes for unknown plaintext");
+                        assert!(matches!(
+                            err.get_ref().and_then(|err| err.downcast_ref::<ReplicationMultipartPlanError>()),
+                            Some(ReplicationMultipartPlanError::InvalidPartSize { part_size })
+                                if *part_size == actual_size
+                        ));
+                    } else {
+                        let plan = result.expect("the selected representation has a known positive size");
+                        let expected_size = if raw { 9 } else { 5 };
+                        assert_eq!(plan.part_number, 2);
+                        assert_eq!(plan.part_size, expected_size);
+                        let range = plan.range.expect("a nonempty part must read a range");
+                        assert_eq!((range.start, range.end), (7, 7 + expected_size - 1));
+                        assert_eq!(plan.next_offset, 7 + expected_size);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multipart_read_plan_retains_an_empty_last_part_without_advancing() {
+        for offset in [5 * 1024 * 1024, i64::MAX] {
+            for raw in [false, true] {
+                let plan = multipart_replication_read_plan(
+                    &ObjectInfo::default(),
+                    &ObjectOptions {
+                        raw_data_movement_read: raw,
+                        ..Default::default()
+                    },
+                    ReplicationMultipartPartInput {
+                        offset,
+                        part_number: 2,
+                        part_size: 0,
+                    },
+                    0,
+                    true,
+                )
+                .expect("an empty final part needs no range read");
+                assert_eq!(plan.part_number, 2);
+                assert_eq!(plan.part_size, 0);
+                assert!(plan.range.is_none());
+                assert_eq!(plan.next_offset, offset);
+            }
+        }
+    }
+
+    #[test]
+    fn multipart_read_plan_rejects_invalid_empty_parts_and_ranges() {
+        for (offset, part_number, actual_size, stored_size, is_last) in [
+            (0, 1, 0, 0, false),
+            (0, 2, -1, 0, true),
+            (0, 2, -1, 9, true),
+            (-1, 2, 0, 0, true),
+            (0, usize::try_from(i32::MAX).expect("i32 fits usize") + 1, 0, 0, true),
+            (i64::MAX, 2, 1, 1, true),
+            (i64::MAX, 2, 2, 2, true),
+        ] {
+            let err = multipart_replication_read_plan(
+                &ObjectInfo::default(),
+                &ObjectOptions::default(),
+                ReplicationMultipartPartInput {
+                    offset,
+                    part_number,
+                    part_size: actual_size,
+                },
+                stored_size,
+                is_last,
+            )
+            .expect_err("invalid part metadata must not become a successful transport plan");
+            assert!(
+                err.kind() == std::io::ErrorKind::InvalidData
+                    || err.get_ref().is_some_and(|err| { err.is::<ReplicationMultipartPlanError>() }),
+                "the failure must preserve a typed metadata or planner error: {err}"
+            );
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn multipart_read_plan_rejects_physical_size_overflow() {
+        for raw in [false, true] {
+            let err = multipart_replication_read_plan(
+                &ObjectInfo::default(),
+                &ObjectOptions {
+                    raw_data_movement_read: raw,
+                    ..Default::default()
+                },
+                ReplicationMultipartPartInput {
+                    offset: 0,
+                    part_number: 1,
+                    part_size: 0,
+                },
+                usize::MAX,
+                true,
+            )
+            .expect_err("a physical size outside the range API must be rejected before casting");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(err.to_string(), "multipart replication stored part size exceeds i64");
+        }
+    }
 
     #[test]
     fn same_state_terminal_retry_uses_validate_only() {
@@ -4826,6 +6009,7 @@ mod tests {
             &ReplicateObjectInfo::default(),
             &guard,
             None,
+            &[],
             ReplicationStatusWritebackMode::ValidateOnly,
         );
         forced_lost.store(true, std::sync::atomic::Ordering::Release);
@@ -5087,6 +6271,7 @@ mod tests {
 
         let action = resolve_replicate_all_action(
             ReplicateAllActionContext {
+                siblings: &NoSiblingLedger,
                 roi: &roi,
                 tgt_client: &target,
                 bucket: &roi.bucket,
@@ -5131,6 +6316,7 @@ mod tests {
 
         let action = resolve_replicate_all_action(
             ReplicateAllActionContext {
+                siblings: &NoSiblingLedger,
                 roi: &roi,
                 tgt_client: &target,
                 bucket: &roi.bucket,
@@ -5150,6 +6336,679 @@ mod tests {
 
     async fn register_test_target(target: &Arc<TargetClient>) {
         ReplicationTargetStore::register_test_target(target).await;
+    }
+
+    const DRIFTED_ASSIGNED_VERSION_ID: &str = "001788697733811332140-fR6j6uXKV-";
+    const DRIFTED_ETAG: &str = "9a0364b9e99bb480dd25e1f0284c8555";
+
+    /// The Wasabi shape (rustfs/backlog#2340): a version-addressed HEAD with
+    /// the source uuid answers 404 (not the AWS 400), ListObjectVersions shows
+    /// the id the target minted, and a HEAD by that id succeeds. Serves exactly
+    /// `requests` connections and returns the request lines it saw.
+    fn spawn_drifted_target_server(requests: usize) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test HTTP listener should bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("test HTTP listener should have an address"));
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().expect("test HTTP client should connect");
+                let mut request = [0_u8; 8192];
+                let bytes_read = stream.read(&mut request).expect("test HTTP request should be read");
+                let text = String::from_utf8_lossy(&request[..bytes_read]).to_string();
+                let request_line = text.lines().next().unwrap_or_default().to_string();
+                let response = if request_line.starts_with("HEAD ") {
+                    if request_line.contains(&format!("versionId={DRIFTED_ASSIGNED_VERSION_ID}")) {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nETag: \"{DRIFTED_ETAG}\"\r\nContent-Length: 4\r\nLast-Modified: Sun, 06 Sep 2026 10:00:00 GMT\r\nConnection: close\r\n\r\n"
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    }
+                } else if request_line.starts_with("GET ") && request_line.contains("versions") {
+                    let body = format!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>target-bucket</Name><Prefix>object</Prefix><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Version><Key>object</Key><VersionId>{DRIFTED_ASSIGNED_VERSION_ID}</VersionId><IsLatest>true</IsLatest><LastModified>2026-09-06T10:00:00.000Z</LastModified><ETag>&quot;{DRIFTED_ETAG}&quot;</ETag><Size>4</Size><StorageClass>STANDARD</StorageClass></Version></ListVersionsResult>"
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    "HTTP/1.1 500 Unexpected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("test HTTP response should be written");
+                seen.push(request_line);
+            }
+            seen
+        });
+        (endpoint, handle)
+    }
+
+    fn drifted_roi_and_object() -> (ReplicateObjectInfo, ObjectInfo) {
+        let roi = ReplicateObjectInfo {
+            bucket: "source".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            op_type: ReplicationType::Heal,
+            replication_status: ReplicationStatusType::Pending,
+            etag: Some(DRIFTED_ETAG.to_string()),
+            size: 4,
+            ..Default::default()
+        };
+        let object_info = ObjectInfo {
+            bucket: roi.bucket.clone(),
+            name: roi.name.clone(),
+            version_id: roi.version_id,
+            etag: Some(DRIFTED_ETAG.to_string()),
+            size: 4,
+            ..Default::default()
+        };
+        (roi, object_info)
+    }
+
+    #[tokio::test]
+    async fn heal_redrive_locates_replica_by_etag_on_target_that_mints_own_version_ids() {
+        let (endpoint, server) = spawn_drifted_target_server(3);
+        let target = test_target_client(endpoint);
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let (roi, object_info) = drifted_roi_and_object();
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+
+        let action = resolve_replicate_all_action(
+            ReplicateAllActionContext {
+                siblings: &NoSiblingLedger,
+                roi: &roi,
+                tgt_client: &target,
+                bucket: &roi.bucket,
+                object: &roi.name,
+                start_time: OffsetDateTime::now_utc(),
+                ssec_audit_required: false,
+            },
+            object_info,
+            &mut rinfo,
+        )
+        .await;
+
+        assert!(
+            matches!(action, Some((ReplicationAction::None, _))),
+            "a replica located by content identity must not be re-driven: {action:?}"
+        );
+        assert!(rinfo.error.is_none(), "{:?}", rinfo.error);
+        assert_eq!(
+            rinfo.target_version_id.as_deref(),
+            Some(DRIFTED_ASSIGNED_VERSION_ID),
+            "a replica located by content identity must be recorded in the target-version ledger"
+        );
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 3, "HEAD by source id, ListObjectVersions, HEAD by assigned id: {seen:?}");
+        assert!(seen[0].starts_with("HEAD ") && seen[0].contains(&roi.version_id.unwrap().to_string()));
+        assert!(seen[1].starts_with("GET ") && seen[1].contains("prefix=object"), "{}", seen[1]);
+        assert!(seen[2].starts_with("HEAD ") && seen[2].contains(DRIFTED_ASSIGNED_VERSION_ID));
+    }
+
+    #[tokio::test]
+    async fn head_not_found_still_replicates_when_identity_contract_is_unknown() {
+        // Same 404, but the target never revealed whether it adopts version
+        // ids: a 404 keeps meaning "replica missing" (adopting targets, e.g.
+        // RustFS/MinIO peers, must not skip a genuinely missing version).
+        let (endpoint, server) = spawn_head_status_server(404);
+        let target = test_target_client(endpoint);
+        let (roi, object_info) = drifted_roi_and_object();
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+
+        let action = resolve_replicate_all_action(
+            ReplicateAllActionContext {
+                siblings: &NoSiblingLedger,
+                roi: &roi,
+                tgt_client: &target,
+                bucket: &roi.bucket,
+                object: &roi.name,
+                start_time: OffsetDateTime::now_utc(),
+                ssec_audit_required: false,
+            },
+            object_info,
+            &mut rinfo,
+        )
+        .await;
+
+        assert!(matches!(action, Some((ReplicationAction::All, _))));
+        server.join().expect("test HTTP server should finish");
+    }
+
+    #[tokio::test]
+    async fn resync_verification_counts_drifted_replica_as_replicated() {
+        let (endpoint, server) = spawn_drifted_target_server(3);
+        let target = test_target_client(endpoint);
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let (roi, _) = drifted_roi_and_object();
+        let mut st = TargetReplicationResyncStatus::default();
+
+        let head_result =
+            head_object_for_worker(target.as_ref(), &target.bucket, &roi.name, roi.version_id.map(|v| v.to_string())).await;
+        let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, &target).await;
+
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!((size, st.replicated_count, st.failed_count), (4, 1, 0));
+        server.join().expect("test HTTP server should finish");
+    }
+
+    /// Serves exactly `requests` connections, answering each from
+    /// `respond(request_line)`, and returns the request lines it saw. Reads
+    /// the whole request (headers plus `Content-Length` body, honoring
+    /// `Expect: 100-continue`) so a PUT with a body is not cut off.
+    fn spawn_scripted_target_server(
+        requests: usize,
+        respond: impl Fn(&str) -> String + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test HTTP listener should bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("test HTTP listener should have an address"));
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().expect("test HTTP client should connect");
+                let mut raw = Vec::new();
+                let mut chunk = [0_u8; 8192];
+                let header_end = loop {
+                    let bytes_read = stream.read(&mut chunk).expect("test HTTP request should be read");
+                    if bytes_read == 0 {
+                        break raw.len();
+                    }
+                    raw.extend_from_slice(&chunk[..bytes_read]);
+                    if let Some(position) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break position + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&raw[..header_end]).to_string();
+                let content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    })
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if head.lines().any(|line| line.to_ascii_lowercase().starts_with("expect:")) && content_length > 0 {
+                    stream
+                        .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                        .expect("test HTTP continue should be written");
+                }
+                while raw.len() < header_end + content_length {
+                    let bytes_read = stream.read(&mut chunk).expect("test HTTP body should be read");
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..bytes_read]);
+                }
+                let request_line = head.lines().next().unwrap_or_default().to_string();
+                stream
+                    .write_all(respond(&request_line).as_bytes())
+                    .expect("test HTTP response should be written");
+                seen.push(request_line);
+            }
+            seen
+        });
+        (endpoint, handle)
+    }
+
+    fn empty_response(status: &str) -> String {
+        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    fn xml_response(status: &str, body: String) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn list_versions_response(version_ids: &[&str]) -> String {
+        let versions = version_ids
+            .iter()
+            .enumerate()
+            .map(|(index, version_id)| {
+                format!(
+                    "<Version><Key>object</Key><VersionId>{version_id}</VersionId><IsLatest>{}</IsLatest><LastModified>2026-09-06T10:00:0{index}.000Z</LastModified><ETag>&quot;{DRIFTED_ETAG}&quot;</ETag><Size>4</Size><StorageClass>STANDARD</StorageClass></Version>",
+                    index == 0
+                )
+            })
+            .collect::<String>();
+        xml_response(
+            "200 OK",
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>target-bucket</Name><Prefix>object</Prefix><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>{versions}</ListVersionsResult>"
+            ),
+        )
+    }
+
+    fn version_purge_dobj(arn: &str) -> DeletedObjectReplicationInfo {
+        let mut state = ReplicationState::default();
+        state.purge_targets.insert(arn.to_string(), VersionPurgeStatusType::Pending);
+        DeletedObjectReplicationInfo {
+            bucket: "source".to_string(),
+            target_arn: arn.to_string(),
+            delete_object: ReplicationDeletedObject {
+                object_name: "object".to_string(),
+                version_id: Some(Uuid::new_v4()),
+                replication_state: Some(state),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn purge_source(ledger: &[(&str, &str)]) -> Arc<VersionPurgeSource> {
+        Arc::new(VersionPurgeSource {
+            etag: Some(DRIFTED_ETAG.to_string()),
+            ledger: ledger
+                .iter()
+                .map(|(arn, version_id)| (arn.to_string(), version_id.to_string()))
+                .collect(),
+            ledger_corrupt: false,
+            claimed_by_siblings: HashMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn version_purge_addresses_the_ledger_version_on_a_target_that_mints_own_ids() {
+        let (endpoint, server) = spawn_scripted_target_server(1, |line| {
+            if line.starts_with("DELETE ") && line.contains(&format!("versionId={DRIFTED_ASSIGNED_VERSION_ID}")) {
+                empty_response("204 No Content")
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        register_test_target(&target).await;
+        let dobj = version_purge_dobj(&target.arn);
+
+        let rinfo =
+            replicate_delete_to_target(&dobj, target.clone(), Some(purge_source(&[(&target.arn, DRIFTED_ASSIGNED_VERSION_ID)])))
+                .await;
+
+        assert_eq!(rinfo.version_purge_status, VersionPurgeStatusType::Complete, "{:?}", rinfo.error);
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 1, "the ledger id is addressed directly, without a lookup: {seen:?}");
+        assert!(
+            !seen[0].contains(&dobj.delete_object.version_id.unwrap().to_string()),
+            "the source uuid must not be sent to a target that never had it: {}",
+            seen[0]
+        );
+        assert!(
+            ReplicationTargetStore::version_identity_capability(&target.arn).version_addressing_unreliable(),
+            "a ledger entry proves the target mints its own ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_purge_without_ledger_locates_the_unique_replica_by_etag() {
+        let (endpoint, server) = spawn_scripted_target_server(2, |line| {
+            if line.starts_with("GET ") && line.contains("versions") {
+                list_versions_response(&[DRIFTED_ASSIGNED_VERSION_ID])
+            } else if line.starts_with("DELETE ") && line.contains(&format!("versionId={DRIFTED_ASSIGNED_VERSION_ID}")) {
+                empty_response("204 No Content")
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        register_test_target(&target).await;
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let dobj = version_purge_dobj(&target.arn);
+
+        let rinfo = replicate_delete_to_target(&dobj, target.clone(), Some(purge_source(&[]))).await;
+
+        assert_eq!(rinfo.version_purge_status, VersionPurgeStatusType::Complete, "{:?}", rinfo.error);
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 2, "ListObjectVersions, then DELETE by the located id: {seen:?}");
+        assert!(seen[0].starts_with("GET ") && seen[0].contains("prefix=object"), "{}", seen[0]);
+        assert!(
+            seen[1].starts_with("DELETE ") && seen[1].contains(DRIFTED_ASSIGNED_VERSION_ID),
+            "{}",
+            seen[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn version_purge_refuses_an_ambiguous_replica_identity_and_backs_off() {
+        let (endpoint, server) = spawn_scripted_target_server(1, |line| {
+            if line.starts_with("GET ") && line.contains("versions") {
+                list_versions_response(&[DRIFTED_ASSIGNED_VERSION_ID, "001788697733811332140-older-generation"])
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        register_test_target(&target).await;
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let dobj = version_purge_dobj(&target.arn);
+        assert!(!purge_backoff_active(&dobj));
+
+        let rinfo = replicate_delete_to_target(&dobj, target.clone(), Some(purge_source(&[]))).await;
+
+        assert_eq!(rinfo.version_purge_status, VersionPurgeStatusType::Failed);
+        assert!(
+            rinfo.error.as_deref().is_some_and(|error| error.contains("ambiguous")),
+            "the refusal must name the deciding evidence: {:?}",
+            rinfo.error
+        );
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 1, "no DELETE may be sent when the replica cannot be told apart: {seen:?}");
+        assert!(purge_backoff_active(&dobj), "an unresolvable purge must not be requeued every heal cycle");
+    }
+
+    #[tokio::test]
+    async fn version_purge_treats_a_missing_replica_as_already_purged() {
+        let (endpoint, server) = spawn_scripted_target_server(1, |line| {
+            if line.starts_with("GET ") && line.contains("versions") {
+                list_versions_response(&[])
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        register_test_target(&target).await;
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let dobj = version_purge_dobj(&target.arn);
+
+        let rinfo = replicate_delete_to_target(&dobj, target.clone(), Some(purge_source(&[]))).await;
+
+        assert_eq!(rinfo.version_purge_status, VersionPurgeStatusType::Complete, "{:?}", rinfo.error);
+        assert_eq!(server.join().expect("test HTTP server should finish").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn version_purge_treats_no_such_version_as_purged() {
+        let (endpoint, server) = spawn_scripted_target_server(1, |line| {
+            if line.starts_with("DELETE ") {
+                xml_response(
+                    "404 Not Found",
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NoSuchVersion</Code><Message>The specified version does not exist.</Message></Error>".to_string(),
+                )
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        register_test_target(&target).await;
+        let dobj = version_purge_dobj(&target.arn);
+
+        let rinfo =
+            replicate_delete_to_target(&dobj, target.clone(), Some(purge_source(&[(&target.arn, DRIFTED_ASSIGNED_VERSION_ID)])))
+                .await;
+
+        assert_eq!(rinfo.version_purge_status, VersionPurgeStatusType::Complete, "{:?}", rinfo.error);
+        assert!(!purge_backoff_active(&dobj));
+        server.join().expect("test HTTP server should finish");
+    }
+
+    #[tokio::test]
+    async fn version_purge_re_resolves_by_etag_when_the_source_id_answers_no_such_version() {
+        // Identity contract unknown (fresh process), no ledger: the first
+        // DELETE goes out by the source uuid. NoSuchVersion there must not
+        // be read as "already gone" while a replica with the source content
+        // still exists under a minted id.
+        let no_such_version = xml_response(
+            "404 Not Found",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NoSuchVersion</Code><Message>The specified version does not exist.</Message></Error>".to_string(),
+        );
+        let (endpoint, server) = spawn_scripted_target_server(3, move |line| {
+            if line.starts_with("DELETE ") && line.contains(&format!("versionId={DRIFTED_ASSIGNED_VERSION_ID}")) {
+                empty_response("204 No Content")
+            } else if line.starts_with("DELETE ") {
+                no_such_version.clone()
+            } else if line.starts_with("GET ") && line.contains("versions") {
+                list_versions_response(&[DRIFTED_ASSIGNED_VERSION_ID])
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        register_test_target(&target).await;
+        let dobj = version_purge_dobj(&target.arn);
+
+        let rinfo = replicate_delete_to_target(&dobj, target.clone(), Some(purge_source(&[]))).await;
+
+        assert_eq!(rinfo.version_purge_status, VersionPurgeStatusType::Complete, "{:?}", rinfo.error);
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(
+            seen.len(),
+            3,
+            "DELETE by source id, ListObjectVersions, DELETE by the located id: {seen:?}"
+        );
+        assert!(seen[0].contains(&dobj.delete_object.version_id.unwrap().to_string()), "{}", seen[0]);
+        assert!(seen[1].starts_with("GET "), "{}", seen[1]);
+        assert!(seen[2].contains(DRIFTED_ASSIGNED_VERSION_ID), "{}", seen[2]);
+        assert!(
+            ReplicationTargetStore::version_identity_capability(&target.arn).version_addressing_unreliable(),
+            "the located replica proves the target mints its own ids"
+        );
+    }
+
+    /// Two same-bytes generations, the older one's replica already claimed
+    /// by its ledger: a purge of the newer (pre-ledger) version must not
+    /// touch it — with the sibling's claim removed the target holds no
+    /// candidate, so the purge is already satisfied there.
+    #[tokio::test]
+    async fn version_purge_disowns_replicas_claimed_by_sibling_ledgers() {
+        let (endpoint, server) = spawn_scripted_target_server(1, |line| {
+            if line.starts_with("GET ") && line.contains("versions") {
+                list_versions_response(&[DRIFTED_ASSIGNED_VERSION_ID])
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        register_test_target(&target).await;
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let dobj = version_purge_dobj(&target.arn);
+        let source = Arc::new(VersionPurgeSource {
+            etag: Some(DRIFTED_ETAG.to_string()),
+            ledger: HashMap::new(),
+            ledger_corrupt: false,
+            claimed_by_siblings: HashMap::from([(target.arn.clone(), HashSet::from([DRIFTED_ASSIGNED_VERSION_ID.to_string()]))]),
+        });
+
+        let rinfo = replicate_delete_to_target(&dobj, target.clone(), Some(source)).await;
+
+        assert_eq!(rinfo.version_purge_status, VersionPurgeStatusType::Complete, "{:?}", rinfo.error);
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 1, "a sibling's replica must never be deleted: {seen:?}");
+    }
+
+    struct ClaimedBySibling(&'static str);
+
+    #[async_trait::async_trait]
+    impl SiblingLedger for ClaimedBySibling {
+        async fn claimed_target_versions(&self, _: &str, _: &str, _: Option<Uuid>, _: &str) -> HashSet<String> {
+            HashSet::from([self.0.to_string()])
+        }
+    }
+
+    /// Heal of a same-bytes newer generation whose PUT never landed: the
+    /// only content match is the older generation's replica (claimed by its
+    /// ledger), so the object must be replicated, not declared converged.
+    #[tokio::test]
+    async fn heal_replicates_a_generation_whose_only_content_match_belongs_to_a_sibling() {
+        let (endpoint, server) = spawn_scripted_target_server(2, |line| {
+            if line.starts_with("HEAD ") {
+                empty_response("404 Not Found")
+            } else if line.starts_with("GET ") && line.contains("versions") {
+                list_versions_response(&[DRIFTED_ASSIGNED_VERSION_ID])
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let (roi, object_info) = drifted_roi_and_object();
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+
+        let action = resolve_replicate_all_action(
+            ReplicateAllActionContext {
+                siblings: &ClaimedBySibling(DRIFTED_ASSIGNED_VERSION_ID),
+                roi: &roi,
+                tgt_client: &target,
+                bucket: &roi.bucket,
+                object: &roi.name,
+                start_time: OffsetDateTime::now_utc(),
+                ssec_audit_required: false,
+            },
+            object_info,
+            &mut rinfo,
+        )
+        .await;
+
+        assert!(matches!(action, Some((ReplicationAction::All, _))), "{action:?}");
+        assert_eq!(server.join().expect("test HTTP server should finish").len(), 2);
+    }
+
+    #[test]
+    fn abandoned_purge_completes_locally_and_keeps_a_finished_target_untouched() {
+        let arn = "arn:rustfs:replication::removed-target";
+        let dobj = version_purge_dobj(arn);
+        let rinfo = abandoned_purge_target_info("source", &dobj, arn);
+        assert_eq!(rinfo.version_purge_status, VersionPurgeStatusType::Complete);
+        assert_eq!(rinfo.arn, arn);
+        assert!(rinfo.error.is_none());
+
+        let mut finished = version_purge_dobj(arn);
+        finished
+            .delete_object
+            .replication_state
+            .as_mut()
+            .expect("purge state")
+            .purge_targets
+            .insert(arn.to_string(), VersionPurgeStatusType::Complete);
+        let rinfo = abandoned_purge_target_info("source", &finished, arn);
+        assert_eq!(rinfo.version_purge_status, VersionPurgeStatusType::Complete);
+    }
+
+    #[tokio::test]
+    async fn version_purge_refuses_a_corrupt_ledger() {
+        let target = test_target_client("http://127.0.0.1:1".to_string());
+        register_test_target(&target).await;
+        let dobj = version_purge_dobj(&target.arn);
+        let source = Arc::new(VersionPurgeSource {
+            etag: Some(DRIFTED_ETAG.to_string()),
+            ledger: HashMap::new(),
+            ledger_corrupt: true,
+            claimed_by_siblings: HashMap::new(),
+        });
+
+        let rinfo = replicate_delete_to_target(&dobj, target.clone(), Some(source)).await;
+
+        assert_eq!(rinfo.version_purge_status, VersionPurgeStatusType::Failed);
+        assert!(
+            rinfo.error.as_deref().is_some_and(|error| error.contains("inconsistent")),
+            "{:?}",
+            rinfo.error
+        );
+        assert!(purge_backoff_active(&dobj));
+    }
+
+    #[tokio::test]
+    async fn metadata_update_on_a_drifted_target_uses_the_tagging_api_instead_of_a_put() {
+        let (endpoint, server) = spawn_scripted_target_server(3, |line| {
+            if line.starts_with("HEAD ") && line.contains(&format!("versionId={DRIFTED_ASSIGNED_VERSION_ID}")) {
+                format!(
+                    "HTTP/1.1 200 OK\r\nETag: \"{DRIFTED_ETAG}\"\r\nContent-Length: 4\r\nx-amz-version-id: {DRIFTED_ASSIGNED_VERSION_ID}\r\nx-amz-tagging-count: 1\r\nLast-Modified: Sun, 06 Sep 2026 10:00:00 GMT\r\nConnection: close\r\n\r\n"
+                )
+            } else if line.starts_with("HEAD ") {
+                empty_response("404 Not Found")
+            } else if line.starts_with("PUT ")
+                && line.contains("tagging")
+                && line.contains(&format!("versionId={DRIFTED_ASSIGNED_VERSION_ID}"))
+            {
+                empty_response("200 OK")
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        let (mut roi, mut object_info) = drifted_roi_and_object();
+        roi.op_type = ReplicationType::Metadata;
+        roi.user_tags = "phase=after".to_string();
+        object_info.user_tags = Arc::new("phase=after".to_string());
+        let mut user_defined = HashMap::new();
+        insert_str(
+            &mut user_defined,
+            &format!("{SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX}{}", target.arn),
+            DRIFTED_ASSIGNED_VERSION_ID.to_string(),
+        );
+        object_info.user_defined = Arc::new(user_defined);
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+
+        let action = resolve_replicate_all_action(
+            ReplicateAllActionContext {
+                siblings: &NoSiblingLedger,
+                roi: &roi,
+                tgt_client: &target,
+                bucket: &roi.bucket,
+                object: &roi.name,
+                start_time: OffsetDateTime::now_utc(),
+                ssec_audit_required: false,
+            },
+            object_info,
+            &mut rinfo,
+        )
+        .await;
+
+        assert!(
+            matches!(action, Some((ReplicationAction::None, _))),
+            "metadata is applied in place; the PUT transport must not run: {action:?}"
+        );
+        assert!(rinfo.error.is_none(), "{:?}", rinfo.error);
+        assert!(
+            rinfo.target_version_id.is_none(),
+            "an id the ledger already records must not trigger another metadata writeback"
+        );
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 3, "HEAD by source id, HEAD by ledger id, PutObjectTagging: {seen:?}");
+        assert!(
+            seen[1].starts_with("HEAD ") && seen[1].contains(DRIFTED_ASSIGNED_VERSION_ID),
+            "{}",
+            seen[1]
+        );
+        assert!(seen[2].starts_with("PUT ") && seen[2].contains("tagging"), "{}", seen[2]);
+    }
+
+    #[test]
+    fn ledger_records_only_ids_the_target_minted() {
+        let source = Uuid::new_v4();
+        assert_eq!(assigned_target_version_id(Some(source.to_string()), Some(source)), None);
+        assert_eq!(assigned_target_version_id(Some(String::new()), Some(source)), None);
+        assert_eq!(assigned_target_version_id(None, Some(source)), None);
+        assert_eq!(
+            assigned_target_version_id(Some(DRIFTED_ASSIGNED_VERSION_ID.to_string()), Some(source)).as_deref(),
+            Some(DRIFTED_ASSIGNED_VERSION_ID)
+        );
+    }
+
+    #[test]
+    fn put_response_audit_records_identity_verdict() {
+        let target = test_target_client("http://127.0.0.1:1".to_string());
+        let source = Uuid::new_v4().to_string();
+        audit_target_version_identity(&target, &source, Some(DRIFTED_ASSIGNED_VERSION_ID));
+        assert_eq!(
+            ReplicationTargetStore::version_identity_capability(&target.arn),
+            VersionIdentityCapability::MintsOwn
+        );
+        audit_target_version_identity(&target, &source, Some(&source));
+        assert_eq!(
+            ReplicationTargetStore::version_identity_capability(&target.arn),
+            VersionIdentityCapability::Adopts
+        );
+        // An unversioned write carries no contract and must not overwrite it.
+        audit_target_version_identity(&target, "null", None);
+        assert_eq!(
+            ReplicationTargetStore::version_identity_capability(&target.arn),
+            VersionIdentityCapability::Adopts
+        );
     }
 
     #[test]
@@ -5702,6 +7561,42 @@ mod tests {
         assert_eq!(roi.target_purge_statuses.get(role), Some(&VersionPurgeStatusType::Pending));
     }
 
+    /// The decision string is not persisted: after a restart, or once the
+    /// configuration is gone, a heal of a failed purge must still name the
+    /// targets the purge state records — that is what lets the delete worker
+    /// settle a removed target as abandoned instead of skipping forever.
+    #[tokio::test]
+    async fn heal_owes_a_failed_purge_to_the_targets_its_purge_state_names_without_a_configuration() {
+        let bucket = format!("heal-orphaned-purge-{}", Uuid::new_v4());
+        let arn = "arn:rustfs:replication:us-east-1:removed:bucket";
+        ReplicationVersioningStore::install_prefix_state_test_config(
+            &bucket,
+            VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                ..Default::default()
+            },
+        );
+        let oi = ObjectInfo {
+            bucket,
+            name: "purge/orphaned.bin".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            version_purge_status: VersionPurgeStatusType::Failed,
+            version_purge_status_internal: Some(format!("{arn}=FAILED;")),
+            ..Default::default()
+        };
+
+        let mut roi = get_heal_replicate_object_info(&oi, &ReplicationConfig::new(None, None))
+            .await
+            .expect("a purge without a configuration must still classify");
+
+        assert!(roi.dsc.targets_map.get(arn).is_some_and(|target| target.replicate), "{:?}", roi.dsc);
+        assert!(matches!(
+            super::super::replication_queue_boundary::replication_heal_queue_action(&mut roi),
+            super::super::replication_queue_boundary::ReplicationHealQueueAction::QueueDelete(_)
+        ));
+    }
+
     #[tokio::test]
     async fn heal_pending_purge_reads_one_versioning_generation() {
         let bucket = format!("heal-versioning-snapshot-{}", Uuid::new_v4());
@@ -6015,7 +7910,7 @@ mod tests {
     }
 
     #[test]
-    fn object_lock_denied_purge_backoff_tracks_version_and_target() {
+    fn purge_backoff_tracks_version_and_target() {
         let denied = DeletedObjectReplicationInfo {
             bucket: "worm-backoff-test-bucket".to_string(),
             target_arn: "arn:rustfs:replication::worm-test:t1".to_string(),
@@ -6026,21 +7921,21 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(!object_lock_denied_purge_backoff_active(&denied));
+        assert!(!purge_backoff_active(&denied));
 
-        record_object_lock_denied_purge(&denied, "arn:rustfs:replication::worm-test:t1");
-        assert!(object_lock_denied_purge_backoff_active(&denied));
+        record_purge_backoff(&denied, "arn:rustfs:replication::worm-test:t1");
+        assert!(purge_backoff_active(&denied));
 
         // A requeue that can also reach a target this denial does not cover
         // must keep flowing: the purge may succeed there.
         let mut other_target = denied.clone();
         other_target.target_arn = "arn:rustfs:replication::worm-test:t2".to_string();
-        assert!(!object_lock_denied_purge_backoff_active(&other_target));
+        assert!(!purge_backoff_active(&other_target));
 
         // A different version of the same object must not be suppressed.
         let mut other_version = denied;
         other_version.delete_object.version_id = Some(uuid::Uuid::new_v4());
-        assert!(!object_lock_denied_purge_backoff_active(&other_version));
+        assert!(!purge_backoff_active(&other_version));
     }
 
     #[tokio::test]
@@ -6080,7 +7975,7 @@ mod tests {
         // failed abort must hand the upload id to the retry schedule (#6854):
         // the object itself is re-replicated under a fresh upload id, so
         // nothing else will ever abort this one.
-        let result = abort_multipart_on_failure(
+        let result = abort_multipart_on_failure::<_, _, _, ()>(
             Err(std::io::Error::other("transfer failed")),
             "dst-bucket",
             "obj",
@@ -6104,7 +7999,7 @@ mod tests {
         let retry_scheduled = Arc::new(AtomicBool::new(false));
         let retry_flag = retry_scheduled.clone();
 
-        let result = abort_multipart_on_failure(
+        let result = abort_multipart_on_failure::<_, _, _, ()>(
             Err(std::io::Error::other("transfer failed")),
             "dst-bucket",
             "obj",
@@ -6322,5 +8217,588 @@ mod tests {
             version_identity_drift_log_due("arn:replication::drift-b", now),
             "one target's report must not silence another's"
         );
+    }
+    mod multipart_transport_tests {
+        use super::super::super::replication_filemeta_boundary::ObjectPartInfo;
+        use super::super::super::replication_storage_boundary::ObjectIO as _;
+        use super::*;
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Full};
+        use std::convert::Infallible;
+
+        #[derive(Debug)]
+        struct Source {
+            body: Bytes,
+            info: ObjectInfo,
+            ranges: StdMutex<Vec<(i64, i64)>>,
+            full_reads: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl super::super::super::replication_storage_boundary::ObjectIO for Source {
+            type Error = Error;
+            type RangeSpec = HTTPRangeSpec;
+            type HeaderMap = HeaderMap;
+            type ObjectOptions = ObjectOptions;
+            type ObjectInfo = ObjectInfo;
+            type GetObjectReader = GetObjectReader;
+            type PutObjectReader = super::super::super::replication_storage_boundary::PutObjReader;
+
+            async fn get_object_reader(
+                &self,
+                _bucket: &str,
+                _object: &str,
+                range: Option<HTTPRangeSpec>,
+                _headers: HeaderMap,
+                opts: &ObjectOptions,
+            ) -> Result<GetObjectReader> {
+                assert_eq!(
+                    opts.version_id,
+                    self.info.version_id.map(|id| id.to_string()),
+                    "every read retains the selected source version"
+                );
+                if range.is_none() {
+                    self.full_reads.fetch_add(1, Ordering::Relaxed);
+                    return Ok(GetObjectReader {
+                        stream: Box::new(std::io::Cursor::new(self.body.clone())),
+                        object_info: self.info.clone(),
+                        buffered_body: None,
+                        body_source: Default::default(),
+                    });
+                }
+                let range = range.expect("multipart transport must request an explicit nonempty range");
+                assert!(!range.is_suffix_length);
+                assert!(range.start <= range.end, "empty parts must not issue an inverted range");
+                self.ranges.lock().expect("range journal lock").push((range.start, range.end));
+                let start = usize::try_from(range.start).expect("nonnegative start");
+                let end = usize::try_from(range.end).expect("nonnegative end");
+                let body = self.body.slice(start..=end);
+                Ok(GetObjectReader {
+                    stream: Box::new(std::io::Cursor::new(body)),
+                    object_info: self.info.clone(),
+                    buffered_body: None,
+                    body_source: Default::default(),
+                })
+            }
+
+            async fn put_object(
+                &self,
+                _bucket: &str,
+                _object: &str,
+                _data: &mut Self::PutObjectReader,
+                _opts: &ObjectOptions,
+            ) -> Result<ObjectInfo> {
+                panic!("replication must not overwrite its source")
+            }
+        }
+
+        #[derive(Debug)]
+        struct RequestRecord {
+            method: http::Method,
+            query: HashMap<String, String>,
+            headers: HeaderMap,
+            body: Bytes,
+        }
+
+        #[tokio::test]
+        async fn multipart_transport_preserves_legacy_zero_actual_sizes() {
+            run_transport(4096, None, false).await;
+        }
+
+        #[tokio::test]
+        async fn multipart_transport_uploads_an_empty_last_part_without_reading_a_range() {
+            run_transport(0, None, false).await;
+        }
+
+        #[tokio::test]
+        async fn multipart_transport_preserves_transformed_unknown_nonempty_parts() {
+            for unknown_part in [(0, 0), (1, 0), (0, -1), (1, -1)] {
+                run_transport(4096, Some(unknown_part), false).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn multipart_transport_preserves_transformed_empty_tail() {
+            run_transport(0, Some((1, 0)), false).await;
+        }
+
+        /// SSE-C passthrough of a compressed object: the stored bytes go out
+        /// as-is and every UploadPart declares the part's plaintext length
+        /// (backlog#2363).
+        #[tokio::test]
+        async fn multipart_transport_declares_passthrough_part_lengths() {
+            run_transport(4096, None, true).await;
+        }
+
+        #[tokio::test]
+        async fn multipart_transport_checks_positive_compressed_part_totals() {
+            const MIB: i64 = 1024 * 1024;
+            for etag_present in [true, false] {
+                run_compressed_transport([5 * MIB, MIB], etag_present, true, None).await;
+                run_compressed_transport([5 * MIB, MIB / 2], etag_present, false, None).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn multipart_transport_checks_positive_compressed_part_boundaries() {
+            const MIB: i64 = 1024 * 1024;
+            for etag_present in [true, false] {
+                run_compressed_transport([5 * MIB + MIB / 2, MIB / 2], etag_present, false, None).await;
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum SourceReadFault {
+            Short,
+            Extra,
+        }
+
+        #[tokio::test]
+        async fn multipart_transport_requires_complete_compressed_stream() {
+            const MIB: i64 = 1024 * 1024;
+            for fault in [SourceReadFault::Short, SourceReadFault::Extra] {
+                run_compressed_transport([5 * MIB, MIB], true, false, Some(fault)).await;
+            }
+        }
+
+        async fn run_compressed_transport(
+            actual_sizes: [i64; 2],
+            etag_present: bool,
+            valid_layout: bool,
+            fault: Option<SourceReadFault>,
+        ) {
+            use crate::io_support::rio::TryGetIndex as _;
+            use rustfs_utils::CompressionAlgorithm;
+            use tokio::io::AsyncReadExt as _;
+
+            const MIB: usize = 1024 * 1024;
+            let body = Bytes::from([vec![0x11; 5 * MIB], vec![0x22; MIB / 2], vec![0x33; MIB / 2]].concat());
+            let mut stored = Vec::new();
+            let mut parts = Vec::new();
+            for (index, plaintext) in [body.slice(..5 * MIB), body.slice(5 * MIB..)].into_iter().enumerate() {
+                let mut compressor = crate::io_support::rio::compression_reader(
+                    std::io::Cursor::new(plaintext),
+                    CompressionAlgorithm::default(),
+                    false,
+                );
+                let mut compressed = Vec::new();
+                compressor.read_to_end(&mut compressed).await.expect("compress source part");
+                parts.push(ObjectPartInfo {
+                    number: index + 1,
+                    size: compressed.len(),
+                    actual_size: actual_sizes[index],
+                    index: compressor
+                        .try_get_index()
+                        .map(crate::io_support::rio::compression_index_storage_bytes),
+                    ..Default::default()
+                });
+                stored.extend_from_slice(&compressed);
+            }
+            let mut metadata = HashMap::new();
+            rustfs_utils::http::insert_str(
+                &mut metadata,
+                rustfs_utils::http::SUFFIX_COMPRESSION,
+                crate::io_support::rio::compression_metadata_value(CompressionAlgorithm::default()),
+            );
+            rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, body.len().to_string());
+            let source = Arc::new(Source {
+                info: ObjectInfo {
+                    bucket: "source".to_string(),
+                    name: "object".to_string(),
+                    size: i64::try_from(stored.len()).expect("stored size"),
+                    actual_size: i64::try_from(body.len()).expect("plaintext size"),
+                    etag: etag_present
+                        .then(|| faster_hex::hex_string(rustfs_utils::hash::HashAlgorithm::Md5.hash_encode(&body).as_ref())),
+                    version_id: Some(Uuid::new_v4()),
+                    user_defined: Arc::new(metadata),
+                    parts: Arc::new(parts),
+                    ..Default::default()
+                },
+                body: body.clone(),
+                ranges: StdMutex::new(Vec::new()),
+                full_reads: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let opts = ObjectOptions {
+                version_id: source.info.version_id.map(|id| id.to_string()),
+                ..Default::default()
+            };
+            let mut full = source
+                .get_object_reader("source", "object", None, HeaderMap::new(), &opts)
+                .await
+                .expect("open complete compressed source");
+            let decoded = full.read_all().await.expect("decode complete source");
+            assert!(
+                decoded.as_slice() == body.as_ref(),
+                "the independent full GET must match every source byte"
+            );
+
+            let (target, journal, server) = start_transport_target().await;
+            let (put_opts, is_multipart) = replication_put_object_options("STANDARD", &source.info).expect("replication options");
+            let mut reader = source
+                .get_object_reader("source", "object", None, HeaderMap::new(), &opts)
+                .await
+                .expect("open replication source");
+            match fault {
+                Some(SourceReadFault::Short) => {
+                    reader.stream = Box::new(
+                        reader
+                            .stream
+                            .take(u64::try_from(body.len() - 1).expect("short stream length")),
+                    );
+                }
+                Some(SourceReadFault::Extra) => {
+                    reader.stream = Box::new(reader.stream.chain(std::io::Cursor::new(vec![0x44])));
+                }
+                None => {}
+            }
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                replicate_all_payload_to_target(
+                    ReplicateAllPayloadContext {
+                        storage: &source,
+                        tgt_client: &target,
+                        bucket: "source",
+                        object: "object",
+                        object_info: &source.info,
+                        obj_opts: &opts,
+                        arn: &target.arn,
+                        transfer_size: i64::try_from(body.len()).expect("plaintext size"),
+                        is_multipart,
+                        put_opts,
+                    },
+                    reader,
+                ),
+            )
+            .await;
+            server.abort();
+            assert!(server.await.expect_err("fixture server is stopped").is_cancelled());
+            let result = result.expect("replication must finish");
+            let requests = journal.lock().expect("request journal lock");
+            let completes: Vec<_> = requests
+                .iter()
+                .filter(|request| request.method == http::Method::POST && request.query.contains_key("uploadId"))
+                .collect();
+            if result.is_err() {
+                assert!(!valid_layout, "valid compressed layout must replicate: {result:?}");
+                assert!(completes.is_empty(), "failed replication must not publish a partial object");
+                assert!(
+                    requests
+                        .iter()
+                        .any(|request| request.method == http::Method::DELETE && request.query.contains_key("uploadId")),
+                    "failed multipart upload must be aborted"
+                );
+                return;
+            }
+            assert!(fault.is_none(), "a short or oversized source must fail before Complete");
+            assert_eq!(requests.len(), 4, "initiate, two parts and complete without retries");
+            assert_eq!(completes.len(), 1, "publish the replica once");
+            let mut replica = Vec::new();
+            for number in [1, 2] {
+                let part = requests
+                    .iter()
+                    .find(|request| request.query.get("partNumber") == Some(&number.to_string()))
+                    .expect("completed source part");
+                assert_eq!(part.method, http::Method::PUT);
+                replica.extend_from_slice(&part.body);
+                let complete_xml = std::str::from_utf8(&completes[0].body).expect("complete XML");
+                assert!(complete_xml.contains(&format!("<PartNumber>{number}</PartNumber>")));
+            }
+            assert!(
+                replica.as_slice() == body.as_ref(),
+                "replica differs from complete GET: sizes={actual_sizes:?}, source={}, replica={}",
+                body.len(),
+                replica.len()
+            );
+            if let Some(etag) = &source.info.etag {
+                assert_eq!(
+                    rustfs_utils::http::get_header(&completes[0].headers, rustfs_utils::http::SUFFIX_SOURCE_ETAG).as_deref(),
+                    Some(etag.as_str())
+                );
+            }
+        }
+
+        async fn start_transport_target() -> (Arc<TargetClient>, Arc<StdMutex<Vec<RequestRecord>>>, tokio::task::JoinHandle<()>) {
+            let journal = Arc::new(StdMutex::new(Vec::<RequestRecord>::new()));
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind multipart target");
+            let endpoint = format!("http://{}", listener.local_addr().expect("multipart target address"));
+            let server_journal = journal.clone();
+            let server = tokio::spawn(async move {
+                let mut connections = JoinSet::new();
+                loop {
+                    let (stream, _) = listener.accept().await.expect("accept multipart request");
+                    let journal = server_journal.clone();
+                    connections.spawn(async move {
+                            let service = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                                let journal = journal.clone();
+                                async move {
+                                    let (request, body) = request.into_parts();
+                                    let query: HashMap<String, String> = url::form_urlencoded::parse(
+                                        request.uri.query().unwrap_or_default().as_bytes(),
+                                    ).into_owned().collect();
+                                    let body = match body.collect().await {
+                                        Ok(body) => body.to_bytes(),
+                                        Err(_) => return Ok::<_, Infallible>(hyper::Response::builder()
+                                            .status(http::StatusCode::BAD_REQUEST)
+                                            .body(Full::new(Bytes::new()))
+                                            .expect("incomplete upload response")),
+                                    };
+                                    let response = if request.method == http::Method::POST && query.contains_key("uploads") {
+                                        "<InitiateMultipartUploadResult><Bucket>target-bucket</Bucket><Key>object</Key><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>"
+                                    } else if request.method == http::Method::PUT {
+                                        ""
+                                    } else if request.method == http::Method::POST && query.contains_key("uploadId") {
+                                        "<CompleteMultipartUploadResult><Location>http://localhost/object</Location><Bucket>target-bucket</Bucket><Key>object</Key><ETag>&quot;target-2&quot;</ETag></CompleteMultipartUploadResult>"
+                                    } else if request.method == http::Method::DELETE && query.contains_key("uploadId") {
+ ""
+ } else {
+                                        panic!("unexpected multipart request: {} {}", request.method, request.uri)
+                                    };
+                                    let response_etag = if request.method == http::Method::PUT && !query.contains_key("partNumber") {
+                                        format!("\"{}\"", faster_hex::hex_string(rustfs_utils::hash::HashAlgorithm::Md5.hash_encode(&body).as_ref()))
+                                    } else {
+                                        "\"uploaded-part\"".to_string()
+                                    };
+                                    journal.lock().expect("request journal lock").push(RequestRecord {
+                                        method: request.method, query, headers: request.headers, body,
+                                    });
+                                    Ok::<_, Infallible>(hyper::Response::builder()
+                                        .header("content-type", "application/xml")
+                                        .header("etag", response_etag)
+                                        .body(Full::new(Bytes::from_static(response.as_bytes())))
+                                        .expect("multipart response"))
+                                }
+                            });
+                            hyper::server::conn::http1::Builder::new()
+                                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                                .await.expect("serve multipart connection");
+                        });
+                }
+            });
+            let mut target = test_target_client(endpoint);
+            let config = target
+                .client
+                .config()
+                .to_builder()
+                .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
+                .force_path_style(true)
+                .build();
+            Arc::get_mut(&mut target).expect("unshared test target").client = Arc::new(aws_sdk_s3::Client::from_conf(config));
+            (target, journal, server)
+        }
+
+        async fn run_transport(tail_size: usize, unknown_part: Option<(usize, i64)>, passthrough: bool) {
+            const FIRST_SIZE: usize = 5 * 1024 * 1024;
+            // The stored (compressed ciphertext) bytes of a passthrough part
+            // are shorter than the plaintext they represent.
+            const PASSTHROUGH_PLAINTEXT_FACTOR: usize = 4;
+            let body = Bytes::from([vec![0x35; FIRST_SIZE], vec![0xa7; tail_size]].concat());
+            let etag = faster_hex::hex_string(rustfs_utils::hash::HashAlgorithm::Md5.hash_encode(&body).as_ref());
+            let mut user_defined = if unknown_part.is_some() {
+                HashMap::from([("x-amz-server-side-encryption".to_string(), "AES256".to_string())])
+            } else {
+                HashMap::new()
+            };
+            if passthrough {
+                user_defined.insert(rustfs_utils::http::SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string());
+                rustfs_utils::http::insert_str(
+                    &mut user_defined,
+                    rustfs_utils::http::SUFFIX_COMPRESSION,
+                    "klauspost/compress/s2".to_string(),
+                );
+            }
+            let plaintext_len = |stored: usize| {
+                i64::try_from(if passthrough {
+                    stored * PASSTHROUGH_PLAINTEXT_FACTOR
+                } else {
+                    stored
+                })
+                .expect("plaintext size")
+            };
+            let source = Arc::new(Source {
+                info: ObjectInfo {
+                    size: i64::try_from(body.len() + if unknown_part.is_some() { 16 } else { 0 }).expect("stored size"),
+                    actual_size: plaintext_len(body.len()),
+                    etag: Some(etag.clone()),
+                    version_id: Some(Uuid::new_v4()),
+                    user_defined: Arc::new(user_defined),
+                    parts: Arc::new(vec![
+                        ObjectPartInfo {
+                            number: 1,
+                            size: FIRST_SIZE + if unknown_part.is_some() { 8 } else { 0 },
+                            actual_size: if let Some((0, size)) = unknown_part {
+                                size
+                            } else if passthrough {
+                                plaintext_len(FIRST_SIZE)
+                            } else if unknown_part.is_some() || tail_size == 0 {
+                                i64::try_from(FIRST_SIZE).expect("first part size")
+                            } else {
+                                0
+                            },
+                            ..Default::default()
+                        },
+                        ObjectPartInfo {
+                            number: 2,
+                            size: tail_size + if unknown_part.is_some() { 8 } else { 0 },
+                            actual_size: if let Some((1, size)) = unknown_part {
+                                size
+                            } else if passthrough {
+                                plaintext_len(tail_size)
+                            } else if unknown_part.is_some() {
+                                i64::try_from(tail_size).expect("tail logical size")
+                            } else {
+                                0
+                            },
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                },
+                body: body.clone(),
+                ranges: StdMutex::new(Vec::new()),
+                full_reads: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let (target, journal, server) = start_transport_target().await;
+            let (put_opts, is_multipart) = replication_put_object_options("STANDARD", &source.info).expect("replication options");
+            let opts = ObjectOptions {
+                version_id: source.info.version_id.map(|id| id.to_string()),
+                raw_data_movement_read: passthrough,
+                ..Default::default()
+            };
+            let reader = source
+                .get_object_reader("source", "object", None, HeaderMap::new(), &opts)
+                .await
+                .expect("open the existing full-object stream");
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                replicate_all_payload_to_target(
+                    ReplicateAllPayloadContext {
+                        storage: &source,
+                        tgt_client: &target,
+                        bucket: "source",
+                        object: "object",
+                        object_info: &source.info,
+                        obj_opts: &opts,
+                        arn: &target.arn,
+                        transfer_size: i64::try_from(body.len()).expect("plaintext size"),
+                        is_multipart,
+                        put_opts,
+                    },
+                    reader,
+                ),
+            )
+            .await;
+            server.abort();
+            assert!(server.await.expect_err("fixture server is stopped").is_cancelled());
+            if let Err(error) = result.expect("replication must finish") {
+                panic!("legacy parts must replicate successfully: {error}");
+            }
+            assert_eq!(
+                source.full_reads.load(Ordering::Relaxed),
+                1,
+                "reuse the initial full stream without an extra read"
+            );
+            if unknown_part.is_some() {
+                let requests = journal.lock().expect("request journal lock");
+                assert_eq!(requests.len(), 1, "unknown transformed boundaries retain one streaming PUT");
+                let request = &requests[0];
+                assert_eq!(request.method, http::Method::PUT);
+                let source_version = source.info.version_id.map(|id| id.to_string()).expect("versioned fixture");
+                assert_eq!(
+                    request.query,
+                    HashMap::from([
+                        ("x-id".to_string(), "PutObject".to_string()),
+                        ("versionId".to_string(), source_version.clone()),
+                    ]),
+                    "single PUT carries only the SDK operation query and the source versionId the target must reuse"
+                );
+                assert_eq!(request.body, body, "single PUT includes every byte of both source parts");
+                assert_eq!(
+                    request.headers.get("content-length").expect("body length"),
+                    body.len().to_string().as_str()
+                );
+                assert_eq!(
+                    rustfs_utils::http::get_header(&request.headers, rustfs_utils::http::SUFFIX_SOURCE_ETAG).as_deref(),
+                    Some(etag.as_str())
+                );
+                assert_eq!(
+                    rustfs_utils::http::get_header(&request.headers, rustfs_utils::http::SUFFIX_SOURCE_VERSION_ID)
+                        .map(|value| value.into_owned()),
+                    Some(source_version),
+                    "single PUT preserves the selected source version"
+                );
+                assert!(
+                    source.ranges.lock().expect("range journal lock").is_empty(),
+                    "unknown logical boundaries must not issue guessed ranges"
+                );
+                return;
+            }
+
+            let requests = journal.lock().expect("request journal lock");
+            assert_eq!(requests.len(), 4, "initiate, two upload parts, and complete without retries");
+            assert!(requests[0].query.contains_key("uploads"));
+            for (index, expected) in [(1, body.slice(..FIRST_SIZE)), (2, body.slice(FIRST_SIZE..))] {
+                assert_eq!(requests[index].method, http::Method::PUT);
+                assert_eq!(requests[index].query.get("partNumber"), Some(&index.to_string()));
+                assert_eq!(requests[index].body, expected, "upload part contains the exact source range");
+                assert_eq!(
+                    requests[index].headers.get("content-length").expect("part content length"),
+                    expected.len().to_string().as_str()
+                );
+                let declared = rustfs_utils::http::get_header(
+                    &requests[index].headers,
+                    rustfs_utils::http::SUFFIX_REPLICATION_PART_ACTUAL_SIZE,
+                );
+                if passthrough {
+                    assert_eq!(
+                        declared.as_deref(),
+                        Some(plaintext_len(expected.len()).to_string().as_str()),
+                        "passthrough parts declare their plaintext length"
+                    );
+                } else {
+                    assert!(declared.is_none(), "decrypted transport carries no passthrough part length");
+                }
+            }
+            if passthrough {
+                let create = &requests[0];
+                assert_eq!(
+                    rustfs_utils::http::get_header(&create.headers, rustfs_utils::http::SUFFIX_REPLICATION_COMPRESSION)
+                        .as_deref(),
+                    Some("klauspost/compress/s2"),
+                    "the session carries the source's compression scheme"
+                );
+                assert_eq!(
+                    rustfs_utils::http::get_header(
+                        &create.headers,
+                        rustfs_utils::http::SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE
+                    )
+                    .as_deref(),
+                    Some(plaintext_len(body.len()).to_string().as_str())
+                );
+            }
+            let complete = &requests[3];
+            assert_eq!(complete.method, http::Method::POST);
+            assert_eq!(
+                rustfs_utils::http::get_header(&complete.headers, rustfs_utils::http::SUFFIX_SOURCE_ETAG).as_deref(),
+                Some(etag.as_str())
+            );
+            let complete_xml = std::str::from_utf8(&complete.body).expect("complete XML");
+            assert_eq!(
+                complete_xml.matches("<Part>").count(),
+                2,
+                "the empty final part must remain in the completion list"
+            );
+            assert!(complete_xml.contains("<PartNumber>1</PartNumber>"));
+            assert!(complete_xml.contains("<PartNumber>2</PartNumber>"));
+            let mut expected_ranges = vec![(0, i64::try_from(FIRST_SIZE - 1).expect("first end"))];
+            if tail_size > 0 {
+                expected_ranges.push((
+                    i64::try_from(FIRST_SIZE).expect("tail start"),
+                    i64::try_from(body.len() - 1).expect("tail end"),
+                ));
+            }
+            assert_eq!(*source.ranges.lock().expect("range journal lock"), expected_ranges);
+        }
     }
 }

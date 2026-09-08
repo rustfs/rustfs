@@ -212,6 +212,8 @@ class SelfTests(unittest.TestCase):
                         bad = {**good, job: {**good[job], "result": value}}
                         self.assertTrue(verify_results(bad, event, "refs/heads/main"))
                 self.assertTrue(verify_results({key: value for key, value in good.items() if key != job}, event, "refs/heads/main"))
+                missing_result = {key: value for key, value in good[job].items() if key != "result"}
+                self.assertTrue(verify_results({**good, job: missing_result}, event, "refs/heads/main"))
             self.assertTrue(verify_results({**good, "unknown-job": {"result": "success"}}, event, "refs/heads/main"))
             for selection in ({}, {"mode": ""}, {"mode": True}, []):
                 bad = {**good, "classify-changes": {"result": "success", "outputs": selection}}

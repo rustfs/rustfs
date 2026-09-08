@@ -38,6 +38,7 @@ use hyper::body::Incoming;
 use pin_project_lite::pin_project;
 use quick_xml::events::Event;
 use rustfs_common::GlobalReadiness;
+use rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard;
 use rustfs_obs::HTTP_SERVER_LOG_TARGET;
 #[cfg(feature = "swift")]
 use rustfs_protocols::swift::SwiftRouter;
@@ -66,6 +67,7 @@ const LOG_SUBSYSTEM_HTTP: &str = "http";
 const REDACTED_QUERY_VALUE: &str = "redacted";
 const OBJECT_ZIP_DOWNLOADS_PATH: &str = "/v3/object-zip-downloads/";
 const HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD: Duration = Duration::from_secs(5);
+static HTTP_SERVER_ERROR_LOGS: [rustfs_utils::LogThrottle; 100] = [const { rustfs_utils::LogThrottle::new(5_000) }; 100];
 const STS_RESPONSE_METADATA_TAG: &str = "ResponseMetadata";
 const STS_REQUEST_ID_TAG: &str = "RequestId";
 const STS_SUCCESS_RESPONSE_TAGS: [&str; 2] = ["AssumeRoleResponse", "AssumeRoleWithWebIdentityResponse"];
@@ -269,10 +271,18 @@ where
         };
         req.extensions_mut().insert(request_context);
 
+        // This outer boundary includes readiness, rate-limit and auth
+        // rejections. Metric attribution never depends on an enabled span.
+        let mut metrics = is_s3.then(|| S3HttpRequestGuard::new(req.method().as_str()));
+        let inner = match metrics.as_mut() {
+            Some(metrics) => metrics.in_scope(|| self.inner.call(req)),
+            None => self.inner.call(req),
+        };
         ExternalRequestContextFuture {
-            inner: self.inner.call(req),
+            inner,
             request_id,
             is_s3,
+            metrics,
         }
     }
 }
@@ -283,6 +293,7 @@ pin_project! {
         inner: F,
         request_id: Option<HeaderValue>,
         is_s3: bool,
+        metrics: Option<S3HttpRequestGuard>,
     }
 }
 
@@ -294,12 +305,24 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        let mut response = match this.inner.poll(cx) {
+        let result = match this.metrics.as_mut() {
+            Some(metrics) => metrics.in_scope(|| this.inner.poll(cx)),
+            None => this.inner.poll(cx),
+        };
+        let mut response = match result {
             Poll::Ready(Ok(response)) => response,
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Ready(Err(error)) => {
+                if let Some(metrics) = this.metrics.as_mut() {
+                    metrics.service_error();
+                }
+                return Poll::Ready(Err(error));
+            }
             Poll::Pending => return Poll::Pending,
         };
 
+        if let Some(metrics) = this.metrics.as_mut() {
+            metrics.response(response.status().as_u16());
+        }
         if let Some(request_id) = this.request_id.take() {
             if *this.is_s3 {
                 response.headers_mut().insert(REQUEST_ID_HEADER, request_id.clone());
@@ -340,6 +363,7 @@ struct RequestLogContext {
     uri: Uri,
     request_started_at: Option<RequestContext>,
     fallback_start: Instant,
+    has_s3_accounting: bool,
 }
 
 impl RequestLogContext {
@@ -359,6 +383,7 @@ impl RequestLogContext {
             uri: req.uri().clone(),
             request_started_at: request_context,
             fallback_start: Instant::now(),
+            has_s3_accounting: S3HttpRequestGuard::is_active(),
         }
     }
 
@@ -427,6 +452,14 @@ impl RequestLogContext {
             if !tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::ERROR) {
                 return;
             }
+            let suppressed_errors = if self.has_s3_accounting {
+                let Some(suppressed) = HTTP_SERVER_ERROR_LOGS[usize::from(status_code - 500)].claim() else {
+                    return;
+                };
+                suppressed
+            } else {
+                0
+            };
             error!(
                 target: HTTP_SERVER_LOG_TARGET,
                 event = HTTP_REQUEST_COMPLETED_EVENT,
@@ -437,8 +470,9 @@ impl RequestLogContext {
                 span_id = %span_id,
                 peer_addr = %self.peer_addr(),
                 method = %self.method.as_str(),
-                uri = %self.redacted_uri(),
+                uri = self.uri.path(),
                 status_code,
+                suppressed_errors,
                 duration_ms,
                 result,
                 "HTTP request completed"
@@ -2230,6 +2264,144 @@ mod tests {
         let readiness = Arc::new(GlobalReadiness::new());
         readiness.mark_stage(rustfs_common::SystemStage::FullReady);
         PublicHealthEndpointLayer::new(crate::runtime_sources::ServerContextSlot::new(), readiness)
+    }
+
+    #[tokio::test]
+    async fn external_s3_http_outcomes_cover_response_error_cancel_and_exclusions_at_warn() {
+        use rustfs_io_metrics::{record_s3_op, s3_http_metrics::s3_http_metrics_snapshot};
+        use rustfs_s3_ops::S3Operation;
+        let _logs = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+        let totals = || {
+            s3_http_metrics_snapshot()
+                .into_iter()
+                .filter(|series| series.operation == S3Operation::RestoreObject.as_str())
+                .fold(std::collections::BTreeMap::<String, u64>::new(), |mut result, series| {
+                    *result.entry(series.outcome.to_string()).or_default() += series.total;
+                    result
+                })
+        };
+        let before = totals();
+        let inner = tower::service_fn(|req: Request<()>| async move {
+            record_s3_op(S3Operation::RestoreObject);
+            match req.uri().path() {
+                "/bucket/cancel" => std::future::pending::<Result<Response<()>, io::Error>>().await,
+                "/bucket/service-error" => Err(io::Error::other("test service failure")),
+                path => Ok(Response::builder()
+                    .status(match path {
+                        "/bucket/denied" => StatusCode::FORBIDDEN,
+                        "/bucket/unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+                        _ => StatusCode::OK,
+                    })
+                    .body(())
+                    .expect("response")),
+            }
+        });
+        let mut service = ExternalRequestContextLayer::default().layer(inner);
+        for path in ["/bucket/ok", "/bucket/denied", "/bucket/unavailable"] {
+            let response = service
+                .call(Request::builder().method(Method::PATCH).uri(path).body(()).expect("request"))
+                .await
+                .expect("response");
+            assert!(response.headers().contains_key(AMZ_REQUEST_ID));
+        }
+        let error = service
+            .call(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri("/bucket/service-error")
+                    .body(())
+                    .expect("request"),
+            )
+            .await;
+        assert!(error.is_err());
+        let mut cancelled = Box::pin(
+            service.call(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri("/bucket/cancel")
+                    .body(())
+                    .expect("request"),
+            ),
+        );
+        assert!(futures::poll!(cancelled.as_mut()).is_pending());
+        drop(cancelled);
+        for path in [
+            "/rustfs/admin/v3/metrics",
+            "/minio/admin/v3/storageinfo",
+            "/rustfs/console/",
+            "/rustfs/rpc/test",
+            "/health/ready",
+            "/_iceberg/v1/config",
+        ] {
+            service
+                .call(Request::builder().uri(path).body(()).expect("excluded request"))
+                .await
+                .expect("excluded response");
+        }
+        let after = totals();
+        for outcome in ["2xx", "4xx", "5xx", "service_error", "cancelled"] {
+            assert_eq!(
+                after.get(outcome).copied().unwrap_or_default() - before.get(outcome).copied().unwrap_or_default(),
+                1,
+                "{outcome}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_s3_http_outcomes_include_real_readiness_rejections() {
+        use rustfs_io_metrics::s3_http_metrics::s3_http_metrics_snapshot;
+        let rejected = || {
+            s3_http_metrics_snapshot()
+                .into_iter()
+                .filter(|series| series.method == "TRACE" && series.operation == "unknown" && series.outcome == "5xx")
+                .map(|series| series.total)
+                .sum::<u64>()
+        };
+        let before = rejected();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("isolated HTTP listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("HTTP client");
+            let service = tower::ServiceBuilder::new()
+                .layer(ExternalRequestContextLayer::default())
+                .layer(crate::server::ReadinessGateLayer::new(Arc::new(GlobalReadiness::new())))
+                .service(StatusService::new(StatusCode::OK));
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    hyper_util::service::TowerToHyperService::new(service),
+                )
+                .await
+                .expect("HTTP connection");
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .http1_only()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("local HTTP client");
+        let response = client
+            .request(Method::TRACE, format!("http://{addr}/bucket/object"))
+            .header(http::header::CONNECTION, "close")
+            .send()
+            .await
+            .expect("readiness response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(AMZ_REQUEST_ID));
+        let _body = response.bytes().await.expect("readiness body");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("bounded HTTP server shutdown")
+            .expect("server task");
+        assert_eq!(rejected() - before, 1, "rejection is counted before the inner trace layer");
     }
 
     async fn public_health_layer_with_tracker(object_traffic_health: Arc<ObjectTrafficHealth>) -> PublicHealthEndpointLayer {
@@ -5133,6 +5305,70 @@ mod tests {
         let uri: http::Uri = "/rustfs/admin/v3/users?token=not-a-download-token".parse().expect("uri");
 
         assert_eq!(redact_sensitive_uri_query(&uri), "/rustfs/admin/v3/users?token=not-a-download-token");
+    }
+
+    #[tokio::test]
+    async fn request_logging_bounds_s3_failure_bursts_without_losing_counts_or_leaking_queries() {
+        use rustfs_io_metrics::s3_http_metrics::s3_http_metrics_snapshot;
+        let count = || {
+            s3_http_metrics_snapshot()
+                .iter()
+                .filter(|series| series.method == "CONNECT" && series.operation == "unknown" && series.outcome == "5xx")
+                .map(|series| series.total)
+                .sum::<u64>()
+        };
+        let before = count();
+        let writer = SharedWriter::default();
+        let captured = writer.buffer.clone();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .without_time()
+                .with_ansi(false)
+                .with_writer(writer)
+                .finish(),
+        );
+        // A distinct status isolates this test's process-wide log window.
+        let mut service = tower::ServiceBuilder::new()
+            .layer(ExternalRequestContextLayer::default())
+            .layer(RequestLoggingLayer)
+            .service(StatusService::new(StatusCode::from_u16(599).expect("server error")));
+        for _ in 0..10 {
+            service
+                .call(
+                    Request::builder()
+                        .method(Method::CONNECT)
+                        .uri("/bucket/object?X-Amz-Signature=private-signature&X-Amz-Security-Token=private-session")
+                        .body(())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+        }
+        assert_eq!(count() - before, 10);
+        let output = String::from_utf8(captured.lock().expect("logs").clone()).expect("UTF-8 logs");
+        assert_eq!(output.matches("http_request_completed").count(), 1, "{output}");
+        assert!(output.contains("/bucket/object"));
+        assert!(!output.contains("private-"));
+        assert!(!output.contains("X-Amz-"));
+        for _ in 0..2 {
+            service
+                .call(
+                    Request::builder()
+                        .uri("/rustfs/admin/v3/info")
+                        .body(())
+                        .expect("admin request"),
+                )
+                .await
+                .expect("admin response");
+        }
+        let output = String::from_utf8(captured.lock().expect("logs").clone()).expect("UTF-8 logs");
+        assert_eq!(
+            output.matches("http_request_completed").count(),
+            3,
+            "admin logging is not throttled: {output}"
+        );
+        assert_eq!(count() - before, 10);
     }
 
     #[tokio::test]

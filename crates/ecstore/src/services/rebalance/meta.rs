@@ -643,16 +643,12 @@ pub(super) fn should_skip_start_rebalance(cancel_attached: bool, in_progress: bo
     cancel_attached && in_progress
 }
 
-pub(super) fn is_rebalance_stopped_terminal_event(terminal_event: &RebalanceTerminalEvent) -> bool {
-    matches!(terminal_event, RebalanceTerminalEvent::Stopped { .. })
-}
-
 pub(super) fn should_preserve_rebalance_stopped_state(
     meta_stopped: bool,
     status: RebalStatus,
     terminal_event: &RebalanceTerminalEvent,
 ) -> bool {
-    (meta_stopped || status == RebalStatus::Stopped) && !is_rebalance_stopped_terminal_event(terminal_event)
+    (meta_stopped || status == RebalStatus::Stopped) && matches!(terminal_event, RebalanceTerminalEvent::Completed { .. })
 }
 
 pub(super) fn resolve_rebalance_participants(pool_stats: &[RebalanceStats], pool_count: usize) -> Vec<bool> {
@@ -920,7 +916,7 @@ pub(super) fn clear_rebalance_cancel_token(meta: Option<&mut RebalanceMeta>) -> 
 
 pub(super) fn stop_rebalance_state(meta: &mut RebalanceMeta, now: OffsetDateTime) {
     clear_rebalance_cancel_token(Some(meta));
-    if meta.stopped_at.is_none() && is_rebalance_in_progress(meta) {
+    if meta.stopped_at.is_none() && (meta.stop_requested || is_rebalance_in_progress(meta)) {
         apply_stopped_at(meta, now);
     } else if meta.stopped_at.is_some() {
         mark_started_rebalance_pools_stopping(meta);

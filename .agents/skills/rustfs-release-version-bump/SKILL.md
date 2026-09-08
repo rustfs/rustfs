@@ -4,17 +4,16 @@ description: "Prepare the version-file and release-asset bump for an exact RustF
 ---
 # RustFS Release Version Bump
 
-Use this skill to publish a RustFS release (alpha, beta, or stable) with a minimal, auditable diff and a complete ship flow (`edit -> verify -> commit -> push -> PR`).
+Use this skill to prepare and verify release version files. Commit, push, and PR steps apply only when included in the user's delivery scope; publishing release tags belongs to `rustfs-release-publish`.
 
 Validated baseline: release pattern used in PR `#2957`.
 
 ## Required inputs
 
 - Exact target version, for example `1.0.0-beta.4`.
-- Delivery scope:
-- Local only (`edit/verify`).
-- Local + git (`commit/push`).
-- Full GitHub flow (`commit/push/PR`).
+- Delivery scope: local (`edit/verify`), git (`commit/push`), or GitHub
+  (`commit/push/PR`). Derive it from the conversation; when unspecified, prepare
+  and verify locally without blocking on a delivery question.
 
 If target version is missing or ambiguous, stop and ask before editing.
 
@@ -23,7 +22,7 @@ Reject any target version containing `-preview`: preview identifiers are tag-onl
 ## Read before editing
 
 - `AGENTS.md` (root and nearest path-specific files).
-- `.github/pull_request_template.md`.
+- `.github/pull_request_template.md` only when preparing a PR.
 - Current branch status and diff against `origin/main`.
 
 ## Default release file scope
@@ -50,8 +49,7 @@ Only drop a file when the current repository release process clearly no longer r
 ## Step-by-step workflow
 
 1. Confirm intent and isolate scope
-- Confirm target version string exactly.
-- Confirm whether user requested local-only or full GitHub flow.
+- Use the exact target and delivery scope already supplied; ask only for a missing or ambiguous target or a material release-policy choice.
 - Inspect current branch and ensure only release-related files are touched for this task.
 
 2. Update workspace versions
@@ -82,18 +80,18 @@ Only drop a file when the current repository release process clearly no longer r
 4. Verify before shipping
 - Run:
 - `make pre-commit`
-- If `make pre-commit` fails, return `BLOCKED` with root cause and do not silently widen scope to fix unrelated issues unless user asks.
+- If `make pre-commit` fails, fix task-attributable failures and rerun affected checks. Report unresolved required checks as `BLOCKED`; do not silently widen scope to fix unrelated issues.
 
-5. Commit strategy
+5. Commit strategy (only when committing is authorized)
 - Preferred split when both parts changed:
 - `chore(release): prepare <version>` for `Cargo.toml` and `Cargo.lock`.
 - `chore(release): align release assets for <version>` for docs and packaging files.
 - If user asks for one commit, use one commit.
 - Stage only intended release files; do not include unrelated working tree changes.
 
-6. Push and PR
+6. Push and PR (only for the authorized delivery scope)
 - Push branch:
-- `git push -u origin <branch>` (first push), or `git push` (tracking already exists).
+- Use the user-requested or configured push remote: `git push -u <push-remote> <branch>` (first push), or `git push` when tracking is already configured.
 - Create PR with template headings unchanged:
 - `gh pr create --base main --head <branch> --title ... --body-file ...`
 - PR title/body must be English.

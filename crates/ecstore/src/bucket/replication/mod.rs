@@ -66,6 +66,7 @@ pub(crate) use replication_lifecycle_bridge::ReplicationLifecycleBridge;
 pub(crate) use replication_migration_bridge::ReplicationMigrationBridge;
 pub use replication_object_bridge::ReplicationObjectBridge;
 pub use replication_object_config::{DeleteReplicationConfigSnapshot, ReplicationConfig};
+pub(crate) use replication_object_decision_boundary::replication_etags_match;
 pub use replication_object_decision_boundary::{
     MustReplicateOptions, ReplicationDeleteScheduleInput, ReplicationDeleteStateSource, delete_replication_state_from_config,
     delete_replication_version_id, should_schedule_delete_replication, should_use_existing_delete_replication_info,
@@ -88,5 +89,6 @@ pub use replication_state::{ReplicationStats, RuntimeReplicationTargetBacklog};
 pub use replication_stats_boundary::{BucketReplicationStat, BucketReplicationStats, BucketStats, InQueueMetric, XferStats};
 pub use replication_storage_boundary::{ReplicationObjectIO, ReplicationStorage};
 pub use replication_target_boundary::SsecPassthroughCapability;
+pub use replication_target_boundary::VersionIdentityCapability;
 pub use replication_target_boundary::{ObjectLockIntegrity, object_lock_put_integrity};
 pub(crate) use replication_target_config_bridge::ReplicationTargetConfigBridge;

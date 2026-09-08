@@ -38,6 +38,17 @@ pub(super) fn resolve_rebalance_worker_result<T>(
 
 pub(super) type RebalanceEntryTask = tokio::task::JoinHandle<Result<RebalanceEntryOutcome>>;
 
+/// Preserve the first real failure even when another task observes cancellation
+/// first. Cancellation is an outcome only when no entry or worker failed.
+pub(super) fn record_rebalance_error(first_error: &mut Option<Error>, err: Error) {
+    if first_error
+        .as_ref()
+        .is_none_or(|first| is_err_operation_canceled(first) && !is_err_operation_canceled(&err))
+    {
+        *first_error = Some(err);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RebalanceEntryCleanupResult {
     Completed { warning: Option<String> },
@@ -65,16 +76,12 @@ pub(super) async fn wait_rebalance_entry_tasks(
             }
             Ok(Err(err)) => {
                 error!("rebalance entry task failed for set {}: {}", set_idx, err);
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
+                record_rebalance_error(&mut first_error, err);
             }
             Err(err) => {
                 let err = Error::other(format!("rebalance entry task join error for set {set_idx}: {err}"));
                 error!("{}", err);
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
+                record_rebalance_error(&mut first_error, err);
             }
         }
     }
@@ -135,6 +142,9 @@ pub(super) fn resolve_rebalance_stats_update_result(
     object_name: &str,
 ) -> Result<()> {
     result.map_err(|err| {
+        if is_err_operation_canceled(&err) {
+            return err;
+        }
         Error::other(format!(
             "rebalance stats update failed for pool {pool_idx} bucket {bucket} object {object_name}: {err}"
         ))
@@ -214,16 +224,11 @@ pub(super) fn resolve_rebalance_terminal_error(primary_err: Error, signal_result
     }
 }
 
-pub(super) fn resolve_rebalance_bucket_error(entry_error: Option<Error>, worker_error: Option<Error>) -> Result<()> {
-    if let Some(err) = entry_error {
-        return Err(err);
-    }
-
+pub(super) fn resolve_rebalance_bucket_error(mut entry_error: Option<Error>, worker_error: Option<Error>) -> Result<()> {
     if let Some(err) = worker_error {
-        return Err(err);
+        record_rebalance_error(&mut entry_error, err);
     }
-
-    Ok(())
+    entry_error.map_or(Ok(()), Err)
 }
 
 pub(super) fn resolve_rebalance_bucket_result(
@@ -362,6 +367,9 @@ pub(super) fn ensure_rebalance_listing_disks_available(has_disks: bool, bucket: 
 }
 
 pub(super) fn with_rebalance_entry_context(stage: &str, bucket: &str, object_name: &str, err: Error) -> Error {
+    if is_err_operation_canceled(&err) {
+        return err;
+    }
     Error::other(format!("rebalance entry {stage} failed for {bucket}/{object_name}: {err}"))
 }
 

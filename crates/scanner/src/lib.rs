@@ -60,6 +60,7 @@ use uuid::Uuid;
 pub mod data_usage_define;
 pub mod error;
 pub mod prefix_usage;
+pub mod raw_page_index;
 mod remote_scanner;
 pub mod runtime_config;
 pub mod scanner;
@@ -68,6 +69,8 @@ pub mod scanner_folder;
 #[cfg(test)]
 mod scanner_heal_admission_baseline;
 pub mod scanner_io;
+#[doc(hidden)]
+pub mod segment_invalidation;
 pub mod sleeper;
 pub(crate) mod storage_api;
 mod workload_admission;
@@ -83,16 +86,19 @@ pub use remote_scanner::{
 pub use runtime_config::{apply_scanner_runtime_config, scanner_runtime_config_status, validate_scanner_runtime_config};
 pub use rustfs_scanner_metrics::last_minute;
 pub use scanner::{
-    ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus, ScannerCycleScheduleStatus, ScannerPauseBacklogAlertReason,
-    ScannerPauseBacklogPhase, ScannerPauseBacklogStatus, ScannerPauseBacklogThresholds, ScannerUsageStateResetResult,
-    init_data_scanner, reset_scanner_cycle_recovery, reset_scanner_usage_state_for_full_rebuild, scanner_cycle_recovery_status,
-    scanner_cycle_schedule_status, scanner_pause_backlog_status, scanner_topology_digest,
+    SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD, ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus,
+    ScannerCycleScheduleStatus, ScannerPauseBacklogAlertReason, ScannerPauseBacklogPhase, ScannerPauseBacklogStatus,
+    ScannerPauseBacklogThresholds, ScannerRecoveryIntentAcceptResult, ScannerRecoveryIntentConflict, ScannerRecoveryIntentRecord,
+    ScannerRecoveryIntentRequest, ScannerUsageStateResetResult, accept_scanner_usage_recovery_intent,
+    get_scanner_usage_recovery_intent, init_data_scanner, init_scanner_with_recovery, reset_scanner_cycle_recovery,
+    reset_scanner_usage_state_for_full_rebuild, run_scanner_usage_recovery_intent, scanner_cycle_recovery_status,
+    scanner_cycle_schedule_status, scanner_pause_backlog_status, scanner_recovery_actor_sha256, scanner_topology_digest,
 };
 pub use scanner_io::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageSnapshot, ScannerDirtyUsageState,
     acknowledge_dirty_usage_generation, acknowledge_scoped_dirty_usage, clear_dirty_usage_bucket, record_dirty_usage_bucket,
-    record_scanner_maintenance_change, scanner_activity_epoch, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
-    scanner_maintenance_generation,
+    record_dirty_usage_object, record_scanner_maintenance_change, scanner_activity_epoch, scanner_dirty_usage_snapshot,
+    scanner_dirty_usage_state, scanner_maintenance_generation,
 };
 pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,6 +106,7 @@ pub use storage_api::ScannerReplicationConfig as ReplicationConfig;
 pub use storage_api::scan::{
     SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES,
     SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
+    SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES,
 };
 pub use workload_admission::set_scanner_workload_admission_snapshot_provider;
 

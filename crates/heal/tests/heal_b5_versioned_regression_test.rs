@@ -44,7 +44,9 @@ use walkdir::WalkDir;
 
 mod storage_api;
 
-use storage_api::integration::{BucketOperations, ECStore, MakeBucketOptions, ObjectIO as _, ObjectOperations as _};
+use storage_api::integration::{
+    BucketOperations, ECStore, MakeBucketOptions, NamespaceLocking as _, ObjectIO as _, ObjectOperations as _,
+};
 
 /// 256 KiB + change: large enough to be stored as non-inline erasure shards
 /// (so each data version materializes as an on-disk `part.*` file we can assert
@@ -106,6 +108,7 @@ async fn put_versioned(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data:
         .put_object(bucket, object, &mut reader, &opts)
         .await
         .expect("versioned put_object failed");
+    wait_for_put_tail(ecstore, bucket, object).await;
     info.version_id
         .map(|u| u.to_string())
         .expect("versioned put must return a version id")
@@ -117,6 +120,7 @@ async fn put_unversioned(ecstore: &Arc<ECStore>, bucket: &str, object: &str, dat
         .put_object(bucket, object, &mut reader, &ObjectOptions::default())
         .await
         .expect("unversioned put_object failed");
+    wait_for_put_tail(ecstore, bucket, object).await;
 }
 
 /// Create a delete-marker as the latest version (versioned:true, no version_id)
@@ -160,20 +164,16 @@ fn xl_meta_path(obj_dir: &Path) -> PathBuf {
     obj_dir.join("xl.meta")
 }
 
-async fn wait_for_two_version_copies(disks: &[PathBuf], bucket: &str, object: &str) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if disks.iter().all(|disk| {
-                let object_dir = object_dir(disk, bucket, object);
-                xl_meta_path(&object_dir).exists() && count_part_files(&object_dir) >= 2
-            }) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("PUT rename tails must converge before wiping the versioned fixture");
+async fn wait_for_put_tail(ecstore: &Arc<ECStore>, bucket: &str, object: &str) {
+    // Shards and xl.meta can exist before the detached PUT owner finishes.
+    let lock = ecstore
+        .new_ns_lock(bucket, object)
+        .await
+        .expect("fixture namespace lock should be created");
+    let _settled = lock
+        .get_write_lock(Duration::from_secs(30))
+        .await
+        .expect("PUT rename tail must finish before inspecting or wiping the fixture");
 }
 
 fn recreate_heal_opts() -> HealOpts {
@@ -305,7 +305,13 @@ mod serial_tests {
         let data_v2 = versioned_test_data(20);
         let v1 = put_versioned(&ecstore, bucket, object, &data_v1).await; // OLD, non-latest
         let v2 = put_versioned(&ecstore, bucket, object, &data_v2).await; // latest
-        wait_for_two_version_copies(&disk_paths, bucket, object).await;
+        assert!(
+            disk_paths.iter().all(|disk| {
+                let dir = object_dir(disk, bucket, object);
+                xl_meta_path(&dir).exists() && count_part_files(&dir) >= 2
+            }),
+            "both versions must exist on every disk before wiping the fixture"
+        );
 
         // ── Pre-wipe: prove the fixture actually has 2 versions on disk[0] ──
         let obj_dir0 = object_dir(&disk_paths[0], bucket, object);

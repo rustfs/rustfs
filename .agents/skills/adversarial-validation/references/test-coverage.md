@@ -3,9 +3,10 @@
 - For every behavior claim, name the focused test/check that fails if the
   changed hunk is reverted. If none is practical, require the reason and
   residual risk.
-- Confirm tests exercise the real production path and assert returned values,
-  exact bytes, stored state, or the specific error variant—not only success,
-  `is_err()`, or no panic.
+- Confirm tests exercise the real production path and distinguish the intended
+  behavior from the named regression. A success, `is_err()`, or no-panic check
+  can be sufficient when that is the actual contract; require exact values,
+  bytes, state, or error variants when those distinctions matter to the change.
 - For new flags/modes, verify each branch and ask which test fails if the branch
   is inverted.
 - For new error propagation, inject the failure and assert the caller observes

@@ -500,6 +500,25 @@ pub fn put_opts_from_headers_with_replication_authorization(
         if let Some(restored) = rustfs_utils::http::ssec_transport_to_stored_metadata(headers) {
             opts.user_defined.extend(restored);
             opts.preserve_ciphertext = true;
+            // A compressed passthrough object restores its compression
+            // layout as well, so the replica decompresses after decrypting
+            // (backlog#2363). The value is validated when the object is read.
+            if let Some(scheme) = get_header(headers, rustfs_utils::http::SUFFIX_REPLICATION_COMPRESSION) {
+                rustfs_utils::http::insert_str(
+                    &mut opts.user_defined,
+                    rustfs_utils::http::SUFFIX_COMPRESSION,
+                    scheme.into_owned(),
+                );
+                if let Some(actual_size) = get_header(headers, rustfs_utils::http::SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE)
+                    && actual_size.parse::<i64>().is_ok_and(|size| size >= 0)
+                {
+                    rustfs_utils::http::insert_str(
+                        &mut opts.user_defined,
+                        rustfs_utils::http::SUFFIX_ACTUAL_SIZE,
+                        actual_size.into_owned(),
+                    );
+                }
+            }
         }
         if let Some(crc) = get_header(headers, SUFFIX_REPLICATION_SSEC_CRC) {
             insert_header_map(&mut opts.user_defined, SUFFIX_REPLICATION_SSEC_CRC, crc.into_owned());
@@ -1586,6 +1605,59 @@ mod tests {
             "2026-01-01T00:00:00Z",
         );
         assert!(!has_replication_retention_update(&missing_request, true));
+    }
+
+    #[test]
+    fn put_opts_from_headers_restores_the_compression_layout_only_for_ssec_passthrough() {
+        use rustfs_utils::http::object_encryption_keys::REPLICATION_SSEC_ALGORITHM_HEADER;
+        use rustfs_utils::http::{
+            SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_REPLICATION_COMPRESSION, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE,
+            get_str,
+        };
+
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        insert_header(&mut headers, SUFFIX_REPLICATION_COMPRESSION, "klauspost/compress/s2");
+        insert_header(&mut headers, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE, "6295552");
+
+        // Without SSE-C transport headers the request is not a passthrough:
+        // the target compresses (or not) by its own policy and must not adopt
+        // a layout the body does not have.
+        let plain = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
+            .expect("authorized replication request should parse");
+        assert!(!plain.preserve_ciphertext);
+        assert!(get_str(&plain.user_defined, SUFFIX_COMPRESSION).is_none());
+        assert!(get_str(&plain.user_defined, SUFFIX_ACTUAL_SIZE).is_none());
+
+        headers.insert(
+            REPLICATION_SSEC_ALGORITHM_HEADER.parse::<http::HeaderName>().unwrap(),
+            HeaderValue::from_static("AES256"),
+        );
+
+        // Unauthorized: inert, like the SSE-C transport itself.
+        let untrusted = put_opts_from_headers(&headers, HashMap::new()).expect("ordinary PUT options should be created");
+        assert!(!untrusted.preserve_ciphertext);
+        assert!(get_str(&untrusted.user_defined, SUFFIX_COMPRESSION).is_none());
+
+        // Authorized passthrough: the stored bytes are compressed ciphertext,
+        // so the replica records the scheme and the plaintext size
+        // (backlog#2363).
+        let trusted = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
+            .expect("authorized replication request should parse");
+        assert!(trusted.preserve_ciphertext);
+        assert_eq!(
+            get_str(&trusted.user_defined, SUFFIX_COMPRESSION).as_deref(),
+            Some("klauspost/compress/s2")
+        );
+        assert_eq!(get_str(&trusted.user_defined, SUFFIX_ACTUAL_SIZE).as_deref(), Some("6295552"));
+
+        // A malformed plaintext size is dropped; the scheme alone still lets
+        // the read path derive the size from the parts.
+        insert_header(&mut headers, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE, "-5");
+        let malformed = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
+            .expect("authorized replication request should parse");
+        assert!(get_str(&malformed.user_defined, SUFFIX_COMPRESSION).is_some());
+        assert!(get_str(&malformed.user_defined, SUFFIX_ACTUAL_SIZE).is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 ---
 name: plugin-contract-guard
-description: Invariants and change procedure for the target-plugin / extension system — plugin manifests, admin plugin/extension catalog and instance APIs, secret redaction, external-plugin install policy. Use when editing crates/targets (manifest, plugin, control_plane, catalog, runtime), crates/extension-schema, or rustfs/src/admin plugin_contract.rs / plugins_*.rs / extensions.rs / target_descriptor.rs.
+description: Guard changes to target-plugin manifests, extension schemas, admin catalog/instance contracts, secret redaction, and external-plugin install policy. Use when a diff changes those contracts in crates/targets, crates/extension-schema, or admin plugin/extension handlers; path membership alone, comments, and unrelated runtime internals do not trigger it.
 ---
 
 # Plugin & Extension Contract Guard

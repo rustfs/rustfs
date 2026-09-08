@@ -57,6 +57,8 @@ const RUSTFS_FULL_FEATURE: &str = "full";
 const TEST_PORT_MIN: u16 = 20_000;
 // Keep allocator ports below the ephemeral range used by bind(..., 0) test helpers.
 const TEST_PORT_RANGE: u16 = 10_000;
+const TEST_PORT_MIN_ENV: &str = "RUSTFS_E2E_TEST_PORT_MIN";
+const TEST_PORT_RANGE_ENV: &str = "RUSTFS_E2E_TEST_PORT_RANGE";
 const TEST_PORT_COUNTER_PATH: &str = "/tmp/rustfs_e2e_next_port";
 const TEST_PORT_LOCK_DIR: &str = "/tmp/rustfs_e2e_port_allocator.lock";
 const TEST_PORT_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
@@ -99,22 +101,74 @@ impl Drop for PortAllocatorGuard {
     }
 }
 
-fn advance_test_port(port: u16) -> u16 {
-    let offset = (port - TEST_PORT_MIN + 1) % TEST_PORT_RANGE;
-    TEST_PORT_MIN + offset
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TestPortAllocatorConfig {
+    min: u16,
+    range: u16,
 }
 
-fn seeded_test_port() -> u16 {
-    let offset = (Uuid::new_v4().as_u128() % u128::from(TEST_PORT_RANGE)) as u16;
-    TEST_PORT_MIN + offset
+impl TestPortAllocatorConfig {
+    fn max_exclusive(self) -> u32 {
+        u32::from(self.min) + u32::from(self.range)
+    }
+
+    fn contains(self, port: &u16) -> bool {
+        (u32::from(self.min)..self.max_exclusive()).contains(&u32::from(*port))
+    }
 }
 
-fn read_next_test_port() -> u16 {
+fn parse_test_port_allocator_config(
+    min_override: Option<&str>,
+    range_override: Option<&str>,
+) -> Result<TestPortAllocatorConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let min = match min_override {
+        Some(value) => value
+            .parse::<u16>()
+            .map_err(|err| format!("{TEST_PORT_MIN_ENV} must be a valid u16: {err}"))?,
+        None => TEST_PORT_MIN,
+    };
+    let range = match range_override {
+        Some(value) => value
+            .parse::<u16>()
+            .map_err(|err| format!("{TEST_PORT_RANGE_ENV} must be a valid u16: {err}"))?,
+        None => TEST_PORT_RANGE,
+    };
+    if range == 0 {
+        return Err(format!("{TEST_PORT_RANGE_ENV} must be greater than zero").into());
+    }
+    if min < 1024 {
+        return Err(format!("{TEST_PORT_MIN_ENV} must be at least 1024").into());
+    }
+    let max_exclusive = u32::from(min) + u32::from(range);
+    if max_exclusive > u32::from(u16::MAX) + 1 {
+        return Err(format!("{TEST_PORT_MIN_ENV} + {TEST_PORT_RANGE_ENV} exceeds u16 port space").into());
+    }
+    Ok(TestPortAllocatorConfig { min, range })
+}
+
+fn test_port_allocator_config() -> Result<TestPortAllocatorConfig, Box<dyn std::error::Error + Send + Sync>> {
+    parse_test_port_allocator_config(
+        std::env::var(TEST_PORT_MIN_ENV).ok().as_deref(),
+        std::env::var(TEST_PORT_RANGE_ENV).ok().as_deref(),
+    )
+}
+
+fn advance_test_port(port: u16, config: TestPortAllocatorConfig) -> u16 {
+    let offset = (port - config.min + 1) % config.range;
+    config.min + offset
+}
+
+fn seeded_test_port(config: TestPortAllocatorConfig) -> u16 {
+    let offset = (Uuid::new_v4().as_u128() % u128::from(config.range)) as u16;
+    config.min + offset
+}
+
+fn read_next_test_port(config: TestPortAllocatorConfig) -> u16 {
     stdfs::read_to_string(TEST_PORT_COUNTER_PATH)
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
-        .filter(|port| (TEST_PORT_MIN..TEST_PORT_MIN + TEST_PORT_RANGE).contains(port))
-        .unwrap_or_else(seeded_test_port)
+        .filter(|port| config.contains(port))
+        .unwrap_or_else(|| seeded_test_port(config))
 }
 
 fn remove_stale_port_allocator_lock() {
@@ -208,6 +262,15 @@ pub fn local_http_client() -> HttpClient {
         .no_proxy()
         .build()
         .expect("failed to build local reqwest client")
+}
+
+pub(crate) fn signal_process(pid: u32, signal: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let output = Command::new("kill").arg(format!("-{signal}")).arg(pid.to_string()).output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(format!("kill -{signal} {pid} failed: {}", String::from_utf8_lossy(&output.stderr)).into())
 }
 
 pub(crate) async fn signed_s3_request(
@@ -629,11 +692,12 @@ impl RustFSTestEnvironment {
     pub async fn find_available_port() -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
         use std::net::TcpListener;
         let _guard = PortAllocatorGuard::acquire().await?;
-        let mut next_port = read_next_test_port();
+        let config = test_port_allocator_config()?;
+        let mut next_port = read_next_test_port(config);
 
-        for _ in 0..TEST_PORT_RANGE {
+        for _ in 0..config.range {
             let port = next_port;
-            next_port = advance_test_port(next_port);
+            next_port = advance_test_port(next_port, config);
             write_next_test_port(next_port)?;
 
             if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
@@ -1700,6 +1764,69 @@ impl RustFSTestClusterEnvironment {
         Ok(())
     }
 
+    /// Append a new single-node erasure pool to a stopped multi-pool cluster.
+    ///
+    /// Used to simulate pool expansion on localhost: every pool already owns
+    /// exactly one node with `drives_per_node >= 2` (the only multi-pool layout
+    /// the single-host `RUSTFS_VOLUMES` syntax can express). The new node is
+    /// allocated a fresh port and empty drive directories; callers must
+    /// [`Self::start`] afterwards so every process picks up the extended
+    /// volumes argument. Existing data directories are left untouched.
+    pub async fn append_single_node_pool(&mut self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        if self.nodes.iter().any(|node| node.process.is_some()) {
+            return Err("stop the cluster before appending a pool".into());
+        }
+        if self.topology.drives_per_node < 2 {
+            return Err(
+                "append_single_node_pool requires drives_per_node >= 2 (the server parser rejects a single-drive ellipses pool)"
+                    .into(),
+            );
+        }
+
+        let mut pools = self.topology.normalized_pools();
+        for (pool_idx, nodes) in pools.iter().enumerate() {
+            if nodes.len() != 1 {
+                return Err(format!(
+                    "pool {pool_idx} spans {} nodes; append_single_node_pool requires one node per pool",
+                    nodes.len()
+                )
+                .into());
+            }
+        }
+
+        let new_idx = self.nodes.len();
+        let port = RustFSTestEnvironment::find_available_port().await?;
+        let address = format!("127.0.0.1:{port}");
+        let data_dirs: Vec<String> = (0..self.topology.drives_per_node)
+            .map(|drive| format!("{}/node{}/drive{}", self.temp_dir, new_idx, drive))
+            .collect();
+        for dir in &data_dirs {
+            fs::create_dir_all(dir).await?;
+        }
+
+        self.nodes.push(ClusterNode {
+            url: format!("http://{address}"),
+            address,
+            data_dir: data_dirs[0].clone(),
+            data_dirs,
+            pool_idx: pools.len(),
+            process: None,
+        });
+        pools.push(vec![new_idx]);
+        self.topology.node_count = self.nodes.len();
+        self.topology.pools = pools;
+        self.node_extra_env.push(Vec::new());
+        self.node_capture_log_paths.push(None);
+        self.volume_proxy_addresses.push(None);
+
+        if !self.extra_env.iter().any(|(key, _)| key == "RUSTFS_UNSAFE_BYPASS_DISK_CHECK") {
+            self.extra_env
+                .push(("RUSTFS_UNSAFE_BYPASS_DISK_CHECK".to_string(), "true".to_string()));
+        }
+
+        Ok(new_idx)
+    }
+
     /// Gracefully stop one cluster node and wait for its process to exit.
     ///
     /// This is intentionally separate from [`Self::stop_node`]: the latter is
@@ -2043,6 +2170,35 @@ mod tests {
             capture_log_path(Path::new("/tmp/e2e-logs"), "/tmp/rustfs_e2e_test_abc"),
             Some(PathBuf::from("/tmp/e2e-logs/rustfs_e2e_test_abc.log"))
         );
+    }
+
+    #[test]
+    fn e2e_port_allocator_uses_default_range() {
+        assert_eq!(
+            parse_test_port_allocator_config(None, None).expect("default port allocator config"),
+            TestPortAllocatorConfig {
+                min: TEST_PORT_MIN,
+                range: TEST_PORT_RANGE
+            }
+        );
+    }
+
+    #[test]
+    fn e2e_port_allocator_accepts_explicit_test_range() {
+        let config = parse_test_port_allocator_config(Some("31000"), Some("128")).expect("explicit port range");
+
+        assert_eq!(advance_test_port(31127, config), 31000);
+        assert!(config.contains(&31000));
+        assert!(config.contains(&31127));
+        assert!(!config.contains(&31128));
+    }
+
+    #[test]
+    fn e2e_port_allocator_rejects_invalid_override() {
+        assert!(parse_test_port_allocator_config(Some("1023"), Some("1")).is_err());
+        assert!(parse_test_port_allocator_config(Some("65000"), Some("1000")).is_err());
+        assert!(parse_test_port_allocator_config(Some("31000"), Some("0")).is_err());
+        assert!(parse_test_port_allocator_config(Some("not-a-port"), Some("128")).is_err());
     }
 
     #[test]

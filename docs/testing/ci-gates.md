@@ -51,7 +51,7 @@ The aggregate requires the validation lanes already selected by `ci.yml`; this c
 | PR touching `paths` in `fuzz.yml` | `Build Fuzz Harness`, `Smoke / <target>` | `fuzz.yml` `fuzz-build`, `pr-fuzz-smoke` | Report-only | `MAX_TOTAL_TIME=60 ./scripts/fuzz/run.sh` |
 | PR touching `paths` in `windows-filesystem.yml` | `Rename Safety` | `windows-filesystem.yml` `rename-safety` | Report-only | the `cargo test -p rustfs-ecstore --lib <filter>` commands in the job, on Windows |
 | PR touching `paths` in `coverage.yml` | `Workspace line coverage` | `coverage.yml` `coverage` | Report-only | `make coverage`; `python3 scripts/check_security_coverage.py target/llvm-cov/coverage.json` |
-| PR touching `paths` in `e2e-upgrade.yml` | `Direct upgrade from rc.2` | `e2e-upgrade.yml` `direct-upgrade` | Report-only | the `cargo test --locked -p e2e_test` command in the job with `RUSTFS_UPGRADE_SOURCE_BINARY` pointing at the pinned previous release |
+| PR touching `paths` in `e2e-upgrade.yml` | `Direct upgrade from the previous release`, `Mixed-version rolling upgrade from the previous release`, `Bucket configuration survives the upgrade`, `Rollback reads current bucket metadata` | `e2e-upgrade.yml` `upgrade` matrix | Report-only | the `cargo test --locked -p e2e_test` command in the job with `RUSTFS_UPGRADE_SOURCE_BINARY` pointing at the pinned previous release (`UPGRADE_SOURCE_VERSION`) |
 | PR touching `paths` in `oidc-keycloak.yml` | `OIDC Keycloak live gate` | `oidc-keycloak.yml` `oidc-keycloak-live` | Report-only | `cargo build --locked -p rustfs --bin rustfs`, then `bash scripts/test/oidc_keycloak_live.sh ./target/debug/rustfs` |
 | PR touching `paths` in `targets-integration.yml` | `PostgreSQL, MySQL, AMQP, and NATS` | `targets-integration.yml` `targets-live` | Report-only | start the containers as in the job, export the `RUSTFS_TEST_*` DSNs, then the job's `cargo test --locked -p rustfs-targets --test <name> -- --ignored --test-threads=1` commands |
 | PR, documentation-only selection | `Quick Checks`, `Typos`, `Test and Lint` | `ci.yml` `quick-checks`, `typos`, `required-checks` | Required directly or via aggregate | Quick Checks commands; `python3 scripts/ci_gate.py --self-test` |
@@ -76,6 +76,7 @@ Scheduled lanes never block a PR. Their workflow-local gate fails the run, sched
 | `ci.yml` (weekly) | full matrix, including the schedule/dispatch-only rio-v2 jobs `build-rustfs-debug-binary-rio-v2` and `e2e-tests-rio-v2` | strict aggregate; the full E2E lane runs on dispatch, merge groups, and main pushes | yes | dispatch `ci.yml` |
 | `build.yml` (weekly) | `build-rustfs` over the six-target platform matrix in `prepare-platform-matrix` (four Linux, macOS aarch64, Windows x86_64) | build/package integrity | yes | dispatch `build.yml` with an exact platform set |
 | `e2e-replication-nightly.yml` (nightly) | `repl-nightly`, `cluster-nightly`, `protocols-nightly` | three independent gates; JUnit, membership listing, server logs | yes | `cargo nextest run --profile e2e-repl-nightly -p e2e_test`; `--profile e2e-nightly`; `-j 1 --profile e2e-protocols` |
+| `e2e-distributed.yml` (storage-sensitive PRs + nightly) | `distributed` | fail-closed 4-node 4-disk S3, durability, replication, movement, fault, and direct/rolling upgrade gate; JUnit, membership listing, per-node server logs | yes, with `never_ran_grace_until` | download the pinned previous release as in the workflow, export `RUSTFS_UPGRADE_SOURCE_BINARY`, then `cargo nextest run --profile e2e-distributed -p e2e_test` |
 | `e2e-s3tests.yml` (weekly) | `s3tests` (single and distributed, four shards each), `upstream-head-canary` | compatibility gate; report, JUnit, node IDs, server logs | yes | `scripts/s3-tests/run.sh` against an existing single or distributed target |
 | `fuzz.yml` (nightly) | `nightly-fuzz-corpus` per target | gate; corpus and crash artifacts | yes | `MAX_TOTAL_TIME=<seconds> ./scripts/fuzz/run.sh` |
 | `minio-interop.yml` (nightly) | `minio-interop` | EC + SSE read-parity gate | yes, with `never_ran_grace_until` | pinned Docker fixture steps in the workflow |
@@ -86,12 +87,18 @@ Scheduled lanes never block a PR. Their workflow-local gate fails the run, sched
 | `mint.yml` (weekly) | `mint` | report-only by design; per-suite PASS/FAIL/NA and raw `log.json` | yes | pinned Docker sequence in the workflow |
 | `coverage.yml` (weekly) | `coverage` | report-only trend; lcov and JSON artifact | yes | `make coverage` |
 | `runner-hygiene.yml` (monthly) | `check-ephemerality` | runner ephemerality | yes | dispatch |
-| `e2e-upgrade.yml` (weekly) | `direct-upgrade` | upgrade gate; server logs | no | see the PR row |
+| `e2e-upgrade.yml` (weekly) | `upgrade` (4-case matrix) | upgrade and rollback gate; server logs | no | see the PR row |
 | `oidc-keycloak.yml` (weekly) | `oidc-keycloak-live` | live OIDC gate | no | see the PR row |
 | `targets-integration.yml` (nightly) | `targets-live` | live target gate; container logs | no | see the PR row |
 | `scheduled-validation-freshness.yml` (nightly) | `check-freshness` | fails on missing or stale attempts or completed successes | n/a | dispatch |
 
 Manual `workflow_dispatch` runs are debugging evidence and do not open scheduled-failure issues. A manual performance run may explicitly allow a known regression; that override is not a passing baseline.
+
+## Packaged functional acceptance
+
+`rustfs-functional-chain.yml` dispatches the packaged-build suites in `rustfs-*-test.yml` on the shared lab runners. A failing suite step or job must fail its workflow. Report collection, cleanup, and dispatch of the next suite can still run with `always()`; continuing diagnostics does not make the failed suite successful.
+
+Workflow status preserves errors that the test scripts report. It does not establish complete execution or a common package identity across the chain: inspect the current run's case results, package identity, and test-script revision as well. A script that returns zero after a failed tool invocation needs its own result check.
 
 ## Release validation
 
@@ -116,8 +123,126 @@ Update this file in the same PR when a job or check name changes, a workflow gai
 
 The existing `ci.yml` test-and-lint job runs the ordinary ECStore and filemeta tests. After that run, `scripts/check_test_wiring.py --check-core` checks the same nextest profile and package selection against `.config/ecstore-required-tests.json`. Every named test must exist, match the filter, and be non-ignored; the job also requires a nonempty JUnit report. This checks membership without running the tests twice. `core-test-listing.json`, JUnit, and the run log are retained in the existing test-and-lint artifact.
 
-The manifest records a minimum set of invariants: write quorum, metadata rollback, stale-writer lock loss, plaintext Range content, multipart cancellation, hiding uncommitted LIST versions, real MinIO metadata, and corrupt part arrays. Renaming or moving a required test must update the manifest in the same change after checking the compiled listing. Extend this list as new deterministic regressions land; it is not a claim that all storage invariants are covered.
+The manifest records a minimum set of invariants: write quorum, metadata rollback, stale-writer lock loss, plaintext Range content, multipart cancellation, hiding uncommitted LIST versions, real MinIO metadata, corrupt part arrays, and the shared on-demand-migration source-backend contract for each provider dialect (S3, Azure, native GCS). The three contract entries live in the `rustfs` suite and reach the lane through that package's default features, so dropping `gcs` from `rustfs`'s defaults fails this check instead of silently deselecting the GCS contract (rustfs/backlog#2323). Renaming or moving a required test must update the manifest in the same change after checking the compiled listing. Extend this list as new deterministic regressions land; it is not a claim that all storage invariants are covered.
 
 The checked-in MinIO corpus is pinned by file SHA256 and its documented source release. The static wiring guard and the CI selection check both reject missing or changed fixtures. These are metadata fixtures, not a legacy shard-body corpus or proof of crash durability. Optional `legacy_bitrot_read_test` runs may still skip when their external corpus is absent; they do not satisfy a required compatibility lane. Real encrypted fixture reads remain in `minio-interop.yml`, and multi-node fault schedules remain in the existing nightly cluster lane. In-process reopen tests do not establish power-loss durability.
 
 Run `python3 scripts/check_test_wiring.py --self-test` to exercise the negative cases: removed/ignored/filtered tests, malformed listing, absent fixtures, and wrong fixture hashes. Do not update hashes merely to silence the guard; a fixture change needs source/provenance and compatibility review.
+## Scanner/Heal Evidence Receipts
+
+The existing `scripts/check_test_wiring.py` also validates Scanner/Heal case
+evidence registered in `.config/scanner-heal-required-tests.json`. It records
+already-built binaries and checks existing nextest output; it does not build,
+run tests, deploy servers, inject faults, or start another CI lane.
+
+The initial case is `background-target-restart`, emitted by
+`heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_remote_shards_after_background_target_restart`.
+That test already runs in `e2e-nightly`. When `RUSTFS_SCANNER_HEAL_RUN_DIR` is set,
+it checks the actual server and test-executable hashes against `run.json`, pins
+the same server binary for all node starts, and writes its oracle only after
+the real assertions pass. The artifact contains the actual pre/post target
+PIDs, per-node S3 listings, expected and downloaded complete-body hashes/lengths,
+and target-disk `VersionShardCensus` fingerprints. Existing baseline objects
+must match their pre-fault physical manifests; the object created during the
+outage has no pre-fault target shard and is checked for complete physical parts
+and exact S3 content.
+
+This case is a **four-node, one-drive-per-node process-restart test**. It is not
+power-loss validation, a 3x4 EC8+4 experiment, an all-version inventory, or proof
+of scanner enumeration, exact MRF disposition, legacy migration, or rollback.
+The registry keeps all G01-G14/P1-P4 and R-E/R-D/R-L release requirements pending
+until their actual feature-specific oracles and required topologies exist.
+Missing cases cannot be supplied by synthetic W20 results. W20's bounded JSON
+and file-hash helpers are reused; its ABBA performance contracts remain in
+`docs/operations/scanner-benchmark-runbook.md`.
+
+### Recording One Case
+
+Use a committed source tree, independently built current binaries, sufficient
+free disk space, and a task-owned artifact directory that does not yet exist.
+Set `SERVER_BINARY` and `TEST_BINARY` to those exact executable paths. The begin
+command requires the server's embedded `--version` commit to match the clean
+checkout and its embedded Git status to be clean. The E2E crate's build script
+embeds its build-time Git revision/dirty state, lockfile Git blob, enabled crate
+features, target, profile and encoded Rust flags. It tracks the crate/dependency
+trees, Cargo inputs and Git HEAD/ref/index, including `common.rs` restart logic.
+The producer checks this compiled identity against the receipt; it does not
+copy a current source revision into an older test binary's identity. The E2E
+uses its existing temporary cluster directories and cleanup. `CARGO_TARGET_DIR`
+controls compilation output; nextest's default report store remains the
+workspace's `target/nextest`. Execute the existing selected case as follows:
+
+```bash
+CASE=background-target-restart
+FILTER='test(test_cluster_root_heal_recovers_remote_shards_after_background_target_restart)'
+RUN_DIR="$PWD/artifacts/scanner-heal-run"
+export RUSTFS_E2E_EXPECTED_FEATURES=default
+scripts/python_bin.sh scripts/check_test_wiring.py \
+  --begin-scanner-heal "$RUN_DIR" "$SERVER_BINARY" "$TEST_BINARY"
+export RUSTFS_SCANNER_HEAL_RUN_DIR="$RUN_DIR"
+export CARGO_BIN_EXE_rustfs="$SERVER_BINARY"
+cargo nextest list --profile e2e-nightly -p e2e_test -E "$FILTER" \
+  --message-format json > "$RUN_DIR/listing.json"
+rm -f target/nextest/e2e-nightly/junit.xml
+set +e
+cargo nextest run --profile e2e-nightly -p e2e_test -E "$FILTER"
+test_exit=$?
+set -e
+cp target/nextest/e2e-nightly/junit.xml "$RUN_DIR/junit.xml"
+scripts/python_bin.sh scripts/check_test_wiring.py --finish-scanner-heal "$RUN_DIR" "$test_exit"
+scripts/python_bin.sh scripts/check_test_wiring.py --check-scanner-heal "$RUN_DIR" "$CASE"
+```
+
+Set `RUSTFS_E2E_EXPECTED_FEATURES` to the actual intended e2e crate feature set,
+including `default` for a default-feature build, comma-separated for extra
+features, or empty for `--no-default-features`. It is mandatory when beginning
+a run. Crate features are distinct from the spawned server's build features.
+
+Do not replace a nonzero command exit with zero. Missing JUnit or an oracle
+emission failure also fails acceptance. Each retry needs a new run directory;
+the producer refuses to overwrite an existing oracle. Keep failed-run logs and
+artifacts. The receipt pins source revision, actual binary hashes, run identity,
+start/finish times, and the artifact hashes. `listing.json`, `junit.xml`, and
+each oracle are limited to 1 MiB; object evidence has the fixture's 9..65 object
+bound. Credentials are not included in the receipt.
+
+The checker binds nextest's flattened suite `binary-id`/`binary-path` to the
+actual test executable and requires the JUnit testcase's embedded execution
+timestamp to fall inside the receipt window (with millisecond precision).
+Copying an old JUnit file and refreshing its mtime does not make it new evidence.
+Schema versions, topology counts, PIDs, EC geometry and shard indices require
+actual integers: booleans and fractional values are rejected, and an index must
+fit the physical data-plus-parity geometry.
+
+The checker rejects unselected/ignored tests, zero/duplicate JUnit cases,
+failures, skipped tests, retry/flaky records, stale or changed artifacts,
+different builds or run IDs, unchanged process IDs, wrong topology, missing
+shard parts, and mismatched S3 content/listings. The raw oracle JSON is emitted
+by the real E2E producer, not accepted from an adapter copying expectations.
+
+`--check-scanner-heal "$RUN_DIR" release` checks available case evidence and
+returns nonzero for every pending release requirement. A focused case pass
+does not approve release. In particular, R-E requires fixed-budget real
+restarts without an unbudgeted final sweep, R-D requires the full
+manager/event/ledger disposition chain, and R-L requires source-conflict and
+crash/retirement evidence. Reader-only or unit fixtures cannot substitute for
+these. The external `rustfs/auto-testing` functional workflows propagate suite
+failures. Their workflow status does not establish this registry's required
+case coverage, build provenance, or object-level oracles.
+
+For automation, `--check-scanner-heal-release "$RUN_DIR"` emits one compact
+JSON decision and exits nonzero while blocked. `verified_cases` contains only
+cases that pass the complete receipt, build provenance, nextest/JUnit and real
+oracle checks; `rejected_cases` names registered cases that do not, and
+`pending_gates` names the unimplemented release requirements. Approval requires
+every registered case to verify, `pending_gates` to be empty, and a future
+registry schema capable of representing the complete release matrix. Schema 1
+is deliberately marked `release_schema_capable: false`: it models only the
+single-version, unversioned-object restart/crash cases and cannot represent
+mixed-version, rollback, EC8+4 or performance evidence. A focused run,
+synthetic harness, compile-only result, skipped/retried test, ordinary CI
+success, or removal of pending text therefore cannot become a release approval.
+
+Run parser/receipt regressions with
+`scripts/python_bin.sh scripts/check_test_wiring.py --self-test`. Those fixtures
+validate the checker only and produce no runtime or performance evidence.

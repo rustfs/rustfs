@@ -44,6 +44,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "sync", "fs", "rt-m
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 bytes = { workspace = true, features = ["serde"] }
 rustfs-utils = { workspace = true, features = ["hash", "http"] }
+rustfs-config = { workspace = true, features = ["constants"] }
 byteorder = { workspace = true }
 tracing.workspace = true
 thiserror.workspace = true

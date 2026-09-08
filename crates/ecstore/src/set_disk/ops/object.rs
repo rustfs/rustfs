@@ -19,6 +19,8 @@
 //! bounds are unchanged, and the impls reach shared primitives through the
 //! SetDisks core (io_primitives) via inherent calls.
 
+use crate::core::pools::DecommissionCapacityAdmission;
+
 #[cfg(test)]
 use super::super::MetadataCacheInvalidationProbe;
 use super::super::{
@@ -3905,6 +3907,7 @@ impl SetDisks {
                         bucket,
                         object,
                         opts.no_lock || object_lock_guard.is_some(),
+                        DecommissionCapacityAdmission::Mutation,
                     )
                     .await?;
                 decommission_object_lock_guard = object_guard;
@@ -4102,7 +4105,7 @@ impl SetDisks {
             {
                 decommission_capacity_guard = Some(
                     store
-                        .acquire_external_decommission_capacity_fence(&[self.pool_index], "mutation")
+                        .acquire_external_decommission_capacity_fence(&[self.pool_index], DecommissionCapacityAdmission::Mutation)
                         .await?,
                 );
             }
@@ -4459,7 +4462,10 @@ impl SetDisks {
                         commit_scanner_publication_lease_tokens.as_ref(),
                     )
                     .with_publication_scope(commit_scanner_publication_scope.clone())
-                    .with_rollback_receipt(commit_rollback_receipt.clone()),
+                    .with_rollback_receipt(commit_rollback_receipt.clone())
+                    .with_namespace_commit_guard(
+                        (!is_meta_bucketname(&commit_bucket)).then(|| commit_set.ctx.begin_namespace_commit()),
+                    ),
                 )
                 .await;
                 if let Some(scope) = commit_scanner_publication_scope.as_ref() {
@@ -5663,6 +5669,10 @@ impl Drop for TransitionUploadCleanup {
         if !self.armed {
             return;
         }
+        #[cfg(all(test, feature = "test-util"))]
+        if transition_transaction_kill_point_is_active(self.cleanup_transaction.as_ref()) {
+            return;
+        }
         let Some(candidate) = self.candidate.as_ref() else {
             return;
         };
@@ -5782,7 +5792,7 @@ pub(crate) async fn cleanup_rejected_transition_upload_durably(
 }
 
 async fn transition_cleanup_store(ctx: &Arc<crate::runtime::instance::InstanceContext>) -> Option<Arc<ECStore>> {
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(feature = "test-util")]
     pause_transition_cleanup_store().await;
 
     transition_object_store(ctx).await
@@ -5867,17 +5877,29 @@ fn transition_source_identity(
 }
 
 async fn save_transition_transaction_if_available(api: Option<&Arc<ECStore>>, transaction: &TransitionTransaction) -> Result<()> {
-    if let Some(api) = api {
-        return save_transition_transaction_record(api.clone(), transaction).await;
-    }
     #[cfg(test)]
-    {
-        Ok(())
-    }
-    #[cfg(not(test))]
-    {
-        Err(Error::other("transition transaction store is unavailable"))
-    }
+    let started = std::time::Instant::now();
+    let result = if let Some(api) = api {
+        save_transition_transaction_record(api.clone(), transaction).await
+    } else {
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+        #[cfg(not(test))]
+        {
+            Err(Error::other("transition transaction store is unavailable"))
+        }
+    };
+    #[cfg(test)]
+    record_transition_transaction_mutation(
+        transaction,
+        TransitionTransactionMutationKind::Create,
+        None,
+        started.elapsed(),
+        result.is_ok(),
+    );
+    result
 }
 
 async fn compare_and_save_transition_transaction_if_available(
@@ -5885,19 +5907,31 @@ async fn compare_and_save_transition_transaction_if_available(
     expected: &TransitionTransaction,
     next: &TransitionTransaction,
 ) -> Result<()> {
-    if let Some(api) = api {
+    #[cfg(test)]
+    let started = std::time::Instant::now();
+    let result = if let Some(api) = api {
         // The transition worker already has a deep poll chain. Keep the CAS
         // read/write/receipt future off Tokio's default worker stack.
-        return Box::pin(save_transition_transaction_record_if_current(api.clone(), expected, next)).await;
-    }
+        Box::pin(save_transition_transaction_record_if_current(api.clone(), expected, next)).await
+    } else {
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+        #[cfg(not(test))]
+        {
+            Err(Error::other("transition transaction store is unavailable"))
+        }
+    };
     #[cfg(test)]
-    {
-        Ok(())
-    }
-    #[cfg(not(test))]
-    {
-        Err(Error::other("transition transaction store is unavailable"))
-    }
+    record_transition_transaction_mutation(
+        next,
+        TransitionTransactionMutationKind::CompareAndSave,
+        Some(expected.state),
+        started.elapsed(),
+        result.is_ok(),
+    );
+    result
 }
 
 async fn advance_and_save_transition_transaction(
@@ -5906,8 +5940,6 @@ async fn advance_and_save_transition_transaction(
     next: TransitionTransactionState,
     remote_version: Option<TransitionRemoteVersion>,
 ) -> Result<()> {
-    #[cfg(test)]
-    record_transition_uploaded_save_attempt(transaction, next);
     let expected = transaction.clone();
     let mut advanced = expected.clone();
     advanced
@@ -5919,10 +5951,33 @@ async fn advance_and_save_transition_transaction(
 }
 
 #[cfg(test)]
-struct TransitionUploadedSaveProbeState {
+struct TransitionTransactionMutationProbeState {
     bucket: String,
     object: String,
-    attempts: std::sync::atomic::AtomicUsize,
+    observations: std::sync::Mutex<Vec<TransitionTransactionMutationObservation>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransitionTransactionMutationKind {
+    Create,
+    CompareAndSave,
+    Delete,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "full mutation measurements are consumed by tests behind `--features test-util`"
+)]
+pub(crate) struct TransitionTransactionMutationObservation {
+    pub(crate) kind: TransitionTransactionMutationKind,
+    pub(crate) previous_state: Option<TransitionTransactionState>,
+    pub(crate) state: TransitionTransactionState,
+    pub(crate) encoded_bytes: usize,
+    pub(crate) elapsed: std::time::Duration,
+    pub(crate) succeeded: bool,
 }
 
 #[cfg(test)]
@@ -5930,31 +5985,35 @@ struct TransitionUploadedSaveProbeState {
     dead_code,
     reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
 )]
-struct TransitionUploadedSaveProbe {
-    state: Arc<TransitionUploadedSaveProbeState>,
+pub(crate) struct TransitionTransactionMutationProbe {
+    state: Arc<TransitionTransactionMutationProbeState>,
 }
 
 #[cfg(test)]
-static TRANSITION_UPLOADED_SAVE_PROBE: std::sync::OnceLock<std::sync::Mutex<Option<Arc<TransitionUploadedSaveProbeState>>>> =
-    std::sync::OnceLock::new();
+static TRANSITION_TRANSACTION_MUTATION_PROBE: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<TransitionTransactionMutationProbeState>>>,
+> = std::sync::OnceLock::new();
 
 #[cfg(test)]
-impl TransitionUploadedSaveProbe {
+impl TransitionTransactionMutationProbe {
     #[allow(
         dead_code,
         reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
     )]
-    fn install(bucket: &str, object: &str) -> Self {
-        let state = Arc::new(TransitionUploadedSaveProbeState {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(TransitionTransactionMutationProbeState {
             bucket: bucket.to_string(),
             object: object.to_string(),
-            attempts: std::sync::atomic::AtomicUsize::new(0),
+            observations: std::sync::Mutex::new(Vec::new()),
         });
-        let mut slot = TRANSITION_UPLOADED_SAVE_PROBE
+        let mut slot = TRANSITION_TRANSACTION_MUTATION_PROBE
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
-            .expect("transition uploaded-save probe mutex should not poison");
-        assert!(slot.is_none(), "transition uploaded-save probe must be installed by one test at a time");
+            .expect("transition transaction mutation probe mutex should not poison");
+        assert!(
+            slot.is_none(),
+            "transition transaction mutation probe must be installed by one test at a time"
+        );
         *slot = Some(Arc::clone(&state));
         drop(slot);
         Self { state }
@@ -5965,17 +6024,31 @@ impl TransitionUploadedSaveProbe {
         reason = "installed by set_disk tests behind `--features test-util` (backlog#1823)"
     )]
     fn attempts(&self) -> usize {
-        self.state.attempts.load(std::sync::atomic::Ordering::Acquire)
+        self.observations()
+            .into_iter()
+            .filter(|observation| {
+                observation.kind == TransitionTransactionMutationKind::CompareAndSave
+                    && observation.state == TransitionTransactionState::Uploaded
+            })
+            .count()
+    }
+
+    pub(crate) fn observations(&self) -> Vec<TransitionTransactionMutationObservation> {
+        self.state
+            .observations
+            .lock()
+            .expect("transition transaction mutation observations mutex should not poison")
+            .clone()
     }
 }
 
 #[cfg(test)]
-impl Drop for TransitionUploadedSaveProbe {
+impl Drop for TransitionTransactionMutationProbe {
     fn drop(&mut self) {
-        let mut slot = TRANSITION_UPLOADED_SAVE_PROBE
+        let mut slot = TRANSITION_TRANSACTION_MUTATION_PROBE
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
-            .expect("transition uploaded-save probe mutex should not poison");
+            .expect("transition transaction mutation probe mutex should not poison");
         if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
             *slot = None;
         }
@@ -5983,19 +6056,34 @@ impl Drop for TransitionUploadedSaveProbe {
 }
 
 #[cfg(test)]
-fn record_transition_uploaded_save_attempt(transaction: &TransitionTransaction, next: TransitionTransactionState) {
-    if next != TransitionTransactionState::Uploaded {
-        return;
-    }
-    let state = TRANSITION_UPLOADED_SAVE_PROBE
+fn record_transition_transaction_mutation(
+    transaction: &TransitionTransaction,
+    kind: TransitionTransactionMutationKind,
+    previous_state: Option<TransitionTransactionState>,
+    elapsed: std::time::Duration,
+    succeeded: bool,
+) {
+    let state = TRANSITION_TRANSACTION_MUTATION_PROBE
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
-        .expect("transition uploaded-save probe mutex should not poison")
+        .expect("transition transaction mutation probe mutex should not poison")
         .as_ref()
         .filter(|state| state.bucket == transaction.source.bucket && state.object == transaction.source.object)
         .cloned();
     if let Some(state) = state {
-        state.attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let encoded_bytes = transaction.encode().map_or(0, |encoded| encoded.len());
+        state
+            .observations
+            .lock()
+            .expect("transition transaction mutation observations mutex should not poison")
+            .push(TransitionTransactionMutationObservation {
+                kind,
+                previous_state,
+                state: transaction.state,
+                encoded_bytes,
+                elapsed,
+                succeeded,
+            });
     }
 }
 
@@ -6003,12 +6091,24 @@ async fn delete_transition_transaction_if_available(
     api: Option<&Arc<ECStore>>,
     transaction: &TransitionTransaction,
 ) -> Result<()> {
-    if let Some(api) = api {
+    #[cfg(test)]
+    let started = std::time::Instant::now();
+    let result = if let Some(api) = api {
         // Conditional delete now includes a read and terminal receipt; box it
         // for the same transition-worker stack bound as the CAS path above.
-        return Box::pin(delete_transition_transaction_record(api.clone(), transaction)).await;
-    }
-    Ok(())
+        Box::pin(delete_transition_transaction_record(api.clone(), transaction)).await
+    } else {
+        Ok(())
+    };
+    #[cfg(test)]
+    record_transition_transaction_mutation(
+        transaction,
+        TransitionTransactionMutationKind::Delete,
+        Some(transaction.state),
+        started.elapsed(),
+        result.is_ok(),
+    );
+    result
 }
 
 async fn delete_transition_transaction_after_remote_cleanup(
@@ -6028,24 +6128,24 @@ async fn delete_transition_transaction_after_remote_cleanup(
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 #[derive(Default)]
 struct TransitionCleanupStoreBarrierState {
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 /// One-shot test barrier placed before transition cleanup resolves its ECStore.
 pub(crate) struct TransitionCleanupStoreBarrier {
     state: Arc<TransitionCleanupStoreBarrierState>,
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 static TRANSITION_CLEANUP_STORE_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<TransitionCleanupStoreBarrierState>>>> =
     std::sync::OnceLock::new();
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 impl TransitionCleanupStoreBarrier {
     /// Install the process-local barrier for the next cleanup-store resolution.
     pub(crate) fn install() -> Self {
@@ -6068,7 +6168,7 @@ impl TransitionCleanupStoreBarrier {
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 impl Drop for TransitionCleanupStoreBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -6082,7 +6182,7 @@ impl Drop for TransitionCleanupStoreBarrier {
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 async fn pause_transition_cleanup_store() {
     let barrier = TRANSITION_CLEANUP_STORE_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -6156,7 +6256,7 @@ async fn pause_after_transition_upload_candidate_recorded() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 struct TransitionUploadedCommitBarrierState {
     bucket: String,
     object: String,
@@ -6164,17 +6264,17 @@ struct TransitionUploadedCommitBarrierState {
     release: tokio::sync::Notify,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) struct TransitionUploadedCommitBarrier {
     state: Arc<TransitionUploadedCommitBarrierState>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 static TRANSITION_UPLOADED_COMMIT_BARRIER: std::sync::OnceLock<
     std::sync::Mutex<Option<Arc<TransitionUploadedCommitBarrierState>>>,
 > = std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl TransitionUploadedCommitBarrier {
     pub(crate) fn install(bucket: &str, object: &str) -> Self {
         let state = Arc::new(TransitionUploadedCommitBarrierState {
@@ -6207,7 +6307,7 @@ impl TransitionUploadedCommitBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl Drop for TransitionUploadedCommitBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -6221,7 +6321,7 @@ impl Drop for TransitionUploadedCommitBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 async fn pause_after_transition_uploaded_persisted(bucket: &str, object: &str) {
     let barrier = TRANSITION_UPLOADED_COMMIT_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -6234,6 +6334,103 @@ async fn pause_after_transition_uploaded_persisted(bucket: &str, object: &str) {
         barrier.arrived.notify_one();
         barrier.release.notified().await;
     }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransitionTransactionKillPoint {
+    PrePutFence,
+    UploadBeforeCommitFence,
+    CommitFenceBeforeLocalCommit,
+    LocalCommitBeforeDelete,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+struct TransitionTransactionKillPointBarrierState {
+    bucket: String,
+    object: String,
+    point: TransitionTransactionKillPoint,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) struct TransitionTransactionKillPointBarrier {
+    state: Arc<TransitionTransactionKillPointBarrierState>,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+static TRANSITION_TRANSACTION_KILL_POINT_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<TransitionTransactionKillPointBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, feature = "test-util"))]
+impl TransitionTransactionKillPointBarrier {
+    pub(crate) fn install(bucket: &str, object: &str, point: TransitionTransactionKillPoint) -> Self {
+        let state = Arc::new(TransitionTransactionKillPointBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            point,
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = TRANSITION_TRANSACTION_KILL_POINT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition transaction kill-point barrier mutex should not poison");
+        assert!(slot.is_none(), "one transition transaction kill-point may be installed at a time");
+        *slot = Some(Arc::clone(&state));
+        drop(slot);
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("transition should reach the requested transaction kill-point");
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for TransitionTransactionKillPointBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = TRANSITION_TRANSACTION_KILL_POINT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition transaction kill-point barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+async fn pause_transition_transaction_at(bucket: &str, object: &str, point: TransitionTransactionKillPoint) {
+    let barrier = TRANSITION_TRANSACTION_KILL_POINT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("transition transaction kill-point barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.point == point)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+fn transition_transaction_kill_point_is_active(transaction: Option<&TransitionTransaction>) -> bool {
+    let Some(transaction) = transaction else {
+        return false;
+    };
+    TRANSITION_TRANSACTION_KILL_POINT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("transition transaction kill-point barrier mutex should not poison")
+        .as_ref()
+        .is_some_and(|barrier| barrier.bucket == transaction.source.bucket && barrier.object == transaction.source.object)
 }
 
 #[cfg(test)]
@@ -7494,6 +7691,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let transported = delete_file_info_with_replication_transport_metadata(fi);
         let fi = &transported;
         let disks = self.disk_inventory().await;
+        let namespace_owner = (!is_meta_bucketname(bucket)).then(|| self.ctx.begin_namespace_commit());
         let write_quorum = disks.len() / 2 + 1;
         let rollback_dir = Uuid::new_v4();
 
@@ -7501,10 +7699,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut errs = Vec::with_capacity(disks.len());
 
         for disk in disks.iter() {
+            let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
             futures.push(async move {
                 if let Some(disk) = disk {
                     match disk
-                        .delete_version(
+                        .delete_version_with_namespace_owner(
                             bucket,
                             object,
                             fi.clone(),
@@ -7513,6 +7712,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 old_data_dir: Some(rollback_dir),
                                 ..Default::default()
                             },
+                            disk_namespace_owner,
                         )
                         .await
                     {
@@ -7560,10 +7760,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let bucket = bucket.to_string();
             let object = object.to_string();
             let fi = fi.clone();
+            let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
             rollback_futures.push(async move {
                 if should_rollback {
                     if let Err(err) = disk
-                        .delete_version(
+                        .delete_version_with_namespace_owner(
                             &bucket,
                             &object,
                             fi,
@@ -7574,6 +7775,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 old_data_dir: Some(rollback_dir),
                                 ..Default::default()
                             },
+                            disk_namespace_owner,
                         )
                         .await
                     {
@@ -7588,7 +7790,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 } else {
                     let rollback_path = format!("{object}/{rollback_dir}");
                     if let Err(err) = disk
-                        .delete(
+                        .delete_with_namespace_owner(
                             &bucket,
                             &rollback_path,
                             DeleteOptions {
@@ -7596,6 +7798,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 immediate: true,
                                 ..Default::default()
                             },
+                            disk_namespace_owner,
                         )
                         .await
                         && err != DiskError::FileNotFound
@@ -7614,6 +7817,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         join_all(rollback_futures).await;
+        drop(namespace_owner);
         quorum_result
     }
 
@@ -8977,7 +9181,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
         let transaction_api = transition_object_store(&self.ctx).await;
-        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+        let transition_compaction_fleet_proof =
+            crate::services::notification_sys::acquire_transition_transaction_compaction_fleet_proof();
+        let compact_transition_transaction = transition_compaction_fleet_proof
+            .as_ref()
+            .is_some_and(crate::services::notification_sys::transition_transaction_compaction_fleet_proof_matches);
+        let transaction_init = TransitionTransactionInit {
             deployment_id: transition_deployment_id(&self.ctx)?,
             transaction_id: Uuid::new_v4(),
             owner_epoch: Uuid::new_v4(),
@@ -8986,9 +9195,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             tier_name: opts.transition.tier.clone(),
             backend_fingerprint: tgt_client.backend_identity(),
             not_after_unix_nanos: transition_transaction_not_after_unix_nanos()?,
-        })
+        };
+        let mut transaction = if compact_transition_transaction {
+            TransitionTransaction::new_compact(transaction_init)
+        } else {
+            TransitionTransaction::new(transaction_init)
+        }
         .map_err(Error::other)?;
         save_transition_transaction_if_available(transaction_api.as_ref(), &transaction).await?;
+        #[cfg(all(test, feature = "test-util"))]
+        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::PrePutFence).await;
         let transaction_id = transaction.transaction_id;
         let dest_obj = transaction.remote_object.clone();
         let mut transition_meta = (*oi.user_defined).clone();
@@ -9065,14 +9281,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj);
         upload_cleanup.set_cleanup_owner(transaction_api.clone(), &transaction);
-        advance_and_save_transition_transaction(
-            transaction_api.as_ref(),
-            &mut transaction,
-            TransitionTransactionState::UploadOutcomeUnknown,
-            None,
-        )
-        .await?;
-        upload_cleanup.update_cleanup_transaction(&transaction);
+        if !compact_transition_transaction {
+            advance_and_save_transition_transaction(
+                transaction_api.as_ref(),
+                &mut transaction,
+                TransitionTransactionState::UploadOutcomeUnknown,
+                None,
+            )
+            .await?;
+            upload_cleanup.update_cleanup_transaction(&transaction);
+        }
         let remote_upload = {
             let lease = &upload_cleanup.lease;
             let recorded_candidate = &mut upload_cleanup.candidate;
@@ -9132,27 +9350,31 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     return Err(err.into());
                 }
             };
-        if let Err(err) = advance_and_save_transition_transaction(
-            transaction_api.as_ref(),
-            &mut transaction,
-            TransitionTransactionState::Uploaded,
-            Some(TransitionRemoteVersion::known_from_put_response(candidate.remote_version().to_string())),
-        )
-        .await
-        {
-            let cleanup_api = transition_cleanup_store(&self.ctx).await;
-            if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api, &mut transaction).await {
-                return Err(StorageError::Io(std::io::Error::other(format!(
-                    "{err}; uploaded transition transaction persist failed and cleanup failed: {cleanup_err}"
-                ))));
+        if !compact_transition_transaction {
+            if let Err(err) = advance_and_save_transition_transaction(
+                transaction_api.as_ref(),
+                &mut transaction,
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::known_from_put_response(candidate.remote_version().to_string())),
+            )
+            .await
+            {
+                let cleanup_api = transition_cleanup_store(&self.ctx).await;
+                if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api, &mut transaction).await {
+                    return Err(StorageError::Io(std::io::Error::other(format!(
+                        "{err}; uploaded transition transaction persist failed and cleanup failed: {cleanup_err}"
+                    ))));
+                }
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object).await;
+                return Err(err);
             }
-            delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object).await;
-            return Err(err);
+            upload_cleanup.update_cleanup_transaction(&transaction);
         }
-        upload_cleanup.update_cleanup_transaction(&transaction);
 
-        #[cfg(test)]
+        #[cfg(all(test, feature = "test-util"))]
         pause_after_transition_uploaded_persisted(bucket, object).await;
+        #[cfg(all(test, feature = "test-util"))]
+        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::UploadBeforeCommitFence).await;
 
         let commit_opts = opts.as_commit_opts();
         // Note: Using clone() here is necessary because ObjectOptions has 124 fields.
@@ -9263,11 +9485,25 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
             return Err(Error::other("remote version state fleet capability changed during transition"));
         }
+        if compact_transition_transaction
+            && !transition_compaction_fleet_proof
+                .as_ref()
+                .is_some_and(crate::services::notification_sys::transition_transaction_compaction_fleet_proof_matches)
+        {
+            drop(transition_lock_guard);
+            if upload_cleanup.cleanup().await.is_ok() {
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object).await;
+            }
+            return Err(Error::other(
+                "transition transaction compaction fleet capability changed during transition",
+            ));
+        }
         if let Err(err) = advance_and_save_transition_transaction(
             transaction_api.as_ref(),
             &mut transaction,
             TransitionTransactionState::LocalCommitStarted,
-            None,
+            compact_transition_transaction
+                .then(|| TransitionRemoteVersion::known_from_put_response(candidate.remote_version().to_string())),
         )
         .await
         {
@@ -9277,6 +9513,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
             return Err(err);
         }
+        upload_cleanup.update_cleanup_transaction(&transaction);
+        #[cfg(all(test, feature = "test-util"))]
+        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::CommitFenceBeforeLocalCommit).await;
         upload_cleanup.disarm();
         if let Err(err) = self.delete_object_version(bucket, object, &fi, false).await {
             warn!(
@@ -9289,33 +9528,47 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             drop(transition_lock_guard);
             return Err(err);
         }
-        match advance_and_save_transition_transaction(
-            transaction_api.as_ref(),
-            &mut transaction,
-            TransitionTransactionState::Committed,
-            None,
-        )
-        .await
-        {
-            Ok(()) => {
-                if let Err(err) = delete_transition_transaction_if_available(transaction_api.as_ref(), &transaction).await {
-                    warn!(
-                        bucket = bucket,
-                        object = object,
-                        transaction_id = %transaction_id,
-                        error = ?err,
-                        "transition committed locally but transaction cleanup failed"
-                    );
-                }
-            }
-            Err(err) => {
+        #[cfg(all(test, feature = "test-util"))]
+        pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::LocalCommitBeforeDelete).await;
+        if compact_transition_transaction {
+            if let Err(err) = delete_transition_transaction_if_available(transaction_api.as_ref(), &transaction).await {
                 warn!(
                     bucket = bucket,
                     object = object,
                     transaction_id = %transaction_id,
                     error = ?err,
-                    "transition committed locally but transaction committed-state advance failed"
+                    "transition committed locally but compact transaction cleanup failed"
                 );
+            }
+        } else {
+            match advance_and_save_transition_transaction(
+                transaction_api.as_ref(),
+                &mut transaction,
+                TransitionTransactionState::Committed,
+                None,
+            )
+            .await
+            {
+                Ok(()) => {
+                    if let Err(err) = delete_transition_transaction_if_available(transaction_api.as_ref(), &transaction).await {
+                        warn!(
+                            bucket = bucket,
+                            object = object,
+                            transaction_id = %transaction_id,
+                            error = ?err,
+                            "transition committed locally but transaction cleanup failed"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        bucket = bucket,
+                        object = object,
+                        transaction_id = %transaction_id,
+                        error = ?err,
+                        "transition committed locally but transaction committed-state advance failed"
+                    );
+                }
             }
         }
 
@@ -12671,6 +12924,65 @@ mod metadata_mutation_generation_tests {
 
     #[tokio::test]
     #[serial_test::serial(metadata_cache_invalidation_probe)]
+    async fn segment_observation_equal_size_mutations_retire_metadata_generation() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "segment-observation-bucket";
+        let object = "hot/object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create segment fixture bucket");
+        }
+        let (before, old_key) = put_and_prime(&set_disks, bucket, object, b"before").await;
+        let probe = MetadataCacheInvalidationProbe::install(bucket, object);
+        let mut replacement = PutObjReader::from_vec(b"after!".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut replacement, &ObjectOptions::default())
+            .await
+            .expect("commit same-length replacement with normal owner locking");
+        assert_eq!(probe.count(), 2, "same-length PUT must retire its metadata generation");
+        assert_retired(&set_disks, &old_key).await;
+        drop(probe);
+        let after = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read replacement metadata");
+        assert_eq!(before.size, after.size);
+        assert_ne!(before.etag, after.etag, "equal size is not equal content");
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("read replacement body through the owner");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("drain replacement body");
+        assert_eq!(body, b"after!");
+        drop(reader);
+
+        let (before, old_key) = put_and_prime(&set_disks, bucket, object, b"after!").await;
+        let probe = MetadataCacheInvalidationProbe::install(bucket, object);
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(HashMap::from([("x-amz-meta-segment".to_string(), "changed".to_string())])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("commit metadata-only mutation with normal owner locking");
+        assert_eq!(probe.count(), 4, "metadata-only mutation must retire both owner fences");
+        assert_retired(&set_disks, &old_key).await;
+        let after = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read committed metadata-only mutation");
+        assert_eq!(before.size, after.size);
+        assert_eq!(before.etag, after.etag);
+        assert!(!before.user_defined.contains_key("x-amz-meta-segment"));
+        assert_eq!(after.user_defined.get("x-amz-meta-segment").map(String::as_str), Some("changed"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(metadata_cache_invalidation_probe)]
     async fn metadata_semantic_mutation_generation_matrix_retires_cached_snapshot() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "metadata-mutation-generation-bucket";
@@ -14860,6 +15172,7 @@ mod transition_upload_integrity_tests {
     use super::*;
     use crate::bucket::lifecycle::lifecycle::{TRANSITION_PENDING, TransitionOptions};
     use crate::layout::endpoints::SetupType;
+    use crate::services::notification_sys::install_transition_transaction_compaction_fleet_proof_for_test;
     use crate::services::tier::test_util::register_mock_tier;
     use crate::set_disk::replication::RestoreFinalizeBarrier;
     use http::HeaderMap;
@@ -16126,6 +16439,7 @@ mod transition_upload_integrity_tests {
         let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        let _compaction_proof = install_transition_transaction_compaction_fleet_proof_for_test("object-transaction-fencing-test");
         let barrier = TransitionCommitBarrier::install(bucket, object);
 
         let transition_set = Arc::clone(&set_disks);
@@ -16222,7 +16536,23 @@ mod transition_upload_integrity_tests {
             let bucket = format!("transition-real-bitrot-{}", position.label());
             let object = format!("{}-corrupt.bin", position.label());
             let payload = vec![0x41; 2 * 1024 * 1024];
-            let original = write_source(&set_disks, &disk_stores, &bucket, &object, &payload).await;
+            // Corruption edits physical shards, so every healthy rename must finish first.
+            for disk in &disk_stores {
+                disk.make_volume(&bucket).await.expect("bucket volume should be created");
+            }
+            let mut reader = PutObjReader::from_vec(payload.to_vec());
+            let original = set_disks
+                .put_object(
+                    &bucket,
+                    &object,
+                    &mut reader,
+                    &ObjectOptions {
+                        write_completion: WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("source object should be written");
             let source = set_disks
                 .get_object_fileinfo(
                     &bucket,
@@ -16312,7 +16642,7 @@ mod transition_upload_integrity_tests {
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
         backend.set_put_remote_version(Some(String::new())).await;
-        let save_probe = TransitionUploadedSaveProbe::install(bucket, object);
+        let save_probe = TransitionTransactionMutationProbe::install(bucket, object);
 
         set_disks
             .transition_object(bucket, object, &transition_options(&original, tier_name))
@@ -16376,7 +16706,7 @@ mod transition_upload_integrity_tests {
         let remote_version = Uuid::nil().to_string();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
         backend.set_put_remote_version(Some(remote_version.clone())).await;
-        let save_probe = TransitionUploadedSaveProbe::install(bucket, object);
+        let save_probe = TransitionTransactionMutationProbe::install(bucket, object);
 
         set_disks
             .transition_object(bucket, object, &transition_options(&original, tier_name))
@@ -20980,5 +21310,419 @@ mod body_cache_hook_e2e_tests {
             compressed.len() as i64,
             "restore read must publish the stored compressed size"
         );
+    }
+}
+
+#[cfg(test)]
+mod single_delete_namespace_owner_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks_isolated;
+    use super::*;
+    use crate::disk::ReadOptions;
+    #[cfg(not(windows))]
+    use crate::disk::STORAGE_FORMAT_FILE;
+    use crate::object_api::WriteCompletion;
+    #[cfg(not(windows))]
+    use tokio::io::AsyncReadExt;
+
+    async fn seed_version(set: &Arc<SetDisks>, bucket: &str, object: &str, version: Uuid, body: &[u8]) {
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(body.to_vec()),
+            &ObjectOptions {
+                versioned: true,
+                version_id: Some(version.to_string()),
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed a complete real object version");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn single_delete_advances_namespace_generation_through_cleanup() {
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "single-delete-namespace";
+        let object = "last-version";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("fixture bucket");
+        }
+        let version = Uuid::new_v4();
+        seed_version(&set, bucket, object, version, &vec![0x41; 256 * 1024]).await;
+        let before = set.ctx.namespace_commit_generation();
+        assert!(!set.ctx.namespace_commits_pending());
+        let request = FileInfo {
+            name: object.to_string(),
+            version_id: Some(version),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        let result =
+            tokio::time::timeout(Duration::from_secs(10), set.delete_object_version(bucket, object, &request, false)).await;
+        if !matches!(result, Ok(Ok(()))) {
+            let retained = dirs.into_iter().map(tempfile::TempDir::keep).collect::<Vec<_>>();
+            panic!("single delete and cleanup did not finish: {result:?}; retained roots: {retained:?}");
+        }
+        for (disk, dir) in disks.iter().zip(&dirs) {
+            let result = disk
+                .read_version("", bucket, object, &version.to_string(), &ReadOptions::default())
+                .await;
+            assert!(matches!(result, Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)));
+            assert!(
+                !dir.path().join(bucket).join(object).exists(),
+                "immediate cleanup must remove the rollback object tree"
+            );
+        }
+        assert!(!set.ctx.namespace_commits_pending());
+        assert_eq!(
+            set.ctx.namespace_commit_generation(),
+            before + 2,
+            "single delete must count one complete root lifetime"
+        );
+    }
+
+    #[cfg(not(windows))]
+    async fn assert_single_delete_physical_owner(case: &'static str) {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        use futures::FutureExt;
+
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60"))], async {
+            let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+            let bucket = "single-delete-physical-owner";
+            let first = Uuid::new_v4();
+            let second = Uuid::new_v4();
+            let first_body = vec![0x51; 256 * 1024];
+            let second_body = vec![0x62; 4096];
+            let missing = case == "missing-marker";
+            let rollback = case == "rollback";
+            let last = case == "last-version";
+            let cleanup = case == "immediate-cleanup";
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("fixture bucket");
+            }
+            if !missing {
+                seed_version(&set, bucket, case, first, &first_body).await;
+                if !last && !cleanup {
+                    seed_version(&set, bucket, case, second, &second_body).await;
+                }
+            }
+            let request = FileInfo {
+                name: case.to_string(),
+                version_id: Some(first),
+                deleted: missing,
+                mark_deleted: missing,
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            };
+            let before = set.ctx.namespace_commit_generation();
+            assert!(!set.ctx.namespace_commits_pending());
+            let mut metadata_paths = Vec::new();
+            let mut originals = Vec::new();
+            let mut cleanup_sources = Vec::new();
+            let mut cleanup_parts = Vec::new();
+            for disk in &disks {
+                let crate::disk::Disk::Local(local) = disk.as_ref() else {
+                    panic!("local fixture required");
+                };
+                let path = local
+                    .get_disk()
+                    .get_object_path_for_io(bucket, case)
+                    .expect("leased IO path")
+                    .join(STORAGE_FORMAT_FILE);
+                originals.push(if missing {
+                    None
+                } else {
+                    Some(std::fs::read(&path).expect("seeded raw metadata"))
+                });
+                if cleanup {
+                    let fi = disk.read_version("", bucket, case, &first.to_string(), &ReadOptions::default())
+                        .await.expect("real non-inline data directory");
+                    assert!(!fi.inline_data(), "cleanup fixture must have real shard files");
+                    let data = path.parent().expect("object parent").join(fi.data_dir.expect("data directory").to_string());
+                    cleanup_parts.push(std::fs::read(data.join("part.1")).expect("real pre-delete shard"));
+                    cleanup_sources.push(data);
+                }
+                metadata_paths.push(path);
+            }
+            if rollback {
+                // Two disks apply the real deletion and then error. Undo must
+                // restore all four disks, including these post-apply failures.
+                for disk in disks.iter().take(2) {
+                    crate::disk::local::set_delete_version_fail_after_commit(disk.path().as_path(), case);
+                }
+            }
+            let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut guards = Vec::new();
+            let mut destination_guards = Vec::new();
+            let later_guards = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut releases = Vec::new();
+            for (index, path) in metadata_paths.iter().enumerate() {
+                let tx = entered_tx.clone();
+                let (release, rx) = std::sync::mpsc::channel::<()>();
+                if last || cleanup {
+                    let source = if cleanup { &cleanup_sources[index] } else { path };
+                    destination_guards.push(hooks::observe_rename_destination(source, move |destination| {
+                        let _ = tx.send((index, destination.to_path_buf()));
+                        let _ = rx.recv();
+                    }));
+                } else {
+                    let hook_path = path.clone();
+                    let path = path.clone();
+                    let pause_path = path.clone();
+                    let later_guards = Arc::clone(&later_guards);
+                    guards.push(hooks::install_at(hooks::Stage::Rename, &hook_path, move || {
+                        let pause = move || {
+                            let _ = tx.send((index, pause_path));
+                            let _ = rx.recv();
+                        };
+                        if rollback {
+                            // This first callback precedes forward metadata publication.
+                            // Arm only the subsequent real backup-restore rename.
+                            let next = hooks::install_at(hooks::Stage::Rename, &path, pause);
+                            later_guards.lock().expect("fixture hook guards").push(next);
+                        } else {
+                            pause();
+                        }
+                    }));
+                }
+                releases.push(release);
+            }
+            drop(entered_tx);
+            let deleting_set = Arc::clone(&set);
+            let mut delete =
+                tokio::spawn(async move { deleting_set.delete_object_version(bucket, case, &request, missing).await });
+            let mut joined = false;
+            let mut counts = None;
+            let mut physical_keys = std::collections::BTreeMap::new();
+            let observations = std::panic::AssertUnwindSafe(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while physical_keys.len() < 4 {
+                        tokio::select! {
+                            entry = entered_rx.recv() => {
+                                let (index, key) = entry.expect("actual physical delete entry");
+                                assert!(physical_keys.insert(index, key).is_none());
+                            }
+                            result = &mut delete => {
+                                joined = true;
+                                panic!("delete returned before physical entry: {result:?}");
+                            }
+                        }
+                    }
+                })
+                .await
+                .expect("all four physical mutations must enter");
+                let pending_at_entry = set.ctx.namespace_commits_pending();
+                let generation_at_entry = set.ctx.namespace_commit_generation();
+                for (path, original) in metadata_paths.iter().zip(&originals) {
+                    if missing {
+                        assert!(!path.exists(), "missing marker must still be unpublished at entry");
+                    } else if cleanup {
+                        assert!(!path.exists(), "cleanup must follow the actual last-version deletion");
+                    } else {
+                        let bytes = std::fs::read(path).expect("paused metadata is readable");
+                        let metadata = rustfs_filemeta::FileMeta::load(&bytes).expect("real metadata must parse");
+                        if !last && !cleanup {
+                            assert!(metadata.find_version(Some(second)).is_ok());
+                        }
+                        assert_eq!(
+                            metadata.find_version(Some(first)).is_err(),
+                            rollback,
+                            "undo entry must follow actual deletion"
+                        );
+                        if !rollback {
+                            assert_eq!(Some(&bytes), original.as_ref());
+                        }
+                    }
+                }
+                if rollback {
+                    tokio::time::pause();
+                    tokio::time::advance(Duration::from_secs(61)).await;
+                    tokio::time::resume();
+                    let result = tokio::time::timeout(Duration::from_secs(5), &mut delete).await;
+                    joined = result.is_ok();
+                    let result = result
+                        .expect("ordinary undo deadlines must return")
+                        .expect("delete coordinator must not panic");
+                    assert!(
+                        matches!(&result, Err(StorageError::InsufficientWriteQuorum(error_bucket, error_object)) if error_bucket == bucket && error_object == case),
+                        "keep the original failed delete quorum: {result:?}"
+                    );
+                } else {
+                    delete.abort();
+                    let result = tokio::time::timeout(Duration::from_secs(5), &mut delete).await;
+                    joined = result.is_ok();
+                    assert!(
+                        result
+                            .expect("cancelled caller must join")
+                            .expect_err("the caller must be cancelled")
+                            .is_cancelled()
+                    );
+                }
+                counts = Some((
+                    pending_at_entry,
+                    generation_at_entry,
+                    set.ctx.namespace_commits_pending(),
+                    set.ctx.namespace_commit_generation(),
+                ));
+                for path in physical_keys.values() {
+                    assert!(
+                        hooks::drain_namespace_key(path)
+                            .now_or_never()
+                            .is_none(),
+                        "the physical metadata executor must still own its exact key"
+                    );
+                }
+            })
+            .catch_unwind()
+            .await;
+
+            drop(releases);
+            drop(guards);
+            drop(destination_guards);
+            let coordinator_drained = joined || tokio::time::timeout(Duration::from_secs(10), &mut delete).await.is_ok();
+            if !coordinator_drained {
+                delete.abort();
+                let _ = tokio::time::timeout(Duration::from_secs(5), &mut delete).await;
+            }
+            later_guards.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+            let drains = futures::future::join_all(physical_keys.values().map(|path| {
+                tokio::time::timeout(Duration::from_secs(5), hooks::drain_namespace_key(path))
+            })).await;
+            let owner_drained = tokio::time::timeout(Duration::from_secs(5), async {
+                while set.ctx.namespace_commits_pending() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            if physical_keys.len() != 4 || !coordinator_drained || !owner_drained || drains.iter().any(|result| result.is_err()) {
+                let retained = dirs.into_iter().map(tempfile::TempDir::keep).collect::<Vec<_>>();
+                eprintln!("single delete cleanup incomplete; retained roots: {retained:?}");
+                if let Err(panic) = observations {
+                    std::panic::resume_unwind(panic);
+                }
+                panic!("single delete physical cleanup did not drain");
+            }
+            if let Err(panic) = observations {
+                std::panic::resume_unwind(panic);
+            }
+            for (index, (disk, (path, original))) in disks.iter().zip(metadata_paths.iter().zip(&originals)).enumerate() {
+                if cleanup {
+                    assert!(!path.exists(), "metadata must remain deleted after cleanup cancellation");
+                    assert!(!cleanup_sources[index].exists(), "physical cleanup must remove the shard directory");
+                    assert_eq!(
+                        std::fs::read(physical_keys[&index].join("part.1")).expect("actual trashed shard"),
+                        cleanup_parts[index],
+                        "trash must contain the exact original shard"
+                    );
+                    continue;
+                }
+                if last {
+                    assert!(!path.exists(), "late trash rename must remove the last metadata");
+                    assert_eq!(
+                        Some(std::fs::read(&physical_keys[&index]).expect("actual trash destination")),
+                        *original,
+                        "last-version trash must contain the exact old metadata"
+                    );
+                    continue;
+                }
+                let bytes = std::fs::read(path).expect("late metadata publication must finish");
+                let metadata = rustfs_filemeta::FileMeta::load(&bytes).expect("final metadata must parse");
+                if missing {
+                    assert!(
+                        metadata
+                            .find_version(Some(first))
+                            .expect("the marker must be published")
+                            .1
+                            .delete_marker
+                            .is_some()
+                    );
+                } else {
+                    assert!(metadata.find_version(Some(second)).is_ok());
+                    assert_eq!(metadata.find_version(Some(first)).is_ok(), rollback);
+                    if rollback {
+                        assert_eq!(Some(&bytes), original.as_ref(), "physical undo must restore exact old metadata");
+                    }
+                    let fi = disk
+                        .read_version("", bucket, case, &second.to_string(), &ReadOptions { read_data: true, ..Default::default() })
+                        .await
+                        .expect("remaining version");
+                    if fi.inline_data() {
+                        assert!(fi.data.as_ref().is_some_and(|data| !data.is_empty()), "remaining inline shard must survive");
+                    } else {
+                        let parts = disk.check_parts(bucket, case, &fi).await.expect("remaining shard check");
+                        assert_eq!(parts.results, vec![crate::disk::CHECK_PART_SUCCESS; fi.parts.len()]);
+                    }
+                }
+            }
+            if !missing && !last && !cleanup {
+                let mut actual = Vec::new();
+                let read_opts = ObjectOptions {
+                    version_id: Some(if rollback { first } else { second }.to_string()),
+                    versioned: true,
+                    ..Default::default()
+                };
+                let mut reader = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    set.get_object_reader(bucket, case, None, HeaderMap::new(), &read_opts),
+                )
+                .await
+                .expect("final GET must finish")
+                .expect("the surviving version must be readable");
+                tokio::time::timeout(Duration::from_secs(5), reader.stream.read_to_end(&mut actual))
+                    .await
+                    .expect("body must drain")
+                    .expect("read surviving body");
+                assert_eq!(actual, if rollback { first_body } else { second_body });
+            }
+            let (pending_at_entry, generation_at_entry, pending_after_return, generation_after_return) =
+                counts.expect("complete observations");
+            assert!(
+                pending_at_entry && pending_after_return,
+                "physical single delete outlived namespace accounting: {case}"
+            );
+            assert_eq!(generation_at_entry, before + 1);
+            assert_eq!(generation_after_return, generation_at_entry);
+            assert_eq!(set.ctx.namespace_commit_generation(), before + 2);
+            assert!(!set.ctx.namespace_commits_pending());
+        })
+        .await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn single_delete_cancel_keeps_owner_until_immediate_data_cleanup() {
+        assert_single_delete_physical_owner("immediate-cleanup").await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn single_delete_cancel_keeps_owner_until_last_version_trash() {
+        assert_single_delete_physical_owner("last-version").await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn single_delete_cancel_keeps_owner_until_metadata_rewrite() {
+        assert_single_delete_physical_owner("remaining-version").await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn single_delete_cancel_keeps_owner_until_missing_marker_publication() {
+        assert_single_delete_physical_owner("missing-marker").await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn single_delete_failed_quorum_keeps_owner_until_physical_undo() {
+        assert_single_delete_physical_owner("rollback").await;
     }
 }

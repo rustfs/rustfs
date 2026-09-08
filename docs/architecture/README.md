@@ -60,4 +60,6 @@ Required headings and strings in these files are asserted by `scripts/check_arch
 | [minio-rustfs-router-compatibility.md](minio-rustfs-router-compatibility.md) | a client or `mc` call that works against MinIO fails against RustFS and you need to know whether the endpoint is missing, stubbed, or deliberately different |
 | [minio-file-format-compat.md](minio-file-format-compat.md) | deciding whether a MinIO drive set, bucket-metadata blob, or SSE object can be read or imported by a given RustFS build, or before touching a listed version anchor |
 
-Operations runbooks live in [../operations/](../README.md#operations) and testing references in [../testing/README.md](../testing/README.md).
+Operations runbooks live in [../operations/](../operations/) and testing references in [../testing/README.md](../testing/README.md).
+
+For per-node HTTP failure ratios and cached storage probe provenance, see [S3 write failure diagnostics](../operations/s3-write-failure-diagnostics.md).

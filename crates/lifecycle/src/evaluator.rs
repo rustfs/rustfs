@@ -22,7 +22,10 @@ use rustfs_replication::ReplicationStatusType;
 use rustfs_scanner_metrics::metrics::IlmAction;
 
 use crate::object_lock;
-use crate::{Event, Lifecycle, ObjectOpts, expiration_action_has_valid_target};
+use crate::{
+    Event, LIFECYCLE_CORRUPT_RULE_ERROR_KIND, Lifecycle, ObjectOpts, expiration_action_has_valid_target,
+    lifecycle_has_corrupt_retention_count,
+};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
@@ -116,13 +119,10 @@ impl Evaluator {
                             break 'top_loop;
                         }
                     }
-                    IlmAction::DeleteAction
-                    | IlmAction::DeleteRestoredAction
-                    | IlmAction::DeleteVersionAction
-                    | IlmAction::DeleteRestoredVersionAction
-                        if self.is_object_locked(obj) =>
-                    {
-                        event = Event::default();
+                    // Restore expiry removes only the temporary local copy; the
+                    // retained logical version and its remote data remain intact.
+                    IlmAction::DeleteAction | IlmAction::DeleteVersionAction if self.is_object_locked(obj) => {
+                        event = obj.restored_copy_expiry(now).unwrap_or_default();
                     }
                     _ => {}
                 }
@@ -153,6 +153,17 @@ impl Evaluator {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("number of versions mismatch, expected {}, got {}", objs[0].num_versions, objs.len()),
+            ));
+        }
+        // PUT validation rejects a negative retention count, so a rule that
+        // carries one came from older persistence or an import. Report it
+        // instead of evaluating a configuration that cannot be honoured;
+        // `eval_inner` independently takes no action for such a rule
+        // (backlog#2201).
+        if lifecycle_has_corrupt_retention_count(&self.policy) {
+            return Err(std::io::Error::new(
+                LIFECYCLE_CORRUPT_RULE_ERROR_KIND,
+                "lifecycle configuration carries a negative 'NewerNoncurrentVersions'",
             ));
         }
         Ok(self.eval_inner(objs, OffsetDateTime::now_utc()).await)
@@ -206,6 +217,95 @@ mod tests {
 
     use super::*;
     use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};
+
+    #[tokio::test]
+    async fn adversarial_restore_expiry_survives_legal_hold() {
+        let mut policy = (*latest_expiration_lifecycle()).clone();
+        policy.rules[0].status = ExpirationStatus::from_static(ExpirationStatus::DISABLED);
+        let policy = Arc::new(policy);
+        policy
+            .validate(&lock_enabled_without_default_retention())
+            .await
+            .expect("valid disabled lifecycle rule");
+        let mut objects = [true, false].map(|is_latest| ObjectOpts {
+            is_latest,
+            num_versions: 2,
+            mod_time: Some(
+                OffsetDateTime::from_unix_timestamp(if is_latest { 1_200_000 } else { 1_000_000 })
+                    .expect("fixed version timestamp"),
+            ),
+            successor_mod_time: (!is_latest)
+                .then(|| OffsetDateTime::from_unix_timestamp(1_200_000).expect("fixed successor timestamp")),
+            transition_status: crate::TRANSITION_COMPLETE.to_string(),
+            restore_expires: Some(OffsetDateTime::from_unix_timestamp(2_000_000).expect("fixed expired restore timestamp")),
+            ..current_object_opts(ReplicationStatusType::Completed)
+        });
+        let evaluator = Evaluator::new(policy).with_lock_retention(Some(lock_enabled_without_default_retention()));
+        let expected = [IlmAction::DeleteRestoredAction, IlmAction::DeleteRestoredVersionAction];
+        let unlocked = evaluator
+            .eval(&objects)
+            .await
+            .expect("unlocked restored versions should evaluate");
+        assert_eq!(unlocked.iter().map(|event| event.action).collect::<Vec<_>>(), expected);
+
+        for object in &mut objects {
+            object
+                .user_defined
+                .insert(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string());
+        }
+        let locked = evaluator
+            .eval(&objects)
+            .await
+            .expect("locked restored versions should evaluate");
+        assert_eq!(
+            locked.iter().map(|event| event.action).collect::<Vec<_>>(),
+            expected,
+            "expiring a restored local copy preserves the retained logical version and remote object"
+        );
+
+        let mut expiring_policy = (*latest_expiration_lifecycle()).clone();
+        expiring_policy.rules[0].noncurrent_version_expiration = Some(NoncurrentVersionExpiration {
+            noncurrent_days: Some(1),
+            newer_noncurrent_versions: None,
+        });
+        let expiring_evaluator =
+            Evaluator::new(Arc::new(expiring_policy)).with_lock_retention(Some(lock_enabled_without_default_retention()));
+        let locked = expiring_evaluator
+            .eval(&objects)
+            .await
+            .expect("locked expired versions should evaluate");
+        assert_eq!(
+            locked.iter().map(|event| event.action).collect::<Vec<_>>(),
+            expected,
+            "blocked logical expiration must still allow an eligible restore-copy cleanup"
+        );
+
+        for status in [ReplicationStatusType::Pending, ReplicationStatusType::Failed] {
+            for object in &mut objects {
+                object.replication_status = status.clone();
+            }
+            for evaluator in [&evaluator, &expiring_evaluator] {
+                let events = evaluator.eval(&objects).await.expect("pending replication should evaluate");
+                assert!(events.iter().all(|event| event.action == IlmAction::NoneAction));
+            }
+        }
+        for object in &mut objects {
+            object.replication_status = ReplicationStatusType::Completed;
+        }
+        for transition_status in ["", crate::TRANSITION_PENDING, "unknown"] {
+            for object in &mut objects {
+                object.transition_status = transition_status.to_string();
+            }
+            for evaluator in [&evaluator, &expiring_evaluator] {
+                let events = evaluator.eval(&objects).await.expect("incomplete transition should evaluate");
+                assert!(
+                    events.iter().all(|event| event.action == IlmAction::NoneAction),
+                    "restore metadata cannot authorize cleanup without a completed transition"
+                );
+            }
+        }
+    }
+
     fn expired_marker_lifecycle() -> Arc<BucketLifecycleConfiguration> {
         Arc::new(BucketLifecycleConfiguration {
             expiry_updated_at: None,

@@ -425,6 +425,7 @@ impl From<rustfs_filemeta::Error> for DiskError {
             rustfs_filemeta::Error::FileVersionNotFound => DiskError::FileVersionNotFound,
             rustfs_filemeta::Error::FileCorrupt => DiskError::FileCorrupt,
             rustfs_filemeta::Error::MethodNotAllowed => DiskError::MethodNotAllowed,
+            rustfs_filemeta::Error::MaxVersionsExceeded => DiskError::MaxVersionsExceeded,
             e => DiskError::other(e),
         }
     }

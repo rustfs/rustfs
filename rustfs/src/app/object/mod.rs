@@ -21,8 +21,8 @@ use crate::storage_api::table::get_bucket_metadata;
 
 use super::storage_api::object_usecase::access::{
     PostObjectRequestMarker, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_request,
-    has_bypass_governance_header, load_bucket_generation_from_store, recursive_force_delete_is_authorized,
-    replication_request_authorized, req_info_mut, req_info_ref,
+    has_bypass_governance_header, load_bucket_generation_from_store, odm_read_generation, prepare_odm_read_generation,
+    recursive_force_delete_is_authorized, replication_request_authorized, req_info_mut, req_info_ref,
 };
 #[cfg(test)]
 use super::storage_api::object_usecase::bucket::quota::BucketQuota;
@@ -121,7 +121,7 @@ use crate::error::ApiError;
 use crate::shared_types::convert_ecstore_object_info;
 use crate::table_catalog;
 use bytes::{BufMut as _, Bytes, BytesMut};
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::{Digest as Md5Digest, Md5};
 use metrics::{counter, histogram};
@@ -239,9 +239,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use time::{

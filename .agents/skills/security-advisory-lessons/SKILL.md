@@ -12,8 +12,9 @@ matched security surface, the concise security reference under
 ## Workflow
 
 1. Freeze the exact diff/head and identify the changed trust boundaries.
-2. Read [advisory-patterns.md](references/advisory-patterns.md), then apply only
-   the matching sections. Useful headings are
+2. Inspect the headings in [advisory-patterns.md](references/advisory-patterns.md),
+   then read the matching sections. Read the full map only for a broad security
+   audit. Useful headings are
    auth/admin, IAM/STS/OIDC, policy/plugins, S3/copy/multipart, protocols, paths,
    secrets/logging/RPC, browser/CORS/proxy, SSE, Object Lock, and serde.
 3. Trace unauthenticated, low-privilege, wrong-action/owner/bucket, malformed,

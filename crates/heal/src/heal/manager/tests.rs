@@ -14,6 +14,9 @@
 
 use super::*;
 use crate::heal::EcstoreError;
+use crate::heal::outcome::{
+    HealAbortReason, HealDeferredReason, HealExecutionOutcome, HealObjectDisposition, HealTraversalCoverage,
+};
 use crate::heal::resume::{CheckpointManager, ReplacementTargetIdentity};
 use crate::heal::storage::{HealObjectInfo, HealStorageAPI};
 use crate::heal::task::{BatchHealFailure, HealOptions, HealPriority, HealRequest, HealTask, HealType};
@@ -22,6 +25,8 @@ use rustfs_heal_contracts::heal_channel::{HealOpts, HealRequestSource};
 use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::Mutex as StdMutex;
 use tempfile::TempDir;
+
+mod running_mainline;
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk, storage_api::status::BucketInfo};
 
@@ -103,6 +108,7 @@ struct MockStorage;
 
 fn completed_retention_fixture(completed_at: SystemTime) -> CompletedHealStatus {
     CompletedHealStatus {
+        outcome: None,
         heal_type: HealType::Cluster,
         status: HealTaskStatus::Completed,
         progress: Some(HealProgress {
@@ -183,37 +189,104 @@ fn completed_retention_count_ttl_and_alias_eviction_are_bounded() {
     );
     entries.insert("future".to_string(), Arc::new(completed_retention_fixture(now + Duration::from_nanos(1))));
     prune_completed_heal_statuses_at(&mut entries, now);
-    assert_eq!(entries.len(), 1);
+    assert_eq!(entries.len(), 2);
     assert!(entries.contains_key("ttl-boundary"));
+    assert!(entries.contains_key("future"), "clock rollback must not expire a new completion");
     prune_completed_heal_statuses_at(&mut entries, now + Duration::from_nanos(1));
+    assert_eq!(entries.len(), 1);
+    assert!(entries.contains_key("future"));
+    prune_completed_heal_statuses_at(&mut entries, now + Duration::from_nanos(1) + KEEP_HEAL_TASK_STATUS_DURATION);
+    assert!(entries.contains_key("future"), "the exact TTL boundary remains retained");
+    prune_completed_heal_statuses_at(&mut entries, now + Duration::from_nanos(2) + KEEP_HEAL_TASK_STATUS_DURATION);
     assert!(entries.is_empty());
+}
+
+#[tokio::test]
+async fn completed_retention_clock_rollback_preserves_terminal_alias_queries() {
+    let completed_at = SystemTime::now() + Duration::from_secs(3600);
+    for status in [
+        HealTaskStatus::Completed,
+        HealTaskStatus::Failed {
+            error: "fixture failure".to_string(),
+        },
+        HealTaskStatus::Cancelled,
+    ] {
+        let manager = HealManager::new(Arc::new(MockStorage), None);
+        let mut snapshot = completed_retention_fixture(completed_at);
+        snapshot.status = status.clone();
+        let expected_progress = snapshot.progress.clone();
+        let snapshot = Arc::new(snapshot);
+        {
+            let mut completed = manager.completed_heals.lock().await;
+            completed.insert("canonical".to_string(), Arc::clone(&snapshot));
+            completed.insert("alias".to_string(), Arc::clone(&snapshot));
+        }
+        for token in ["canonical", "alias"] {
+            let report = manager
+                .get_task_report_since(token, Some(3))
+                .await
+                .expect("a clock rollback must retain terminal queries");
+            assert_eq!(report.status, status);
+            assert_eq!(report.progress, expected_progress);
+            assert_eq!(report.result_items.len(), 1);
+            assert_eq!((report.min_seq, report.next_seq), (3, 5));
+            assert!(!report.result_items_truncated);
+        }
+        let mut completed = manager.completed_heals.lock().await;
+        prune_completed_heal_statuses_at(&mut completed, completed_at + KEEP_HEAL_TASK_STATUS_DURATION);
+        assert_eq!(completed.len(), 2, "both tokens remain at the exact TTL boundary");
+        prune_completed_heal_statuses_at(&mut completed, completed_at + KEEP_HEAL_TASK_STATUS_DURATION + Duration::from_nanos(1));
+        assert!(completed.is_empty(), "both tokens expire after the TTL");
+    }
+}
+
+#[test]
+fn completed_retention_clock_rollback_keeps_count_and_alias_eviction_bounded() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
+    let oldest = Arc::new(completed_retention_fixture(now + Duration::from_secs(1)));
+    let mut entries = HashMap::from([
+        ("oldest".to_string(), Arc::clone(&oldest)),
+        ("oldest-alias".to_string(), oldest),
+    ]);
+    for index in 2..=MAX_COMPLETED_HEAL_TOKENS {
+        entries.insert(
+            format!("task-{index}"),
+            Arc::new(completed_retention_fixture(now + Duration::from_secs(2))),
+        );
+    }
+    prune_completed_heal_statuses_at(&mut entries, now);
+    assert_eq!(entries.len(), MAX_COMPLETED_HEAL_TOKENS - 1);
+    assert!(!entries.contains_key("oldest"));
+    assert!(!entries.contains_key("oldest-alias"));
 }
 
 #[test]
 fn completed_retention_total_byte_cap_and_cap_plus_one() {
     let now = SystemTime::now();
-    let key = "large".to_string();
-    let mut entry = completed_retention_fixture(now);
-    let base_bytes = entry.retained_bytes() + key.capacity() + size_of::<(String, Arc<CompletedHealStatus>)>();
-    entry.retained_bytes.take();
-    entry.status = HealTaskStatus::Failed {
-        error: "x".repeat(MAX_COMPLETED_HEAL_BYTES - base_bytes),
-    };
-    assert_eq!(
-        entry.retained_bytes() + key.capacity() + size_of::<(String, Arc<CompletedHealStatus>)>(),
-        MAX_COMPLETED_HEAL_BYTES
-    );
-    let mut entries = HashMap::from([(key, Arc::new(entry))]);
-    prune_completed_heal_statuses_at(&mut entries, now);
-    assert_eq!(entries.len(), 1, "exact byte cap remains retained");
-    let mut over = Arc::try_unwrap(entries.remove("large").expect("entry retained")).expect("entry not shared");
-    over.retained_bytes.take();
-    if let HealTaskStatus::Failed { error } = &mut over.status {
-        *error = "x".repeat(error.len() + 1);
+    for completed_at in [now, now + Duration::from_secs(1)] {
+        let key = "large".to_string();
+        let mut entry = completed_retention_fixture(completed_at);
+        let base_bytes = entry.retained_bytes() + key.capacity() + size_of::<(String, Arc<CompletedHealStatus>)>();
+        entry.retained_bytes.take();
+        entry.status = HealTaskStatus::Failed {
+            error: "x".repeat(MAX_COMPLETED_HEAL_BYTES - base_bytes),
+        };
+        assert_eq!(
+            entry.retained_bytes() + key.capacity() + size_of::<(String, Arc<CompletedHealStatus>)>(),
+            MAX_COMPLETED_HEAL_BYTES
+        );
+        let mut entries = HashMap::from([(key, Arc::new(entry))]);
+        prune_completed_heal_statuses_at(&mut entries, now);
+        assert_eq!(entries.len(), 1, "exact byte cap remains retained");
+        let mut over = Arc::try_unwrap(entries.remove("large").expect("entry retained")).expect("entry not shared");
+        over.retained_bytes.take();
+        if let HealTaskStatus::Failed { error } = &mut over.status {
+            *error = "x".repeat(error.len() + 1);
+        }
+        entries.insert("large".to_string(), Arc::new(over));
+        prune_completed_heal_statuses_at(&mut entries, now);
+        assert!(entries.is_empty(), "oversized metadata cannot escape total byte bound");
     }
-    entries.insert("large".to_string(), Arc::new(over));
-    prune_completed_heal_statuses_at(&mut entries, now);
-    assert!(entries.is_empty(), "oversized metadata cannot escape total byte bound");
 }
 
 #[tokio::test]
@@ -288,6 +361,59 @@ pub(super) async fn pause_completed_retention_before_publish(task_id: &str, stat
 }
 
 #[tokio::test]
+async fn canonical_outcome_cancel_wins_before_worker_finalizes_success() {
+    use crate::heal::outcome::{HealAbortReason, HealExecutionOutcome};
+    use crate::heal::task::{OUTCOME_FINISH_TEST_HOOK, OutcomeFinishTestHook};
+    let bucket = "canonical-outcome-cancel-before-finish";
+    let manager = HealManager::new(Arc::new(MockStorage), None);
+    let request = HealRequest::object(bucket.to_string(), "object".to_string(), None);
+    let task_id = request.id.clone();
+    let duplicate = HealRequest::object(bucket.to_string(), "object".to_string(), None);
+    let alias = duplicate.id.clone();
+    let retention_hook = Arc::new(CompletedRetentionHook::default());
+    {
+        let mut hooks = COMPLETED_RETENTION_HOOKS.lock().await;
+        hooks.insert(bucket.to_string(), retention_hook.clone());
+        hooks.insert(task_id.clone(), retention_hook.clone());
+    }
+    let finish_hook = Arc::new(OutcomeFinishTestHook {
+        task_id: task_id.clone(),
+        reached: Notify::new(),
+        release: Notify::new(),
+    });
+    *OUTCOME_FINISH_TEST_HOOK.lock().await = Some(finish_hook.clone());
+    manager.submit_heal_request(request).await.expect("admit original");
+    manager.submit_heal_request(duplicate).await.expect("admit alias");
+    process_manager_queue_once(&manager).await;
+    tokio::time::timeout(Duration::from_secs(5), retention_hook.started.notified())
+        .await
+        .expect("storage started");
+    retention_hook.execute.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), finish_hook.reached.notified())
+        .await
+        .expect("storage returned before outcome finalization");
+    manager.cancel_task(&alias).await.expect("cancel wins publication");
+    finish_hook.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), retention_hook.handoff.notified())
+        .await
+        .expect("scheduler completes cancelled handoff");
+    for token in [&task_id, &alias] {
+        let report = manager.get_task_report(token).await.expect("cancelled token retained");
+        assert_eq!(report.status, HealTaskStatus::Cancelled);
+        assert_eq!(
+            report.outcome.as_ref().expect("frozen outcome").execution,
+            HealExecutionOutcome::Aborted(HealAbortReason::Cancelled)
+        );
+    }
+    retention_hook.finish.notify_one();
+    *OUTCOME_FINISH_TEST_HOOK.lock().await = None;
+    COMPLETED_RETENTION_HOOKS
+        .lock()
+        .await
+        .retain(|key, _| key != bucket && key != &task_id);
+}
+
+#[tokio::test]
 async fn completed_retention_cancel_wins_over_a_prepared_retry_snapshot() {
     let bucket = "completed-retention-retry-cancel";
     let manager = HealManager::new(Arc::new(MockStorage), None);
@@ -325,6 +451,10 @@ async fn completed_retention_cancel_wins_over_a_prepared_retry_snapshot() {
     for token in [&task_id, &alias] {
         let report = manager.get_task_report(token).await.expect("cancelled token retained");
         assert_eq!(report.status, HealTaskStatus::Cancelled);
+        assert_eq!(
+            report.outcome.as_ref().expect("cancelled outcome retained").execution,
+            crate::heal::outcome::HealExecutionOutcome::Aborted(crate::heal::outcome::HealAbortReason::Cancelled)
+        );
         assert_eq!(report.progress.expect("frozen progress").objects_scanned, 1);
     }
     assert!(!manager.retrying_heals.lock().await.contains_key(&task_id));
@@ -391,6 +521,7 @@ async fn completed_retention_scheduler_preserves_progress_aliases_and_atomic_han
             .expect("scheduler archives terminal");
         assert!(!manager.active_heals.lock().await.contains_key(&task_id));
         let expected = task.get_progress().await;
+        let expected_outcome = task.get_outcome().await;
         for token in [&task_id, &alias] {
             assert_eq!(manager.get_task_progress(token).await.expect("terminal progress query"), expected);
             let report = manager
@@ -398,6 +529,7 @@ async fn completed_retention_scheduler_preserves_progress_aliases_and_atomic_han
                 .await
                 .expect("terminal token remains queryable at handoff");
             assert_eq!(report.progress.as_ref(), Some(&expected));
+            assert_eq!(report.outcome.as_deref(), Some(&expected_outcome));
             assert!(report.result_items.is_empty());
             match outcome {
                 "success" => assert_eq!(report.status, HealTaskStatus::Completed),
@@ -455,10 +587,15 @@ impl HealStorageAPI for MockStorage {
     async fn heal_object(
         &self,
         bucket: &str,
-        _object: &str,
+        object: &str,
         _version_id: Option<&str>,
         _opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
+        if bucket.starts_with("heal-start-retry-deadline-object-") && object == "blocked" {
+            let hook = COMPLETED_RETENTION_HOOKS.lock().await[bucket].clone();
+            hook.started.notify_one();
+            std::future::pending::<()>().await;
+        }
         if bucket == "completed-retention-failed" {
             return Err(Error::TaskExecutionFailed {
                 message: "retention fixture failure".to_string(),
@@ -520,11 +657,35 @@ impl HealStorageAPI for MockStorage {
 
     async fn list_objects_for_heal_page(
         &self,
-        _bucket: &str,
+        bucket: &str,
         _prefix: &str,
-        _continuation_token: Option<&str>,
+        continuation_token: Option<&str>,
         _include_lifecycle_object_info: bool,
     ) -> Result<(Vec<crate::heal::storage::HealListItem>, Option<String>, bool)> {
+        if bucket.starts_with("heal-start-retry-deadline-") {
+            if continuation_token.is_some() {
+                let hook = COMPLETED_RETENTION_HOOKS.lock().await[bucket].clone();
+                hook.started.notify_one();
+                std::future::pending::<()>().await;
+            }
+            let listing_timeout = bucket.starts_with("heal-start-retry-deadline-listing-");
+            let names = if listing_timeout {
+                vec!["completed"]
+            } else {
+                vec!["completed", "blocked"]
+            };
+            let objects = names
+                .into_iter()
+                .map(|name| crate::heal::storage::HealListItem {
+                    name: name.to_string(),
+                    version_id: None,
+                    mod_time_unix_nanos: None,
+                    lifecycle_object_info: None,
+                    is_delete_marker: false,
+                })
+                .collect();
+            return Ok((objects, listing_timeout.then(|| "next".to_string()), listing_timeout));
+        }
         Ok((Vec::new(), None, false))
     }
 
@@ -545,6 +706,161 @@ impl HealStorageAPI for MockStorage {
             hook.replacement_resume_disk.clone(),
         ))
     }
+}
+
+async fn assert_heal_start_retry_control_preserves_real_executor_progress(cancel: bool) {
+    for phase in ["listing", "object"] {
+        let bucket = format!("heal-start-retry-deadline-{phase}-{cancel}");
+        let manager = HealManager::new(Arc::new(MockStorage), None);
+        let mut request = HealRequest::new(
+            HealType::Prefix {
+                bucket: bucket.clone(),
+                prefix: String::new(),
+            },
+            HealOptions {
+                timeout: Some(if cancel {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::from_millis(200)
+                }),
+                ..Default::default()
+            },
+            HealPriority::High,
+        );
+        request.source = HealRequestSource::Admin;
+        let task_id = request.id.clone();
+        let hook = Arc::new(CompletedRetentionHook::default());
+        {
+            let mut hooks = COMPLETED_RETENTION_HOOKS.lock().await;
+            hooks.insert(bucket.clone(), Arc::clone(&hook));
+            hooks.insert(task_id.clone(), Arc::clone(&hook));
+        }
+        manager.submit_heal_request(request).await.expect("admit deadline task");
+        process_manager_queue_once(&manager).await;
+        tokio::time::timeout(Duration::from_secs(5), hook.started.notified())
+            .await
+            .expect("executor reaches blocked storage");
+        let active = manager.get_task_report(&task_id).await.expect("active report");
+        assert_eq!(active.progress.expect("real completed object progress").objects_healed, 1);
+        if cancel {
+            manager.active_heals.lock().await[&task_id].cancel_token.cancel();
+        }
+        tokio::time::timeout(Duration::from_secs(5), hook.handoff.notified())
+            .await
+            .expect("deadline archives task");
+        let report = manager.get_task_report(&task_id).await.expect("terminal report");
+        assert_eq!(
+            report.status,
+            if cancel {
+                HealTaskStatus::Cancelled
+            } else {
+                HealTaskStatus::Timeout
+            },
+            "blocked {phase}"
+        );
+        let progress = report.progress.expect("terminal progress retained");
+        assert_eq!(progress.objects_healed, 1);
+        assert_eq!(progress.objects_failed, 0, "interrupted object has no terminal storage result");
+        assert_eq!(report.result_items.len(), 1, "completed result retained");
+        let outcome = report.outcome.expect("canonical terminal outcome retained");
+        assert_eq!(
+            outcome.execution,
+            HealExecutionOutcome::Aborted(if cancel {
+                HealAbortReason::Cancelled
+            } else {
+                HealAbortReason::Deadline
+            })
+        );
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Partial);
+        assert_eq!(outcome.counters.healed, 0, "legacy success supplies no authoritative repair proof");
+        let completed = outcome
+            .objects
+            .iter()
+            .find(|item| item.identity.object == "completed")
+            .expect("completed object diagnostic retained");
+        assert_eq!(completed.disposition, HealObjectDisposition::Unknown);
+        if phase == "object" {
+            let interrupted = outcome
+                .objects
+                .iter()
+                .find(|item| item.identity.object == "blocked")
+                .expect("interrupted object diagnostic retained");
+            assert_eq!(
+                interrupted.disposition,
+                if cancel {
+                    HealObjectDisposition::Cancelled
+                } else {
+                    HealObjectDisposition::Deferred {
+                        reason: HealDeferredReason::Deadline,
+                        retry_not_before: None,
+                    }
+                }
+            );
+        } else {
+            assert_eq!(outcome.objects.len(), 1, "an unread page cannot supply object identities");
+        }
+        assert!(!manager.active_heals.lock().await.contains_key(&task_id));
+        assert!(!manager.retrying_heals.lock().await.contains_key(&task_id));
+        assert!(!manager.heal_queue.lock().await.contains_request_id(&task_id));
+        hook.finish.notify_one();
+        COMPLETED_RETENTION_HOOKS
+            .lock()
+            .await
+            .retain(|key, _| key != &bucket && key != &task_id);
+    }
+}
+
+#[tokio::test]
+async fn heal_start_retry_deadline_preserves_real_executor_progress() {
+    assert_heal_start_retry_control_preserves_real_executor_progress(false).await;
+}
+
+#[tokio::test]
+async fn heal_start_retry_cancellation_preserves_real_executor_progress() {
+    assert_heal_start_retry_control_preserves_real_executor_progress(true).await;
+}
+
+#[tokio::test]
+async fn heal_start_retry_scheduler_carries_explicit_budget_and_identity() {
+    let manager = HealManager::new(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            task_timeout: Duration::ZERO,
+            ..Default::default()
+        }),
+    );
+    let mut request = HealRequest::object("retry-transition".to_string(), "object".to_string(), None);
+    request.source = HealRequestSource::Admin;
+    request.options.timeout = Some(Duration::from_secs(60));
+    let task_id = request.id.clone();
+    let created_at = request.created_at;
+    let hook = Arc::new(CompletedRetentionHook::default());
+    COMPLETED_RETENTION_HOOKS
+        .lock()
+        .await
+        .insert(task_id.clone(), Arc::clone(&hook));
+    manager
+        .submit_heal_request(request)
+        .await
+        .expect("admit explicit-budget task");
+    process_manager_queue_once(&manager).await;
+    tokio::time::timeout(Duration::from_secs(5), hook.handoff.notified())
+        .await
+        .expect("real read-quorum failure prepares retry");
+    let retry = manager.retrying_heals.lock().await[&task_id].request.clone();
+    assert_eq!(retry.id, task_id);
+    assert_eq!(retry.created_at, created_at);
+    assert_eq!(retry.source, HealRequestSource::Admin);
+    assert_eq!(retry.retry_attempts, 1);
+    let remaining = retry.options.timeout.expect("retry retains explicit budget");
+    assert!(remaining > Duration::ZERO && remaining < Duration::from_secs(60));
+    assert!(matches!(
+        manager.get_task_status(&task_id).await.expect("retry remains queryable"),
+        HealTaskStatus::Retrying { retry_attempt: 1, .. }
+    ));
+    manager.cancel_task(&task_id).await.expect("cancel held retry");
+    hook.finish.notify_one();
+    COMPLETED_RETENTION_HOOKS.lock().await.remove(&task_id);
 }
 
 struct ManagerRecoveryTestHook {
@@ -628,6 +944,84 @@ fn bucket_request(bucket: &str, priority: HealPriority, source: HealRequestSourc
     request
 }
 
+fn scoped_object_request(bucket: &str, object: &str, pool_index: usize, set_index: usize) -> HealRequest {
+    HealRequest::new(
+        HealType::Object {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            version_id: None,
+        },
+        HealOptions {
+            pool_index: Some(pool_index),
+            set_index: Some(set_index),
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    )
+}
+
+#[tokio::test]
+async fn scheduler_bulkhead_starts_other_sets_and_retains_same_set_tail() {
+    let manager = HealManager::new(Arc::new(MockStorage), None);
+    {
+        let mut config = manager.config.write().await;
+        config.max_concurrent_heals = 2;
+        config.max_concurrent_per_set = 1;
+        config.set_bulkhead_enable = true;
+        config.event_driven_scheduler_enable = false;
+        config.mainline_throttle_enable = false;
+    }
+
+    let first_set = scoped_object_request("scheduler-bulkhead-set-a-first", "object-a", 0, 1);
+    let first_set_id = first_set.id.clone();
+    let same_set_tail = scoped_object_request("scheduler-bulkhead-set-a-tail", "object-b", 0, 1);
+    let same_set_tail_id = same_set_tail.id.clone();
+    let other_set = scoped_object_request("scheduler-bulkhead-set-b", "object-c", 0, 2);
+    let other_set_id = other_set.id.clone();
+
+    let first_hook = Arc::new(CompletedRetentionHook::default());
+    let other_hook = Arc::new(CompletedRetentionHook::default());
+    {
+        let mut hooks = COMPLETED_RETENTION_HOOKS.lock().await;
+        hooks.insert("scheduler-bulkhead-set-a-first".to_string(), first_hook.clone());
+        hooks.insert("scheduler-bulkhead-set-b".to_string(), other_hook.clone());
+    }
+    {
+        let mut queue = manager.heal_queue.lock().await;
+        assert_eq!(queue.push(first_set), QueuePushOutcome::Accepted);
+        assert_eq!(queue.push(same_set_tail), QueuePushOutcome::Accepted);
+        assert_eq!(queue.push(other_set), QueuePushOutcome::Accepted);
+    }
+
+    process_manager_queue_once(&manager).await;
+    tokio::time::timeout(Duration::from_secs(5), first_hook.started.notified())
+        .await
+        .expect("first set task should start");
+    tokio::time::timeout(Duration::from_secs(5), other_hook.started.notified())
+        .await
+        .expect("other set task should start despite same-set tail");
+
+    assert_eq!(manager.get_active_task_count().await, 2);
+    assert_eq!(manager.get_queue_length().await, 1);
+    assert!(matches!(manager.get_task_status(&same_set_tail_id).await, Ok(HealTaskStatus::Pending)));
+    {
+        let active = manager.active_heals.lock().await;
+        assert!(active.contains_key(&first_set_id));
+        assert!(active.contains_key(&other_set_id));
+        assert!(!active.contains_key(&same_set_tail_id));
+        let counts = running_heal_set_counts(&active);
+        assert_eq!(counts.get("pool_0_set_1"), Some(&1));
+        assert_eq!(counts.get("pool_0_set_2"), Some(&1));
+    }
+
+    manager.cancel_task(&first_set_id).await.expect("cancel first active task");
+    manager.cancel_task(&other_set_id).await.expect("cancel other active task");
+    COMPLETED_RETENTION_HOOKS
+        .lock()
+        .await
+        .retain(|bucket, _| !bucket.starts_with("scheduler-bulkhead-"));
+}
+
 #[test]
 fn test_push_displacing_lower_priority_actually_enqueues_new_request() {
     // Regression for the release-build defect where the enqueue side effect lived inside
@@ -698,6 +1092,191 @@ fn queued_request_id_for_dedup_key_tracks_the_representative() {
     let last = queue.pop_next().expect("second request must be queued");
     assert_eq!(last.id, second_id);
     assert!(queue.queued_request_id_for_dedup_key(&first_key).is_none());
+}
+
+#[test]
+fn mrf_verified_repair_event_requires_positive_exact_identity() {
+    use crate::heal::outcome::{HealObjectIdentity, HealObjectKind, HealObjectOutcome};
+    use rustfs_common::mrf_channel::{MrfKind, MrfScope, MrfVerifiedRepairDisposition};
+
+    let version = uuid::Uuid::new_v4();
+    let incarnation = uuid::Uuid::new_v4();
+    let target = MrfRepairNoticeTarget {
+        bucket: Arc::from("bucket"),
+        object: Arc::from("object"),
+        version_id: Some(*version.as_bytes()),
+        kind: MrfKind::PartialWrite,
+        scope: Some(MrfScope {
+            pool_index: 1,
+            set_index: 2,
+        }),
+        lease: None,
+    };
+    let matching = HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: "bucket".to_string(),
+            object: "object".to_string(),
+            version_id: Some(version.to_string()),
+            bucket_incarnation_id: Some(incarnation),
+            pool_index: Some(1),
+            set_index: Some(2),
+        },
+        disposition: HealObjectDisposition::Repaired,
+        detail: None,
+    };
+
+    let event = mrf_verified_repair_event_for_target(&target, &matching).expect("matching positive receipt should publish");
+    assert_eq!(event.kind, MrfKind::PartialWrite);
+    assert_eq!(event.bucket.as_ref(), "bucket");
+    assert_eq!(event.object.as_ref(), "object");
+    assert_eq!(event.version_id, Some(*version.as_bytes()));
+    assert_eq!(
+        event.scope,
+        Some(MrfScope {
+            pool_index: 1,
+            set_index: 2
+        })
+    );
+    assert_eq!(event.lease, None);
+    assert_eq!(event.bucket_incarnation_id, incarnation);
+    assert_eq!(event.disposition, MrfVerifiedRepairDisposition::Repaired);
+
+    assert!(
+        mrf_verified_repair_event_for_target(
+            &MrfRepairNoticeTarget {
+                kind: MrfKind::DecodeFailure,
+                ..target.clone()
+            },
+            &matching
+        )
+        .is_none(),
+        "only receipt-producing partial-write object heals can publish verified events today"
+    );
+
+    for rejected in [
+        HealObjectOutcome {
+            disposition: HealObjectDisposition::Unknown,
+            ..matching.clone()
+        },
+        HealObjectOutcome {
+            identity: HealObjectIdentity {
+                bucket_incarnation_id: None,
+                ..matching.identity.clone()
+            },
+            ..matching.clone()
+        },
+        HealObjectOutcome {
+            identity: HealObjectIdentity {
+                object: "other".to_string(),
+                ..matching.identity.clone()
+            },
+            ..matching.clone()
+        },
+        HealObjectOutcome {
+            identity: HealObjectIdentity {
+                pool_index: Some(3),
+                ..matching.identity.clone()
+            },
+            ..matching
+        },
+    ] {
+        assert!(
+            mrf_verified_repair_event_for_target(&target, &rejected).is_none(),
+            "legacy, incomplete or mismatched outcomes must not discharge MRF responsibility"
+        );
+    }
+}
+
+#[test]
+fn completed_mrf_notice_publishes_only_verified_positive_events() {
+    use crate::heal::outcome::{HealObjectIdentity, HealObjectKind, HealObjectOutcome, HealTaskOutcome};
+    use rustfs_common::mrf_channel::{MrfKind, MrfScope, take_mrf_verified_repair_events_for};
+
+    let bucket = Arc::<str>::from("verified-mrf-completed-bucket");
+    let _ = take_mrf_verified_repair_events_for(bucket.as_ref());
+    let version = uuid::Uuid::new_v4();
+    let incarnation = uuid::Uuid::new_v4();
+    let matching_target = MrfRepairNoticeTarget {
+        bucket: bucket.clone(),
+        object: Arc::from("object-a"),
+        version_id: Some(*version.as_bytes()),
+        kind: MrfKind::PartialWrite,
+        scope: Some(MrfScope {
+            pool_index: 1,
+            set_index: 2,
+        }),
+        lease: None,
+    };
+    let mismatch_target = MrfRepairNoticeTarget {
+        object: Arc::from("object-b"),
+        ..matching_target.clone()
+    };
+    let mut outcome = HealTaskOutcome::default();
+    outcome.execution = HealExecutionOutcome::Completed;
+    outcome.coverage = crate::heal::outcome::HealTraversalCoverage::Complete;
+    outcome.record(HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: bucket.to_string(),
+            object: "object-a".to_string(),
+            version_id: Some(version.to_string()),
+            bucket_incarnation_id: Some(incarnation),
+            pool_index: Some(1),
+            set_index: Some(2),
+        },
+        disposition: HealObjectDisposition::VerifiedHealthy,
+        detail: None,
+    });
+    outcome.record(HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: bucket.to_string(),
+            object: "object-b".to_string(),
+            version_id: Some(version.to_string()),
+            bucket_incarnation_id: None,
+            pool_index: Some(1),
+            set_index: Some(2),
+        },
+        disposition: HealObjectDisposition::Repaired,
+        detail: None,
+    });
+    let completed = CompletedHealStatus {
+        outcome: Some(Arc::new(outcome)),
+        ..completed_retention_fixture(SystemTime::now())
+    };
+
+    publish_verified_mrf_repair_events(&[matching_target.clone(), mismatch_target], &completed);
+
+    let events = take_mrf_verified_repair_events_for(bucket.as_ref());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].object.as_ref(), "object-a");
+    assert_eq!(events[0].lease, None);
+    assert_eq!(events[0].bucket_incarnation_id, incarnation);
+
+    let failed = CompletedHealStatus {
+        status: HealTaskStatus::Failed {
+            error: "terminal failure".to_string(),
+        },
+        ..completed.clone()
+    };
+    publish_verified_mrf_repair_events(std::slice::from_ref(&matching_target), &failed);
+    assert!(
+        take_mrf_verified_repair_events_for(bucket.as_ref()).is_empty(),
+        "failed terminal tasks must not publish a verified repair event"
+    );
+
+    let mut completed_with_errors_outcome = completed.outcome.as_ref().expect("completed outcome").as_ref().clone();
+    completed_with_errors_outcome.execution = crate::heal::outcome::HealExecutionOutcome::CompletedWithErrors;
+    let completed_with_errors = CompletedHealStatus {
+        outcome: Some(Arc::new(completed_with_errors_outcome)),
+        ..completed
+    };
+    publish_verified_mrf_repair_events(std::slice::from_ref(&matching_target), &completed_with_errors);
+    assert!(
+        take_mrf_verified_repair_events_for(bucket.as_ref()).is_empty(),
+        "non-success canonical outcomes must not publish a verified repair event"
+    );
 }
 
 #[test]
@@ -1976,6 +2555,7 @@ async fn insert_retrying_request(manager: &HealManager, request: HealRequest) ->
         task_id,
         Arc::new(CompletedHealStatus {
             progress: None,
+            outcome: None,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: request.heal_type,
             status: HealTaskStatus::Retrying {
@@ -2398,6 +2978,88 @@ async fn admin_force_start_cancels_overlapping_active_task_first() {
 }
 
 #[tokio::test]
+async fn admission_snapshot_tracks_start_duplicate_force_start_and_displacement() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let manager = Arc::new(HealManager::new(
+        storage,
+        Some(HealConfig {
+            queue_size: 1,
+            ..Default::default()
+        }),
+    ));
+
+    let mut paused = admin_prefix_request("bucket-a", "logs/");
+    paused.priority = HealPriority::Low;
+    let hook = Arc::new(DuplicateAdmissionTestHook {
+        request_id: paused.id.clone(),
+        active_lock_reached: Notify::new(),
+        active_lock_release: Notify::new(),
+    });
+    *DUPLICATE_ADMISSION_TEST_HOOK.lock().await = Some(hook.clone());
+
+    let submit_manager = Arc::clone(&manager);
+    let mut paused_submission = tokio::spawn(async move { submit_manager.submit_heal_request(paused).await });
+    tokio::time::timeout(Duration::from_secs(1), hook.active_lock_reached.notified())
+        .await
+        .expect("admission should reach the test-only lock phase hook");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut paused_submission)
+            .await
+            .is_err(),
+        "admission must wait while the lock-phase hook is held"
+    );
+    hook.active_lock_release.notify_one();
+    assert_eq!(
+        paused_submission
+            .await
+            .expect("paused admission task should join")
+            .expect("paused admission should succeed"),
+        HealAdmissionResult::Accepted
+    );
+    *DUPLICATE_ADMISSION_TEST_HOOK.lock().await = None;
+
+    let duplicate = admin_prefix_request("bucket-a", "logs/");
+    let duplicate_receipt = manager
+        .submit_heal_request_with_receipt(duplicate)
+        .await
+        .expect("duplicate admission should return a canonical receipt");
+    assert_eq!(duplicate_receipt.result, HealAdmissionResult::Merged);
+
+    let mut high = admin_prefix_request("bucket-b", "logs/");
+    high.priority = HealPriority::High;
+    assert_eq!(
+        manager
+            .submit_heal_request(high)
+            .await
+            .expect("higher priority admin request should displace queued low-priority work"),
+        HealAdmissionResult::Accepted
+    );
+
+    let mut forced = admin_prefix_request("bucket-c", "logs/");
+    forced.force_start = true;
+    assert_eq!(
+        manager
+            .submit_heal_request(forced)
+            .await
+            .expect("forceStart should keep explicit admission semantics"),
+        HealAdmissionResult::Accepted
+    );
+
+    let admission = manager.operations_snapshot().await.admission;
+    assert_eq!(admission.accepted, 3);
+    assert_eq!(admission.merged, 1);
+    assert_eq!(admission.full, 0);
+    assert_eq!(admission.dropped, 0);
+    assert_eq!(admission.duplicate, 1);
+    assert_eq!(admission.displaced, 1);
+    assert_eq!(admission.force_start, 1);
+    assert!(
+        admission.max_lock_phase_micros > 0,
+        "snapshot should expose a measurable queue/admission lock phase for p95-style external aggregation"
+    );
+}
+
+#[tokio::test]
 async fn test_operations_snapshot_counts_active_by_source_and_priority() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
     let manager = HealManager::new(storage, None);
@@ -2700,6 +3362,7 @@ async fn test_retrying_completion_outranks_the_queue_for_the_same_id() {
         task_id.clone(),
         Arc::new(CompletedHealStatus {
             progress: None,
+            outcome: None,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: request.heal_type.clone(),
             status: HealTaskStatus::Retrying {
@@ -2737,6 +3400,7 @@ async fn test_get_task_status_reads_recent_completed_status() {
         "completed-token".to_string(),
         Arc::new(CompletedHealStatus {
             progress: None,
+            outcome: None,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: HealType::Bucket {
                 bucket: "bucket".to_string(),
@@ -2768,6 +3432,7 @@ async fn test_get_task_report_for_path_reads_completed_items() {
         "completed-token".to_string(),
         Arc::new(CompletedHealStatus {
             progress: None,
+            outcome: None,
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: HealType::Object {
                 bucket: "bucket".to_string(),
@@ -2843,7 +3508,7 @@ async fn test_cancel_task_removes_queued_request() {
 }
 
 #[tokio::test]
-async fn test_mrf_repaired_notice_waits_for_successful_completion() {
+async fn mrf_ownership_unverified_completion_does_not_emit_repaired() {
     let bucket = "mrf-completion-success";
     let object = "object";
     let version_id = Some([9u8; 16]);
@@ -2873,21 +3538,81 @@ async fn test_mrf_repaired_notice_waits_for_successful_completion() {
     );
 
     process_manager_queue_once(&manager).await;
-    for _ in 0..100 {
-        let events = rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket);
-        if !events.is_empty() {
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0].object.as_ref(), object);
-            assert_eq!(events[0].version_id, version_id);
-            return;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let stats = manager.get_statistics().await;
+            if stats.successful_tasks + stats.failed_tasks > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("successful MRF-owned heal should emit one repaired event");
+    })
+    .await
+    .expect("scheduler completes the task");
+    assert!(rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket).is_empty());
+    assert!(!lock_mrf_repair_notice_targets(&manager.mrf_repair_notice_targets).contains_key(&receipt.task_id));
 }
 
 #[tokio::test]
-async fn test_mrf_repaired_notice_removed_on_queued_cancel_without_event() {
+async fn mrf_ownership_dry_run_and_empty_window_do_not_emit_repaired() {
+    for empty_window in [false, true] {
+        let bucket = if empty_window {
+            "mrf-empty-outcome"
+        } else {
+            "mrf-dry-run-outcome"
+        };
+        let manager = HealManager::new(Arc::new(MockStorage), None);
+        let request = HealRequest::new(
+            if empty_window {
+                HealType::Cluster
+            } else {
+                HealType::Object {
+                    bucket: bucket.to_string(),
+                    object: "object".to_string(),
+                    version_id: None,
+                }
+            },
+            HealOptions {
+                recursive: true,
+                dry_run: !empty_window,
+                recreate_missing: true,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let receipt = manager
+            .submit_mrf_heal_request_with_receipt(request, Arc::from(bucket), Arc::from("object"), None)
+            .await
+            .expect("notice target registered");
+        process_manager_queue_once(&manager).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stats = manager.get_statistics().await;
+                if stats.successful_tasks + stats.failed_tasks > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduler completed");
+        let report = manager.get_task_report(&receipt.task_id).await.expect("completed report");
+        assert_eq!(report.status, HealTaskStatus::Completed);
+        let outcome = report.outcome.expect("canonical outcome");
+        if empty_window {
+            assert!(outcome.objects.is_empty());
+        } else {
+            assert_eq!(
+                outcome.objects[0].disposition,
+                crate::heal::outcome::HealObjectDisposition::DryRunObserved
+            );
+        }
+        assert!(rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn mrf_ownership_queued_cancel_does_not_emit_repaired() {
     let bucket = "mrf-completion-cancel";
     let object = "object";
     let _ = rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket);

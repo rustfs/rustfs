@@ -25,7 +25,7 @@
 10|crates/ecstore/src/cluster/rpc/remote_disk.rs
 6|crates/ecstore/src/config/com.rs
 14|crates/ecstore/src/config/storageclass.rs
-182|crates/ecstore/src/core/pools.rs
+178|crates/ecstore/src/core/pools.rs
 7|crates/ecstore/src/data_movement/mod.rs
 2|crates/ecstore/src/data_usage/local_snapshot.rs
 12|crates/ecstore/src/data_usage/mod.rs
@@ -33,9 +33,9 @@
 1|crates/ecstore/src/disk/mod.rs
 5|crates/ecstore/src/erasure/codec/bridge.rs
 1|crates/ecstore/src/erasure/coding/decode_reader.rs
-10|crates/ecstore/src/erasure/coding/encode.rs
+8|crates/ecstore/src/erasure/coding/encode.rs
 25|crates/ecstore/src/erasure/coding/erasure.rs
-4|crates/ecstore/src/layout/disks_layout.rs
+3|crates/ecstore/src/layout/disks_layout.rs
 2|crates/ecstore/src/layout/endpoint.rs
 17|crates/ecstore/src/layout/endpoints.rs
 1|crates/ecstore/src/layout/format.rs
@@ -45,7 +45,7 @@
 1|crates/ecstore/src/object_api/types.rs
 3|crates/ecstore/src/runtime/sources.rs
 4|crates/ecstore/src/services/batch_processor.rs
-14|crates/ecstore/src/services/notification_sys.rs
+13|crates/ecstore/src/services/notification_sys.rs
 16|crates/ecstore/src/services/rebalance/control.rs
 1|crates/ecstore/src/services/rebalance/entry.rs
 8|crates/ecstore/src/services/rebalance/meta.rs
@@ -66,8 +66,7 @@
 3|crates/ecstore/src/set_disk/read.rs
 5|crates/ecstore/src/store/bucket.rs
 1|crates/ecstore/src/store/heal_walk.rs
-12|crates/ecstore/src/store/init.rs
-2|crates/ecstore/src/store/init_format.rs
+10|crates/ecstore/src/store/init.rs
 3|crates/ecstore/src/store/multipart.rs
 6|crates/ecstore/src/store/object.rs
 5|crates/ecstore/src/store/rebalance/support.rs

@@ -34,11 +34,14 @@ use rustfs_utils::http::{
 };
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::hash::Hasher;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::{collections::HashMap, io::Cursor};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -67,8 +70,42 @@ const _XL_FLAG_INLINE_DATA: u8 = 1 << 2;
 const META_DATA_READ_DEFAULT: usize = 4 << 10;
 const MSGP_UINT32_SIZE: usize = 5;
 
-/// Max object versions per object, default is 10000
-const DEFAULT_OBJECT_MAX_VERSIONS: usize = 10000;
+/// Default max object versions per object.
+pub const DEFAULT_OBJECT_MAX_VERSIONS: usize = rustfs_config::DEFAULT_API_OBJECT_MAX_VERSIONS;
+
+static OBJECT_MAX_VERSIONS: AtomicUsize = AtomicUsize::new(DEFAULT_OBJECT_MAX_VERSIONS);
+
+#[cfg(test)]
+thread_local! {
+    static OBJECT_MAX_VERSIONS_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[inline]
+pub fn object_max_versions() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = OBJECT_MAX_VERSIONS_OVERRIDE.with(Cell::get) {
+        return limit;
+    }
+
+    OBJECT_MAX_VERSIONS.load(AtomicOrdering::Relaxed)
+}
+
+pub fn set_object_max_versions(limit: usize) -> Result<()> {
+    if limit == 0 {
+        return Err(Error::other("object max versions must be greater than 0"));
+    }
+    OBJECT_MAX_VERSIONS.store(limit, AtomicOrdering::Relaxed);
+    Ok(())
+}
+
+#[cfg(test)]
+fn set_object_max_versions_override_for_test(limit: Option<usize>) -> Option<usize> {
+    OBJECT_MAX_VERSIONS_OVERRIDE.with(|override_limit| {
+        let previous = override_limit.get();
+        override_limit.set(limit);
+        previous
+    })
+}
 
 /// Returns the inline data map key for a version_id. "null" for null version.
 pub(crate) fn data_key_for_version(version_id: Option<Uuid>) -> String {
@@ -460,18 +497,6 @@ impl FileMeta {
             return Err(Error::other("file meta version invalid"));
         }
 
-        // check max versions limit
-        if self.versions.len() + 1 > DEFAULT_OBJECT_MAX_VERSIONS {
-            return Err(Error::other(
-                "You've exceeded the limit on the number of versions you can create on this object",
-            ));
-        }
-
-        if self.versions.is_empty() {
-            self.versions.push(FileMetaShallowVersion::try_from(version)?);
-            return Ok(());
-        }
-
         let vid = version.get_version_id();
         let vid_is_null = vid.is_none() || vid == Some(Uuid::nil());
         let existing_idx = if vid_is_null {
@@ -488,6 +513,15 @@ impl FileMeta {
                 return Err(Error::other("cannot replace a free version with a non-free version"));
             }
             return self.set_idx(fidx, version);
+        }
+
+        if self.versions.len() >= object_max_versions() {
+            return Err(Error::MaxVersionsExceeded);
+        }
+
+        if self.versions.is_empty() {
+            self.versions.push(FileMetaShallowVersion::try_from(version)?);
+            return Ok(());
         }
 
         let new_shallow = FileMetaShallowVersion::try_from(version)?;
@@ -692,10 +726,15 @@ impl FileMeta {
                             }
                         }
 
-                        let old_dir = v.object.as_ref().map(|v| v.data_dir).unwrap_or_default();
+                        // The version stays on disk while the purge replicates
+                        // (status PENDING/FAILED); its data dir must stay with
+                        // it. Returning the dir here made the disk layer delete
+                        // it, which turned every non-inline retained version
+                        // into an unreadable zombie: the purge state could never
+                        // be applied and the bucket could never be deleted.
                         self.set_idx(i, v)?;
 
-                        return Ok(old_dir);
+                        return Ok(None);
                     }
                     found_index = Some(i);
                 }
@@ -1323,6 +1362,88 @@ mod test {
             },
             _ => unreachable!("ordering regression only constructs object and delete versions"),
         }
+    }
+
+    struct ObjectMaxVersionsRestore {
+        previous: Option<usize>,
+    }
+
+    impl Drop for ObjectMaxVersionsRestore {
+        fn drop(&mut self) {
+            set_object_max_versions_override_for_test(self.previous);
+        }
+    }
+
+    fn with_object_max_versions_for_test<R>(limit: usize, test: impl FnOnce() -> R) -> R {
+        let previous = set_object_max_versions_override_for_test(Some(limit));
+        let _restore = ObjectMaxVersionsRestore { previous };
+        test()
+    }
+
+    #[test]
+    fn add_version_filemata_rejects_new_version_above_configured_limit() {
+        with_object_max_versions_for_test(2, || {
+            let mut fm = FileMeta::new();
+            fm.add_version_filemata(valid_object_version(Uuid::from_u128(1), vec![10, 20]))
+                .expect("add first version within limit");
+            fm.add_version_filemata(valid_object_version(Uuid::from_u128(2), vec![10, 20]))
+                .expect("add second version at limit");
+
+            let err = fm
+                .add_version_filemata(valid_object_version(Uuid::from_u128(3), vec![10, 20]))
+                .expect_err("new version above limit must fail");
+
+            assert_eq!(err, Error::MaxVersionsExceeded);
+            assert_eq!(fm.versions.len(), 2, "failed insert must not mutate version list");
+        });
+    }
+
+    #[test]
+    fn add_version_filemata_allows_same_version_replacement_at_limit() {
+        with_object_max_versions_for_test(2, || {
+            let mut fm = FileMeta::new();
+            let target = Uuid::from_u128(10);
+            fm.add_version_filemata(valid_object_version(target, vec![10, 20]))
+                .expect("add target version");
+            fm.add_version_filemata(valid_object_version(Uuid::from_u128(20), vec![10, 20]))
+                .expect("add peer version at limit");
+
+            fm.add_version_filemata(valid_object_version(target, vec![30, 40]))
+                .expect("same version replacement at limit must succeed");
+
+            assert_eq!(fm.versions.len(), 2);
+            let replaced = fm
+                .versions
+                .iter()
+                .find(|version| version.header.version_id == Some(target))
+                .expect("target version must remain present")
+                .parse_version_meta()
+                .expect("parse replaced version");
+            assert_eq!(replaced.object.expect("object version").part_sizes, vec![30, 40]);
+        });
+    }
+
+    #[test]
+    fn add_version_allows_null_version_replacement_at_limit() {
+        with_object_max_versions_for_test(1, || {
+            let mut fm = FileMeta::new();
+            let mut first = FileInfo::new("object", 2, 2);
+            first.mod_time = Some(OffsetDateTime::now_utc());
+            first.version_id = None;
+            fm.add_version(first).expect("add initial null version");
+
+            let mut replacement = FileInfo::new("object", 2, 2);
+            replacement.mod_time = Some(OffsetDateTime::now_utc());
+            replacement.version_id = None;
+            replacement.size = 42;
+            fm.add_version(replacement)
+                .expect("null version replacement at limit must succeed");
+
+            assert_eq!(fm.versions.len(), 1);
+            assert_eq!(fm.versions[0].header.version_id, Some(Uuid::nil()));
+            let replaced = fm.versions[0].parse_version_meta().expect("parse null replacement");
+            assert_eq!(replaced.object.expect("object version").size, 42);
+        });
     }
 
     #[test]
@@ -2700,6 +2821,58 @@ mod test {
             fm.versions.is_empty(),
             "delete-marker version purge should remove the local marker instead of rewriting purge metadata onto it"
         );
+    }
+
+    /// Regression for rustfs/backlog#2340: a version purge that still awaits
+    /// the replication target keeps the object version on disk with a pending
+    /// purge status. Its data dir must be retained with it; handing the dir
+    /// back here made the disk layer delete it, leaving every non-inline
+    /// retained version unreadable. The dir is released only once the purge
+    /// completes and the version itself goes away.
+    #[test]
+    fn delete_version_pending_version_purge_retains_object_data_dir() {
+        let version_id = Uuid::new_v4();
+        let data_dir = Uuid::new_v4();
+        let mut fm = FileMeta::new();
+        let mut fi = FileInfo::new("object", 2, 2);
+        fi.version_id = Some(version_id);
+        fi.data_dir = Some(data_dir);
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        fm.add_version(fi).unwrap();
+
+        let pending_purge = FileInfo {
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            mark_deleted: true,
+            replication_state_internal: Some(ReplicationState {
+                version_purge_status_internal: Some("target=PENDING;".to_string()),
+                purge_targets: version_purge_statuses_map("target=PENDING;"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let freed = fm.delete_version(&pending_purge).unwrap();
+        assert_eq!(freed, None, "a pending purge must not release the retained version's data dir");
+        assert_eq!(fm.versions.len(), 1, "the version must stay until the purge replicates");
+        let retained = fm
+            .into_fileinfo("vol", "object", &version_id.to_string(), false, false, true)
+            .unwrap();
+        assert_eq!(retained.data_dir, Some(data_dir));
+        assert_eq!(retained.version_purge_status(), VersionPurgeStatusType::Pending);
+
+        let completed_purge = FileInfo {
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            replication_state_internal: Some(ReplicationState {
+                version_purge_status_internal: Some("target=COMPLETE;".to_string()),
+                purge_targets: version_purge_statuses_map("target=COMPLETE;"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let freed = fm.delete_version(&completed_purge).unwrap();
+        assert_eq!(freed, Some(data_dir), "a completed purge removes the version and releases its data dir");
+        assert!(fm.versions.is_empty());
     }
 
     #[test]

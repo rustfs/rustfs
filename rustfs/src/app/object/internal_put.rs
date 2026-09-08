@@ -48,6 +48,8 @@ use http::HeaderName;
 /// other internal provenance is written verbatim.
 pub(crate) struct InternalPutContext {
     pub(crate) bucket: String,
+    /// Pins background work to its original bucket across deletion and recreation.
+    pub(crate) expected_bucket_incarnation_id: Option<Uuid>,
     pub(crate) key: String,
     /// Plaintext object length. The single-object path requires it, exactly
     /// like S3 PutObject rejects an unknown `Content-Length`.
@@ -57,6 +59,9 @@ pub(crate) struct InternalPutContext {
     pub(crate) expected_md5_hex: Option<String>,
     /// ETag to store instead of the computed one.
     pub(crate) preserve_etag: Option<String>,
+    /// Reject an existing current object under the storage commit lock.
+    pub(crate) if_absent: bool,
+    pub(crate) preserve_delete_marker: bool,
     pub(crate) content_headers: HashMap<String, String>,
     pub(crate) user_metadata: HashMap<String, String>,
     pub(crate) tags: Option<String>,
@@ -236,10 +241,13 @@ impl DefaultObjectUsecase {
         let start_time = Instant::now();
         let InternalPutContext {
             bucket,
+            expected_bucket_incarnation_id,
             key,
             size,
             expected_md5_hex,
             preserve_etag,
+            if_absent,
+            preserve_delete_marker,
             content_headers,
             user_metadata,
             tags,
@@ -252,7 +260,10 @@ impl DefaultObjectUsecase {
         };
         let size = i64::try_from(size).map_err(|_| ApiError::invalid_request("internal put size exceeds the supported range"))?;
 
-        let headers = internal_put_headers(&content_headers)?;
+        let mut headers = internal_put_headers(&content_headers)?;
+        if if_absent {
+            headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        }
         validate_internal_write_target(&key, &bucket, &headers).await?;
         remove_source_replication_bookkeeping(&mut internal_metadata);
 
@@ -287,6 +298,8 @@ impl DefaultObjectUsecase {
             origin: PutObjectOrigin::Internal {
                 principal_id,
                 emit_events,
+                preserve_delete_marker,
+                expected_bucket_incarnation_id,
             },
         };
         let committed = self
@@ -358,6 +371,8 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        opts.expected_bucket_incarnation_id = ctx.expected_bucket_incarnation_id;
+
         let dsc = must_replicate_object(
             &ctx.bucket,
             &ctx.key,
@@ -419,7 +434,10 @@ impl DefaultObjectUsecase {
         let bucket = ctx.bucket.as_str();
         let key = ctx.key.as_str();
         let store = self.object_store().ok_or_else(not_initialized)?;
-        let mut opts = ObjectOptions::default();
+        let mut opts = ObjectOptions {
+            expected_bucket_incarnation_id: ctx.expected_bucket_incarnation_id,
+            ..Default::default()
+        };
         let session = store
             .get_multipart_info(bucket, key, upload_id, &opts)
             .await
@@ -527,10 +545,15 @@ impl DefaultObjectUsecase {
             .map_err(api_error_from_s3)?;
         let store = self.object_store().ok_or_else(not_initialized)?;
 
-        let headers = HeaderMap::new();
+        let mut headers = HeaderMap::new();
+        if ctx.if_absent {
+            headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        }
         let mut opts =
             get_complete_multipart_upload_opts_with_replication_authorization(&headers, false).map_err(ApiError::from)?;
+        opts.expected_bucket_incarnation_id = ctx.expected_bucket_incarnation_id;
         opts.preserve_etag = ctx.preserve_etag.clone();
+        opts.preserve_delete_marker = ctx.preserve_delete_marker;
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
         opts.versioned = versioned;
         opts.version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &key).await;
@@ -666,7 +689,7 @@ impl DefaultObjectUsecase {
                     schedule_object_replication(obj_info.clone(), store, completion_replication_decision).await;
                 }
 
-                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                rustfs_scanner::record_dirty_usage_object(&bucket, &key);
                 Ok::<_, ApiError>(obj_info)
             }
         });
@@ -686,10 +709,24 @@ impl DefaultObjectUsecase {
     }
 
     /// Discard an internal multipart upload and its staged parts.
-    pub(crate) async fn internal_abort_multipart_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<(), ApiError> {
+    pub(crate) async fn internal_abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        expected_bucket_incarnation_id: Option<Uuid>,
+    ) -> Result<(), ApiError> {
         let store = self.object_store().ok_or_else(not_initialized)?;
         store
-            .abort_multipart_upload(bucket, key, upload_id, &ObjectOptions::default())
+            .abort_multipart_upload(
+                bucket,
+                key,
+                upload_id,
+                &ObjectOptions {
+                    expected_bucket_incarnation_id,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(ApiError::from)?;
         rustfs_scanner::record_dirty_usage_bucket(bucket);
@@ -743,10 +780,13 @@ mod tests {
     fn internal_context(bucket: &str, key: &str, body: &[u8]) -> InternalPutContext {
         InternalPutContext {
             bucket: bucket.to_string(),
+            expected_bucket_incarnation_id: None,
             key: key.to_string(),
             size: Some(body.len() as u64),
             expected_md5_hex: Some(md5_hex(body)),
             preserve_etag: None,
+            if_absent: false,
+            preserve_delete_marker: false,
             content_headers: HashMap::from([
                 ("Content-Type".to_string(), "text/plain".to_string()),
                 ("Cache-Control".to_string(), "max-age=60".to_string()),
@@ -1123,9 +1163,14 @@ mod tests {
         ))
         .await
         .expect("part of the aborted upload must stage");
-        Box::pin(usecase.internal_abort_multipart_upload(&bucket, &ctx.key, &aborted_upload_id))
-            .await
-            .expect("internal abort must succeed");
+        Box::pin(usecase.internal_abort_multipart_upload(
+            &bucket,
+            &ctx.key,
+            &aborted_upload_id,
+            ctx.expected_bucket_incarnation_id,
+        ))
+        .await
+        .expect("internal abort must succeed");
         let uploads = Box::pin(store.list_multipart_uploads(&bucket, &ctx.key, None, None, None, 100))
             .await
             .expect("list multipart uploads after abort");

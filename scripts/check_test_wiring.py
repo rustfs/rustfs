@@ -10,12 +10,20 @@ import re
 import subprocess
 import sys
 import tempfile
-import tomllib
 import unittest
+import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from unittest import mock
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+from scanner_abba import MAX_JSON_BYTES, digest, number, read_json, require, sha, write_json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -567,10 +575,7 @@ def check_quick_checks(root: Path) -> list[str]:
         errors.append(f"{relative}: missing composite action")
         return errors
     steps = yaml_block(runs, "steps", 2) or []
-    for command in (
-        "shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh",
-        "python3 scripts/ci_gate.py --self-test",
-    ):
+    for command in ("shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh", "make script-tests"):
         step = workflow_step_block(steps, command, key="run", indent=4)
         if step is None:
             errors.append(f"{relative}: missing direct execution of {command}")
@@ -876,6 +881,251 @@ def check_core_listing(root: Path, listing: Path) -> list[str]:
         return [f"cannot read core nextest listing: {error}"]
 
 
+def evidence_integer(value: object, name: str, minimum: int, maximum: int) -> int:
+    require(type(value) is int and minimum <= value <= maximum, f"invalid integer {name}")
+    return value
+
+
+def scanner_heal_oracle_names(root: Path) -> tuple[str, ...]:
+    registry = read_json(root / ".config/scanner-heal-required-tests.json")
+    evidence_integer(registry.get("schema"), "registry schema", 1, 1)
+    cases = registry.get("cases")
+    require(isinstance(cases, dict) and cases, "invalid scanner/heal registry")
+    names = set()
+    for case_id, requirement in cases.items():
+        require(isinstance(case_id, str) and case_id, "invalid scanner/heal case identity")
+        oracle = requirement.get("oracle")
+        require(isinstance(oracle, str) and oracle.endswith(".json"), f"invalid oracle for {case_id}")
+        path = Path(oracle)
+        require(not path.is_absolute() and ".." not in path.parts, f"oracle path escapes run directory for {case_id}")
+        require(requirement.get("evidence") in ("process-restart", "process-crash-restart"),
+                f"invalid evidence for {case_id}")
+        require(type(requirement.get("unclean_shutdown_marker")) is bool,
+                f"invalid unclean-shutdown marker expectation for {case_id}")
+        names.add(oracle)
+    return tuple(sorted(names))
+
+
+def begin_scanner_heal_receipt(root: Path, directory: Path, binary: Path, test_binary: Path) -> None:
+    """Record an existing build; this command never builds or runs a test."""
+    require(not directory.exists(), "scanner/heal run directory must be new")
+    require(not subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=no"], cwd=root, text=True).strip(),
+            "commit tracked source changes before creating evidence")
+    builds = {}
+    for label, path in (("binary", binary), ("test_binary", test_binary)):
+        path = path.resolve(strict=True)
+        require(path.is_file() and os.access(path, os.X_OK), f"missing executable {label}")
+        builds[label] = {"path": str(path), "sha256": digest(path)}
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    require(re.fullmatch(r"[0-9a-f]{40}", revision), "invalid source revision")
+    version = subprocess.check_output([builds["binary"]["path"], "--version"], text=True, timeout=30)
+    embedded_revision = re.search(r"^git commit\s*:\s*([0-9a-f]{40})\s*$", version, re.MULTILINE)
+    embedded_status = re.search(r"^git status\s*:\s*(.*)\Z", version, re.MULTILINE | re.DOTALL)
+    require(embedded_revision is not None and embedded_revision[1] == revision, "server binary source revision mismatch")
+    require(embedded_status is not None and not embedded_status[1].strip(), "server binary was built from dirty/unknown source")
+    lock_blob = subprocess.check_output(["git", "hash-object", "Cargo.lock"], cwd=root, text=True).strip()
+    require(re.fullmatch(r"[0-9a-f]{40}", lock_blob), "invalid Cargo.lock identity")
+    features = os.environ.get("RUSTFS_E2E_EXPECTED_FEATURES")
+    require(features is not None, "set RUSTFS_E2E_EXPECTED_FEATURES to the compiled e2e crate feature set")
+    features = ",".join(sorted(set(filter(None, (feature.strip() for feature in features.split(","))))))
+    require(all(re.fullmatch(r"[a-z0-9-]+", feature) for feature in features.split(",") if feature), "invalid expected features")
+    directory.mkdir(parents=True)
+    write_json(directory / "run.json", {"schema": 1, "run_id": uuid.uuid4().hex,
+                                       "source_revision": revision,
+                                       "binary_source_revision": embedded_revision[1],
+                                       "test_build": {"source_revision": revision, "dirty": False,
+                                                      "lock_blob": lock_blob, "features": features},
+                                       "started_at": datetime.now(timezone.utc).timestamp(), **builds})
+
+
+def finish_scanner_heal_receipt(directory: Path, exit_code: int, root: Path = ROOT) -> None:
+    require(type(exit_code) is int and 0 <= exit_code <= 255, "invalid test exit code")
+    require(not (directory / "execution.json").exists(), "execution receipt already exists")
+    run = read_json(directory / "run.json")
+    artifacts = {}
+    oracle_names = scanner_heal_oracle_names(root)
+    for name in ("listing.json", "junit.xml"):
+        path = directory / name
+        if exit_code != 0 and not path.exists():
+            continue
+        require(path.is_file() and 0 < path.stat().st_size <= MAX_JSON_BYTES, f"missing/oversized {name}")
+        require(path.stat().st_mtime >= run["started_at"], f"stale {name}")
+        artifacts[name] = digest(path)
+    for name in oracle_names:
+        path = directory / name
+        if not path.exists():
+            continue
+        require(path.is_file() and 0 < path.stat().st_size <= MAX_JSON_BYTES, f"missing/oversized {name}")
+        require(path.stat().st_mtime >= run["started_at"], f"stale {name}")
+        artifacts[name] = digest(path)
+    if exit_code == 0:
+        require(any(name in artifacts for name in oracle_names), "missing scanner/heal case oracle")
+    write_json(directory / "execution.json", {"run_id": run["run_id"], "exit_code": exit_code,
+                                             "finished_at": datetime.now(timezone.utc).timestamp(),
+                                             "artifacts": artifacts})
+
+
+def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> list[str]:
+    """Validate one actual case, or fail the release while required lanes are pending."""
+    try:
+        registry = read_json(root / ".config/scanner-heal-required-tests.json")
+        evidence_integer(registry.get("schema"), "registry schema", 1, 1)
+        require(registry.get("cases"), "invalid scanner/heal registry")
+        selected = registry["cases"] if case_id == "release" else {case_id: registry["cases"][case_id]}
+        run = read_json(directory / "run.json")
+        execution = read_json(directory / "execution.json")
+        evidence_integer(run.get("schema"), "run schema", 1, 1)
+        require(re.fullmatch(r"[0-9a-f]{32}", run["run_id"]), "invalid run identity")
+        require(re.fullmatch(r"[0-9a-f]{40}", run["source_revision"]), "invalid source revision")
+        require(run.get("binary_source_revision") == run["source_revision"], "server source provenance missing")
+        expected_build = run["test_build"]
+        require(expected_build["source_revision"] == run["source_revision"] and expected_build["dirty"] is False,
+                "test source provenance missing")
+        require(re.fullmatch(r"[0-9a-f]{40}", expected_build["lock_blob"]), "invalid test lockfile identity")
+        require(isinstance(expected_build["features"], str), "missing test features")
+        require(execution.get("run_id") == run["run_id"], "execution belongs to another run")
+        require(type(execution.get("exit_code")) is int and execution["exit_code"] == 0, "test command failed or did not run")
+        number(run["started_at"], "started_at", 1)
+        number(execution["finished_at"], "finished_at", run["started_at"])
+        for label in ("binary", "test_binary"):
+            require(sha(run[label]["sha256"]) and digest(Path(run[label]["path"])) == run[label]["sha256"],
+                    f"{label} changed or missing")
+        for name in ("listing.json", "junit.xml"):
+            path = directory / name
+            require(0 < path.stat().st_size <= MAX_JSON_BYTES, f"missing/oversized {name}")
+            require(run["started_at"] <= path.stat().st_mtime <= execution["finished_at"], f"{name} outside run window")
+            require(digest(path) == execution["artifacts"][name], f"{name} hash mismatch")
+        suites = read_json(directory / "listing.json")["rust-suites"]
+        xml = (directory / "junit.xml").read_bytes()
+        require(b"<!DOCTYPE" not in xml and b"<!ENTITY" not in xml, "JUnit entities are forbidden")
+        junit = ET.fromstring(xml)
+        cases = list(junit.iter("testcase"))
+        require(bool(cases), "JUnit has zero testcases")
+        for case in cases:
+            require(not any(child.tag in ("failure", "error", "skipped", "rerunFailure", "rerunError", "flakyFailure", "flakyError")
+                            for child in case), "JUnit contains failed, skipped or retried tests")
+        errors = []
+        for name, requirement in selected.items():
+            suite, test = requirement["suite"], requirement["name"]
+            for key in ("nodes", "drives_per_node"):
+                evidence_integer(requirement["topology"][key], f"required {key}", 1, 16)
+            listing_suite = suites[suite]
+            require(listing_suite["binary-id"] == suite, "nextest suite binary identity mismatch")
+            listed_binary = Path(listing_suite["binary-path"]).resolve(strict=True)
+            require(listed_binary == Path(run["test_binary"]["path"]).resolve(strict=True) and
+                    digest(listed_binary) == run["test_binary"]["sha256"], "nextest selected another test binary")
+            require(listing_suite["package-name"] == "e2e_test" and listing_suite["build-platform"] in ("host", "target"),
+                    "unexpected nextest suite metadata")
+            listed = listing_suite.get("testcases", {}).get(test, {})
+            require(listed.get("ignored") is False and listed.get("filter-match", {}).get("status") == "matches",
+                    f"required test not selected: {suite}::{test}")
+            matches = [case for case in cases if case.get("name") == test and case.get("classname") == suite]
+            require(len(matches) == 1, f"missing/duplicate JUnit case: {suite}::{test}")
+            started = datetime.fromisoformat(matches[0].attrib["timestamp"].replace("Z", "+00:00"))
+            require(started.tzinfo is not None, "JUnit timestamp must include timezone")
+            # quick-junit truncates timestamps to milliseconds.
+            require(run["started_at"] - 0.001 <= started.timestamp() <= execution["finished_at"],
+                    "JUnit testcase executed outside this run")
+            path = directory / requirement["oracle"]
+            require(path.resolve().is_relative_to(directory.resolve()), "oracle path escapes run directory")
+            require(run["started_at"] <= path.stat().st_mtime <= execution["finished_at"], "oracle outside run window")
+            require(digest(path) == execution["artifacts"][requirement["oracle"]], "oracle hash mismatch")
+            oracle = read_json(path)
+            evidence_integer(oracle.get("schema"), "oracle schema", 1, 1)
+            require(oracle.get("evidence") == requirement["evidence"], f"not real {requirement['evidence']} evidence")
+            require(oracle.get("case") == name and oracle.get("run_id") == run["run_id"], "oracle belongs to another case/run")
+            require(oracle.get("source_revision") == run["source_revision"], "oracle source mismatch")
+            require(oracle.get("unclean_shutdown_marker") is requirement["unclean_shutdown_marker"],
+                    "unclean-shutdown marker evidence mismatch")
+            built = oracle["test_build"]
+            for key in ("source_revision", "dirty", "lock_blob", "features"):
+                require(built[key] == expected_build[key], f"compiled test {key} mismatch")
+            require(built["dirty"] is False, "test binary was compiled from dirty source")
+            require(all(isinstance(built[key], str) and built[key] and built[key] != "unknown" for key in ("target", "profile")),
+                    "missing compiled target/profile")
+            require(isinstance(built["rustflags_hex"], str) and re.fullmatch(r"(?:[0-9a-f]{2})*", built["rustflags_hex"]) is not None,
+                    "invalid compiled rustflags")
+            for label in ("binary", "test_binary"):
+                require(oracle.get(f"{label}_sha256") == run[label]["sha256"], f"oracle {label} mismatch")
+            require(oracle.get("topology") == requirement["topology"], "oracle topology mismatch")
+            for key in ("nodes", "drives_per_node"):
+                evidence_integer(oracle["topology"][key], f"observed {key}", 1, 16)
+            evidence_integer(oracle.get("pid_before"), "pid_before", 1, 2**32 - 1)
+            evidence_integer(oracle.get("pid_after"), "pid_after", 1, 2**32 - 1)
+            require(oracle["pid_before"] != oracle["pid_after"], "no process restart witnessed")
+            objects = oracle["objects"]
+            require(isinstance(objects, list) and requirement["min_objects"] <= len(objects) <= requirement["max_objects"],
+                    "incomplete/oversized object oracle")
+            require(len({obj["key"] for obj in objects}) == len(objects), "duplicate object identity")
+            require(sum(obj["expected_physical"] is None for obj in objects) == 1,
+                    "only the outage object may lack a pre-fault target manifest")
+            for obj in objects:
+                require(isinstance(obj["key"], str) and 0 < len(obj["key"].encode()) <= 1024, "invalid object identity")
+                require(obj["version_id"] is None, "this case only covers unversioned objects")
+                require(type(obj["expected_bytes"]) is int and obj["expected_bytes"] > 0, "missing expected bytes")
+                require(type(obj["actual_bytes"]) is int and obj["actual_bytes"] == obj["expected_bytes"], "S3 body length mismatch")
+                require(sha(obj["expected_sha256"]) and obj["actual_sha256"] == obj["expected_sha256"], "S3 body digest mismatch")
+                physical = obj["physical"]
+                if obj["expected_physical"] is not None:
+                    require(physical == obj["expected_physical"], "target shard differs from pre-fault manifest")
+                for geometry in [physical] + ([obj["expected_physical"]] if obj["expected_physical"] is not None else []):
+                    data = evidence_integer(geometry["data_blocks"], "EC data blocks", 1, 16)
+                    parity = evidence_integer(geometry["parity_blocks"], "EC parity blocks", 1, 16)
+                    require(data + parity == oracle["topology"]["nodes"] * oracle["topology"]["drives_per_node"],
+                            "EC geometry differs from this case's single set")
+                    evidence_integer(geometry["erasure_index"], "target erasure index", 1, data + parity)
+                require(physical["has_xl_meta"] is True and physical["version_id"] is None, "missing target metadata")
+                parts = physical["expected_part_numbers"]
+                require(isinstance(parts, list) and 0 < len(parts) <= 10000, "no physical part coverage")
+                require(all(type(part) is int and part > 0 for part in parts) and len(set(parts)) == len(parts),
+                        "invalid physical part identity")
+                require({str(part) for part in parts} == set(physical["present_part_fingerprints"]), "target shard parts missing")
+                for part in physical["present_part_fingerprints"].values():
+                    require(type(part["size"]) is int and part["size"] > 0 and sha(part["sha256"]), "invalid target shard fingerprint")
+            node_listings = oracle["node_listings"]
+            require(isinstance(node_listings, list) and len(node_listings) == requirement["topology"]["nodes"],
+                    "missing per-node S3 listing")
+            require(all(keys == sorted(obj["key"] for obj in objects) for keys in node_listings),
+                    "S3 listing differs from object oracle")
+        if case_id == "release":
+            errors.extend(f"pending {gate}: {reason}" for gate, reason in registry["release_pending"].items())
+        return errors
+    except (OSError, KeyError, TypeError, ValueError, ET.ParseError) as error:
+        return [f"scanner/heal evidence rejected: {error}"]
+
+
+def scanner_heal_release_status(root: Path, directory: Path) -> dict[str, object]:
+    """Return a compact release decision without weakening case validation."""
+    registry = read_json(root / ".config/scanner-heal-required-tests.json")
+    evidence_integer(registry.get("schema"), "registry schema", 1, 1)
+    cases = registry.get("cases")
+    require(isinstance(cases, dict) and cases, "invalid scanner/heal registry")
+    pending = registry.get("release_pending")
+    require(isinstance(pending, dict), "invalid scanner/heal release requirements")
+    for gate, reason in pending.items():
+        require(isinstance(gate, str) and re.fullmatch(r"[A-Z][A-Z0-9-]*", gate) is not None,
+                "invalid scanner/heal release gate")
+        require(isinstance(reason, str) and reason.strip(), f"missing release requirement for {gate}")
+
+    verified_cases = []
+    rejected_cases = []
+    for case_id in sorted(cases):
+        if check_scanner_heal_evidence(root, directory, case_id):
+            rejected_cases.append(case_id)
+        else:
+            verified_cases.append(case_id)
+
+    return {
+        "schema": 1,
+        "decision": "blocked",
+        "release_approved": False,
+        "release_schema_capable": False,
+        "verified_cases": verified_cases,
+        "rejected_cases": rejected_cases,
+        "pending_gates": sorted(pending),
+    }
+
+
 def validate(root: Path) -> list[str]:
     errors: list[str] = []
     errors.extend(check_core_fixtures(root))
@@ -909,8 +1159,7 @@ class SelfTests(unittest.TestCase):
                 "    - name: Lint workflows\n      shell: bash\n      run: shellcheck --version && actionlint\n"
                 "    - name: Error format ratchet\n      shell: bash\n"
                 "      run: ./scripts/check_error_other_format_ratchet.sh\n"
-                "    - name: Required gate contract\n      shell: bash\n"
-                "      run: python3 scripts/ci_gate.py --self-test\n"
+                "    - name: Script tests\n      shell: bash\n      run: make script-tests\n"
             )
             sources = {
                 ".github/workflows/ci.yml": caller.replace(
@@ -968,10 +1217,10 @@ class SelfTests(unittest.TestCase):
                 "only installed actionlint": action.replace("run: shellcheck --version && actionlint", "run: echo actionlint"),
                 "missing shellcheck preflight": action.replace("shellcheck --version && ", ""),
                 "missing ratchet": action.replace("run: ./scripts/check_error_other_format_ratchet.sh", "run: echo skipped"),
-                "missing gate contract": action.replace("run: python3 scripts/ci_gate.py --self-test", "run: echo skipped"),
+                "missing script tests": action.replace("run: make script-tests", "run: echo skipped"),
+                "swallowed script failure": action.replace("run: make script-tests", "run: make script-tests || true"),
                 "swallowed lint failure": action.replace("&& actionlint", "&& actionlint || true"),
                 "swallowed ratchet failure": action.replace("ratchet.sh", "ratchet.sh || true"),
-                "swallowed gate failure": action.replace("ci_gate.py --self-test", "ci_gate.py --self-test || true"),
                 "conditional lint": action.replace("run: shellcheck", "if: false\n      run: shellcheck"),
                 "ignored ratchet failure": action.replace("run: ./scripts/", "continue-on-error: true\n      run: ./scripts/"),
                 "non-failing shell": action.replace("shell: bash", "shell: bash {0}"),
@@ -979,10 +1228,7 @@ class SelfTests(unittest.TestCase):
                     "name: Lint workflows", "name: |\n        run: shellcheck --version && actionlint"
                 ).replace("\n      run: shellcheck --version && actionlint\n", "\n      run: shellcheck --version && actionlint\n        || true\n"),
             }
-            for command in (
-                "shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh",
-                "python3 scripts/ci_gate.py --self-test",
-            ):
+            for command in ("shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh", "make script-tests"):
                 for key in ("'if' : false", '"if": false', "'continue-on-error': true", '"continue-on-error" : true'):
                     mutations[f"quoted {command} {key}"] = action.replace(f"run: {command}", f"{key}\n      run: {command}")
                 for separator in ("", "\n", "        # continued command\n"):
@@ -1002,14 +1248,11 @@ class SelfTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "scripts").mkdir()
-            commands = ("shellcheck", "actionlint", "./scripts/check_error_other_format_ratchet.sh", "python3")
-            for failing, run in (
-                ("shellcheck", "shellcheck --version && actionlint"),
-                ("actionlint", "shellcheck --version && actionlint"),
-                ("./scripts/check_error_other_format_ratchet.sh", "./scripts/check_error_other_format_ratchet.sh"),
-                ("python3", "python3 scripts/ci_gate.py --self-test"),
-            ):
+            commands = ("shellcheck", "actionlint", "./scripts/check_error_other_format_ratchet.sh")
+            (root / "Makefile").write_text(".PHONY: script-tests\nscript-tests:\n\texit 17\n")
+            for failing in (*commands, "make script-tests"):
                 with self.subTest(command=failing):
+                    run = "shellcheck --version && actionlint" if failing in ("shellcheck", "actionlint") else failing
                     step = workflow_step_block(steps, run, key="run", indent=4)
                     self.assertIsNotNone(step)
                     run_index = next(index for index, line in enumerate(step[1]) if line.startswith("      run:"))
@@ -1024,12 +1267,340 @@ class SelfTests(unittest.TestCase):
                         cwd=root, env=dict(os.environ, PATH=f"{root}{os.pathsep}{os.environ['PATH']}"),
                         capture_output=True, text=True,
                     )
-                    self.assertEqual(result.returncode, 17, result.stderr)
+                    self.assertEqual(result.returncode, 2 if failing == "make script-tests" else 17, result.stderr)
 
     def test_validate_includes_quick_checks(self) -> None:
         error = "Quick Checks wiring regression"
         with mock.patch(__name__ + ".check_quick_checks", return_value=[error]):
             self.assertIn(error, validate(ROOT))
+
+    def scanner_heal_fixture(self, directory: Path) -> tuple[Path, Path]:
+        """Parser fixtures only; these files are never runtime evidence."""
+        root, run_dir = directory / "repo", directory / "run"
+        (root / ".config").mkdir(parents=True)
+        run_dir.mkdir()
+        registry = read_json(ROOT / ".config/scanner-heal-required-tests.json")
+        write_json(root / ".config/scanner-heal-required-tests.json", registry)
+        requirements = registry["cases"]
+        binary = directory / "fake-binary"
+        binary.write_bytes(b"parser fixture, not a real build")
+        binary.chmod(0o700)
+        build = {"path": str(binary), "sha256": digest(binary)}
+        write_json(run_dir / "run.json", {"schema": 1, "run_id": "a" * 32, "source_revision": "b" * 40,
+                                         "binary_source_revision": "b" * 40,
+                                         "test_build": {"source_revision": "b" * 40, "dirty": False,
+                                                        "lock_blob": "c" * 40, "features": "default"},
+                                         "started_at": datetime.now(timezone.utc).timestamp() - 1,
+                                         "binary": build, "test_binary": build})
+        suite = "e2e_test"
+        write_json(run_dir / "listing.json", {"rust-suites": {suite: {
+            "binary-id": suite, "binary-path": str(binary), "package-name": "e2e_test", "build-platform": "target",
+            "testcases": {
+                requirement["name"]: {"ignored": False, "filter-match": {"status": "matches"}}
+                for requirement in requirements.values()
+            }
+        }}})
+        (run_dir / "junit.xml").write_text(
+            "<testsuites><testsuite>"
+            + "".join(
+                f'<testcase name="{requirement["name"]}" classname="{requirement["suite"]}" '
+                f'timestamp="{datetime.now(timezone.utc).isoformat(timespec="milliseconds")}"/>'
+                for requirement in requirements.values()
+            )
+            + "</testsuite></testsuites>"
+        )
+        physical = {"has_xl_meta": True, "version_id": None, "data_dir": "data-generation",
+                    "erasure_index": 1, "data_blocks": 2, "parity_blocks": 2, "expected_part_numbers": [1],
+                    "present_part_fingerprints": {"1": {"size": 12, "sha256": "c" * 64}},
+                    "inline_data_fingerprint": None}
+        obj = {"key": "object", "version_id": None, "expected_bytes": 16, "actual_bytes": 16,
+               "expected_sha256": "d" * 64, "actual_sha256": "d" * 64,
+               "expected_physical": physical, "physical": physical}
+        objects = [dict(obj, key=f"object-{index}") for index in range(9)]
+        objects[-1] = dict(objects[-1], expected_physical=None)
+        for case_id, requirement in requirements.items():
+            write_json(run_dir / requirement["oracle"], {
+                "schema": 1, "evidence": requirement["evidence"], "case": case_id,
+                "run_id": "a" * 32, "source_revision": "b" * 40,
+                "test_build": {"source_revision": "b" * 40, "dirty": False, "lock_blob": "c" * 40,
+                               "features": "default", "target": "aarch64-apple-darwin", "profile": "debug", "rustflags_hex": ""},
+                "binary_sha256": build["sha256"], "test_binary_sha256": build["sha256"],
+                "topology": requirement["topology"], "pid_before": 10, "pid_after": 11,
+                "unclean_shutdown_marker": requirement["unclean_shutdown_marker"],
+                "objects": objects, "node_listings": [[item["key"] for item in objects]] * 4,
+            })
+        finish_scanner_heal_receipt(run_dir, 0, root)
+        return root, run_dir
+
+    def test_scanner_heal_case_does_not_approve_pending_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            self.assertEqual(check_scanner_heal_evidence(root, run_dir, "background-target-restart"), [])
+            errors = check_scanner_heal_evidence(root, run_dir, "release")
+            self.assertEqual(len(errors), 21)
+            self.assertTrue(any(error.startswith("pending R-E:") for error in errors))
+            self.assertTrue(any(error.startswith("pending R-D:") for error in errors))
+            self.assertTrue(any(error.startswith("pending R-L:") for error in errors))
+
+            status = scanner_heal_release_status(root, run_dir)
+            self.assertEqual(status["decision"], "blocked")
+            self.assertFalse(status["release_approved"])
+            self.assertEqual(status["rejected_cases"], [])
+            self.assertEqual(len(status["pending_gates"]), 21)
+
+    def test_scanner_heal_case_only_schema_cannot_approve_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["release_pending"] = {}
+            write_json(root / ".config/scanner-heal-required-tests.json", registry)
+
+            status = scanner_heal_release_status(root, run_dir)
+            self.assertEqual(status["decision"], "blocked")
+            self.assertFalse(status["release_approved"])
+            self.assertFalse(status["release_schema_capable"])
+            self.assertEqual(status["rejected_cases"], [])
+            self.assertEqual(status["pending_gates"], [])
+
+    def test_scanner_heal_release_status_rejects_synthetic_case(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["release_pending"] = {}
+            write_json(root / ".config/scanner-heal-required-tests.json", registry)
+            path = run_dir / "background-target-crash.json"
+            oracle = read_json(path)
+            oracle["evidence"] = "synthetic"
+            write_json(path, oracle)
+            (run_dir / "execution.json").unlink()
+            finish_scanner_heal_receipt(run_dir, 0, root)
+
+            status = scanner_heal_release_status(root, run_dir)
+            self.assertEqual(status["decision"], "blocked")
+            self.assertFalse(status["release_approved"])
+            self.assertEqual(status["rejected_cases"], ["background-target-crash"])
+            self.assertEqual(status["pending_gates"], [])
+
+    def test_scanner_heal_release_status_rejects_focused_case_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            registry["release_pending"] = {}
+            write_json(root / ".config/scanner-heal-required-tests.json", registry)
+            (run_dir / "background-target-crash.json").unlink()
+            (run_dir / "execution.json").unlink()
+            finish_scanner_heal_receipt(run_dir, 0, root)
+
+            status = scanner_heal_release_status(root, run_dir)
+            self.assertEqual(status["decision"], "blocked")
+            self.assertFalse(status["release_approved"])
+            self.assertEqual(status["verified_cases"], ["background-target-restart"])
+            self.assertEqual(status["rejected_cases"], ["background-target-crash"])
+
+    def test_scanner_heal_finish_collects_oracles_from_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            alternate = dict(registry["cases"]["background-target-restart"])
+            alternate["oracle"] = "alternate-target-restart.json"
+            registry["cases"]["alternate-target-restart"] = alternate
+            write_json(root / ".config/scanner-heal-required-tests.json", registry)
+            oracle = read_json(run_dir / "background-target-restart.json")
+            oracle["case"] = "alternate-target-restart"
+            write_json(run_dir / "alternate-target-restart.json", oracle)
+            (run_dir / "background-target-restart.json").unlink()
+            (run_dir / "execution.json").unlink()
+
+            finish_scanner_heal_receipt(run_dir, 0, root)
+
+            self.assertIn("alternate-target-restart.json", read_json(run_dir / "execution.json")["artifacts"])
+            self.assertEqual(check_scanner_heal_evidence(root, run_dir, "alternate-target-restart"), [])
+
+    def test_scanner_heal_release_consumes_multiple_registry_oracles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            registry = read_json(root / ".config/scanner-heal-required-tests.json")
+            alternate = dict(registry["cases"]["background-target-restart"])
+            alternate["oracle"] = "alternate-target-restart.json"
+            registry["cases"]["alternate-target-restart"] = alternate
+            write_json(root / ".config/scanner-heal-required-tests.json", registry)
+            oracle = read_json(run_dir / "background-target-restart.json")
+            oracle["case"] = "alternate-target-restart"
+            write_json(run_dir / "alternate-target-restart.json", oracle)
+            (run_dir / "execution.json").unlink()
+
+            finish_scanner_heal_receipt(run_dir, 0, root)
+
+            artifacts = read_json(run_dir / "execution.json")["artifacts"]
+            self.assertIn("background-target-restart.json", artifacts)
+            self.assertIn("alternate-target-restart.json", artifacts)
+            self.assertEqual(check_scanner_heal_evidence(root, run_dir, "alternate-target-restart"), [])
+            errors = check_scanner_heal_evidence(root, run_dir, "release")
+            self.assertEqual(len(errors), 21)
+            self.assertTrue(all(error.startswith("pending ") for error in errors))
+
+    def test_scanner_heal_crash_case_rejects_restart_oracle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            path = run_dir / "background-target-crash.json"
+            oracle = read_json(path)
+            oracle["evidence"] = "process-restart"
+            oracle["unclean_shutdown_marker"] = False
+            write_json(path, oracle)
+            (run_dir / "execution.json").unlink()
+            finish_scanner_heal_receipt(run_dir, 0, root)
+
+            self.assertTrue(check_scanner_heal_evidence(root, run_dir, "background-target-crash"))
+
+    def test_scanner_heal_rejects_broken_execution_and_artifacts(self) -> None:
+        for fault in ("exit", "missing", "zero", "skipped", "failed", "retry", "filtered", "ignored", "stale",
+                      "hash", "binary", "synthetic", "wrong-run", "same-pid", "body", "parts", "listing", "topology"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root, run_dir = self.scanner_heal_fixture(Path(tmp))
+                path = run_dir / "background-target-restart.json"
+                oracle = read_json(path)
+                if fault == "exit":
+                    receipt = read_json(run_dir / "execution.json")
+                    receipt["exit_code"] = 42
+                    write_json(run_dir / "execution.json", receipt)
+                elif fault == "missing":
+                    path.unlink()
+                elif fault == "zero":
+                    (run_dir / "junit.xml").write_text("<testsuites/>")
+                elif fault in ("skipped", "failed", "retry"):
+                    junit = run_dir / "junit.xml"
+                    tag = {"skipped": "skipped", "failed": "failure", "retry": "rerunFailure"}[fault]
+                    junit.write_text(junit.read_text().replace("/></testsuite>", f"><{tag}/></testcase></testsuite>"))
+                elif fault in ("filtered", "ignored"):
+                    listing = read_json(run_dir / "listing.json")
+                    case = next(iter(listing["rust-suites"]["e2e_test"]["testcases"].values()))
+                    case["ignored"] = fault == "ignored"
+                    case["filter-match"]["status"] = "mismatch" if fault == "filtered" else "matches"
+                    write_json(run_dir / "listing.json", listing)
+                elif fault == "stale":
+                    os.utime(path, (1, 1))
+                elif fault == "hash":
+                    path.write_text(path.read_text() + " ")
+                elif fault == "binary":
+                    Path(read_json(run_dir / "run.json")["binary"]["path"]).write_bytes(b"another build")
+                else:
+                    if fault == "synthetic":
+                        oracle["evidence"] = "synthetic"
+                    elif fault == "wrong-run":
+                        oracle["run_id"] = "f" * 32
+                    elif fault == "same-pid":
+                        oracle["pid_after"] = oracle["pid_before"]
+                    elif fault == "body":
+                        oracle["objects"][0]["actual_sha256"] = "e" * 64
+                    elif fault == "parts":
+                        oracle["objects"][0]["physical"]["present_part_fingerprints"] = {}
+                    elif fault == "listing":
+                        oracle["node_listings"][0] = []
+                    elif fault == "topology":
+                        oracle["topology"] = {"nodes": 3, "drives_per_node": 4}
+                    write_json(path, oracle)
+                if fault not in ("exit", "missing", "stale", "hash", "binary"):
+                    (run_dir / "execution.json").unlink()
+                    finish_scanner_heal_receipt(run_dir, 0)
+                self.assertTrue(check_scanner_heal_evidence(root, run_dir, "background-target-restart"), fault)
+
+    def test_scanner_heal_receipts_reject_reuse_and_missing_builds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                finish_scanner_heal_receipt(run_dir, 0)
+            with self.assertRaisesRegex(ValueError, "must be new"):
+                begin_scanner_heal_receipt(root, run_dir, Path("missing"), Path("missing"))
+            with mock.patch("subprocess.check_output", side_effect=["", "b" * 40]):
+                with self.assertRaises(FileNotFoundError):
+                    begin_scanner_heal_receipt(root, Path(tmp) / "new-run", Path(tmp) / "missing", Path(tmp) / "missing")
+
+    def test_scanner_heal_begin_requires_embedded_source_provenance(self) -> None:
+        for kind in ("current", "stale", "dirty", "unknown"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root, _ = self.scanner_heal_fixture(Path(tmp))
+                sources = root / "crates/e2e_test/src"
+                sources.mkdir(parents=True)
+                (sources / "heal_erasure_disk_rebuild_test.rs").write_bytes(b"oracle source")
+                (sources / "chaos.rs").write_bytes(b"census source")
+                revision = "c" * 40 if kind == "stale" else "b" * 40
+                version = f"rustfs\ngit commit   : {revision}\ngit status   :\n"
+                if kind == "dirty":
+                    version += "modified source\n"
+                if kind == "unknown":
+                    version = "rustfs without build provenance"
+                with mock.patch("subprocess.check_output", side_effect=["", "b" * 40, version, "c" * 40]), \
+                     mock.patch.dict(os.environ, {"RUSTFS_E2E_EXPECTED_FEATURES": "default"}):
+                    directory = Path(tmp) / "fresh"
+                    binary = Path(tmp) / "fake-binary"
+                    if kind == "current":
+                        begin_scanner_heal_receipt(root, directory, binary, binary)
+                        self.assertEqual(read_json(directory / "run.json")["binary_source_revision"], "b" * 40)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "server binary"):
+                            begin_scanner_heal_receipt(root, directory, binary, binary)
+                        self.assertFalse(directory.exists())
+
+    def test_scanner_heal_rejects_copied_junit_and_wrong_suite_build(self) -> None:
+        for fault in ("old-junit", "missing-time", "wrong-binary", "common-source", "lockfile", "features", "dirty-build"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root, run_dir = self.scanner_heal_fixture(Path(tmp))
+                if fault in ("old-junit", "missing-time"):
+                    path = run_dir / "junit.xml"
+                    xml = ET.fromstring(path.read_bytes())
+                    testcase = next(xml.iter("testcase"))
+                    if fault == "old-junit":
+                        testcase.set("timestamp", "2000-01-01T00:00:00.000Z")
+                    else:
+                        del testcase.attrib["timestamp"]
+                    # Rewriting/copying gives an old execution a fresh mtime.
+                    path.write_bytes(ET.tostring(xml))
+                elif fault == "wrong-binary":
+                    path = run_dir / "listing.json"
+                    listing = read_json(path)
+                    another = Path(tmp) / "another-binary"
+                    another.write_bytes(Path(tmp, "fake-binary").read_bytes())
+                    listing["rust-suites"]["e2e_test"]["binary-path"] = str(another)
+                    write_json(path, listing)
+                else:
+                    path = run_dir / "background-target-restart.json"
+                    oracle = read_json(path)
+                    key, value = {"common-source": ("source_revision", "f" * 40), "lockfile": ("lock_blob", "f" * 40),
+                                  "features": ("features", "default,sftp"), "dirty-build": ("dirty", True)}[fault]
+                    oracle["test_build"][key] = value
+                    write_json(path, oracle)
+                (run_dir / "execution.json").unlink()
+                finish_scanner_heal_receipt(run_dir, 0)
+                self.assertTrue(check_scanner_heal_evidence(root, run_dir, "background-target-restart"), fault)
+
+    def test_scanner_heal_rejects_boolean_fractional_and_out_of_geometry_integers(self) -> None:
+        valid = {"schema": 1, "nodes": 4, "drives_per_node": 1, "pid_before": 10, "pid_after": 11,
+                 "erasure_index": 1, "data_blocks": 2, "parity_blocks": 2}
+        cases = [(field, value) for field, correct in valid.items() for value in (True, float(correct))]
+        cases += [("erasure_index", 5), ("erasure_index", 0), ("pid_after", -1)]
+        for field, value in cases:
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as tmp:
+                root, run_dir = self.scanner_heal_fixture(Path(tmp))
+                path = run_dir / "background-target-restart.json"
+                oracle = read_json(path)
+                if field in ("nodes", "drives_per_node"):
+                    oracle["topology"][field] = value
+                elif field in ("erasure_index", "data_blocks", "parity_blocks"):
+                    oracle["objects"][-1]["physical"][field] = value
+                else:
+                    oracle[field] = value
+                write_json(path, oracle)
+                (run_dir / "execution.json").unlink()
+                finish_scanner_heal_receipt(run_dir, 0)
+                self.assertTrue(check_scanner_heal_evidence(root, run_dir, "background-target-restart"))
+        for filename in ("run.json", ".config/scanner-heal-required-tests.json"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as tmp:
+                root, run_dir = self.scanner_heal_fixture(Path(tmp))
+                path = (root if filename.startswith(".config") else run_dir) / filename
+                content = read_json(path)
+                content["schema"] = True
+                write_json(path, content)
+                self.assertTrue(check_scanner_heal_evidence(root, run_dir, "background-target-restart"))
 
     def test_core_gate_rejects_missing_ignored_filtered_and_corrupt_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1673,6 +2244,35 @@ def main() -> int:
     if sys.argv[1:] == ["--self-test"]:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTests)
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
+    if sys.argv[1:2] in (["--begin-scanner-heal"], ["--finish-scanner-heal"], ["--check-scanner-heal"],
+                         ["--check-scanner-heal-release"]):
+        try:
+            if len(sys.argv) == 5 and sys.argv[1] == "--begin-scanner-heal":
+                begin_scanner_heal_receipt(ROOT, Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]))
+                return 0
+            if len(sys.argv) == 4 and sys.argv[1] == "--finish-scanner-heal":
+                finish_scanner_heal_receipt(Path(sys.argv[2]), int(sys.argv[3]))
+                return 0
+            if len(sys.argv) == 4 and sys.argv[1] == "--check-scanner-heal":
+                errors = check_scanner_heal_evidence(ROOT, Path(sys.argv[2]), sys.argv[3])
+                for error in errors:
+                    print(f"ERROR: {error}", file=sys.stderr)
+                if not errors:
+                    print(f"Case evidence verified: {sys.argv[3]}; this does not approve release")
+                return 1 if errors else 0
+            if len(sys.argv) == 3 and sys.argv[1] == "--check-scanner-heal-release":
+                try:
+                    status = scanner_heal_release_status(ROOT, Path(sys.argv[2]))
+                except (OSError, KeyError, TypeError, ValueError, ET.ParseError) as error:
+                    print(json.dumps({"schema": 1, "decision": "invalid", "release_approved": False,
+                                      "error": str(error)}, sort_keys=True, separators=(",", ":")))
+                    return 2
+                print(json.dumps(status, sort_keys=True, separators=(",", ":")))
+                return 0 if status["release_approved"] else 1
+            raise ValueError("expected --begin-scanner-heal DIR BINARY TEST_BINARY, --finish-scanner-heal DIR EXIT, --check-scanner-heal DIR CASE|release, or --check-scanner-heal-release DIR")
+        except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
     if len(sys.argv) == 3 and sys.argv[1] == "--check-core":
         errors = check_core_listing(ROOT, Path(sys.argv[2]))
         for error in errors:

@@ -175,6 +175,9 @@ pub const BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION: u32 = 2;
 pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v3\0";
 pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
 pub const CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-cross-pool-fence-capability-v1\0";
+pub const ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-ilm-recovery-export-capability-v1\0";
+pub const TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX: &[u8] =
+    b"rustfs-transition-transaction-compaction-capability-v1\0";
 pub const TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE: usize = 64 * 1024;
 pub const TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE: usize = 1024;
 pub const TIER_MUTATION_RPC_MAX_ABORT_PAYLOAD_SIZE: usize = TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE;
@@ -217,6 +220,30 @@ pub fn is_remote_version_state_capability_probe(command: &[u8]) -> bool {
 pub fn is_cross_pool_fence_capability_probe(command: &[u8]) -> bool {
     command.len() == CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX.len() + 16
         && command.starts_with(CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn ilm_recovery_export_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_ilm_recovery_export_capability_probe(command: &[u8]) -> bool {
+    command.len() == ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn transition_transaction_compaction_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_transition_transaction_compaction_capability_probe(command: &[u8]) -> bool {
+    command.len() == TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX)
 }
 
 pub fn encode_remote_version_state_capability(
@@ -562,11 +589,13 @@ pub fn canonical_scanner_dirty_usage_snapshot_response_body(
     body.push_u64(response.generation);
     body.push_u64(response.pending_bucket_count);
     body.push_u32(response.protocol_version);
+    body.push_str(&response.owner_id)?;
     body.push_bool(response.complete);
     body.push_count(response.buckets.len())?;
     for bucket in &response.buckets {
         body.push_str(&bucket.bucket)?;
         body.push_u64(bucket.generation);
+        body.push_bytes(bucket.bucket_incarnation.as_ref())?;
     }
     Ok(body.finish())
 }
@@ -1829,13 +1858,16 @@ mod scanner_activity_tests {
                 ScannerDirtyUsageBucket {
                     bucket: "archive".to_string(),
                     generation: 3,
+                    bucket_incarnation: vec![1; 16].into(),
                 },
                 ScannerDirtyUsageBucket {
                     bucket: "photos".to_string(),
                     generation: 7,
+                    bucket_incarnation: vec![2; 16].into(),
                 },
             ],
             response_proof: vec![9; 32].into(),
+            owner_id: "11111111-1111-1111-1111-111111111111".to_string(),
         };
         let baseline = canonical_scanner_dirty_usage_snapshot_response_body(&[1; 16], &response)
             .expect("scanner dirty usage snapshot response should encode");
@@ -1852,6 +1884,9 @@ mod scanner_activity_tests {
         let mut protocol = response.clone();
         protocol.protocol_version = 2;
         variants.push(protocol);
+        let mut owner = response.clone();
+        owner.owner_id = "22222222-2222-2222-2222-222222222222".to_string();
+        variants.push(owner);
         let mut complete = response.clone();
         complete.complete = false;
         variants.push(complete);
@@ -1861,6 +1896,9 @@ mod scanner_activity_tests {
         let mut bucket_generation = response.clone();
         bucket_generation.buckets[0].generation = 4;
         variants.push(bucket_generation);
+        let mut bucket_incarnation = response.clone();
+        bucket_incarnation.buckets[0].bucket_incarnation = vec![3; 16].into();
+        variants.push(bucket_incarnation);
         let mut bucket_order = response.clone();
         bucket_order.buckets.reverse();
         variants.push(bucket_order);
@@ -2127,12 +2165,15 @@ mod scanner_activity_tests {
 mod heal_control_tests {
     use super::{
         CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_PROTOCOL_VERSION,
-        REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX, canonical_heal_control_capability_ack, canonical_heal_control_request_body,
-        canonical_heal_control_response_body, decode_remote_version_state_capability, encode_cross_pool_fence_capability,
-        encode_remote_version_state_capability, heal_control_capability_probe, heal_control_coordinator_epoch,
-        heal_control_execution_timeout, heal_control_execution_timeout_for, internode_rpc_timeout,
-        is_cross_pool_fence_capability_probe, is_heal_control_capability_probe, is_remote_version_state_capability_probe,
-        normalize_internode_rpc_timeout, remote_version_state_capability_probe,
+        ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX, REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX,
+        TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX, canonical_heal_control_capability_ack,
+        canonical_heal_control_request_body, canonical_heal_control_response_body, decode_remote_version_state_capability,
+        encode_cross_pool_fence_capability, encode_remote_version_state_capability, heal_control_capability_probe,
+        heal_control_coordinator_epoch, heal_control_execution_timeout, heal_control_execution_timeout_for,
+        ilm_recovery_export_capability_probe, internode_rpc_timeout, is_cross_pool_fence_capability_probe,
+        is_heal_control_capability_probe, is_ilm_recovery_export_capability_probe, is_remote_version_state_capability_probe,
+        is_transition_transaction_compaction_capability_probe, normalize_internode_rpc_timeout,
+        remote_version_state_capability_probe, transition_transaction_compaction_capability_probe,
     };
     use crate::heal_control;
     use std::time::Duration;
@@ -2194,6 +2235,34 @@ mod heal_control_tests {
         let probe = remote_version_state_capability_probe(&[7; 16]);
         assert!(is_remote_version_state_capability_probe(&probe));
         assert!(!is_remote_version_state_capability_probe(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX));
+    }
+
+    #[test]
+    fn ilm_recovery_export_capability_probe_requires_exact_prefix_and_nonce() {
+        let probe = ilm_recovery_export_capability_probe(&[7; 16]);
+        assert!(is_ilm_recovery_export_capability_probe(&probe));
+        assert!(!is_ilm_recovery_export_capability_probe(ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX));
+        let mut wrong_prefix = probe.clone();
+        wrong_prefix[0] ^= 1;
+        assert!(!is_ilm_recovery_export_capability_probe(&wrong_prefix));
+        let mut extra = probe;
+        extra.push(0);
+        assert!(!is_ilm_recovery_export_capability_probe(&extra));
+    }
+
+    #[test]
+    fn transition_transaction_compaction_probe_requires_exact_prefix_and_nonce() {
+        let probe = transition_transaction_compaction_capability_probe(&[7; 16]);
+        assert!(is_transition_transaction_compaction_capability_probe(&probe));
+        assert!(!is_transition_transaction_compaction_capability_probe(
+            TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX,
+        ));
+        let mut wrong_prefix = probe.clone();
+        wrong_prefix[0] ^= 1;
+        assert!(!is_transition_transaction_compaction_capability_probe(&wrong_prefix));
+        let mut extra = probe;
+        extra.push(0);
+        assert!(!is_transition_transaction_compaction_capability_probe(&extra));
     }
 
     #[test]

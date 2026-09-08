@@ -18,6 +18,25 @@ use super::{
     DiskOption, DiskStore, Endpoint, HealDiskExt as _, local_disk_map_read, new_disk, resume::ReplacementTargetIdentity,
 };
 
+/// Whether automatic replacement may fall back to the set-wide format heal when
+/// a target cannot pass the independent-mount admission.
+///
+/// Directory-backed deployments already declare, through
+/// `RUSTFS_UNSAFE_BYPASS_DISK_CHECK`, that their endpoints are plain
+/// directories sharing a device with the host root. Those endpoints can never
+/// satisfy [`auto_replacement_target_identity`], so without this fallback a
+/// runtime-wiped or replaced directory disk would stay deferred forever. The
+/// admission check itself is never bypassed; the fallback only routes the heal
+/// through the ordinary format path that formats every unformatted disk in the
+/// set, which is exactly what the pre-admission `heal_disk` path did.
+pub(crate) fn directory_backed_replacement_fallback_enabled() -> bool {
+    rustfs_utils::get_env_bool_with_aliases(
+        rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK,
+        &[rustfs_config::ENV_MINIO_CI],
+        rustfs_config::DEFAULT_UNSAFE_BYPASS_DISK_CHECK,
+    )
+}
+
 pub(crate) async fn auto_replacement_target_ready(disk: &DiskStore, local_disks: &[DiskStore]) -> bool {
     auto_replacement_target_identity(disk, local_disks).await.is_some()
 }
@@ -184,12 +203,47 @@ mod tests {
         assert!(endpoint.is_local);
     }
 
+    #[test]
+    fn directory_backed_fallback_is_off_by_default() {
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, None::<&str>),
+                (rustfs_config::ENV_MINIO_CI, None::<&str>),
+            ],
+            || assert!(!directory_backed_replacement_fallback_enabled()),
+        );
+    }
+
+    #[test]
+    fn directory_backed_fallback_follows_the_disk_check_bypass() {
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, Some("true")),
+                (rustfs_config::ENV_MINIO_CI, None::<&str>),
+            ],
+            || assert!(directory_backed_replacement_fallback_enabled()),
+        );
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, Some("false")),
+                (rustfs_config::ENV_MINIO_CI, Some("true")),
+            ],
+            || {
+                assert!(
+                    !directory_backed_replacement_fallback_enabled(),
+                    "the canonical key must win over the alias"
+                )
+            },
+        );
+    }
+
     #[tokio::test]
     async fn runtime_environment_cannot_bypass_mount_admission() {
         temp_env::async_with_vars(
             [
                 ("RUSTFS_TEST_AUTO_REPLACEMENT_READINESS_BYPASS", Some("1")),
                 ("RUSTFS_E2E_AUTO_REPLACEMENT_READINESS_BYPASS", Some("1")),
+                (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, Some("true")),
             ],
             async {
                 let temp = TempDir::new().expect("temporary replacement root should be created");

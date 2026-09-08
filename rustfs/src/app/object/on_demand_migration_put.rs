@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! On-demand migration write-back (rustfs/backlog#2153): the app-layer
-//! [`OdmWriteBack`] the ecstore pull pipeline stores source objects with.
+//! [`OdmWriteBack`] the migration service stores source objects with.
 //!
 //! Every write goes through the internal put entry points, so a pulled
 //! object is indistinguishable from a client PUT: bucket default SSE, quota,
@@ -34,7 +34,7 @@
 use super::*;
 
 use crate::app::storage_api::multipart_usecase::contract::multipart::CompletePart;
-use crate::app::storage_api::object_usecase::on_demand_migration::{
+use crate::on_demand_migration::{
     LocalObject, OdmWriteBack, SourceHead, WriteBackBody, WriteBackError, WriteBackOutcome, WriteBackPart, WriteBackRequest,
     is_multipart_etag,
 };
@@ -65,6 +65,15 @@ impl OnDemandMigrationWriteBack {
         self.usecase()
             .object_store()
             .ok_or_else(|| WriteBackError::Local("object store is not initialized".to_string()))
+    }
+
+    fn require_atomic_write_back(&self) -> Result<(), WriteBackError> {
+        if !self.store()?.supports_atomic_create_only_write_back() {
+            return Err(WriteBackError::Unsupported(
+                "write-back requires namespace locking and exactly one pool with one erasure set".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -115,6 +124,12 @@ pub(super) fn expected_md5_hex(head: &SourceHead) -> Option<String> {
     if head.sse.is_some() {
         return None;
     }
+    // Azure stamps an opaque concurrency token in the ETag slot. It is
+    // recorded as provenance, but reading it as a digest would compare the
+    // pulled bytes against a value that never described them.
+    if head.etag_is_opaque {
+        return None;
+    }
     let etag = head.etag.as_deref()?;
     if etag.len() != 32 || is_multipart_etag(etag) || !etag.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -157,10 +172,13 @@ pub(super) async fn write_back_context(request: &WriteBackRequest, single_part: 
     };
     InternalPutContext {
         bucket: request.bucket.clone(),
+        expected_bucket_incarnation_id: Some(request.bucket_incarnation_id),
         key: request.key.clone(),
         size: Some(head.size),
         expected_md5_hex: single_part.then(|| expected_md5_hex(head)).flatten(),
         preserve_etag,
+        if_absent: true,
+        preserve_delete_marker: request.respect_delete_marker,
         content_headers: content_headers(head),
         user_metadata: head.user_metadata.clone(),
         tags: request.tags.as_ref().and_then(encode_tags),
@@ -207,6 +225,7 @@ impl OdmWriteBack for OnDemandMigrationWriteBack {
     }
 
     async fn put_object(&self, request: &WriteBackRequest, body: WriteBackBody) -> Result<WriteBackOutcome, WriteBackError> {
+        self.require_atomic_write_back()?;
         let ctx = write_back_context(request, true).await;
         self.usecase()
             .internal_put_object(ctx, body)
@@ -216,6 +235,7 @@ impl OdmWriteBack for OnDemandMigrationWriteBack {
     }
 
     async fn create_multipart_upload(&self, request: &WriteBackRequest) -> Result<String, WriteBackError> {
+        self.require_atomic_write_back()?;
         let ctx = write_back_context(request, false).await;
         self.usecase()
             .internal_create_multipart_upload(&ctx)
@@ -249,6 +269,7 @@ impl OdmWriteBack for OnDemandMigrationWriteBack {
         upload_id: &str,
         parts: Vec<WriteBackPart>,
     ) -> Result<WriteBackOutcome, WriteBackError> {
+        self.require_atomic_write_back()?;
         let ctx = write_back_context(request, false).await;
         let parts = parts
             .into_iter()
@@ -265,9 +286,9 @@ impl OdmWriteBack for OnDemandMigrationWriteBack {
             .map_err(write_back_error)
     }
 
-    async fn abort_multipart_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<(), WriteBackError> {
+    async fn abort_multipart_upload(&self, request: &WriteBackRequest, upload_id: &str) -> Result<(), WriteBackError> {
         self.usecase()
-            .internal_abort_multipart_upload(bucket, key, upload_id)
+            .internal_abort_multipart_upload(&request.bucket, &request.key, upload_id, Some(request.bucket_incarnation_id))
             .await
             .map_err(write_back_error)
     }
@@ -277,15 +298,15 @@ impl OdmWriteBack for OnDemandMigrationWriteBack {
 mod tests {
     use super::*;
     use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartOperations as _;
-    use crate::app::storage_api::object_usecase::on_demand_migration::{PullFailureReason, SourceSse};
     use crate::app::storage_api::s3::{
         BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
         ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus, ServerSideEncryptionByDefault,
         ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, VersioningConfiguration,
     };
     use crate::app::storage_api::test::bucket::utils::serialize;
-    use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
+    use crate::on_demand_migration::{PullFailureReason, SourceSse};
     use http::Method;
     use rustfs_utils::http::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, contains_key_str, get_str};
     use sha2::{Digest as Sha256Digest, Sha256};
@@ -325,15 +346,17 @@ mod tests {
         }
     }
 
-    fn request(bucket: &str, key: &str, head: SourceHead) -> WriteBackRequest {
+    fn request(bucket: &str, bucket_incarnation_id: Uuid, key: &str, head: SourceHead) -> WriteBackRequest {
         WriteBackRequest {
             bucket: bucket.to_string(),
+            bucket_incarnation_id,
             key: key.to_string(),
             head,
             source_label: SOURCE_LABEL.to_string(),
             pulled_at: OffsetDateTime::from_unix_timestamp(1_756_800_000).expect("valid timestamp"),
             preserve_etag: true,
             emit_events: true,
+            respect_delete_marker: true,
             tags: Some(HashMap::from([
                 ("team".to_string(), "storage".to_string()),
                 ("env".to_string(), "prod".to_string()),
@@ -454,7 +477,15 @@ mod tests {
         let body = b"pulled from the legacy bucket".to_vec();
         let head = source_head(&body);
         let outcome = write_back
-            .put_object(&request(&bucket, "dir/obj.txt", head.clone()), body_stream(&body))
+            .put_object(
+                &request(
+                    &bucket,
+                    store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+                    "dir/obj.txt",
+                    head.clone(),
+                ),
+                body_stream(&body),
+            )
             .await
             .expect("write-back must commit");
         assert_eq!(outcome.etag, head.etag, "single-part source ETag is preserved");
@@ -488,6 +519,107 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn write_back_rejects_unsupported_topology_before_any_mutation() {
+        let (_dir, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        let bucket = "odm-unsupported";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket");
+        let write_back = OnDemandMigrationWriteBack::new();
+        let req = request(
+            bucket,
+            store.bucket_incarnation_id(bucket).await.expect("bucket incarnation"),
+            "key",
+            source_head(b"source"),
+        );
+        assert!(matches!(
+            write_back.put_object(&req, body_stream(b"source")).await,
+            Err(WriteBackError::Unsupported(_))
+        ));
+        assert!(matches!(
+            write_back.create_multipart_upload(&req).await,
+            Err(WriteBackError::Unsupported(_))
+        ));
+        assert!(matches!(
+            write_back.complete_multipart_upload(&req, "no-session", Vec::new()).await,
+            Err(WriteBackError::Unsupported(_))
+        ));
+        assert_nothing_left(&store, bucket, "key").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stale_write_back_cannot_mutate_a_recreated_bucket() {
+        let (store, bucket) = write_back_test_bucket("odm-wb-incarnation", false).await;
+        let old_id = store.bucket_incarnation_id(&bucket).await.expect("old bucket incarnation");
+        let stale = request(&bucket, old_id, "object", source_head(b"source"));
+        let (resume, wait) = tokio::sync::oneshot::channel();
+        let delayed = {
+            let stale = stale.clone();
+            tokio::spawn(async move {
+                wait.await.expect("resume old source pull");
+                OnDemandMigrationWriteBack::new()
+                    .put_object(&stale, body_stream(b"source"))
+                    .await
+            })
+        };
+        store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete original bucket");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate bucket");
+        let new_id = store.bucket_incarnation_id(&bucket).await.expect("replacement incarnation");
+        assert_ne!(old_id, new_id);
+        resume.send(()).expect("release delayed pull");
+        assert!(delayed.await.expect("delayed pull task").is_err());
+        assert_nothing_left(&store, &bucket, "object").await;
+
+        let write_back = OnDemandMigrationWriteBack::new();
+        assert!(write_back.create_multipart_upload(&stale).await.is_err());
+        let current = request(&bucket, new_id, "object", source_head(b"current"));
+        let upload = write_back
+            .create_multipart_upload(&current)
+            .await
+            .expect("create replacement upload");
+        // A stale capability must fail independently of whether its upload ID
+        // happens to name a valid session in the replacement bucket.
+        assert!(
+            write_back
+                .upload_part(&stale, &upload, 1, 6, body_stream(b"source"))
+                .await
+                .is_err()
+        );
+        let part = write_back
+            .upload_part(&current, &upload, 1, 7, body_stream(b"current"))
+            .await
+            .expect("stage current part");
+        assert!(
+            write_back
+                .complete_multipart_upload(&stale, &upload, vec![part.clone()])
+                .await
+                .is_err()
+        );
+        assert!(write_back.abort_multipart_upload(&stale, &upload).await.is_err());
+        write_back
+            .complete_multipart_upload(&current, &upload, vec![part])
+            .await
+            .expect("stale cleanup preserves replacement upload");
+        assert_eq!(raw_object_bytes(&store, &bucket, "object").await, b"current");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn write_back_integrity_failure_leaves_nothing_behind() {
         let (store, bucket) = write_back_test_bucket("odm-wb-etag", false).await;
         let body = b"the source lied about this body".to_vec();
@@ -495,12 +627,180 @@ mod tests {
         head.etag = Some(md5_hex(b"a different body"));
 
         let err = OnDemandMigrationWriteBack::new()
-            .put_object(&request(&bucket, "wrong.bin", head), body_stream(&body))
+            .put_object(
+                &request(
+                    &bucket,
+                    store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+                    "wrong.bin",
+                    head,
+                ),
+                body_stream(&body),
+            )
             .await
             .expect_err("an ETag mismatch must fail the write-back");
         assert_eq!(err, WriteBackError::Integrity);
         assert_eq!(err.reason(), PullFailureReason::EtagMismatch);
         assert_nothing_left(&store, &bucket, "wrong.bin").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn write_back_commit_does_not_overwrite_a_concurrent_client_put() {
+        use crate::app::storage_api::test::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+        for versioned in [false, true] {
+            let (store, bucket) = write_back_test_bucket("odm-wb-race", versioned).await;
+            let source = b"old source bytes";
+            let client = b"new client bytes";
+            let req = request(
+                &bucket,
+                store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+                "race",
+                source_head(source),
+            );
+            let client_req = request(
+                &bucket,
+                store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+                "race",
+                source_head(client),
+            );
+            let mut client_ctx = write_back_context(&client_req, true).await;
+            client_ctx.if_absent = false;
+            let client_after = PutObjectCommitBarrier::install(&bucket, "race", PutObjectCommitPause::AfterNamespace);
+            let client_put = tokio::spawn(async move {
+                DefaultObjectUsecase::from_global()
+                    .internal_put_object(client_ctx, body_stream(client))
+                    .await
+            });
+            client_after.wait_until_paused().await;
+            let source_before = PutObjectCommitBarrier::install(&bucket, "race", PutObjectCommitPause::BeforeNamespace);
+            let write_back = OnDemandMigrationWriteBack::new();
+            let (result, ()) = tokio::join!(write_back.put_object(&req, body_stream(source)), async {
+                source_before.wait_until_paused().await;
+                drop(source_before);
+                drop(client_after);
+            });
+            let committed = client_put.await.expect("client task").expect("ordinary client write wins");
+            assert!(
+                matches!(result, Err(WriteBackError::Local(ref error)) if error.contains("PreconditionFailed")),
+                "{result:?}"
+            );
+            let stored = stored_object(&store, &bucket, "race").await;
+            assert_eq!(stored.etag, committed.etag);
+            assert_eq!(stored.version_id, committed.version_id);
+            assert_eq!(committed.version_id.is_some(), versioned);
+            assert_eq!(raw_object_bytes(&store, &bucket, "race").await, client);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_back_multipart_completion_preserves_a_client_put_after_staging() {
+        crate::app::gating_test_env::run_large_stack_test(
+            "odm-write-back-multipart-client-put-race",
+            write_back_multipart_completion_preserves_a_client_put_after_staging_inner,
+        );
+    }
+
+    async fn write_back_multipart_completion_preserves_a_client_put_after_staging_inner() {
+        let (store, bucket) = write_back_test_bucket("odm-mpu-race", false).await;
+        let write_back = OnDemandMigrationWriteBack::new();
+        let req = request(
+            &bucket,
+            store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+            "race",
+            source_head(b"source"),
+        );
+        let upload_id = write_back.create_multipart_upload(&req).await.expect("create");
+        let part = write_back
+            .upload_part(&req, &upload_id, 1, 6, body_stream(b"source"))
+            .await
+            .expect("stage");
+        let mut client_ctx = write_back_context(
+            &request(
+                &bucket,
+                store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+                "race",
+                source_head(b"client"),
+            ),
+            true,
+        )
+        .await;
+        client_ctx.if_absent = false;
+        let committed = DefaultObjectUsecase::from_global()
+            .internal_put_object(client_ctx, body_stream(b"client"))
+            .await
+            .expect("client put after staging");
+        let result = write_back.complete_multipart_upload(&req, &upload_id, vec![part]).await;
+        assert!(
+            matches!(result, Err(WriteBackError::Local(ref error)) if error.contains("PreconditionFailed")),
+            "{result:?}"
+        );
+        write_back
+            .abort_multipart_upload(&req, &upload_id)
+            .await
+            .expect("abort rejected upload");
+        let stored = stored_object(&store, &bucket, "race").await;
+        assert_eq!(stored.etag, committed.etag);
+        assert_eq!(stored.version_id, committed.version_id);
+        assert_eq!(raw_object_bytes(&store, &bucket, "race").await, b"client");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn write_back_preserves_delete_markers_unless_policy_allows_revival() {
+        for multipart in [false, true] {
+            let (store, bucket) = write_back_test_bucket("odm-wb-tombstone", true).await;
+            let write_back = OnDemandMigrationWriteBack::new();
+            let mut req = request(
+                &bucket,
+                store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+                "deleted",
+                source_head(b"source"),
+            );
+            let staged = if multipart {
+                let id = write_back.create_multipart_upload(&req).await.expect("create");
+                let part = write_back
+                    .upload_part(&req, &id, 1, 6, body_stream(b"source"))
+                    .await
+                    .expect("part");
+                Some((id, part))
+            } else {
+                None
+            };
+            store
+                .delete_object(
+                    &bucket,
+                    "deleted",
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("delete marker");
+            let marker = stored_object(&store, &bucket, "deleted").await;
+            assert!(marker.delete_marker);
+            let rejected = if let Some((id, part)) = staged {
+                let result = write_back.complete_multipart_upload(&req, &id, vec![part]).await;
+                write_back.abort_multipart_upload(&req, &id).await.expect("abort");
+                result
+            } else {
+                write_back.put_object(&req, body_stream(b"source")).await
+            };
+            assert!(
+                matches!(rejected, Err(WriteBackError::Local(ref error)) if error.contains("PreconditionFailed")),
+                "{rejected:?}"
+            );
+            let retained = stored_object(&store, &bucket, "deleted").await;
+            assert!(retained.delete_marker);
+            assert_eq!(retained.version_id, marker.version_id);
+            req.respect_delete_marker = false;
+            write_back
+                .put_object(&req, body_stream(b"source"))
+                .await
+                .expect("explicit revival policy");
+            assert!(!stored_object(&store, &bucket, "deleted").await.delete_marker);
+        }
     }
 
     #[tokio::test]
@@ -516,7 +816,15 @@ mod tests {
             Err(io::Error::new(io::ErrorKind::BrokenPipe, "tee primary dropped before EOF")),
         ]);
         let err = OnDemandMigrationWriteBack::new()
-            .put_object(&request(&bucket, "torn.bin", head.clone()), torn)
+            .put_object(
+                &request(
+                    &bucket,
+                    store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+                    "torn.bin",
+                    head.clone(),
+                ),
+                torn,
+            )
             .await
             .expect_err("a broken stream must fail the write-back");
         assert_ne!(err, WriteBackError::Integrity, "{err}");
@@ -525,7 +833,15 @@ mod tests {
         // A clean EOF short of the advertised size is just as fatal.
         let short = stream(vec![Ok(Bytes::copy_from_slice(&body[..64 * 1024]))]);
         let err = OnDemandMigrationWriteBack::new()
-            .put_object(&request(&bucket, "short.bin", head), short)
+            .put_object(
+                &request(
+                    &bucket,
+                    store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+                    "short.bin",
+                    head,
+                ),
+                short,
+            )
             .await
             .expect_err("a short body must fail the write-back");
         assert!(matches!(err, WriteBackError::Local(_) | WriteBackError::Integrity), "{err}");
@@ -541,7 +857,12 @@ mod tests {
         let mut head = source_head(&body);
         head.etag = Some(format!("{}-2", md5_hex(&body)));
         head.is_multipart_etag = true;
-        let request = request(&bucket, "big/object.bin", head.clone());
+        let request = request(
+            &bucket,
+            store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+            "big/object.bin",
+            head.clone(),
+        );
         let write_back = OnDemandMigrationWriteBack::new();
 
         let upload_id = write_back.create_multipart_upload(&request).await.expect("create");
@@ -579,10 +900,7 @@ mod tests {
             .upload_part(&request, &aborted, 1, 4096, body_stream(&body[..4096]))
             .await
             .expect("stage part");
-        write_back
-            .abort_multipart_upload(&bucket, "big/object.bin", &aborted)
-            .await
-            .expect("abort");
+        write_back.abort_multipart_upload(&request, &aborted).await.expect("abort");
         let uploads = store
             .list_multipart_uploads(&bucket, "big/object.bin", None, None, None, 100)
             .await
@@ -635,7 +953,12 @@ mod tests {
 
             let body = b"plaintext that must be encrypted at rest".to_vec();
             let head = source_head(&body);
-            let request = request(&bucket, "secret.txt", head.clone());
+            let request = request(
+                &bucket,
+                store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+                "secret.txt",
+                head.clone(),
+            );
             // The source ETag is not forced onto an encrypted object; the
             // local ETag is whatever the SSE write path computes.
             assert_eq!(write_back_context(&request, true).await.preserve_etag, None);
@@ -673,7 +996,15 @@ mod tests {
         let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("odm-wb-quota", 64).await;
         let body = vec![0x71; 4096];
         let err = OnDemandMigrationWriteBack::new()
-            .put_object(&request(&bucket, "over.bin", source_head(&body)), body_stream(&body))
+            .put_object(
+                &request(
+                    &bucket,
+                    store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+                    "over.bin",
+                    source_head(&body),
+                ),
+                body_stream(&body),
+            )
             .await
             .expect_err("a full quota must reject the write-back");
         assert!(matches!(err, WriteBackError::Quota(_)), "{err}");
@@ -738,7 +1069,12 @@ mod tests {
 
         let body = b"replicate me".to_vec();
         let head = source_head(&body);
-        let request = request(&bucket, "replicated.txt", head);
+        let request = request(
+            &bucket,
+            store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+            "replicated.txt",
+            head,
+        );
         let ctx = write_back_context(&request, true).await;
         assert!(ctx.emit_events, "policy.emit_events reaches the creation event");
         assert_eq!(ctx.principal_id, ON_DEMAND_MIGRATION_PRINCIPAL_ID);
@@ -786,7 +1122,12 @@ mod tests {
         head.user_metadata
             .insert(forged_replica_key.to_string(), ReplicationStatusType::Replica.as_str().to_string());
 
-        let mut write_request = request(&bucket, "unadmitted.txt", head);
+        let mut write_request = request(
+            &bucket,
+            store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"),
+            "unadmitted.txt",
+            head,
+        );
         write_request.tags = Some(HashMap::from([("replicate".to_string(), "no".to_string())]));
         OnDemandMigrationWriteBack::new()
             .put_object(&write_request, body_stream(&body))
@@ -874,11 +1215,17 @@ mod tests {
         head.sse = None;
         head.etag = None;
         assert_eq!(expected_md5_hex(&head), None);
+
+        // An Azure ETag can be any string the service chooses; even one that
+        // happens to look like an MD5 must not be checked against the bytes.
+        let mut head = source_head(b"abc");
+        head.etag_is_opaque = true;
+        assert_eq!(expected_md5_hex(&head), None, "opaque provider ETag");
     }
 
     #[test]
     fn provenance_and_tags_are_stable() {
-        let mut request = request("b", "k", source_head(b"x"));
+        let mut request = request("b", Uuid::nil(), "k", source_head(b"x"));
         let metadata = provenance_metadata(&request);
         assert_eq!(metadata.len(), 10, "five keys under two prefixes");
         assert_provenance(&metadata, &request.head);
@@ -899,7 +1246,7 @@ mod tests {
     #[tokio::test]
     async fn write_back_context_applies_the_etag_and_event_policy() {
         let body = b"context".to_vec();
-        let mut request = request("no-such-bucket", "k", source_head(&body));
+        let mut request = request("no-such-bucket", Uuid::nil(), "k", source_head(&body));
         let ctx = write_back_context(&request, true).await;
         assert_eq!(ctx.expected_md5_hex, Some(md5_hex(&body)));
         assert_eq!(ctx.preserve_etag, Some(md5_hex(&body)));

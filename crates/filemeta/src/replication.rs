@@ -442,6 +442,10 @@ pub struct ReplicatedTargetInfo {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_delete_marker_version_id: Option<String>,
+    /// Kept in step with the replication crate's copy: the id a target that
+    /// mints its own version ids assigned to this object version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_version_id: Option<String>,
 }
 
 impl ReplicatedTargetInfo {

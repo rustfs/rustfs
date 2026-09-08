@@ -13,7 +13,7 @@ what Claude Code needs on top: commands and pointers.
 cargo build --release --bin rustfs   # production binary
 cargo check -p <crate>               # fast type-check one crate
 cargo test -p <crate>                # test one crate
-cargo fmt --all                      # format (required before PR)
+cargo fmt --all --check              # for Rust changes; see AGENTS.md verification tiers
 make pre-commit                      # fast gate: fmt + arch checks + quick-check (NO clippy/tests)
 make pre-pr                          # optional full gate for broad cross-module changes
 make build-docker BUILD_OS=ubuntu22.04
@@ -42,5 +42,5 @@ make build-docker BUILD_OS=ubuntu22.04
 
 Repo-wide domain invariants (dual internal metadata keys, defensive UUID
 reads, unversioned tier buckets) live in [AGENTS.md](AGENTS.md) under
-"Cross-Cutting Domain Invariants" — read them before touching metadata or
+"Cross-Cutting Storage Invariants" — read them before touching metadata or
 tiering code.

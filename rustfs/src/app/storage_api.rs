@@ -28,14 +28,19 @@ pub(crate) fn EndpointServerPools(
 /// the direct s3s surface (s3s footprint ratchet, `scripts/check_s3s_footprint.sh`).
 pub(crate) mod s3 {
     #[cfg(test)]
-    pub(crate) use s3s::dto::{
-        BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ListObjectsV2Input,
-        ListObjectsV2Output, ReplicationConfiguration, ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus,
-        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, VersioningConfiguration,
-    };
-    pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
+    pub(crate) use s3s::S3Response;
     #[cfg(test)]
-    pub(crate) use s3s::{S3Request, S3Response};
+    pub(crate) use s3s::dto::ListObjectsInput;
+    #[cfg(test)]
+    pub(crate) use s3s::dto::{
+        BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, GetObjectInput,
+        HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output, ReplicationConfiguration, ReplicationRule,
+        ReplicationRuleFilter, ReplicationRuleStatus, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+        ServerSideEncryptionRule, Tag, VersioningConfiguration,
+    };
+    #[cfg(test)]
+    pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
+    pub(crate) use s3s::{S3Error, S3ErrorCode, S3Request, S3Result};
 }
 
 pub(crate) mod admin {
@@ -262,8 +267,9 @@ pub(crate) mod access {
     pub(crate) use crate::storage::storage_api::access_consumer::{
         PostObjectRequestMarker, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_request,
         bucket_config_mutation_incarnation, has_bypass_governance_header, load_bucket_generation_from_store,
-        log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization, recursive_force_delete_is_authorized,
-        replication_request_authorized, req_info_mut, req_info_ref,
+        log_list_buckets_iam_implicit_deny, odm_read_generation, prepare_list_buckets_iam_authorization,
+        prepare_odm_read_generation, recursive_force_delete_is_authorized, replication_request_authorized, req_info_mut,
+        req_info_ref,
     };
 }
 
@@ -392,6 +398,12 @@ pub(crate) mod bucket {
 
                 lc.validate(lock_config).await
             }
+
+            /// The `std::io::ErrorKind` [`validate_lifecycle_config`] uses for a
+            /// lifecycle document that violates the published schema shape, which
+            /// the S3 boundary answers with `MalformedXML` (backlog#2201).
+            pub(crate) const LIFECYCLE_MALFORMED_XML_ERROR_KIND: std::io::ErrorKind =
+                crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::LIFECYCLE_MALFORMED_XML_ERROR_KIND;
         }
 
         pub(crate) mod lifecycle_contract {
@@ -628,26 +640,6 @@ pub(crate) mod bucket {
         }
     }
 
-    pub(crate) mod on_demand_migration {
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::source_client::{
-            SourceClient, SourceError, SourceGet, SourceHead, SourceListRequest, SourceObject, SourcePage,
-        };
-        #[cfg(test)]
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
-            BREAKER_FAILURE_THRESHOLD, BreakerState, FilterConfig, OnDemandMigrationConfig, PathStyle, Provider, SourceConfig,
-            SourceCredentials, TlsConfig,
-        };
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
-            BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OdmStateError, OnDemandMigrationSys, PolicyConfig,
-            PullError, PullLeader, PullOutcome, PullReason, PullSlot, RangeGetPolicy, SourceBody, SourceErrorPolicy,
-            commit_inline, idle_guarded_body,
-        };
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
-            ListEntryKey, ListThroughCursor, ListThroughMerger, ListThroughToken, ListThroughTokenError, MergeSide,
-            SOURCE_LIST_MAX_RATE_WAIT, SourceListPlan, decode_continuation_token, source_list_plan,
-        };
-    }
-
     pub(crate) mod policy_sys {
         pub(crate) type PolicySys = crate::storage::storage_api::ecstore_bucket::policy_sys::PolicySys;
     }
@@ -726,6 +718,8 @@ pub(crate) mod bucket {
                     delete_marker_version_id: None,
                     delete_marker: false,
                     delete_marker_mtime: None,
+                    target_delete_marker_version_ids: Default::default(),
+                    target_delete_marker_version_ids_corrupt: false,
                     target_arns,
                     force_delete_id: Some(operation_id),
                     force_delete_generation: Some(i64::try_from(generation.unix_timestamp_nanos()).unwrap_or(i64::MAX)),
@@ -1181,19 +1175,6 @@ pub(crate) mod bucket_usecase {
 pub(crate) mod object_usecase {
     pub(crate) use super::storage_contracts::BUCKET_LIFECYCLE_LOCK_OBJECT;
 
-    pub(crate) mod on_demand_migration {
-        #[cfg(test)]
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::PullFailureReason;
-        #[cfg(test)]
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::source_client::SourceSse;
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::source_client::{
-            SourceHead, is_multipart_etag,
-        };
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
-            LocalObject, OdmWriteBack, WriteBackBody, WriteBackError, WriteBackOutcome, WriteBackPart, WriteBackRequest,
-        };
-    }
-
     pub(crate) mod object_cache {
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::ecstore_object::GetObjectBodySource;
@@ -1280,7 +1261,7 @@ pub(crate) mod context {
     pub(crate) use super::EndpointServerPools;
     pub(crate) use super::bucket;
     pub(crate) use super::runtime;
-    pub(crate) use crate::storage::storage_api::{ECStore, EndpointServerPools};
+    pub(crate) use crate::storage::storage_api::{BootstrapLocalTarget, ECStore, EndpointServerPools, InstanceContext};
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::{Endpoint, Endpoints, PoolEndpoints};
 }

@@ -25,17 +25,18 @@
 //! set, rewritten on a group-commit cadence (every flush interval or flush
 //! threshold new intents). A rewrite is atomic at the record level only — a
 //! torn tail simply truncates during replay because every record carries its
-//! own CRC32. Losing the last flush window (≤500 ms) is acceptable because
-//! every producer keeps its own safety net: read-repair re-detects on the
-//! next failing read, and the scanner's corrupt-metadata branch leaves a
-//! pending-ledger entry behind even when its MRF intent is accepted
-//! (backlog#1894 axis A), so a lost intent is retried by the ledger rather
-//! than waiting for the failed-object TTL to re-scan the path.
+//! own CRC32. Neither ingress nor manager admission is a durable ownership
+//! receipt. The last flush window can be lost. Read-repair can rediscover a
+//! failed read; the scanner retains bounded, expiring retry hints. Partial
+//! writes also use a best-effort in-memory fast path, not a durable successor.
+//! These mechanisms must not be reported as verified repair completion.
+//! The partial-write caller's restart-survival requirement remains unmet by
+//! admission alone; a verified durable handoff is still required.
 
 use super::{DiskStore, HealDiskExt as _, local_disk_map_read};
 use crate::heal::manager::{HealManager, MrfRepairNoticeTarget};
 use metrics::{counter, gauge};
-use rustfs_common::mrf_channel::{MRF_MAX_ATTEMPTS, MrfIntent};
+use rustfs_common::mrf_channel::{MRF_MAX_ATTEMPTS, MrfIngressResult, MrfIntent};
 use rustfs_heal_contracts::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -44,6 +45,10 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealType};
+
+/// Read-only inspection of committed MRF checkpoints. The legacy consumer
+/// remains unchanged until ownership-aware replay is deployed.
+pub mod snapshot;
 
 /// Journal location inside the metadata bucket, following the resume-state
 /// layout.
@@ -179,6 +184,11 @@ impl MrfQueue {
         self.pending_keys.insert(key);
         self.pending.push_back(intent);
         MrfQueuePushResult::Enqueued
+    }
+
+    fn raise_limits_for_replay(&mut self, intents: usize, bytes: usize) {
+        self.capacity = self.capacity.max(self.pending.len().saturating_add(intents));
+        self.byte_budget = self.byte_budget.max(self.bytes.saturating_add(bytes));
     }
 
     /// Bool compatibility adapter: only a newly executable queue item is
@@ -514,9 +524,8 @@ struct MrfRuntime {
     /// waiting out an admission backoff must not re-fsync every local disk
     /// twice a second.
     dirty: bool,
-    /// True while a journal snapshot exists on disk that no longer reflects
-    /// an all-consumed pending set; the next idle tick removes it (MinIO
-    /// deletes its `list.bin` after replay for the same reason).
+    /// True while a journal snapshot exists on disk that may still be needed
+    /// for replay or cleanup.
     journal_on_disk: bool,
     /// Earliest instant a full-admission retry may proceed.
     backoff_until: Option<tokio::time::Instant>,
@@ -581,8 +590,8 @@ impl MrfRuntime {
             self.dirty = true;
             match submit_mrf_heal_request(manager, &intent).await {
                 // Accepted intents leave the pending set; the next flush persists the
-                // smaller snapshot. The scanner ledger is cleared later, when the
-                // canonical heal task reaches a successful terminal completion.
+                // smaller snapshot. This is not a durable successor receipt and
+                // does not discharge the producer's existing retry hints.
                 Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {}
                 Ok(HealAdmissionResult::Full) | Ok(HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)) => {
                     intent.attempts = intent.attempts.saturating_add(1);
@@ -650,9 +659,10 @@ pub fn spawn_mrf_consumer(manager: Arc<HealManager>) {
 
 /// Replay the durable journal into a fresh pending queue and submit whatever
 /// it armed. Returns the number of intact intents replayed. Duplicates are
-/// merged by the manager's dedup key; the journal file is removed once read
-/// (torn tails truncate via the per-record CRC). Public for integration tests;
-/// the live consumer invokes this through [`replay_into`] at startup.
+/// merged by the manager's dedup key; the journal is retained whenever replay
+/// cannot fully hand off a successor in-memory snapshot (torn tails truncate
+/// via the per-record CRC). Public for integration tests; the live consumer
+/// invokes this through [`replay_into`] at startup.
 pub async fn replay_journal_once(manager: &Arc<HealManager>) -> usize {
     let config = MrfConsumerConfig::default();
     let mut queue = MrfQueue::new(config.queue_capacity, config.journal_max_bytes);
@@ -665,7 +675,13 @@ struct ReplayOutcome {
     journal_on_disk: bool,
 }
 
-/// Shared replay core: read + decode + re-arm + delete, then drain what fits.
+fn replay_must_retain_journal(rearm_incomplete: bool, pending_depth: usize) -> bool {
+    rearm_incomplete || pending_depth > 0
+}
+
+/// Shared replay core: read + decode + re-arm, then drain what fits. The
+/// startup journal is removed only after every replayed record has either
+/// reached the manager or been proven redundant inside the in-memory queue.
 async fn replay_into(
     manager: &Arc<HealManager>,
     queue: &mut MrfQueue,
@@ -686,9 +702,9 @@ async fn replay_into(
             }
         },
     };
-    let mut intents = Vec::new();
     let (decoded, truncated) = decode_journal(&data);
-    intents.extend(decoded);
+    let replayed = decoded.len();
+    let intents = decoded;
     if truncated > 0 {
         tracing::warn!(
             target: "rustfs::heal::mrf",
@@ -696,20 +712,41 @@ async fn replay_into(
             "MRF journal had a torn tail; truncated records were discarded"
         );
     }
-    counter!("rustfs_heal_mrf_replayed_total").increment(u64::try_from(intents.len()).unwrap_or(u64::MAX));
-    let replayed = intents.len();
+    counter!("rustfs_heal_mrf_replayed_total").increment(u64::try_from(replayed).unwrap_or(u64::MAX));
+    let replay_bytes = intents
+        .iter()
+        .fold(0usize, |total, intent| total.saturating_add(intent.estimated_bytes()));
+    // The decoded journal is already resident in memory. Allow the startup
+    // queue to arm that full bounded snapshot so a later flush can become the
+    // successor anchor instead of overwriting the old journal with only a
+    // prefix.
+    queue.raise_limits_for_replay(intents.len(), replay_bytes);
+    let mut rearm_incomplete = false;
     for intent in intents {
         let result = queue.try_push_typed(intent.clone());
-        if !matches!(result, MrfQueuePushResult::Enqueued) {
-            rustfs_common::mrf_channel::release_mrf_intent(&intent);
+        match result {
+            MrfQueuePushResult::Enqueued => {}
+            MrfQueuePushResult::Coalesced => rustfs_common::mrf_channel::release_mrf_intent(&intent),
+            MrfQueuePushResult::Rejected => {
+                rearm_incomplete = true;
+                rustfs_common::mrf_channel::release_mrf_intent(&intent);
+            }
         }
     }
-    let journal_on_disk = !delete_journals().await;
 
     // Drain the replayed intents immediately; whatever the manager refuses
     // stays armed in `queue` for the consumer's retry loop.
     if backoff_until.is_none() {
         while let Some(mut intent) = queue.pop_front() {
+            if !matches!(
+                rustfs_common::mrf_channel::try_rearm_mrf_replay_intent(&mut intent),
+                MrfIngressResult::Enqueued
+            ) {
+                queue.push_back(intent);
+                rearm_incomplete = true;
+                *backoff_until = Some(tokio::time::Instant::now());
+                break;
+            }
             match submit_mrf_heal_request(manager, &intent).await {
                 Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {}
                 Ok(HealAdmissionResult::Full) | Ok(HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)) => {
@@ -717,13 +754,36 @@ async fn replay_into(
                     if intent.attempts < MRF_MAX_ATTEMPTS {
                         queue.push_back(intent);
                         *backoff_until = Some(tokio::time::Instant::now());
+                    } else {
+                        rearm_incomplete = true;
+                        counter!("rustfs_heal_mrf_dropped_total", "reason" => "attempts_exhausted").increment(1);
+                        rustfs_common::mrf_channel::release_mrf_intent(&intent);
                     }
                     break;
                 }
-                Ok(HealAdmissionResult::Dropped(_)) | Err(_) => {}
+                Ok(HealAdmissionResult::Dropped(_)) => {
+                    rustfs_common::mrf_channel::release_mrf_intent(&intent);
+                }
+                Err(_) => {
+                    intent.attempts = intent.attempts.saturating_add(1);
+                    if intent.attempts < MRF_MAX_ATTEMPTS {
+                        queue.push_back(intent);
+                        *backoff_until = Some(tokio::time::Instant::now());
+                    } else {
+                        rearm_incomplete = true;
+                        counter!("rustfs_heal_mrf_dropped_total", "reason" => "attempts_exhausted").increment(1);
+                        rustfs_common::mrf_channel::release_mrf_intent(&intent);
+                    }
+                    break;
+                }
             }
         }
     }
+    let journal_on_disk = if replay_must_retain_journal(rearm_incomplete, queue.depth()) {
+        true
+    } else {
+        !delete_journals().await
+    };
     ReplayOutcome {
         replayed,
         journal_on_disk,
@@ -743,13 +803,13 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
         backoff_until: None,
     };
 
-    // Replay: read the journal, re-arm intents (duplicates are merged by the
-    // manager's dedup key), then drop the file so the next flush starts clean.
+    // Replay reads the journal and re-arms intents. The startup journal stays
+    // on disk whenever any replayed intent still needs a successor snapshot.
     let replay = replay_into(&manager, &mut runtime.queue, &mut runtime.backoff_until).await;
     runtime.journal_on_disk = replay.journal_on_disk;
-    // The replay deleted the journal file; anything still pending (e.g. the
-    // manager was full and backoff armed) must be re-persisted by the next
-    // flush or a crash before it would lose those intents.
+    // Anything still pending (e.g. the manager was full and backoff armed)
+    // must be re-persisted by the next flush before replay can delete the
+    // startup anchor.
     runtime.dirty = runtime.queue.depth() > 0;
 
     let mut flush_tick = tokio::time::interval(runtime.config.flush_interval);
@@ -790,7 +850,11 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
                 }
             }
             _ = flush_tick.tick() => {
-                match tick_action(runtime.dirty, runtime.queue.depth(), runtime.journal_on_disk) {
+                match tick_action(
+                    runtime.dirty,
+                    runtime.queue.depth(),
+                    runtime.journal_on_disk,
+                ) {
                     TickAction::Flush => {
                         runtime.flush().await;
                         runtime.dispatch(manager.as_ref()).await;
@@ -803,8 +867,8 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
                         runtime.dispatch(manager.as_ref()).await;
                     }
                     TickAction::DeleteJournal => {
-                        // All intents consumed: remove the journal so a restart
-                        // replays nothing (mirrors MinIO's post-replay unlink).
+                        // All replayed intents have either been accepted,
+                        // merged, or replaced by a pending successor snapshot.
                         if delete_journals().await {
                             runtime.journal_on_disk = false;
                             gauge!("rustfs_heal_mrf_journal_bytes").set(0.0);
@@ -883,6 +947,72 @@ mod tests {
 
         // Fully quiescent: nothing to do.
         assert!(matches!(tick_action(false, 0, false), Idle));
+    }
+
+    #[test]
+    fn replay_cleanup_retains_journal_for_unarmed_or_refused_records() {
+        assert!(
+            replay_must_retain_journal(true, 0),
+            "a rejected replay record still needs its disk anchor"
+        );
+        assert!(
+            replay_must_retain_journal(false, 1),
+            "a Full admission retry must keep the startup journal until the next snapshot"
+        );
+        assert!(
+            !replay_must_retain_journal(false, 0),
+            "only a fully consumed replay snapshot may be deleted"
+        );
+    }
+
+    #[test]
+    fn durable_replay_acquires_a_fresh_lease_before_manager_admission() {
+        let unique = uuid::Uuid::new_v4();
+        let original = intent(&format!("replay-{unique}"), "object", 0);
+        assert!(original.lease.is_none(), "legacy journal records do not persist process leases");
+        let mut queue = MrfQueue::new(2, usize::MAX);
+        assert_eq!(queue.try_push_typed(original.clone()), MrfQueuePushResult::Enqueued);
+        assert_eq!(
+            queue.try_push_typed(original),
+            MrfQueuePushResult::Coalesced,
+            "legacy duplicates are one durable responsibility before a lease is assigned"
+        );
+        let mut replay = queue.pop_front().expect("one deduplicated replay record");
+        assert_eq!(
+            rustfs_common::mrf_channel::try_rearm_mrf_replay_intent(&mut replay),
+            MrfIngressResult::Enqueued
+        );
+        assert!(replay.lease.is_some(), "manager admission must receive the replay lease");
+        assert!(
+            rustfs_common::mrf_channel::MrfDurableRepairAnchor::from_intent(&replay, uuid::Uuid::new_v4()).is_some(),
+            "the replay identity must be usable by the durable proof consumer"
+        );
+        let mut encoded = Vec::new();
+        assert!(encode_intent(&replay, &mut encoded));
+        let (decoded, truncated) = decode_journal(&encoded);
+        assert_eq!(truncated, 0);
+        assert_eq!(decoded.len(), 1);
+        assert!(
+            decoded[0].lease.is_none(),
+            "process-local leases must not enter the durable journal format"
+        );
+        rustfs_common::mrf_channel::release_mrf_intent(&replay);
+    }
+
+    #[test]
+    fn replay_can_arm_more_records_than_live_queue_budget() {
+        let mut queue = MrfQueue::new(1, intent("bucket", "object-0", 0).estimated_bytes());
+        let intents = vec![intent("bucket", "object-0", 0), intent("bucket", "object-1", 0)];
+        let bytes = intents
+            .iter()
+            .fold(0usize, |total, intent| total.saturating_add(intent.estimated_bytes()));
+
+        queue.raise_limits_for_replay(intents.len(), bytes);
+
+        for intent in intents {
+            assert_eq!(queue.try_push_typed(intent), MrfQueuePushResult::Enqueued);
+        }
+        assert_eq!(queue.depth(), 2);
     }
 
     #[test]

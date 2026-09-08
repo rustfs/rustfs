@@ -18,6 +18,8 @@
 use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod capacity {
+    pub(crate) use crate::storage::storage_api::ecstore_capacity::is_pool_activation_fleet_proof_error;
+
     pub(crate) mod service {
         pub(crate) use crate::storage::storage_api::{all_local_disk, disk_drive_path, disk_endpoint};
     }
@@ -74,11 +76,16 @@ pub(crate) mod config_test {
 
 pub(crate) mod error {
     pub(crate) mod contract {
+        pub(crate) use super::super::storage_contracts::error::StorageErrorCode;
+
         pub(crate) mod range {
             pub(crate) use super::super::super::storage_contracts::HTTPRangeError;
         }
     }
 
+    pub(crate) use crate::storage::storage_api::ecstore_error::PoolMetadataError;
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_error::PoolMetadataFailure;
     pub(crate) use crate::storage::storage_api::{QuotaError, StorageError};
 }
 
@@ -145,8 +152,8 @@ pub(crate) mod server {
 
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::{
-            Endpoint, EndpointServerPools, Endpoints, PeerRestClient, PoolEndpoints, gen_signature_headers,
-            gen_tonic_signature_headers,
+            Endpoint, EndpointServerPools, Endpoints, PeerRestClient, PoolEndpoints, ScannerScopedDirtyUsageAckEntry,
+            gen_signature_headers, gen_tonic_signature_headers,
         };
 
         pub(crate) mod ecfs {
@@ -172,11 +179,14 @@ pub(crate) mod server {
 
         pub(crate) mod tonic_service {
             #[cfg(test)]
+            pub(crate) use crate::storage::storage_api::tonic_service_consumer::make_server;
+            #[cfg(test)]
             pub(crate) use crate::storage::storage_api::tonic_service_consumer::{
                 heal_topology_fingerprint, make_heal_control_server_for_source,
             };
             pub(crate) use crate::storage::storage_api::tonic_service_consumer::{
-                make_heal_control_server_with_cache, make_scanner_control_server, make_server, make_tier_mutation_control_server,
+                make_heal_control_server_with_cache, make_scanner_control_server, make_server_for_slot,
+                make_tier_mutation_control_server,
             };
         }
     }
@@ -278,10 +288,6 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod background {
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::OnDemandMigrationSys;
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::backfill::{
-            BackfillRunner, SysBackfillContexts, install_global_backfill_runner, spawn_backfill_recovery_loop,
-        };
         pub(crate) use crate::storage::storage_api::{
             BitrotSelfTestError, ECStore, bitrot_self_test, set_workload_admission_snapshot_provider,
         };
@@ -294,7 +300,6 @@ pub(crate) mod startup {
             }
         }
 
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::OnDemandMigrationSys;
         pub(crate) use crate::storage::storage_api::{
             ECStore, Error, Result, get_global_replication_pool, init_bucket_metadata_sys,
             reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata, try_migrate_iam_config,
@@ -414,4 +419,33 @@ pub(crate) mod table {
         StorageObjectInfo, StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader, get_bucket_metadata,
         get_lock_acquire_timeout, table_catalog_path_hash,
     };
+}
+
+pub(crate) mod on_demand_migration {
+    pub(crate) use crate::storage::storage_api::ECStore;
+    pub(crate) use crate::storage::storage_api::StorageObjectOptions as ObjectOptions;
+    pub(crate) use crate::storage::storage_api::contract::{
+        namespace::NamespaceLocking, object::HTTPPreconditions, object::ObjectOperations, range::HTTPRangeSpec,
+    };
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{
+        BUCKET_CONFIG_PUBLISH_HOOK, get_on_demand_migration_config, get_on_demand_migration_config_in,
+    };
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::remote_s3_client;
+    pub(crate) use crate::storage::storage_api::ecstore_config::com::{read_config_with_metadata, save_config_with_opts};
+    pub(crate) use crate::storage::storage_api::ecstore_disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+    pub(crate) use crate::storage::storage_api::ecstore_error::Error as StorageError;
+    pub(crate) use crate::storage::storage_api::ecstore_object::WriteCompletion;
+    pub(crate) use crate::storage::storage_api::ecstore_set_disk::get_lock_acquire_timeout;
+
+    #[cfg(test)]
+    pub(crate) mod test_support {
+        pub(crate) use crate::storage::storage_api::contract::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, BucketOperations};
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::{
+            BUCKET_ON_DEMAND_MIGRATION_CONFIG, BucketMetadata,
+        };
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{BucketMetadataSys, init_bucket_metadata_sys};
+        pub(crate) use crate::storage::storage_api::ecstore_set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+    }
 }

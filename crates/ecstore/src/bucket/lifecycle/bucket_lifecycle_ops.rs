@@ -32,6 +32,7 @@ use crate::bucket::lifecycle::manual_transition_job::{
     record_manual_transition_worker_result_with_reason, renew_manual_transition_job_lease_if_owned,
     save_manual_transition_job_record_if_current, save_manual_transition_task_if_absent, update_manual_transition_job_record,
 };
+use crate::bucket::lifecycle::recovery_disposition_runtime::run_recovery_disposition_maintenance_loop;
 use crate::bucket::lifecycle::replication_sink;
 use crate::bucket::lifecycle::replication_sink::{
     DeleteReplicationConfigSnapshot, ReplicationObjectBridge, ReplicationStatusType, replication_state_to_filemeta,
@@ -149,6 +150,19 @@ pub type ExpiryOpType = Box<dyn ExpiryOp + Send + Sync + 'static>;
 static XXHASH_SEED: u64 = 0;
 static TIER_FREE_VERSION_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 static MANUAL_TRANSITION_JOB_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
+static RECOVERY_DISPOSITION_MAINTENANCE_STARTED: OnceLock<()> = OnceLock::new();
+
+#[cfg(test)]
+#[derive(Default)]
+struct FreeVersionPostRemoteDeleteTestBarrier {
+    arrived: Notify,
+    release: Notify,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static FREE_VERSION_POST_REMOTE_DELETE_TEST_BARRIER: Arc<FreeVersionPostRemoteDeleteTestBarrier>;
+}
 
 pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
 #[allow(
@@ -909,6 +923,11 @@ async fn cleanup_free_version_exact(api: Arc<ECStore>, oi: &ObjectInfo, cancel: 
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "tier free-version remote delete timed out")
             })??;
         }
+    }
+    #[cfg(test)]
+    if let Ok(barrier) = FREE_VERSION_POST_REMOTE_DELETE_TEST_BARRIER.try_with(Arc::clone) {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
     }
     if !free_version_cleanup_fences_current(&topology_generation, &api, &bucket_guard, &object_guards, &lease, cancel, deadline) {
         // Remote DELETE is idempotent, but a changed fence makes the local
@@ -2381,7 +2400,18 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
     let _ = spawn_tier_free_version_recovery_once(api.clone(), &TIER_FREE_VERSION_RECOVERY_STARTED);
     spawn_tier_delete_journal_recovery_once(api.clone());
     spawn_transition_transaction_recovery_once(api.clone());
+    spawn_recovery_disposition_maintenance_once(api.clone());
     spawn_manual_transition_job_recovery_once(api);
+}
+
+fn spawn_recovery_disposition_maintenance_once(api: Arc<ECStore>) -> Option<JoinHandle<()>> {
+    let cancel_token = api.ctx.background_cancel_token()?;
+    if RECOVERY_DISPOSITION_MAINTENANCE_STARTED.set(()).is_err() {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        run_recovery_disposition_maintenance_loop(api, cancel_token).await;
+    }))
 }
 
 fn spawn_manual_transition_job_recovery_once(api: Arc<ECStore>) -> Option<JoinHandle<()>> {
@@ -4006,6 +4036,10 @@ impl ManualTransitionRunReport {
             || self.skipped_queue_timeout > 0
     }
 
+    fn has_enqueue_backpressure(&self) -> bool {
+        self.skipped_queue_full > 0 || self.skipped_queue_closed > 0 || self.skipped_queue_timeout > 0
+    }
+
     pub fn was_truncated(&self) -> bool {
         self.truncated_by_limit || self.truncated_by_duration || self.cancelled
     }
@@ -4221,7 +4255,7 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
             }
             report.scanned = report.scanned.saturating_add(1);
             enqueue_transition_with_lifecycle_report(Some(api.clone()), object, &lc, &src, &options, &mut report).await;
-            if report.has_partial_enqueue() {
+            if report.has_enqueue_backpressure() {
                 report.next_marker.clone_from(&previous_marker);
                 report.next_version_idmarker.clone_from(&previous_version_marker);
                 report.continuation_token =
@@ -5831,7 +5865,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     use crate::services::tier::test_util::register_mock_tier;
     #[cfg(feature = "test-util")]
-    use crate::services::tier::tier::TierConfigMgr;
+    use crate::services::tier::tier::{TIER_DRIVER_TEST_FACTORY, TierConfigMgr, TierDriverTestFactory};
     #[cfg(feature = "test-util")]
     use crate::services::tier::warm_backend::{TransitionCandidateProbe, WarmBackend as _};
     use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause};
@@ -7833,6 +7867,119 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial]
+    async fn tier_remove_waits_for_inflight_free_version_local_commit() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("tier-remove-free-version-{}", Uuid::new_v4());
+        let object = "free-version";
+        create_test_bucket(&ecstore, &bucket).await;
+        let (backend, identity_hex) = register_recovery_mock_tier(&ecstore).await;
+        let tier_manager = ecstore.tier_config_mgr();
+        {
+            let manager = tier_manager.read().await;
+            manager
+                .save_tiering_config(Arc::clone(&ecstore))
+                .await
+                .expect("mock tier configuration should persist before removal");
+        }
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, Some(identity_hex)).await;
+        let page = list_tier_free_versions(Arc::clone(&ecstore), 1, None, None, CancellationToken::new())
+            .await
+            .expect("seeded free version should be listed");
+        let oi = page
+            .items
+            .into_iter()
+            .next()
+            .expect("seeded free version should be recoverable");
+
+        backend
+            .set_put_remote_version(Some(oi.transitioned_object.version_id.clone()))
+            .await;
+        let seed_lease = TierConfigMgr::acquire_operation_lease(&tier_manager, "WARM")
+            .await
+            .expect("mock tier lease should be available");
+        seed_lease
+            .put(&oi.transitioned_object.name, ReaderImpl::Body(Bytes::from_static(b"body")), 4)
+            .await
+            .expect("remote free-version tuple should be seeded");
+        drop(seed_lease);
+
+        let barrier = Arc::new(super::FreeVersionPostRemoteDeleteTestBarrier::default());
+        let cleanup_barrier = Arc::clone(&barrier);
+        let cleanup_store = Arc::clone(&ecstore);
+        let cleanup_oi = oi.clone();
+        let cleanup = tokio::spawn(async move {
+            super::FREE_VERSION_POST_REMOTE_DELETE_TEST_BARRIER
+                .scope(cleanup_barrier, async move {
+                    super::cleanup_free_version_exact(cleanup_store, &cleanup_oi, &CancellationToken::new()).await
+                })
+                .await
+        });
+        tokio::time::timeout(StdDuration::from_secs(30), barrier.arrived.notified())
+            .await
+            .expect("free-version cleanup should pause after the remote delete");
+        assert!(!backend.contains(&oi.transitioned_object.name).await);
+
+        let remove_manager = Arc::clone(&tier_manager);
+        let remove_store = Arc::clone(&ecstore);
+        let remove_backend = backend.clone();
+        let remove_driver_factory: TierDriverTestFactory = Arc::new(move |_| Ok(Box::new(remove_backend.clone())));
+        let mut remove = tokio::spawn(async move {
+            TIER_DRIVER_TEST_FACTORY
+                .scope(
+                    remove_driver_factory,
+                    TierConfigMgr::remove_and_save(&remove_manager, remove_store, "WARM", true),
+                )
+                .await
+        });
+        let prepared = tokio::time::timeout(StdDuration::from_secs(30), async {
+            loop {
+                match TierConfigMgr::acquire_operation_lease(&tier_manager, "WARM").await {
+                    Ok(lease) => drop(lease),
+                    Err(err) if TierConfigMgr::operation_lease_blocked_by_mutation(&err) => break,
+                    Err(err) => panic!("tier remove should only block new operations while cleanup is paused: {err}"),
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::select! {
+            prepared = prepared => {
+                prepared.expect("tier remove should install its prepared admission fence");
+            }
+            result = &mut remove => {
+                panic!("tier remove finished before installing its prepared admission fence: {result:?}");
+            }
+        }
+        assert!(!remove.is_finished(), "tier remove must wait for the leased local cleanup commit");
+
+        barrier.release.notify_one();
+        tokio::time::timeout(StdDuration::from_secs(30), cleanup)
+            .await
+            .expect("free-version cleanup should finish after release")
+            .expect("free-version cleanup task should join")
+            .expect("free-version cleanup should keep its generation current");
+        tokio::time::timeout(StdDuration::from_secs(30), remove)
+            .await
+            .expect("tier remove should finish after local cleanup")
+            .expect("tier remove task should join")
+            .expect("tier remove should pass its fresh authoritative proof");
+
+        assert!(!tier_manager.read().await.is_tier_valid("WARM"));
+        for disk_path in &disk_paths {
+            assert!(
+                !fs::try_exists(disk_path.join(&bucket).join(object))
+                    .await
+                    .expect("post-removal free-version path check should succeed")
+            );
+        }
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty free-version test bucket should be removed");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
     async fn free_version_worker_serializes_cleanup_with_object_writes() {
         let (disk_paths, ecstore) = setup_test_env().await;
         let bucket = format!("recovery-worker-lock-{}", Uuid::new_v4());
@@ -9807,6 +9954,18 @@ mod tests {
         assert_eq!(report.skipped_queue_closed, 0);
         assert_eq!(report.skipped_queue_timeout, 0);
         assert!(report.has_partial_enqueue());
+        assert!(report.has_enqueue_backpressure());
+    }
+
+    #[test]
+    fn manual_transition_in_flight_skip_does_not_stop_the_scan() {
+        let options = ManualTransitionRunOptions::default();
+        let mut report = ManualTransitionRunReport::new("bucket", &options);
+
+        report.record_enqueue_outcome(TransitionEnqueueOutcome::AlreadyInFlight);
+
+        assert!(report.has_partial_enqueue());
+        assert!(!report.has_enqueue_backpressure());
     }
 
     #[test]

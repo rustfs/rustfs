@@ -94,21 +94,22 @@ runs:
       shell: bash
       run: ./scripts/check_embedded_secrets.sh
 
+    - name: Run script contract tests
+      shell: bash
+      run: make script-tests
+
     - name: Check test wiring
       shell: bash
       run: |
         python3 ./scripts/check_test_wiring.py --self-test
         python3 ./scripts/check_scheduled_validation_freshness.py --self-test
         python3 ./scripts/test_security_workflow.py
+        python3 ./scripts/test_nightly_candidate.py
         python3 ./scripts/check_test_wiring.py
 
     - name: Check no planning docs committed
       shell: bash
       run: ./scripts/check_no_planning_docs.sh
-
-    - name: Check the CI selection and required gate contract
-      shell: bash
-      run: python3 scripts/ci_gate.py --self-test
 
     - name: Check io_uring lane --lib precondition
       shell: bash

@@ -1,0 +1,1939 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Outbound client for an on-demand migration source bucket.
+//!
+//! `SourceClient` maps local keys onto a read-only `SourceBackend`. The
+//! S3 backend uses the shared remote builder and exposes the surface the
+//! migration path needs (HEAD, ranged streaming GET, ListObjectsV2, GetObjectTagging, a
+//! probe for admin validation). Every request carries the
+//! `source-proxy-request` anti-loop marker in both the `x-rustfs-` and
+//! `x-minio-` prefixes so a RustFS/MinIO source answers locally instead of
+//! proxying the miss back, and the SDK `User-Agent` is suffixed with
+//! `RustFS-OnDemandMigration/<version>` for source-side log attribution.
+//! Client-supplied `If-*`, `Authorization`, `Host` and SSE-C headers are never
+//! forwarded: v1 rejects SSE-C source objects outright.
+
+use super::azure::AzureSourceBackend;
+#[cfg(feature = "gcs")]
+use super::gcs::GcsNativeSourceBackend;
+use super::list_through::{ListPageError, validate_list_page};
+use super::storage_api::HTTPRangeSpec;
+use super::storage_api::remote_s3_client::{
+    PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, RemoteS3RetryPolicy, build_remote_s3_config,
+};
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::operation::get_object::GetObjectOutput;
+use aws_sdk_s3::operation::head_object::HeadObjectOutput;
+use aws_sdk_s3::primitives::{ByteStream, DateTime as SdkDateTime};
+use aws_sdk_s3::types::{Object as SdkObject, ServerSideEncryption};
+use aws_smithy_runtime_api::box_error::BoxError;
+use aws_smithy_runtime_api::client::interceptors::Intercept;
+use aws_smithy_runtime_api::client::interceptors::context::BeforeTransmitInterceptorContextMut;
+use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+use aws_smithy_types::config_bag::ConfigBag;
+use aws_smithy_types::error::display::DisplayErrorContext;
+use http::HeaderMap;
+use rustfs_utils::http::{SUFFIX_SOURCE_PROXY_REQUEST, insert_header};
+use std::collections::HashMap;
+use std::fmt;
+use std::num::NonZeroU64;
+use std::time::{Duration, SystemTime};
+use url::Url;
+
+/// Appended to the SDK `User-Agent` on every source request.
+pub const USER_AGENT_SUFFIX: &str = concat!("RustFS-OnDemandMigration/", env!("CARGO_PKG_VERSION"));
+
+/// Source provider family; drives the `PathStyle::Auto` decision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SourceProvider {
+    Aws,
+    Gcs,
+    R2,
+    Minio,
+    Rustfs,
+    /// Generic S3-compatible service.
+    #[default]
+    S3,
+    /// Native Azure Blob service; not an S3 dialect.
+    Azure,
+    /// Native GCS JSON API with a service-account key; not an S3 dialect.
+    GcsNative,
+}
+
+impl SourceProvider {
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "aws" => Some(Self::Aws),
+            "gcs" => Some(Self::Gcs),
+            "r2" => Some(Self::R2),
+            "minio" => Some(Self::Minio),
+            "rustfs" => Some(Self::Rustfs),
+            "s3" => Some(Self::S3),
+            "azure" => Some(Self::Azure),
+            "gcs_native" => Some(Self::GcsNative),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Aws => "aws",
+            Self::Gcs => "gcs",
+            Self::R2 => "r2",
+            Self::Minio => "minio",
+            Self::Rustfs => "rustfs",
+            Self::S3 => "s3",
+            Self::Azure => "azure",
+            Self::GcsNative => "gcs_native",
+        }
+    }
+
+    fn prefers_virtual_host(self) -> bool {
+        matches!(self, Self::Aws | Self::Gcs | Self::R2)
+    }
+}
+
+/// Resolves `PathStyle::Auto` for a source: IP-literal or `localhost`
+/// endpoints cannot carry a bucket subdomain and always use path-style;
+/// otherwise AWS/GCS/R2 use virtual-host addressing and MinIO/RustFS/generic
+/// S3 use path-style. Explicit choices pass through unchanged.
+pub fn resolve_path_style(path_style: PathStyle, provider: SourceProvider, endpoint_host: &str) -> PathStyle {
+    match path_style {
+        PathStyle::Auto => {
+            if host_is_ip_or_localhost(endpoint_host) || !provider.prefers_virtual_host() {
+                PathStyle::Path
+            } else {
+                PathStyle::VirtualHost
+            }
+        }
+        explicit => explicit,
+    }
+}
+
+fn host_is_ip_or_localhost(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.eq_ignore_ascii_case("localhost") || bare.parse::<std::net::IpAddr>().is_ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceTimeouts {
+    pub connect: Duration,
+    pub read: Duration,
+}
+
+impl Default for SourceTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            read: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Plain description of a source bucket; ODM-05 converts the persisted
+/// bucket configuration into this shape.
+#[derive(Clone, Debug)]
+pub struct SourceClientSpec {
+    /// `scheme://host[:port]` with no path, query or userinfo.
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    /// Prepended to every local key when addressing the source; `None` or
+    /// empty means the local namespace maps 1:1 onto the source bucket.
+    pub source_prefix: Option<String>,
+    pub provider: SourceProvider,
+    pub path_style: PathStyle,
+    pub credentials: Option<RemoteCredentials>,
+    pub skip_tls_verify: bool,
+    pub ca_cert_pem: Option<String>,
+    pub timeouts: SourceTimeouts,
+    /// Wire requests one logical source call may cost. The pull pipeline and
+    /// the backfill job own the retry budget (`pull.rs` `PULL_MAX_RETRIES`,
+    /// `backfill.rs` `LIST_MAX_RETRIES`) and the breaker counts logical calls,
+    /// so ODM declares [`RemoteS3RetryPolicy::Disabled`]. An ambiguous HEAD
+    /// 404 additionally probes the bucket before declaring a key absent.
+    pub retry: RemoteS3RetryPolicy,
+    /// Bytes per second the pull pipeline may consume from this source;
+    /// `None` means unlimited. Enforced by the consumer, not by this client.
+    pub bandwidth_limit: Option<NonZeroU64>,
+    /// Which [`SourceBackend`] to build. The S3 variant reads `region`,
+    /// `path_style` and `credentials`; the native variants ignore all three
+    /// and carry their own credentials.
+    pub backend: SourceBackendSpec,
+}
+
+/// Provider-specific half of [`SourceClientSpec`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SourceBackendSpec {
+    #[default]
+    S3,
+    Azure(AzureSourceSpec),
+    Gcs(GcsSourceSpec),
+}
+
+/// Native Azure Blob parameters. The container is [`SourceClientSpec::bucket`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct AzureSourceSpec {
+    pub account: String,
+    pub auth: AzureAuth,
+}
+
+impl fmt::Debug for AzureSourceSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AzureSourceSpec")
+            .field("account", &self.account)
+            .field("auth", &self.auth)
+            .finish()
+    }
+}
+
+/// How Azure requests are authorized.
+#[derive(Clone, PartialEq, Eq)]
+pub enum AzureAuth {
+    /// Base64 storage-account key, signed per request with Shared Key.
+    SharedKey(String),
+    /// SAS query string without the leading `?`, appended to every URL.
+    Sas(String),
+}
+
+impl fmt::Debug for AzureAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Both variants are secrets; only the scheme may be rendered.
+        f.write_str(match self {
+            Self::SharedKey(_) => "SharedKey(REDACTED)",
+            Self::Sas(_) => "Sas(REDACTED)",
+        })
+    }
+}
+
+/// Native GCS parameters. The bucket is [`SourceClientSpec::bucket`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct GcsSourceSpec {
+    /// Service-account key JSON.
+    pub service_account_json: String,
+}
+
+impl fmt::Debug for GcsSourceSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GcsSourceSpec")
+            .field("service_account_json", &"REDACTED")
+            .finish()
+    }
+}
+
+impl SourceClientSpec {
+    fn endpoint_spec(&self) -> Result<RemoteS3EndpointSpec, RemoteS3ClientError> {
+        let url = Url::parse(self.endpoint.trim()).map_err(|err| RemoteS3ClientError::InvalidEndpoint(err.to_string()))?;
+        let secure = match url.scheme() {
+            "https" => true,
+            "http" => false,
+            other => {
+                return Err(RemoteS3ClientError::InvalidEndpoint(format!(
+                    "unsupported scheme {other}; expected http or https"
+                )));
+            }
+        };
+        let Some(host) = url.host_str() else {
+            return Err(RemoteS3ClientError::InvalidEndpoint("endpoint has no host".to_string()));
+        };
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(RemoteS3ClientError::InvalidEndpoint("endpoint must not carry userinfo".to_string()));
+        }
+        if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+            return Err(RemoteS3ClientError::InvalidEndpoint(
+                "endpoint must be an origin without path, query or fragment".to_string(),
+            ));
+        }
+        let endpoint = match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+
+        Ok(RemoteS3EndpointSpec {
+            endpoint,
+            secure,
+            region: self.region.clone(),
+            path_style: resolve_path_style(self.path_style, self.provider, host),
+            credentials: self.credentials.clone(),
+            skip_tls_verify: self.skip_tls_verify,
+            ca_cert_pem: self.ca_cert_pem.clone(),
+            connect_timeout: Some(self.timeouts.connect),
+            read_timeout: Some(self.timeouts.read),
+            retry: self.retry,
+            user_agent_suffix: USER_AGENT_SUFFIX,
+        })
+    }
+}
+
+/// Failure classes of a source request. Variants carry a rendered message
+/// rather than the SDK error so callers stay independent of the operation
+/// error types; `class_label` is stable for metrics.
+#[derive(Debug, thiserror::Error)]
+pub enum SourceError {
+    #[error("source object not found")]
+    NotFound,
+    #[error("source denied access")]
+    AccessDenied,
+    #[error("source throttled the request")]
+    Throttled,
+    #[error("source request timed out")]
+    Timeout,
+    #[error("failed to connect to source: {0}")]
+    Connect(String),
+    #[error("source returned server error {0}")]
+    ServerError(u16),
+    #[error("unsupported source object: {0}")]
+    Unsupported(String),
+    #[error("invalid source listing: {0}")]
+    InvalidPagination(#[from] ListPageError),
+    #[error("source request failed: {0}")]
+    Other(String),
+}
+
+impl SourceError {
+    /// Transient classes a caller may retry (subject to its own budget).
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            SourceError::Throttled | SourceError::Timeout | SourceError::Connect(_) | SourceError::ServerError(_)
+        )
+    }
+
+    pub fn class_label(&self) -> &'static str {
+        match self {
+            SourceError::NotFound => "not_found",
+            SourceError::AccessDenied => "access_denied",
+            SourceError::Throttled => "throttled",
+            SourceError::Timeout => "timeout",
+            SourceError::Connect(_) => "connect",
+            SourceError::ServerError(_) => "server_error",
+            SourceError::Unsupported(_) => "unsupported",
+            SourceError::InvalidPagination(_) => "invalid_pagination",
+            SourceError::Other(_) => "other",
+        }
+    }
+}
+
+const THROTTLE_CODES: &[&str] = &[
+    "SlowDown",
+    "Throttling",
+    "ThrottlingException",
+    "RequestLimitExceeded",
+    "TooManyRequests",
+    "RequestThrottled",
+    "ServerBusy",
+];
+const NOT_FOUND_CODES: &[&str] = &["NoSuchKey"];
+const ACCESS_DENIED_CODES: &[&str] = &[
+    "AccessDenied",
+    "InvalidAccessKeyId",
+    "SignatureDoesNotMatch",
+    "AllAccessDisabled",
+    "ExpiredToken",
+    "InvalidToken",
+    "AuthorizationPermissionMismatch",
+];
+
+pub(super) fn classify_status(status: u16, code: Option<&str>, message: String) -> SourceError {
+    if let Some(code) = code {
+        if THROTTLE_CODES.contains(&code) {
+            return SourceError::Throttled;
+        }
+        if NOT_FOUND_CODES.contains(&code) {
+            return SourceError::NotFound;
+        }
+        if ACCESS_DENIED_CODES.contains(&code) {
+            return SourceError::AccessDenied;
+        }
+    }
+    match status {
+        401 | 403 => SourceError::AccessDenied,
+        429 | 503 => SourceError::Throttled,
+        500..=599 => SourceError::ServerError(status),
+        _ => SourceError::Other(message),
+    }
+}
+
+fn classify_sdk_error<E>(err: SdkError<E, HttpResponse>) -> SourceError
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
+    let message = format!("{}", DisplayErrorContext(&err));
+    match &err {
+        SdkError::TimeoutError(_) => SourceError::Timeout,
+        SdkError::DispatchFailure(failure) => {
+            if failure.is_timeout() {
+                SourceError::Timeout
+            } else if failure.is_io() {
+                SourceError::Connect(message)
+            } else {
+                SourceError::Other(message)
+            }
+        }
+        SdkError::ConstructionFailure(_) => SourceError::Other(message),
+        SdkError::ResponseError(response) => classify_status(response.raw().status().as_u16(), None, message),
+        SdkError::ServiceError(service) => classify_status(service.raw().status().as_u16(), err.code(), message),
+        _ => SourceError::Other(message),
+    }
+}
+
+/// Server-side encryption the source reports for an object. Recognized only:
+/// the write-back path stores plaintext bytes the source already decrypted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceSse {
+    S3,
+    Kms { key_id: Option<String> },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceHead {
+    /// ETag with surrounding quotes stripped.
+    pub etag: Option<String>,
+    /// `Content-Length` of the response: the object size for HEAD and
+    /// unranged GET, the range length for a ranged GET.
+    pub size: u64,
+    pub last_modified: Option<SystemTime>,
+    pub content_type: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_disposition: Option<String>,
+    pub content_language: Option<String>,
+    pub cache_control: Option<String>,
+    pub expires: Option<String>,
+    /// `x-amz-meta-*` values keyed without the prefix, matching the stored
+    /// user-metadata shape.
+    pub user_metadata: HashMap<String, String>,
+    pub version_id: Option<String>,
+    pub storage_class: Option<String>,
+    pub sse: Option<SourceSse>,
+    pub is_multipart_etag: bool,
+    /// The provider's ETag is not derived from the object bytes (Azure
+    /// stamps an opaque concurrency token). Such an ETag is recorded for
+    /// provenance but must never be read as a content digest, so the
+    /// write-back path refuses to use it as the expected MD5.
+    pub etag_is_opaque: bool,
+}
+
+/// Per-operation fields shared by HEAD and GET outputs.
+struct HeadParts {
+    etag: Option<String>,
+    content_length: Option<i64>,
+    last_modified: Option<SdkDateTime>,
+    content_type: Option<String>,
+    content_encoding: Option<String>,
+    content_disposition: Option<String>,
+    content_language: Option<String>,
+    cache_control: Option<String>,
+    expires: Option<String>,
+    metadata: Option<HashMap<String, String>>,
+    version_id: Option<String>,
+    storage_class: Option<String>,
+    server_side_encryption: Option<ServerSideEncryption>,
+    ssekms_key_id: Option<String>,
+    sse_customer_algorithm: Option<String>,
+}
+
+pub(super) fn normalize_etag(etag: Option<String>) -> Option<String> {
+    etag.map(|etag| etag.trim().trim_matches('"').to_string())
+        .filter(|etag| !etag.is_empty())
+}
+
+/// Multipart ETags end in `-<part count>`; single-part ETags are bare MD5.
+pub fn is_multipart_etag(etag: &str) -> bool {
+    etag.rsplit_once('-')
+        .is_some_and(|(_, parts)| !parts.is_empty() && parts.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn system_time(value: Option<SdkDateTime>) -> Option<SystemTime> {
+    value.and_then(|value| SystemTime::try_from(value).ok())
+}
+
+fn source_head(parts: HeadParts) -> Result<SourceHead, SourceError> {
+    if parts.sse_customer_algorithm.is_some() {
+        return Err(SourceError::Unsupported(
+            "source object is encrypted with SSE-C; customer-key sources are not supported".to_string(),
+        ));
+    }
+    let size = parts
+        .content_length
+        .and_then(|length| u64::try_from(length).ok())
+        .ok_or_else(|| SourceError::Other("source response has no valid content-length".to_string()))?;
+    let etag = normalize_etag(parts.etag);
+    let is_multipart_etag = etag.as_deref().is_some_and(is_multipart_etag);
+    let sse = parts.server_side_encryption.map(|sse| match sse {
+        ServerSideEncryption::Aes256 => SourceSse::S3,
+        _ => SourceSse::Kms {
+            key_id: parts.ssekms_key_id,
+        },
+    });
+
+    Ok(SourceHead {
+        etag,
+        size,
+        last_modified: system_time(parts.last_modified),
+        content_type: parts.content_type,
+        content_encoding: parts.content_encoding,
+        content_disposition: parts.content_disposition,
+        content_language: parts.content_language,
+        cache_control: parts.cache_control,
+        expires: parts.expires,
+        user_metadata: parts.metadata.unwrap_or_default(),
+        version_id: parts.version_id,
+        storage_class: parts.storage_class,
+        sse,
+        is_multipart_etag,
+        etag_is_opaque: false,
+    })
+}
+
+fn source_head_from_head_output(output: HeadObjectOutput) -> Result<SourceHead, SourceError> {
+    source_head(HeadParts {
+        etag: output.e_tag,
+        content_length: output.content_length,
+        last_modified: output.last_modified,
+        content_type: output.content_type,
+        content_encoding: output.content_encoding,
+        content_disposition: output.content_disposition,
+        content_language: output.content_language,
+        cache_control: output.cache_control,
+        expires: output.expires_string,
+        metadata: output.metadata,
+        version_id: output.version_id,
+        storage_class: output.storage_class.map(|class| class.as_str().to_string()),
+        server_side_encryption: output.server_side_encryption,
+        ssekms_key_id: output.ssekms_key_id,
+        sse_customer_algorithm: output.sse_customer_algorithm,
+    })
+}
+
+/// Ranged/unranged GET response: `head` describes the returned bytes.
+pub struct SourceGet {
+    pub head: SourceHead,
+    pub body: ByteStream,
+    /// `Content-Range` of a ranged response (`bytes a-b/total`).
+    pub content_range: Option<String>,
+}
+
+impl fmt::Debug for SourceGet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceGet")
+            .field("head", &self.head)
+            .field("content_range", &self.content_range)
+            .finish_non_exhaustive()
+    }
+}
+
+fn source_get_from_output(output: GetObjectOutput) -> Result<SourceGet, SourceError> {
+    let content_range = output.content_range;
+    let body = output.body;
+    let head = source_head(HeadParts {
+        etag: output.e_tag,
+        content_length: output.content_length,
+        last_modified: output.last_modified,
+        content_type: output.content_type,
+        content_encoding: output.content_encoding,
+        content_disposition: output.content_disposition,
+        content_language: output.content_language,
+        cache_control: output.cache_control,
+        expires: output.expires_string,
+        metadata: output.metadata,
+        version_id: output.version_id,
+        storage_class: output.storage_class.map(|class| class.as_str().to_string()),
+        server_side_encryption: output.server_side_encryption,
+        ssekms_key_id: output.ssekms_key_id,
+        sse_customer_algorithm: output.sse_customer_algorithm,
+    })?;
+    Ok(SourceGet {
+        head,
+        body,
+        content_range,
+    })
+}
+
+/// Renders an `HTTPRangeSpec` as the `Range` header value sent to the source.
+pub fn range_header_value(range: &HTTPRangeSpec) -> Result<String, SourceError> {
+    if range.is_suffix_length {
+        let suffix = range.start.unsigned_abs();
+        if suffix == 0 {
+            return Err(SourceError::Other("invalid range: zero suffix length".to_string()));
+        }
+        return Ok(format!("bytes=-{suffix}"));
+    }
+    if range.start < 0 {
+        return Err(SourceError::Other("invalid range: negative start".to_string()));
+    }
+    match range.end {
+        -1 => Ok(format!("bytes={}-", range.start)),
+        end if end >= range.start => Ok(format!("bytes={}-{end}", range.start)),
+        _ => Err(SourceError::Other("invalid range: end precedes start".to_string())),
+    }
+}
+
+/// One listing entry, keyed in the local namespace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceObject {
+    pub key: String,
+    pub etag: Option<String>,
+    pub size: u64,
+    pub last_modified: Option<SystemTime>,
+    pub storage_class: Option<String>,
+    pub is_multipart_etag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourcePage {
+    pub objects: Vec<SourceObject>,
+    /// Rolled-up prefixes, in the same namespace as `objects`; always empty when the
+    /// request carried no delimiter.
+    pub common_prefixes: Vec<String>,
+    pub is_truncated: bool,
+    pub next_continuation_token: Option<String>,
+}
+
+/// One `ListObjectsV2` page request against the source. Keys are given in the
+/// local namespace at `SourceClient`, and in the source namespace at
+/// `SourceBackend`; `SourceClient` maps them through `source_prefix`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceListRequest<'a> {
+    pub prefix: Option<&'a str>,
+    /// Rolls the source's own listing up the same way the local one is rolled
+    /// up, so a page under a delimiter stays bounded.
+    pub delimiter: Option<&'a str>,
+    /// Ignored by S3 when `continuation_token` is set, so the caller must pass
+    /// at most one of the two.
+    pub start_after: Option<&'a str>,
+    pub continuation_token: Option<&'a str>,
+    pub max_keys: i32,
+}
+
+/// Result of [`SourceClient::probe`]: the bucket answered HEAD and a
+/// one-key listing succeeded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceProbe {
+    pub sample_object: Option<SourceObject>,
+    pub has_more_objects: bool,
+}
+
+/// Adds the `source-proxy-request` anti-loop markers before signing so they
+/// join the SigV4 canonical request (same shape as the replication proxy).
+#[derive(Debug)]
+struct SourceProxyMarkerInterceptor {
+    headers: HeaderMap,
+}
+
+impl SourceProxyMarkerInterceptor {
+    fn new() -> Self {
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_PROXY_REQUEST, "true");
+        Self { headers }
+    }
+}
+
+impl Intercept for SourceProxyMarkerInterceptor {
+    fn name(&self) -> &'static str {
+        "RustfsSourceProxyMarker"
+    }
+
+    fn modify_before_signing(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let request_headers = context.request_mut().headers_mut();
+        for (name, value) in &self.headers {
+            request_headers.try_insert(name.clone(), value.clone())?;
+        }
+        Ok(())
+    }
+}
+
+/// Read-only provider operations in the source bucket namespace.
+///
+/// Implementations must preserve streaming, honor the requested range and
+/// pagination cursor, and classify failures without including credentials.
+/// `SourceClient` owns prefix mapping so every provider shares the same local
+/// namespace. Continuation tokens are opaque and must never be prefix-mapped.
+#[async_trait::async_trait]
+pub trait SourceBackend: Send + Sync {
+    async fn head(&self, key: &str) -> Result<SourceHead, SourceError>;
+    async fn get(&self, key: &str, range: Option<&HTTPRangeSpec>) -> Result<SourceGet, SourceError>;
+    async fn list(&self, request: &SourceListRequest<'_>) -> Result<SourcePage, SourceError>;
+    async fn tagging(&self, key: &str) -> Result<HashMap<String, String>, SourceError>;
+    /// Verify bucket access; `SourceClient` separately probes a filtered listing.
+    async fn probe(&self) -> Result<(), SourceError>;
+}
+
+/// S3-compatible implementation, including request signing and anti-loop headers.
+pub struct S3SourceBackend {
+    client: S3Client,
+    bucket: String,
+}
+
+pub struct SourceClient {
+    backend: Box<dyn SourceBackend>,
+    endpoint: String,
+    bucket: String,
+    source_prefix: Option<String>,
+    timeouts: SourceTimeouts,
+    bandwidth_limit: Option<NonZeroU64>,
+}
+
+impl fmt::Debug for SourceClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceClient")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("source_prefix", &self.source_prefix)
+            .field("timeouts", &self.timeouts)
+            .field("bandwidth_limit", &self.bandwidth_limit)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SourceClient {
+    pub async fn new(spec: &SourceClientSpec) -> Result<Self, RemoteS3ClientError> {
+        match &spec.backend {
+            SourceBackendSpec::S3 => {
+                let endpoint = spec.endpoint_spec()?;
+                let config = build_remote_s3_config(&endpoint).await?;
+                Ok(Self::from_config_builder(config, endpoint.endpoint_url(), spec))
+            }
+            SourceBackendSpec::Azure(azure) => {
+                let backend = AzureSourceBackend::new(
+                    &spec.endpoint,
+                    &spec.bucket,
+                    azure,
+                    spec.timeouts,
+                    spec.skip_tls_verify,
+                    spec.ca_cert_pem.as_deref(),
+                )?;
+                Ok(Self::from_backend(Box::new(backend), spec))
+            }
+            #[cfg(not(feature = "gcs"))]
+            SourceBackendSpec::Gcs(_) => Err(RemoteS3ClientError::BackendNotCompiled("gcs_native")),
+            #[cfg(feature = "gcs")]
+            SourceBackendSpec::Gcs(gcs) => {
+                let backend = GcsNativeSourceBackend::new(
+                    &spec.endpoint,
+                    &spec.bucket,
+                    gcs,
+                    spec.timeouts,
+                    spec.skip_tls_verify,
+                    spec.ca_cert_pem.as_deref(),
+                )?;
+                Ok(Self::from_backend(Box::new(backend), spec))
+            }
+        }
+    }
+
+    /// Wraps a ready backend in the prefix-mapping client. The endpoint is
+    /// kept only for `Debug` and admin status.
+    fn from_backend(backend: Box<dyn SourceBackend>, spec: &SourceClientSpec) -> Self {
+        Self {
+            backend,
+            endpoint: spec.endpoint.clone(),
+            bucket: spec.bucket.clone(),
+            source_prefix: spec.source_prefix.clone().filter(|prefix| !prefix.is_empty()),
+            timeouts: spec.timeouts,
+            bandwidth_limit: spec.bandwidth_limit,
+        }
+    }
+
+    /// `config` must come from [`SourceClientSpec::endpoint_spec`], which is
+    /// where the policy disabling SDK-level retries is declared.
+    fn from_config_builder(config: aws_sdk_s3::config::Builder, endpoint: String, spec: &SourceClientSpec) -> Self {
+        let client = S3Client::from_conf(config.interceptor(SourceProxyMarkerInterceptor::new()).build());
+        Self {
+            backend: Box::new(S3SourceBackend {
+                client,
+                bucket: spec.bucket.clone(),
+            }),
+            endpoint,
+            bucket: spec.bucket.clone(),
+            source_prefix: spec.source_prefix.clone().filter(|prefix| !prefix.is_empty()),
+            timeouts: spec.timeouts,
+            bandwidth_limit: spec.bandwidth_limit,
+        }
+    }
+
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub fn source_prefix(&self) -> Option<&str> {
+        self.source_prefix.as_deref()
+    }
+
+    pub fn timeouts(&self) -> SourceTimeouts {
+        self.timeouts
+    }
+
+    pub fn bandwidth_limit(&self) -> Option<NonZeroU64> {
+        self.bandwidth_limit
+    }
+
+    /// Source-side key for a local key.
+    pub fn source_key(&self, local_key: &str) -> String {
+        match &self.source_prefix {
+            Some(prefix) => format!("{prefix}{local_key}"),
+            None => local_key.to_string(),
+        }
+    }
+
+    /// Local key for a source key; `None` when the key lies outside the
+    /// configured prefix.
+    pub fn local_key<'a>(&self, source_key: &'a str) -> Option<&'a str> {
+        match &self.source_prefix {
+            Some(prefix) => source_key.strip_prefix(prefix.as_str()),
+            None => Some(source_key),
+        }
+    }
+
+    pub async fn head_object(&self, key: &str) -> Result<SourceHead, SourceError> {
+        self.backend.head(&self.source_key(key)).await
+    }
+
+    /// Streams the object, preserving an optional HTTP byte range.
+    pub async fn get_object(&self, key: &str, range: Option<&HTTPRangeSpec>) -> Result<SourceGet, SourceError> {
+        self.backend.get(&self.source_key(key), range).await
+    }
+
+    /// Lists one page under the local prefix.
+    pub async fn list_objects_v2(
+        &self,
+        prefix: Option<&str>,
+        continuation_token: Option<&str>,
+        max_keys: i32,
+    ) -> Result<SourcePage, SourceError> {
+        self.list_page(&SourceListRequest {
+            prefix,
+            continuation_token,
+            max_keys,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Maps keys and common prefixes while leaving opaque cursors untouched.
+    pub async fn list_page(&self, request: &SourceListRequest<'_>) -> Result<SourcePage, SourceError> {
+        let prefix = self.source_key(request.prefix.unwrap_or_default());
+        let start_after = request.start_after.map(|key| self.source_key(key));
+        let mut page = self
+            .backend
+            .list(&SourceListRequest {
+                prefix: Some(&prefix),
+                start_after: start_after.as_deref(),
+                ..*request
+            })
+            .await?;
+        validate_list_page(page.is_truncated, request.continuation_token, page.next_continuation_token.as_deref())?;
+        page.objects = page
+            .objects
+            .into_iter()
+            .filter_map(|object| self.local_object(object))
+            .collect();
+        page.common_prefixes = page
+            .common_prefixes
+            .into_iter()
+            .filter_map(|prefix| self.local_key(&prefix).map(str::to_string))
+            .collect();
+        Ok(page)
+    }
+
+    fn local_object(&self, mut object: SourceObject) -> Option<SourceObject> {
+        object.key = self.local_key(&object.key)?.to_string();
+        Some(object)
+    }
+
+    pub async fn get_object_tagging(&self, key: &str) -> Result<HashMap<String, String>, SourceError> {
+        self.backend.tagging(&self.source_key(key)).await
+    }
+
+    pub async fn probe(&self) -> Result<SourceProbe, SourceError> {
+        self.backend.probe().await?;
+        let page = self.list_objects_v2(None, None, 1).await?;
+        Ok(SourceProbe {
+            sample_object: page.objects.into_iter().next(),
+            has_more_objects: page.is_truncated,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl SourceBackend for S3SourceBackend {
+    async fn head(&self, key: &str) -> Result<SourceHead, SourceError> {
+        match self.client.head_object().bucket(&self.bucket).key(key).send().await {
+            Ok(output) => source_head_from_head_output(output),
+            Err(err) if err.raw_response().is_some_and(|response| response.status().as_u16() == 404) => {
+                // HEAD has no error body: a missing bucket must not poison
+                // the per-key negative cache as though only the key was absent.
+                self.probe().await?;
+                Err(SourceError::NotFound)
+            }
+            Err(err) => Err(classify_sdk_error(err)),
+        }
+    }
+
+    /// Streams the object; `range` is passed through as an HTTP `Range`
+    /// header and omitted entirely when `None`.
+    async fn get(&self, key: &str, range: Option<&HTTPRangeSpec>) -> Result<SourceGet, SourceError> {
+        let range = range.map(range_header_value).transpose()?;
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .set_range(range)
+            .send()
+            .await
+            .map_err(classify_sdk_error)?;
+        source_get_from_output(output)
+    }
+
+    async fn list(&self, request: &SourceListRequest<'_>) -> Result<SourcePage, SourceError> {
+        // `start_after` is silently ignored by S3 once a continuation token is
+        // present; refuse the ambiguous pair rather than list from the wrong
+        // position.
+        if request.continuation_token.is_some() && request.start_after.is_some() {
+            return Err(SourceError::Other(
+                "source listing takes either a continuation token or start-after, not both".to_string(),
+            ));
+        }
+        let output = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(request.prefix.unwrap_or_default())
+            .set_delimiter(request.delimiter.map(str::to_string))
+            .set_start_after(request.start_after.map(str::to_string))
+            .set_continuation_token(request.continuation_token.map(str::to_string))
+            .max_keys(request.max_keys)
+            .send()
+            .await
+            .map_err(classify_sdk_error)?;
+
+        let is_truncated = output.is_truncated.unwrap_or(false);
+        let next_continuation_token = output.next_continuation_token;
+        let objects = output
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .map(s3_source_object)
+            .collect::<Result<Vec<_>, _>>()?;
+        let common_prefixes = output
+            .common_prefixes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|prefix| prefix.prefix)
+            .collect();
+
+        Ok(SourcePage {
+            objects,
+            common_prefixes,
+            is_truncated,
+            next_continuation_token,
+        })
+    }
+
+    async fn tagging(&self, key: &str) -> Result<HashMap<String, String>, SourceError> {
+        let output = self
+            .client
+            .get_object_tagging()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(classify_sdk_error)?;
+        Ok(output.tag_set.into_iter().map(|tag| (tag.key, tag.value)).collect())
+    }
+
+    async fn probe(&self) -> Result<(), SourceError> {
+        self.client
+            .head_bucket()
+            .bucket(&self.bucket)
+            .send()
+            .await
+            .map_err(classify_sdk_error)?;
+        Ok(())
+    }
+}
+
+fn s3_source_object(object: SdkObject) -> Result<SourceObject, SourceError> {
+    let key = object
+        .key
+        .ok_or_else(|| SourceError::Other("source listing object has no key".to_string()))?;
+    let size = object
+        .size
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or_else(|| SourceError::Other("source listing object has no valid size".to_string()))?;
+    let etag = normalize_etag(object.e_tag);
+    let is_multipart_etag = etag.as_deref().is_some_and(is_multipart_etag);
+    Ok(SourceObject {
+        key,
+        etag,
+        size,
+        last_modified: system_time(object.last_modified),
+        storage_class: object.storage_class.map(|class| class.as_str().to_string()),
+        is_multipart_etag,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::on_demand_migration::backend_contract::{BackendCapabilities, OBJECT_MD5, assert_backend_contract};
+    use aws_smithy_runtime_api::client::http::{HttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn};
+    use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
+    use aws_smithy_runtime_api::client::result::ConnectorError;
+    use aws_smithy_runtime_api::http::StatusCode as SmithyStatusCode;
+    use aws_smithy_types::body::SdkBody;
+    use proptest::prelude::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug)]
+    struct RecordedRequest {
+        method: String,
+        uri: String,
+        headers: Vec<(String, String)>,
+    }
+
+    impl RecordedRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum Scripted {
+        Response {
+            status: u16,
+            headers: Vec<(&'static str, String)>,
+            body: Vec<u8>,
+        },
+        Io,
+        Timeout,
+    }
+
+    fn ok(headers: Vec<(&'static str, String)>, body: &str) -> Scripted {
+        Scripted::Response {
+            status: 200,
+            headers,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn status(status: u16, body: &str) -> Scripted {
+        Scripted::Response {
+            status,
+            headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    type Recorded = Arc<Mutex<Vec<RecordedRequest>>>;
+
+    #[derive(Clone, Debug)]
+    struct ScriptedConnector {
+        requests: Recorded,
+        responses: Arc<Mutex<VecDeque<Scripted>>>,
+    }
+
+    impl HttpConnector for ScriptedConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            self.requests
+                .lock()
+                .expect("recorded request lock should not be poisoned")
+                .push(RecordedRequest {
+                    method: request.method().to_string(),
+                    uri: request.uri().to_string(),
+                    headers: request
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                });
+            let next = self
+                .responses
+                .lock()
+                .expect("scripted response lock should not be poisoned")
+                .pop_front()
+                .expect("test script must provide a response for every request");
+            match next {
+                Scripted::Response { status, headers, body } => {
+                    let mut response = HttpResponse::new(
+                        SmithyStatusCode::try_from(status).expect("scripted status should be valid"),
+                        SdkBody::from(body),
+                    );
+                    for (name, value) in headers {
+                        response.headers_mut().insert(name, value);
+                    }
+                    HttpConnectorFuture::ready(Ok(response))
+                }
+                Scripted::Io => HttpConnectorFuture::ready(Err(ConnectorError::io("connection refused".into()))),
+                Scripted::Timeout => HttpConnectorFuture::ready(Err(ConnectorError::timeout("connect timed out".into()))),
+            }
+        }
+    }
+
+    fn spec(source_prefix: Option<&str>) -> SourceClientSpec {
+        SourceClientSpec {
+            endpoint: "https://source.example.com".to_string(),
+            region: "us-east-1".to_string(),
+            bucket: "source-bucket".to_string(),
+            source_prefix: source_prefix.map(str::to_string),
+            provider: SourceProvider::Minio,
+            path_style: PathStyle::Auto,
+            credentials: Some(RemoteCredentials {
+                access_key: "access".to_string(),
+                secret_key: "very-secret".to_string(),
+                session_token: Some("session-token".to_string()),
+                expiration: None,
+                account_id: String::new(),
+            }),
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+            retry: RemoteS3RetryPolicy::Disabled,
+            timeouts: SourceTimeouts::default(),
+            bandwidth_limit: NonZeroU64::new(1_000_000),
+            backend: SourceBackendSpec::S3,
+        }
+    }
+
+    #[cfg(not(feature = "gcs"))]
+    #[tokio::test]
+    async fn gcs_backend_not_compiled_keeps_hmac_s3_available() {
+        let mut native = spec(None);
+        native.provider = SourceProvider::GcsNative;
+        native.credentials = None;
+        native.backend = SourceBackendSpec::Gcs(GcsSourceSpec {
+            service_account_json: "{}".to_string(),
+        });
+        assert!(matches!(
+            SourceClient::new(&native).await,
+            Err(RemoteS3ClientError::BackendNotCompiled("gcs_native"))
+        ));
+
+        let mut hmac = spec(None);
+        hmac.provider = SourceProvider::Gcs;
+        hmac.endpoint = "https://storage.googleapis.com".to_string();
+        SourceClient::new(&hmac)
+            .await
+            .expect("GCS HMAC uses the always-available S3 backend");
+    }
+
+    async fn scripted_client(spec: &SourceClientSpec, responses: Vec<Scripted>) -> (SourceClient, Recorded) {
+        let requests: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let connector = SharedHttpConnector::new(ScriptedConnector {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+        });
+        let http_client = http_client_fn(move |_settings, _components| connector.clone());
+        let endpoint = spec.endpoint_spec().expect("test spec endpoint should parse");
+        let config = build_remote_s3_config(&endpoint)
+            .await
+            .expect("test spec should build")
+            .http_client(http_client);
+        (SourceClient::from_config_builder(config, endpoint.endpoint_url(), spec), requests)
+    }
+
+    fn recorded(requests: &Recorded) -> Vec<RecordedRequest> {
+        requests.lock().expect("recorded request lock should not be poisoned").clone()
+    }
+
+    fn assert_outbound_markers(request: &RecordedRequest) {
+        assert_eq!(
+            request.header("x-rustfs-source-proxy-request"),
+            Some("true"),
+            "{} {} must carry the rustfs anti-loop marker",
+            request.method,
+            request.uri
+        );
+        assert_eq!(
+            request.header("x-minio-source-proxy-request"),
+            Some("true"),
+            "{} {} must carry the minio anti-loop marker",
+            request.method,
+            request.uri
+        );
+        let user_agent = request.header("user-agent").expect("SDK request must carry a user-agent");
+        assert!(
+            user_agent.ends_with(&format!(" {USER_AGENT_SUFFIX}")),
+            "user-agent {user_agent} must end with the migration suffix"
+        );
+        assert!(request.header("authorization").is_some(), "request must be signed");
+        assert!(request.header("x-amz-security-token").is_some(), "session token must be signed in");
+    }
+
+    fn head_headers() -> Vec<(&'static str, String)> {
+        vec![
+            ("etag", "\"d41d8cd98f00b204e9800998ecf8427e-3\"".to_string()),
+            ("content-length", "1234".to_string()),
+            ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+            ("content-type", "text/plain".to_string()),
+            ("content-encoding", "gzip".to_string()),
+            ("content-disposition", "attachment; filename=\"a.txt\"".to_string()),
+            ("content-language", "en".to_string()),
+            ("cache-control", "max-age=60".to_string()),
+            ("expires", "Thu, 01 Jan 2026 00:00:00 GMT".to_string()),
+            ("x-amz-meta-owner", "alice".to_string()),
+            ("x-amz-meta-tier", "hot".to_string()),
+            ("x-amz-version-id", "v1".to_string()),
+            ("x-amz-storage-class", "STANDARD_IA".to_string()),
+            ("x-amz-server-side-encryption", "aws:kms".to_string()),
+            ("x-amz-server-side-encryption-aws-kms-key-id", "key-1".to_string()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn head_object_maps_source_head_fields() {
+        let (client, requests) = scripted_client(&spec(Some("data/")), vec![ok(head_headers(), "")]).await;
+        let head = client.head_object("dir/obj.txt").await.expect("HEAD should map");
+
+        let requests = recorded(&requests);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "HEAD");
+        assert!(
+            requests[0]
+                .uri
+                .starts_with("https://source.example.com/source-bucket/data/dir/obj.txt"),
+            "path-style URI with prefix expected, got {}",
+            requests[0].uri
+        );
+        assert_outbound_markers(&requests[0]);
+
+        assert_eq!(head.etag.as_deref(), Some("d41d8cd98f00b204e9800998ecf8427e-3"));
+        assert!(head.is_multipart_etag);
+        assert_eq!(head.size, 1234);
+        assert_eq!(head.last_modified, Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_445_412_480)));
+        assert_eq!(head.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(head.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(head.content_disposition.as_deref(), Some("attachment; filename=\"a.txt\""));
+        assert_eq!(head.content_language.as_deref(), Some("en"));
+        assert_eq!(head.cache_control.as_deref(), Some("max-age=60"));
+        assert_eq!(head.expires.as_deref(), Some("Thu, 01 Jan 2026 00:00:00 GMT"));
+        assert_eq!(
+            head.user_metadata,
+            HashMap::from([
+                ("owner".to_string(), "alice".to_string()),
+                ("tier".to_string(), "hot".to_string())
+            ])
+        );
+        assert_eq!(head.version_id.as_deref(), Some("v1"));
+        assert_eq!(head.storage_class.as_deref(), Some("STANDARD_IA"));
+        assert_eq!(
+            head.sse,
+            Some(SourceSse::Kms {
+                key_id: Some("key-1".to_string())
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn head_object_recognizes_sse_s3_and_single_part_etag() {
+        let headers = vec![
+            ("etag", "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string()),
+            ("content-length", "0".to_string()),
+            ("x-amz-server-side-encryption", "AES256".to_string()),
+        ];
+        let (client, _) = scripted_client(&spec(None), vec![ok(headers, "")]).await;
+        let head = client.head_object("obj").await.expect("HEAD should map");
+        assert_eq!(head.sse, Some(SourceSse::S3));
+        assert!(!head.is_multipart_etag);
+        assert_eq!(head.size, 0);
+        assert!(head.user_metadata.is_empty());
+    }
+
+    #[tokio::test]
+    async fn head_object_rejects_sse_c_source_objects() {
+        let headers = vec![
+            ("etag", "\"abc\"".to_string()),
+            ("content-length", "10".to_string()),
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256".to_string()),
+        ];
+        let (client, _) = scripted_client(&spec(None), vec![ok(headers, "")]).await;
+        let err = client
+            .head_object("obj")
+            .await
+            .expect_err("SSE-C source objects are unsupported");
+        assert!(matches!(err, SourceError::Unsupported(_)), "{err:?}");
+        assert_eq!(err.class_label(), "unsupported");
+        assert!(!err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn get_object_passes_range_through_and_streams_body() {
+        let headers = vec![
+            ("etag", "\"abc\"".to_string()),
+            ("content-length", "5".to_string()),
+            ("content-range", "bytes 10-14/100".to_string()),
+        ];
+        let (client, requests) = scripted_client(&spec(Some("data/")), vec![ok(headers, "hello")]).await;
+        let range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 10,
+            end: 14,
+        };
+        let get = client
+            .get_object("obj", Some(&range))
+            .await
+            .expect("ranged GET should succeed");
+
+        let requests = recorded(&requests);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].header("range"), Some("bytes=10-14"));
+        assert_outbound_markers(&requests[0]);
+
+        assert_eq!(get.content_range.as_deref(), Some("bytes 10-14/100"));
+        assert_eq!(get.head.size, 5);
+        let body = get.body.collect().await.expect("body should stream").into_bytes();
+        assert_eq!(body.as_ref(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn get_object_without_range_sends_no_range_header() {
+        let headers = vec![("etag", "\"abc\"".to_string()), ("content-length", "5".to_string())];
+        let (client, requests) = scripted_client(&spec(None), vec![ok(headers, "hello")]).await;
+        let get = client.get_object("obj", None).await.expect("GET should succeed");
+        let requests = recorded(&requests);
+        assert!(requests[0].header("range").is_none(), "unranged GET must not send Range");
+        assert!(get.content_range.is_none());
+    }
+
+    #[test]
+    fn range_header_value_covers_open_and_suffix_forms() {
+        let render = |is_suffix_length, start, end| {
+            range_header_value(&HTTPRangeSpec {
+                is_suffix_length,
+                start,
+                end,
+            })
+        };
+        assert_eq!(render(false, 0, 99).expect("closed range"), "bytes=0-99");
+        assert_eq!(render(false, 5, -1).expect("open range"), "bytes=5-");
+        assert_eq!(render(true, 10, -1).expect("suffix range"), "bytes=-10");
+        assert_eq!(render(true, -10, -1).expect("negative suffix range"), "bytes=-10");
+        assert!(render(true, 0, -1).is_err());
+        assert!(render(false, -1, 5).is_err());
+        assert!(render(false, 10, 5).is_err());
+    }
+
+    const LIST_PAGE_ONE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>source-bucket</Name>
+  <Prefix>data/photos/</Prefix>
+  <MaxKeys>2</MaxKeys>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>token-1</NextContinuationToken>
+  <Contents>
+    <Key>data/photos/a.jpg</Key>
+    <LastModified>2015-10-21T07:28:00.000Z</LastModified>
+    <ETag>&quot;aaaa-2&quot;</ETag>
+    <Size>42</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+  <Contents>
+    <Key>outside/b.jpg</Key>
+    <ETag>&quot;bbbb&quot;</ETag>
+    <Size>7</Size>
+  </Contents>
+</ListBucketResult>"#;
+
+    const LIST_PAGE_TWO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>source-bucket</Name>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>data/photos/c.jpg</Key>
+    <ETag>&quot;cccc&quot;</ETag>
+    <Size>1</Size>
+  </Contents>
+</ListBucketResult>"#;
+
+    const LIST_TRUNCATED_WITHOUT_TOKEN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>source-bucket</Name>
+  <IsTruncated>true</IsTruncated>
+</ListBucketResult>"#;
+
+    #[tokio::test]
+    async fn list_objects_v2_pages_and_strips_source_prefix() {
+        let (client, requests) =
+            scripted_client(&spec(Some("data/")), vec![ok(Vec::new(), LIST_PAGE_ONE), ok(Vec::new(), LIST_PAGE_TWO)]).await;
+
+        let page = client
+            .list_objects_v2(Some("photos/"), None, 2)
+            .await
+            .expect("first page should list");
+        assert!(page.is_truncated);
+        assert_eq!(page.next_continuation_token.as_deref(), Some("token-1"));
+        assert_eq!(
+            page.objects,
+            vec![SourceObject {
+                key: "photos/a.jpg".to_string(),
+                etag: Some("aaaa-2".to_string()),
+                size: 42,
+                last_modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_445_412_480)),
+                storage_class: Some("STANDARD".to_string()),
+                is_multipart_etag: true,
+            }],
+            "entries outside the source prefix are dropped"
+        );
+
+        let page = client
+            .list_objects_v2(Some("photos/"), page.next_continuation_token.as_deref(), 2)
+            .await
+            .expect("second page should list");
+        assert!(!page.is_truncated);
+        assert!(page.next_continuation_token.is_none());
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.objects[0].key, "photos/c.jpg");
+        assert!(!page.objects[0].is_multipart_etag);
+
+        let requests = recorded(&requests);
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_eq!(request.method, "GET");
+            assert!(request.uri.contains("list-type=2"), "{}", request.uri);
+            assert!(request.uri.contains("prefix=data%2Fphotos%2F"), "{}", request.uri);
+            assert!(request.uri.contains("max-keys=2"), "{}", request.uri);
+            assert_outbound_markers(request);
+        }
+        assert!(!requests[0].uri.contains("continuation-token"), "{}", requests[0].uri);
+        assert!(requests[1].uri.contains("continuation-token=token-1"), "{}", requests[1].uri);
+    }
+
+    #[tokio::test]
+    async fn list_page_maps_delimiter_prefixes_and_start_after_but_not_cursors() {
+        let body = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<IsTruncated>true</IsTruncated><NextContinuationToken>data/opaque</NextContinuationToken>
+<CommonPrefixes><Prefix>data/photos/</Prefix></CommonPrefixes>
+<CommonPrefixes><Prefix>outside/</Prefix></CommonPrefixes>
+</ListBucketResult>"#;
+        let next_body = body.replace("data/opaque", "data/next");
+        let (client, requests) =
+            scripted_client(&spec(Some("data/")), vec![ok(Vec::new(), body), ok(Vec::new(), &next_body)]).await;
+        let first = client
+            .list_page(&SourceListRequest {
+                prefix: Some("photos/"),
+                delimiter: Some("/"),
+                start_after: Some("photos/a"),
+                max_keys: 2,
+                ..Default::default()
+            })
+            .await
+            .expect("delimiter listing should succeed");
+        assert_eq!(first.common_prefixes, vec!["photos/"]);
+        assert_eq!(first.next_continuation_token.as_deref(), Some("data/opaque"));
+        let second = client
+            .list_page(&SourceListRequest {
+                continuation_token: first.next_continuation_token.as_deref(),
+                max_keys: 2,
+                ..Default::default()
+            })
+            .await
+            .expect("opaque continuation should succeed");
+        assert_eq!(second.common_prefixes, first.common_prefixes);
+        let requests = recorded(&requests);
+        let query = |request: &RecordedRequest| {
+            Url::parse(&request.uri)
+                .expect("request URI")
+                .query_pairs()
+                .into_owned()
+                .collect::<HashMap<_, _>>()
+        };
+        let first_query = query(&requests[0]);
+        assert_eq!(first_query.get("prefix").map(String::as_str), Some("data/photos/"));
+        assert_eq!(first_query.get("start-after").map(String::as_str), Some("data/photos/a"));
+        assert_eq!(first_query.get("delimiter").map(String::as_str), Some("/"));
+        let second_query = query(&requests[1]);
+        assert_eq!(second_query.get("continuation-token").map(String::as_str), Some("data/opaque"));
+        assert!(!second_query.contains_key("start-after"));
+    }
+
+    #[tokio::test]
+    async fn list_page_rejects_ambiguous_cursor_before_sending() {
+        let (client, requests) = scripted_client(&spec(Some("data/")), vec![]).await;
+        let err = client
+            .list_page(&SourceListRequest {
+                start_after: Some("a"),
+                continuation_token: Some("opaque"),
+                max_keys: 1,
+                ..Default::default()
+            })
+            .await
+            .expect_err("ambiguous list position must fail");
+        assert!(matches!(err, SourceError::Other(_)));
+        assert!(recorded(&requests).is_empty(), "invalid request must never reach the source");
+    }
+
+    #[tokio::test]
+    async fn list_objects_v2_rejects_truncated_page_without_token() {
+        let (client, _) = scripted_client(&spec(None), vec![ok(Vec::new(), LIST_TRUNCATED_WITHOUT_TOKEN)]).await;
+        let err = client
+            .list_objects_v2(None, None, 10)
+            .await
+            .expect_err("truncated page without token is corrupt");
+        assert!(matches!(err, SourceError::InvalidPagination(ListPageError::Missing)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn list_page_validates_s3_cursor_progress_before_mapping_entries() {
+        for contents in ["", "<Contents><Key>data/a</Key><Size>1</Size></Contents>"] {
+            for (truncated, next, expected) in [
+                (true, None, Some(ListPageError::Missing)),
+                (true, Some(""), Some(ListPageError::Empty)),
+                (true, Some("stuck"), Some(ListPageError::Repeated)),
+                (true, Some("opaque-next"), None),
+                (false, None, None),
+                (false, Some("stuck"), None),
+            ] {
+                let next_xml = next
+                    .map(|next| format!("<NextContinuationToken>{next}</NextContinuationToken>"))
+                    .unwrap_or_default();
+                let body = format!(
+                    "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>{truncated}</IsTruncated>{next_xml}{contents}</ListBucketResult>"
+                );
+                let (client, requests) = scripted_client(&spec(Some("data/")), vec![ok(Vec::new(), &body)]).await;
+                let result = client
+                    .list_page(&SourceListRequest {
+                        continuation_token: Some("stuck"),
+                        max_keys: 2,
+                        ..Default::default()
+                    })
+                    .await;
+                match expected {
+                    Some(expected) => {
+                        let error = result.expect_err("malformed pagination must fail at the provider boundary");
+                        assert!(
+                            matches!(&error, SourceError::InvalidPagination(actual) if *actual == expected),
+                            "{error:?}"
+                        );
+                        assert_eq!(error.class_label(), "invalid_pagination");
+                        assert!(!error.is_retryable());
+                        assert!(!error.to_string().contains("stuck"), "errors must not echo opaque tokens");
+                    }
+                    None => {
+                        let page = result.expect("progressing empty/nonempty pages and EOF are valid");
+                        assert_eq!(page.is_truncated, truncated);
+                        assert_eq!(page.next_continuation_token.as_deref(), next);
+                        assert_eq!(page.objects.len(), usize::from(!contents.is_empty()));
+                        if let Some(object) = page.objects.first() {
+                            assert_eq!(object.key, "a");
+                        }
+                    }
+                }
+                let requests = recorded(&requests);
+                assert_eq!(requests.len(), 1, "invalid pagination must not be retried");
+                assert!(requests[0].uri.contains("continuation-token=stuck"));
+            }
+        }
+    }
+
+    struct ListOnlyBackend(SourcePage);
+
+    #[async_trait::async_trait]
+    impl SourceBackend for ListOnlyBackend {
+        async fn list(&self, request: &SourceListRequest<'_>) -> Result<SourcePage, SourceError> {
+            assert_eq!(request.continuation_token, Some("stuck"), "opaque cursors reach every provider unchanged");
+            Ok(self.0.clone())
+        }
+
+        async fn head(&self, _key: &str) -> Result<SourceHead, SourceError> {
+            panic!("unexpected HEAD in list test")
+        }
+        async fn get(&self, _key: &str, _range: Option<&HTTPRangeSpec>) -> Result<SourceGet, SourceError> {
+            panic!("unexpected GET in list test")
+        }
+        async fn tagging(&self, _key: &str) -> Result<HashMap<String, String>, SourceError> {
+            panic!("unexpected tagging in list test")
+        }
+        async fn probe(&self) -> Result<(), SourceError> {
+            panic!("unexpected probe in list test")
+        }
+    }
+
+    #[tokio::test]
+    async fn list_page_validates_non_s3_provider_cursors_at_the_common_boundary() {
+        for (next, expected) in [
+            (None, ListPageError::Missing),
+            (Some(""), ListPageError::Empty),
+            (Some("stuck"), ListPageError::Repeated),
+        ] {
+            let mut client = prefix_client(Some("data/".into()));
+            client.backend = Box::new(ListOnlyBackend(SourcePage {
+                is_truncated: true,
+                next_continuation_token: next.map(str::to_string),
+                ..Default::default()
+            }));
+            let error = client
+                .list_objects_v2(None, Some("stuck"), 2)
+                .await
+                .expect_err("all providers must advance pagination");
+            assert!(matches!(error, SourceError::InvalidPagination(actual) if actual == expected));
+        }
+    }
+
+    const TAGGING_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <TagSet>
+    <Tag><Key>env</Key><Value>prod</Value></Tag>
+    <Tag><Key>team</Key><Value>storage</Value></Tag>
+  </TagSet>
+</Tagging>"#;
+
+    #[tokio::test]
+    async fn get_object_tagging_and_probe_carry_markers_on_every_request() {
+        let (client, requests) = scripted_client(
+            &spec(Some("data/")),
+            vec![
+                ok(Vec::new(), TAGGING_BODY),
+                ok(Vec::new(), ""),
+                ok(Vec::new(), LIST_PAGE_ONE),
+            ],
+        )
+        .await;
+
+        let tags = client.get_object_tagging("obj").await.expect("tagging should parse");
+        assert_eq!(
+            tags,
+            HashMap::from([
+                ("env".to_string(), "prod".to_string()),
+                ("team".to_string(), "storage".to_string())
+            ])
+        );
+
+        let probe = client.probe().await.expect("probe should succeed");
+        assert!(probe.has_more_objects);
+        assert_eq!(probe.sample_object.as_ref().map(|object| object.key.as_str()), Some("photos/a.jpg"));
+
+        let requests = recorded(&requests);
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].uri.contains("tagging"), "{}", requests[0].uri);
+        assert_eq!(requests[1].method, "HEAD");
+        assert!(requests[2].uri.contains("max-keys=1"), "{}", requests[2].uri);
+        for request in &requests {
+            assert_outbound_markers(request);
+        }
+    }
+
+    const SLOW_DOWN_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>"#;
+    const ACCESS_DENIED_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"#;
+
+    #[tokio::test]
+    async fn source_error_classification_covers_every_class() {
+        let cases: Vec<(Scripted, &str, bool)> = vec![
+            (status(404, ""), "other", false),
+            (status(404, "<Error><Code>NoSuchKey</Code></Error>"), "not_found", false),
+            (status(404, "<Error><Code>NoSuchBucket</Code></Error>"), "other", false),
+            (status(404, "<Error><Code>NoSuchVersion</Code></Error>"), "other", false),
+            (status(403, ACCESS_DENIED_BODY), "access_denied", false),
+            (status(401, ""), "access_denied", false),
+            (status(429, ""), "throttled", true),
+            (status(503, SLOW_DOWN_BODY), "throttled", true),
+            (status(500, ""), "server_error", true),
+            (status(502, ""), "server_error", true),
+            (Scripted::Io, "connect", true),
+            (Scripted::Timeout, "timeout", true),
+        ];
+        for (scripted, expected_label, retryable) in cases {
+            let (client, _) = scripted_client(&spec(None), vec![scripted.clone()]).await;
+            let err = match client.get_object("obj", None).await {
+                Ok(_) => panic!("{scripted:?} must fail"),
+                Err(err) => err,
+            };
+            assert_eq!(err.class_label(), expected_label, "{scripted:?} -> {err:?}");
+            assert_eq!(err.is_retryable(), retryable, "{scripted:?} -> {err:?}");
+            if let SourceError::ServerError(code) = &err {
+                assert!(matches!(scripted, Scripted::Response { status, .. } if status == *code));
+            }
+        }
+
+        let (client, requests) = scripted_client(&spec(None), vec![status(404, ""), status(200, "")]).await;
+        assert!(matches!(client.head_object("missing").await, Err(SourceError::NotFound)));
+        assert_eq!(recorded(&requests).len(), 2, "ambiguous HEAD 404 must check the bucket");
+        let (client, _) = scripted_client(&spec(None), vec![status(404, ""), status(404, "")]).await;
+        assert!(matches!(client.head_object("missing").await, Err(SourceError::Other(_))));
+        let (client, _) = scripted_client(&spec(None), vec![status(404, ""), status(403, "")]).await;
+        assert!(matches!(client.head_object("missing").await, Err(SourceError::AccessDenied)));
+        let (client, _) = scripted_client(&spec(None), vec![status(403, "")]).await;
+        assert!(matches!(client.head_object("secret").await, Err(SourceError::AccessDenied)));
+    }
+
+    #[test]
+    fn source_listing_rejects_missing_and_negative_sizes() {
+        for size in [None, Some(-1)] {
+            let object = SdkObject::builder().key("key").set_size(size).build();
+            assert!(matches!(s3_source_object(object), Err(SourceError::Other(_))));
+        }
+        assert!(matches!(
+            s3_source_object(SdkObject::builder().size(0).build()),
+            Err(SourceError::Other(_))
+        ));
+        assert_eq!(
+            s3_source_object(SdkObject::builder().key("empty").size(0).build())
+                .expect("empty object")
+                .size,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn source_client_debug_redacts_credentials() {
+        let (client, _) = scripted_client(&spec(Some("data/")), Vec::new()).await;
+        let rendered = format!("{client:?}");
+        assert!(rendered.contains("source-bucket"));
+        assert!(rendered.contains("data/"));
+        assert!(rendered.contains("https://source.example.com"));
+        assert!(!rendered.contains("very-secret"));
+        assert!(!rendered.contains("session-token"));
+        assert!(!rendered.contains("access"), "access key must not be rendered either: {rendered}");
+    }
+
+    #[test]
+    fn source_client_spec_endpoint_parsing() {
+        let mut s = spec(None);
+        let endpoint = s.endpoint_spec().expect("https origin should parse");
+        assert_eq!(endpoint.endpoint, "source.example.com");
+        assert!(endpoint.secure);
+        assert_eq!(endpoint.user_agent_suffix, USER_AGENT_SUFFIX);
+        assert_eq!(endpoint.connect_timeout, Some(Duration::from_secs(10)));
+        assert_eq!(endpoint.read_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(endpoint.path_style, PathStyle::Path);
+
+        s.endpoint = "http://[::1]:9000".to_string();
+        let endpoint = s.endpoint_spec().expect("bracketed IPv6 origin should parse");
+        assert_eq!(endpoint.endpoint, "[::1]:9000");
+        assert!(!endpoint.secure);
+
+        for bad in [
+            "ftp://source.example.com",
+            "https://user:pw@source.example.com",
+            "https://source.example.com/bucket",
+            "https://source.example.com/?x=1",
+            "not a url",
+        ] {
+            s.endpoint = bad.to_string();
+            assert!(
+                matches!(s.endpoint_spec(), Err(RemoteS3ClientError::InvalidEndpoint(_))),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_path_style_auto_follows_provider_and_host() {
+        use SourceProvider::*;
+        for provider in [Aws, Gcs, R2] {
+            assert_eq!(
+                resolve_path_style(PathStyle::Auto, provider, "s3.example.com"),
+                PathStyle::VirtualHost,
+                "{provider:?}"
+            );
+        }
+        for provider in [Minio, Rustfs, S3] {
+            assert_eq!(
+                resolve_path_style(PathStyle::Auto, provider, "s3.example.com"),
+                PathStyle::Path,
+                "{provider:?}"
+            );
+        }
+        for host in ["10.0.0.1", "[::1]", "localhost", "LOCALHOST"] {
+            assert_eq!(resolve_path_style(PathStyle::Auto, Aws, host), PathStyle::Path, "{host}");
+        }
+        assert_eq!(resolve_path_style(PathStyle::VirtualHost, Minio, "10.0.0.1"), PathStyle::VirtualHost);
+        assert_eq!(resolve_path_style(PathStyle::Path, Aws, "s3.amazonaws.com"), PathStyle::Path);
+        assert_eq!(SourceProvider::from_label(" AWS "), Some(Aws));
+        assert_eq!(SourceProvider::from_label(" Azure "), Some(Azure));
+        assert_eq!(SourceProvider::from_label("gcs_native"), Some(GcsNative));
+        assert_eq!(SourceProvider::from_label("swift"), None);
+    }
+
+    const CONTRACT_LIST_PAGE_ONE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>source-bucket</Name>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>cursor-1</NextContinuationToken>
+  <Contents>
+    <Key>dir/a.txt</Key>
+    <LastModified>2015-10-21T07:28:00.000Z</LastModified>
+    <ETag>&quot;5d41402abc4b2a76b9719d911017c592&quot;</ETag>
+    <Size>5</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+  <CommonPrefixes><Prefix>dir/sub/</Prefix></CommonPrefixes>
+</ListBucketResult>"#;
+
+    const CONTRACT_LIST_PAGE_TWO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>source-bucket</Name>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>dir/b.txt</Key>
+    <LastModified>2015-10-21T07:28:00.000Z</LastModified>
+    <ETag>&quot;7d41402abc4b2a76b9719d911017c592&quot;</ETag>
+    <Size>7</Size>
+  </Contents>
+</ListBucketResult>"#;
+
+    const CONTRACT_TAGGING: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet>
+  <Tag><Key>env</Key><Value>prod</Value></Tag>
+</TagSet></Tagging>"#;
+
+    fn contract_object_headers(content_length: u64) -> Vec<(&'static str, String)> {
+        vec![
+            ("etag", format!("\"{OBJECT_MD5}\"")),
+            ("content-length", content_length.to_string()),
+            ("content-type", "text/plain".to_string()),
+            ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+            ("x-amz-meta-owner", "alice".to_string()),
+            ("x-amz-storage-class", "STANDARD".to_string()),
+        ]
+    }
+
+    /// The S3 backend behind the scripted connector, without the prefix-mapping
+    /// client on top: the contract is a property of the backend itself.
+    async fn scripted_s3_backend(responses: Vec<Scripted>) -> (S3SourceBackend, Recorded) {
+        let spec = spec(None);
+        let requests: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let connector = SharedHttpConnector::new(ScriptedConnector {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+        });
+        let http_client = http_client_fn(move |_settings, _components| connector.clone());
+        let endpoint = spec.endpoint_spec().expect("test spec endpoint should parse");
+        let config = build_remote_s3_config(&endpoint)
+            .await
+            .expect("test spec should build")
+            .http_client(http_client)
+            .interceptor(SourceProxyMarkerInterceptor::new());
+        (
+            S3SourceBackend {
+                client: S3Client::from_conf(config.build()),
+                bucket: spec.bucket.clone(),
+            },
+            requests,
+        )
+    }
+
+    #[tokio::test]
+    async fn s3_backend_satisfies_the_shared_backend_contract() {
+        let mut ranged = contract_object_headers(3);
+        ranged.push(("content-range", "bytes 1-3/5".to_string()));
+        let (backend, requests) = scripted_s3_backend(vec![
+            ok(contract_object_headers(5), ""),
+            ok(contract_object_headers(5), "hello"),
+            ok(ranged, "ell"),
+            ok(Vec::new(), CONTRACT_LIST_PAGE_ONE),
+            ok(Vec::new(), CONTRACT_LIST_PAGE_TWO),
+            ok(Vec::new(), CONTRACT_TAGGING),
+            ok(Vec::new(), ""),
+            status(404, ""),
+            // An object HEAD 404 requires the existing S3 bucket HEAD probe.
+            ok(Vec::new(), ""),
+            status(403, ACCESS_DENIED_BODY),
+        ])
+        .await;
+
+        assert_backend_contract(
+            &backend,
+            BackendCapabilities {
+                etag_is_opaque: false,
+                supports_start_after: true,
+                supports_tagging: true,
+            },
+        )
+        .await;
+        let requests = recorded(&requests);
+        let actual: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                (
+                    request.method.as_str(),
+                    url::Url::parse(&request.uri).expect("recorded S3 URL").path().to_string(),
+                )
+            })
+            .collect();
+        let expected = [
+            ("HEAD", "/source-bucket/dir/a.txt"),
+            ("GET", "/source-bucket/dir/a.txt"),
+            ("GET", "/source-bucket/dir/a.txt"),
+            ("GET", "/source-bucket/"),
+            ("GET", "/source-bucket/"),
+            ("GET", "/source-bucket/dir/a.txt"),
+            ("HEAD", "/source-bucket/"),
+            ("HEAD", "/source-bucket/missing"),
+            ("HEAD", "/source-bucket/"),
+            ("HEAD", "/source-bucket/secret"),
+        ];
+        assert_eq!(actual, expected.map(|(method, path)| (method, path.to_string())));
+        for request in &requests {
+            assert_outbound_markers(request);
+        }
+    }
+
+    fn prefix_client(prefix: Option<String>) -> SourceClient {
+        SourceClient {
+            backend: Box::new(S3SourceBackend {
+                client: S3Client::from_conf(
+                    aws_sdk_s3::Config::builder()
+                        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                        .build(),
+                ),
+                bucket: "bucket".to_string(),
+            }),
+            endpoint: "https://source.example.com".to_string(),
+            bucket: "bucket".to_string(),
+            source_prefix: prefix.filter(|prefix| !prefix.is_empty()),
+            timeouts: SourceTimeouts::default(),
+            bandwidth_limit: None,
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn source_and_local_keys_round_trip(prefix in proptest::option::of("[a-z0-9/_-]{0,16}"), key in "[a-zA-Z0-9/._ -]{0,32}") {
+            let client = prefix_client(prefix.clone());
+            let source_key = client.source_key(&key);
+            prop_assert_eq!(client.local_key(&source_key), Some(key.as_str()));
+            match prefix.as_deref().filter(|prefix| !prefix.is_empty()) {
+                Some(prefix) => {
+                    prop_assert!(source_key.starts_with(prefix));
+                    prop_assert_eq!(&source_key[prefix.len()..], key.as_str());
+                }
+                None => prop_assert_eq!(source_key.as_str(), key.as_str()),
+            }
+        }
+
+        #[test]
+        fn local_key_rejects_keys_outside_prefix(prefix in "[a-z]{1,8}/", key in "[a-z]{1,8}/[a-z]{0,8}") {
+            let client = prefix_client(Some(prefix.clone()));
+            let source_key = format!("{prefix}{key}");
+            let inside = client.local_key(&source_key);
+            prop_assert_eq!(inside, Some(key.as_str()));
+            if !key.starts_with(&prefix) {
+                prop_assert_eq!(client.local_key(&key), None);
+            }
+        }
+    }
+}

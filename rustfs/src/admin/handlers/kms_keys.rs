@@ -18,6 +18,7 @@ use super::kms_audit::{KmsAdminAudit, KmsAdminOperation};
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_kms_key};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_kms_runtime_service_manager, current_or_init_kms_runtime_service_manager};
+use crate::admin::storage_api::s3;
 use crate::admin::utils::extract_query_params;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::kms_deletion_gate::current_key_impact;
@@ -197,6 +198,25 @@ fn extract_key_id(uri: &hyper::Uri) -> Option<String> {
         .find_map(|name| query_params.get(name).filter(|value| !value.is_empty()).cloned())
 }
 
+/// Name of the key a legacy create request asks for.
+///
+/// `mc admin kms key create <name>` sends the name as the `key-id` query
+/// parameter with no body, while RustFS clients send it as the `name` tag.
+/// Both are honored. A request carrying both has to agree with itself:
+/// picking one silently would create a key under a name the caller never
+/// sees in its own request.
+fn legacy_create_key_name(uri: &hyper::Uri, tags: &HashMap<String, String>) -> S3Result<Option<String>> {
+    let query_name = extract_key_id(uri);
+    let tag_name = tags.get("name").cloned();
+    match (query_name, tag_name) {
+        (Some(query), Some(tag)) if query != tag => Err(s3::error(
+            s3::S3ErrorCode::InvalidRequest,
+            format!("key name in the query ({query}) and in tags.name ({tag}) differ"),
+        )),
+        (query, tag) => Ok(query.or(tag)),
+    }
+}
+
 /// The `key_id` of a KMS admin request body, read without committing to the
 /// strict schema of the endpoint: the authorization gate needs the target key
 /// before the body is parsed for execution, and a body that fails the strict
@@ -332,9 +352,8 @@ impl Operation for CreateKeyHandler {
             return Err(s3_error!(InternalError, "kms service is not initialized"));
         };
 
-        // Extract key name from tags if provided
         let tags = request.tags.unwrap_or_default();
-        let key_name = tags.get("name").cloned();
+        let key_name = legacy_create_key_name(&req.uri, &tags)?;
 
         let kms_request = CreateKeyRequest {
             key_name,
@@ -479,8 +498,8 @@ mod tests {
         DescribeKmsKeyResponse, GenerateDataKeyApiRequest, GenerateDataKeyApiResponse, ListKeysApiResponse, ListKmsKeysResponse,
         delete_key_error_status, delete_request_from_query, extract_key_id, extract_query_params, key_impact_if_requested,
         key_list_filters, kms_create_key_actions, kms_delete_key_actions, kms_describe_key_actions,
-        kms_generate_data_key_actions, kms_list_keys_actions, parse_list_limit, scoped_key_id, stable_json_value,
-        wants_key_impact,
+        kms_generate_data_key_actions, kms_list_keys_actions, legacy_create_key_name, parse_list_limit, scoped_key_id,
+        stable_json_value, wants_key_impact,
     };
     use http::Uri;
     use hyper::StatusCode;
@@ -499,6 +518,46 @@ mod tests {
 
     fn assert_lacks_action(actions: &[Action], action: Action) {
         assert!(!actions.contains(&action), "expected action list not to contain {action:?}");
+    }
+
+    #[test]
+    fn legacy_create_key_name_honors_the_minio_key_id_query() {
+        let uri: Uri = "/rustfs/admin/v3/kms/key/create?key-id=minio-key"
+            .parse()
+            .expect("uri should parse");
+
+        let name = legacy_create_key_name(&uri, &HashMap::new()).expect("a query-only name is valid");
+        assert_eq!(name.as_deref(), Some("minio-key"));
+    }
+
+    #[test]
+    fn legacy_create_key_name_falls_back_to_the_name_tag() {
+        let uri: Uri = "/rustfs/admin/v3/kms/key/create".parse().expect("uri should parse");
+        let tags = HashMap::from([("name".to_string(), "tagged-key".to_string())]);
+
+        let name = legacy_create_key_name(&uri, &tags).expect("a tag-only name is valid");
+        assert_eq!(name.as_deref(), Some("tagged-key"));
+        assert_eq!(legacy_create_key_name(&uri, &HashMap::new()).expect("no name is valid"), None);
+    }
+
+    #[test]
+    fn legacy_create_key_name_accepts_agreeing_sources_and_refuses_conflicting_ones() {
+        let uri: Uri = "/rustfs/admin/v3/kms/key/create?key-id=minio-key"
+            .parse()
+            .expect("uri should parse");
+
+        let agreeing = HashMap::from([("name".to_string(), "minio-key".to_string())]);
+        let name = legacy_create_key_name(&uri, &agreeing).expect("agreeing sources are valid");
+        assert_eq!(name.as_deref(), Some("minio-key"));
+
+        let conflicting = HashMap::from([("name".to_string(), "other-key".to_string())]);
+        let refused = legacy_create_key_name(&uri, &conflicting).expect_err("conflicting names must be refused");
+        assert_eq!(*refused.code(), super::s3::S3ErrorCode::InvalidRequest);
+        assert!(
+            refused
+                .message()
+                .is_some_and(|message| message.contains("minio-key") && message.contains("other-key"))
+        );
     }
 
     #[test]
