@@ -9,12 +9,14 @@ The drill rehearses the complete loop — back up, lose the persistence layer, p
 
 The drill covers the **Local** backend, the only backend RustFS produces a full-material bundle for. The responsibility split is described in `crates/kms/src/backup/capability.rs`:
 
-| Backend | What a RustFS bundle carries | What restores it |
+| Backend | RustFS bundle export | What restores it |
 | --- | --- | --- |
 | Local | Key records, all stored versions, the KDF salt, sanitized configuration | The RustFS restore in this runbook |
-| Static | Non-sensitive references only | The operator re-supplies the secret out of band |
-| Vault KV2 + Transit | KV metadata and Transit ciphertext references | Vault's native snapshot restore, then the RustFS orchestration |
-| Vault Transit | Metadata, configuration references, verification data | Vault's native snapshot restore, then the RustFS orchestration |
+| Static | Refused with `501`; RustFS holds no material to export | The operator re-supplies the secret out of band |
+| Vault KV2 | Refused with `501` | Vault's native snapshot restore, then the RustFS orchestration |
+| Vault Transit | Refused with `501` | Vault's native snapshot restore, then the RustFS orchestration |
+
+The `501` is not a gap in this runbook: `POST /rustfs/admin/v3/kms/backup` refuses any backend other than `Local` (`rustfs/src/admin/handlers/kms_backup.rs`, `execute_backup`), so no RustFS bundle exists to plan around for the other three. Note that `capability.rs` still *declares* `FullMaterial` responsibility for Vault KV2 in storage-only mode; no export path implements it, so treat the declaration as a reservation, not a capability.
 
 For the Vault backends there is no RustFS-side export: the cryptographic root is non-exportable and comes back through Vault's own disaster-recovery flow. RustFS owns the refusal to proceed before that has happened and the ordering of everything after it — see the Vault section below.
 

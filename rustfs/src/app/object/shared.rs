@@ -240,10 +240,8 @@ pub(super) fn has_put_sse_request_headers(headers: &HeaderMap) -> bool {
 /// A request-level value always wins; the bucket default only fills a gap, and
 /// the unknown-algorithm fallback lives once in [`bucket_default_write_sse`].
 ///
-/// `has_explicit_ssec` suppresses the default entirely. Only COPY passes `true`
-/// today: its destination may carry SSE-C, which must not also be given managed
-/// encryption. PUT and extract pass `false`, matching their current behaviour —
-/// see backlog#1826 for the divergence that leaves.
+/// `has_explicit_ssec` suppresses the default entirely: an SSE-C destination
+/// must not also be given managed encryption.
 ///
 /// Callers layering further overrides (PUT's `ciphertext_passthrough`) apply
 /// them to the returned pair.
@@ -263,7 +261,14 @@ pub(super) fn resolve_bucket_default_sse(
     };
 
     let effective_sse = requested_sse.or_else(|| bucket_default().map(bucket_default_write_sse));
-    let effective_kms_key_id = requested_kms_key_id.or_else(|| bucket_default().and_then(|sse| sse.kms_master_key_id.clone()));
+    let effective_kms_key_id = if effective_sse
+        .as_ref()
+        .is_some_and(|sse| sse.as_str() == ServerSideEncryption::AWS_KMS)
+    {
+        requested_kms_key_id.or_else(|| bucket_default().and_then(|sse| sse.kms_master_key_id.clone()))
+    } else {
+        requested_kms_key_id
+    };
     (effective_sse, effective_kms_key_id)
 }
 
@@ -1185,6 +1190,21 @@ mod tests {
 
         assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
         assert_eq!(kms_key_id.as_deref(), Some("request-key"));
+    }
+
+    #[test]
+    fn resolve_bucket_default_sse_does_not_inherit_a_kms_key_for_an_explicit_sse_s3_request() {
+        let config = bucket_sse_config_with(ServerSideEncryption::AWS_KMS, Some("bucket-key"));
+
+        let (sse, kms_key_id) = resolve_bucket_default_sse(
+            Some(&config),
+            Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+            None,
+            false,
+        );
+
+        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+        assert!(kms_key_id.is_none(), "an SSE-S3 request must not inherit the bucket KMS key");
     }
 
     #[test]

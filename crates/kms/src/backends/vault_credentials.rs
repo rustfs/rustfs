@@ -114,7 +114,7 @@ impl fmt::Debug for SecretString {
 }
 
 /// Expiry attributes of a lease-bound token.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LeaseInfo {
     /// Time-to-live granted at issue or renewal.
     pub(crate) ttl: Duration,
@@ -207,31 +207,102 @@ pub(crate) trait TokenSource: fmt::Debug + Send + Sync {
 }
 
 /// Token source for [`VaultAuthMethod::Token`]: always yields the token fixed
-/// at configuration time. The token carries no lease, so it is never renewed
-/// and never expires from the provider's point of view.
+/// at configuration time.
+///
+/// The token itself is never re-issued, but it usually still expires:
+/// `vault token create` defaults to a 768-hour TTL. Hard-coding "no lease"
+/// here left the renewal task unstarted and published no remaining-TTL gauge,
+/// so a healthy-looking cluster turned every KMS call into a 403 a month later
+/// and could only be recovered by a restart or a reconfigure (backlog#2369 P3).
+/// The source therefore asks Vault what it is holding, once per client
+/// generation, and lets the existing renewal loop take over whenever the answer
+/// carries a TTL.
+/// Map a `lookup-self` answer onto a lease.
+///
+/// A zero TTL is Vault's answer for a token that never expires (root and
+/// periodic-root tokens), which keeps the pre-probe behaviour exactly: no
+/// lease, no renewal task, no expiry gate. A response that omits `renewable`
+/// is treated as not renewable, so the renewal loop falls back to re-reading
+/// the remaining TTL instead of assuming it can extend it.
+fn static_token_lease(ttl_secs: u64, renewable: Option<bool>) -> Option<LeaseInfo> {
+    (ttl_secs > 0).then_some(LeaseInfo {
+        ttl: Duration::from_secs(ttl_secs),
+        renewable: renewable.unwrap_or(false),
+    })
+}
+
 pub(crate) struct StaticToken {
     token: TokenLease,
+    /// Client authenticated with the configured token, used only for
+    /// `lookup-self`. Per-generation renewals use the generation's own client.
+    lookup_client: VaultClient,
 }
 
 impl StaticToken {
-    pub(crate) fn new(token: String) -> Self {
-        Self {
+    pub(crate) fn new(settings: &VaultConnectionSettings, token: String) -> Result<Self> {
+        let lookup_client = settings.build_client(&token)?;
+        Ok(Self {
             token: TokenLease::new(token, None),
-        }
+            lookup_client,
+        })
     }
 }
 
 #[async_trait]
 impl TokenSource for StaticToken {
     async fn acquire(&self) -> AttemptResult<TokenLease> {
-        Ok(self.token.clone())
+        // A lookup failure must not fail the login. The token itself may well
+        // be valid: a policy can omit `lookup-self`, and Vault may simply be
+        // unreachable for the moment. Failing here would take down deployments
+        // that work today, so the probe degrades to the pre-probe behaviour —
+        // no lease, no renewal — and says so loudly instead.
+        let lease = match vaultrs::token::lookup_self(&self.lookup_client).await {
+            Ok(lookup) => static_token_lease(lookup.ttl, lookup.renewable),
+            Err(error) => {
+                warn!(
+                    event = "vault_static_token_lookup_failed",
+                    error = %error,
+                    "Could not read the configured Vault token's remaining lifetime, so it will not be \
+                     renewed and its expiry will not be tracked. Grant the token `lookup-self` (Vault's \
+                     default policy does) or switch to AppRole, Kubernetes or an agent-managed token file"
+                );
+                None
+            }
+        };
+
+        if let Some(lease) = lease
+            && !lease.renewable
+        {
+            warn!(
+                event = "vault_static_token_not_renewable",
+                ttl_secs = lease.ttl.as_secs(),
+                "The configured Vault token expires and cannot be renewed; RustFS will fail closed as it \
+                 approaches expiry. Switch to AppRole, Kubernetes or an agent-managed token file, or \
+                 reconfigure with a fresh token before it lapses"
+            );
+        }
+
+        Ok(TokenLease::new(self.token.expose().to_string(), lease))
+    }
+
+    async fn renew(&self, client: &VaultClient) -> AttemptResult<TokenLease> {
+        // Vault refuses renew-self on a non-renewable token; the renewal loop
+        // then falls back to `acquire`, which re-reads the remaining TTL and
+        // keeps the gauge honest until the fail-closed window is reached.
+        let auth = vaultrs::token::renew_self(client, None)
+            .await
+            .map_err(|error| attempt_error("token renewal", error))?;
+        Ok(TokenLease::from_auth(auth))
     }
 }
 
 impl fmt::Debug for StaticToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // TokenLease::fmt already redacts the token value.
-        f.debug_struct("StaticToken").field("token", &self.token).finish()
+        // TokenLease::fmt already redacts the token value; VaultClient embeds
+        // its settings, including the token, so it must stay out of Debug.
+        f.debug_struct("StaticToken")
+            .field("token", &self.token)
+            .finish_non_exhaustive()
     }
 }
 
@@ -541,7 +612,7 @@ pub(crate) fn token_source_for(
     settings: &VaultConnectionSettings,
 ) -> Result<Box<dyn TokenSource>> {
     match auth_method {
-        VaultAuthMethod::Token { token } => Ok(Box::new(StaticToken::new(token.clone()))),
+        VaultAuthMethod::Token { token } => Ok(Box::new(StaticToken::new(settings, token.clone())?)),
         VaultAuthMethod::AppRole {
             role_id,
             secret_id,
@@ -1201,14 +1272,22 @@ mod tests {
         (Arc::new(provider), state)
     }
 
+    /// A provider whose token reports no expiry, which is what `lookup-self`
+    /// answers for a root or periodic-root token. Scripted rather than backed
+    /// by [`StaticToken`] because the real source now asks Vault what it holds.
     async fn static_provider() -> VaultCredentialProvider {
         VaultCredentialProvider::new(
             test_settings(),
-            Box::new(StaticToken::new(TEST_TOKEN.to_string())),
+            Box::new(ScriptedSource {
+                state: Arc::new(ScriptedState::default()),
+                ttl: Duration::ZERO,
+                renewable: false,
+                login_delay: Duration::ZERO,
+            }),
             test_policy(Duration::from_secs(10), Duration::from_secs(5)),
         )
         .await
-        .expect("static provider must build without a live Vault")
+        .expect("a token without an expiry must build without a live Vault")
     }
 
     #[tokio::test]
@@ -1231,20 +1310,57 @@ mod tests {
         assert!(provider.spawn_renewal_task().is_none(), "a token without a lease has nothing to renew");
     }
 
-    #[tokio::test]
-    async fn test_static_token_source_yields_configured_token() {
-        let settings = test_settings();
-        let source = token_source_for(
+    #[test]
+    fn test_static_token_source_builds_without_contacting_vault() {
+        token_source_for(
             &VaultAuthMethod::Token {
                 token: TEST_TOKEN.to_string(),
             },
-            &settings,
+            &test_settings(),
         )
         .expect("token auth must map to a source");
+    }
 
-        let lease = source.acquire().await.expect("static acquire cannot fail");
-        assert_eq!(lease.expose(), TEST_TOKEN);
-        assert!(lease.lease_info().is_none(), "static tokens must not carry a lease");
+    /// backlog#2369 P3: `vault token create` defaults to a 768-hour TTL, so
+    /// hard-coding "no lease" for token auth left the renewal task unstarted
+    /// and turned a healthy cluster into one that answers 403 a month later.
+    /// The lease now comes from what Vault reports.
+    #[test]
+    fn static_token_lease_follows_what_vault_reports() {
+        assert_eq!(
+            static_token_lease(0, Some(true)),
+            None,
+            "a token Vault reports as non-expiring must keep behaving as one"
+        );
+        assert_eq!(
+            static_token_lease(0, None),
+            None,
+            "a non-expiring token stays non-expiring whatever renewable says"
+        );
+        assert_eq!(
+            static_token_lease(2_764_800, Some(true)),
+            Some(LeaseInfo {
+                ttl: Duration::from_secs(2_764_800),
+                renewable: true,
+            }),
+            "the default 768-hour token must be tracked and renewed"
+        );
+        assert_eq!(
+            static_token_lease(3_600, Some(false)),
+            Some(LeaseInfo {
+                ttl: Duration::from_secs(3_600),
+                renewable: false,
+            }),
+            "an expiring token that cannot be renewed still needs its expiry tracked"
+        );
+        assert_eq!(
+            static_token_lease(3_600, None),
+            Some(LeaseInfo {
+                ttl: Duration::from_secs(3_600),
+                renewable: false,
+            }),
+            "an omitted renewable flag must not be read as renewable"
+        );
     }
 
     #[tokio::test]
@@ -1759,7 +1875,7 @@ mod tests {
                 renewable: true,
             }),
         );
-        let static_source = StaticToken::new(TEST_TOKEN.to_string());
+        let static_source = StaticToken::new(&test_settings(), TEST_TOKEN.to_string()).expect("static source");
         let approle_source = AppRoleLogin::new(
             &test_settings(),
             "approle".to_string(),

@@ -2042,7 +2042,7 @@ impl DefaultObjectUsecase {
             bucket_sse_config.as_ref().map(|(config, _timestamp)| config),
             original_sse,
             ssekms_key_id,
-            false,
+            sse_customer_algorithm.is_some() || sse_customer_key.is_some() || sse_customer_key_md5.is_some(),
         );
         if effective_sse
             .as_ref()

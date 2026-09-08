@@ -9209,6 +9209,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let dest_obj = transaction.remote_object.clone();
         let mut transition_meta = (*oi.user_defined).clone();
         rustfs_utils::http::remove_str(&mut transition_meta, rustfs_utils::http::SUFFIX_PART_CHECKSUMS);
+        // The tier holds opaque stored bytes. Its metadata must not be treated
+        // as a second object header set: forwarding SSE intent or wrapped DEKs
+        // would request a second encryption pass and disclose local envelope
+        // material to the remote provider.
+        transition_meta.retain(|key, _| !rustfs_utils::http::is_replication_stripped_encryption_key(key));
         transition_meta.insert("name".to_string(), object.to_string());
         rustfs_utils::http::metadata_compat::insert_str(
             &mut transition_meta,
@@ -9765,13 +9770,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     part_opts.part_number = Some(part_info.number);
                     #[cfg(test)]
                     fail_restore_multipart_at(RestoreMultipartFailurePoint::InvalidPartSize)?;
-                    if part_info.actual_size <= 0 {
-                        return Err(Error::other(format!("invalid multipart restore part size {}", part_info.actual_size)));
+                    if part_info.size == 0 {
+                        return Err(Error::other(format!("invalid multipart restore stored part size {}", part_info.size)));
                     }
+                    let stored_part_size = i64::try_from(part_info.size).map_err(|_| {
+                        Error::other(format!("multipart restore stored part size exceeds i64: {}", part_info.size))
+                    })?;
                     #[cfg(test)]
                     fail_restore_multipart_at(RestoreMultipartFailurePoint::RangeOverflow)?;
                     let part_end = part_offset
-                        .checked_add(part_info.actual_size - 1)
+                        .checked_add(stored_part_size - 1)
                         .ok_or_else(|| Error::other("multipart restore part range overflow".to_string()))?;
                     let rs = Some(HTTPRangeSpec {
                         is_suffix_length: false,
@@ -9799,13 +9807,19 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     #[cfg(test)]
                     fail_restore_multipart_at(RestoreMultipartFailurePoint::HashReader)?;
                     let hash_reader =
-                        HashReader::from_stream(reader, part_info.actual_size, part_info.actual_size, None, None, false)?;
+                        HashReader::from_stream(reader, stored_part_size, part_info.actual_size, None, None, false)?;
                     let mut p_reader = PutObjReader::new(hash_reader);
                     #[cfg(test)]
                     fail_restore_multipart_at(RestoreMultipartFailurePoint::PutPart)?;
+                    // `ropts` carries the object's ETag so the single-part copy-back
+                    // keeps it (the writer only ever sees stored bytes). A part write
+                    // must not inherit that object-level value, or every restored part
+                    // would be recorded under the same ETag; each part keeps its own.
+                    let mut part_write_opts = ropts.clone();
+                    part_write_opts.preserve_etag = Some(part_info.etag.clone()).filter(|etag| !etag.is_empty());
                     let p_info = self_
                         .clone()
-                        .put_object_part(bucket, object, &res.upload_id, part_info.number, &mut p_reader, &ropts)
+                        .put_object_part(bucket, object, &res.upload_id, part_info.number, &mut p_reader, &part_write_opts)
                         .await?;
                     #[cfg(test)]
                     let p_info = if restore_multipart_failure_is(RestoreMultipartFailurePoint::SizeMismatch) {
@@ -9815,7 +9829,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     } else {
                         p_info
                     };
-                    if p_info.size as i64 != part_info.actual_size {
+                    if p_info.size as i64 != stored_part_size {
                         return Err(Error::other(ObjectApiError::InvalidObjectState(GenericError {
                             bucket: bucket.to_string(),
                             object: object.to_string(),
@@ -9847,6 +9861,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     user_defined: restore_commit_metadata,
                     no_lock: false,
                     decommission_capacity_admission: opts.decommission_capacity_admission.clone(),
+                    // The composite ETag would otherwise be recomputed from the
+                    // parts as they were written back, which for an encrypted or
+                    // compressed object digests stored bytes rather than the
+                    // object's public ETag.
+                    preserve_etag: oi.etag.clone(),
                     ..Default::default()
                 };
                 self_
@@ -13486,6 +13505,303 @@ mod transition_commit_failure_tests {
                 .is_none(),
             "successful multipart restore must consume the worker-liveness marker"
         );
+    }
+
+    /// backlog#2368 B5: the tier stores opaque bytes, so the archive request
+    /// must not carry the object's encryption headers. Forwarding them made
+    /// every S3 target reject an SSE-C archive outright, asked the target to
+    /// encrypt an SSE-KMS object a second time under a key id it does not own,
+    /// and handed the wrapped DEK to a third-party provider.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transition_does_not_forward_encryption_metadata_to_the_tier() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-encryption-metadata-bucket";
+        let object = "object.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let encryption_metadata = [
+            ("x-amz-server-side-encryption", "aws:kms"),
+            ("x-amz-server-side-encryption-aws-kms-key-id", "arn:aws:kms:us-east-1:123:key/abc"),
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            (rustfs_utils::http::INTERNAL_ENCRYPTION_KEY_HEADER, "d3JhcHBlZC1kZWs="),
+            (rustfs_utils::http::INTERNAL_ENCRYPTION_IV_HEADER, "AAAAAAAAAAAAAAAA"),
+            (rustfs_utils::http::INTERNAL_ENCRYPTION_ALGORITHM_HEADER, "AES256"),
+        ];
+        let mut user_defined: HashMap<String, String> = encryption_metadata
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        user_defined.insert("x-amz-meta-owner".to_string(), "finance".to_string());
+
+        let mut reader = PutObjReader::from_vec(b"stored bytes the tier keeps opaque ".repeat(64));
+        set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    user_defined,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the encrypted source object should be written");
+        let original = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("the source object should be readable");
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name,
+                        etag: original.etag.clone().unwrap_or_default(),
+                        ..Default::default()
+                    },
+                    version_id: original.version_id.map(|version| version.to_string()),
+                    mod_time: original.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the encrypted object should transition");
+
+        let transitioned = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("the transitioned object should be readable");
+        let remote_metadata = backend
+            .metadata(&transitioned.transitioned_object.name)
+            .await
+            .expect("the tier must have received the object");
+
+        for (key, _) in encryption_metadata {
+            assert!(
+                !remote_metadata.keys().any(|stored| stored.eq_ignore_ascii_case(key)),
+                "transition must not forward {key} to the tier: {remote_metadata:?}"
+            );
+        }
+        assert!(
+            remote_metadata
+                .iter()
+                .any(|(key, value)| key.eq_ignore_ascii_case("x-amz-meta-owner") && value == "finance"),
+            "ordinary user metadata must still travel to the tier: {remote_metadata:?}"
+        );
+
+        // Read-through and restore both resolve encryption locally, so the
+        // stripped keys must survive untouched in the local metadata.
+        for (key, value) in encryption_metadata {
+            assert_eq!(
+                transitioned.user_defined.get(key).map(String::as_str),
+                Some(value),
+                "the local copy must keep {key}"
+            );
+        }
+    }
+
+    /// Deterministic bytes that do not repeat with a short period, so a slice
+    /// taken at the wrong offset cannot coincidentally compare equal.
+    fn stored_representation_bytes(seed: u32, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|index| {
+                let mixed = (index as u32).wrapping_add(seed).wrapping_mul(2_654_435_761);
+                (mixed >> 13) as u8
+            })
+            .collect()
+    }
+
+    /// Compares two stored representations without dumping megabytes of bytes
+    /// into the failure output.
+    fn assert_stored_representation_eq(actual: &[u8], expected: &[u8], what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{what}: stored length differs");
+        if let Some(offset) = actual.iter().zip(expected).position(|(left, right)| left != right) {
+            panic!(
+                "{what}: stored bytes differ at offset {offset} (found {:#04x}, expected {:#04x})",
+                actual[offset], expected[offset]
+            );
+        }
+    }
+
+    async fn read_stored_representation(set_disks: &Arc<SetDisks>, bucket: &str, object: &str) -> Vec<u8> {
+        let mut reader = set_disks
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    raw_data_movement_read: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stored-representation reader should open");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("stored body should drain");
+        body
+    }
+
+    /// backlog#2368 B3: the multipart restore loop addresses the tier in STORED
+    /// coordinates. Accumulating each part's PLAINTEXT length instead handed
+    /// every part a misaligned slice of the remote object whose length still
+    /// satisfied the range, the `HashReader` and the completion size check, so
+    /// the copy-back reported success while silently replacing the bytes.
+    ///
+    /// The fixture reproduces the encrypted geometry — a stored form LONGER
+    /// than the plaintext it encodes — because that is what keeps a
+    /// plaintext-coordinate range inside the tier object and makes the
+    /// corruption silent rather than a short read.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn multipart_restore_copies_the_stored_representation_back_verbatim() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-multipart-stored-coordinates-bucket";
+        let object = "object.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        // The minimum-part-size gate reads the PLAINTEXT length, so part one
+        // clears 5 MiB there while its stored form carries encoding overhead.
+        let part_shapes = [(6 * 1024 * 1024_usize, 9_216_usize), (256 * 1024_usize, 512_usize)];
+        let mut user_defined = HashMap::new();
+        user_defined.insert(rustfs_utils::http::INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), "AES256".to_string());
+        user_defined.insert(
+            rustfs_utils::http::INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
+            "AAAAAAAAAAAAAAAA".to_string(),
+        );
+
+        let upload = set_disks
+            .new_multipart_upload(
+                bucket,
+                object,
+                &ObjectOptions {
+                    user_defined: user_defined.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("multipart upload should be created");
+
+        let mut uploaded_parts = Vec::new();
+        let mut expected_stored = Vec::new();
+        for (index, (plaintext_len, overhead)) in part_shapes.iter().enumerate() {
+            let stored = stored_representation_bytes(index as u32 * 7 + 1, plaintext_len + overhead);
+            expected_stored.extend_from_slice(&stored);
+            let stored_len = stored.len() as i64;
+            let hash_reader =
+                HashReader::from_stream(std::io::Cursor::new(stored), stored_len, *plaintext_len as i64, None, None, false)
+                    .expect("hash reader over the stored representation");
+            let mut reader = PutObjReader::new(hash_reader);
+            let info = set_disks
+                .put_object_part(bucket, object, &upload.upload_id, index + 1, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("stored part should be staged");
+            assert_eq!(info.size as i64, stored_len, "a part is stored in its encoded length");
+            uploaded_parts.push(CompletePart {
+                part_num: info.part_num,
+                etag: info.etag,
+                ..Default::default()
+            });
+        }
+
+        let original = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload.upload_id, uploaded_parts, &ObjectOptions::default())
+            .await
+            .expect("source multipart upload should complete");
+        let original_parts: Vec<(usize, usize, i64, String)> = original
+            .parts
+            .iter()
+            .map(|part| (part.number, part.size, part.actual_size, part.etag.clone()))
+            .collect();
+        for (_, size, actual_size, _) in &original_parts {
+            assert!(
+                *size as i64 > *actual_size,
+                "the fixture must keep the two coordinate systems apart: stored {size} vs plaintext {actual_size}"
+            );
+        }
+        let stored_before = read_stored_representation(&set_disks, bucket, object).await;
+        assert_stored_representation_eq(&stored_before, &expected_stored, "the fixture must store its encoded bytes verbatim");
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name,
+                        etag: original.etag.clone().unwrap_or_default(),
+                        ..Default::default()
+                    },
+                    version_id: original.version_id.map(|version| version.to_string()),
+                    mod_time: original.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("multipart source should transition before restore");
+
+        let operation_id = Uuid::new_v4();
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(restore_metadata(operation_id, true)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the restore generation should be installed");
+        let mut restore_opts = ObjectOptions::default();
+        restore_opts.transition.restore_request.days = Some(1);
+        restore_opts.user_defined = restore_operation_id_metadata(operation_id);
+        set_disks
+            .clone()
+            .restore_transitioned_object(bucket, object, &restore_opts)
+            .await
+            .expect("multipart restore should complete");
+
+        let stored_after = read_stored_representation(&set_disks, bucket, object).await;
+        assert_stored_representation_eq(
+            &stored_after,
+            &expected_stored,
+            "a multipart restore must copy the stored representation back verbatim",
+        );
+
+        let restored = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("the restored object should be readable");
+        let restored_parts: Vec<(usize, usize, i64, String)> = restored
+            .parts
+            .iter()
+            .map(|part| (part.number, part.size, part.actual_size, part.etag.clone()))
+            .collect();
+        assert_eq!(
+            restored_parts, original_parts,
+            "restore must rebuild the same part layout, sizes and part ETags"
+        );
+        assert_eq!(restored.size, original.size, "restore must keep the stored object size");
+        // backlog#2369 P7.1: the copy-back digests stored bytes, so the object's
+        // public ETag has to be carried over rather than recomputed.
+        assert_eq!(restored.etag, original.etag, "restore must preserve the object ETag");
     }
 
     #[tokio::test]

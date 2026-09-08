@@ -5165,6 +5165,9 @@ pub async fn put_restore_opts(
         user_defined: meta,
         version_id: oi.version_id.map(|e| e.to_string()),
         mod_time: oi.mod_time,
+        // Restore writes stored (possibly encrypted) bytes, so the writer's
+        // computed MD5 is not the object's public plaintext ETag.
+        preserve_etag: oi.etag.clone(),
         //expires:           oi.expires,
         ..Default::default()
     })
