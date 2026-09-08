@@ -964,6 +964,19 @@ def scanner_heal_oracle_names(root: Path) -> tuple[str, ...]:
                 f"invalid evidence for {case_id}")
         require(type(requirement.get("unclean_shutdown_marker")) is bool,
                 f"invalid unclean-shutdown marker expectation for {case_id}")
+        if "erasure" in requirement:
+            erasure = requirement["erasure"]
+            require(isinstance(erasure, dict), f"invalid erasure expectation for {case_id}")
+            data_blocks = evidence_integer(erasure.get("data_blocks"), f"{case_id} data_blocks", 1, 16)
+            parity_blocks = evidence_integer(erasure.get("parity_blocks"), f"{case_id} parity_blocks", 1, 16)
+            require(data_blocks >= parity_blocks, f"invalid erasure geometry for {case_id}")
+            require(data_blocks + parity_blocks == requirement["topology"]["nodes"] * requirement["topology"]["drives_per_node"],
+                    f"erasure geometry differs from topology for {case_id}")
+        if "erasure_set_drive_count" in requirement:
+            erasure_set_drive_count = evidence_integer(requirement.get("erasure_set_drive_count"),
+                                                       f"{case_id} erasure_set_drive_count", 1, 64)
+            require(erasure_set_drive_count == requirement["topology"]["nodes"] * requirement["topology"]["drives_per_node"],
+                    f"erasure set drive count differs from topology for {case_id}")
         names.add(oracle)
     return tuple(sorted(names))
 
@@ -1192,6 +1205,19 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
             require(oracle.get("topology") == requirement["topology"], "oracle topology mismatch")
             for key in ("nodes", "drives_per_node"):
                 evidence_integer(oracle["topology"][key], f"observed {key}", 1, 16)
+            expected_erasure = requirement.get("erasure")
+            if expected_erasure is not None:
+                require(isinstance(expected_erasure, dict), "invalid erasure expectation")
+                expected_data_blocks = evidence_integer(expected_erasure.get("data_blocks"), "expected EC data blocks", 1, 16)
+                expected_parity_blocks = evidence_integer(expected_erasure.get("parity_blocks"), "expected EC parity blocks", 1, 16)
+                require(
+                    expected_data_blocks + expected_parity_blocks
+                    == oracle["topology"]["nodes"] * oracle["topology"]["drives_per_node"],
+                    "expected EC geometry differs from topology",
+                )
+            else:
+                expected_data_blocks = None
+                expected_parity_blocks = None
             evidence_integer(oracle.get("pid_before"), "pid_before", 1, 2**32 - 1)
             evidence_integer(oracle.get("pid_after"), "pid_after", 1, 2**32 - 1)
             require(oracle["pid_before"] != oracle["pid_after"], "no process restart witnessed")
@@ -1215,6 +1241,9 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
                     parity = evidence_integer(geometry["parity_blocks"], "EC parity blocks", 1, 16)
                     require(data + parity == oracle["topology"]["nodes"] * oracle["topology"]["drives_per_node"],
                             "EC geometry differs from this case's single set")
+                    if expected_data_blocks is not None:
+                        require(data == expected_data_blocks and parity == expected_parity_blocks,
+                                "EC data/parity geometry differs from the required case")
                     evidence_integer(geometry["erasure_index"], "target erasure index", 1, data + parity)
                 require(physical["has_xl_meta"] is True and physical["version_id"] is None, "missing target metadata")
                 parts = physical["expected_part_numbers"]
@@ -1603,8 +1632,13 @@ class SelfTests(unittest.TestCase):
         def oracle_objects(requirement: dict[str, object]) -> list[dict[str, object]]:
             topology = requirement["topology"]
             total_blocks = topology["nodes"] * topology["drives_per_node"]
-            parity_blocks = 4 if total_blocks == 12 else total_blocks // 2
-            data_blocks = total_blocks - parity_blocks
+            erasure = requirement.get("erasure")
+            if erasure is None:
+                parity_blocks = 4 if total_blocks == 12 else total_blocks // 2
+                data_blocks = total_blocks - parity_blocks
+            else:
+                data_blocks = erasure["data_blocks"]
+                parity_blocks = erasure["parity_blocks"]
             physical = {"has_xl_meta": True, "version_id": None, "data_dir": "data-generation",
                         "erasure_index": 1, "data_blocks": data_blocks, "parity_blocks": parity_blocks,
                         "expected_part_numbers": [1],
@@ -1875,6 +1909,27 @@ class SelfTests(unittest.TestCase):
                     if requirement["gate"] == gate:
                         requirement["evidence_fields"] = list(SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS[gate])
                         break
+
+    def test_scanner_heal_ec84_case_rejects_wrong_erasure_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run_dir = self.scanner_heal_fixture(Path(tmp))
+            self.assertEqual(check_scanner_heal_evidence(root, run_dir, "background-target-crash-ec8-4"), [])
+
+            path = run_dir / "background-target-crash-ec8-4.json"
+            oracle = read_json(path)
+            oracle["objects"][0]["physical"]["data_blocks"] = 10
+            oracle["objects"][0]["physical"]["parity_blocks"] = 2
+            oracle["objects"][0]["expected_physical"]["data_blocks"] = 10
+            oracle["objects"][0]["expected_physical"]["parity_blocks"] = 2
+            write_json(path, oracle)
+            (run_dir / "execution.json").unlink()
+            finish_scanner_heal_receipt(run_dir, 0, root)
+
+            errors = check_scanner_heal_evidence(root, run_dir, "background-target-crash-ec8-4")
+            self.assertTrue(
+                any("EC data/parity geometry differs from the required case" in error for error in errors),
+                errors,
+            )
 
     def test_scanner_heal_pending_gate_cannot_map_to_implemented_lane(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

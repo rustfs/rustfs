@@ -18,8 +18,8 @@
 mod tests {
     use crate::chaos::{VersionShardCensus, census_object_version_on_disk, sha256_hex, signed_admin_post};
     use crate::common::{
-        FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request, init_logging,
-        rustfs_binary_path,
+        ClusterTopology, FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request,
+        init_logging, rustfs_binary_path,
     };
     use crate::storage_api::RUSTFS_META_BUCKET;
     use aws_sdk_s3::primitives::ByteStream;
@@ -60,6 +60,29 @@ mod tests {
         oracle: &'static str,
         evidence: &'static str,
         unclean_shutdown_marker: bool,
+        topology: EvidenceTopology,
+        storage_class_standard: Option<&'static str>,
+        erasure_set_drive_count: Option<&'static str>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct EvidenceTopology {
+        nodes: usize,
+        drives_per_node: usize,
+    }
+
+    impl EvidenceTopology {
+        const fn new(nodes: usize, drives_per_node: usize) -> Self {
+            Self { nodes, drives_per_node }
+        }
+
+        fn total_drives(self) -> usize {
+            self.nodes * self.drives_per_node
+        }
+
+        fn cluster_topology(self) -> ClusterTopology {
+            ClusterTopology::single_pool_multidrive(self.nodes, self.drives_per_node)
+        }
     }
 
     const BACKGROUND_TARGET_RESTART_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
@@ -67,6 +90,9 @@ mod tests {
         oracle: "background-target-restart.json",
         evidence: "process-restart",
         unclean_shutdown_marker: false,
+        topology: EvidenceTopology::new(4, 1),
+        storage_class_standard: None,
+        erasure_set_drive_count: None,
     };
 
     const BACKGROUND_TARGET_CRASH_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
@@ -74,6 +100,29 @@ mod tests {
         oracle: "background-target-crash.json",
         evidence: "process-crash-restart",
         unclean_shutdown_marker: true,
+        topology: EvidenceTopology::new(4, 1),
+        storage_class_standard: None,
+        erasure_set_drive_count: None,
+    };
+
+    const BACKGROUND_TARGET_RESTART_EC84_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
+        id: "background-target-restart-ec8-4",
+        oracle: "background-target-restart-ec8-4.json",
+        evidence: "process-restart",
+        unclean_shutdown_marker: false,
+        topology: EvidenceTopology::new(3, 4),
+        storage_class_standard: Some("EC:4"),
+        erasure_set_drive_count: Some("12"),
+    };
+
+    const BACKGROUND_TARGET_CRASH_EC84_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
+        id: "background-target-crash-ec8-4",
+        oracle: "background-target-crash-ec8-4.json",
+        evidence: "process-crash-restart",
+        unclean_shutdown_marker: true,
+        topology: EvidenceTopology::new(3, 4),
+        storage_class_standard: Some("EC:4"),
+        erasure_set_drive_count: Some("12"),
     };
 
     struct RestartEvidenceContext {
@@ -332,11 +381,10 @@ mod tests {
 
     // Healing may rewrite non-identity bookkeeping in xl.meta. The census
     // therefore compares the canonical selected metadata fields plus every
-    // physical shard, while the payload seed makes object mix-ups observable.
+    // physical shard.
     #[derive(Debug)]
     struct PhysicalObjectManifest {
         key: String,
-        payload_seed: u8,
         shard_census: VersionShardCensus,
     }
 
@@ -974,6 +1022,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_cluster_root_heal_recovers_ec84_shards_after_background_target_restart()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        timeout(
+            Duration::from_secs(420),
+            run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetRestartEc84),
+        )
+        .await?
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cluster_root_heal_recovers_ec84_shards_after_background_target_crash()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        timeout(
+            Duration::from_secs(420),
+            run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetCrashEc84),
+        )
+        .await?
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_cluster_root_heal_recovers_remote_shards_after_coordinator_restart() -> Result<(), Box<dyn Error + Send + Sync>>
     {
         timeout(
@@ -1010,29 +1078,38 @@ mod tests {
         IsolatedTargetRestart,
         BackgroundTargetRestart,
         BackgroundTargetCrash,
+        BackgroundTargetRestartEc84,
+        BackgroundTargetCrashEc84,
         BackgroundCoordinatorRestart,
         TargetEndpointBlackhole,
     }
 
     async fn run_cluster_root_heal_interruption(scenario: InterruptionScenario) -> Result<(), Box<dyn Error + Send + Sync>> {
         let server_binary = rustfs_binary_path();
-        let evidence_run = match scenario {
-            InterruptionScenario::BackgroundTargetRestart => {
-                restart_evidence_run(&server_binary, BACKGROUND_TARGET_RESTART_EVIDENCE)?
-            }
-            InterruptionScenario::BackgroundTargetCrash => {
-                restart_evidence_run(&server_binary, BACKGROUND_TARGET_CRASH_EVIDENCE)?
-            }
+        let evidence_case = match scenario {
+            InterruptionScenario::BackgroundTargetRestart => Some(BACKGROUND_TARGET_RESTART_EVIDENCE),
+            InterruptionScenario::BackgroundTargetCrash => Some(BACKGROUND_TARGET_CRASH_EVIDENCE),
+            InterruptionScenario::BackgroundTargetRestartEc84 => Some(BACKGROUND_TARGET_RESTART_EC84_EVIDENCE),
+            InterruptionScenario::BackgroundTargetCrashEc84 => Some(BACKGROUND_TARGET_CRASH_EC84_EVIDENCE),
             _ => None,
+        };
+        let evidence_run = match evidence_case {
+            Some(case) => restart_evidence_run(&server_binary, case)?,
+            None => None,
         };
         let mut evidence_objects = Vec::new();
         let (background_enabled, interruption_node, interruption_kind) = match scenario {
             InterruptionScenario::IsolatedTargetRestart => (false, 1, "target_restart"),
             InterruptionScenario::BackgroundTargetRestart => (true, 1, "background_target_restart"),
             InterruptionScenario::BackgroundTargetCrash => (true, 1, "background_target_crash"),
+            InterruptionScenario::BackgroundTargetRestartEc84 => (true, 1, "background_target_restart_ec8_4"),
+            InterruptionScenario::BackgroundTargetCrashEc84 => (true, 1, "background_target_crash_ec8_4"),
             InterruptionScenario::BackgroundCoordinatorRestart => (true, 0, "coordinator_restart"),
             InterruptionScenario::TargetEndpointBlackhole => (false, 1, "target_endpoint_blackhole"),
         };
+        let topology = evidence_case
+            .map(|case| case.topology)
+            .unwrap_or_else(|| EvidenceTopology::new(4, 1));
         init_logging();
         info!(
             event = "heal_interruption_started",
@@ -1044,9 +1121,15 @@ mod tests {
             "Starting root-heal interruption test"
         );
 
-        let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+        let mut cluster = RustFSTestClusterEnvironment::with_topology(topology.cluster_topology()).await?;
         cluster.set_env("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", "true");
         cluster.set_env("RUSTFS_HEAL_ENABLED", "true");
+        if let Some(storage_class) = evidence_case.and_then(|case| case.storage_class_standard) {
+            cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", storage_class);
+        }
+        if let Some(erasure_set_drive_count) = evidence_case.and_then(|case| case.erasure_set_drive_count) {
+            cluster.set_env("RUSTFS_ERASURE_SET_DRIVE_COUNT", erasure_set_drive_count);
+        }
         // Heal control uses the first lexicographically sorted grid host.
         // Keep that coordinator distinct from the remote target at index 1.
         cluster.nodes.sort_by(|left, right| left.url.cmp(&right.url));
@@ -1095,11 +1178,22 @@ mod tests {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(4 * 1024 * 1024)
             .clamp(1024 * 1024, 16 * 1024 * 1024);
+        let mut created_online_objects = Vec::with_capacity(online_object_count);
         let mut expected_manifests = Vec::with_capacity(online_object_count);
         let mut unclean_shutdown_marker_observed = None;
-        for index in 0..online_object_count {
-            let key = format!("cluster/online/object-{index:04}.bin");
-            let payload_seed = u8::try_from(index + 1).expect("clamped object count must fit in u8");
+        let mut attempt_count = 0usize;
+        let max_online_attempts = online_object_count.saturating_mul(topology.total_drives().max(1));
+        while expected_manifests.len() < online_object_count {
+            if attempt_count >= max_online_attempts {
+                return Err(format!(
+                    "target replacement drive held only {}/{} baseline object shards after {attempt_count} writes",
+                    expected_manifests.len(),
+                    online_object_count
+                )
+                .into());
+            }
+            let key = format!("cluster/online/object-{attempt_count:04}.bin");
+            let payload_seed = ((attempt_count % 251) + 1) as u8;
             timeout(
                 Duration::from_secs(30),
                 clients[0]
@@ -1111,6 +1205,11 @@ mod tests {
             )
             .await??;
             let shard_census = census_object_version_on_disk(&replaced_disk, bucket, &key, None)?;
+            if !shard_census.has_xl_meta {
+                timeout(Duration::from_secs(30), clients[0].delete_object().bucket(bucket).key(&key).send()).await??;
+                attempt_count += 1;
+                continue;
+            }
             assert!(
                 shard_census.is_complete(),
                 "node 1 should hold a complete baseline shard for {key}: {shard_census:?}"
@@ -1119,11 +1218,9 @@ mod tests {
                 !shard_census.expected_part_numbers.is_empty(),
                 "chaos objects must use physical part shards rather than inline data: {shard_census:?}"
             );
-            expected_manifests.push(PhysicalObjectManifest {
-                key,
-                payload_seed,
-                shard_census,
-            });
+            created_online_objects.push((key.clone(), payload_seed));
+            expected_manifests.push(PhysicalObjectManifest { key, shard_census });
+            attempt_count += 1;
         }
 
         let expected_pool_metadata = if background_enabled {
@@ -1169,31 +1266,38 @@ mod tests {
             if node_index == 1 {
                 continue;
             }
-            let census = census_object_version_on_disk(Path::new(&node.data_dir), bucket, outage_key, None)?;
-            assert!(
-                census.is_complete(),
-                "online node {node_index} must hold a complete outage-object shard: {census:?}"
-            );
-            let erasure_index = census
-                .erasure_index
-                .ok_or_else(|| format!("online node {node_index} outage-object shard has no erasure index: {census:?}"))?;
-            assert!(
-                (1..=cluster.nodes.len()).contains(&erasure_index),
-                "online node {node_index} outage-object erasure index is out of range: {census:?}"
-            );
-            assert!(
-                outage_peer_erasure_indices.insert(erasure_index),
-                "outage-object erasure index {erasure_index} is duplicated across online nodes"
-            );
+            for (drive_index, drive) in node.data_dirs.iter().enumerate() {
+                let census = census_object_version_on_disk(Path::new(drive), bucket, outage_key, None)?;
+                assert!(
+                    census.is_complete(),
+                    "online node {node_index} drive {drive_index} must hold a complete outage-object shard: {census:?}"
+                );
+                let erasure_index = census.erasure_index.ok_or_else(|| {
+                    format!("online node {node_index} drive {drive_index} outage-object shard has no erasure index: {census:?}")
+                })?;
+                assert!(
+                    (1..=topology.total_drives()).contains(&erasure_index),
+                    "online node {node_index} drive {drive_index} outage-object erasure index is out of range: {census:?}"
+                );
+                assert!(
+                    outage_peer_erasure_indices.insert(erasure_index),
+                    "outage-object erasure index {erasure_index} is duplicated across online drives"
+                );
+            }
         }
         assert_eq!(
             outage_peer_erasure_indices.len(),
-            cluster.nodes.len().saturating_sub(1),
-            "every online node must contribute one unique outage-object erasure index"
+            topology.total_drives().saturating_sub(cluster.nodes[1].data_dirs.len()),
+            "every online drive must contribute one unique outage-object erasure index"
         );
-        let expected_outage_target_erasure_index = (1..=cluster.nodes.len())
-            .find(|index| !outage_peer_erasure_indices.contains(index))
-            .ok_or("online outage-object shards leave no erasure index for the replacement target")?;
+        let missing_outage_erasure_indices = (1..=topology.total_drives())
+            .filter(|index| !outage_peer_erasure_indices.contains(index))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            missing_outage_erasure_indices.len(),
+            cluster.nodes[1].data_dirs.len(),
+            "the stopped node must account for every missing outage-object erasure index"
+        );
 
         let heal_body = r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
         if !background_enabled {
@@ -1586,29 +1690,35 @@ mod tests {
             "outage object must have a complete target shard: {outage_census:?}"
         );
         assert_eq!(
+            outage_census
+                .erasure_index
+                .filter(|index| missing_outage_erasure_indices.contains(index)),
             outage_census.erasure_index,
-            Some(expected_outage_target_erasure_index),
-            "the outage object must be rebuilt into its own missing erasure slot"
+            "the outage object must be rebuilt into one of the stopped node's missing erasure slots"
         );
 
         if let Some(cycle_end) = scanner_cycle_floor {
             wait_for_scanner_cycle_after(&cluster, cycle_end).await?;
         }
 
-        let mut expected_keys = expected_manifests
+        let mut expected_keys = created_online_objects
             .iter()
-            .map(|manifest| manifest.key.clone())
+            .map(|(key, _)| key.clone())
             .collect::<HashSet<_>>();
         assert!(expected_keys.insert(outage_key.to_string()));
         let node_listings = assert_all_nodes_list_exact_keys(&clients, bucket, &expected_keys).await?;
 
         let target_client = cluster.create_s3_client(1)?;
-        for expected in &expected_manifests {
-            let response = target_client.get_object().bucket(bucket).key(&expected.key).send().await?;
+        for (key, payload_seed) in &created_online_objects {
+            let response = target_client.get_object().bucket(bucket).key(key).send().await?;
             let actual = response.body.collect().await?.into_bytes();
-            let expected_body = deterministic_object_body(object_size_bytes, expected.payload_seed);
-            assert_eq!(actual.as_ref(), expected_body.as_slice(), "object body changed for {}", expected.key);
-            if evidence_run.is_some() {
+            let expected_body = deterministic_object_body(object_size_bytes, *payload_seed);
+            assert_eq!(actual.as_ref(), expected_body.as_slice(), "object body changed for {key}");
+            if evidence_run.is_some()
+                && let Some(expected) = expected_manifests
+                    .iter()
+                    .find(|manifest| manifest.key.as_str() == key.as_str())
+            {
                 evidence_objects.push(serde_json::json!({
                     "key": expected.key, "version_id": expected.shard_census.version_id,
                     "expected_bytes": expected_body.len(), "actual_bytes": actual.len(),
