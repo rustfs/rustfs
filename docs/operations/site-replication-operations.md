@@ -113,7 +113,10 @@ If this marker is stuck:
 3. Wait for one 600-second pass or restart one healthy node to trigger the
    startup pass.
 4. Re-run the identical edit only if the operation remains visible; a different
-   endpoint edit is rejected while the existing refresh is pending.
+   endpoint edit is rejected while the existing refresh is pending. The journal
+   pins the edit's payload, so a re-run without `--replicate-ilm-expiry` keeps
+   the value the first attempt recorded, and a re-run asking for a different
+   value is rejected. Finish or remove the pending refresh before changing it.
 
 A peer removed from the topology no longer blocks completion. A remove request
 is accepted when it removes every active unacknowledged peer.

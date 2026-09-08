@@ -3040,6 +3040,15 @@ fn peer_endpoint_refresh_requested(state: &SiteReplicationState, incoming: &Peer
         .is_some_and(|peer| !peer_connection_settings_match(peer, incoming))
 }
 
+/// A persisted refresh journal pins the edit's payload: the commit reads the
+/// peer and the ilm-expiry override back out of it, so a re-run cannot change
+/// them. Re-running without the flag keeps the pinned value - that is the
+/// documented way to redrive a stuck refresh - but a re-run that asks for a
+/// different value must be rejected rather than accepted and ignored.
+fn endpoint_refresh_ilm_override_conflicts(persisted: &PendingEndpointRefresh, requested: Option<bool>) -> bool {
+    requested.is_some() && requested != persisted.ilm_expiry_override
+}
+
 fn merge_pending_endpoint_refresh(
     state: &SiteReplicationState,
     candidate: &PendingEndpointRefresh,
@@ -7505,6 +7514,15 @@ impl Operation for SiteReplicationEditHandler {
         if persisted_pending.is_some() && !endpoint_refresh_requested {
             return Err(s3_error!(InvalidRequest, "an endpoint target refresh is already pending"));
         }
+        if endpoint_refresh_requested
+            && let Some(persisted) = persisted_pending.as_ref()
+            && endpoint_refresh_ilm_override_conflicts(persisted, ilm_expiry_override)
+        {
+            return Err(s3_error!(
+                InvalidRequest,
+                "endpoint target refresh is pending with a different ilm expiry setting"
+            ));
+        }
         let pending = endpoint_refresh_requested.then(|| {
             persisted_pending.clone().unwrap_or_else(|| PendingEndpointRefresh {
                 id: Uuid::new_v4().to_string(),
@@ -11902,6 +11920,29 @@ mod tests {
     /// would use `edit_state` (no local-name sync) and would clear the journal
     /// under the request that owns it, whose own commit then reports the
     /// refresh as changed and denies the coordinator its acknowledgement.
+    #[test]
+    fn a_pending_endpoint_refresh_pins_its_ilm_expiry_override() {
+        let (_, pending, _) = endpoint_refresh_remove_fixture();
+        let with_override = PendingEndpointRefresh {
+            ilm_expiry_override: Some(true),
+            ..pending.clone()
+        };
+
+        assert!(
+            !endpoint_refresh_ilm_override_conflicts(&with_override, None),
+            "re-running the edit without the flag redrives the pinned refresh"
+        );
+        assert!(!endpoint_refresh_ilm_override_conflicts(&with_override, Some(true)));
+        assert!(
+            endpoint_refresh_ilm_override_conflicts(&with_override, Some(false)),
+            "a different requested value must be rejected, not silently ignored"
+        );
+        assert!(
+            endpoint_refresh_ilm_override_conflicts(&pending, Some(false)),
+            "the journal pins an unset override too"
+        );
+    }
+
     #[test]
     fn a_peer_side_endpoint_refresh_journal_is_not_resumed_locally() {
         let (state, coordinator_pending, local) = endpoint_refresh_remove_fixture();
