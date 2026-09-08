@@ -7,6 +7,8 @@
 
 RustFS supports queued multi-pool decommission start requests on multi-pool deployments. The admin handler accepts the MinIO-compatible request shape, including comma-separated pool targets. An empty target list is rejected; single-pool deployments reject decommission because there is no destination pool; on multi-pool deployments one or more valid target pools are accepted as a single queued operation.
 
+Deterministic request rejections (unsupported single-pool operations, missing or terminal targets, an empty start request, removing the last active pool, and clearing unresolved recovery entries) retain the typed `InvalidArgument` error and its actionable reason. Active-operation conflicts retain their existing `InvalidRequest` or `OperationAborted` contract. Storage, quorum, and fleet-proof failures are not converted into argument errors.
+
 ### Request Semantics
 
 `POST /v3/pools/decommission` with comma-separated pool targets is a queue submission:
@@ -15,7 +17,8 @@ RustFS supports queued multi-pool decommission start requests on multi-pool depl
 - reject duplicate target pools in the same request;
 - reject active or queued target pools;
 - reject completed decommission targets, because completion means the pool can be removed from the deployment configuration;
-- allow failed or canceled targets to be retried;
+- require failed or canceled targets to be cleared before restarting, except
+  when unresolved listing entries require an explicit recovery retry;
 - persist queued metadata before starting workers;
 - start only the local-leader prefix of the queue on the receiving node.
 
@@ -56,6 +59,29 @@ Cancel separates active and queued behavior:
 
 Cancel requests can be accepted on non-leader nodes as remote cancel intent; the leader observes the pending cancel and applies it to the active worker.
 
+`queuedBuckets` retains the unfinished work inventory after cancellation. It is
+not evidence of active scheduling: `queued` is false and `startTime` is absent.
+Operators and tests must inspect the terminal flags, peer state and progress
+stability instead of requiring the historical inventory to be empty. A normal
+canceled entry remains blocked until clear; unresolved listing entries instead
+retain the explicit retry path that can re-observe or resolve those entries.
+
+### Publication On Retiring Pools
+
+Ordinary publication rechecks the selected pool against the durable pool metadata under its existing read fence. Selection may have happened before retirement, or on a node whose local pool state has not been refreshed. A staged new PUT must return `SlowDown` instead of publishing into a pool that has since become suspended. The staged input is not automatically replayed into another pool.
+
+Running, queued, failed, canceled, and completed decommission states exclude the source from new ordinary publication, including new multipart uploads. Previously created multipart uploads retain their drain path while the source remains non-terminal; terminal source states reject further multipart publication. Failed and canceled entries become writable for new ordinary publication only after an allowed clear operation removes that state. This check does not change repair admission or the separate fence for operations that only release capacity.
+
+For mixed batch deletes, only the pools selected to receive new delete markers are publication targets. Exact-version deletions on other pools remain protected by the same pool metadata read fence, without treating the retiring source or an unrelated reserved target as a destination for those markers.
+
+### Shared Capacity On Healthy Targets
+
+Ordinary publication into a healthy target is not rejected solely because that pool has an active decommission reservation. This follows the MinIO decommission write-routing contract: the retiring source stops accepting new writes, while the remaining pools share physical capacity between foreground requests and migration. A reservation remains a migration budget and recovery ledger, not an exclusive foreground-write quota. Repair retains its existing conservative reservation admission policy.
+
+The existing durable metadata fence, valid active reservation checks, owner/mutation identity, pending-intent recovery, target write quorum and source-cleanup preflight remain required. Foreground writes do not acquire the mover's target I/O lock or settle its pending intent. Capacity estimates, including filesystem free-space deltas observed during migration, may include concurrent unrelated I/O; they are not proof of exclusive space or of a committed target object. Actual write failures and identity/quorum checks remain authoritative. Space loss can stop migration with the source retained, including after a target copy has committed. Capacity exhaustion can also fail foreground writes; this policy does not guarantee foreground priority or success. RustFS retains its existing capacity-blocked state and recovery behavior rather than changing terminal-state or retry semantics here.
+
+The native regression overlaps public PUT and multipart create/part replacement/complete/abort operations with a paused target rename on another node context, checks that foreground publication leaves the pending migration ledger unchanged, and then checks both sufficient-capacity cleanup and injected capacity loss with byte-for-byte retained source and target data. Mixed batch deletion covers marker publication on both reserved and unreserved healthy targets together with exact-version removal on the retiring source. Capacity is injected deterministically; the object and metadata operations use real temporary disks, not a physical disk-exhaustion test.
+
 ### Status Response Shape
 
 `GET /v3/pools/list` and `GET /v3/pools/status?pool=...` expose per-pool machine-readable decommission state. The `status` field can report `active`, `running`, `queued`, `complete`, `failed`, or `canceled`.
@@ -69,6 +95,40 @@ When decommission metadata is present, `decommissionInfo` includes:
 - `waitingReason`: `queued` for queued entries and `waiting_for_worker` when metadata exists but no worker has started.
 
 This makes queued pools and stalled metadata visible without requiring operators to inspect pool metadata files directly.
+
+### Scanner Backlog Replica Conflicts
+
+Native scanner CAS publication uses the storage-owned replica write path, not a
+direct write to a set selected from node-local pool state. On multi-pool stores,
+the fixed object namespace precedes the durable pool metadata read fence and
+the actual replica-set namespace. Admission excludes running, queued and
+completed sources; failed/canceled sources retain the scanner's existing
+membership-repair behavior. Missing pool metadata does not authorize a replica.
+Healthy reserved targets remain writable under the shared-capacity contract.
+
+The replica writer retains both outer guards in an owned task and waits for the
+rename tail, including when its caller is canceled. Lock-loss signals remain
+attached to the set commit. This does not require every disk to succeed or alter
+write quorum/fsync policy. Replica writes for this one internal key serialize
+through its fixed namespace; ordinary PUT/GET do not enter this writer. The
+scanner still requires CAS success on every surviving set before acknowledging
+a ledger generation, and retains its partial-commit recovery protocol.
+Older scanner writers still use direct set CAS; this source-publication fence
+requires updating every scanner-capable node. No new on-disk or wire format is
+introduced.
+
+The exact internal object `.rustfs.sys/buckets/.scanner-pause-backlog.json` is
+published with CAS to surviving sets. Its replica-local object modification
+times are not scanner ledger generations. A cross-pool migration receiving
+`PreconditionFailed` can therefore accept an existing unversioned replica with
+an identical known ETag, payload identity and metadata even when its write time
+differs. This exception does not apply to other keys, versioned objects, delete
+markers, missing identity evidence, or a different older ledger payload.
+
+The source is still revalidated under its mutation fence before migration.
+Existing capacity-owner and mutation checks reconcile the pending intent before
+source cleanup; the replica exception does not clear an unknown intent, rewrite
+the native target, or change the scanner's committed-membership selection.
 
 ## MinIO Divergence Decisions
 
