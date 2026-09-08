@@ -1138,6 +1138,7 @@ fn tick_action(dirty: bool, depth: usize, journal_on_disk: bool, retain_replay_j
 mod tests {
     use super::*;
     use rustfs_common::mrf_channel::{MrfIntent, MrfKind, MrfVerifiedRepairDisposition, MrfVerifiedRepairEvent};
+    use serial_test::serial;
     use std::sync::Arc as StdArc;
 
     fn intent(bucket: &str, object: &str, attempts: u8) -> MrfIntent {
@@ -1151,6 +1152,12 @@ mod tests {
             enqueued_at_ms: 1_700_000_000_000,
             attempts,
         }
+    }
+
+    fn encoded_payload(intent: &MrfIntent) -> Vec<u8> {
+        let mut payload = Vec::new();
+        assert!(encode_intent(intent, &mut payload), "fixture intent must encode");
+        payload
     }
 
     #[test]
@@ -1284,6 +1291,66 @@ mod tests {
             Some(ReplayCleanup::Legacy),
             "journals written by the runtime still use the legacy cleanup path"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn runtime_idle_cleanup_deletes_runtime_and_replay_recovery_anchors() {
+        let _env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("rustfs_mrf_runtime_idle_cleanup")
+            .build()
+            .await;
+        let disks = journal_disks().await;
+        assert!(!disks.is_empty(), "test environment must register local disks");
+
+        let replay_owner = Uuid::new_v4();
+        let runtime_owner = Uuid::new_v4();
+        let config = MrfConsumerConfig::default();
+        let journal_max_bytes = config.journal_max_bytes;
+        let replay_payload = encoded_payload(&intent("cleanup-bucket", "replay-object", 0));
+        let runtime_payload = encoded_payload(&intent("cleanup-bucket", "runtime-object", 0));
+        snapshot::publish_committed_snapshot(&disks, replay_owner, 7, &replay_payload, journal_max_bytes)
+            .await
+            .expect("publish retained replay checkpoint");
+        snapshot::publish_committed_snapshot(&disks, runtime_owner, 8, &runtime_payload, journal_max_bytes)
+            .await
+            .expect("publish runtime checkpoint");
+        assert!(write_journal(MRF_SCOPED_JOURNAL_PATH, &runtime_payload).await);
+        assert!(write_journal(MRF_JOURNAL_PATH, &runtime_payload).await);
+
+        let mut runtime = MrfRuntime {
+            queue: MrfQueue::new(2, usize::MAX),
+            config,
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: 9,
+            new_since_flush: 0,
+            dirty: false,
+            journal_on_disk: true,
+            retain_replay_journal: false,
+            durable_replay_anchors: Vec::new(),
+            replay_cleanup: Some(ReplayCleanup::Committed {
+                owner: replay_owner,
+                sequence: 7,
+            }),
+            runtime_checkpoint: Some((runtime_owner, 8)),
+            backoff_until: None,
+        };
+
+        assert!(
+            runtime.delete_idle_recovery_anchors().await,
+            "idle cleanup should remove both runtime and replay recovery anchors"
+        );
+        assert_eq!(runtime.replay_cleanup, None);
+        assert_eq!(runtime.runtime_checkpoint, None);
+        assert!(
+            snapshot::inspect_local_committed_snapshot(journal_max_bytes)
+                .await
+                .expect("inspect committed checkpoints after cleanup")
+                .is_none(),
+            "both committed checkpoint generations must be gone after idle cleanup"
+        );
+        assert_eq!(read_journal(MRF_SCOPED_JOURNAL_PATH).await, None);
+        assert_eq!(read_journal(MRF_JOURNAL_PATH).await, None);
     }
 
     #[test]
