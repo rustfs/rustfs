@@ -539,6 +539,47 @@ fn scanner_segment_reuse_activation_preflight_for_cycle(
     })
 }
 
+fn scanner_durable_segment_invalidation_evidence(
+    dirty_usage_snapshot: &DirtyUsageSnapshot,
+    results: &[DataUsageCache],
+    expected_sources: &HashSet<DataUsageCacheSource>,
+) -> DirtyUsageProducerEvidence {
+    let mut evidence = dirty_usage_producer_evidence(dirty_usage_snapshot);
+    if !evidence.generation_window_bound
+        || !evidence.producer_identity_coverage_complete
+        || !scanner_results_form_complete_snapshot(results, expected_sources)
+    {
+        return evidence;
+    }
+
+    let mut covered_sources = HashSet::with_capacity(expected_sources.len());
+    let all_sets_proved = results.iter().all(|result| {
+        let Some(source) = result.info.source else {
+            return false;
+        };
+        expected_sources.contains(&source)
+            && covered_sources.insert(source)
+            && scanner_segment_invalidation_proof_matches(result.info.segment_invalidation_proof.as_ref(), &evidence)
+    });
+    if all_sets_proved && covered_sources.len() == expected_sources.len() {
+        evidence.durable_producer_identity = true;
+        evidence.restart_gap_absent = true;
+    }
+    evidence
+}
+
+fn scanner_segment_invalidation_proof_matches(
+    proof: Option<&crate::DataUsageSegmentInvalidationProof>,
+    evidence: &DirtyUsageProducerEvidence,
+) -> bool {
+    proof.is_some_and(|proof| {
+        proof.process_epoch == scanner_activity_epoch()
+            && proof.generation_start == evidence.generation_start
+            && proof.generation_end == evidence.generation_end
+            && proof.producer_identity_coverage_complete
+    })
+}
+
 fn scanner_segment_reuse_activated() -> bool {
     scanner_segment_reuse_activation_preflight().scanner_segment_reuse_activated
 }

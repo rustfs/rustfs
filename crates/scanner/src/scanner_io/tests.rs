@@ -238,6 +238,49 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_skips_distributed_blocke
 }
 
 #[test]
+#[serial]
+fn scanner_durable_segment_invalidation_evidence_requires_matching_complete_set_proofs() {
+    use crate::segment_invalidation::SegmentInvalidationProducerIdentity;
+
+    clear_dirty_usage_buckets_for_tests();
+    record_dirty_usage_bucket_from_producers("photos", SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION);
+    let dirty_usage_snapshot = snapshot_dirty_usage_buckets(&[bucket_info("photos")], dirty_usage_generation());
+    let process_proof = dirty_usage_producer_evidence(&dirty_usage_snapshot)
+        .segment_invalidation_proof()
+        .expect("complete process-local producer coverage should produce proof metadata");
+    let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0), DataUsageCacheSource::new(0, 1)]);
+    let results = vec![
+        complete_set_cache_with_segment_proof(DataUsageCacheSource::new(0, 0), process_proof.clone()),
+        complete_set_cache_with_segment_proof(DataUsageCacheSource::new(0, 1), process_proof.clone()),
+    ];
+
+    let durable_evidence = scanner_durable_segment_invalidation_evidence(&dirty_usage_snapshot, &results, &expected_sources);
+
+    assert!(durable_evidence.producer_identity_coverage_complete);
+    assert!(durable_evidence.durable_producer_identity);
+    assert!(durable_evidence.restart_gap_absent);
+
+    let mut stale_epoch = results.clone();
+    stale_epoch[0]
+        .info
+        .segment_invalidation_proof
+        .as_mut()
+        .expect("proof fixture should exist")
+        .process_epoch = "stale-process".to_string();
+    let stale_evidence = scanner_durable_segment_invalidation_evidence(&dirty_usage_snapshot, &stale_epoch, &expected_sources);
+    assert!(stale_evidence.producer_identity_coverage_complete);
+    assert!(!stale_evidence.durable_producer_identity);
+    assert!(!stale_evidence.restart_gap_absent);
+
+    record_dirty_usage_bucket("videos");
+    let changed_evidence = scanner_durable_segment_invalidation_evidence(&dirty_usage_snapshot, &results, &expected_sources);
+    assert!(!changed_evidence.producer_identity_coverage_complete);
+    assert!(!changed_evidence.durable_producer_identity);
+    assert!(!changed_evidence.restart_gap_absent);
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[test]
 fn scanner_cycle_result_returns_segment_reuse_activation_preflight() {
     let proof = ScannerSegmentReuseActivationProof {
         production_activation: true,
@@ -272,6 +315,26 @@ fn complete_process_local_producer_evidence() -> DirtyUsageProducerEvidence {
         generation_window_bound: true,
         generation_start: 7,
         generation_end: 7,
+    }
+}
+
+fn complete_set_cache_with_segment_proof(
+    source: DataUsageCacheSource,
+    proof: crate::DataUsageSegmentInvalidationProof,
+) -> DataUsageCache {
+    DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: DATA_USAGE_ROOT.to_string(),
+            next_cycle: 7,
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            leader_epoch: 11,
+            source: Some(source),
+            snapshot_complete: true,
+            scan_plan_digest: Some(DataUsageScanPlanDigest([3; 32])),
+            segment_invalidation_proof: Some(proof),
+            ..Default::default()
+        },
+        cache: HashMap::new(),
     }
 }
 
