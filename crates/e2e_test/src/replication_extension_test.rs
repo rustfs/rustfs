@@ -4236,6 +4236,16 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
     <Destination><Bucket>{target_b_arn}</Bucket></Destination>
   </Rule>
   <Rule>
+    <ID>matrix-and-tags</ID>
+    <Priority>135</Priority>
+    <Status>Enabled</Status>
+    <Filter><And><Prefix>and-tags/</Prefix><Tag><Key>env</Key><Value>prod</Value></Tag><Tag><Key>tier</Key><Value>gold</Value></Tag></And></Filter>
+    <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>
+    <DeleteReplication><Status>Enabled</Status></DeleteReplication>
+    <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+    <Destination><Bucket>{target_b_arn}</Bucket></Destination>
+  </Rule>
+  <Rule>
     <ID>matrix-disabled</ID>
     <Priority>140</Priority>
     <Status>Disabled</Status>
@@ -4289,6 +4299,7 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
         "matrix-prefix",
         "matrix-tag",
         "matrix-disabled",
+        "matrix-and-tags",
         "matrix-priority-high",
         "Priority>200",
         "<Status>Disabled</Status>",
@@ -4408,6 +4419,30 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
     // matching tag later remains metadata-only and fails closed.
     put_single_tag_current(&source_client, source_bucket, "tagged/no-match.txt", "route", "tagged").await?;
     assert_replication_key_absent(&target_client_b, target_bucket_b, "tagged/no-match.txt", Duration::from_secs(3)).await?;
+
+    // S3 and MinIO both read `And.Tags` as AND: an object carrying only one of
+    // the required tags is not admitted. Matching any single tag would push
+    // data to a destination the rule never selected (backlog#2366 P1-1), and
+    // the two-tag rule is the shape `mc replicate add --tags "k1=v1&k2=v2"`
+    // writes, so a single-tag rule passing is not evidence for this.
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("and-tags/partial.txt")
+        .tagging("env=prod")
+        .body(ByteStream::from_static(b"one of two tags"))
+        .send()
+        .await?;
+    assert_replication_key_absent(&target_client_b, target_bucket_b, "and-tags/partial.txt", Duration::from_secs(3)).await?;
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("and-tags/full.txt")
+        .tagging("env=prod&tier=gold")
+        .body(ByteStream::from_static(b"both tags"))
+        .send()
+        .await?;
+    wait_for_user_get_object(&target_client_b, target_bucket_b, "and-tags/full.txt").await?;
 
     source_client
         .put_object()
