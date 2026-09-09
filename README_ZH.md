@@ -150,7 +150,10 @@ docker compose -f docker-compose-simple.yml up -d
 
 ```bash
 # 在本地构建多架构镜像
-./docker-buildx.sh --build-arg RELEASE=latest
+./docker-buildx.sh
+
+# 在本地构建单平台镜像
+./docker-buildx.sh -p linux/amd64
 
 # 构建并推送到仓库
 ./docker-buildx.sh --push

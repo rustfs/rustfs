@@ -211,7 +211,10 @@ For developers who want to build RustFS Docker images from source with multi-arc
 
 ```bash
 # Build multi-architecture images locally
-./docker-buildx.sh --build-arg RELEASE=latest
+./docker-buildx.sh
+
+# Build a single-platform image locally
+./docker-buildx.sh -p linux/amd64
 
 # Build and push to registry
 ./docker-buildx.sh --push
