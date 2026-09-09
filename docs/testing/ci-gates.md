@@ -336,6 +336,18 @@ pre-mounted small filesystem. P4 is release evidence only when it completes the
 default two-hour soak; `--allow-short-soak` is diagnostic and skips P4 bundle
 gate validation.
 
+Already collected W13 raw MRF artifacts can be re-packaged and checked without
+rerunning the Rust test with:
+
+```bash
+scripts/python_bin.sh scripts/run_scanner_heal_mrf_evidence.py \
+  --run-dir /path/to/scanner-heal-w13-evidence-run
+```
+
+The producer rejects fixture, dry-run, synthetic, stale-revision, incomplete
+MRF responsibility, missing disk-full ENOSPC observations, and short P4 cleanup
+soaks before writing `release-bundle-w13.json`.
+
 Legacy rollback evidence for R-L is assembled from a measured proof JSON:
 
 ```bash

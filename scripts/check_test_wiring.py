@@ -323,6 +323,19 @@ SCANNER_HEAL_RELEASE_CRASH_BOUNDARY_FIELDS = {
         "process-restart-replay",
     ),
 }
+SCANNER_HEAL_RELEASE_G12_QUOTA_PATH_CASES = {
+    "reset_quota_path_evidence": (
+        "storage-owner-reconstruction",
+        "future-reservation-protocol-fail-closed",
+        "reservation-ledger-retained",
+    ),
+    "settlement_quota_path_evidence": (
+        "distributed-hard-quota-admission",
+        "quota-stats-current-usage-observed",
+        "oversized-put-rejected",
+        "rejected-object-not-visible",
+    ),
+}
 SCANNER_HEAL_RELEASE_G05_PER_OBJECT_OUTCOME_CASES = (
     "object-repaired",
     "object-already-healthy",
@@ -1822,6 +1835,8 @@ def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple
             fields.append("whole_cycle_fallback_observed")
     if gate == "G04" and field == "root_floor_intent_crash_evidence":
         fields.extend(("durable_intent_cases", "persist_failure_blocks_acceptance"))
+    if gate == "G12":
+        fields.append("quota_path_cases")
     if gate == "G05":
         if field == "per_object_outcome_oracle":
             fields.extend(("per_object_outcome_cases", "outcome_counts", "status_matches_object_oracle"))
@@ -2147,6 +2162,13 @@ def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dic
         )
         release_bundle_bool_true(evidence.get("persist_failure_blocks_acceptance"),
                                  f"{gate}.{field}.persist_failure_blocks_acceptance")
+
+    if gate == "G12":
+        release_bundle_exact_strings(
+            evidence.get("quota_path_cases"),
+            SCANNER_HEAL_RELEASE_G12_QUOTA_PATH_CASES[field],
+            f"{gate}.{field}.quota_path_cases",
+        )
 
     if gate == "G05":
         if field == "per_object_outcome_oracle":
@@ -2540,7 +2562,7 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
             evidence_integer(evidence.get("lock_hold_p95_ms"), f"{gate}.{field}.lock_hold_p95_ms", 0, 2**31 - 1)
             evidence_integer(evidence.get("foreground_latency_p95_ms"),
                              f"{gate}.{field}.foreground_latency_p95_ms", 1, 2**31 - 1)
-    if gate in ("G01", "G11", "G13", "R-L"):
+    if gate in ("G01", "G11", "G12", "G13", "R-L"):
         validate_release_bundle_domain_evidence(gate, field, evidence)
     if gate == "P1" and field == "foreground_latency_throughput_measurement":
         evidence_integer(evidence.get("foreground_latency_p95_ms"),
@@ -3109,6 +3131,8 @@ def write_scanner_heal_release_bundle_fixture(root: Path, directory: Path) -> Pa
                 evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
             if gate in ("G04", "G07", "R-E", "R-L"):
                 evidence["crash_points"] = ["fixture-before-commit"]
+            if gate == "G12":
+                evidence["quota_path_cases"] = list(SCANNER_HEAL_RELEASE_G12_QUOTA_PATH_CASES[field])
             if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
                 evidence["replayed_records"] = 1
                 evidence["responsibility_anchor_retained"] = True
@@ -3527,6 +3551,8 @@ class SelfTests(unittest.TestCase):
                 if gate == "G04" and field == "root_floor_intent_crash_evidence":
                     evidence["durable_intent_cases"] = list(SCANNER_HEAL_RELEASE_CRASH_BOUNDARY_FIELDS[(gate, field)])
                     evidence["persist_failure_blocks_acceptance"] = True
+                if gate == "G12":
+                    evidence["quota_path_cases"] = list(SCANNER_HEAL_RELEASE_G12_QUOTA_PATH_CASES[field])
                 if gate == "G05" and field == "per_object_outcome_oracle":
                     evidence["per_object_outcome_cases"] = list(SCANNER_HEAL_RELEASE_G05_PER_OBJECT_OUTCOME_CASES)
                     evidence["outcome_counts"] = {"repaired": 4, "healthy": 3, "skipped": 2, "failed": 1}
@@ -4527,6 +4553,20 @@ class SelfTests(unittest.TestCase):
                 "root_floor_intent_crash_evidence",
                 lambda item: item.pop("persist_failure_blocks_acceptance"),
                 "persist_failure_blocks_acceptance",
+            ),
+            (
+                "g12-reset-quota-cases",
+                "G12",
+                "reset_quota_path_evidence",
+                lambda item: item["quota_path_cases"].remove("future-reservation-protocol-fail-closed"),
+                "quota_path_cases missing cases",
+            ),
+            (
+                "g12-settlement-quota-cases",
+                "G12",
+                "settlement_quota_path_evidence",
+                lambda item: item["quota_path_cases"].remove("rejected-object-not-visible"),
+                "quota_path_cases missing cases",
             ),
             (
                 "mixed-version-cases",
