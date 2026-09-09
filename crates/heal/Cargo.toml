@@ -31,6 +31,7 @@ workspace = true
 
 [features]
 default = []
+test-util = []
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",

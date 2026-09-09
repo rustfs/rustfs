@@ -1422,6 +1422,15 @@ impl HealManager {
         config: Option<HealConfig>,
         workload_provider: Option<WorkloadSnapshotProviderRef>,
     ) -> Self {
+        Self::new_with_root_recovery(storage, config, workload_provider, Arc::new(root_recovery::RootHealRecovery::default()))
+    }
+
+    fn new_with_root_recovery(
+        storage: Arc<dyn HealStorageAPI>,
+        config: Option<HealConfig>,
+        workload_provider: Option<WorkloadSnapshotProviderRef>,
+        root_recovery: Arc<root_recovery::RootHealRecovery>,
+    ) -> Self {
         let config = config.unwrap_or_default();
         Self {
             config: Arc::new(RwLock::new(config)),
@@ -1435,7 +1444,7 @@ impl HealManager {
             mrf_repair_notice_targets: Arc::new(StdMutex::new(HashMap::new())),
             replacement_recovery_anchors: Arc::new(std::sync::Mutex::new(HashMap::new())),
             replacement_recovery_blocked_sets: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            root_recovery: Arc::new(root_recovery::RootHealRecovery::default()),
+            root_recovery,
             force_start_shutdown: Mutex::new(()),
             storage,
             cancel_token: CancellationToken::new(),
@@ -1444,6 +1453,27 @@ impl HealManager {
             workload_provider,
             admission_telemetry: Arc::new(StdMutex::new(HealAdmissionTelemetry::default())),
         }
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn new_without_root_recovery_for_test(storage: Arc<dyn HealStorageAPI>, config: Option<HealConfig>) -> Self {
+        Self::new_with_root_recovery(storage, config, None, Arc::new(root_recovery::RootHealRecovery::disabled_for_tests()))
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn new_with_workload_provider_without_root_recovery_for_test(
+        storage: Arc<dyn HealStorageAPI>,
+        config: Option<HealConfig>,
+        workload_provider: Option<WorkloadSnapshotProviderRef>,
+    ) -> Self {
+        Self::new_with_root_recovery(
+            storage,
+            config,
+            workload_provider,
+            Arc::new(root_recovery::RootHealRecovery::disabled_for_tests()),
+        )
     }
 
     /// Start HealManager

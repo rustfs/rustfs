@@ -73,11 +73,11 @@ async fn await_count(client: &reqwest::Client, base: &str, selector: &str, expec
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let result = query(client, base, &format!("count({selector}) or vector(0)")).await;
-        if let Ok(rows) = &result {
-            if rows[0]["value"][1].as_str().and_then(|value| value.parse::<u64>().ok()) == Some(expected) {
-                println!("PASS count={expected}: {selector}");
-                return Ok(());
-            }
+        if let Ok(rows) = &result
+            && rows[0]["value"][1].as_str().and_then(|value| value.parse::<u64>().ok()) == Some(expected)
+        {
+            println!("PASS count={expected}: {selector}");
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(format!("expected {expected} for {selector}; last result: {result:?}").into());

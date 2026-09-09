@@ -141,7 +141,7 @@ async fn start_fixture(
         started: AtomicUsize::new(0),
         committed: AtomicUsize::new(0),
     });
-    let manager = HealManager::new_with_workload_provider(
+    let manager = HealManager::new_with_workload_provider_without_root_recovery_for_test(
         storage.clone(),
         Some(HealConfig {
             mainline_throttle_enable: pacing_enabled,
