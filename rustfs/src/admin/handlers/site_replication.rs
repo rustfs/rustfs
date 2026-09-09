@@ -4947,7 +4947,7 @@ async fn ensure_site_replication_bucket_targets(bucket: &str) -> S3Result<()> {
         return Ok(());
     };
     let config = bucket_replication_config_for_target_refresh(bucket).await?;
-    ensure_site_replication_bucket_targets_with_runtime(
+    let written = ensure_site_replication_bucket_targets_with_runtime(
         bucket,
         &runtime.state,
         &runtime.local_peer,
@@ -4955,7 +4955,11 @@ async fn ensure_site_replication_bucket_targets(bucket: &str) -> S3Result<()> {
         &runtime.service_account_secret_key,
         expected_incarnation_id,
     )
-    .await
+    .await?;
+    if written {
+        reload_bucket_metadata_on_peers(bucket, "site_replication_bucket_targets", false).await;
+    }
+    Ok(())
 }
 
 async fn ensure_site_replication_bucket_setup(bucket: &str) -> S3Result<bool> {
@@ -5025,6 +5029,9 @@ async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deploymen
         Err(err) => return Err(ApiError::from(err).into()),
     }
 
+    if removed > 0 {
+        reload_bucket_metadata_on_peers(bucket, "site_replication_bucket_cleanup", true).await;
+    }
     Ok(removed)
 }
 
@@ -5341,7 +5348,7 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
         let local_peer = current_local_runtime_peer(&target_state);
         let _targets_guard = lock_bucket_targets_metadata(&bucket.name).await;
         let replication_config = bucket_replication_config_for_target_refresh(&bucket.name).await?;
-        ensure_site_replication_bucket_targets_with_runtime(
+        let written = ensure_site_replication_bucket_targets_with_runtime(
             &bucket.name,
             &target_state,
             &local_peer,
@@ -5350,6 +5357,9 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
             expected_incarnation_id,
         )
         .await?;
+        if written {
+            reload_bucket_metadata_on_peers(&bucket.name, "site_replication_endpoint_refresh", false).await;
+        }
 
         rewritten.push(bucket.name.clone());
 
@@ -5393,16 +5403,12 @@ async fn site_bucket_resync_manifest_entry(bucket: &str, peer: &PeerInfo, now: O
         ..Default::default()
     };
     let _targets_guard = lock_bucket_targets_metadata(bucket).await;
-    let (config, _) = match metadata_sys::get_replication_config(bucket).await {
-        Ok(config) => config,
-        Err(err) => {
-            entry.status = "failed".to_string();
-            entry.err_detail = summarize_peer_error_detail(&err.to_string());
-            return entry;
-        }
-    };
-    let targets = match metadata_sys::list_bucket_targets(bucket).await {
-        Ok(targets) => targets,
+    // Read what is persisted, not this node's cache: the wiring may have
+    // been written by another node moments ago (`start_site_bucket_resync`
+    // already reads its targets from disk), and an operator resync must see
+    // the same records the drive will use.
+    let (config, targets) = match site_bucket_resync_persisted_wiring(bucket).await {
+        Ok(wiring) => wiring,
         Err(err) => {
             entry.status = "failed".to_string();
             entry.err_detail = summarize_peer_error_detail(&err.to_string());
@@ -5433,6 +5439,15 @@ async fn site_bucket_resync_manifest_entry(bucket: &str, peer: &PeerInfo, now: O
     entry
 }
 
+/// The persisted replication configuration and bucket targets, bypassing the
+/// node-local metadata cache. `ConfigNotFound` surfaces for a bucket without
+/// a replication configuration, matching the cached read's error.
+async fn site_bucket_resync_persisted_wiring(bucket: &str) -> Result<(ReplicationConfiguration, BucketTargets), StorageError> {
+    let metadata = metadata_sys::get_config_from_disk(bucket).await?;
+    let config = metadata.replication_config.ok_or(StorageError::ConfigNotFound)?;
+    Ok((config, metadata.bucket_target_config.unwrap_or_default()))
+}
+
 async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &str) -> ResyncBucketStatus {
     let mut bucket_status = ResyncBucketStatus {
         bucket: bucket.to_string(),
@@ -5455,17 +5470,8 @@ async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &st
         }
     };
 
-    let (config, _) = match metadata_sys::get_replication_config(bucket).await {
-        Ok(config) => config,
-        Err(err) => {
-            bucket_status.status = "failed".to_string();
-            bucket_status.err_detail = err.to_string();
-            return bucket_status;
-        }
-    };
-
-    let targets = match metadata_sys::list_bucket_targets_from_disk(bucket).await {
-        Ok(targets) => targets,
+    let (config, targets) = match site_bucket_resync_persisted_wiring(bucket).await {
+        Ok(wiring) => wiring,
         Err(err) => {
             bucket_status.status = "failed".to_string();
             bucket_status.err_detail = err.to_string();
@@ -6061,6 +6067,10 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
     }
     drop(lifecycle_guard);
     drop(targets_guard);
+
+    if !skip_config_write {
+        reload_bucket_metadata_on_peers(&item.bucket, "site_replication_bucket_meta", item.r#type == "lc-config").await;
+    }
 
     if item.r#type == "replication-config" {
         // Rebuild the local outbound rules too: a site that joined an already-replicated
@@ -7448,6 +7458,7 @@ impl Operation for SRPeerBucketOpsHandler {
                 )
                 .await
                 .map_err(ApiError::from)?;
+                reload_bucket_metadata_on_peers(&bucket, "site_replication_make_bucket", false).await;
             }
             "configure-replication" => {
                 store
