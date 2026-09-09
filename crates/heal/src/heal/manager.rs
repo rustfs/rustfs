@@ -945,7 +945,7 @@ impl HealManager {
     }
 
     fn queued_request_can_be_displaced(request: &HealRequest) -> bool {
-        !root_recovery::is_root_heal(&request.heal_type, request.source)
+        !root_recovery::is_admin_heal_recovery(&request.heal_type, request.source)
     }
 
     fn request_bypasses_mainline_throttle(request: &HealRequest) -> bool {
@@ -1492,13 +1492,13 @@ impl HealManager {
         );
 
         // Keep scheduler, cancellation, and retry ownership stable until every
-        // unfinished root traversal has a durable successor. A failed write
-        // must leave the manager running and the shutdown marker unclean.
+        // unfinished admin control-plane heal has a durable successor. A failed
+        // write must leave the manager running and the shutdown marker unclean.
         let mut active_heals = self.active_heals.lock().await;
         let queue = self.heal_queue.lock().await;
         let retrying = self.retrying_heals.lock().await;
         for task in active_heals.values() {
-            if root_recovery::is_root_heal(&task.heal_type, task.source) {
+            if root_recovery::is_admin_heal_recovery(&task.heal_type, task.source) {
                 if task.get_status().await == HealTaskStatus::Completed {
                     self.root_recovery.remove(&task.id, &task.heal_type, task.source).await?;
                 } else {
@@ -1684,7 +1684,7 @@ impl HealManager {
                         .requests()
                         .chain(retrying.values().map(|retrying| &retrying.request))
                         .filter(|pending| {
-                            root_recovery::is_root_heal(&pending.heal_type, pending.source) && pending.id != request.id
+                            root_recovery::is_admin_heal_recovery(&pending.heal_type, pending.source) && pending.id != request.id
                         })
                         .map(|pending| pending.id.clone()),
                 );
@@ -1938,15 +1938,15 @@ impl HealManager {
             }
         }
 
-        let durable_root_handoff = root_recovery::is_root_heal(&request.heal_type, request.source);
-        let durable_root_handoff_required = durable_root_handoff
+        let durable_handoff = root_recovery::is_admin_heal_recovery(&request.heal_type, request.source);
+        let durable_handoff_required = durable_handoff
             && (request.force_start
                 || queue.len() < config.queue_size
                 || (Self::can_displace_queued_work(&request)
                     && queue.can_displace_lower_priority_where(request.priority, Self::queued_request_can_be_displaced)));
-        // A root admin receipt is a cluster traversal responsibility. Persist
-        // it before queue publication so a crash after admission can replay it.
-        if durable_root_handoff_required {
+        // An admin receipt is a control-plane responsibility. Persist it before
+        // queue publication so a crash after admission can replay it.
+        if durable_handoff_required {
             self.root_recovery.persist(&request).await?;
         }
 
@@ -1956,7 +1956,7 @@ impl HealManager {
         let request_source = request.source;
         let admission_decision = Self::admit_request_to_queue(&mut queue, request, &config, "submit");
         let admission = admission_decision.result;
-        if durable_root_handoff_required && !admission.is_admitted() {
+        if durable_handoff_required && !admission.is_admitted() {
             self.root_recovery
                 .remove(&request_id, &request_heal_type, request_source)
                 .await?;
@@ -2417,11 +2417,15 @@ impl HealManager {
             self.remove_mrf_repair_notice_targets_for_task(&request.id);
         }
 
-        if heal_type_matches_path(&HealType::Cluster, heal_path) {
-            for pending in self.root_recovery.pending().await? {
-                if self.root_recovery.cancel_pending(&pending.id).await? {
-                    cancelled += 1;
-                }
+        for pending in self
+            .root_recovery
+            .pending()
+            .await?
+            .into_iter()
+            .filter(|pending| heal_type_matches_path(&pending.heal_type, heal_path))
+        {
+            if self.root_recovery.cancel_pending(&pending.id).await? {
+                cancelled += 1;
             }
         }
         if cancelled == 0 {

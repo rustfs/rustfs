@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Graceful-shutdown handoff for administrator root heals. This namespace is
+//! Graceful-shutdown handoff for administrator heals. This namespace is
 //! separate from erasure-set checkpoints and replacement generations, which
-//! cannot represent a cluster traversal. One coordinator disk owns each
-//! record; never create a fallback copy after an uncertain write or deletion.
+//! cannot represent an admitted admin control-plane request. One coordinator
+//! disk owns each record; never create a fallback copy after an uncertain write
+//! or deletion.
 
 use super::*;
 use crate::heal::storage_api::owner::{EcstoreConditionalFileUpdate, EcstoreDiskAPI, EcstoreDiskBytes};
@@ -25,13 +26,170 @@ use serde::{Deserialize, Serialize};
 // The metadata bucket already exists and its parent is durable. Creating a
 // nested journal directory here would also require syncing every ancestor.
 const ROOT_RECOVERY_PREFIX: &str = "root-heal-";
-const ROOT_RECOVERY_SCHEMA: u32 = 1;
+const LEGACY_ROOT_RECOVERY_SCHEMA: u32 = 1;
+const ROOT_RECOVERY_SCHEMA: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RecoveryHealType {
+    Cluster,
+    Bucket {
+        bucket: String,
+    },
+    Object {
+        bucket: String,
+        object: String,
+        version_id: Option<String>,
+    },
+    Prefix {
+        bucket: String,
+        prefix: String,
+    },
+    ErasureSet {
+        buckets: Vec<String>,
+        set_disk_id: String,
+    },
+    Metadata {
+        bucket: String,
+        object: String,
+    },
+    EcDecode {
+        bucket: String,
+        object: String,
+        version_id: Option<String>,
+    },
+}
+
+impl RecoveryHealType {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Cluster => {}
+            Self::Bucket { bucket } => validate_recovery_component("bucket", bucket)?,
+            Self::Object {
+                bucket,
+                object,
+                version_id,
+            }
+            | Self::EcDecode {
+                bucket,
+                object,
+                version_id,
+            } => {
+                validate_recovery_component("bucket", bucket)?;
+                validate_recovery_component("object", object)?;
+                if let Some(version_id) = version_id {
+                    validate_recovery_component("version id", version_id)?;
+                }
+            }
+            Self::Prefix { bucket, prefix } => {
+                validate_recovery_component("bucket", bucket)?;
+                validate_recovery_component("prefix", prefix)?;
+            }
+            Self::ErasureSet { buckets, set_disk_id } => {
+                validate_recovery_component("set disk id", set_disk_id)?;
+                if buckets.is_empty() {
+                    return Err(Error::Other("Admin heal recovery erasure set must name buckets".to_string()));
+                }
+                for bucket in buckets {
+                    validate_recovery_component("bucket", bucket)?;
+                }
+            }
+            Self::Metadata { bucket, object } => {
+                validate_recovery_component("bucket", bucket)?;
+                validate_recovery_component("object", object)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl From<&HealType> for RecoveryHealType {
+    fn from(heal_type: &HealType) -> Self {
+        match heal_type {
+            HealType::Cluster => Self::Cluster,
+            HealType::Bucket { bucket } => Self::Bucket { bucket: bucket.clone() },
+            HealType::Object {
+                bucket,
+                object,
+                version_id,
+            } => Self::Object {
+                bucket: bucket.clone(),
+                object: object.clone(),
+                version_id: version_id.clone(),
+            },
+            HealType::Prefix { bucket, prefix } => Self::Prefix {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+            },
+            HealType::ErasureSet { buckets, set_disk_id } => Self::ErasureSet {
+                buckets: buckets.clone(),
+                set_disk_id: set_disk_id.clone(),
+            },
+            HealType::Metadata { bucket, object } => Self::Metadata {
+                bucket: bucket.clone(),
+                object: object.clone(),
+            },
+            HealType::ECDecode {
+                bucket,
+                object,
+                version_id,
+            } => Self::EcDecode {
+                bucket: bucket.clone(),
+                object: object.clone(),
+                version_id: version_id.clone(),
+            },
+        }
+    }
+}
+
+impl From<RecoveryHealType> for HealType {
+    fn from(heal_type: RecoveryHealType) -> Self {
+        match heal_type {
+            RecoveryHealType::Cluster => Self::Cluster,
+            RecoveryHealType::Bucket { bucket } => Self::Bucket { bucket },
+            RecoveryHealType::Object {
+                bucket,
+                object,
+                version_id,
+            } => Self::Object {
+                bucket,
+                object,
+                version_id,
+            },
+            RecoveryHealType::Prefix { bucket, prefix } => Self::Prefix { bucket, prefix },
+            RecoveryHealType::ErasureSet { buckets, set_disk_id } => Self::ErasureSet { buckets, set_disk_id },
+            RecoveryHealType::Metadata { bucket, object } => Self::Metadata { bucket, object },
+            RecoveryHealType::EcDecode {
+                bucket,
+                object,
+                version_id,
+            } => Self::ECDecode {
+                bucket,
+                object,
+                version_id,
+            },
+        }
+    }
+}
+
+fn validate_recovery_component(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() || value.contains('\0') {
+        return Err(Error::Other(format!("Invalid admin heal recovery {label}")));
+    }
+    Ok(())
+}
+
+fn default_recovery_heal_type() -> RecoveryHealType {
+    RecoveryHealType::Cluster
+}
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RootHealIntent {
     schema: u32,
     task_id: String,
+    #[serde(default = "default_recovery_heal_type")]
+    heal_type: RecoveryHealType,
     #[serde(deserialize_with = "decode_options")]
     options: HealOptions,
     priority: HealPriority,
@@ -44,6 +202,7 @@ impl RootHealIntent {
         Self {
             schema: ROOT_RECOVERY_SCHEMA,
             task_id: request.id.clone(),
+            heal_type: RecoveryHealType::from(&request.heal_type),
             options: request.options.clone(),
             priority: request.priority,
             retry_attempts: request.retry_attempts,
@@ -52,7 +211,7 @@ impl RootHealIntent {
     }
 
     fn into_request(self) -> HealRequest {
-        let mut request = HealRequest::new(HealType::Cluster, self.options, self.priority);
+        let mut request = HealRequest::new(self.heal_type.into(), self.options, self.priority);
         request.id = self.task_id;
         request.source = HealRequestSource::Admin;
         request.retry_attempts = self.retry_attempts;
@@ -68,8 +227,18 @@ pub(super) struct RootHealRecovery {
     disks: Option<Vec<DiskStore>>,
 }
 
-pub(super) fn is_root_heal(heal_type: &HealType, source: HealRequestSource) -> bool {
-    source == HealRequestSource::Admin && matches!(heal_type, HealType::Cluster)
+pub(super) fn is_admin_heal_recovery(heal_type: &HealType, source: HealRequestSource) -> bool {
+    source == HealRequestSource::Admin
+        && matches!(
+            heal_type,
+            HealType::Cluster
+                | HealType::Bucket { .. }
+                | HealType::Object { .. }
+                | HealType::Prefix { .. }
+                | HealType::ErasureSet { .. }
+                | HealType::Metadata { .. }
+                | HealType::ECDecode { .. }
+        )
 }
 
 fn decode_options<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<HealOptions, D::Error> {
@@ -111,9 +280,15 @@ fn decode_intent(task_id: &str, bytes: &[u8]) -> Result<RootHealIntent> {
     let _ = intent_path(task_id)?;
     let intent: RootHealIntent = serde_json::from_slice(bytes)
         .map_err(|error| Error::Other(format!("Invalid root heal recovery record {task_id}: {error}")))?;
-    if intent.schema != ROOT_RECOVERY_SCHEMA || intent.task_id != task_id {
+    if intent.task_id != task_id {
         return Err(Error::Other(format!("Unsupported or mismatched root heal recovery record {task_id}")));
     }
+    match intent.schema {
+        LEGACY_ROOT_RECOVERY_SCHEMA if intent.heal_type == RecoveryHealType::Cluster => {}
+        ROOT_RECOVERY_SCHEMA => {}
+        _ => return Err(Error::Other(format!("Unsupported or mismatched root heal recovery record {task_id}"))),
+    }
+    intent.heal_type.validate()?;
     Ok(intent)
 }
 
@@ -163,7 +338,7 @@ impl RootHealRecovery {
     }
 
     pub(super) async fn persist(&self, request: &HealRequest) -> Result<()> {
-        if !is_root_heal(&request.heal_type, request.source) {
+        if !is_admin_heal_recovery(&request.heal_type, request.source) {
             return Ok(());
         }
         let _guard = self.mutation.lock().await;
@@ -199,9 +374,13 @@ impl RootHealRecovery {
     }
 
     pub(super) async fn remove(&self, task_id: &str, heal_type: &HealType, source: HealRequestSource) -> Result<bool> {
-        if !is_root_heal(heal_type, source) {
+        if !is_admin_heal_recovery(heal_type, source) {
             return Ok(false);
         }
+        self.remove_pending_by_id(task_id).await
+    }
+
+    async fn remove_pending_by_id(&self, task_id: &str) -> Result<bool> {
         let _guard = self.mutation.lock().await;
         let Some((disk, bytes)) = Self::find(&self.disks().await?, task_id).await? else {
             return Ok(false);
@@ -221,7 +400,7 @@ impl RootHealRecovery {
     }
 
     pub(super) async fn checkpoint_failed_execution(&self, task: &HealTask) -> Result<()> {
-        if !is_root_heal(&task.heal_type, task.source) {
+        if !is_admin_heal_recovery(&task.heal_type, task.source) {
             return Ok(());
         }
         let remaining = match task.retry_request_with_remaining_timeout().await {
@@ -235,6 +414,9 @@ impl RootHealRecovery {
             return Ok(());
         };
         let mut intent = decode_intent(&task.id, &expected)?;
+        if HealType::from(intent.heal_type.clone()) != task.heal_type {
+            return Err(Error::Other(format!("Root heal recovery owner changed for {}", task.id)));
+        }
         let mut expected_options = intent.options.clone();
         expected_options.timeout = task.options.timeout;
         if intent.created_at != task.created_at || intent.priority != task.priority || expected_options != task.options {
@@ -268,7 +450,7 @@ impl RootHealRecovery {
         if intent_path(task_id).is_err() {
             return Ok(false);
         }
-        self.remove(task_id, &HealType::Cluster, HealRequestSource::Admin).await
+        self.remove_pending_by_id(task_id).await
     }
 
     pub(super) async fn pending(&self) -> Result<Vec<HealRequest>> {
