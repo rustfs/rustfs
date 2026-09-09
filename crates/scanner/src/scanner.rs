@@ -3628,7 +3628,7 @@ pub(crate) use activity::{
 pub(crate) use activity::{ScannerCycleOutcome, scanner_cycle_outcome_with_pending_maintenance};
 pub use backlog::{
     ScannerPauseBacklogAlertReason, ScannerPauseBacklogPhase, ScannerPauseBacklogStatus, ScannerPauseBacklogThresholds,
-    scanner_pause_backlog_status,
+    register_scanner_pause_backlog_retirement, scanner_pause_backlog_status,
 };
 #[cfg(test)]
 pub(crate) use cycle_state::encode_scanner_cycle_fence_for_test;
