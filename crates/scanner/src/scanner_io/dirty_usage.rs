@@ -22,10 +22,11 @@ pub(super) static DIRTY_USAGE_BUCKETS: LazyLock<StdMutex<DirtyUsageBuckets>> = L
 // observe a bucket generation without its matching scope and producer evidence.
 pub(super) static DIRTY_USAGE_BUCKET_SCOPES: LazyLock<StdMutex<DirtyUsageBucketScopes>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
-// Non-authoritative process-local producer coverage. Any future segment reuse
-// activation must bind this to the exact generation window and durable proof.
+// Non-authoritative process-local producer coverage. Segment reuse binds this
+// per-bucket suffix to an earlier durable proof from the same process epoch.
 pub(super) static DIRTY_USAGE_PRODUCER_IDENTITIES: LazyLock<StdMutex<DirtyUsageProducerIdentities>> =
     LazyLock::new(|| StdMutex::new(BTreeMap::new()));
+pub(super) static DIRTY_USAGE_PRODUCER_COVERAGE: AtomicU64 = AtomicU64::new(0);
 pub(super) static DIRTY_USAGE_BUCKET_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 pub(super) static SCANNER_ACTIVITY_EPOCH: LazyLock<String> = LazyLock::new(|| format!("{:032x}", rand::random::<u128>()));
 pub(super) static SCANNER_MAINTENANCE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -56,16 +57,16 @@ pub(super) enum DirtyUsageBucketScope {
 
 pub(super) type DirtyUsageBucketScopes = HashMap<String, DirtyUsageBucketScope>;
 
-const MAX_DIRTY_USAGE_TOP_LEVEL_ENTRIES_PER_BUCKET: usize = 128;
+pub(super) const MAX_DIRTY_USAGE_TOP_LEVEL_ENTRIES_PER_BUCKET: usize = 128;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct DirtyUsageProducerIdentityState {
     first_generation: u64,
     last_generation: u64,
+    fully_identified: bool,
 }
 
-pub(super) type DirtyUsageProducerIdentities =
-    BTreeMap<crate::segment_invalidation::SegmentInvalidationProducerIdentity, DirtyUsageProducerIdentityState>;
+pub(super) type DirtyUsageProducerIdentities = BTreeMap<String, DirtyUsageProducerIdentityState>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct DirtyUsageProducerEvidence {
@@ -126,6 +127,7 @@ pub fn acknowledge_scoped_dirty_usage(
     let (cleared, pending) = {
         let mut dirty = dirty_usage_buckets();
         let mut dirty_scopes = dirty_usage_bucket_scopes();
+        let mut producer_identities = dirty_usage_producer_identities();
         let checked = entries
             .iter()
             .map(|(guard, generation)| {
@@ -145,6 +147,7 @@ pub fn acknowledge_scoped_dirty_usage(
             probe_only,
         )?;
         if cleared > 0 {
+            producer_identities.retain(|bucket, _| dirty.contains_key(bucket));
             advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
         }
         (cleared, dirty.len())
@@ -191,6 +194,7 @@ fn apply_scoped_dirty_usage_ack(
 mod scoped_dirty_usage_tests {
     use super::*;
     use crate::segment_invalidation::SegmentInvalidationProducerIdentity;
+    use serial_test::serial;
 
     #[test]
     fn scoped_dirty_usage_preserves_uncovered_newer_and_replayed_generations() {
@@ -253,6 +257,7 @@ mod scoped_dirty_usage_tests {
     }
 
     #[test]
+    #[serial]
     fn dirty_usage_tracks_known_segment_producer_identities_without_authorizing_unknown_sources() {
         clear_dirty_usage_buckets_for_tests();
         record_dirty_usage_object_from_producer("photos", "hot/object", SegmentInvalidationProducerIdentity::PutObject);
@@ -280,6 +285,19 @@ mod scoped_dirty_usage_tests {
             Some(&DirtyUsageBucketScope::WholeBucket),
             "an unknown producer keeps the bucket dirty but must not count as producer coverage"
         );
+        let snapshot = snapshot_dirty_usage_buckets(
+            &[BucketInfo {
+                name: "photos".to_string(),
+                created: None,
+                deleted: None,
+                versioning: false,
+                object_locking: false,
+            }],
+            dirty_usage_generation(),
+        );
+        let evidence = dirty_usage_producer_evidence(&snapshot);
+        assert!(!evidence.producer_identity_coverage_complete);
+        assert!(!evidence.generation_window_bound);
 
         clear_dirty_usage_buckets_for_tests();
         assert!(dirty_usage_producer_identities_for_tests().is_empty());
@@ -353,7 +371,7 @@ where
         let generation = advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
         dirty_buckets.insert(bucket.to_string(), generation);
         dirty_scopes.insert(bucket.to_string(), DirtyUsageBucketScope::WholeBucket);
-        record_segment_invalidation_producer_identities_for_generation(&mut producer_identities, generation, producers);
+        record_segment_invalidation_producer_identities_for_generation(&mut producer_identities, bucket, generation, producers);
         dirty_buckets.len()
     };
     global_metrics().record_scanner_dirty_usage_pending(usize_to_u64_saturated(pending_buckets));
@@ -418,7 +436,7 @@ where
         if overflowed {
             *scope = DirtyUsageBucketScope::WholeBucket;
         }
-        record_segment_invalidation_producer_identities_for_generation(&mut producer_identities, generation, producers);
+        record_segment_invalidation_producer_identities_for_generation(&mut producer_identities, bucket, generation, producers);
         dirty_buckets.len()
     };
     global_metrics().record_scanner_dirty_usage_pending(usize_to_u64_saturated(pending_buckets));
@@ -428,27 +446,46 @@ where
 
 fn record_segment_invalidation_producer_identities_for_generation<I>(
     identities: &mut DirtyUsageProducerIdentities,
+    bucket: &str,
     generation: u64,
     producers: I,
 ) where
     I: IntoIterator<Item = crate::segment_invalidation::SegmentInvalidationProducerIdentity>,
 {
+    let mut event_coverage = 0_u64;
+    let mut fully_identified = true;
     for producer in producers {
-        if producer.producer().is_some() {
-            identities
-                .entry(producer)
-                .and_modify(|state| state.last_generation = state.last_generation.max(generation))
-                .or_insert(DirtyUsageProducerIdentityState {
-                    first_generation: generation,
-                    last_generation: generation,
-                });
+        if let Some(coverage_bit) = producer.production_coverage_bit() {
+            event_coverage |= coverage_bit;
+        } else {
+            fully_identified = false;
         }
+    }
+    fully_identified &= event_coverage != 0;
+    DIRTY_USAGE_PRODUCER_COVERAGE.fetch_or(event_coverage, Ordering::AcqRel);
+
+    if let Some(state) = identities.get_mut(bucket) {
+        state.last_generation = state.last_generation.max(generation);
+        state.fully_identified &= fully_identified;
+    } else {
+        identities.insert(
+            bucket.to_string(),
+            DirtyUsageProducerIdentityState {
+                first_generation: generation,
+                last_generation: generation,
+                fully_identified,
+            },
+        );
     }
 }
 
 #[cfg(test)]
 fn dirty_usage_producer_identities_for_tests() -> BTreeSet<crate::segment_invalidation::SegmentInvalidationProducerIdentity> {
-    dirty_usage_producer_identities().keys().copied().collect()
+    let coverage = DIRTY_USAGE_PRODUCER_COVERAGE.load(Ordering::Acquire);
+    crate::segment_invalidation::SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION
+        .into_iter()
+        .filter(|identity| identity.production_coverage_bit().is_some_and(|bit| coverage & bit != 0))
+        .collect()
 }
 
 fn dirty_usage_top_level_entry(object: &str) -> Option<String> {
@@ -531,6 +568,7 @@ pub fn acknowledge_dirty_usage_generation(
     let (cleared_buckets, pending_buckets) = {
         let mut dirty_buckets = dirty_usage_buckets();
         let mut dirty_scopes = dirty_usage_bucket_scopes();
+        let mut producer_identities = dirty_usage_producer_identities();
         let current_generation = DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire);
         if generation == 0 || generation == u64::MAX || current_generation == u64::MAX || generation > current_generation {
             return Err(ScannerDirtyUsageAckError::InvalidGeneration);
@@ -539,6 +577,7 @@ pub fn acknowledge_dirty_usage_generation(
         let before = dirty_buckets.len();
         dirty_buckets.retain(|_, dirty_generation| *dirty_generation > generation);
         dirty_scopes.retain(|bucket, _| dirty_buckets.contains_key(bucket));
+        producer_identities.retain(|bucket, _| dirty_buckets.contains_key(bucket));
         let cleared_buckets = before.saturating_sub(dirty_buckets.len());
         if cleared_buckets > 0 {
             advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
@@ -562,8 +601,11 @@ pub fn clear_dirty_usage_bucket(bucket: &str) {
     let pending_buckets = {
         let mut dirty_buckets = dirty_usage_buckets();
         let mut dirty_scopes = dirty_usage_bucket_scopes();
+        let mut producer_identities = dirty_usage_producer_identities();
         dirty_buckets.remove(bucket);
         dirty_scopes.remove(bucket);
+        producer_identities.remove(bucket);
+        DIRTY_USAGE_PRODUCER_COVERAGE.store(0, Ordering::Release);
         advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
         dirty_buckets.len()
     };
@@ -625,6 +667,7 @@ pub(super) fn clear_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) {
     let (cleared_buckets, pending_buckets) = {
         let mut dirty_buckets = dirty_usage_buckets();
         let mut dirty_scopes = dirty_usage_bucket_scopes();
+        let mut producer_identities = dirty_usage_producer_identities();
         let mut cleared_buckets = 0usize;
         for (bucket, generation) in snapshot {
             if dirty_buckets.get(bucket).is_some_and(|current| current == generation) {
@@ -634,6 +677,7 @@ pub(super) fn clear_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) {
             }
         }
         if cleared_buckets > 0 {
+            producer_identities.retain(|bucket, _| dirty_buckets.contains_key(bucket));
             advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
         }
         (cleared_buckets, dirty_buckets.len())
@@ -724,16 +768,28 @@ pub(super) fn dirty_usage_snapshot_status(snapshot: &DirtyUsageSnapshot) -> Dirt
 }
 
 pub(super) fn dirty_usage_producer_evidence(snapshot: &DirtyUsageSnapshot) -> DirtyUsageProducerEvidence {
-    let generation_window_bound = dirty_usage_snapshot_status(snapshot) == DirtyUsageSnapshotStatus::Current
+    let snapshot_current = dirty_usage_snapshot_status(snapshot) == DirtyUsageSnapshotStatus::Current
         && snapshot.generation != 0
-        && snapshot.generation != u64::MAX;
-    let identities = dirty_usage_producer_identities()
-        .iter()
-        .filter(|(_, state)| state.first_generation <= snapshot.generation)
-        .map(|(identity, _)| *identity)
-        .collect::<BTreeSet<_>>();
-    let producer_identity_coverage_complete =
-        generation_window_bound && crate::segment_invalidation::complete_segment_invalidation_producers(identities).is_ok();
+        && snapshot.generation != u64::MAX
+        && !snapshot.buckets.is_empty();
+    let producer_identities = dirty_usage_producer_identities();
+    let mut generation_start = u64::MAX;
+    let mut generation_end = 0;
+    let producer_identity_coverage_complete = snapshot_current
+        && snapshot.buckets.iter().all(|(bucket, generation)| {
+            producer_identities.get(bucket).is_some_and(|state| {
+                generation_start = generation_start.min(state.first_generation);
+                generation_end = generation_end.max(state.last_generation);
+                state.fully_identified && state.last_generation == *generation
+            })
+        })
+        && DIRTY_USAGE_PRODUCER_COVERAGE.load(Ordering::Acquire)
+            & crate::segment_invalidation::SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION_COVERAGE_MASK
+            == crate::segment_invalidation::SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION_COVERAGE_MASK;
+    let generation_window_bound = producer_identity_coverage_complete
+        && generation_start != u64::MAX
+        && generation_end >= generation_start
+        && generation_end <= snapshot.generation;
 
     DirtyUsageProducerEvidence {
         producer_identity_coverage_complete,
@@ -743,8 +799,8 @@ pub(super) fn dirty_usage_producer_evidence(snapshot: &DirtyUsageSnapshot) -> Di
         durable_producer_identity: false,
         restart_gap_absent: false,
         generation_window_bound,
-        generation_start: snapshot.generation,
-        generation_end: snapshot.generation,
+        generation_start: if generation_window_bound { generation_start } else { 0 },
+        generation_end: if generation_window_bound { generation_end } else { 0 },
     }
 }
 
@@ -758,6 +814,7 @@ pub(crate) fn clear_dirty_usage_buckets_for_tests() {
     dirty_usage_buckets().clear();
     dirty_usage_bucket_scopes().clear();
     dirty_usage_producer_identities().clear();
+    DIRTY_USAGE_PRODUCER_COVERAGE.store(0, Ordering::Release);
 }
 
 #[cfg(test)]
