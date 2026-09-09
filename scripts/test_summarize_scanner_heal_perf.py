@@ -16,6 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import summarize_scanner_heal_perf as summary
+import check_test_wiring as wiring
 
 
 def sha(path: Path) -> str:
@@ -67,6 +68,13 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
                     "failure_domain": "three-node-localhost-lab",
                     "same_window_sampling": True,
                 },
+                "scheduler": {
+                    "bounds": ["admission-retry-idempotency", "deadline-budget", "lock-hold-bound", "minimum-progress"],
+                    "max_deferred_items": 128,
+                    "max_deferred_bytes": 1048576,
+                    "max_retry_age_seconds": 300,
+                    "duplicate_task_bound_observed": True,
+                },
                 "crash_restart": {
                     "fault_modes": ["process-restart", "process-crash-restart"],
                     "unclean_shutdown_marker": True,
@@ -81,6 +89,25 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
                     "required_artifacts": ["allocation-profile", "flamegraph", "rss-samples", "save-frequency"],
                     "collector_config_sha256": "7" * 64,
                     "profiler_config_sha256": "8" * 64,
+                    "measurements": {
+                        "resolved_samples": 120,
+                        "allocation_bytes": 4096,
+                        "rss_peak_bytes": 10485760,
+                        "save_operations": 64,
+                        "saved_bytes": 8192,
+                    },
+                },
+                "heal_capacity": {
+                    "objects": 96,
+                    "versions": 96,
+                    "bytes": 12582912,
+                    "completed_objects": 96,
+                },
+                "recovery_window": {
+                    "pressure_recovery_window_seconds": 45,
+                    "heal_lock_wait_p99_ms": 8,
+                    "recovery_p95_ms": 1500,
+                    "recovery_p99_ms": 2200,
                 },
             },
         }
@@ -89,11 +116,25 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
             "comparison": "build",
             "round": 1,
             "status": "pass",
+            "foreground_p95_ms": 8.0,
+            "foreground_p99_ms": 10.0,
+            "throughput_ops": 100.0,
+            "error_rate": 0.0,
             "p99_regression": 0.02,
             "throughput_change": -0.01,
-            "p1": {"required_reduction": 0.8, "observed_reduction": 0.82, "repeatability_drift": 0.01},
+            "p1": {
+                "required_reduction": 0.8,
+                "observed_reduction": 0.82,
+                "repeatability_drift": 0.01,
+                "baseline_walk_objects": 100,
+                "baseline_cold_walk_objects": 100,
+                "candidate_walk_objects": 20,
+                "candidate_cold_walk_objects": 0,
+            },
             "p2_post_stop_work_multiples": [None, 1.1, 1.0, None],
             "w10_w11": {
+                "foreground_pressure_samples": [10, 10, 10, 10],
+                "foreground_pressure_high_samples": [0, 3, 3, 0],
                 "foreground_pressure_high_sample_ratios": [0.0, 0.25, 0.25, 0.0],
                 "heal_lock_wait_p99_ms": [12.0, 8.0, 9.0, 13.0],
                 "attempt_cost_per_healed_object": [None, 1.2, 1.3, None],
@@ -104,6 +145,10 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
                 "heal_duplicate_task_count": [0, 0, 0, 0],
                 "heal_lock_hold_p95_ms": [7.0, 6.0, 6.5, 7.5],
             },
+            "w10": {
+                "status": "not_applicable",
+                "pacing_observed": False,
+            },
             "w11": {"status": "not_applicable"},
         }
         self.report = {
@@ -112,6 +157,8 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
             "evidence": "measured",
             "cells": 120,
             "comparisons": self.full_comparisons(),
+            "started_at": "2026-09-09T00:00:00Z",
+            "finished_at": "2026-09-09T02:30:00Z",
         }
         self.write_inputs()
 
@@ -123,6 +170,14 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
                     row = copy.deepcopy(self.comparison)
                     row.update(scenario=scenario, comparison=comparison, round=round_id)
                     if scenario == "running-heal" and comparison == "build":
+                        row["w10"] = {
+                            "status": "observed",
+                            "pacing_observed": True,
+                            "candidate_pressure_high_ratio": 0.3,
+                            "candidate_delay_events": 3,
+                            "foreground_p99_change": -0.02,
+                            "foreground_throughput_change": 0.01,
+                        }
                         row["w11"] = {
                             "status": "observed",
                             "rss_growth_limit": 0.05,
@@ -180,6 +235,55 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         )
         self.assertIn("w11_running_heal_build_statuses: observed,observed,observed", summary.markdown(result))
         self.assertEqual(result["cache_cost"]["max_save_body_amplification"], 2.0)
+
+    def test_release_descriptor_binds_g10_p1_p3_measured_artifacts(self):
+        profile_paths = []
+        for kind in summary.RELEASE_PROFILE_ARTIFACTS:
+            artifact = self.root / f"{kind}.artifact"
+            artifact.write_text(f"{kind} measured profile\n", encoding="utf-8")
+            profile_paths.append(f"{kind}={artifact}")
+        args = type("Args", (), {
+            "abba_dir": self.abba,
+            "cache_cost_log": None,
+            "require_cache_cost": False,
+            "release_bundle_descriptor_out": self.root / "release-descriptor.json",
+            "release_source_revision": "b" * 40,
+            "release_profile_artifact": profile_paths,
+        })
+        result = summary.build_summary(args)
+        summary.write_release_bundle_descriptor(args, result)
+        descriptor = summary.read_json(args.release_bundle_descriptor_out)
+        self.assertEqual(sorted(descriptor["gates"]), ["G10", "P1", "P3"])
+        self.assertEqual(
+            descriptor["gates"]["G10"]["evidence_fields"]["scheduler_bound_evidence"]["scheduler_bounds"],
+            list(summary.RELEASE_SCHEDULER_BOUNDS),
+        )
+        profile = descriptor["gates"]["P1"]["evidence_fields"]["profile_evidence"]
+        self.assertEqual(sorted(profile["profile_artifacts"]), sorted(summary.RELEASE_PROFILE_ARTIFACTS))
+        self.assertEqual(
+            profile["measurement_window_id"],
+            descriptor["gates"]["P3"]["evidence_fields"]["two_hour_pressure_measurement"]["measurement_window_id"],
+        )
+        for gate in ("G10", "P1", "P3"):
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                status = wiring.scanner_heal_release_bundle_gate_status(
+                    Path(__file__).resolve().parents[1],
+                    args.release_bundle_descriptor_out,
+                    gate,
+                )
+            self.assertEqual(status["verified_gate"], gate)
+
+    def test_release_descriptor_requires_profile_artifacts(self):
+        args = type("Args", (), {
+            "abba_dir": self.abba,
+            "cache_cost_log": None,
+            "require_cache_cost": False,
+            "release_bundle_descriptor_out": self.root / "release-descriptor.json",
+            "release_source_revision": "b" * 40,
+            "release_profile_artifact": [],
+        })
+        with self.assertRaisesRegex(ValueError, "missing profile artifacts"):
+            summary.write_release_bundle_descriptor(args, summary.build_summary(args))
 
     def test_synthetic_report_fails_as_performance_conclusion(self):
         self.report.update(status="synthetic_validated", performance="pending", evidence="synthetic")

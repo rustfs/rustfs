@@ -1556,13 +1556,14 @@ pub(crate) use cache::{
     current_cache_root_or_prepare_with_generation,
 };
 pub use dirty_usage::{
-    ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageSnapshot, ScannerDirtyUsageState,
-    ScannerDurableDirtyUsageReplayEntry, ScannerDurableDirtyUsageReplayError, ScannerDurableDirtyUsageReplayRecord,
-    ScannerDurableDirtyUsageReplayScope, acknowledge_dirty_usage_generation, acknowledge_scoped_dirty_usage,
-    clear_dirty_usage_bucket, encode_durable_dirty_usage_producer_replay_record, record_dirty_usage_bucket,
-    record_dirty_usage_bucket_from_producer, record_dirty_usage_bucket_from_producers, record_dirty_usage_object,
-    record_dirty_usage_object_from_producer, record_scanner_maintenance_change, replay_durable_dirty_usage_producer_record,
-    scanner_activity_epoch, scanner_dirty_usage_snapshot, scanner_dirty_usage_state, scanner_maintenance_generation,
+    ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageClearObserver, ScannerDirtyUsageSnapshot,
+    ScannerDirtyUsageState, ScannerDurableDirtyUsageReplayEntry, ScannerDurableDirtyUsageReplayError,
+    ScannerDurableDirtyUsageReplayRecord, ScannerDurableDirtyUsageReplayScope, acknowledge_dirty_usage_generation,
+    acknowledge_scoped_dirty_usage, clear_dirty_usage_bucket, encode_durable_dirty_usage_producer_replay_record,
+    record_dirty_usage_bucket, record_dirty_usage_bucket_from_producer, record_dirty_usage_bucket_from_producers,
+    record_dirty_usage_object, record_dirty_usage_object_from_producer, record_scanner_maintenance_change,
+    replay_durable_dirty_usage_producer_record, scanner_activity_epoch, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
+    scanner_maintenance_generation, set_scanner_dirty_usage_clear_observer,
 };
 #[cfg(test)]
 pub(crate) use dirty_usage::{clear_dirty_usage_buckets_for_tests, dirty_usage_buckets_for_tests};

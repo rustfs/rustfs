@@ -14,6 +14,7 @@
 /// process-wide dirty-usage invalidation state, its acknowledgment protocol, and snapshot helpers.
 use super::*;
 use std::collections::BTreeSet;
+use std::sync::RwLock as StdRwLock;
 
 pub(super) static DIRTY_USAGE_BUCKET_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub(super) static DIRTY_USAGE_BUCKETS: LazyLock<StdMutex<DirtyUsageBuckets>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
@@ -27,6 +28,8 @@ pub(super) static DIRTY_USAGE_BUCKET_SCOPES: LazyLock<StdMutex<DirtyUsageBucketS
 // per-bucket suffix to an earlier durable proof from the same process epoch.
 pub(super) static DIRTY_USAGE_PRODUCER_IDENTITIES: LazyLock<StdMutex<DirtyUsageProducerIdentities>> =
     LazyLock::new(|| StdMutex::new(BTreeMap::new()));
+static DIRTY_USAGE_CLEAR_OBSERVER: LazyLock<StdRwLock<Option<ScannerDirtyUsageClearObserver>>> =
+    LazyLock::new(|| StdRwLock::new(None));
 pub(super) static DIRTY_USAGE_PRODUCER_COVERAGE: AtomicU64 = AtomicU64::new(0);
 pub(super) static DIRTY_USAGE_BUCKET_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 pub(super) static SCANNER_ACTIVITY_EPOCH: LazyLock<String> = LazyLock::new(|| format!("{:032x}", rand::random::<u128>()));
@@ -48,6 +51,8 @@ pub struct ScannerDirtyUsageBucket {
     pub bucket: String,
     pub generation: u64,
 }
+
+pub type ScannerDirtyUsageClearObserver = Arc<dyn Fn(Vec<ScannerDirtyUsageBucket>) + Send + Sync + 'static>;
 
 /// A non-durable optimization hint for a dirty bucket.
 ///
@@ -95,6 +100,28 @@ impl DirtyUsageProducerEvidence {
                 cold_zero_walk_oracle: false,
             }
         })
+    }
+}
+
+pub fn set_scanner_dirty_usage_clear_observer(
+    observer: Option<ScannerDirtyUsageClearObserver>,
+) -> Option<ScannerDirtyUsageClearObserver> {
+    let mut slot = DIRTY_USAGE_CLEAR_OBSERVER
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::replace(&mut *slot, observer)
+}
+
+fn notify_dirty_usage_clear(cleared: Vec<ScannerDirtyUsageBucket>) {
+    if cleared.is_empty() {
+        return;
+    }
+    let observer = DIRTY_USAGE_CLEAR_OBSERVER
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(observer) = observer {
+        observer(cleared);
     }
 }
 
@@ -309,7 +336,7 @@ pub fn acknowledge_scoped_dirty_usage(
 ) -> std::result::Result<u64, ScannerDirtyUsageAckError> {
     // Lock order: sorted bucket lifecycle/metadata fences (caller), then dirty map.
     // No await or storage operation occurs while the dirty map is locked.
-    let (cleared, pending) = {
+    let (cleared, pending, cleared_buckets) = {
         let mut dirty = dirty_usage_buckets();
         let mut dirty_scopes = dirty_usage_bucket_scopes();
         let mut producer_identities = dirty_usage_producer_identities();
@@ -322,6 +349,18 @@ pub fn acknowledge_scoped_dirty_usage(
                     .map_err(|_| ScannerDirtyUsageAckError::IncarnationUnavailable)
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let cleared_buckets = if probe_only {
+            Vec::new()
+        } else {
+            checked
+                .iter()
+                .filter(|(bucket, generation)| dirty.get(*bucket) == Some(generation))
+                .map(|(bucket, generation)| ScannerDirtyUsageBucket {
+                    bucket: (*bucket).to_string(),
+                    generation: *generation,
+                })
+                .collect::<Vec<_>>()
+        };
         let cleared = apply_scoped_dirty_usage_ack(
             instance_id,
             scanner_activity_epoch(),
@@ -335,8 +374,9 @@ pub fn acknowledge_scoped_dirty_usage(
             producer_identities.retain(|bucket, _| dirty.contains_key(bucket));
             advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
         }
-        (cleared, dirty.len())
+        (cleared, dirty.len(), cleared_buckets)
     };
+    notify_dirty_usage_clear(cleared_buckets);
     if !probe_only {
         global_metrics().record_scanner_dirty_usage_cycle_clear(usize_to_u64_saturated(cleared), usize_to_u64_saturated(pending));
     }
@@ -911,7 +951,7 @@ pub fn acknowledge_dirty_usage_generation(
         return Err(ScannerDirtyUsageAckError::ProcessChanged);
     }
 
-    let (cleared_buckets, pending_buckets) = {
+    let (cleared_buckets, pending_buckets, cleared) = {
         let mut dirty_buckets = dirty_usage_buckets();
         let mut dirty_scopes = dirty_usage_bucket_scopes();
         let mut producer_identities = dirty_usage_producer_identities();
@@ -921,6 +961,14 @@ pub fn acknowledge_dirty_usage_generation(
         }
 
         let before = dirty_buckets.len();
+        let cleared = dirty_buckets
+            .iter()
+            .filter(|(_, dirty_generation)| **dirty_generation <= generation)
+            .map(|(bucket, dirty_generation)| ScannerDirtyUsageBucket {
+                bucket: bucket.clone(),
+                generation: *dirty_generation,
+            })
+            .collect::<Vec<_>>();
         dirty_buckets.retain(|_, dirty_generation| *dirty_generation > generation);
         dirty_scopes.retain(|bucket, _| dirty_buckets.contains_key(bucket));
         producer_identities.retain(|bucket, _| dirty_buckets.contains_key(bucket));
@@ -928,8 +976,9 @@ pub fn acknowledge_dirty_usage_generation(
         if cleared_buckets > 0 {
             advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
         }
-        (cleared_buckets, dirty_buckets.len())
+        (cleared_buckets, dirty_buckets.len(), cleared)
     };
+    notify_dirty_usage_clear(cleared);
     global_metrics()
         .record_scanner_dirty_usage_cycle_clear(usize_to_u64_saturated(cleared_buckets), usize_to_u64_saturated(pending_buckets));
     Ok(())
@@ -944,17 +993,23 @@ pub fn clear_dirty_usage_bucket(bucket: &str) {
         return;
     }
 
-    let pending_buckets = {
+    let (pending_buckets, cleared) = {
         let mut dirty_buckets = dirty_usage_buckets();
         let mut dirty_scopes = dirty_usage_bucket_scopes();
         let mut producer_identities = dirty_usage_producer_identities();
-        dirty_buckets.remove(bucket);
+        let cleared = dirty_buckets.remove(bucket).map(|generation| ScannerDirtyUsageBucket {
+            bucket: bucket.to_string(),
+            generation,
+        });
         dirty_scopes.remove(bucket);
         producer_identities.remove(bucket);
         DIRTY_USAGE_PRODUCER_COVERAGE.store(0, Ordering::Release);
         advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
-        dirty_buckets.len()
+        (dirty_buckets.len(), cleared)
     };
+    if let Some(cleared) = cleared {
+        notify_dirty_usage_clear(vec![cleared]);
+    }
     global_metrics().record_scanner_dirty_usage_clear(usize_to_u64_saturated(pending_buckets));
 }
 
@@ -1010,24 +1065,30 @@ pub(crate) async fn dirty_usage_bucket_notified() {
 }
 
 pub(super) fn clear_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) {
-    let (cleared_buckets, pending_buckets) = {
+    let (cleared_buckets, pending_buckets, cleared) = {
         let mut dirty_buckets = dirty_usage_buckets();
         let mut dirty_scopes = dirty_usage_bucket_scopes();
         let mut producer_identities = dirty_usage_producer_identities();
         let mut cleared_buckets = 0usize;
+        let mut cleared = Vec::new();
         for (bucket, generation) in snapshot {
             if dirty_buckets.get(bucket).is_some_and(|current| current == generation) {
                 dirty_buckets.remove(bucket);
                 dirty_scopes.remove(bucket);
                 cleared_buckets += 1;
+                cleared.push(ScannerDirtyUsageBucket {
+                    bucket: bucket.clone(),
+                    generation: *generation,
+                });
             }
         }
         if cleared_buckets > 0 {
             producer_identities.retain(|bucket, _| dirty_buckets.contains_key(bucket));
             advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
         }
-        (cleared_buckets, dirty_buckets.len())
+        (cleared_buckets, dirty_buckets.len(), cleared)
     };
+    notify_dirty_usage_clear(cleared);
     global_metrics()
         .record_scanner_dirty_usage_cycle_clear(usize_to_u64_saturated(cleared_buckets), usize_to_u64_saturated(pending_buckets));
 }
