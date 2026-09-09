@@ -12,14 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Exact, single-record inspection for legacy transitioned-version metadata.
-//!
-//! Mutation intentionally remains fail closed until the disk boundary exposes
-//! a conditional metadata-generation write and the fleet advertises the
-//! reconciliation capability. The existing best-effort metadata writers are
-//! not safe here: quorum failure may remove an existing `xl.meta`.
+//! Exact, generation-conditional reconciliation of legacy transition metadata.
+//! Repairs are monotonic and never use metadata rollback or remote deletion.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -27,12 +24,16 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::bucket::utils::check_bucket_and_object_names;
+use crate::disk::{DiskAPI as _, TransitionStateReconcileCondition, UpdateMetadataOpts};
 use crate::object_api::ObjectOptions;
 use crate::services::notification_sys::{
-    acquire_cross_pool_fence_fleet_proof, acquire_remote_version_state_fleet_proof, cross_pool_fence_fleet_proof_matches,
-    cross_pool_fence_topology_generation, remote_version_state_fleet_proof_matches,
+    LegacyTransitionStateReconcileFleetProofToken, acquire_cross_pool_fence_fleet_proof,
+    acquire_legacy_transition_state_reconcile_fleet_proof, acquire_remote_version_state_fleet_proof,
+    cross_pool_fence_fleet_proof_matches, cross_pool_fence_topology_generation,
+    legacy_transition_state_reconcile_fleet_proof_current, legacy_transition_state_reconcile_fleet_proof_matches,
+    remote_version_state_fleet_proof_matches,
 };
-use crate::services::tier::tier::{TierConfigMgr, tier_destination_id_from_metadata};
+use crate::services::tier::tier::{TierConfigMgr, TierOperationLease, tier_destination_id_from_metadata};
 use crate::services::tier::warm_backend::LegacyTransitionStateProbe;
 use crate::set_disk::read_legacy_transition_state_metadata_copies;
 use crate::store::ECStore;
@@ -111,6 +112,7 @@ pub struct LegacyTransitionStateSource {
 pub struct LegacyTransitionStateCopyRepresentation {
     pub disk_index: usize,
     pub metadata_digest: String,
+    pub unchanged_metadata_digest: String,
     pub state_aliases: Vec<LegacyTransitionStateMetadataAlias>,
     pub version_aliases: Vec<LegacyTransitionStateMetadataAlias>,
     pub destination_aliases: Vec<LegacyTransitionStateMetadataAlias>,
@@ -174,6 +176,9 @@ pub struct LegacyTransitionStateReconcileResponse {
     pub reason: String,
     pub retryable: bool,
     pub changed: bool,
+    /// A failed RPC may have committed even when its response/readback is lost.
+    #[serde(default)]
+    pub changes_indeterminate: bool,
     pub selector: LegacyTransitionStateReconcileSelector,
     pub source: Option<LegacyTransitionStateSource>,
     pub original_sets: Vec<LegacyTransitionStateSetRepresentation>,
@@ -201,6 +206,63 @@ pub enum LegacyTransitionStateReconcileError {
 struct InspectedCopy {
     file_info: FileInfo,
     representation: LegacyTransitionStateCopyRepresentation,
+}
+
+/// Ownership accompanies a local publication into its blocking executor.
+/// Remote disks reconstruct fleet/backend ownership from current local state;
+/// serialized options never carry an authority supplied by another process.
+pub(crate) struct TransitionStateReconcileAuthority {
+    // Declaration order releases physical locks, tier, bucket, then fleet.
+    objects: Vec<crate::store::ObjectLockDiagGuard>,
+    tier: TierOperationLease,
+    bucket: Option<rustfs_lock::NamespaceLockGuard>,
+    fleet: LegacyTransitionStateReconcileFleetProofToken,
+}
+
+impl std::fmt::Debug for TransitionStateReconcileAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransitionStateReconcileAuthority")
+            .finish_non_exhaustive()
+    }
+}
+
+impl TransitionStateReconcileAuthority {
+    pub(crate) fn is_current(&self) -> bool {
+        legacy_transition_state_reconcile_fleet_proof_current(&self.fleet)
+            && self.tier.is_current_generation()
+            && self.bucket.as_ref().is_none_or(|bucket| !bucket.is_lock_lost())
+            && self.objects.iter().all(|guard| !guard.is_lock_lost())
+    }
+
+    pub(crate) async fn for_disk(condition: &TransitionStateReconcileCondition) -> crate::disk::error::Result<Arc<Self>> {
+        use crate::disk::error::Error as DiskError;
+        if let Some(authority) = &condition.authority {
+            if authority.is_current() {
+                return Ok(Arc::clone(authority));
+            }
+            return Err(DiskError::OutdatedXLMeta);
+        }
+        let fleet = acquire_legacy_transition_state_reconcile_fleet_proof()
+            .await
+            .ok_or(DiskError::OutdatedXLMeta)?;
+        let topology = acquire_cross_pool_fence_fleet_proof().ok_or(DiskError::OutdatedXLMeta)?;
+        if cross_pool_fence_topology_generation(&topology) != condition.topology_generation {
+            return Err(DiskError::OutdatedXLMeta);
+        }
+        let tier = TierConfigMgr::acquire_operation_lease(&crate::runtime::sources::global_tier_config_mgr(), &condition.tier)
+            .await
+            .map_err(|_| DiskError::OutdatedXLMeta)?;
+        if rustfs_utils::crypto::hex(tier.backend_identity()) != condition.target.destination_id {
+            return Err(DiskError::OutdatedXLMeta);
+        }
+        Ok(Arc::new(Self {
+            fleet,
+            tier,
+            objects: Vec::new(),
+            bucket: None,
+        }))
+    }
 }
 
 fn digest_hex(bytes: &[u8]) -> String {
@@ -253,6 +315,11 @@ fn inspect_copy(
         representation: LegacyTransitionStateCopyRepresentation {
             disk_index,
             metadata_digest: digest_hex(raw),
+            unchanged_metadata_digest: digest_hex(
+                &metadata
+                    .transition_reconcile_generation(version_id)
+                    .map_err(|err| LegacyTransitionStateReconcileError::Corrupt(err.to_string()))?,
+            ),
             state_aliases: metadata_aliases(&object_metadata.meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE),
             version_aliases: metadata_aliases(&object_metadata.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID),
             destination_aliases: metadata_aliases(&object_metadata.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID),
@@ -349,7 +416,7 @@ impl ECStore {
         let inspection: futures::future::BoxFuture<
             '_,
             Result<LegacyTransitionStateReconcileResponse, LegacyTransitionStateReconcileError>,
-        > = Box::pin(self.inspect_legacy_transition_state_inner(canonical_selector.clone()));
+        > = Box::pin(self.inspect_legacy_transition_state_inner(canonical_selector.clone(), false, None));
         match inspection.await {
             Ok(response) => Ok(response),
             Err(err) => Ok(error_response(canonical_selector, err)),
@@ -359,6 +426,8 @@ impl ECStore {
     async fn inspect_legacy_transition_state_inner(
         &self,
         selector: LegacyTransitionStateReconcileSelector,
+        write_locked: bool,
+        bound_lease: Option<&TierOperationLease>,
     ) -> Result<LegacyTransitionStateReconcileResponse, LegacyTransitionStateReconcileError> {
         let (selector, local_version_id) = selector.canonicalize()?;
         let remote_fleet_proof = acquire_remote_version_state_fleet_proof();
@@ -366,29 +435,34 @@ impl ECStore {
         // Snapshot lock order: bucket lifecycle READ, then the fixed and
         // physical object READ domains in pool/set order. Release these locks
         // before acquiring the tier lease or waiting on remote I/O.
-        let bucket_guard = self
-            .acquire_bucket_lifecycle_read_lock(&selector.bucket)
-            .await
-            .map_err(|err| LegacyTransitionStateReconcileError::BackendUnavailable(err.to_string()))?;
+        let bucket_guard = if write_locked {
+            None
+        } else {
+            Some(
+                self.acquire_bucket_lifecycle_read_lock(&selector.bucket)
+                    .await
+                    .map_err(|err| LegacyTransitionStateReconcileError::BackendUnavailable(err.to_string()))?,
+            )
+        };
         let bucket_incarnation = self
             .bucket_incarnation_id_from_disk(&selector.bucket)
             .await
             .map_err(|err| LegacyTransitionStateReconcileError::BackendUnavailable(err.to_string()))?;
         let encoded_object = rustfs_utils::path::encode_dir_object(&selector.object);
         let mut lock_options = ObjectOptions::default();
-        let object_guards = self
-            .acquire_all_physical_object_read_locks(
+        let object_guards = if write_locked {
+            Vec::new()
+        } else {
+            self.acquire_all_physical_object_read_locks(
                 "legacy_transition_state_reconcile_inspect",
                 &selector.bucket,
                 &encoded_object,
                 &mut lock_options,
             )
             .await
-            .map_err(|err| LegacyTransitionStateReconcileError::BackendUnavailable(err.to_string()))?;
-        // The deployed probe capability predates the reconciliation wire
-        // format and destination-identity preservation guarantee. It may make
-        // GET diagnostics possible, but it cannot authorize POST.
-        let fleet_ready = false;
+            .map_err(|err| LegacyTransitionStateReconcileError::BackendUnavailable(err.to_string()))?
+        };
+        let fleet_ready = acquire_legacy_transition_state_reconcile_fleet_proof().await.is_some();
         let mut topology_ready = topology_proof.is_some();
         let mut source = None;
         let mut original_sets = Vec::new();
@@ -454,7 +528,9 @@ impl ECStore {
                 });
             }
         }
-        if object_guards.iter().any(|guard| guard.is_lock_lost()) || bucket_guard.is_lock_lost() {
+        if object_guards.iter().any(|guard| guard.is_lock_lost())
+            || bucket_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+        {
             return Err(LegacyTransitionStateReconcileError::BackendUnavailable(
                 "a local metadata snapshot lock was lost before inspection completed".to_string(),
             ));
@@ -483,6 +559,7 @@ impl ECStore {
                 reason: "the selected object does not contain a complete transition source tuple".to_string(),
                 retryable: false,
                 changed: false,
+                changes_indeterminate: false,
                 selector,
                 source: Some(source),
                 original_sets,
@@ -505,6 +582,7 @@ impl ECStore {
                 reason: "an explicit unknown transition state is not legacy absence".to_string(),
                 retryable: false,
                 changed: false,
+                changes_indeterminate: false,
                 selector,
                 source: Some(source),
                 original_sets,
@@ -542,18 +620,32 @@ impl ECStore {
             }
         }
         let tier_manager = self.tier_config_mgr();
-        let lease = match persisted_destination {
-            Some(destination) => {
-                TierConfigMgr::acquire_operation_lease_for_backend_identity(
-                    &tier_manager,
-                    &file_info.transition_tier,
-                    destination,
-                )
-                .await
-            }
-            None => TierConfigMgr::acquire_operation_lease(&tier_manager, &file_info.transition_tier).await,
+        let owned_lease = if bound_lease.is_none() {
+            Some(
+                match persisted_destination {
+                    Some(destination) => {
+                        TierConfigMgr::acquire_operation_lease_for_backend_identity(
+                            &tier_manager,
+                            &file_info.transition_tier,
+                            destination,
+                        )
+                        .await
+                    }
+                    None => TierConfigMgr::acquire_operation_lease(&tier_manager, &file_info.transition_tier).await,
+                }
+                .map_err(|err| LegacyTransitionStateReconcileError::BackendUnavailable(err.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let lease = bound_lease.or(owned_lease.as_ref()).ok_or_else(|| {
+            LegacyTransitionStateReconcileError::BackendUnavailable("tier generation lease is unavailable".to_string())
+        })?;
+        if persisted_destination.is_some_and(|identity| identity != lease.backend_identity()) {
+            return Err(LegacyTransitionStateReconcileError::Corrupt(
+                "persisted tier destination differs from the leased backend".to_string(),
+            ));
         }
-        .map_err(|err| LegacyTransitionStateReconcileError::BackendUnavailable(err.to_string()))?;
         let tier_generation = lease.generation();
         let destination_id = rustfs_utils::crypto::hex(lease.backend_identity());
         let probe = tokio::time::timeout(
@@ -620,6 +712,7 @@ impl ECStore {
                 reason: "the live backend probe did not prove exactly one remote version model".to_string(),
                 retryable: true,
                 changed: false,
+                changes_indeterminate: false,
                 selector,
                 source: Some(source),
                 original_sets,
@@ -653,6 +746,7 @@ impl ECStore {
                 reason: "the live backend candidate does not match the persisted nonempty legacy remote version".to_string(),
                 retryable: true,
                 changed: false,
+                changes_indeterminate: false,
                 selector,
                 source: Some(source),
                 original_sets,
@@ -688,6 +782,7 @@ impl ECStore {
                     .to_string(),
                 retryable: false,
                 changed: false,
+                changes_indeterminate: false,
                 selector,
                 source: Some(source),
                 original_sets,
@@ -720,6 +815,7 @@ impl ECStore {
             },
             retryable: !already_explicit,
             changed: false,
+            changes_indeterminate: false,
             selector,
             source: Some(source),
             original_sets,
@@ -750,6 +846,7 @@ impl ECStore {
                 reason: "reconciliation digest does not match the supplied source, sets, and target".to_string(),
                 retryable: false,
                 changed: false,
+                changes_indeterminate: false,
                 selector: request.selector,
                 source: Some(request.source),
                 original_sets: request.original_sets,
@@ -758,54 +855,279 @@ impl ECStore {
                 readiness: unavailable_write_readiness(),
             });
         }
-        let current = self.inspect_legacy_transition_state(request.selector.clone()).await?;
+        let mut changed = false;
+        let mut indeterminate = false;
+        let result = Box::pin(self.apply_legacy_transition_state(&request, &mut changed, &mut indeterminate)).await;
+        let mut response = match result {
+            Ok(response) => response,
+            Err(err) => error_response(request.selector.clone(), err),
+        };
+        response.changed = changed;
+        response.changes_indeterminate = indeterminate;
+        Ok(response)
+    }
+
+    async fn apply_legacy_transition_state(
+        &self,
+        request: &LegacyTransitionStateReconcileRequest,
+        changed: &mut bool,
+        indeterminate: &mut bool,
+    ) -> Result<LegacyTransitionStateReconcileResponse, LegacyTransitionStateReconcileError> {
+        let unavailable = |message: &str| LegacyTransitionStateReconcileError::WriteFenceUnavailable(message.to_string());
+        let fleet = acquire_legacy_transition_state_reconcile_fleet_proof()
+            .await
+            .ok_or_else(|| unavailable("every metadata writer must support conditional transition reconciliation"))?;
+        // Admission -> bucket lifecycle WRITE -> exact tier generation ->
+        // all physical object WRITE domains -> disk metadata mutation domain.
+        let bucket = self
+            .acquire_bucket_lifecycle_write_lock(&request.selector.bucket)
+            .await
+            .map_err(|err| unavailable(&err.to_string()))?;
+        let tier = TierConfigMgr::acquire_operation_lease(&self.tier_config_mgr(), &request.source.tier)
+            .await
+            .map_err(|err| unavailable(&err.to_string()))?;
+        if tier.generation() != request.target.tier_generation
+            || rustfs_utils::crypto::hex(tier.backend_identity()) != request.target.destination_id
+        {
+            return Err(LegacyTransitionStateReconcileError::StaleExpectedTuple(
+                "tier generation or destination changed".to_string(),
+            ));
+        }
+        let object = rustfs_utils::path::encode_dir_object(&request.selector.object);
+        let objects = self
+            .acquire_all_physical_object_write_locks("legacy_transition_state_reconcile", &request.selector.bucket, &object)
+            .await
+            .map_err(|err| unavailable(&err.to_string()))?;
+        let authority = Arc::new(TransitionStateReconcileAuthority {
+            fleet,
+            tier,
+            objects,
+            bucket: Some(bucket),
+        });
+        let mut current = self
+            .inspect_legacy_transition_state_inner(request.selector.clone(), true, Some(&authority.tier))
+            .await?;
         if !matches!(
             current.outcome,
             LegacyTransitionStateReconcileOutcome::ReadyToMigrate | LegacyTransitionStateReconcileOutcome::Migrated
         ) {
             return Ok(current);
         }
-        let current_matches_request = current.source.as_ref() == Some(&request.source)
-            && current.original_sets == request.original_sets
-            && current.target.as_ref() == Some(&request.target)
-            && current.reconciliation_digest.as_deref() == Some(request.reconciliation_digest.as_str());
-        if !current_matches_request {
-            return Ok(LegacyTransitionStateReconcileResponse {
-                outcome: LegacyTransitionStateReconcileOutcome::Corrupt,
-                reason_code: "stale_expected_tuple".to_string(),
-                reason: "the authoritative source, target, or per-set metadata changed after inspection".to_string(),
-                retryable: false,
-                changed: false,
-                selector: request.selector,
-                source: current.source,
-                original_sets: current.original_sets,
-                target: current.target,
-                reconciliation_digest: current.reconciliation_digest,
-                readiness: current.readiness,
-            });
+        validate_reconcile_snapshot(request, current.source.as_ref(), &current.original_sets, current.target.as_ref())?;
+        if !current.readiness.fleet_ready || !current.readiness.topology_ready {
+            return Err(unavailable("the current fleet/topology snapshot cannot authorize metadata writes"));
         }
-        if current.outcome == LegacyTransitionStateReconcileOutcome::Migrated {
-            return Ok(current);
+        let topology = request
+            .source
+            .topology_generation
+            .as_ref()
+            .ok_or_else(|| unavailable("topology proof is absent"))?;
+        let (_, version_id) = request.selector.clone().canonicalize()?;
+        // Visit every observed copy, including an already committed retry
+        // subset. The second pass is a zero-write barrier in the same disk
+        // mutation domain; a delayed first attempt can only be idempotent.
+        for verify_only in [false, true] {
+            for set in self.all_set_disks() {
+                let Some(original_set) = request
+                    .original_sets
+                    .iter()
+                    .find(|item| item.pool_index == set.pool_index && item.set_index == set.set_index)
+                else {
+                    continue;
+                };
+                let disks = set.disk_inventory().await;
+                for original in &original_set.copies {
+                    if !legacy_transition_state_reconcile_fleet_proof_matches(&authority.fleet).await
+                        || self
+                            .bucket_incarnation_id_from_disk(&request.selector.bucket)
+                            .await
+                            .map_err(|err| unavailable(&err.to_string()))?
+                            .to_string()
+                            != request.source.bucket_incarnation
+                        || !authority.is_current()
+                    {
+                        return Err(unavailable("fleet, tier, bucket, or object fence changed before metadata publication"));
+                    }
+                    let disk = disks
+                        .get(original.disk_index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| unavailable("an authoritative disk is unavailable"))?;
+                    let opts = UpdateMetadataOpts {
+                        transition_reconcile: Some(Box::new(TransitionStateReconcileCondition {
+                            expected_metadata_digest: original.metadata_digest.clone(),
+                            unchanged_metadata_digest: original.unchanged_metadata_digest.clone(),
+                            target: rustfs_filemeta::TransitionStateReconcileTarget {
+                                state: request.target.state,
+                                remote_version: request.target.remote_version.clone(),
+                                destination_id: request.target.destination_id.clone(),
+                            },
+                            tier: request.source.tier.clone(),
+                            topology_generation: topology.clone(),
+                            verify_only,
+                            authority: Some(Arc::clone(&authority)),
+                        })),
+                        ..Default::default()
+                    };
+                    let already_target = current
+                        .original_sets
+                        .iter()
+                        .find(|item| item.pool_index == set.pool_index && item.set_index == set.set_index)
+                        .and_then(|item| item.copies.iter().find(|copy| copy.disk_index == original.disk_index))
+                        .is_some_and(|copy| representation_matches_target(copy, &request.target));
+                    // Empty metadata makes a server which ignores the new
+                    // conditional option reject the legacy update operation.
+                    let result = disk
+                        .update_metadata(
+                            &request.selector.bucket,
+                            &object,
+                            FileInfo {
+                                version_id,
+                                ..Default::default()
+                            },
+                            &opts,
+                        )
+                        .await;
+                    set.invalidate_get_object_metadata_cache(&request.selector.bucket, &object)
+                        .await;
+                    match result {
+                        Ok(()) => {
+                            *changed |= !verify_only && !already_target;
+                        }
+                        Err(err) => {
+                            *indeterminate |= !verify_only && !already_target;
+                            return Err(match err {
+                                crate::disk::error::Error::OutdatedXLMeta => {
+                                    unavailable("a disk generation, rollback, or publication fence changed; inspect or retry")
+                                }
+                                crate::disk::error::Error::FileCorrupt => LegacyTransitionStateReconcileError::Corrupt(
+                                    "a disk rejected conflicting transition metadata".to_string(),
+                                ),
+                                _ => LegacyTransitionStateReconcileError::BackendUnavailable(err.to_string()),
+                            });
+                        }
+                    }
+                }
+            }
         }
-        let mut write_readiness = current.readiness;
-        write_readiness.fleet_ready = false;
-        write_readiness.post_ready = false;
-        Ok(LegacyTransitionStateReconcileResponse {
-            outcome: LegacyTransitionStateReconcileOutcome::BackendUnavailable,
-            reason_code: "write_fence_unavailable".to_string(),
-            reason:
-                "conditional per-set xl.meta generation writes and a fleet reconciliation-capability fence are not implemented"
-                    .to_string(),
-            retryable: true,
-            changed: false,
-            selector: request.selector,
-            source: Some(request.source),
-            original_sets: request.original_sets,
-            target: Some(request.target),
-            reconciliation_digest: Some(request.reconciliation_digest),
-            readiness: write_readiness,
-        })
+        let (source, copies) = self.read_reconciled_transition_snapshot(&request.selector).await?;
+        validate_reconcile_snapshot(request, Some(&source), &copies, Some(&request.target))?;
+        if copies
+            .iter()
+            .flat_map(|set| &set.copies)
+            .any(|copy| !representation_matches_target(copy, &request.target))
+        {
+            return Err(unavailable("strong readback did not prove convergence of every authoritative copy"));
+        }
+        if !legacy_transition_state_reconcile_fleet_proof_matches(&authority.fleet).await || !authority.is_current() {
+            return Err(unavailable("publication authority changed before final readback completed"));
+        }
+        current.outcome = LegacyTransitionStateReconcileOutcome::Migrated;
+        current.reason_code = if *changed { "migrated" } else { "already_converged" }.to_string();
+        current.reason = "every authoritative metadata copy contains the proven state and destination".to_string();
+        current.retryable = false;
+        current.reconciliation_digest = Some(response_digest(&source, &copies, &request.target)?);
+        current.source = Some(source);
+        current.original_sets = copies;
+        current.readiness = readiness(true, true, true, true, false);
+        Ok(current)
     }
+
+    async fn read_reconciled_transition_snapshot(
+        &self,
+        selector: &LegacyTransitionStateReconcileSelector,
+    ) -> Result<(LegacyTransitionStateSource, Vec<LegacyTransitionStateSetRepresentation>), LegacyTransitionStateReconcileError>
+    {
+        let (_, version_id) = selector.clone().canonicalize()?;
+        let incarnation = self
+            .bucket_incarnation_id_from_disk(&selector.bucket)
+            .await
+            .map_err(|err| LegacyTransitionStateReconcileError::BackendUnavailable(err.to_string()))?;
+        let topology = acquire_cross_pool_fence_fleet_proof()
+            .ok_or_else(|| LegacyTransitionStateReconcileError::WriteFenceUnavailable("topology proof expired".to_string()))?;
+        let mut source = None;
+        let mut sets = Vec::new();
+        for set in self.all_set_disks() {
+            let raw = read_legacy_transition_state_metadata_copies(&set, &selector.bucket, &selector.object)
+                .await
+                .map_err(|err| LegacyTransitionStateReconcileError::BackendUnavailable(err.to_string()))?;
+            let total_copies = raw.len();
+            let available_copies = raw.iter().flatten().count();
+            let mut copies = Vec::new();
+            for (index, raw) in raw.into_iter().enumerate() {
+                let Some(raw) = raw else { continue };
+                let Some(copy) = inspect_copy(&raw, index, &selector.bucket, &selector.object, version_id)? else {
+                    continue;
+                };
+                let mut observed_source = source_from_file_info(selector, incarnation, &copy.file_info)?;
+                observed_source.topology_generation = Some(cross_pool_fence_topology_generation(&topology));
+                if source.as_ref().is_some_and(|source| source != &observed_source) {
+                    return Err(LegacyTransitionStateReconcileError::StaleExpectedTuple(
+                        "immutable source changed during readback".to_string(),
+                    ));
+                }
+                source = Some(observed_source);
+                copies.push(copy.representation);
+            }
+            if !copies.is_empty() {
+                sets.push(LegacyTransitionStateSetRepresentation {
+                    pool_index: set.pool_index,
+                    set_index: set.set_index,
+                    total_copies,
+                    available_copies,
+                    copies,
+                });
+            }
+        }
+        Ok((
+            source.ok_or_else(|| LegacyTransitionStateReconcileError::StaleExpectedTuple("source disappeared".to_string()))?,
+            sets,
+        ))
+    }
+}
+
+fn representation_matches_target(copy: &LegacyTransitionStateCopyRepresentation, target: &LegacyTransitionStateTarget) -> bool {
+    let aliases_equal = |aliases: &[LegacyTransitionStateMetadataAlias], value: &str| {
+        !aliases.is_empty()
+            && aliases
+                .iter()
+                .all(|alias| alias.value_hex == rustfs_utils::crypto::hex(value.as_bytes()))
+    };
+    aliases_equal(&copy.state_aliases, target.state.as_str())
+        && aliases_equal(&copy.destination_aliases, &target.destination_id)
+        && match &target.remote_version {
+            Some(version) => aliases_equal(&copy.version_aliases, version),
+            None => copy.version_aliases.iter().all(|alias| alias.value_hex.is_empty()),
+        }
+}
+
+fn validate_reconcile_snapshot(
+    request: &LegacyTransitionStateReconcileRequest,
+    source: Option<&LegacyTransitionStateSource>,
+    sets: &[LegacyTransitionStateSetRepresentation],
+    target: Option<&LegacyTransitionStateTarget>,
+) -> Result<(), LegacyTransitionStateReconcileError> {
+    let matches = source == Some(&request.source)
+        && target == Some(&request.target)
+        && !sets.is_empty()
+        && sets.len() == request.original_sets.len()
+        && sets.iter().zip(&request.original_sets).all(|(current, original)| {
+            current.pool_index == original.pool_index
+                && current.set_index == original.set_index
+                && current.total_copies == original.total_copies
+                && current.available_copies == original.available_copies
+                && current.copies.len() == original.copies.len()
+                && current.copies.iter().zip(&original.copies).all(|(current, original)| {
+                    current.disk_index == original.disk_index
+                        && current.unchanged_metadata_digest == original.unchanged_metadata_digest
+                        && (current == original || representation_matches_target(current, &request.target))
+                })
+        });
+    if !matches {
+        return Err(LegacyTransitionStateReconcileError::StaleExpectedTuple(
+            "source, ownership, target, or unrelated metadata differs from the inspected generation".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn legacy_remote_version_matches_target(file_info: &FileInfo, target: &LegacyTransitionStateTarget) -> bool {
@@ -866,6 +1188,7 @@ fn error_response(
         reason: err.to_string(),
         retryable,
         changed: false,
+        changes_indeterminate: false,
         selector,
         source: None,
         original_sets: Vec::new(),
@@ -1078,7 +1401,7 @@ mod tests {
             tier_generation: 1,
         };
         let digest = response_digest(&source, &sets, &target).expect("valid source digest");
-        let mut changed = source.clone();
+        let mut changed = source;
         changed.remote_object.push_str("-changed");
         assert_ne!(digest, response_digest(&changed, &sets, &target).expect("changed source digest"));
     }
