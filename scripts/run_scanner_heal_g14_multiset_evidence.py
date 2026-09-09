@@ -212,7 +212,7 @@ def proof_from_case_directories(raw_values: list[str], out_dir: Path, source_rev
         "peer_count": oracle["peer_count"],
         "same_window_remote_proof": oracle["same_window_remote_proof"],
         "all_peers_bound_to_generation_window": oracle["all_peers_bound_to_generation_window"],
-        "case_evidence": copy_case_artifacts(out_dir, records, window_id, source_revision),
+        "case_evidence": copy_case_artifacts(out_dir, [selected], window_id, source_revision),
     }
 
 
@@ -408,6 +408,13 @@ def run_self_test() -> None:
             "--out-dir", str(root / "out"),
         ]))
         require(descriptor.is_file(), "self-test case-dir descriptor missing")
+        data = read_json(descriptor)
+        evidence = data["gates"]["G14"]["evidence_fields"]["same_window_field_evidence"]
+        artifact = descriptor.parent / evidence["artifact"]
+        case_evidence = read_json(artifact)["case_evidence"]
+        require(len(case_evidence) == 1, "self-test case-dir descriptor copied non-covering case evidence")
+        require(case_evidence[0]["case"] == "background-target-crash-ec8-4-multi-pool",
+                "self-test case-dir descriptor selected the wrong covering case")
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

@@ -44,6 +44,24 @@ SCANNER_HEAL_RELEASE_REQUIRED_GATES = (
     "P1", "P2", "P3", "P4", "R-E", "R-D", "R-L",
 )
 SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
+    "G01": (
+        "root_authority_evidence",
+        "quota_authority_evidence",
+    ),
+    "G02": (
+        "bounded_checkpoint_oracle",
+        "independent_version_inventory",
+    ),
+    "G03": (
+        "durable_root_publication_proof",
+        "scoped_ack_request_identity",
+        "participating_peer_capability_snapshot",
+        "mixed_peer_ack_fallback_oracle",
+    ),
+    "G04": (
+        "cache_boundary_crash_evidence",
+        "root_floor_intent_crash_evidence",
+    ),
     "G05": (
         "per_object_outcome_oracle",
         "terminal_retention_bounds",
@@ -62,21 +80,28 @@ SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
         "disk_full_matrix",
         "replica_loss_matrix",
     ),
-    "G03": (
-        "durable_root_publication_proof",
-        "scoped_ack_request_identity",
-        "participating_peer_capability_snapshot",
-        "mixed_peer_ack_fallback_oracle",
-    ),
     "G09": (
         "mixed_version_reader_evidence",
         "mixed_version_writer_evidence",
         "rollback_payload_evidence",
     ),
+    "G10": (
+        "scheduler_bound_evidence",
+        "pressure_recovery_evidence",
+    ),
     "G11": (
         "maintenance_producer_matrix",
         "complete_producer_inventory",
         "segment_activation_preflight",
+    ),
+    "G12": (
+        "reset_quota_path_evidence",
+        "settlement_quota_path_evidence",
+    ),
+    "G13": (
+        "quorum_minus_one_matrix",
+        "unknown_disk_remount_matrix",
+        "object_lock_dry_run_grace_evidence",
     ),
     "G14": (
         "same_window_field_evidence",
@@ -85,15 +110,30 @@ SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
         "multi_pool_evidence",
         "distributed_segment_invalidation_evidence",
     ),
+    "P1": (
+        "cold_walk_share_measurement",
+        "foreground_latency_throughput_measurement",
+        "profile_evidence",
+    ),
+    "P2": (
+        "post_stop_convergence_measurement",
+        "cold_segment_reuse_measurement",
+    ),
+    "P3": (
+        "two_hour_pressure_measurement",
+        "heal_capacity_measurement",
+        "recovery_window_measurement",
+    ),
     "P4": (
         "mrf_scale_measurement",
         "mrf_replay_cost_measurement",
         "retained_responsibility_evidence",
         "mrf_cleanup_gc_soak_evidence",
     ),
-    "P2": (
-        "post_stop_convergence_measurement",
-        "cold_segment_reuse_measurement",
+    "R-E": (
+        "fixed_budget_restart_evidence",
+        "enumeration_evidence",
+        "classification_evidence",
     ),
     "R-D": (
         "manager_disposition_evidence",
@@ -101,29 +141,34 @@ SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
         "ledger_disposition_evidence",
         "grace_handling",
     ),
+    "R-L": (
+        "legacy_source_conflict_evidence",
+        "migration_gap_evidence",
+        "crash_safe_source_retirement_evidence",
+    ),
 }
 SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS = {
-    "G01": ("root_authority_evidence", "quota_authority_evidence"),
-    "G02": ("bounded_checkpoint_oracle", "independent_version_inventory"),
+    "G01": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G01"],
+    "G02": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G02"],
     "G03": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G03"],
-    "G04": ("cache_boundary_crash_evidence", "root_floor_intent_crash_evidence"),
+    "G04": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G04"],
     "G05": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G05"],
     "G06": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G06"],
-    "G07": ("mrf_responsibility_oracle", "commit_boundary_crash_matrix"),
-    "G08": ("mrf_capacity_evidence", "disk_full_matrix", "replica_loss_matrix"),
+    "G07": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G07"],
+    "G08": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G08"],
     "G09": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G09"],
-    "G10": ("scheduler_bound_evidence", "pressure_recovery_evidence"),
+    "G10": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G10"],
     "G11": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G11"],
-    "G12": ("reset_quota_path_evidence", "settlement_quota_path_evidence"),
-    "G13": ("quorum_minus_one_matrix", "unknown_disk_remount_matrix", "object_lock_dry_run_grace_evidence"),
+    "G12": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G12"],
+    "G13": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G13"],
     "G14": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G14"],
-    "P1": ("cold_walk_share_measurement", "foreground_latency_throughput_measurement", "profile_evidence"),
+    "P1": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P1"],
     "P2": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P2"],
-    "P3": ("two_hour_pressure_measurement", "heal_capacity_measurement", "recovery_window_measurement"),
+    "P3": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P3"],
     "P4": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P4"],
-    "R-E": ("fixed_budget_restart_evidence", "enumeration_evidence", "classification_evidence"),
+    "R-E": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["R-E"],
     "R-D": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["R-D"],
-    "R-L": ("legacy_source_conflict_evidence", "migration_gap_evidence", "crash_safe_source_retirement_evidence"),
+    "R-L": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["R-L"],
 }
 SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES = {
     ("G03", "durable_root_publication_proof"): "durable-root-publication",
@@ -137,6 +182,18 @@ SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES = {
     ("R-L", "migration_gap_evidence"): "migration-gap",
     ("R-L", "crash_safe_source_retirement_evidence"): "crash-safe-source-retirement",
 }
+SCANNER_HEAL_RELEASE_G01_ROOT_AUTHORITY_CASES = (
+    "root-cas-success",
+    "root-readback-success",
+    "incomplete-root-rejected",
+    "stale-root-rejected",
+)
+SCANNER_HEAL_RELEASE_G01_QUOTA_AUTHORITY_CASES = (
+    "quota-floor-readback",
+    "quota-over-limit-rejected",
+    "rejected-object-invisible",
+    "quota-fails-closed-without-authority",
+)
 SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS = {
     ("G07", "mrf_responsibility_oracle"),
     ("G07", "commit_boundary_crash_matrix"),
@@ -266,6 +323,19 @@ SCANNER_HEAL_RELEASE_CRASH_BOUNDARY_FIELDS = {
         "process-restart-replay",
     ),
 }
+SCANNER_HEAL_RELEASE_G12_QUOTA_PATH_CASES = {
+    "reset_quota_path_evidence": (
+        "storage-owner-reconstruction",
+        "future-reservation-protocol-fail-closed",
+        "reservation-ledger-retained",
+    ),
+    "settlement_quota_path_evidence": (
+        "distributed-hard-quota-admission",
+        "quota-stats-current-usage-observed",
+        "oversized-put-rejected",
+        "rejected-object-not-visible",
+    ),
+}
 SCANNER_HEAL_RELEASE_G05_PER_OBJECT_OUTCOME_CASES = (
     "object-repaired",
     "object-already-healthy",
@@ -318,6 +388,24 @@ SCANNER_HEAL_RELEASE_RD_GRACE_CASES = (
     "grace-expired-prunes-terminal",
     "restart-preserves-grace-clock",
 )
+SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES = {
+    "legacy_source_conflict_evidence": (
+        "data-movement-owned-target-equivalence",
+        "newer-target-conflict-rejected",
+        "legacy-part-checksum-gap-rejected",
+    ),
+    "migration_gap_evidence": (
+        "encrypted-iam-decrypt-before-normalize",
+        "empty-legacy-source-inherits-prior-responsibilities",
+        "missing-corrupt-empty-sources-fail-closed",
+    ),
+    "crash_safe_source_retirement_evidence": (
+        "source-change-capacity-failure-keeps-old-commit",
+        "torn-inactive-payload-keeps-previous-anchor",
+        "commit-boundary-lost-response-idempotent",
+        "successor-retry-validates-orphan",
+    ),
+}
 SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES = {
     "durable_root_publication_proof": (
         "root-cas-success",
@@ -1677,6 +1765,23 @@ def is_json_artifact_format(value: str) -> bool:
 
 def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple[str, ...]:
     fields: list[str] = []
+    if gate == "G01":
+        if field == "root_authority_evidence":
+            fields.extend((
+                "root_authority_cases",
+                "root_cas_observed",
+                "root_readback_observed",
+                "incomplete_root_rejected",
+                "stale_root_rejected",
+            ))
+        if field == "quota_authority_evidence":
+            fields.extend((
+                "quota_authority_cases",
+                "quota_floor_readback_observed",
+                "over_limit_put_rejected",
+                "rejected_object_invisible",
+                "quota_fails_closed_without_authority",
+            ))
     if gate in ("G03", "G09", "R-L"):
         fields.extend(("versions", "mixed_version_role"))
     if gate == "G02":
@@ -1730,6 +1835,8 @@ def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple
             fields.append("whole_cycle_fallback_observed")
     if gate == "G04" and field == "root_floor_intent_crash_evidence":
         fields.extend(("durable_intent_cases", "persist_failure_blocks_acceptance"))
+    if gate == "G12":
+        fields.append("quota_path_cases")
     if gate == "G05":
         if field == "per_object_outcome_oracle":
             fields.extend(("per_object_outcome_cases", "outcome_counts", "status_matches_object_oracle"))
@@ -1853,6 +1960,28 @@ def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple
                 "grace_retention_observed",
                 "grace_expiry_pruned_terminal_records",
             ))
+    if gate == "R-L":
+        if field == "legacy_source_conflict_evidence":
+            fields.extend((
+                "legacy_source_conflict_cases",
+                "source_conflicts_rejected",
+                "takeover_identity_bound",
+                "legacy_checksum_gap_rejected",
+            ))
+        if field == "migration_gap_evidence":
+            fields.extend((
+                "migration_gap_cases",
+                "migration_gap_closed",
+                "legacy_sources_fail_closed",
+                "prior_responsibilities_inherited",
+            ))
+        if field == "crash_safe_source_retirement_evidence":
+            fields.extend((
+                "source_retirement_cases",
+                "source_retirement_is_crash_safe",
+                "old_source_retained_until_successor",
+                "recovered_pending_migration",
+            ))
     return tuple(dict.fromkeys(fields))
 
 
@@ -1953,6 +2082,33 @@ def release_bundle_number(value: object, name: str, minimum: int | float = 0) ->
 
 
 def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dict[str, object]) -> None:
+    if gate == "G01":
+        if field == "root_authority_evidence":
+            release_bundle_exact_strings(
+                evidence.get("root_authority_cases"),
+                SCANNER_HEAL_RELEASE_G01_ROOT_AUTHORITY_CASES,
+                f"{gate}.{field}.root_authority_cases",
+            )
+            release_bundle_bool_true(evidence.get("root_cas_observed"), f"{gate}.{field}.root_cas_observed")
+            release_bundle_bool_true(evidence.get("root_readback_observed"), f"{gate}.{field}.root_readback_observed")
+            release_bundle_bool_true(evidence.get("incomplete_root_rejected"),
+                                     f"{gate}.{field}.incomplete_root_rejected")
+            release_bundle_bool_true(evidence.get("stale_root_rejected"), f"{gate}.{field}.stale_root_rejected")
+        if field == "quota_authority_evidence":
+            release_bundle_exact_strings(
+                evidence.get("quota_authority_cases"),
+                SCANNER_HEAL_RELEASE_G01_QUOTA_AUTHORITY_CASES,
+                f"{gate}.{field}.quota_authority_cases",
+            )
+            release_bundle_bool_true(evidence.get("quota_floor_readback_observed"),
+                                     f"{gate}.{field}.quota_floor_readback_observed")
+            release_bundle_bool_true(evidence.get("over_limit_put_rejected"),
+                                     f"{gate}.{field}.over_limit_put_rejected")
+            release_bundle_bool_true(evidence.get("rejected_object_invisible"),
+                                     f"{gate}.{field}.rejected_object_invisible")
+            release_bundle_bool_true(evidence.get("quota_fails_closed_without_authority"),
+                                     f"{gate}.{field}.quota_fails_closed_without_authority")
+
     if gate == "G02":
         if field == "bounded_checkpoint_oracle":
             release_bundle_bool_true(evidence.get("checkpoint_progress_bounded"),
@@ -2006,6 +2162,13 @@ def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dic
         )
         release_bundle_bool_true(evidence.get("persist_failure_blocks_acceptance"),
                                  f"{gate}.{field}.persist_failure_blocks_acceptance")
+
+    if gate == "G12":
+        release_bundle_exact_strings(
+            evidence.get("quota_path_cases"),
+            SCANNER_HEAL_RELEASE_G12_QUOTA_PATH_CASES[field],
+            f"{gate}.{field}.quota_path_cases",
+        )
 
     if gate == "G05":
         if field == "per_object_outcome_oracle":
@@ -2314,6 +2477,44 @@ def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dic
             release_bundle_bool_true(evidence.get("grace_expiry_pruned_terminal_records"),
                                      f"{gate}.{field}.grace_expiry_pruned_terminal_records")
 
+    if gate == "R-L":
+        if field == "legacy_source_conflict_evidence":
+            release_bundle_exact_strings(
+                evidence.get("legacy_source_conflict_cases"),
+                SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field],
+                f"{gate}.{field}.legacy_source_conflict_cases",
+            )
+            release_bundle_bool_true(evidence.get("source_conflicts_rejected"),
+                                     f"{gate}.{field}.source_conflicts_rejected")
+            release_bundle_bool_true(evidence.get("takeover_identity_bound"),
+                                     f"{gate}.{field}.takeover_identity_bound")
+            release_bundle_bool_true(evidence.get("legacy_checksum_gap_rejected"),
+                                     f"{gate}.{field}.legacy_checksum_gap_rejected")
+        if field == "migration_gap_evidence":
+            release_bundle_exact_strings(
+                evidence.get("migration_gap_cases"),
+                SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field],
+                f"{gate}.{field}.migration_gap_cases",
+            )
+            release_bundle_bool_true(evidence.get("migration_gap_closed"),
+                                     f"{gate}.{field}.migration_gap_closed")
+            release_bundle_bool_true(evidence.get("legacy_sources_fail_closed"),
+                                     f"{gate}.{field}.legacy_sources_fail_closed")
+            release_bundle_bool_true(evidence.get("prior_responsibilities_inherited"),
+                                     f"{gate}.{field}.prior_responsibilities_inherited")
+        if field == "crash_safe_source_retirement_evidence":
+            release_bundle_exact_strings(
+                evidence.get("source_retirement_cases"),
+                SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field],
+                f"{gate}.{field}.source_retirement_cases",
+            )
+            release_bundle_bool_true(evidence.get("source_retirement_is_crash_safe"),
+                                     f"{gate}.{field}.source_retirement_is_crash_safe")
+            release_bundle_bool_true(evidence.get("old_source_retained_until_successor"),
+                                     f"{gate}.{field}.old_source_retained_until_successor")
+            release_bundle_bool_true(evidence.get("recovered_pending_migration"),
+                                     f"{gate}.{field}.recovered_pending_migration")
+
 
 def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, gate: str, field: str,
                                      evidence: dict[str, object]) -> str:
@@ -2361,7 +2562,7 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
             evidence_integer(evidence.get("lock_hold_p95_ms"), f"{gate}.{field}.lock_hold_p95_ms", 0, 2**31 - 1)
             evidence_integer(evidence.get("foreground_latency_p95_ms"),
                              f"{gate}.{field}.foreground_latency_p95_ms", 1, 2**31 - 1)
-    if gate in ("G11", "G13"):
+    if gate in ("G01", "G11", "G12", "G13", "R-L"):
         validate_release_bundle_domain_evidence(gate, field, evidence)
     if gate == "P1" and field == "foreground_latency_throughput_measurement":
         evidence_integer(evidence.get("foreground_latency_p95_ms"),
@@ -2719,66 +2920,80 @@ def copy_release_bundle_artifact(descriptor_path: Path, bundle_dir: Path, eviden
     evidence["sha256"] = source_sha
 
 
-def assemble_scanner_heal_release_bundle(root: Path, descriptor_path: Path, directory: Path) -> tuple[Path, dict[str, object]]:
-    """Copy measured Scanner/Heal evidence into one validated release bundle."""
+def assemble_scanner_heal_release_bundle_descriptors(
+    root: Path,
+    descriptor_paths: list[Path],
+    directory: Path,
+) -> tuple[Path, dict[str, object]]:
+    """Copy measured Scanner/Heal evidence descriptors into one validated release bundle."""
     require(not directory.exists(), "scanner/heal release bundle directory must be new")
+    require(descriptor_paths, "scanner/heal release bundle assembly requires at least one descriptor")
     registry = read_json(root / ".config/scanner-heal-required-tests.json")
     requirements, release_schema_capable, _ = scanner_heal_release_requirements(registry)
     require(release_schema_capable, "scanner/heal release bundle assembly requires schema 2 registry")
-    descriptor_path = descriptor_path.resolve(strict=True)
-    descriptor = read_json(descriptor_path)
-    reject_release_bundle_markers(descriptor, "scanner/heal release evidence descriptor")
-    require(descriptor.get("schema") == 1, "unsupported scanner/heal release evidence descriptor schema")
-    require(descriptor.get("evidence") == "measured", "scanner/heal release evidence descriptor must be measured")
-    source_revision = descriptor.get("source_revision")
-    require(isinstance(source_revision, str) and re.fullmatch(r"[0-9a-f]{40}", source_revision) is not None,
-            "scanner/heal release evidence descriptor source revision is invalid")
-    raw_gates = descriptor.get("gates")
-    require(isinstance(raw_gates, dict), "scanner/heal release evidence descriptor missing gates")
-    unknown_gates = sorted(set(raw_gates) - set(requirements))
-    require(not unknown_gates, f"scanner/heal release evidence descriptor has unknown gates: {', '.join(unknown_gates)}")
 
     bundle_dir = directory.resolve()
     artifact_dir = bundle_dir / "artifacts"
     artifact_dir.mkdir(parents=True)
     assembled_gates = {}
-    for gate in sorted(raw_gates):
-        raw_gate = raw_gates[gate]
-        require(isinstance(raw_gate, dict), f"{gate} descriptor gate must be an object")
-        reject_release_bundle_markers(raw_gate, f"{gate} descriptor gate")
-        raw_fields = raw_gate.get("evidence_fields", raw_gate)
-        require(isinstance(raw_fields, dict), f"{gate} descriptor gate missing evidence fields")
-        required_fields = set(SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate])
-        unknown_fields = sorted(set(raw_fields) - required_fields)
-        require(not unknown_fields, f"{gate} descriptor has unknown fields: {', '.join(unknown_fields)}")
-        fields = {}
-        for field in sorted(raw_fields):
-            raw_evidence = raw_fields[field]
-            require(isinstance(raw_evidence, dict), f"{gate}.{field} descriptor evidence must be an object")
-            evidence = json.loads(json.dumps(raw_evidence))
-            reject_release_bundle_markers(evidence, f"{gate}.{field} descriptor evidence")
-            copy_release_bundle_artifact(descriptor_path, bundle_dir, evidence, gate, field, f"{gate}-{field}")
-            profile_artifacts = evidence.get("profile_artifacts")
-            if profile_artifacts is not None:
-                require(isinstance(profile_artifacts, dict), f"{gate}.{field} profile artifacts must be an object")
-                for artifact_kind, item in sorted(profile_artifacts.items()):
-                    require(isinstance(item, dict), f"{gate}.{field}.{artifact_kind} descriptor profile artifact must be an object")
-                    reject_release_bundle_markers(item, f"{gate}.{field}.{artifact_kind} descriptor profile artifact")
-                    copy_release_bundle_artifact(
-                        descriptor_path,
-                        bundle_dir,
-                        item,
-                        gate,
-                        f"{field}.{artifact_kind}",
-                        f"{gate}-{field}-{artifact_kind}",
-                    )
-            fields[field] = evidence
-        assembled_gates[gate] = {
-            "status": "pass",
-            "lane": requirements[gate]["lane"],
-            "evidence_type": "measured",
-            "evidence_fields": fields,
-        }
+    source_revision = None
+    for descriptor_index, raw_descriptor_path in enumerate(descriptor_paths):
+        descriptor_path = raw_descriptor_path.resolve(strict=True)
+        descriptor = read_json(descriptor_path)
+        label = f"scanner/heal release evidence descriptor {descriptor_index + 1}"
+        reject_release_bundle_markers(descriptor, label)
+        require(descriptor.get("schema") == 1, f"unsupported {label} schema")
+        require(descriptor.get("evidence") == "measured", f"{label} must be measured")
+        descriptor_revision = descriptor.get("source_revision")
+        require(isinstance(descriptor_revision, str) and re.fullmatch(r"[0-9a-f]{40}", descriptor_revision) is not None,
+                f"{label} source revision is invalid")
+        if source_revision is None:
+            source_revision = descriptor_revision
+        else:
+            require(descriptor_revision == source_revision, "scanner/heal release descriptor source revisions differ")
+        raw_gates = descriptor.get("gates")
+        require(isinstance(raw_gates, dict), f"{label} missing gates")
+        unknown_gates = sorted(set(raw_gates) - set(requirements))
+        require(not unknown_gates, f"{label} has unknown gates: {', '.join(unknown_gates)}")
+
+        for gate in sorted(raw_gates):
+            require(gate not in assembled_gates, f"scanner/heal release descriptor repeats gate: {gate}")
+            raw_gate = raw_gates[gate]
+            require(isinstance(raw_gate, dict), f"{gate} descriptor gate must be an object")
+            reject_release_bundle_markers(raw_gate, f"{gate} descriptor gate")
+            raw_fields = raw_gate.get("evidence_fields", raw_gate)
+            require(isinstance(raw_fields, dict), f"{gate} descriptor gate missing evidence fields")
+            required_fields = set(SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate])
+            unknown_fields = sorted(set(raw_fields) - required_fields)
+            require(not unknown_fields, f"{gate} descriptor has unknown fields: {', '.join(unknown_fields)}")
+            fields = {}
+            for field in sorted(raw_fields):
+                raw_evidence = raw_fields[field]
+                require(isinstance(raw_evidence, dict), f"{gate}.{field} descriptor evidence must be an object")
+                evidence = json.loads(json.dumps(raw_evidence))
+                reject_release_bundle_markers(evidence, f"{gate}.{field} descriptor evidence")
+                copy_release_bundle_artifact(descriptor_path, bundle_dir, evidence, gate, field, f"{gate}-{field}")
+                profile_artifacts = evidence.get("profile_artifacts")
+                if profile_artifacts is not None:
+                    require(isinstance(profile_artifacts, dict), f"{gate}.{field} profile artifacts must be an object")
+                    for artifact_kind, item in sorted(profile_artifacts.items()):
+                        require(isinstance(item, dict), f"{gate}.{field}.{artifact_kind} descriptor profile artifact must be an object")
+                        reject_release_bundle_markers(item, f"{gate}.{field}.{artifact_kind} descriptor profile artifact")
+                        copy_release_bundle_artifact(
+                            descriptor_path,
+                            bundle_dir,
+                            item,
+                            gate,
+                            f"{field}.{artifact_kind}",
+                            f"{gate}-{field}-{artifact_kind}",
+                        )
+                fields[field] = evidence
+            assembled_gates[gate] = {
+                "status": "pass",
+                "lane": requirements[gate]["lane"],
+                "evidence_type": "measured",
+                "evidence_fields": fields,
+            }
 
     bundle = bundle_dir / "release-evidence.json"
     write_json(bundle, {
@@ -2788,6 +3003,11 @@ def assemble_scanner_heal_release_bundle(root: Path, descriptor_path: Path, dire
         "gates": assembled_gates,
     })
     return bundle, scanner_heal_release_bundle_status(root, bundle)
+
+
+def assemble_scanner_heal_release_bundle(root: Path, descriptor_path: Path, directory: Path) -> tuple[Path, dict[str, object]]:
+    """Copy one measured Scanner/Heal evidence descriptor into a validated release bundle."""
+    return assemble_scanner_heal_release_bundle_descriptors(root, [descriptor_path], directory)
 
 
 def write_scanner_heal_release_bundle_fixture(root: Path, directory: Path) -> Path:
@@ -2911,6 +3131,8 @@ def write_scanner_heal_release_bundle_fixture(root: Path, directory: Path) -> Pa
                 evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
             if gate in ("G04", "G07", "R-E", "R-L"):
                 evidence["crash_points"] = ["fixture-before-commit"]
+            if gate == "G12":
+                evidence["quota_path_cases"] = list(SCANNER_HEAL_RELEASE_G12_QUOTA_PATH_CASES[field])
             if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
                 evidence["replayed_records"] = 1
                 evidence["responsibility_anchor_retained"] = True
@@ -3298,6 +3520,22 @@ class SelfTests(unittest.TestCase):
                         "versions_retained": 16,
                         "bytes_retained": 16,
                     })
+                if gate == "G01" and field == "root_authority_evidence":
+                    evidence.update({
+                        "root_authority_cases": list(SCANNER_HEAL_RELEASE_G01_ROOT_AUTHORITY_CASES),
+                        "root_cas_observed": True,
+                        "root_readback_observed": True,
+                        "incomplete_root_rejected": True,
+                        "stale_root_rejected": True,
+                    })
+                if gate == "G01" and field == "quota_authority_evidence":
+                    evidence.update({
+                        "quota_authority_cases": list(SCANNER_HEAL_RELEASE_G01_QUOTA_AUTHORITY_CASES),
+                        "quota_floor_readback_observed": True,
+                        "over_limit_put_rejected": True,
+                        "rejected_object_invisible": True,
+                        "quota_fails_closed_without_authority": True,
+                    })
                 if gate in ("G03", "G09", "R-L"):
                     evidence["versions"] = ["a" * 40, source_revision]
                     evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
@@ -3313,6 +3551,8 @@ class SelfTests(unittest.TestCase):
                 if gate == "G04" and field == "root_floor_intent_crash_evidence":
                     evidence["durable_intent_cases"] = list(SCANNER_HEAL_RELEASE_CRASH_BOUNDARY_FIELDS[(gate, field)])
                     evidence["persist_failure_blocks_acceptance"] = True
+                if gate == "G12":
+                    evidence["quota_path_cases"] = list(SCANNER_HEAL_RELEASE_G12_QUOTA_PATH_CASES[field])
                 if gate == "G05" and field == "per_object_outcome_oracle":
                     evidence["per_object_outcome_cases"] = list(SCANNER_HEAL_RELEASE_G05_PER_OBJECT_OUTCOME_CASES)
                     evidence["outcome_counts"] = {"repaired": 4, "healthy": 3, "skipped": 2, "failed": 1}
@@ -3486,6 +3726,21 @@ class SelfTests(unittest.TestCase):
                     evidence["grace_window_seconds"] = 300
                     evidence["grace_retention_observed"] = True
                     evidence["grace_expiry_pruned_terminal_records"] = True
+                if gate == "R-L" and field == "legacy_source_conflict_evidence":
+                    evidence["legacy_source_conflict_cases"] = list(SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field])
+                    evidence["source_conflicts_rejected"] = True
+                    evidence["takeover_identity_bound"] = True
+                    evidence["legacy_checksum_gap_rejected"] = True
+                if gate == "R-L" and field == "migration_gap_evidence":
+                    evidence["migration_gap_cases"] = list(SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field])
+                    evidence["migration_gap_closed"] = True
+                    evidence["legacy_sources_fail_closed"] = True
+                    evidence["prior_responsibilities_inherited"] = True
+                if gate == "R-L" and field == "crash_safe_source_retirement_evidence":
+                    evidence["source_retirement_cases"] = list(SCANNER_HEAL_RELEASE_RL_REQUIRED_CASES[field])
+                    evidence["source_retirement_is_crash_safe"] = True
+                    evidence["old_source_retained_until_successor"] = True
+                    evidence["recovered_pending_migration"] = True
                 if field == "profile_evidence":
                     evidence["resolved_samples"] = 1
                     evidence["allocation_bytes"] = 1024
@@ -3590,6 +3845,71 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(evidence["artifact"], "artifacts/G01-root_authority_evidence.json")
             self.assertEqual(evidence["sha256"], digest(bundle.parent / evidence["artifact"]))
             self.assertTrue((bundle.parent / evidence["artifact"]).is_file())
+
+    def test_scanner_heal_release_bundle_assembler_merges_measured_descriptors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, descriptor = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            source = read_json(descriptor)
+            descriptor_paths = []
+            for gate in ("G01", "G09"):
+                partial = descriptor.parent / f"release-bundle-{gate}.json"
+                write_json(partial, {
+                    "schema": 1,
+                    "evidence": "measured",
+                    "source_revision": source["source_revision"],
+                    "gates": {gate: source["gates"][gate]},
+                })
+                descriptor_paths.append(partial)
+
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                bundle, status = assemble_scanner_heal_release_bundle_descriptors(
+                    root,
+                    descriptor_paths,
+                    Path(tmp) / "assembled",
+                )
+            self.assertEqual(status["decision"], "blocked")
+            self.assertFalse(status["release_approved"])
+            self.assertIn("G01", status["verified_gates"])
+            self.assertIn("G09", status["verified_gates"])
+            self.assertIn("G02", status["pending_gates"])
+            assembled = read_json(bundle)
+            self.assertEqual(sorted(assembled["gates"]), ["G01", "G09"])
+            g09 = assembled["gates"]["G09"]["evidence_fields"]["mixed_version_reader_evidence"]
+            self.assertTrue((bundle.parent / g09["artifact"]).is_file())
+
+    def test_scanner_heal_release_bundle_assembler_rejects_duplicate_descriptor_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, descriptor = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                with self.assertRaisesRegex(ValueError, "repeats gate: G01"):
+                    assemble_scanner_heal_release_bundle_descriptors(
+                        root,
+                        [descriptor, descriptor],
+                        Path(tmp) / "assembled",
+                    )
+
+    def test_scanner_heal_release_bundle_assembler_rejects_mixed_descriptor_revisions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, descriptor = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            source = read_json(descriptor)
+            g01 = descriptor.parent / "release-bundle-g01.json"
+            g09 = descriptor.parent / "release-bundle-g09.json"
+            write_json(g01, {
+                "schema": 1,
+                "evidence": "measured",
+                "source_revision": source["source_revision"],
+                "gates": {"G01": source["gates"]["G01"]},
+            })
+            write_json(g09, {
+                "schema": 1,
+                "evidence": "measured",
+                "source_revision": "c" * 40,
+                "gates": {"G09": source["gates"]["G09"]},
+            })
+
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                with self.assertRaisesRegex(ValueError, "source revisions differ"):
+                    assemble_scanner_heal_release_bundle_descriptors(root, [g01, g09], Path(tmp) / "assembled")
 
     def test_scanner_heal_release_bundle_gate_accepts_single_measured_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3978,6 +4298,20 @@ class SelfTests(unittest.TestCase):
             ("p1-throughput", "P1", "foreground_latency_throughput_measurement", lambda item: item.pop("throughput_ops_per_second"), "throughput_ops_per_second"),
             ("p3-fixed-load", "P3", "two_hour_pressure_measurement", lambda item: item.update({"fixed_offered_load": False}), "fixed offered load"),
             (
+                "g01-root-cases",
+                "G01",
+                "root_authority_evidence",
+                lambda item: item["root_authority_cases"].remove("stale-root-rejected"),
+                "root_authority_cases missing cases",
+            ),
+            (
+                "g01-quota-fail-closed",
+                "G01",
+                "quota_authority_evidence",
+                lambda item: item.update({"quota_fails_closed_without_authority": False}),
+                "quota_fails_closed_without_authority",
+            ),
+            (
                 "rd-manager",
                 "R-D",
                 "manager_disposition_evidence",
@@ -4099,6 +4433,12 @@ class SelfTests(unittest.TestCase):
                 "per_object_outcome_cases missing cases",
             ),
             (
+                "g01-authority-mirror",
+                lambda payload: payload["root_authority_cases"].remove("incomplete-root-rejected"),
+                ("G01", "root_authority_evidence"),
+                "root_authority_cases missing cases",
+            ),
+            (
                 "g06-truncation-mirror",
                 lambda payload: payload["truncation_cases"].remove("trailing-data-node-status-reject"),
                 ("G06", "truncation_behavior"),
@@ -4127,6 +4467,12 @@ class SelfTests(unittest.TestCase):
                 lambda payload: payload["grace_cases"].remove("grace-expired-prunes-terminal"),
                 ("R-D", "grace_handling"),
                 "grace_cases missing cases",
+            ),
+            (
+                "rl-migration-gap-mirror",
+                lambda payload: payload.update({"migration_gap_closed": False}),
+                ("R-L", "migration_gap_evidence"),
+                "migration_gap_closed",
             ),
         ):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
@@ -4209,6 +4555,20 @@ class SelfTests(unittest.TestCase):
                 "persist_failure_blocks_acceptance",
             ),
             (
+                "g12-reset-quota-cases",
+                "G12",
+                "reset_quota_path_evidence",
+                lambda item: item["quota_path_cases"].remove("future-reservation-protocol-fail-closed"),
+                "quota_path_cases missing cases",
+            ),
+            (
+                "g12-settlement-quota-cases",
+                "G12",
+                "settlement_quota_path_evidence",
+                lambda item: item["quota_path_cases"].remove("rejected-object-not-visible"),
+                "quota_path_cases missing cases",
+            ),
+            (
                 "mixed-version-cases",
                 "G09",
                 "mixed_version_writer_evidence",
@@ -4221,6 +4581,27 @@ class SelfTests(unittest.TestCase):
                 "rollback_payload_evidence",
                 lambda item: item.update({"rollback_payload_replayed": False}),
                 "rollback_payload_replayed",
+            ),
+            (
+                "legacy-source-conflict-cases",
+                "R-L",
+                "legacy_source_conflict_evidence",
+                lambda item: item["legacy_source_conflict_cases"].remove("newer-target-conflict-rejected"),
+                "legacy_source_conflict_cases missing cases",
+            ),
+            (
+                "migration-gap-closed",
+                "R-L",
+                "migration_gap_evidence",
+                lambda item: item.update({"migration_gap_closed": False}),
+                "migration_gap_closed",
+            ),
+            (
+                "source-retirement-crash-safe",
+                "R-L",
+                "crash_safe_source_retirement_evidence",
+                lambda item: item.update({"source_retirement_is_crash_safe": False}),
+                "source_retirement_is_crash_safe",
             ),
             (
                 "scheduler-bounds",
@@ -4365,25 +4746,14 @@ class SelfTests(unittest.TestCase):
             self.assertIn("ec8-4-multiset", status["pending_lanes"])
             self.assertIn("scheduler-pressure", status["pending_lanes"])
             requirements, _, _ = scanner_heal_release_requirements(read_json(root / ".config/scanner-heal-required-tests.json"))
-            self.assertIn("durable_root_publication_proof", requirements["G03"]["evidence_fields"])
-            self.assertIn("per_object_outcome_oracle", requirements["G05"]["evidence_fields"])
-            self.assertIn("truncation_behavior", requirements["G06"]["evidence_fields"])
-            self.assertIn("disk_full_matrix", requirements["G08"]["evidence_fields"])
-            self.assertIn("mixed_version_writer_evidence", requirements["G09"]["evidence_fields"])
-            self.assertIn("segment_activation_preflight", requirements["G11"]["evidence_fields"])
-            self.assertIn("distributed_segment_invalidation_evidence", requirements["G14"]["evidence_fields"])
-            self.assertIn("cold_segment_reuse_measurement", requirements["P2"]["evidence_fields"])
-            self.assertEqual(
-                tuple(requirements["P4"]["evidence_fields"]),
-                SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P4"],
-            )
-            self.assertIn("grace_handling", requirements["R-D"]["evidence_fields"])
+            for gate, expected_fields in SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS.items():
+                self.assertEqual(tuple(requirements[gate]["evidence_fields"]), expected_fields, gate)
 
     def test_scanner_heal_required_evidence_fields_cannot_be_removed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, run_dir = self.scanner_heal_fixture(Path(tmp))
             registry = read_json(root / ".config/scanner-heal-required-tests.json")
-            for gate in ("G03", "G05", "G06", "G07", "G08", "G09", "G11", "G14", "P2", "P4", "R-D"):
+            for gate, expected_fields in SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS.items():
                 for requirement in registry["release_requirements"]:
                     if requirement["gate"] == gate:
                         requirement["evidence_fields"] = []
@@ -4397,7 +4767,7 @@ class SelfTests(unittest.TestCase):
                 registry = read_json(root / ".config/scanner-heal-required-tests.json")
                 for requirement in registry["release_requirements"]:
                     if requirement["gate"] == gate:
-                        requirement["evidence_fields"] = list(SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS[gate])
+                        requirement["evidence_fields"] = list(expected_fields)
                         break
 
     def test_scanner_heal_ec84_case_rejects_wrong_erasure_geometry(self) -> None:
@@ -5368,9 +5738,13 @@ def main() -> int:
                     return 2
                 print(json.dumps(status, sort_keys=True, separators=(",", ":")))
                 return 0 if status["decision"] == "verified" else 1
-            if len(sys.argv) == 4 and sys.argv[1] == "--assemble-scanner-heal-release-bundle":
+            if len(sys.argv) >= 4 and sys.argv[1] == "--assemble-scanner-heal-release-bundle":
                 try:
-                    bundle, status = assemble_scanner_heal_release_bundle(ROOT, Path(sys.argv[2]), Path(sys.argv[3]))
+                    bundle, status = assemble_scanner_heal_release_bundle_descriptors(
+                        ROOT,
+                        [Path(item) for item in sys.argv[2:-1]],
+                        Path(sys.argv[-1]),
+                    )
                 except (OSError, KeyError, TypeError, ValueError, ET.ParseError) as error:
                     print(json.dumps({"schema": 1, "decision": "invalid", "release_approved": False,
                                       "error": str(error)}, sort_keys=True, separators=(",", ":")))
@@ -5382,7 +5756,7 @@ def main() -> int:
                 bundle = write_scanner_heal_release_bundle_fixture(ROOT, Path(sys.argv[2]))
                 print(bundle)
                 return 0
-            raise ValueError("expected --begin-scanner-heal DIR BINARY TEST_BINARY, --finish-scanner-heal DIR EXIT, --check-scanner-heal DIR CASE|release, --check-scanner-heal-release DIR, --check-scanner-heal-release-bundle FILE, --check-scanner-heal-release-bundle-gate FILE GATE, --assemble-scanner-heal-release-bundle DESCRIPTOR DIR, or --write-scanner-heal-release-bundle-fixture DIR")
+            raise ValueError("expected --begin-scanner-heal DIR BINARY TEST_BINARY, --finish-scanner-heal DIR EXIT, --check-scanner-heal DIR CASE|release, --check-scanner-heal-release DIR, --check-scanner-heal-release-bundle FILE, --check-scanner-heal-release-bundle-gate FILE GATE, --assemble-scanner-heal-release-bundle DESCRIPTOR [DESCRIPTOR ...] DIR, or --write-scanner-heal-release-bundle-fixture DIR")
         except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
             print(f"ERROR: {error}", file=sys.stderr)
             return 1
@@ -5411,7 +5785,8 @@ def main() -> int:
             "usage: check_test_wiring.py [--self-test | --check-core LISTING | --check-profile PROFILE LISTING | "
             "--update-profile PROFILE LISTING PLATFORM | --check-scanner-heal-release-bundle FILE | "
             "--check-scanner-heal-release-bundle-gate FILE GATE | "
-            "--assemble-scanner-heal-release-bundle DESCRIPTOR DIR | --write-scanner-heal-release-bundle-fixture DIR]",
+            "--assemble-scanner-heal-release-bundle DESCRIPTOR [DESCRIPTOR ...] DIR | "
+            "--write-scanner-heal-release-bundle-fixture DIR]",
             file=sys.stderr,
         )
         return 2
