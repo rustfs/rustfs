@@ -39,8 +39,6 @@ use s3s::dto::{
     BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled, ReplicationConfiguration, VersioningConfiguration,
 };
 use sha2::{Digest as _, Sha256};
-#[cfg(test)]
-use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
@@ -1559,10 +1557,12 @@ pub(crate) use cache::{
 };
 pub use dirty_usage::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageSnapshot, ScannerDirtyUsageState,
-    acknowledge_dirty_usage_generation, acknowledge_scoped_dirty_usage, clear_dirty_usage_bucket, record_dirty_usage_bucket,
+    ScannerDurableDirtyUsageReplayEntry, ScannerDurableDirtyUsageReplayError, ScannerDurableDirtyUsageReplayRecord,
+    ScannerDurableDirtyUsageReplayScope, acknowledge_dirty_usage_generation, acknowledge_scoped_dirty_usage,
+    clear_dirty_usage_bucket, encode_durable_dirty_usage_producer_replay_record, record_dirty_usage_bucket,
     record_dirty_usage_bucket_from_producer, record_dirty_usage_bucket_from_producers, record_dirty_usage_object,
-    record_dirty_usage_object_from_producer, record_scanner_maintenance_change, scanner_activity_epoch,
-    scanner_dirty_usage_snapshot, scanner_dirty_usage_state, scanner_maintenance_generation,
+    record_dirty_usage_object_from_producer, record_scanner_maintenance_change, replay_durable_dirty_usage_producer_record,
+    scanner_activity_epoch, scanner_dirty_usage_snapshot, scanner_dirty_usage_state, scanner_maintenance_generation,
 };
 #[cfg(test)]
 pub(crate) use dirty_usage::{clear_dirty_usage_buckets_for_tests, dirty_usage_buckets_for_tests};
