@@ -91,4 +91,16 @@ tests, and leaves the required raw G09 artifacts under
 inputs for the Scanner/Heal release bundle gate; the runner does not mark the
 full release matrix complete by itself.
 
+The distributed Scanner/Heal EC8+4 restart case is registered as
+`ec84-target-drive-restart` and selected by this profile:
+
+```bash
+scripts/run_scanner_heal_evidence_case.sh --case ec84-target-drive-restart
+```
+
+That command records the current build, runs exactly the registered
+`distributed::heal_test` case, validates the JUnit/listing/oracle receipt, and
+keeps the wider release gate blocked until the remaining release evidence lanes
+have measured artifacts.
+
 Membership is pinned by `.config/e2e-distributed-selection.txt`. Update the Linux and Darwin entries with `python3 ./scripts/check_test_wiring.py --update-profile e2e-distributed <listing.json> <platform>` after adding or renaming a case.

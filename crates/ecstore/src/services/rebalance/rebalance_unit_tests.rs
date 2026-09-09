@@ -1908,6 +1908,124 @@ fn test_is_transient_rebalance_error_accepts_wrapped_disk_timeout() {
 }
 
 #[test]
+fn test_rebalance_stage_wrapped_transient_errors_remain_retryable() {
+    let cases = [
+        Error::Lock(rustfs_lock::LockError::timeout(".rustfs.sys/pool.bin@latest", Duration::from_secs(5))),
+        Error::Lock(rustfs_lock::LockError::network(
+            "peer unavailable",
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        )),
+        Error::SlowDown,
+        Error::ErasureReadQuorum,
+        Error::ErasureWriteQuorum,
+        Error::Io(std::io::Error::other(DiskError::Timeout)),
+        Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+    ];
+    for mut error in cases {
+        for depth in 0..=3 {
+            assert!(is_transient_rebalance_error(&error), "transient source lost at depth {depth}: {error:?}");
+            assert!(
+                should_defer_rebalance_entry_failure(&error),
+                "exhausted transient entries must be deferred"
+            );
+            assert!(should_retry_rebalance_listing(&error, 0, 3));
+            assert!(
+                !should_retry_rebalance_listing(&error, 2, 3),
+                "wrapping must not bypass the attempt limit"
+            );
+            error = data_movement::data_movement_stage_error_for_test(
+                "rebalance_object",
+                "put_object",
+                "bucket",
+                "baseline/00042.bin",
+                error,
+            );
+        }
+    }
+}
+
+#[test]
+fn test_rebalance_stage_wrapped_terminal_errors_remain_terminal() {
+    let cases = [
+        Error::FileAccessDenied,
+        Error::FileCorrupt,
+        Error::OperationCanceled,
+        Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string()),
+        Error::Lock(rustfs_lock::LockError::already_locked("bucket/object", "owner")),
+        Error::other("permission denied"),
+    ];
+    for mut error in cases {
+        for depth in 0..=3 {
+            assert!(
+                !is_transient_rebalance_error(&error),
+                "terminal source must survive depth {depth}: {error:?}"
+            );
+            assert!(!should_defer_rebalance_entry_failure(&error));
+            // Object names are untrusted context, not evidence of a transient failure.
+            error = data_movement::data_movement_stage_error_for_test(
+                "rebalance_object",
+                "put_object",
+                "bucket",
+                "remote lock rpc timed out",
+                error,
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_rebalance_stage_wrapped_lock_timeout_retries_real_migration_loop() {
+    for succeeds_on_retry in [true, false] {
+        let backend = MigrationBackendSpy::new(None, None);
+        let attempts = AtomicUsize::new(0);
+        let waits = AtomicUsize::new(0);
+        let mut transfer = |_, _, _| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if succeeds_on_retry && attempt > 0 {
+                    return Ok(());
+                }
+                Err(data_movement::data_movement_stage_error_for_test(
+                    "rebalance_object",
+                    "put_object",
+                    "bucket",
+                    "baseline/00042.bin",
+                    Error::Lock(rustfs_lock::LockError::timeout(".rustfs.sys/pool.bin@latest", Duration::from_secs(5))),
+                ))
+            }
+        };
+        let version = version_normal();
+        let result = migrate_entry_version_with_retry_wait(
+            &backend,
+            "bucket".to_string(),
+            0,
+            &version,
+            None,
+            3,
+            false,
+            &mut transfer,
+            |_: String, _: String, _: ObjectOptions| async { Ok::<_, Error>(ObjectInfo::default()) },
+            |_| {
+                waits.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(())
+            },
+        )
+        .await;
+        assert_eq!(result.moved, succeeds_on_retry);
+        assert_eq!(result.failed, !succeeds_on_retry);
+        assert_eq!(attempts.load(Ordering::SeqCst), if succeeds_on_retry { 2 } else { 3 });
+        assert_eq!(backend.get_calls(), attempts.load(Ordering::SeqCst));
+        assert_eq!(waits.load(Ordering::SeqCst), attempts.load(Ordering::SeqCst) - 1);
+        if !succeeds_on_retry {
+            assert_eq!(result.stage, Some("write_target"));
+            assert!(should_defer_rebalance_entry_failure(
+                result.error.as_ref().expect("exhaustion must retain its source error")
+            ));
+        }
+    }
+}
+
+#[test]
 fn test_is_transient_rebalance_error_accepts_io_timeout_message() {
     assert!(is_transient_rebalance_error(&Error::Io(std::io::Error::other("timeout"))));
 }

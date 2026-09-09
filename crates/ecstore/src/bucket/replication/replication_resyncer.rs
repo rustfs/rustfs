@@ -3843,6 +3843,13 @@ async fn persist_replication_state_if_current<S: ReplicationStorage>(
     match storage.put_object_metadata(&roi.bucket, &roi.name, &write_opts).await {
         Ok(updated) => {
             *object_info = updated;
+            if mode == ReplicationStatusWritebackMode::Update {
+                runtime_sources::notify_scanner_dirty_usage_mutation(
+                    &roi.bucket,
+                    &roi.name,
+                    runtime_sources::ScannerDirtyUsageMutationSource::Replication,
+                );
+            }
             Ok(ReplicationStatePersistOutcome::Updated)
         }
         Err(Error::PreconditionFailed) => Ok(ReplicationStatePersistOutcome::Superseded),

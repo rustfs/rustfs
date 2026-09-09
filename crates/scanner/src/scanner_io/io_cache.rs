@@ -26,6 +26,21 @@ pub(super) struct ScannerSetCacheGeneration {
 pub(super) struct PreparedScopedSetScan {
     pub(super) buckets: Vec<BucketInfo>,
     pub(super) cache: DataUsageCache,
+    pub(super) cold_bucket_reuse_proof: Option<ScopedColdBucketReuseProof>,
+}
+
+pub(super) struct ScopedColdBucketReuseProof {
+    pub(super) baseline_scan_plan_digest: DataUsageScanPlanDigest,
+    pub(super) source: DataUsageCacheSource,
+    pub(super) bucket_incarnations: HashMap<String, uuid::Uuid>,
+}
+
+impl ScopedColdBucketReuseProof {
+    fn authorizes(&self, source: DataUsageCacheSource, baseline_scan_plan_digest: DataUsageScanPlanDigest) -> bool {
+        self.source == source
+            && self.baseline_scan_plan_digest == baseline_scan_plan_digest
+            && !self.bucket_incarnations.is_empty()
+    }
 }
 
 pub(super) fn prepare_scoped_set_scan(
@@ -51,10 +66,16 @@ pub(super) fn prepare_scoped_set_scan(
         || old_cache.info.scan_plan_digest != Some(baseline_scan_plan_digest)
         || old_cache.info.cache_key_format != DATA_USAGE_CACHE_KEY_FORMAT
         || !old_cache.has_complete_root_inventory(&old_cache.find(DATA_USAGE_ROOT)?.children)
-        || !unselected_bucket_incarnations_match(old_cache, all_buckets, selected_buckets, current_bucket_incarnations)
     {
         return None;
     }
+    let unselected_bucket_incarnations =
+        unselected_bucket_incarnation_bindings(old_cache, all_buckets, selected_buckets, current_bucket_incarnations)?;
+    let cold_bucket_reuse_proof = (!unselected_bucket_incarnations.is_empty()).then_some(ScopedColdBucketReuseProof {
+        baseline_scan_plan_digest,
+        source: generation.source,
+        bucket_incarnations: unselected_bucket_incarnations,
+    });
 
     let mut cache = DataUsageCache {
         info: DataUsageCacheInfo {
@@ -100,35 +121,41 @@ pub(super) fn prepare_scoped_set_scan(
             .cloned()
             .collect(),
         cache,
+        cold_bucket_reuse_proof,
     })
 }
 
-fn unselected_bucket_incarnations_match(
+fn unselected_bucket_incarnation_bindings(
     old_cache: &DataUsageCache,
     all_buckets: &[BucketInfo],
     selected_buckets: &HashSet<String>,
     current_bucket_incarnations: Option<&HashMap<String, uuid::Uuid>>,
-) -> bool {
-    let Some(current_bucket_incarnations) = current_bucket_incarnations else {
-        return all_buckets.iter().all(|bucket| selected_buckets.contains(&bucket.name));
-    };
-    all_buckets
+) -> Option<HashMap<String, uuid::Uuid>> {
+    let mut unselected_buckets = all_buckets
         .iter()
         .filter(|bucket| !selected_buckets.contains(&bucket.name))
-        .all(|bucket| {
-            let Some(current) = current_bucket_incarnations
-                .get(&bucket.name)
-                .filter(|incarnation| !incarnation.is_nil())
-            else {
-                return false;
-            };
-            old_cache
+        .peekable();
+    let Some(current_bucket_incarnations) = current_bucket_incarnations else {
+        return unselected_buckets.peek().is_none().then(HashMap::new);
+    };
+    let mut bound_incarnations = HashMap::new();
+    for bucket in unselected_buckets {
+        let current = current_bucket_incarnations
+            .get(&bucket.name)
+            .filter(|incarnation| !incarnation.is_nil())?;
+        if old_cache.find(&bucket.name).is_none()
+            || old_cache
                 .info
                 .scan_bucket_incarnations
                 .get(&bucket.name)
                 .filter(|cached| !cached.is_nil())
-                == Some(current)
-        })
+                != Some(current)
+        {
+            return None;
+        }
+        bound_incarnations.insert(bucket.name.clone(), *current);
+    }
+    Some(bound_incarnations)
 }
 
 async fn scanner_current_bucket_incarnations(set: &SetDisks, all_buckets: &[BucketInfo]) -> Option<HashMap<String, uuid::Uuid>> {
@@ -222,7 +249,13 @@ impl ScannerIOCache for SetDisks {
             current_bucket_incarnations.as_ref(),
         );
         let cold_zero_walk_reuse_candidate = scoped_scan.as_ref().is_some_and(|prepared| {
-            old_cache.info.next_cycle < want_cycle && !prepared.buckets.is_empty() && prepared.buckets.len() < all_buckets.len()
+            old_cache.info.next_cycle < want_cycle
+                && scope.baseline_scan_plan_digest.is_some_and(|baseline_scan_plan_digest| {
+                    prepared
+                        .cold_bucket_reuse_proof
+                        .as_ref()
+                        .is_some_and(|proof| proof.authorizes(source, baseline_scan_plan_digest))
+                })
         });
         let mut scoped_cache = scoped_scan.map(|mut prepared| {
             buckets = prepared.buckets;
@@ -268,6 +301,9 @@ impl ScannerIOCache for SetDisks {
             cache.info.lkg_last_update = None;
             cache.info.lkg_leader_epoch = None;
             cache.info.lkg_scan_plan_digest = None;
+            if cold_zero_walk_reuse_candidate {
+                cold_zero_walk_reuse_observed.store(true, Ordering::Release);
+            }
             if cache.find(DATA_USAGE_ROOT).is_none() {
                 cache.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
             }

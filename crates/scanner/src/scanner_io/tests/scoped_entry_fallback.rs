@@ -226,9 +226,40 @@ fn record_segment_dirty_usage(bucket: &str) {
     }
 }
 
-#[tokio::test]
+// The scoped fallback fixture keeps two EC pools and several scan futures live
+// at once. Run the async cases on a dedicated stack so Linux libtest defaults
+// exercise the assertions instead of aborting before the oracle finishes.
+fn run_scoped_entry_fallback_test<F, Fut>(thread_name: &'static str, test_fn: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("scoped entry fallback runtime should build");
+            runtime.block_on(test_fn());
+        })
+        .expect("scoped entry fallback test thread should spawn");
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[test]
 #[serial]
-async fn scoped_entry_fallback_distinguishes_planned_scope_from_real_cold_walks() {
+fn scoped_entry_fallback_distinguishes_planned_scope_from_real_cold_walks() {
+    run_scoped_entry_fallback_test(
+        "scanner-scoped-entry-planned-scope",
+        scoped_entry_fallback_distinguishes_planned_scope_from_real_cold_walks_case,
+    );
+}
+
+async fn scoped_entry_fallback_distinguishes_planned_scope_from_real_cold_walks_case() {
     let (_dir, store) = setup_two_pool_scanner_store().await;
     clear_dirty_usage_buckets_for_tests();
     let hot = format!("hot-{}", Uuid::new_v4().simple());
@@ -244,16 +275,55 @@ async fn scoped_entry_fallback_distinguishes_planned_scope_from_real_cold_walks(
     run_entry(&store, 1, Some(&hot), false, false, false).await;
     let usage = run_entry(&store, 2, Some(&hot), true, true, false).await;
     persist_baseline(&store, &usage).await;
+    acknowledge_dirty_usage_generation(scanner_activity_epoch(), dirty_usage_generation())
+        .expect("durable whole-cycle publication should acknowledge the initial producer window");
+    put_and_settle(&store, &hot, "hot-segment/object").await;
+    record_dirty_usage_object_from_producer(
+        &hot,
+        "hot-segment/object",
+        crate::segment_invalidation::SegmentInvalidationProducerIdentity::PutObject,
+    );
     let usage = run_entry(&store, 3, Some(&hot), true, true, true).await;
-    assert_eq!(usage.buckets_usage[&hot].objects_count, 1);
+    assert_eq!(usage.buckets_usage[&hot].objects_count, 2);
     assert_eq!(usage.buckets_usage[&cold].objects_count, 1);
-    assert_eq!(usage.objects_total_count, 2);
+    assert_eq!(usage.objects_total_count, 3);
+
+    persist_baseline(&store, &usage).await;
+    acknowledge_dirty_usage_generation(scanner_activity_epoch(), dirty_usage_generation())
+        .expect("durable prefix publication should acknowledge the typed suffix");
+    for index in 0..=MAX_DIRTY_USAGE_TOP_LEVEL_ENTRIES_PER_BUCKET {
+        record_dirty_usage_object_from_producer(
+            &hot,
+            &format!("overflow-{index}/object"),
+            crate::segment_invalidation::SegmentInvalidationProducerIdentity::PutObject,
+        );
+    }
+    let usage = run_entry(&store, 4, Some(&hot), true, true, false).await;
+    assert_eq!(usage.objects_total_count, 3);
+
+    persist_baseline(&store, &usage).await;
+    acknowledge_dirty_usage_generation(scanner_activity_epoch(), dirty_usage_generation())
+        .expect("durable whole-bucket fallback should acknowledge the overflow window");
+    record_dirty_usage_object_from_producer(
+        &hot,
+        "hot-segment/object",
+        crate::segment_invalidation::SegmentInvalidationProducerIdentity::Unknown,
+    );
+    let usage = run_entry(&store, 5, Some(&hot), true, false, false).await;
+    assert_eq!(usage.objects_total_count, 3);
     clear_dirty_usage_buckets_for_tests();
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn scoped_entry_fallback_rejects_invalid_persisted_baseline_at_the_walker() {
+fn scoped_entry_fallback_rejects_invalid_persisted_baseline_at_the_walker() {
+    run_scoped_entry_fallback_test(
+        "scanner-scoped-entry-invalid-baseline",
+        scoped_entry_fallback_rejects_invalid_persisted_baseline_at_the_walker_case,
+    );
+}
+
+async fn scoped_entry_fallback_rejects_invalid_persisted_baseline_at_the_walker_case() {
     let (_dir, store) = setup_two_pool_scanner_store().await;
     clear_dirty_usage_buckets_for_tests();
     let hot = format!("hot-{}", Uuid::new_v4().simple());
@@ -310,9 +380,16 @@ async fn scoped_entry_fallback_rejects_invalid_persisted_baseline_at_the_walker(
     clear_dirty_usage_buckets_for_tests();
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn scoped_entry_fallback_covers_overflow_and_new_bucket_inventory() {
+fn scoped_entry_fallback_covers_overflow_and_new_bucket_inventory() {
+    run_scoped_entry_fallback_test(
+        "scanner-scoped-entry-overflow-inventory",
+        scoped_entry_fallback_covers_overflow_and_new_bucket_inventory_case,
+    );
+}
+
+async fn scoped_entry_fallback_covers_overflow_and_new_bucket_inventory_case() {
     let (_dir, store) = setup_two_pool_scanner_store().await;
     clear_dirty_usage_buckets_for_tests();
     let hot = format!("hot-{}", Uuid::new_v4().simple());

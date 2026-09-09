@@ -50,6 +50,11 @@ fn ensure_rebalance_entry_active(cancel: &CancellationToken) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static REBALANCE_ENTRY_RUN_FENCE_BARRIER: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+}
+
 #[derive(Debug)]
 struct RebalanceEntryTarget {
     bucket: String,
@@ -256,9 +261,15 @@ impl ECStore {
             .sort_by_key(|v| (v.mod_time.is_none(), std::cmp::Reverse(v.mod_time)));
 
         // Entry lock order is bucket incarnation -> activation_gate -> rebalance.bin -> movement gate.
+        // Target capacity admission can then acquire pool.bin under the run fence.
         // Stop waits for in-flight entries through cleanup, but not for entries admitted later.
         ensure_rebalance_entry_active(&cancel)?;
         let run_guard = self.rebalance_run_guard(rebalance_id.as_ref(), "rebalance entry").await?;
+        #[cfg(test)]
+        if let Ok((arrived, release)) = REBALANCE_ENTRY_RUN_FENCE_BARRIER.try_with(Clone::clone) {
+            arrived.notify_one();
+            release.notified().await;
+        }
         let lock_lost_signal = run_guard.lock_lost_signal();
         #[cfg(test)]
         let _run_signal_test_fence = lock_lost_signal
@@ -1235,6 +1246,130 @@ mod tests {
         let pool_stats = &meta.as_ref().expect("rebalance metadata should exist").pool_stats[0];
         assert_eq!(pool_stats.bytes, 0, "deferred cleanup must not commit completion stats");
         assert_eq!(pool_stats.cleanup_warnings.count, 1, "deferred cleanup must not add a permanent warning");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_entry_progresses_while_peer_activation_waits_for_run_fence() {
+        const REBALANCE_ID: &str = "rebalance-peer-activation-lock-order";
+        let (_temp_dirs, store, peer) = crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(Some(
+            active_rebalance_meta(REBALANCE_ID),
+        ))
+        .await;
+        assert!(!Arc::ptr_eq(&store.ctx, &peer.ctx), "node-local movement gates must be independent");
+        {
+            let mut meta = peer.rebalance_meta.write().await;
+            let meta = meta.as_mut().expect("peer should know the durable run");
+            meta.activation_gate = Arc::default();
+            meta.cancel = None;
+        }
+        let bucket = crate::disk::RUSTFS_META_BUCKET;
+        let object = "rebalance-peer-activation-object";
+        let version_id = uuid::Uuid::new_v4();
+        let payload = b"entry must drain before peer activation takes the pool fence".repeat(1024);
+        let source_set = store.pools[0].get_disks_by_key(object);
+        let target_set = store.pools[1].get_disks_by_key(object);
+        let opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(version_id.to_string()),
+            ..Default::default()
+        };
+        let mut writer = PutObjReader::from_vec(payload.clone());
+        let source_before = source_set
+            .put_object(bucket, object, &mut writer, &opts)
+            .await
+            .expect("source version should be written");
+        let entry = metacache_entry_from_source(&source_set, bucket, object).await;
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        // JoinSet aborts both scoped tasks if an assertion or timeout fails.
+        let mut tasks = tokio::task::JoinSet::new();
+        let entry_store = Arc::clone(&store);
+        tasks.spawn(
+            REBALANCE_ENTRY_RUN_FENCE_BARRIER.scope((Arc::clone(&arrived), Arc::clone(&release)), async move {
+                entry_store
+                    .rebalance_entry(
+                        RebalanceEntryTarget {
+                            bucket: bucket.to_string(),
+                            pool_index: 0,
+                        },
+                        entry,
+                        source_set,
+                        Arc::new(RebalanceBucketConfigs::default()),
+                        Arc::from(REBALANCE_ID),
+                        CancellationToken::new(),
+                    )
+                    .await
+            }),
+        );
+        tokio::time::timeout(StdDuration::from_secs(30), arrived.notified())
+            .await
+            .expect("real entry must acquire its persisted run read fence");
+
+        let attempted = Arc::new(tokio::sync::Notify::new());
+        let peer_pool = Arc::clone(&peer.pools[0]);
+        let (activation_done, activation_result) = tokio::sync::oneshot::channel();
+        tasks.spawn(
+            crate::core::pools::REBALANCE_ACTIVATION_LOCK_ATTEMPT.scope(Arc::clone(&attempted), async move {
+                let result = peer.fence_rebalance_worker_activation(peer_pool, REBALANCE_ID).await;
+                let result = result.map(|fence| match fence {
+                    super::super::control::RebalanceWorkerActivationFence::Ready(fence) => {
+                        fence.ensure_held().expect("peer activation must retain both fences");
+                    }
+                    super::super::control::RebalanceWorkerActivationFence::NotStartedTerminal => {
+                        panic!("the paused entry's run must still require activation");
+                    }
+                });
+                activation_done.send(result).expect("activation receiver should remain alive");
+                Ok(RebalanceEntryOutcome::Completed)
+            }),
+        );
+        tokio::time::timeout(StdDuration::from_secs(30), attempted.notified())
+            .await
+            .expect("peer activation must attempt the persisted rebalance write fence");
+        release.notify_one();
+
+        tokio::time::timeout(StdDuration::from_secs(30), async {
+            while let Some(result) = tasks.join_next().await {
+                assert!(matches!(
+                    result
+                        .expect("scoped task must not panic")
+                        .expect("entry must not fail or defer"),
+                    RebalanceEntryOutcome::Completed
+                ));
+            }
+        })
+        .await
+        .expect("entry and peer activation must both make progress");
+        activation_result
+            .await
+            .expect("peer activation result should be sent")
+            .expect("peer activation must not time out behind the entry it blocks");
+
+        let mut reader = target_set
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("the exact target version must be readable");
+        let mut actual = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut actual)
+            .await
+            .expect("target body should drain completely");
+        assert_eq!(actual, payload);
+        assert_eq!(reader.object_info.version_id, source_before.version_id);
+        assert_eq!(reader.object_info.etag, source_before.etag);
+        assert_eq!(reader.object_info.mod_time, source_before.mod_time);
+        let source_error = store.pools[0]
+            .get_object_info(bucket, object, &opts)
+            .await
+            .expect_err("completed entry must clean up the source version");
+        assert!(crate::error::is_err_object_not_found(&source_error) || crate::error::is_err_version_not_found(&source_error));
+        let meta = store.rebalance_meta.read().await;
+        let stats = &meta.as_ref().expect("local run must remain installed").pool_stats[0];
+        assert_eq!(stats.num_objects, 1);
+        assert_eq!(stats.num_versions, 1);
+        assert_eq!(stats.cleanup_warnings.count, 0);
     }
 
     #[tokio::test]

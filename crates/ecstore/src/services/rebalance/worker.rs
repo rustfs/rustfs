@@ -244,6 +244,7 @@ pub(super) fn resolve_rebalance_bucket_result(
 }
 
 pub(super) fn is_transient_rebalance_error(err: &Error) -> bool {
+    let err = rebalance_error_source(err);
     match err {
         Error::SlowDown
         | Error::ErasureReadQuorum
@@ -254,6 +255,15 @@ pub(super) fn is_transient_rebalance_error(err: &Error) -> bool {
         Error::Io(io_err) => is_rebalance_transient_io_error(io_err) || is_rebalance_transient_message(&io_err.to_string()),
         _ => is_rebalance_transient_message(&err.to_string()) || is_network_or_host_down(&err.to_string(), true),
     }
+}
+
+fn rebalance_error_source(mut err: &Error) -> &Error {
+    // Stage context contains object names, so classify the preserved source,
+    // not timeout-like text supplied by an object name. Iterate nested stages.
+    while let Some(source) = crate::data_movement::data_movement_stage_source(err) {
+        err = source;
+    }
+    err
 }
 
 fn is_rebalance_transient_lock_error(err: &rustfs_lock::LockError) -> bool {
@@ -309,6 +319,7 @@ pub(super) fn rebalance_listing_retry_delay(attempt: usize) -> Duration {
 }
 
 fn is_rebalance_lock_or_rpc_timeout(err: &Error) -> bool {
+    let err = rebalance_error_source(err);
     match err {
         Error::Lock(rustfs_lock::LockError::Timeout { .. }) | Error::Lock(rustfs_lock::LockError::Network { .. }) => true,
         Error::Io(io_err) => is_rebalance_lock_or_rpc_timeout_message(&io_err.to_string()),
@@ -583,5 +594,50 @@ impl SetDisks {
             "Rebalance listing completed"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod error_source_tests {
+    use super::*;
+
+    #[test]
+    fn stage_wrapped_errors_select_the_source_backoff_policy() {
+        let cases = [
+            (
+                Error::Lock(rustfs_lock::LockError::timeout(".rustfs.sys/pool.bin@latest", Duration::from_secs(5))),
+                true,
+            ),
+            (
+                Error::Lock(rustfs_lock::LockError::network(
+                    "peer unavailable",
+                    std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+                )),
+                true,
+            ),
+            (Error::other("remote lock rpc timed out"), true),
+            (Error::SlowDown, false),
+            (Error::Io(std::io::Error::other(DiskError::Timeout)), false),
+            (Error::FileAccessDenied, false),
+        ];
+        for (mut error, lock_backoff) in cases {
+            for depth in 0..=3 {
+                assert_eq!(
+                    is_rebalance_lock_or_rpc_timeout(&error),
+                    lock_backoff,
+                    "wrong backoff at depth {depth}: {error:?}"
+                );
+                if !lock_backoff {
+                    assert_eq!(rebalance_migration_retry_delay(1, &error), REBALANCE_MIGRATION_RETRY_BASE_DELAY * 2);
+                }
+                error = crate::data_movement::data_movement_stage_error_for_test(
+                    "rebalance_object",
+                    "put_object",
+                    "bucket",
+                    "remote lock rpc timed out",
+                    error,
+                );
+            }
+        }
     }
 }
