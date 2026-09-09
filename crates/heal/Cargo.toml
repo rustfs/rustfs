@@ -104,6 +104,7 @@ walkdir = { workspace = true }
 http = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
+chrono = { workspace = true }
 
 [lib]
 doctest = false

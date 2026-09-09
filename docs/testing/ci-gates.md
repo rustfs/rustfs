@@ -294,6 +294,21 @@ tests, and runs the distributed hard-quota admission E2E. A full run writes
 a failure; a single gate descriptor still does not approve the complete release
 bundle.
 
+The W13 durable MRF replay lanes can emit raw G07/G08/P4 JSON artifacts with:
+
+```bash
+scripts/run_scanner_heal_w13_mrf_evidence.sh
+```
+
+The runner builds the current checkout, runs the ignored MRF evidence test, and
+writes `release-bundle-w13.json` for `--check-scanner-heal-release-bundle-gate`.
+Use `--test g07|g08|p4` while narrowing a failure. G08 disk-full evidence must
+run against a real fillable filesystem: on Linux as root the runner mounts a
+small tmpfs automatically, otherwise pass `--enospc-root` pointing at a
+pre-mounted small filesystem. P4 is release evidence only when it completes the
+default two-hour soak; `--allow-short-soak` is diagnostic and skips P4 bundle
+gate validation.
+
 When the real release lanes have produced their dedicated artifacts, validate
 the complete hard-gate bundle with:
 
