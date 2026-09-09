@@ -362,7 +362,12 @@ mod canonical_outcome {
         assert_eq!((progress.objects_scanned, progress.objects_healed, progress.objects_failed), (2, 1, 1));
         let (legacy_summary, legacy_detail) = outcome.legacy_status("finished", None);
         assert_eq!(legacy_summary, "stopped");
-        assert_eq!(legacy_detail.as_deref(), Some("heal traversal completed with errors: 1 failed objects"));
+        assert_eq!(
+            legacy_detail.as_deref(),
+            Some(
+                "heal traversal completed with errors: 1 failed objects; first failed object bucket-a/object-a (retry_exhausted): Storage error: Lock error: Lock acquisition timeout for resource 'object-a' after 5s"
+            )
+        );
         assert_eq!(
             storage.heal_object_calls.lock().expect("object calls").as_slice(),
             ["object-a", "object-b", "object-a", "object-a", "object-a"]
