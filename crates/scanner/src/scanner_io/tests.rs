@@ -89,7 +89,7 @@ fn scanner_activity_preflight_defers_a_temporarily_offline_peer() {
 fn scanner_segment_reuse_activation_preflight_reports_release_gate_inputs() {
     let preflight = scanner_segment_reuse_activation_preflight();
 
-    assert!(!preflight.production_activation);
+    assert!(preflight.production_activation);
     assert!(!preflight.scanner_segment_reuse_activated);
     assert!(!scanner_segment_reuse_activated());
     assert_eq!(preflight.proof_inputs, SCANNER_SEGMENT_ACTIVATION_PROOF_INPUTS);
@@ -179,7 +179,7 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_reports_cycle_inputs_wit
         true,
     );
 
-    assert!(!preflight.production_activation);
+    assert!(preflight.production_activation);
     assert!(!preflight.scanner_segment_reuse_activated);
     assert_eq!(
         preflight.fail_closed_blockers().collect::<Vec<_>>(),
@@ -204,7 +204,7 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_blocks_unbounded_inputs(
         false,
     );
 
-    assert!(!preflight.production_activation);
+    assert!(preflight.production_activation);
     assert!(!preflight.scanner_segment_reuse_activated);
     assert_eq!(
         preflight.fail_closed_blockers().collect::<Vec<_>>(),
@@ -229,7 +229,7 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_skips_distributed_blocke
         true,
     );
 
-    assert!(!preflight.production_activation);
+    assert!(preflight.production_activation);
     assert!(!preflight.scanner_segment_reuse_activated);
     assert_eq!(
         preflight.fail_closed_blockers().collect::<Vec<_>>(),
@@ -277,6 +277,98 @@ fn scanner_durable_segment_invalidation_evidence_requires_matching_complete_set_
     assert!(!changed_evidence.producer_identity_coverage_complete);
     assert!(!changed_evidence.durable_producer_identity);
     assert!(!changed_evidence.restart_gap_absent);
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[test]
+#[serial]
+fn scanner_segment_reuse_activation_replays_cold_durable_baseline() {
+    use crate::segment_invalidation::SegmentInvalidationProducerIdentity;
+
+    clear_dirty_usage_buckets_for_tests();
+    for producer in SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION {
+        record_dirty_usage_object_from_producer("photos", "2026/object", producer);
+    }
+    let dirty_usage_snapshot =
+        snapshot_dirty_usage_buckets(&[bucket_info("photos"), bucket_info("archive")], dirty_usage_generation());
+    let mut segment_proof = dirty_usage_producer_evidence(&dirty_usage_snapshot)
+        .segment_invalidation_proof()
+        .expect("complete process-local producer coverage should produce proof metadata");
+    segment_proof.cold_zero_walk_oracle = true;
+    let scan_plan_digest = DataUsageScanPlanDigest([6; 32]);
+    let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0), DataUsageCacheSource::new(0, 1)]);
+    let baseline = DataUsageInfo {
+        last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+        scanner_cycle: Some(7),
+        scanner_epoch: Some(11),
+        buckets_count: 2,
+        buckets_usage: HashMap::from([
+            ("photos".to_string(), Default::default()),
+            ("archive".to_string(), Default::default()),
+        ]),
+        usage_snapshot_complete: true,
+        usage_snapshot_converged: Some(true),
+        usage_snapshot_set_states: expected_sources
+            .iter()
+            .map(|source| DataUsageSnapshotSetState {
+                pool_index: u64::try_from(source.pool_index).expect("test pool index should fit"),
+                set_index: u64::try_from(source.set_index).expect("test set index should fit"),
+                scanner_cycle: Some(7),
+                scanner_epoch: Some(11),
+                scan_plan_digest: Some(scan_plan_digest.0),
+                complete: true,
+                tombstone: false,
+                segment_invalidation_proof: Some(segment_proof.clone()),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let baseline = Bytes::from(serde_json::to_vec(&baseline).expect("baseline should encode"));
+
+    let preflight = scanner_segment_reuse_activation_preflight_for_baseline(
+        &dirty_usage_snapshot,
+        false,
+        ScannerCacheBaselineProof {
+            authoritative_data: Some(&baseline),
+            observed_candidate_data: None,
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest,
+        },
+    );
+
+    assert!(preflight.production_activation);
+    assert!(preflight.scanner_segment_reuse_activated);
+    assert_eq!(preflight.fail_closed_blockers().collect::<Vec<_>>(), Vec::<&str>::new());
+
+    let mut missing_cold_baseline =
+        serde_json::from_slice::<DataUsageInfo>(&baseline).expect("baseline should decode for negative case");
+    missing_cold_baseline.usage_snapshot_set_states[0]
+        .segment_invalidation_proof
+        .as_mut()
+        .expect("proof should exist")
+        .cold_zero_walk_oracle = false;
+    let missing_cold_baseline = Bytes::from(serde_json::to_vec(&missing_cold_baseline).expect("negative baseline should encode"));
+    let preflight = scanner_segment_reuse_activation_preflight_for_baseline(
+        &dirty_usage_snapshot,
+        false,
+        ScannerCacheBaselineProof {
+            authoritative_data: Some(&missing_cold_baseline),
+            observed_candidate_data: None,
+            expected_sources: &expected_sources,
+            leader_epoch: 11,
+            want_cycle: 8,
+            scan_plan_digest,
+        },
+    );
+
+    assert!(preflight.production_activation);
+    assert!(!preflight.scanner_segment_reuse_activated);
+    assert_eq!(
+        preflight.fail_closed_blockers().collect::<Vec<_>>(),
+        vec!["missing_producer_identity", "restart_gap", "missing_cold_zero_walk_oracle"]
+    );
     clear_dirty_usage_buckets_for_tests();
 }
 
@@ -1627,6 +1719,7 @@ async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers
         generation_start: 8,
         generation_end: 8,
         producer_identity_coverage_complete: true,
+        cold_zero_walk_oracle: false,
     };
     set.nsscanner_cache(
         ctx.clone(),

@@ -184,6 +184,7 @@ fn completed_data_usage_info_carries_segment_invalidation_proof_to_set_state() {
         generation_start: 5,
         generation_end: 8,
         producer_identity_coverage_complete: true,
+        cold_zero_walk_oracle: true,
     };
     let mut set = completed_root_cache("bucket", 2, 10, source);
     set.info.segment_invalidation_proof = Some(proof.clone());

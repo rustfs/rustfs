@@ -85,6 +85,7 @@ impl DirtyUsageProducerEvidence {
                 generation_start: self.generation_start,
                 generation_end: self.generation_end,
                 producer_identity_coverage_complete: true,
+                cold_zero_walk_oracle: false,
             }
         })
     }
