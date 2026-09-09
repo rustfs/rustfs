@@ -80,8 +80,11 @@ runtime_profile_for() {
         background-target-crash|background-target-restart)
             echo "background-4x1"
             ;;
-        background-target-crash-ec8-4|background-target-restart-ec8-4)
+        background-target-crash-ec8-4|background-target-restart-ec8-4|background-target-restart-ec8-4-multi-set)
             echo "background-ec8-4"
+            ;;
+        background-target-crash-ec8-4-multi-pool)
+            echo "background-ec8-4-multi-pool"
             ;;
         ec84-target-drive-restart)
             echo "distributed-ec8-4"
@@ -104,6 +107,11 @@ apply_runtime_profile() {
             export RUSTFS_HEAL_CHAOS_OBJECT_COUNT="${RUSTFS_HEAL_CHAOS_OBJECT_COUNT:-32}"
             export RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES="${RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES:-8388608}"
             export RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS="${RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS:-180}"
+            ;;
+        background-ec8-4-multi-pool)
+            export RUSTFS_HEAL_CHAOS_OBJECT_COUNT="${RUSTFS_HEAL_CHAOS_OBJECT_COUNT:-16}"
+            export RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES="${RUSTFS_HEAL_CHAOS_OBJECT_SIZE_BYTES:-4194304}"
+            export RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS="${RUSTFS_HEAL_CHAOS_PARTIAL_TIMEOUT_SECS:-240}"
             ;;
     esac
 }
