@@ -572,7 +572,7 @@ impl ECStore {
     where
         S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
     {
-        // Lock order: pool_meta_save_gate -> pool.bin -> rebalance.bin.
+        // Lock order: pool_meta_save_gate -> rebalance.bin -> pool.bin.
         let mut pool_meta_guard = self.pool_meta_save_gate.lock().await;
         pool_meta_guard.ensure_write_safe("rebalance worker activation")?;
         // Classify the durable rebalance record while holding both namespace
