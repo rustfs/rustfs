@@ -95,7 +95,6 @@ fn preflight_startup_rpc_secret_with(
     }
 }
 
-const LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY: Duration = Duration::from_secs(60 * 3);
 const LOCAL_DECOMMISSION_RESUME_RETRY_DELAY: Duration = Duration::from_secs(30);
 const LOCAL_DECOMMISSION_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 const LOCAL_DECOMMISSION_WATCHDOG_MAX_RETRY_DELAY: Duration = Duration::from_secs(60 * 5);
@@ -280,20 +279,26 @@ where
     }
 }
 
+async fn reconcile_local_decommission_after_init(store: &Arc<ECStore>, rx: CancellationToken) -> Result<()> {
+    store
+        .ensure_pool_meta_side_effects_safe("decommission worker recovery blocked while pool metadata requires recovery")
+        .await?;
+    if store.has_active_local_decommission_worker().await {
+        return Ok(());
+    }
+    store.refresh_pool_status_meta().await?;
+    let resume_required = pool_meta_has_active_decommission(&*store.pool_meta.read().await);
+    if resume_required {
+        crate::core::pools::acquire_pool_activation_fleet_proof(&store.ctx).await?;
+    }
+    store.spawn_missing_local_decommission_routines_with_token(rx).await
+}
+
 async fn supervise_local_decommission_after_init(store: Arc<ECStore>, rx: CancellationToken) {
     run_local_decommission_watchdog(rx.clone(), || {
         let store = store.clone();
         let worker_rx = rx.clone();
-        async move {
-            store
-                .ensure_pool_meta_side_effects_safe("decommission worker recovery blocked while pool metadata requires recovery")
-                .await?;
-            if store.has_active_local_decommission_worker().await {
-                return Ok(());
-            }
-            store.refresh_pool_status_meta().await?;
-            store.spawn_missing_local_decommission_routines_with_token(worker_rx).await
-        }
+        async move { reconcile_local_decommission_after_init(&store, worker_rx).await }
     })
     .await;
 }
@@ -784,14 +789,9 @@ impl ECStore {
             );
         }
         if has_local_decommission_leadership {
-            let store = self.clone();
-            let decommission_rx = rx.clone();
-            tokio::spawn(async move {
-                if !wait_for_local_decommission_resume_delay(&decommission_rx, LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY).await {
-                    return;
-                }
-                supervise_local_decommission_after_init(store, decommission_rx).await;
-            });
+            // The watchdog checks recovery safety and retries transient failures.
+            // Resume persisted work without an unconditional cold-start delay.
+            tokio::spawn(supervise_local_decommission_after_init(self.clone(), rx.clone()));
         }
 
         let recovery_store = self.clone();
@@ -2105,6 +2105,44 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn test_local_decommission_watchdog_cancelled_start_does_not_reconcile() {
+        let rx = CancellationToken::new();
+        rx.cancel();
+        run_local_decommission_watchdog(rx, || async {
+            panic!("cancelled startup must not schedule persisted work");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_local_decommission_recovery_waits_for_live_fleet_proof_before_reserving_worker() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        mark_test_pool_decommissioning(&store, 0).await;
+        assert!(store.ctx.is_dist_erasure().await);
+        let worker_rx = CancellationToken::new();
+
+        {
+            let _proof_guard = crate::services::notification_sys::without_cross_pool_fence_fleet_proof_for_test();
+            let err = super::reconcile_local_decommission_after_init(&store, worker_rx.clone())
+                .await
+                .expect_err("cold distributed recovery must wait for live fleet proof");
+            assert!(
+                crate::core::pools::is_pool_activation_fleet_proof_error(&err),
+                "recovery must reach the live fleet proof gate: {err:?}"
+            );
+            assert!(store.decommission_cancelers.read().await.iter().all(Option::is_none));
+            assert!(pool_meta_has_active_decommission(&*store.pool_meta.read().await));
+        }
+
+        super::reconcile_local_decommission_after_init(&store, worker_rx.clone())
+            .await
+            .expect("restored fleet proof should admit the persisted worker");
+        assert!(store.has_active_local_decommission_worker().await);
+        worker_rx.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn test_local_decommission_watchdog_retries_general_failures_until_cancelled() {
         let rx = CancellationToken::new();
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -2115,11 +2153,13 @@ mod tests {
                 let attempts = attempts.clone();
                 let rx = rx.clone();
                 async move {
-                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                        Err(StorageError::SlowDown)
-                    } else {
-                        rx.cancel();
-                        Ok(())
+                    match attempts.fetch_add(1, Ordering::SeqCst) {
+                        0 => Err(StorageError::other("pool activation requires a live fleet capability proof")),
+                        1 => Err(StorageError::SlowDown),
+                        _ => {
+                            rx.cancel();
+                            Ok(())
+                        }
                     }
                 }
             }
@@ -2128,8 +2168,11 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         tokio::time::advance(LOCAL_DECOMMISSION_RESUME_RETRY_DELAY).await;
-        task.await.expect("watchdog task should exit after cancellation");
+        tokio::task::yield_now().await;
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        tokio::time::advance(local_decommission_watchdog_retry_delay(2)).await;
+        task.await.expect("watchdog task should exit after cancellation");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test(start_paused = true)]

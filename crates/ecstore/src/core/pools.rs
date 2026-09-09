@@ -12721,6 +12721,9 @@ impl ECStore {
         self: &Arc<Self>,
         rx: CancellationToken,
     ) -> Result<()> {
+        #[cfg(test)]
+        let endpoints = self.instance_endpoints().unwrap_or_else(|| self.endpoints());
+        #[cfg(not(test))]
         let endpoints = self.endpoints();
         let index_cancelers = self.reserve_missing_local_decommission_routines(&rx, &endpoints).await?;
         if index_cancelers.is_empty() {
