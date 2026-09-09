@@ -3853,6 +3853,30 @@ fn pending_remote_peer_ids(peers: &BTreeMap<String, PeerInfo>, local_peer: &Peer
         .collect()
 }
 
+/// The peers a pending remove / rotation still has to notify: every remote
+/// peer that has not acked, with the local site excluded by the same
+/// deployment-id-or-endpoint identity [`pending_remote_peer_ids`] finalizes
+/// on. The tick-driven `local_peer` carries the node's own listen address
+/// rather than the registered site endpoint (and a handler's carries the
+/// request `Host`, which behind a load balancer differs too), so an
+/// endpoint-only check dialed the site itself, timed out against the
+/// lifecycle lock this very request holds, and reported the operation as
+/// `Partial` (backlog#2367 A-4).
+fn pending_peers_awaiting_notification<'a>(
+    peers: &'a BTreeMap<String, PeerInfo>,
+    local_peer: &PeerInfo,
+    acked_deployment_ids: &BTreeSet<String>,
+) -> Vec<&'a PeerInfo> {
+    peers
+        .values()
+        .filter(|peer| {
+            peer.deployment_id != local_peer.deployment_id
+                && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+                && !acked_deployment_ids.contains(&peer.deployment_id)
+        })
+        .collect()
+}
+
 fn pending_all_remote_peers_acked(
     peers: &BTreeMap<String, PeerInfo>,
     local_peer: &PeerInfo,
@@ -4068,12 +4092,7 @@ async fn drive_pending_rotation(pending: &PendingRotation, local_peer: &PeerInfo
     };
 
     let mut peer_errors = Vec::new();
-    for peer in pending.peers.values() {
-        if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
-            || pending.acked_deployment_ids.contains(&peer.deployment_id)
-        {
-            continue;
-        }
+    for peer in pending_peers_awaiting_notification(&pending.peers, local_peer, &pending.acked_deployment_ids) {
         // A superseded join returns BEFORE `apply_iam`, so a no-op answer
         // means the peer never installed the new secret. Acking it would
         // finalize a rotation half the mesh cannot authenticate against
@@ -4376,12 +4395,9 @@ async fn drive_pending_remove(pending_remove: &PendingRemove, local_peer: &PeerI
     if secret_candidates.is_empty() {
         peer_errors.push("site replication service account secret unavailable".to_string());
     } else {
-        for peer in pending_remove.original_peers.values() {
-            if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
-                || pending_remove.acked_deployment_ids.contains(&peer.deployment_id)
-            {
-                continue;
-            }
+        for peer in
+            pending_peers_awaiting_notification(&pending_remove.original_peers, local_peer, &pending_remove.acked_deployment_ids)
+        {
             if let Err(err) = PeerAdminRequest::put(
                 &runtime_peer_connection(peer)?,
                 SITE_REPLICATION_PEER_REMOVE_PATH,
@@ -15433,5 +15449,55 @@ mod tests {
             !apply.contains("metadata_sys::update_if_incarnation(&item.bucket"),
             "no replicated config write may bypass the source stamp"
         );
+    }
+
+    /// backlog#2367 A-4: `remove --all` notified "the peer" at the site's own
+    /// registered endpoint. The tick-driven local peer carries the node's
+    /// listen address, so an endpoint-only self check let the loop dial the
+    /// site itself and report `Partial: failed to notify 1 peer(s)`.
+    #[test]
+    fn pending_notifications_skip_the_local_site_by_deployment_id() {
+        let local_registered = PeerInfo {
+            deployment_id: "site-b".to_string(),
+            ..peer("site-b", "http://site-b.example.com:9000")
+        };
+        let remote = PeerInfo {
+            deployment_id: "site-a".to_string(),
+            ..peer("site-a", "http://site-a.example.com:9000")
+        };
+        let acked = PeerInfo {
+            deployment_id: "site-c".to_string(),
+            ..peer("site-c", "http://site-c.example.com:9000")
+        };
+        let peers = BTreeMap::from([
+            (local_registered.deployment_id.clone(), local_registered.clone()),
+            (remote.deployment_id.clone(), remote),
+            (acked.deployment_id.clone(), acked.clone()),
+        ]);
+        let acked_ids = BTreeSet::from([acked.deployment_id]);
+
+        // The tick resolves the local peer from its own listen address.
+        let local_from_tick = PeerInfo {
+            deployment_id: "site-b".to_string(),
+            ..peer("site-b", "http://127.0.0.1:9000")
+        };
+        let to_notify: Vec<&str> = pending_peers_awaiting_notification(&peers, &local_from_tick, &acked_ids)
+            .iter()
+            .map(|peer| peer.deployment_id.as_str())
+            .collect();
+        assert_eq!(to_notify, vec!["site-a"], "the local site and the acked peer are never dialed");
+
+        // Identity stays consistent with what finalization waits for.
+        assert_eq!(
+            pending_remote_peer_ids(&peers, &local_from_tick),
+            BTreeSet::from(["site-a".to_string(), "site-c".to_string()])
+        );
+
+        // A handler-resolved local peer (registered endpoint) agrees.
+        let to_notify: Vec<&str> = pending_peers_awaiting_notification(&peers, &local_registered, &acked_ids)
+            .iter()
+            .map(|peer| peer.deployment_id.as_str())
+            .collect();
+        assert_eq!(to_notify, vec!["site-a"]);
     }
 }
