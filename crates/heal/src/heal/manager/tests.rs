@@ -865,6 +865,88 @@ async fn heal_start_retry_scheduler_carries_explicit_budget_and_identity() {
     COMPLETED_RETENTION_HOOKS.lock().await.remove(&task_id);
 }
 
+#[tokio::test]
+async fn heal_start_retry_scheduler_carries_explicit_budget_across_retries() {
+    let manager = HealManager::new_without_root_recovery_for_test(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            task_timeout: Duration::ZERO,
+            event_driven_scheduler_enable: false,
+            ..Default::default()
+        }),
+    );
+    let mut request = HealRequest::object("retry-transition".to_string(), "object".to_string(), None);
+    request.source = HealRequestSource::Admin;
+    request.options.timeout = Some(Duration::from_secs(60));
+    let task_id = request.id.clone();
+    let created_at = request.created_at;
+    manager
+        .submit_heal_request(request)
+        .await
+        .expect("admit explicit-budget task");
+
+    let mut previous_remaining = Duration::from_secs(60);
+    for expected_attempt in 1..=3 {
+        process_manager_queue_once(&manager).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if manager.retrying_heals.lock().await.contains_key(&task_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recoverable executor failure should enter retry backoff");
+
+        let retry = manager.retrying_heals.lock().await[&task_id].request.clone();
+        assert_eq!(retry.id, task_id);
+        assert_eq!(retry.created_at, created_at);
+        assert_eq!(retry.source, HealRequestSource::Admin);
+        assert_eq!(retry.retry_attempts, expected_attempt);
+        let remaining = retry.options.timeout.expect("retry retains explicit budget");
+        assert!(
+            remaining > Duration::ZERO && remaining < previous_remaining,
+            "retry attempt {expected_attempt} should carry only the unused explicit budget"
+        );
+        previous_remaining = remaining;
+        assert_eq!(manager.operations_snapshot().await.queue_length, 0);
+        assert_eq!(manager.operations_snapshot().await.retrying_tasks, 1);
+
+        let retry_delay = recoverable_heal_retry_delay(expected_attempt);
+        tokio::time::timeout(retry_delay + Duration::from_secs(1), async {
+            loop {
+                if !manager.retrying_heals.lock().await.contains_key(&task_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retry backoff should requeue the same task id");
+        assert_eq!(manager.operations_snapshot().await.queue_length, 1);
+    }
+
+    process_manager_queue_once(&manager).await;
+    let final_error = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(HealTaskStatus::Failed { error }) = manager.get_task_status(&task_id).await {
+                break error;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retry limit should finish as a terminal failure");
+    let final_error_lower = final_error.to_ascii_lowercase();
+    assert!(
+        final_error_lower.contains("insufficient") && final_error_lower.contains("read"),
+        "terminal failure should retain the recoverable storage error: {final_error}"
+    );
+    assert_eq!(manager.operations_snapshot().await.queue_length, 0);
+    assert_eq!(manager.operations_snapshot().await.retrying_tasks, 0);
+}
+
 struct ManagerRecoveryTestHook {
     replacement_resume_disk: DiskStore,
     listed: StdMutex<bool>,
