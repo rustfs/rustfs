@@ -135,21 +135,24 @@ evidence registered in `.config/scanner-heal-required-tests.json`. It records
 already-built binaries and checks existing nextest output; it does not build,
 run tests, deploy servers, inject faults, or start another CI lane.
 
-The initial case is `background-target-restart`, emitted by
-`heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_remote_shards_after_background_target_restart`.
-That test already runs in `e2e-nightly`. When `RUSTFS_SCANNER_HEAL_RUN_DIR` is set,
-it checks the actual server and test-executable hashes against `run.json`, pins
-the same server binary for all node starts, and writes its oracle only after
-the real assertions pass. The artifact contains the actual pre/post target
+The registered cases are emitted by existing E2E tests. The original
+`background-target-restart` / `background-target-crash` cases run in
+`e2e-nightly` on a four-node, one-drive-per-node topology. The
+`ec84-target-drive-restart` case runs in `e2e-distributed` on a three-node,
+four-drive EC8+4 topology. When `RUSTFS_SCANNER_HEAL_RUN_DIR` is set, the
+producer checks the actual server and test-executable hashes against `run.json`,
+pins the same server binary for all node starts, and writes its oracle only
+after the real assertions pass. The artifact contains the actual pre/post target
 PIDs, per-node S3 listings, expected and downloaded complete-body hashes/lengths,
 and target-disk `VersionShardCensus` fingerprints. Existing baseline objects
 must match their pre-fault physical manifests; the object created during the
 outage has no pre-fault target shard and is checked for complete physical parts
 and exact S3 content.
 
-This case is a **four-node, one-drive-per-node process-restart test**. It is not
-power-loss validation, a 3x4 EC8+4 experiment, an all-version inventory, or proof
-of scanner enumeration, exact MRF disposition, legacy migration, or rollback.
+These cases are still restart-focused evidence slices. They are not power-loss
+validation, an all-version inventory, or proof of scanner enumeration, exact MRF
+disposition, legacy migration, multi-pool/multi-set release coverage, or
+rollback.
 The schema 2 registry separates the implemented single-set restart lane from
 structured release lanes for authority coverage, checkpoint/crash, status and
 outcome, MRF responsibility, mixed-version rollback, scheduler pressure,
@@ -180,27 +183,12 @@ The producer checks this compiled identity against the receipt; it does not
 copy a current source revision into an older test binary's identity. The E2E
 uses its existing temporary cluster directories and cleanup. `CARGO_TARGET_DIR`
 controls compilation output; nextest's default report store remains the
-workspace's `target/nextest`. Execute the existing selected case as follows:
+workspace's `target/nextest`. Prefer the registry-aware runner for concrete
+cases:
 
 ```bash
-CASE=background-target-restart
-FILTER='test(test_cluster_root_heal_recovers_remote_shards_after_background_target_restart)'
-RUN_DIR="$PWD/artifacts/scanner-heal-run"
-export RUSTFS_E2E_EXPECTED_FEATURES=default
-scripts/python_bin.sh scripts/check_test_wiring.py \
-  --begin-scanner-heal "$RUN_DIR" "$SERVER_BINARY" "$TEST_BINARY"
-export RUSTFS_SCANNER_HEAL_RUN_DIR="$RUN_DIR"
-export CARGO_BIN_EXE_rustfs="$SERVER_BINARY"
-cargo nextest list --profile e2e-nightly -p e2e_test -E "$FILTER" \
-  --message-format json > "$RUN_DIR/listing.json"
-rm -f target/nextest/e2e-nightly/junit.xml
-set +e
-cargo nextest run --profile e2e-nightly -p e2e_test -E "$FILTER"
-test_exit=$?
-set -e
-cp target/nextest/e2e-nightly/junit.xml "$RUN_DIR/junit.xml"
-scripts/python_bin.sh scripts/check_test_wiring.py --finish-scanner-heal "$RUN_DIR" "$test_exit"
-scripts/python_bin.sh scripts/check_test_wiring.py --check-scanner-heal "$RUN_DIR" "$CASE"
+scripts/run_scanner_heal_evidence_case.sh --case background-target-restart
+scripts/run_scanner_heal_evidence_case.sh --case ec84-target-drive-restart
 ```
 
 Set `RUSTFS_E2E_EXPECTED_FEATURES` to the actual intended e2e crate feature set,
