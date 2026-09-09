@@ -214,9 +214,11 @@ SCANNER_HEAL_RELEASE_MRF_ARTIFACT_KINDS = {
 }
 SCANNER_HEAL_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS = (
     "missing_producer_identity",
+    "missing_durable_journal_replay",
     "restart_gap",
     "generation_gap",
     "overflow",
+    "stale_ack_generation",
     "missing_cold_zero_walk_oracle",
     "distributed_without_peer_invalidation",
 )
@@ -228,6 +230,8 @@ SCANNER_HEAL_SEGMENT_ACTIVATION_PROOF_INPUTS = (
     "process_epoch",
     "generation_window",
     "producer_identities",
+    "durable_dirty_producer_journal",
+    "ack_generation_guard",
 )
 SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES = (
     "put_object",
@@ -250,6 +254,13 @@ SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES = (
     "replication",
     "tier",
     "directory_object",
+)
+SCANNER_HEAL_DURABLE_JOURNAL_FAIL_CLOSED_CASES = (
+    "corrupt-record",
+    "mixed-version-producer",
+    "oversized-record",
+    "unsupported-producer",
+    "invalid-generation",
 )
 SCANNER_HEAL_RELEASE_G11_REQUIRED_CASES = {
     "maintenance_producer_matrix": (
@@ -1885,9 +1896,13 @@ def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple
                 "producer_families",
                 "matrix_cases",
                 "durable_identity_observed",
+                "durable_journal_replay_observed",
+                "durable_journal_hydration_bound",
                 "generation_window_bound",
                 "restart_gap_absent",
                 "overflow_absent",
+                "ack_clear_generation_observed",
+                "invalid_journal_inputs_rejected",
             ),
             "complete_producer_inventory": (
                 "required_producer_identities",
@@ -2320,10 +2335,21 @@ def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dic
             )
             release_bundle_bool_true(evidence.get("durable_identity_observed"),
                                      f"{gate}.{field}.durable_identity_observed")
+            release_bundle_bool_true(evidence.get("durable_journal_replay_observed"),
+                                     f"{gate}.{field}.durable_journal_replay_observed")
+            release_bundle_bool_true(evidence.get("durable_journal_hydration_bound"),
+                                     f"{gate}.{field}.durable_journal_hydration_bound")
             release_bundle_bool_true(evidence.get("generation_window_bound"),
                                      f"{gate}.{field}.generation_window_bound")
             release_bundle_bool_true(evidence.get("restart_gap_absent"), f"{gate}.{field}.restart_gap_absent")
             release_bundle_bool_true(evidence.get("overflow_absent"), f"{gate}.{field}.overflow_absent")
+            release_bundle_bool_true(evidence.get("ack_clear_generation_observed"),
+                                     f"{gate}.{field}.ack_clear_generation_observed")
+            release_bundle_exact_strings(
+                evidence.get("invalid_journal_inputs_rejected"),
+                SCANNER_HEAL_DURABLE_JOURNAL_FAIL_CLOSED_CASES,
+                f"{gate}.{field}.invalid_journal_inputs_rejected",
+            )
         if field == "complete_producer_inventory":
             release_bundle_exact_strings(
                 evidence.get("required_producer_identities"),
@@ -3642,9 +3668,13 @@ class SelfTests(unittest.TestCase):
                     evidence["producer_families"] = list(SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES)
                     evidence["matrix_cases"] = list(SCANNER_HEAL_RELEASE_G11_REQUIRED_CASES[field])
                     evidence["durable_identity_observed"] = True
+                    evidence["durable_journal_replay_observed"] = True
+                    evidence["durable_journal_hydration_bound"] = True
                     evidence["generation_window_bound"] = True
                     evidence["restart_gap_absent"] = True
                     evidence["overflow_absent"] = True
+                    evidence["ack_clear_generation_observed"] = True
+                    evidence["invalid_journal_inputs_rejected"] = list(SCANNER_HEAL_DURABLE_JOURNAL_FAIL_CLOSED_CASES)
                 if gate == "G11" and field == "complete_producer_inventory":
                     evidence["required_producer_identities"] = list(SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES)
                     evidence["observed_producer_identities"] = list(SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES)
@@ -4183,11 +4213,53 @@ class SelfTests(unittest.TestCase):
                 "missing G11.segment_activation_preflight.proof_inputs",
             ),
             (
+                "activation-missing-durable-journal-input",
+                "G11",
+                "segment_activation_preflight",
+                lambda item: item["proof_inputs"].remove("durable_dirty_producer_journal"),
+                "missing G11.segment_activation_preflight.proof_inputs",
+            ),
+            (
+                "activation-missing-ack-guard",
+                "G11",
+                "segment_activation_preflight",
+                lambda item: item["fail_closed_checks"].remove("stale_ack_generation"),
+                "missing G11.segment_activation_preflight.fail_closed_checks",
+            ),
+            (
                 "producer-matrix-missing",
                 "G11",
                 "maintenance_producer_matrix",
                 lambda item: item["producer_identities"].remove("tier_expiration"),
                 "producer_identities missing cases",
+            ),
+            (
+                "producer-matrix-no-journal-replay",
+                "G11",
+                "maintenance_producer_matrix",
+                lambda item: item.update({"durable_journal_replay_observed": False}),
+                "durable_journal_replay_observed",
+            ),
+            (
+                "producer-matrix-no-hydration-bound",
+                "G11",
+                "maintenance_producer_matrix",
+                lambda item: item.update({"durable_journal_hydration_bound": False}),
+                "durable_journal_hydration_bound",
+            ),
+            (
+                "producer-matrix-no-ack-clear-generation",
+                "G11",
+                "maintenance_producer_matrix",
+                lambda item: item.update({"ack_clear_generation_observed": False}),
+                "ack_clear_generation_observed",
+            ),
+            (
+                "producer-matrix-missing-invalid-journal-case",
+                "G11",
+                "maintenance_producer_matrix",
+                lambda item: item["invalid_journal_inputs_rejected"].remove("mixed-version-producer"),
+                "invalid_journal_inputs_rejected missing cases",
             ),
             (
                 "producer-inventory-missing",

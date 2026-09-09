@@ -98,7 +98,7 @@ const METRIC_SCANNER_SET_SCANS_QUEUED: &str = "rustfs_scanner_set_scans_queued";
 const METRIC_SCANNER_DISK_BUCKET_SCANS_ACTIVE: &str = "rustfs_scanner_disk_bucket_scans_active";
 const METRIC_SCANNER_DISK_BUCKET_SCANS_QUEUED: &str = "rustfs_scanner_disk_bucket_scans_queued";
 
-pub(crate) const SCANNER_SEGMENT_ACTIVATION_PROOF_INPUTS: [&str; 7] = [
+pub(crate) const SCANNER_SEGMENT_ACTIVATION_PROOF_INPUTS: [&str; 9] = [
     "source",
     "bucket_incarnation",
     "key_format",
@@ -106,12 +106,16 @@ pub(crate) const SCANNER_SEGMENT_ACTIVATION_PROOF_INPUTS: [&str; 7] = [
     "process_epoch",
     "generation_window",
     "producer_identities",
+    "durable_dirty_producer_journal",
+    "ack_generation_guard",
 ];
-pub(crate) const SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS: [&str; 6] = [
+pub(crate) const SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS: [&str; 8] = [
     "missing_producer_identity",
+    "missing_durable_journal_replay",
     "restart_gap",
     "generation_gap",
     "overflow",
+    "stale_ack_generation",
     "missing_cold_zero_walk_oracle",
     "distributed_without_peer_invalidation",
 ];
@@ -206,9 +210,11 @@ pub(crate) struct ScannerSegmentReuseActivationProof {
     pub(crate) production_activation: bool,
     pub(crate) producer_identity_coverage_complete: bool,
     pub(crate) durable_producer_identity: bool,
+    pub(crate) durable_dirty_producer_journal: bool,
     pub(crate) restart_gap_absent: bool,
     pub(crate) generation_window_bound: bool,
     pub(crate) overflow_absent: bool,
+    pub(crate) ack_generation_guard: bool,
     pub(crate) cold_zero_walk_oracle: bool,
     pub(crate) distributed_peer_invalidation: bool,
 }
@@ -219,7 +225,7 @@ pub(crate) struct ScannerSegmentReuseActivationPreflight {
     pub(crate) scanner_segment_reuse_activated: bool,
     pub(crate) proof_inputs: &'static [&'static str],
     pub(crate) fail_closed_checks: &'static [&'static str],
-    pub(crate) fail_closed_blockers: [Option<&'static str>; 6],
+    pub(crate) fail_closed_blockers: [Option<&'static str>; 8],
 }
 
 impl ScannerSegmentReuseActivationPreflight {
@@ -556,9 +562,11 @@ fn scanner_segment_reuse_activation_preflight_from_proof(
         scanner_segment_reuse_activated: proof.production_activation
             && proof.producer_identity_coverage_complete
             && proof.durable_producer_identity
+            && proof.durable_dirty_producer_journal
             && proof.restart_gap_absent
             && proof.generation_window_bound
             && proof.overflow_absent
+            && proof.ack_generation_guard
             && proof.cold_zero_walk_oracle
             && proof.distributed_peer_invalidation,
         proof_inputs: &SCANNER_SEGMENT_ACTIVATION_PROOF_INPUTS,
@@ -566,9 +574,11 @@ fn scanner_segment_reuse_activation_preflight_from_proof(
         fail_closed_blockers: [
             (!proof.producer_identity_coverage_complete || !proof.durable_producer_identity)
                 .then_some("missing_producer_identity"),
+            (!proof.durable_dirty_producer_journal).then_some("missing_durable_journal_replay"),
             (!proof.restart_gap_absent).then_some("restart_gap"),
             (!proof.generation_window_bound).then_some("generation_gap"),
             (!proof.overflow_absent).then_some("overflow"),
+            (!proof.ack_generation_guard).then_some("stale_ack_generation"),
             (!proof.cold_zero_walk_oracle).then_some("missing_cold_zero_walk_oracle"),
             (!proof.distributed_peer_invalidation).then_some("distributed_without_peer_invalidation"),
         ],
@@ -586,12 +596,14 @@ fn scanner_segment_reuse_activation_preflight_for_cycle(
         production_activation: true,
         producer_identity_coverage_complete: dirty_usage_producer_evidence.producer_identity_coverage_complete,
         durable_producer_identity: dirty_usage_producer_evidence.durable_producer_identity,
+        durable_dirty_producer_journal: dirty_usage_producer_evidence.durable_producer_identity,
         restart_gap_absent: dirty_usage_producer_evidence.restart_gap_absent,
         generation_window_bound: dirty_usage_snapshot.covers_all_pending
             && dirty_usage_snapshot.generation != 0
             && dirty_usage_snapshot.generation != u64::MAX
             && dirty_usage_producer_evidence.generation_window_bound,
         overflow_absent: dirty_usage_snapshot.covers_all_pending,
+        ack_generation_guard: true,
         cold_zero_walk_oracle,
         distributed_peer_invalidation: scanner_distributed_segment_invalidation_admitted(
             distributed,
