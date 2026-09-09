@@ -954,6 +954,17 @@ pub(crate) async fn get_local_server_property() -> rustfs_madmin::ServerProperti
 }
 
 pub(crate) async fn init_background_replication(store: Arc<ECStore>) {
+    ecstore_bucket::replication::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(|bucket, object, source| {
+        let producer = match source {
+            ecstore_bucket::replication::ScannerDirtyUsageMutationSource::Replication => {
+                rustfs_scanner::SegmentInvalidationProducerIdentity::Replication
+            }
+            ecstore_bucket::replication::ScannerDirtyUsageMutationSource::TierExpiration => {
+                rustfs_scanner::SegmentInvalidationProducerIdentity::TierExpiration
+            }
+        };
+        rustfs_scanner::record_dirty_usage_object_from_producer(bucket, object, producer);
+    })));
     ecstore_bucket::replication::init_background_replication(store).await;
 }
 
