@@ -1197,31 +1197,32 @@ mod tests {
         root.join(lane).join(format!("{gate}-{field}.json"))
     }
 
-    fn write_w13_evidence(
-        root: &Path,
-        source_revision: &str,
-        run_id: &str,
-        window_id: &str,
-        started_at: &str,
-        finished_at: &str,
-        gate: &str,
-        field: &str,
-        artifact_kind: &str,
+    struct W13Evidence<'a> {
+        source_revision: &'a str,
+        run_id: &'a str,
+        window_id: &'a str,
+        started_at: &'a str,
+        finished_at: &'a str,
+        gate: &'a str,
+        field: &'a str,
+        artifact_kind: &'a str,
         extra: Map<String, Value>,
-    ) {
-        let path = w13_evidence_path(root, gate, field);
+    }
+
+    fn write_w13_evidence(root: &Path, evidence: W13Evidence<'_>) {
+        let path = w13_evidence_path(root, evidence.gate, evidence.field);
         fs::create_dir_all(path.parent().expect("W13 evidence artifact parent")).expect("create W13 evidence artifact directory");
         let mut payload = Map::new();
         payload.insert("schema".to_string(), json!(1));
         payload.insert("evidence_type".to_string(), json!("measured"));
-        payload.insert("artifact_kind".to_string(), json!(artifact_kind));
-        payload.insert("source_revision".to_string(), json!(source_revision));
-        payload.insert("run_id".to_string(), json!(run_id));
-        payload.insert("measurement_window_id".to_string(), json!(window_id));
-        payload.insert("started_at".to_string(), json!(started_at));
-        payload.insert("finished_at".to_string(), json!(finished_at));
-        payload.insert("gate".to_string(), json!(gate));
-        payload.insert("field".to_string(), json!(field));
+        payload.insert("artifact_kind".to_string(), json!(evidence.artifact_kind));
+        payload.insert("source_revision".to_string(), json!(evidence.source_revision));
+        payload.insert("run_id".to_string(), json!(evidence.run_id));
+        payload.insert("measurement_window_id".to_string(), json!(evidence.window_id));
+        payload.insert("started_at".to_string(), json!(evidence.started_at));
+        payload.insert("finished_at".to_string(), json!(evidence.finished_at));
+        payload.insert("gate".to_string(), json!(evidence.gate));
+        payload.insert("field".to_string(), json!(evidence.field));
         payload.insert(
             "command".to_string(),
             json!([
@@ -1238,8 +1239,11 @@ mod tests {
                 "--nocapture"
             ]),
         );
-        payload.insert("summary".to_string(), json!(format!("Measured W13 MRF evidence for {gate}.{field}")));
-        payload.extend(extra);
+        payload.insert(
+            "summary".to_string(),
+            json!(format!("Measured W13 MRF evidence for {}.{}", evidence.gate, evidence.field)),
+        );
+        payload.extend(evidence.extra);
         let bytes = serde_json::to_vec_pretty(&Value::Object(payload)).expect("serialize W13 evidence payload");
         fs::write(&path, [bytes.as_slice(), b"\n"].concat()).expect("write W13 evidence artifact");
     }
@@ -1670,15 +1674,17 @@ mod tests {
             );
             write_w13_evidence(
                 &evidence_root,
-                &source_revision,
-                &format!("{run_id}-g07-responsibility"),
-                &format!("{window_id}-g07"),
-                &started_at,
-                &finished_at,
-                "G07",
-                "mrf_responsibility_oracle",
-                "mrf-durable-responsibility-oracle",
-                responsibility,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-g07-responsibility"),
+                    window_id: &format!("{window_id}-g07"),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "G07",
+                    field: "mrf_responsibility_oracle",
+                    artifact_kind: "mrf-durable-responsibility-oracle",
+                    extra: responsibility,
+                },
             );
 
             let mut crash = Map::new();
@@ -1706,15 +1712,17 @@ mod tests {
             crash.insert("proof_discharged_anchor".to_string(), json!(proof_discharged));
             write_w13_evidence(
                 &evidence_root,
-                &source_revision,
-                &format!("{run_id}-g07-crash"),
-                &format!("{window_id}-g07"),
-                &started_at,
-                &finished_at,
-                "G07",
-                "commit_boundary_crash_matrix",
-                "mrf-commit-boundary-crash-matrix",
-                crash,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-g07-crash"),
+                    window_id: &format!("{window_id}-g07"),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "G07",
+                    field: "commit_boundary_crash_matrix",
+                    artifact_kind: "mrf-commit-boundary-crash-matrix",
+                    extra: crash,
+                },
             );
         }
 
@@ -1735,15 +1743,17 @@ mod tests {
             capacity.insert("replay_limit_raise_observed".to_string(), json!(true));
             write_w13_evidence(
                 &evidence_root,
-                &source_revision,
-                &format!("{run_id}-g08-capacity"),
-                &format!("{window_id}-g08"),
-                &started_at,
-                &finished_at,
-                "G08",
-                "mrf_capacity_evidence",
-                "mrf-capacity-boundary",
-                capacity,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-g08-capacity"),
+                    window_id: &format!("{window_id}-g08"),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "G08",
+                    field: "mrf_capacity_evidence",
+                    artifact_kind: "mrf-capacity-boundary",
+                    extra: capacity,
+                },
             );
 
             let mut disk_full = Map::new();
@@ -1767,15 +1777,17 @@ mod tests {
             );
             write_w13_evidence(
                 &evidence_root,
-                &source_revision,
-                &format!("{run_id}-g08-disk-full"),
-                &format!("{window_id}-g08"),
-                &started_at,
-                &finished_at,
-                "G08",
-                "disk_full_matrix",
-                "mrf-disk-full-enospc-matrix",
-                disk_full,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-g08-disk-full"),
+                    window_id: &format!("{window_id}-g08"),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "G08",
+                    field: "disk_full_matrix",
+                    artifact_kind: "mrf-disk-full-enospc-matrix",
+                    extra: disk_full,
+                },
             );
 
             let mut replica = Map::new();
@@ -1787,15 +1799,17 @@ mod tests {
             replica.insert("resident_intent_retained_after_rejection".to_string(), json!(true));
             write_w13_evidence(
                 &evidence_root,
-                &source_revision,
-                &format!("{run_id}-g08-replica"),
-                &format!("{window_id}-g08"),
-                &started_at,
-                &finished_at,
-                "G08",
-                "replica_loss_matrix",
-                "mrf-replica-loss-matrix",
-                replica,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-g08-replica"),
+                    window_id: &format!("{window_id}-g08"),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "G08",
+                    field: "replica_loss_matrix",
+                    artifact_kind: "mrf-replica-loss-matrix",
+                    extra: replica,
+                },
             );
         }
 
@@ -1807,15 +1821,17 @@ mod tests {
             scale.insert("deduped_depth".to_string(), json!(scale_deduped_depth));
             write_w13_evidence(
                 &evidence_root,
-                &source_revision,
-                &format!("{run_id}-p4-scale"),
-                window_id.as_str(),
-                &started_at,
-                &finished_at,
-                "P4",
-                "mrf_scale_measurement",
-                "mrf-scale-measurement",
-                scale,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-p4-scale"),
+                    window_id: window_id.as_str(),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "P4",
+                    field: "mrf_scale_measurement",
+                    artifact_kind: "mrf-scale-measurement",
+                    extra: scale,
+                },
             );
 
             let mut replay_cost = Map::new();
@@ -1826,15 +1842,17 @@ mod tests {
             replay_cost.insert("elapsed_seconds".to_string(), json!(measured_seconds));
             write_w13_evidence(
                 &evidence_root,
-                &source_revision,
-                &format!("{run_id}-p4-replay-cost"),
-                window_id.as_str(),
-                &started_at,
-                &finished_at,
-                "P4",
-                "mrf_replay_cost_measurement",
-                "mrf-replay-cost-measurement",
-                replay_cost,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-p4-replay-cost"),
+                    window_id: window_id.as_str(),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "P4",
+                    field: "mrf_replay_cost_measurement",
+                    artifact_kind: "mrf-replay-cost-measurement",
+                    extra: replay_cost,
+                },
             );
 
             let mut retained = Map::new();
@@ -1856,15 +1874,17 @@ mod tests {
             retained.insert("successor_snapshot_published".to_string(), json!(successor_snapshot));
             write_w13_evidence(
                 &evidence_root,
-                &source_revision,
-                &format!("{run_id}-p4-retained"),
-                window_id.as_str(),
-                &started_at,
-                &finished_at,
-                "P4",
-                "retained_responsibility_evidence",
-                "mrf-retained-responsibility-soak",
-                retained,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-p4-retained"),
+                    window_id: window_id.as_str(),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "P4",
+                    field: "retained_responsibility_evidence",
+                    artifact_kind: "mrf-retained-responsibility-soak",
+                    extra: retained,
+                },
             );
 
             let mut cleanup = Map::new();
@@ -1886,15 +1906,17 @@ mod tests {
             cleanup.insert("successor_snapshot_published".to_string(), json!(successor_snapshot));
             write_w13_evidence(
                 &evidence_root,
-                &source_revision,
-                &format!("{run_id}-p4-cleanup"),
-                window_id.as_str(),
-                &started_at,
-                &finished_at,
-                "P4",
-                "mrf_cleanup_gc_soak_evidence",
-                "mrf-cleanup-gc-soak",
-                cleanup,
+                W13Evidence {
+                    source_revision: &source_revision,
+                    run_id: &format!("{run_id}-p4-cleanup"),
+                    window_id: window_id.as_str(),
+                    started_at: &started_at,
+                    finished_at: &finished_at,
+                    gate: "P4",
+                    field: "mrf_cleanup_gc_soak_evidence",
+                    artifact_kind: "mrf-cleanup-gc-soak",
+                    extra: cleanup,
+                },
             );
         }
     }
