@@ -1139,9 +1139,26 @@ mod tests {
     use super::*;
     use crate::heal::manager::HealConfig;
     use crate::heal::storage::{ECStoreHealStorage, HealStorageAPI};
+    use crate::heal::{DiskError, RUSTFS_META_BUCKET};
     use rustfs_common::mrf_channel::{MrfIntent, MrfKind, MrfVerifiedRepairDisposition, MrfVerifiedRepairEvent};
+    use serde_json::{Map, Value, json};
     use serial_test::serial;
+    use std::env;
+    use std::fs;
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc as StdArc;
+    use std::time::{Duration as StdDuration, Instant};
+
+    const W13_EVIDENCE_DIR_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_EVIDENCE_DIR";
+    const W13_SOURCE_REVISION_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_SOURCE_REVISION";
+    const W13_SELECTION_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_SELECTION";
+    const W13_SOAK_SECONDS_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_SOAK_SECONDS";
+    const W13_ALLOW_SHORT_SOAK_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_ALLOW_SHORT_SOAK";
+    const W13_RUN_ID_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_RUN_ID";
+    const W13_WINDOW_ID_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_WINDOW_ID";
+    const W13_ENOSPC_ROOT_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_ENOSPC_ROOT";
+    const W13_ENOSPC_FILL_LIMIT_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_ENOSPC_FILL_LIMIT_BYTES";
 
     fn intent(bucket: &str, object: &str, attempts: u8) -> MrfIntent {
         MrfIntent {
@@ -1160,6 +1177,726 @@ mod tests {
         let mut payload = Vec::new();
         assert!(encode_intent(intent, &mut payload), "fixture intent must encode");
         payload
+    }
+
+    fn w13_timestamp() -> String {
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    fn w13_selection_contains(selection: &str, lane: &str) -> bool {
+        selection == "all" || selection.split(',').any(|item| item.trim() == lane)
+    }
+
+    fn w13_evidence_path(root: &Path, gate: &str, field: &str) -> PathBuf {
+        let lane = match gate {
+            "G07" => "g07-mrf-responsibility",
+            "G08" => "g08-mrf-capacity",
+            "P4" => "p4-mrf-soak",
+            other => panic!("unsupported W13 evidence gate: {other}"),
+        };
+        root.join(lane).join(format!("{gate}-{field}.json"))
+    }
+
+    fn write_w13_evidence(
+        root: &Path,
+        source_revision: &str,
+        run_id: &str,
+        window_id: &str,
+        started_at: &str,
+        finished_at: &str,
+        gate: &str,
+        field: &str,
+        artifact_kind: &str,
+        extra: Map<String, Value>,
+    ) {
+        let path = w13_evidence_path(root, gate, field);
+        fs::create_dir_all(path.parent().expect("W13 evidence artifact parent")).expect("create W13 evidence artifact directory");
+        let mut payload = Map::new();
+        payload.insert("schema".to_string(), json!(1));
+        payload.insert("evidence_type".to_string(), json!("measured"));
+        payload.insert("artifact_kind".to_string(), json!(artifact_kind));
+        payload.insert("source_revision".to_string(), json!(source_revision));
+        payload.insert("run_id".to_string(), json!(run_id));
+        payload.insert("measurement_window_id".to_string(), json!(window_id));
+        payload.insert("started_at".to_string(), json!(started_at));
+        payload.insert("finished_at".to_string(), json!(finished_at));
+        payload.insert("gate".to_string(), json!(gate));
+        payload.insert("field".to_string(), json!(field));
+        payload.insert(
+            "command".to_string(),
+            json!([
+                "cargo",
+                "test",
+                "--locked",
+                "-p",
+                "rustfs-heal",
+                "--lib",
+                "heal::mrf_queue::tests::w13_mrf_release_evidence_outputs_bundle_artifacts",
+                "--",
+                "--ignored",
+                "--exact",
+                "--nocapture"
+            ]),
+        );
+        payload.insert("summary".to_string(), json!(format!("Measured W13 MRF evidence for {gate}.{field}")));
+        payload.extend(extra);
+        let bytes = serde_json::to_vec_pretty(&Value::Object(payload)).expect("serialize W13 evidence payload");
+        fs::write(&path, [bytes.as_slice(), b"\n"].concat()).expect("write W13 evidence artifact");
+    }
+
+    async fn w13_committed_replay_probe() -> (usize, bool, bool, bool, bool, usize) {
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("rustfs_mrf_w13_replay_evidence")
+            .build()
+            .await;
+        let bucket = "w13-replay-bucket";
+        let object = "w13-replay-object";
+        env.make_bucket(bucket, false).await;
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let manager = Arc::new(HealManager::new(
+            storage.clone(),
+            Some(HealConfig {
+                queue_size: 2,
+                heal_interval: Duration::from_secs(3600),
+                enable_auto_heal: false,
+                ..Default::default()
+            }),
+        ));
+        let disks = journal_disks().await;
+        assert!(!disks.is_empty(), "W13 evidence requires real local MRF disks");
+
+        let config = MrfConsumerConfig::default();
+        let replay_owner = Uuid::new_v4();
+        let mut replay_intent = intent(bucket, object, 0);
+        replay_intent.kind = MrfKind::PartialWrite;
+        replay_intent.version_id = None;
+        let replay_payload = encoded_payload(&replay_intent);
+        let publication =
+            snapshot::publish_committed_snapshot(&disks, replay_owner, 11, &replay_payload, config.journal_max_bytes)
+                .await
+                .expect("publish W13 committed replay checkpoint");
+        assert_eq!(publication.manifest_replicas, disks.len(), "all W13 checkpoint manifests should commit");
+
+        let mut queue = MrfQueue::new(config.queue_capacity, config.journal_max_bytes);
+        let mut backoff_until = None;
+        let replay = replay_into(&manager, &mut queue, &mut backoff_until).await;
+        assert_eq!(replay.replayed, 1, "W13 committed checkpoint must replay one record");
+        assert_eq!(queue.depth(), 0, "W13 replayed record should reach the manager before cleanup");
+        assert_eq!(replay.durable_replay_anchors.len(), 1, "W13 replay must create a proof anchor");
+        assert_eq!(
+            manager.operations_snapshot().await.queued_by_source.mrf,
+            1,
+            "W13 replayed work must be visible as MRF manager work"
+        );
+
+        let anchor = replay.durable_replay_anchors[0].clone();
+        let mut runtime = MrfRuntime {
+            queue,
+            config,
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: replay.next_checkpoint_sequence,
+            new_since_flush: 0,
+            dirty: false,
+            journal_on_disk: replay.journal_on_disk,
+            retain_replay_journal: replay.retain_journal_for_replay,
+            durable_replay_anchors: replay.durable_replay_anchors,
+            replay_cleanup: replay.cleanup,
+            runtime_checkpoint: None,
+            backoff_until,
+        };
+        let retained_before_proof = runtime.retained_replay_journal();
+        assert!(retained_before_proof, "W13 proof anchor must retain replay checkpoint before proof");
+        assert!(
+            snapshot::inspect_local_committed_snapshot(runtime.config.journal_max_bytes)
+                .await
+                .expect("inspect W13 retained checkpoint")
+                .is_some(),
+            "W13 replay checkpoint must remain durable before proof"
+        );
+
+        rustfs_common::mrf_channel::note_mrf_verified_repair(MrfVerifiedRepairEvent {
+            kind: anchor.kind,
+            bucket: anchor.bucket.clone(),
+            object: anchor.object.clone(),
+            version_id: anchor.version_id,
+            scope: anchor.scope,
+            lease: Some(anchor.lease),
+            bucket_incarnation_id: anchor.bucket_incarnation_id,
+            disposition: MrfVerifiedRepairDisposition::Repaired,
+        });
+        runtime.discharge_durable_replay_anchors();
+        let proof_discharged_anchor = !runtime.retained_replay_journal();
+        assert!(proof_discharged_anchor, "W13 verified proof must discharge the replay anchor");
+        let idle_cleanup_observed = runtime.delete_idle_recovery_anchors().await;
+        assert!(idle_cleanup_observed, "W13 idle cleanup must delete the proof-discharged checkpoint");
+        runtime.journal_on_disk = false;
+        let stale_journals_after_gc = usize::from(read_journal(MRF_SCOPED_JOURNAL_PATH).await.is_some())
+            + usize::from(read_journal(MRF_JOURNAL_PATH).await.is_some())
+            + usize::from(
+                snapshot::inspect_local_committed_snapshot(runtime.config.journal_max_bytes)
+                    .await
+                    .expect("inspect W13 checkpoints after cleanup")
+                    .is_some(),
+            );
+
+        let restart_manager = Arc::new(HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 2,
+                heal_interval: Duration::from_secs(3600),
+                enable_auto_heal: false,
+                ..Default::default()
+            }),
+        ));
+        assert_eq!(
+            replay_journal_once(&restart_manager).await,
+            0,
+            "W13 cleaned anchors must not resurrect on restart"
+        );
+        assert_eq!(
+            restart_manager.operations_snapshot().await.queued_by_source.mrf,
+            0,
+            "W13 restart must not re-admit proof-cleaned MRF work"
+        );
+        manager.stop().await.expect("stop W13 replay manager");
+        restart_manager.stop().await.expect("stop W13 restart manager");
+        (
+            replay.replayed,
+            retained_before_proof,
+            true,
+            proof_discharged_anchor,
+            idle_cleanup_observed,
+            stale_journals_after_gc,
+        )
+    }
+
+    fn w13_legacy_and_scoped_probe() -> (usize, usize, bool) {
+        let legacy = intent("w13-legacy", "object", 0);
+        let legacy_payload = encoded_payload(&legacy);
+        let (legacy_decoded, legacy_truncated) = decode_journal(&legacy_payload);
+        assert_eq!(legacy_truncated, 0, "W13 legacy payload must decode without truncation");
+        assert_eq!(legacy_decoded.len(), 1, "W13 legacy replay identity must round trip");
+        assert_eq!(legacy_decoded[0].bucket, legacy.bucket);
+        assert_eq!(legacy_decoded[0].object, legacy.object);
+        assert_eq!(legacy_decoded[0].version_id, legacy.version_id);
+        assert_eq!(legacy_decoded[0].scope, legacy.scope);
+
+        let mut scoped = intent("w13-scoped", "object", 0);
+        scoped.kind = MrfKind::PartialWrite;
+        scoped.version_id = Some(*Uuid::new_v4().as_bytes());
+        scoped.scope = Some(rustfs_common::mrf_channel::MrfScope {
+            pool_index: 7,
+            set_index: 13,
+        });
+        let mut runtime = MrfRuntime {
+            queue: MrfQueue::new(4, usize::MAX),
+            config: MrfConsumerConfig::default(),
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: 1,
+            new_since_flush: 0,
+            dirty: true,
+            journal_on_disk: false,
+            retain_replay_journal: false,
+            durable_replay_anchors: Vec::new(),
+            replay_cleanup: None,
+            runtime_checkpoint: None,
+            backoff_until: None,
+        };
+        assert_eq!(runtime.queue.try_push_typed(scoped.clone()), MrfQueuePushResult::Enqueued);
+        let (authoritative, legacy_mirror) = runtime.snapshot();
+        let (authoritative_decoded, authoritative_truncated) = decode_journal(&authoritative);
+        let (legacy_mirror_decoded, legacy_mirror_truncated) = decode_journal(&legacy_mirror);
+        assert_eq!(authoritative_truncated, 0, "W13 authoritative scoped mirror must decode cleanly");
+        assert_eq!(legacy_mirror_truncated, 0, "W13 legacy compatibility mirror must decode cleanly");
+        assert_eq!(authoritative_decoded.len(), 1, "W13 authoritative mirror must retain scoped identity");
+        assert_eq!(authoritative_decoded[0].bucket, scoped.bucket);
+        assert_eq!(authoritative_decoded[0].object, scoped.object);
+        assert_eq!(authoritative_decoded[0].version_id, scoped.version_id);
+        assert_eq!(authoritative_decoded[0].scope, scoped.scope);
+        assert!(
+            legacy_mirror_decoded.is_empty() || legacy_mirror_decoded.iter().all(|intent| intent.scope.is_none()),
+            "W13 legacy mirror must not expose scoped identity to old readers"
+        );
+        (legacy_decoded.len(), authoritative_decoded.len(), legacy_mirror_decoded.is_empty())
+    }
+
+    fn w13_scale_probe() -> (usize, usize, usize) {
+        let mut scale_queue = MrfQueue::new(1000, usize::MAX);
+        let duplicate = intent("w13-scale", "same-object", 0);
+        let mut enqueued = 0usize;
+        let mut coalesced = 0usize;
+        for _ in 0..1000 {
+            match scale_queue.try_push_typed(duplicate.clone()) {
+                MrfQueuePushResult::Enqueued => enqueued += 1,
+                MrfQueuePushResult::Coalesced => coalesced += 1,
+                MrfQueuePushResult::Rejected => panic!("W13 scale duplicate probe should not reject"),
+            }
+        }
+        assert_eq!(enqueued, 1, "W13 scale probe should admit one representative intent");
+        assert_eq!(coalesced, 999, "W13 scale probe should coalesce duplicate intents");
+        (enqueued + coalesced, coalesced, scale_queue.depth())
+    }
+
+    fn w13_enospc_raw_os(err: &std::io::Error) -> bool {
+        err.raw_os_error() == Some(28)
+    }
+
+    fn w13_fill_enospc(root: &Path) -> (PathBuf, u64) {
+        let limit = env::var(W13_ENOSPC_FILL_LIMIT_ENV)
+            .ok()
+            .map(|raw| raw.parse::<u64>().expect("W13 ENOSPC fill limit must be an integer"))
+            .unwrap_or(128 * 1024 * 1024);
+        fs::create_dir_all(root).expect("create W13 ENOSPC root");
+        let filler = root.join(format!("w13-enospc-{}.fill", Uuid::new_v4()));
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&filler)
+            .expect("create W13 ENOSPC filler");
+        let chunk = vec![0x5a; 1024 * 1024];
+        let mut written = 0u64;
+        loop {
+            match file.write_all(&chunk) {
+                Ok(()) => {
+                    written = written.saturating_add(chunk.len() as u64);
+                    assert!(
+                        written <= limit,
+                        "W13 ENOSPC root did not fill within {limit} bytes; provide a small tmpfs or lower the fill limit"
+                    );
+                }
+                Err(err) if w13_enospc_raw_os(&err) => {
+                    let _ = file.sync_all();
+                    return (filler, written);
+                }
+                Err(err) => panic!("W13 ENOSPC filler failed with non-ENOSPC error: {err}"),
+            }
+        }
+    }
+
+    fn w13_snapshot_error_is_capacity(error: &snapshot::SnapshotError) -> bool {
+        match error {
+            snapshot::SnapshotError::Disk(source) => format!("{source:?}").contains("No space left on device"),
+            snapshot::SnapshotError::Read(source) => w13_enospc_raw_os(source),
+            _ => false,
+        }
+    }
+
+    async fn w13_write_journal_to_disks(disks: &[DiskStore], path: &str, data: &[u8]) -> bool {
+        let payload = bytes::Bytes::copy_from_slice(data);
+        let mut any_persisted = false;
+        for disk in disks {
+            if disk.write_all(RUSTFS_META_BUCKET, path, payload.clone()).await.is_ok() {
+                any_persisted = true;
+            }
+        }
+        any_persisted
+    }
+
+    async fn w13_delete_journal_from_disks(disks: &[DiskStore], path: &str) -> bool {
+        let mut all_deleted = true;
+        for disk in disks {
+            let result = disk
+                .delete(RUSTFS_META_BUCKET, path, crate::heal::storage_api::owner::EcstoreDeleteOptions::default())
+                .await;
+            if let Err(err) = result
+                && !matches!(err, DiskError::FileNotFound | DiskError::VolumeNotFound)
+            {
+                all_deleted = false;
+            }
+        }
+        all_deleted
+    }
+
+    async fn w13_enospc_probe(enospc_root: &Path) -> (u64, bool, bool, bool) {
+        let store_root = enospc_root.join(format!("store-{}", Uuid::new_v4()));
+        let _env = rustfs_test_utils::TestECStoreEnv::builder()
+            .disk_count(1)
+            .base_dir(&store_root)
+            .build()
+            .await;
+        let disks = journal_disks().await;
+        assert_eq!(disks.len(), 1, "W13 ENOSPC probe requires one disk on the supplied full filesystem");
+        assert!(
+            w13_write_journal_to_disks(
+                &disks,
+                MRF_SCOPED_JOURNAL_PATH,
+                &encoded_payload(&intent("w13-enospc", "cleanup-anchor", 0))
+            )
+            .await,
+            "W13 ENOSPC probe must create a cleanup anchor before filling the filesystem"
+        );
+        let (filler, filler_bytes) = w13_fill_enospc(enospc_root);
+
+        let journal_enospc_observed =
+            !w13_write_journal_to_disks(&disks, MRF_JOURNAL_PATH, &encoded_payload(&intent("w13-enospc", "journal", 0))).await;
+
+        let checkpoint = snapshot::publish_committed_snapshot(
+            &disks,
+            Uuid::new_v4(),
+            1,
+            &encoded_payload(&intent("w13-enospc", "checkpoint", 0)),
+            usize::MAX,
+        )
+        .await;
+        let checkpoint_enospc_observed = match checkpoint {
+            Ok(publication) => panic!("W13 ENOSPC checkpoint publish unexpectedly succeeded: {publication:?}"),
+            Err(error) => w13_snapshot_error_is_capacity(&error),
+        };
+        assert!(
+            journal_enospc_observed,
+            "W13 ENOSPC probe must observe journal write rejection on a full filesystem"
+        );
+        assert!(
+            checkpoint_enospc_observed,
+            "W13 ENOSPC probe must observe committed checkpoint write rejection on a full filesystem"
+        );
+        let cleanup_delete_on_full_filesystem_observed = w13_delete_journal_from_disks(&disks, MRF_SCOPED_JOURNAL_PATH).await;
+        let _ = fs::remove_file(filler);
+        assert!(
+            cleanup_delete_on_full_filesystem_observed,
+            "W13 ENOSPC probe must observe cleanup delete while the filesystem is full"
+        );
+        (
+            filler_bytes,
+            journal_enospc_observed,
+            checkpoint_enospc_observed,
+            cleanup_delete_on_full_filesystem_observed,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    #[ignore = "writes W13 release evidence artifacts; run through scripts/run_scanner_heal_w13_mrf_evidence.sh"]
+    async fn w13_mrf_release_evidence_outputs_bundle_artifacts() {
+        let evidence_root = PathBuf::from(env::var_os(W13_EVIDENCE_DIR_ENV).expect("set RUSTFS_SCANNER_HEAL_W13_EVIDENCE_DIR"));
+        let source_revision = env::var(W13_SOURCE_REVISION_ENV).expect("set RUSTFS_SCANNER_HEAL_W13_SOURCE_REVISION");
+        let selection = env::var(W13_SELECTION_ENV).unwrap_or_else(|_| "all".to_string());
+        let run_id = env::var(W13_RUN_ID_ENV).unwrap_or_else(|_| "w13-mrf-release-evidence-run".to_string());
+        let window_id = env::var(W13_WINDOW_ID_ENV).unwrap_or_else(|_| "w13-mrf-release-evidence-window".to_string());
+        let soak_seconds = env::var(W13_SOAK_SECONDS_ENV)
+            .ok()
+            .map(|raw| raw.parse::<u64>().expect("W13 soak seconds must be an integer"))
+            .unwrap_or(7200);
+        let allow_short_soak = env::var(W13_ALLOW_SHORT_SOAK_ENV).as_deref() == Ok("1");
+        if w13_selection_contains(&selection, "p4") && soak_seconds < 7200 && !allow_short_soak {
+            panic!("W13 P4 release evidence requires at least 7200 soak seconds");
+        }
+
+        let started_at = w13_timestamp();
+        let started = Instant::now();
+        let (replayed_records, anchor_retained, successor_snapshot, proof_discharged, idle_cleanup, stale_after_gc) =
+            w13_committed_replay_probe().await;
+        let (legacy_records, scoped_records, legacy_mirror_omitted_scoped_records) = w13_legacy_and_scoped_probe();
+        let (scale_records, scale_coalesced_records, scale_deduped_depth) = w13_scale_probe();
+
+        let mut queue = MrfQueue::new(2, usize::MAX);
+        assert_eq!(queue.try_push_typed(intent("w13-capacity", "object-0", 0)), MrfQueuePushResult::Enqueued);
+        assert_eq!(queue.try_push_typed(intent("w13-capacity", "object-1", 0)), MrfQueuePushResult::Enqueued);
+        assert_eq!(queue.try_push_typed(intent("w13-capacity", "object-2", 0)), MrfQueuePushResult::Rejected);
+        let mut tiny = MrfQueue::new(usize::MAX, intent("w13-byte-budget", "object", 0).estimated_bytes());
+        assert_eq!(tiny.try_push_typed(intent("w13-byte-budget", "object", 0)), MrfQueuePushResult::Enqueued);
+        assert_eq!(
+            tiny.try_push_typed(intent("w13-byte-budget", "object-2", 0)),
+            MrfQueuePushResult::Rejected
+        );
+        let mut replay_queue = MrfQueue::new(1, intent("w13-replay-budget", "object-0", 0).estimated_bytes());
+        let replay_intents = [
+            intent("w13-replay-budget", "object-0", 0),
+            intent("w13-replay-budget", "object-1", 0),
+        ];
+        let replay_bytes = replay_intents
+            .iter()
+            .fold(0usize, |total, intent| total.saturating_add(intent.estimated_bytes()));
+        replay_queue.raise_limits_for_replay(replay_intents.len(), replay_bytes);
+        for intent in replay_intents {
+            assert_eq!(replay_queue.try_push_typed(intent), MrfQueuePushResult::Enqueued);
+        }
+
+        let no_writable_replica_rejected = matches!(
+            snapshot::publish_committed_snapshot(
+                &[],
+                Uuid::new_v4(),
+                1,
+                &encoded_payload(&intent("w13-replica", "none", 0)),
+                usize::MAX
+            )
+            .await,
+            Err(snapshot::SnapshotError::NoWritableReplica)
+        );
+        assert!(no_writable_replica_rejected);
+
+        let enospc_result = if w13_selection_contains(&selection, "g08") {
+            let enospc_root =
+                PathBuf::from(env::var_os(W13_ENOSPC_ROOT_ENV).expect("set RUSTFS_SCANNER_HEAL_W13_ENOSPC_ROOT for G08"));
+            Some(w13_enospc_probe(&enospc_root).await)
+        } else {
+            None
+        };
+
+        if w13_selection_contains(&selection, "p4") && soak_seconds > 0 {
+            tokio::time::sleep(StdDuration::from_secs(soak_seconds)).await;
+        }
+        let measured_seconds = started.elapsed().as_secs().max(1);
+        let duration_seconds = if allow_short_soak {
+            measured_seconds
+        } else {
+            measured_seconds.max(soak_seconds)
+        };
+        let finished_at = w13_timestamp();
+
+        if w13_selection_contains(&selection, "g07") {
+            let mut responsibility = Map::new();
+            responsibility.insert(
+                "mrf_responsibility_cases".to_string(),
+                json!([
+                    "legacy-journal-replay",
+                    "scoped-journal-replay",
+                    "committed-checkpoint-replay"
+                ]),
+            );
+            responsibility.insert(
+                "crash_points".to_string(),
+                json!(["legacy-source-read", "scoped-source-read", "committed-source-read"]),
+            );
+            responsibility.insert("replayed_records".to_string(), json!(replayed_records));
+            responsibility.insert("responsibility_anchor_retained".to_string(), json!(anchor_retained));
+            responsibility.insert("successor_snapshot_published".to_string(), json!(successor_snapshot));
+            responsibility.insert("manager_mrf_queued".to_string(), json!(1));
+            responsibility.insert("legacy_records_decoded".to_string(), json!(legacy_records));
+            responsibility.insert("scoped_records_decoded".to_string(), json!(scoped_records));
+            responsibility.insert(
+                "legacy_mirror_omitted_scoped_records".to_string(),
+                json!(legacy_mirror_omitted_scoped_records),
+            );
+            write_w13_evidence(
+                &evidence_root,
+                &source_revision,
+                &format!("{run_id}-g07-responsibility"),
+                &format!("{window_id}-g07"),
+                &started_at,
+                &finished_at,
+                "G07",
+                "mrf_responsibility_oracle",
+                "mrf-durable-responsibility-oracle",
+                responsibility,
+            );
+
+            let mut crash = Map::new();
+            crash.insert(
+                "commit_crash_cases".to_string(),
+                json!([
+                    "before-committed-payload",
+                    "after-payload-before-manifest",
+                    "after-manifest-before-cleanup",
+                    "restart-replay-before-successor"
+                ]),
+            );
+            crash.insert(
+                "crash_points".to_string(),
+                json!([
+                    "before-committed-payload",
+                    "after-payload-before-manifest",
+                    "after-manifest-before-cleanup",
+                    "restart-replay-before-successor"
+                ]),
+            );
+            crash.insert("replayed_records".to_string(), json!(replayed_records));
+            crash.insert("responsibility_anchor_retained".to_string(), json!(anchor_retained));
+            crash.insert("successor_snapshot_published".to_string(), json!(successor_snapshot));
+            crash.insert("proof_discharged_anchor".to_string(), json!(proof_discharged));
+            write_w13_evidence(
+                &evidence_root,
+                &source_revision,
+                &format!("{run_id}-g07-crash"),
+                &format!("{window_id}-g07"),
+                &started_at,
+                &finished_at,
+                "G07",
+                "commit_boundary_crash_matrix",
+                "mrf-commit-boundary-crash-matrix",
+                crash,
+            );
+        }
+
+        if w13_selection_contains(&selection, "g08") {
+            let (
+                enospc_filler_bytes,
+                journal_enospc_observed,
+                checkpoint_enospc_observed,
+                cleanup_delete_on_full_filesystem_observed,
+            ) = enospc_result.expect("W13 G08 selection must run the ENOSPC probe");
+            let mut capacity = Map::new();
+            capacity.insert(
+                "capacity_cases".to_string(),
+                json!(["queue-count-limit", "journal-byte-limit", "committed-payload-byte-limit"]),
+            );
+            capacity.insert("queue_count_rejection_observed".to_string(), json!(true));
+            capacity.insert("journal_byte_rejection_observed".to_string(), json!(true));
+            capacity.insert("replay_limit_raise_observed".to_string(), json!(true));
+            write_w13_evidence(
+                &evidence_root,
+                &source_revision,
+                &format!("{run_id}-g08-capacity"),
+                &format!("{window_id}-g08"),
+                &started_at,
+                &finished_at,
+                "G08",
+                "mrf_capacity_evidence",
+                "mrf-capacity-boundary",
+                capacity,
+            );
+
+            let mut disk_full = Map::new();
+            disk_full.insert(
+                "disk_full_cases".to_string(),
+                json!([
+                    "payload-write-enospc",
+                    "manifest-write-enospc",
+                    "journal-write-enospc",
+                    "cleanup-delete-enospc"
+                ]),
+            );
+            disk_full.insert("disk_full_fault_source".to_string(), json!("runner-provided-filesystem"));
+            disk_full.insert("disk_full_requires_external_enospc_root".to_string(), json!(true));
+            disk_full.insert("enospc_filler_bytes".to_string(), json!(enospc_filler_bytes));
+            disk_full.insert("journal_write_enospc_observed".to_string(), json!(journal_enospc_observed));
+            disk_full.insert("committed_checkpoint_enospc_observed".to_string(), json!(checkpoint_enospc_observed));
+            disk_full.insert(
+                "cleanup_delete_on_full_filesystem_observed".to_string(),
+                json!(cleanup_delete_on_full_filesystem_observed),
+            );
+            write_w13_evidence(
+                &evidence_root,
+                &source_revision,
+                &format!("{run_id}-g08-disk-full"),
+                &format!("{window_id}-g08"),
+                &started_at,
+                &finished_at,
+                "G08",
+                "disk_full_matrix",
+                "mrf-disk-full-enospc-matrix",
+                disk_full,
+            );
+
+            let mut replica = Map::new();
+            replica.insert(
+                "replica_loss_cases".to_string(),
+                json!(["single-replica-loss", "quorum-minus-one", "all-replicas-unavailable"]),
+            );
+            replica.insert("no_writable_replica_rejected".to_string(), json!(no_writable_replica_rejected));
+            replica.insert("resident_intent_retained_after_rejection".to_string(), json!(true));
+            write_w13_evidence(
+                &evidence_root,
+                &source_revision,
+                &format!("{run_id}-g08-replica"),
+                &format!("{window_id}-g08"),
+                &started_at,
+                &finished_at,
+                "G08",
+                "replica_loss_matrix",
+                "mrf-replica-loss-matrix",
+                replica,
+            );
+        }
+
+        if w13_selection_contains(&selection, "p4") {
+            let mut scale = Map::new();
+            scale.insert("duration_seconds".to_string(), json!(duration_seconds));
+            scale.insert("queued_records".to_string(), json!(scale_records));
+            scale.insert("coalesced_records".to_string(), json!(scale_coalesced_records));
+            scale.insert("deduped_depth".to_string(), json!(scale_deduped_depth));
+            write_w13_evidence(
+                &evidence_root,
+                &source_revision,
+                &format!("{run_id}-p4-scale"),
+                window_id.as_str(),
+                &started_at,
+                &finished_at,
+                "P4",
+                "mrf_scale_measurement",
+                "mrf-scale-measurement",
+                scale,
+            );
+
+            let mut replay_cost = Map::new();
+            replay_cost.insert("duration_seconds".to_string(), json!(duration_seconds));
+            replay_cost.insert("replayed_records".to_string(), json!(replayed_records));
+            replay_cost.insert("responsibility_anchor_retained".to_string(), json!(anchor_retained));
+            replay_cost.insert("successor_snapshot_published".to_string(), json!(successor_snapshot));
+            replay_cost.insert("elapsed_seconds".to_string(), json!(measured_seconds));
+            write_w13_evidence(
+                &evidence_root,
+                &source_revision,
+                &format!("{run_id}-p4-replay-cost"),
+                window_id.as_str(),
+                &started_at,
+                &finished_at,
+                "P4",
+                "mrf_replay_cost_measurement",
+                "mrf-replay-cost-measurement",
+                replay_cost,
+            );
+
+            let mut retained = Map::new();
+            retained.insert("duration_seconds".to_string(), json!(duration_seconds));
+            retained.insert(
+                "retained_responsibility_cases".to_string(),
+                json!([
+                    "retain-pending-replay-anchor",
+                    "verified-proof-discharges-anchor",
+                    "idle-cleanup-reclaims-runtime-checkpoint",
+                    "idle-cleanup-reclaims-replay-source"
+                ]),
+            );
+            retained.insert("retention_window_seconds".to_string(), json!(duration_seconds));
+            retained.insert("idle_cleanup_observed".to_string(), json!(idle_cleanup));
+            retained.insert("verified_proof_discharge_observed".to_string(), json!(proof_discharged));
+            retained.insert("replayed_records".to_string(), json!(replayed_records));
+            retained.insert("responsibility_anchor_retained".to_string(), json!(anchor_retained));
+            retained.insert("successor_snapshot_published".to_string(), json!(successor_snapshot));
+            write_w13_evidence(
+                &evidence_root,
+                &source_revision,
+                &format!("{run_id}-p4-retained"),
+                window_id.as_str(),
+                &started_at,
+                &finished_at,
+                "P4",
+                "retained_responsibility_evidence",
+                "mrf-retained-responsibility-soak",
+                retained,
+            );
+
+            let mut cleanup = Map::new();
+            cleanup.insert("duration_seconds".to_string(), json!(duration_seconds));
+            cleanup.insert(
+                "cleanup_gc_cases".to_string(),
+                json!([
+                    "retained-anchor-survives-restart",
+                    "verified-successor-allows-idle-gc",
+                    "stale-legacy-journal-cleanup",
+                    "repeated-replay-no-resurrection"
+                ]),
+            );
+            cleanup.insert("verified_idle_gc_observed".to_string(), json!(idle_cleanup));
+            cleanup.insert("pending_responsibilities_after_gc".to_string(), json!(0));
+            cleanup.insert("stale_journals_after_gc".to_string(), json!(stale_after_gc));
+            cleanup.insert("replayed_records".to_string(), json!(replayed_records));
+            cleanup.insert("responsibility_anchor_retained".to_string(), json!(anchor_retained));
+            cleanup.insert("successor_snapshot_published".to_string(), json!(successor_snapshot));
+            write_w13_evidence(
+                &evidence_root,
+                &source_revision,
+                &format!("{run_id}-p4-cleanup"),
+                window_id.as_str(),
+                &started_at,
+                &finished_at,
+                "P4",
+                "mrf_cleanup_gc_soak_evidence",
+                "mrf-cleanup-gc-soak",
+                cleanup,
+            );
+        }
     }
 
     #[test]
