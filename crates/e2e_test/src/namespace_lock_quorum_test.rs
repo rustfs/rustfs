@@ -81,7 +81,7 @@ async fn test_degraded_cluster_read_quorum_follows_erasure_layout() -> TestResul
         let read_quorum = node_count - parity;
         let write_quorum = read_quorum + usize::from(read_quorum == parity);
         let mut cluster = RustFSTestClusterEnvironment::new(node_count).await?;
-        cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", &format!("EC:{parity}"));
+        cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", format!("EC:{parity}"));
         // Wait for every seed fanout before removing any physical shard.
         cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
         cluster.set_env("RUSTFS_OBS_METRICS_EXPORT_ENABLED", "false");
