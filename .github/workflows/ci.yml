@@ -1002,10 +1002,21 @@ jobs:
       # debug binary; each test spawns its own rustfs server on a random port.
       - name: Run e2e full suite
         env:
+          RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-full-logs
+          RUSTFS_HEAL_CHAOS_SERVER_RUST_LOG: rustfs::heal=debug,rustfs_heal=debug,rustfs_ecstore::disk=debug,rustfs_lock=debug,rustfs=error
           RUSTFS_E2E_STARTUP_CAS_BINARY: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs
           RUSTFS_E2E_STARTUP_CAS_BUILD_MANIFEST: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs.e2e-startup-cas-build.json
           RUSTFS_E2E_STARTUP_CAS_ARTIFACT_DIR: ${{ runner.temp }}/rustfs-startup-cas-evidence
         run: cargo nextest run --profile e2e-full -p e2e_test
+
+      - name: Upload e2e full diagnostics
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: e2e-full-diagnostics-${{ github.run_number }}
+          path: ${{ runner.temp }}/rustfs-e2e-full-logs/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload junit
         if: always()

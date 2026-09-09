@@ -1581,7 +1581,19 @@ mod tests {
                 }
             }
             if Instant::now() >= heal_deadline {
-                let matching = matching_manifest_count(&replaced_disk, bucket, &expected_manifests)?;
+                let mut mismatched_manifests = Vec::new();
+                for expected in &expected_manifests {
+                    let actual = census_object_version_on_disk(&replaced_disk, bucket, &expected.key, None)?;
+                    if !actual.matches_manifest(&expected.shard_census) {
+                        mismatched_manifests.push(serde_json::json!({
+                            "key": expected.key,
+                            "expected": expected.shard_census,
+                            "actual": actual,
+                        }));
+                    }
+                }
+                let matching = expected_manifests.len() - mismatched_manifests.len();
+                let mismatched_manifests = serde_json::Value::Array(mismatched_manifests);
                 let outage_census = census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?;
                 let pool_metadata =
                     census_object_version_on_disk(&replaced_disk, RUSTFS_META_BUCKET, POOL_METADATA_OBJECT, None)?;
@@ -1604,7 +1616,7 @@ mod tests {
                     Err(_) => "replacement status request exceeded 5s diagnostic budget".to_string(),
                 };
                 return Err(format!(
-                    "root heal did not recover after {interruption_kind} within {heal_timeout_secs}s: baseline={matching}/{}, outage={outage_census:?}, pool_metadata={pool_metadata:?}, status={final_status}, task_status={task_status}, pre_interrupt_status={pre_interrupt_status}, pre_heal_replacement={pre_heal_replacement}, pre_interrupt_replacement={pre_interrupt_replacement}, replacement_status={replacement_status}",
+                    "root heal did not recover after {interruption_kind} within {heal_timeout_secs}s: baseline={matching}/{}, mismatched_manifests={mismatched_manifests}, outage={outage_census:?}, pool_metadata={pool_metadata:?}, status={final_status}, task_status={task_status}, pre_interrupt_status={pre_interrupt_status}, pre_heal_replacement={pre_heal_replacement}, pre_interrupt_replacement={pre_interrupt_replacement}, replacement_status={replacement_status}",
                     expected_manifests.len()
                 )
                 .into());
