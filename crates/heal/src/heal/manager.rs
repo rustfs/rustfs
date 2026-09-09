@@ -1366,6 +1366,51 @@ impl HealManager {
         });
     }
 
+    async fn start_root_recovery_terminal_gc(&self) {
+        let cancel = self.cancel_token.clone();
+        let root_recovery = self.root_recovery.clone();
+        tokio::spawn(async move {
+            let mut ticker = interval(RESUME_GC_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        match root_recovery.gc_terminal_receipts_once(SystemTime::now()).await {
+                            Ok(report) => {
+                                if report.pending_removed > 0 || report.terminals_removed > 0 || report.budget_exhausted {
+                                    debug!(
+                                        target: "rustfs::heal::manager",
+                                        event = EVENT_HEAL_RESUME_GC,
+                                        component = LOG_COMPONENT_HEAL,
+                                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                                        state = "root_terminal_gc",
+                                        scanned = report.scanned,
+                                        retained = report.retained,
+                                        pending_removed = report.pending_removed,
+                                        terminals_removed = report.terminals_removed,
+                                        budget_exhausted = report.budget_exhausted,
+                                        "Root heal terminal receipt GC inspected durable state"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                warn!(
+                                    target: "rustfs::heal::manager",
+                                    event = EVENT_HEAL_RESUME_GC,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                                    state = "root_terminal_gc_failed",
+                                    error = %error,
+                                    "Root heal terminal receipt GC failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Create new HealManager
     pub fn new(storage: Arc<dyn HealStorageAPI>, config: Option<HealConfig>) -> Self {
         Self::new_with_workload_provider(storage, config, None)
@@ -1453,6 +1498,7 @@ impl HealManager {
 
         // Inspect resume artifacts in a bounded, fail-closed background task.
         self.start_resume_gc().await;
+        self.start_root_recovery_terminal_gc().await;
 
         // start auto disk scanner to heal unformatted disks
         if self.config.read().await.enable_auto_heal {
