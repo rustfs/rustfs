@@ -10,6 +10,7 @@ from decimal import Decimal
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import sys
 from typing import Any
 
@@ -518,9 +519,18 @@ def profile_wrapper_artifact(
     window_id: str,
     kind: str,
     path: Path,
+    profile_measurements: dict[str, Any],
 ) -> dict[str, Any]:
+    required_metrics = {
+        "allocation-profile": ("resolved_samples", "allocation_bytes"),
+        "flamegraph": ("resolved_samples",),
+        "rss-samples": ("resolved_samples", "rss_peak_bytes"),
+        "save-frequency": ("resolved_samples", "save_operations", "saved_bytes"),
+    }[kind]
+    raw_artifact = artifact_dir / f"P1-profile_evidence-{kind}.raw{path.suffix}"
+    shutil.copyfile(path, raw_artifact)
     wrapper = artifact_dir / f"P1-profile_evidence-{kind}.json"
-    write_json(wrapper, {
+    payload = {
         "schema": 1,
         "evidence_type": "measured",
         "source_revision": source_revision,
@@ -530,9 +540,14 @@ def profile_wrapper_artifact(
         "field": "profile_evidence",
         "artifact_kind": kind,
         "raw_profile_name": path.name,
-        "raw_profile_sha256": digest(path),
-        "raw_profile_bytes": path.stat().st_size,
-    })
+        "raw_profile_artifact": raw_artifact.relative_to(artifact_dir.parent).as_posix(),
+        "raw_profile_sha256": digest(raw_artifact),
+        "raw_profile_bytes": raw_artifact.stat().st_size,
+        "raw_profile_format": path.suffix.lower().lstrip(".") or "binary",
+    }
+    for metric in required_metrics:
+        payload[metric] = require_integer(profile_measurements.get(metric), metric, 1)
+    write_json(wrapper, payload)
     return {
         "artifact": wrapper.relative_to(artifact_dir.parent).as_posix(),
         "sha256": digest(wrapper),
@@ -606,6 +621,13 @@ def write_release_bundle_descriptor(args: argparse.Namespace, summary: dict[str,
     require(isinstance(profile, dict), "missing release_evidence.profile")
     profile_measurements = profile.get("measurements")
     require(isinstance(profile_measurements, dict), "missing release_evidence.profile.measurements")
+    profile_costs = {
+        "resolved_samples": require_integer(profile_measurements.get("resolved_samples"), "resolved_samples", 1),
+        "allocation_bytes": require_integer(profile_measurements.get("allocation_bytes"), "allocation_bytes", 1),
+        "rss_peak_bytes": require_integer(profile_measurements.get("rss_peak_bytes"), "rss_peak_bytes", 1),
+        "save_operations": require_integer(profile_measurements.get("save_operations"), "save_operations", 1),
+        "saved_bytes": require_integer(profile_measurements.get("saved_bytes"), "saved_bytes", 1),
+    }
     profile_artifacts = profile_artifact_map(args.release_profile_artifact)
 
     descriptor = args.release_bundle_descriptor_out
@@ -735,14 +757,10 @@ def write_release_bundle_descriptor(args: argparse.Namespace, summary: dict[str,
                     artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
                     "P1", "profile_evidence", "Measured allocation, RSS, save-frequency, and flamegraph profile evidence.",
                     {
-                        "resolved_samples": require_integer(profile_measurements.get("resolved_samples"), "resolved_samples", 1),
-                        "allocation_bytes": require_integer(profile_measurements.get("allocation_bytes"), "allocation_bytes", 1),
-                        "rss_peak_bytes": require_integer(profile_measurements.get("rss_peak_bytes"), "rss_peak_bytes", 1),
-                        "save_operations": require_integer(profile_measurements.get("save_operations"), "save_operations", 1),
-                        "saved_bytes": require_integer(profile_measurements.get("saved_bytes"), "saved_bytes", 1),
+                        **profile_costs,
                         "profile_artifacts": {
                             kind: profile_wrapper_artifact(
-                                artifact_dir, source_revision, run_id, window_id, kind, path
+                                artifact_dir, source_revision, run_id, window_id, kind, path, profile_costs
                             )
                             for kind, path in sorted(profile_artifacts.items())
                         },
