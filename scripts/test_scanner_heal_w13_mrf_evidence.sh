@@ -55,3 +55,4 @@ if bash "$RUNNER" --plan-only --test p4 --soak-seconds 10 >/dev/null 2>&1; then
 fi
 
 bash "$RUNNER" --self-test
+"$PROJECT_ROOT/scripts/python_bin.sh" "$PROJECT_ROOT/scripts/run_scanner_heal_mrf_evidence.py" --self-test

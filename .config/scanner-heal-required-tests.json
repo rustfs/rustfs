@@ -171,7 +171,11 @@
       "lane": "authority-coverage",
       "status": "pending",
       "description": "Complete root and quota authority coverage",
-      "requires": ["root authority evidence", "quota authority evidence"]
+      "requires": ["root authority evidence", "quota authority evidence"],
+      "evidence_fields": [
+        "root_authority_evidence",
+        "quota_authority_evidence"
+      ]
     },
     {
       "gate": "G02",
@@ -179,7 +183,11 @@
       "lane": "checkpoint-and-crash",
       "status": "pending",
       "description": "Bounded checkpoint progress and independent version inventory",
-      "requires": ["bounded checkpoint oracle", "independent version inventory"]
+      "requires": ["bounded checkpoint oracle", "independent version inventory"],
+      "evidence_fields": [
+        "bounded_checkpoint_oracle",
+        "independent_version_inventory"
+      ]
     },
     {
       "gate": "G03",
@@ -201,7 +209,11 @@
       "lane": "checkpoint-and-crash",
       "status": "pending",
       "description": "Crash at every cache, root, floor and intent boundary",
-      "requires": ["cache boundary crash evidence", "root/floor/intent crash evidence"]
+      "requires": ["cache boundary crash evidence", "root/floor/intent crash evidence"],
+      "evidence_fields": [
+        "cache_boundary_crash_evidence",
+        "root_floor_intent_crash_evidence"
+      ]
     },
     {
       "gate": "G05",
@@ -272,7 +284,11 @@
       "lane": "scheduler-pressure",
       "status": "pending",
       "description": "Bounded scheduling and pressure recovery",
-      "requires": ["scheduler bound evidence", "pressure recovery evidence"]
+      "requires": ["scheduler bound evidence", "pressure recovery evidence"],
+      "evidence_fields": [
+        "scheduler_bound_evidence",
+        "pressure_recovery_evidence"
+      ]
     },
     {
       "gate": "G11",
@@ -297,7 +313,11 @@
       "lane": "authority-coverage",
       "status": "pending",
       "description": "Both quota paths during reset and settlement",
-      "requires": ["reset quota-path evidence", "settlement quota-path evidence"]
+      "requires": ["reset quota-path evidence", "settlement quota-path evidence"],
+      "evidence_fields": [
+        "reset_quota_path_evidence",
+        "settlement_quota_path_evidence"
+      ]
     },
     {
       "gate": "G13",
@@ -305,7 +325,12 @@
       "lane": "maintenance-producers",
       "status": "pending",
       "description": "Quorum-minus-one, unknown disks, remount, Object Lock, dry-run, grace and commit tail",
-      "requires": ["quorum-minus-one matrix", "unknown-disk/remount matrix", "Object Lock dry-run grace evidence"]
+      "requires": ["quorum-minus-one matrix", "unknown-disk/remount matrix", "Object Lock dry-run grace evidence"],
+      "evidence_fields": [
+        "quorum_minus_one_matrix",
+        "unknown_disk_remount_matrix",
+        "object_lock_dry_run_grace_evidence"
+      ]
     },
     {
       "gate": "G14",
@@ -334,7 +359,12 @@
       "lane": "scheduler-pressure",
       "status": "pending",
       "description": "Measured cold-walk share and foreground latency/throughput",
-      "requires": ["cold-walk share measurement", "foreground latency/throughput measurement"]
+      "requires": ["cold-walk share measurement", "foreground latency/throughput measurement"],
+      "evidence_fields": [
+        "cold_walk_share_measurement",
+        "foreground_latency_throughput_measurement",
+        "profile_evidence"
+      ]
     },
     {
       "gate": "P2",
@@ -354,7 +384,12 @@
       "lane": "scheduler-pressure",
       "status": "pending",
       "description": "Measured two-hour pressure/heal capacity and recovery window",
-      "requires": ["two-hour pressure measurement", "heal capacity measurement", "recovery-window measurement"]
+      "requires": ["two-hour pressure measurement", "heal capacity measurement", "recovery-window measurement"],
+      "evidence_fields": [
+        "two_hour_pressure_measurement",
+        "heal_capacity_measurement",
+        "recovery_window_measurement"
+      ]
     },
     {
       "gate": "P4",
@@ -376,7 +411,12 @@
       "lane": "checkpoint-and-crash",
       "status": "pending",
       "description": "Fixed-budget real process restart through enumeration and classification",
-      "requires": ["fixed-budget restart evidence", "enumeration evidence", "classification evidence"]
+      "requires": ["fixed-budget restart evidence", "enumeration evidence", "classification evidence"],
+      "evidence_fields": [
+        "fixed_budget_restart_evidence",
+        "enumeration_evidence",
+        "classification_evidence"
+      ]
     },
     {
       "gate": "R-D",
@@ -398,7 +438,12 @@
       "lane": "mixed-version-rollback",
       "status": "pending",
       "description": "Legacy source conflicts, migration gaps and crash-safe source retirement",
-      "requires": ["legacy source-conflict evidence", "migration-gap evidence", "crash-safe source retirement evidence"]
+      "requires": ["legacy source-conflict evidence", "migration-gap evidence", "crash-safe source retirement evidence"],
+      "evidence_fields": [
+        "legacy_source_conflict_evidence",
+        "migration_gap_evidence",
+        "crash_safe_source_retirement_evidence"
+      ]
     }
   ]
 }

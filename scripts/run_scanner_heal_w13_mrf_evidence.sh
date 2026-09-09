@@ -305,104 +305,13 @@ PY
 
 write_release_descriptor() {
     local source_revision="$1"
-    "$PYTHON_BIN" - "$ROOT" "$RUN_DIR" "$source_revision" "$TEST_SELECTION" <<'PY'
-import hashlib
-import json
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1])
-run_dir = pathlib.Path(sys.argv[2])
-source_revision = sys.argv[3]
-selection = sys.argv[4]
-descriptor = run_dir / "release-bundle-w13.json"
-registry = json.loads((root / ".config/scanner-heal-required-tests.json").read_text())
-requirements = {item["gate"]: item for item in registry["release_requirements"]}
-artifacts = {
-    "G07": {
-        "mrf_responsibility_oracle": run_dir / "g07-mrf-responsibility" / "G07-mrf_responsibility_oracle.json",
-        "commit_boundary_crash_matrix": run_dir / "g07-mrf-responsibility" / "G07-commit_boundary_crash_matrix.json",
-    },
-    "G08": {
-        "mrf_capacity_evidence": run_dir / "g08-mrf-capacity" / "G08-mrf_capacity_evidence.json",
-        "disk_full_matrix": run_dir / "g08-mrf-capacity" / "G08-disk_full_matrix.json",
-        "replica_loss_matrix": run_dir / "g08-mrf-capacity" / "G08-replica_loss_matrix.json",
-    },
-    "P4": {
-        "mrf_scale_measurement": run_dir / "p4-mrf-soak" / "P4-mrf_scale_measurement.json",
-        "mrf_replay_cost_measurement": run_dir / "p4-mrf-soak" / "P4-mrf_replay_cost_measurement.json",
-        "retained_responsibility_evidence": run_dir / "p4-mrf-soak" / "P4-retained_responsibility_evidence.json",
-        "mrf_cleanup_gc_soak_evidence": run_dir / "p4-mrf-soak" / "P4-mrf_cleanup_gc_soak_evidence.json",
-    },
-}
-if selection == "g07":
-    artifacts = {"G07": artifacts["G07"]}
-elif selection == "g08":
-    artifacts = {"G08": artifacts["G08"]}
-elif selection == "p4":
-    artifacts = {"P4": artifacts["P4"]}
-
-mirrors = {
-    ("G07", "mrf_responsibility_oracle"): ("crash_points", "mrf_responsibility_cases", "replayed_records", "responsibility_anchor_retained", "successor_snapshot_published"),
-    ("G07", "commit_boundary_crash_matrix"): ("crash_points", "commit_crash_cases", "replayed_records", "responsibility_anchor_retained", "successor_snapshot_published"),
-    ("G08", "mrf_capacity_evidence"): ("capacity_cases",),
-    ("G08", "disk_full_matrix"): ("disk_full_cases",),
-    ("G08", "replica_loss_matrix"): ("replica_loss_cases",),
-    ("P4", "mrf_replay_cost_measurement"): ("duration_seconds", "replayed_records", "responsibility_anchor_retained", "successor_snapshot_published"),
-    ("P4", "retained_responsibility_evidence"): ("duration_seconds", "retained_responsibility_cases", "retention_window_seconds", "idle_cleanup_observed", "verified_proof_discharge_observed", "replayed_records", "responsibility_anchor_retained", "successor_snapshot_published"),
-    ("P4", "mrf_cleanup_gc_soak_evidence"): ("duration_seconds", "cleanup_gc_cases", "verified_idle_gc_observed", "pending_responsibilities_after_gc", "stale_journals_after_gc", "replayed_records", "responsibility_anchor_retained", "successor_snapshot_published"),
-}
-
-def digest(path: pathlib.Path) -> str:
-    hasher = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-def relative_to_descriptor(path: pathlib.Path) -> str:
-    return path.resolve(strict=True).relative_to(descriptor.parent.resolve()).as_posix()
-
-gates: dict[str, object] = {}
-for gate, gate_artifacts in artifacts.items():
-    fields: dict[str, object] = {}
-    for field, artifact in gate_artifacts.items():
-        payload = json.loads(artifact.read_text())
-        if payload.get("source_revision") != source_revision:
-            raise SystemExit(f"{gate}.{field}: source revision does not match this checkout")
-        evidence = {
-            "artifact": relative_to_descriptor(artifact),
-            "sha256": digest(artifact),
-            "evidence_type": "measured",
-            "source_revision": source_revision,
-            "run_id": payload["run_id"],
-            "measurement_window_id": payload["measurement_window_id"],
-            "started_at": payload["started_at"],
-            "finished_at": payload["finished_at"],
-            "command": payload["command"],
-            "artifact_format": "json",
-            "summary": payload["summary"],
-        }
-        for mirror in mirrors.get((gate, field), ()):
-            evidence[mirror] = payload[mirror]
-        if gate == "P4" and field == "mrf_scale_measurement":
-            evidence["duration_seconds"] = payload["duration_seconds"]
-        fields[field] = evidence
-    gates[gate] = {
-        "status": "pass",
-        "lane": requirements[gate]["lane"],
-        "evidence_type": "measured",
-        "evidence_fields": fields,
-    }
-
-descriptor.write_text(json.dumps({
-    "schema": 1,
-    "evidence": "measured",
-    "source_revision": source_revision,
-    "gates": gates,
-}, indent=2, sort_keys=True) + "\n")
-print(descriptor)
-PY
+    local descriptor="$RUN_DIR/release-bundle-w13.json"
+    "$PYTHON_BIN" "$ROOT/scripts/run_scanner_heal_mrf_evidence.py" \
+        --run-dir "$RUN_DIR" \
+        --out-file "$descriptor" \
+        --source-revision "$source_revision" \
+        --test "$TEST_SELECTION" >&2
+    printf '%s\n' "$descriptor"
 }
 
 run_self_test() {

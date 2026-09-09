@@ -423,7 +423,7 @@ for gate, gate_artifacts in artifacts.items():
             "artifact_format": "json",
             "summary": payload["summary"],
         }
-        for mirror in ("crash_points", "durable_intent_cases", "persist_failure_blocks_acceptance"):
+        for mirror in ("crash_points", "durable_intent_cases", "persist_failure_blocks_acceptance", "quota_path_cases"):
             if mirror in payload:
                 evidence[mirror] = payload[mirror]
         fields[field] = evidence

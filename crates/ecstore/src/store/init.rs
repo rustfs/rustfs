@@ -12807,11 +12807,25 @@ mod tests {
     #[test]
     #[serial_test::serial(storage_class_env)]
     fn legacy_transition_state_inspection_and_apply_keep_all_disk_copies_unchanged() {
-        run_large_stack_async_test("legacy-state-reconcile-inspection", legacy_transition_state_inspection_and_apply_case);
+        run_large_stack_async_test("legacy-state-reconcile-inspection", || {
+            legacy_transition_state_inspection_and_apply_case(false)
+        });
     }
 
     #[cfg(feature = "test-util")]
-    async fn legacy_transition_state_inspection_and_apply_case() {
+    #[cfg(not(windows))]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn legacy_transition_state_backfill_retries_partial_commits_and_preserves_other_bytes() {
+        run_large_stack_async_test("legacy-state-reconcile-backfill", || {
+            legacy_transition_state_inspection_and_apply_case(true)
+        });
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn legacy_transition_state_inspection_and_apply_case(write_enabled: bool) {
+        #[cfg(windows)]
+        assert!(!write_enabled, "Windows supports inspection but cannot prove repair directory durability");
         use crate::bucket::lifecycle::legacy_transition_state_reconcile::{
             LegacyTransitionStateReconcileOutcome as Outcome, LegacyTransitionStateReconcileRequest,
             LegacyTransitionStateReconcileSelector,
@@ -12923,6 +12937,187 @@ mod tests {
                 target,
                 reconciliation_digest: inspected.reconciliation_digest.expect("expected tuple digest"),
             };
+            #[cfg(not(windows))]
+            if write_enabled {
+                crate::services::notification_sys::with_legacy_transition_state_fleet_proof_for_test(async {
+                    crate::disk::local::bucket_durability::set(bucket, Some(crate::disk::local::DurabilityMode::None));
+                    let unsynced = store.reconcile_legacy_transition_state(request.clone()).await;
+                    crate::disk::local::bucket_durability::set(bucket, None);
+                    let unsynced = unsynced.expect("repair without metadata durability");
+                    assert_eq!(unsynced.outcome, Outcome::BackendUnavailable);
+                    assert!(!unsynced.changed);
+                    let rollback = paths[0].parent().expect("object directory").join(Uuid::new_v4().to_string());
+                    tokio::fs::create_dir(&rollback).await.expect("pending rollback directory");
+                    tokio::fs::write(rollback.join(crate::disk::STORAGE_FORMAT_FILE_BACKUP), &original[0])
+                        .await
+                        .expect("pending old metadata backup");
+                    let unsettled = store.reconcile_legacy_transition_state(request.clone()).await;
+                    tokio::fs::remove_dir_all(&rollback).await.expect("settle fixture rollback");
+                    let unsettled = unsettled.expect("repair must wait for rollback");
+                    assert_eq!(unsettled.outcome, Outcome::BackendUnavailable);
+                    assert!(!unsettled.changed);
+                    for (path, bytes) in paths.iter().zip(&original) {
+                        assert_eq!(tokio::fs::read(path).await.expect("blocked repair leaves original bytes"), *bytes);
+                    }
+                    // The first disk commits; the second stops after staging.
+                    // This models an interrupted cross-disk effect without rollback.
+                    let disks = store.all_set_disks()[0].disk_inventory().await;
+                    let first_disk = disks[0].as_ref().expect("first physical disk");
+                    let publication_path = first_disk
+                        .get_object_path_for_io_if_local(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+                        .expect("local disk")
+                        .expect("publication path");
+                    let crash_key = format!("{object}/{STORAGE_FORMAT_FILE}");
+                    let _hook = crate::disk::os::prepared_publication_test_hooks::install_at(
+                        crate::disk::os::prepared_publication_test_hooks::Stage::Rename,
+                        &publication_path,
+                        move || {
+                            crate::crash_inject::arm(crate::crash_inject::CrashPoint::MetaWriteAfterTmpBeforeRename, &crash_key);
+                        },
+                    );
+                    let partial = store
+                        .reconcile_legacy_transition_state(request.clone())
+                        .await
+                        .expect("partial repair response");
+                    assert_eq!(partial.outcome, Outcome::BackendUnavailable, "{partial:?}");
+                    assert!(partial.changed, "first copy was committed: {partial:?}");
+                    assert!(partial.changes_indeterminate);
+                    assert_ne!(tokio::fs::read(&paths[0]).await.expect("first committed copy"), original[0]);
+                    for (path, bytes) in paths[1..].iter().zip(&original[1..]) {
+                        assert_eq!(tokio::fs::read(path).await.expect("uncommitted copy"), *bytes);
+                    }
+                    assert!(
+                        store.all_set_disks()[0]
+                            .load_file_info_versions_exact(bucket, object)
+                            .await
+                            .is_err(),
+                        "cleanup cannot select a partial repair subset"
+                    );
+                    let repaired = store
+                        .reconcile_legacy_transition_state(request.clone())
+                        .await
+                        .expect("retry original snapshot");
+                    assert_eq!(repaired.outcome, Outcome::Migrated, "{repaired:?}");
+                    assert!(repaired.changed);
+                    assert!(!repaired.changes_indeterminate);
+                    let mut committed = Vec::new();
+                    for (path, original) in paths.iter().zip(&original) {
+                        let raw = tokio::fs::read(path).await.expect("repaired copy");
+                        let metadata = FileMeta::load(&raw).expect("decode repaired copy");
+                        let previous = FileMeta::load(original).expect("decode original copy");
+                        assert_eq!(
+                            metadata.transition_reconcile_generation(None).unwrap(),
+                            previous.transition_reconcile_generation(None).unwrap()
+                        );
+                        let (_, version) = metadata.find_version(None).expect("selected version");
+                        let info = version.into_fileinfo(bucket, object, true).expect("repaired FileInfo");
+                        assert_eq!(info.transition_version_state, expected_state);
+                        assert_eq!(info.transition_version, request.target.remote_version);
+                        committed.push(raw);
+                    }
+                    assert!(
+                        store.all_set_disks()[0]
+                            .load_file_info_versions_exact(bucket, object)
+                            .await
+                            .expect("converged cleanup snapshot")
+                            .is_some()
+                    );
+                    let replay = store
+                        .reconcile_legacy_transition_state(request.clone())
+                        .await
+                        .expect("idempotent original request replay");
+                    assert_eq!(replay.outcome, Outcome::Migrated, "{replay:?}");
+                    assert!(!replay.changed);
+                    for (path, expected) in paths.iter().zip(&committed) {
+                        assert_eq!(
+                            tokio::fs::read(path).await.expect("replayed copy"),
+                            *expected,
+                            "idempotence preserves raw encoding"
+                        );
+                    }
+                    for (path, bytes) in paths.iter().zip(&original) {
+                        tokio::fs::write(path, bytes)
+                            .await
+                            .expect("reset independent cancellation fixture");
+                    }
+                    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+                    let (release, released) = std::sync::mpsc::channel::<()>();
+                    let _pause = crate::disk::os::prepared_publication_test_hooks::install_at(
+                        crate::disk::os::prepared_publication_test_hooks::Stage::Rename,
+                        &publication_path,
+                        move || {
+                            let _ = entered_tx.send(());
+                            let _ = released.recv();
+                        },
+                    );
+                    let mut repair = Box::pin(store.reconcile_legacy_transition_state(request.clone()));
+                    tokio::select! {
+                        result = &mut repair => panic!("repair completed before publication pause: {result:?}"),
+                        result = entered => result.expect("publication executor entered"),
+                    }
+                    let update_options = crate::disk::UpdateMetadataOpts::default();
+                    let mut update = Box::pin(first_disk.update_metadata(
+                        bucket,
+                        object,
+                        FileInfo {
+                            metadata: HashMap::from([("x-amz-meta-concurrent".to_string(), "kept".to_string())]),
+                            ..Default::default()
+                        },
+                        &update_options,
+                    ));
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_millis(25), update.as_mut())
+                            .await
+                            .is_err(),
+                        "another metadata RMW must wait for publication"
+                    );
+                    drop(repair);
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_millis(25), update.as_mut())
+                            .await
+                            .is_err(),
+                        "cancelling the coordinator must not release an in-flight disk mutation"
+                    );
+                    release.send(()).expect("resume owned publication");
+                    update.await.expect("serialized metadata update");
+                    let raw = tokio::fs::read(&paths[0])
+                        .await
+                        .expect("cancelled repair and later metadata update");
+                    let (_, version) = FileMeta::load(&raw)
+                        .expect("metadata after cancellation")
+                        .find_version(None)
+                        .expect("selected version");
+                    let info = version
+                        .into_fileinfo(bucket, object, true)
+                        .expect("metadata after serialized update");
+                    assert_eq!(info.transition_version_state, expected_state);
+                    assert_eq!(info.metadata.get("x-amz-meta-concurrent").map(String::as_str), Some("kept"));
+                    let stale = store
+                        .reconcile_legacy_transition_state(request.clone())
+                        .await
+                        .expect("stale original request");
+                    assert_eq!(
+                        stale.outcome,
+                        Outcome::Corrupt,
+                        "unrelated metadata change invalidates the original generation: {stale:?}"
+                    );
+                    assert!(!stale.changed);
+                    assert_eq!(tokio::fs::read(&paths[0]).await.expect("stale write leaves bytes unchanged"), raw);
+                    assert_eq!(backend.remove_count().await, 0);
+                    // A pinned version probe uses GET to verify that exact
+                    // candidate; every backend operation still targets it.
+                    let operations = backend.op_log().await;
+                    assert!(
+                        operations.iter().all(|operation| match operation {
+                            MockWarmOp::Probe { object } | MockWarmOp::Get { object } => object == &request.source.remote_object,
+                            _ => false,
+                        }),
+                        "unexpected backend effects: {operations:?}"
+                    );
+                })
+                .await;
+                continue;
+            }
             let mut tampered = request.clone();
             tampered.source.remote_object.push_str("-other");
             let probes_before = backend.op_log().await.len();
