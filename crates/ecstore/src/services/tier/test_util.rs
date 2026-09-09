@@ -653,6 +653,26 @@ impl MockWarmBackend {
 
 #[async_trait]
 impl WarmBackend for MockWarmBackend {
+    async fn probe_legacy_metadata(
+        &self,
+        object: &str,
+        remote_version: Option<&str>,
+    ) -> Result<super::warm_backend::LegacyTransitionStateProbe, std::io::Error> {
+        use super::warm_backend::LegacyTransitionStateProbe as Probe;
+        let candidate = match remote_version {
+            Some(version) if !version.is_empty() => self.probe_transition_version(object, version).await?,
+            _ => self.probe_transition_candidate(object).await?,
+        };
+        Ok(match candidate {
+            TransitionCandidateProbe::Missing => Probe::Missing,
+            TransitionCandidateProbe::UnversionedPresent => Probe::UnversionedPresent,
+            TransitionCandidateProbe::VersionedPresent(version) if version == "null" => Probe::SuspendedNullPresent,
+            TransitionCandidateProbe::VersionedPresent(version) => Probe::VersionedPresent(version),
+            TransitionCandidateProbe::Ambiguous => Probe::Ambiguous,
+            TransitionCandidateProbe::Unsupported => Probe::Unsupported,
+        })
+    }
+
     fn validate_remote_version_id(&self, remote_version_id: &str) -> Result<(), std::io::Error> {
         if remote_version_id.is_empty() {
             return Ok(());
@@ -874,8 +894,9 @@ pub async fn register_mock_tier_backend(handle: &Arc<RwLock<TierConfigMgr>>, tie
             ..Default::default()
         },
     );
-    tier_config_mgr
-        .install_test_driver(tier_name, Box::new(backend))
+    drop(tier_config_mgr);
+    TierConfigMgr::install_test_driver_in(handle, tier_name, Box::new(backend))
+        .await
         .expect("mock tier driver should install");
 }
 

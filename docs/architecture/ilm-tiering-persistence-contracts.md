@@ -522,7 +522,7 @@ The following single-record protocol approves how historical objects without Rus
 
 ### Current
 
-An absent `transitioned-version-state` key decodes as `TransitionVersionState::Unknown`. The current GET and free-version cleanup paths reject that state rather than interpreting an empty remote version as unversioned. There is no admin route that repairs this field in `xl.meta`. The existing transition-transaction reconcile route operates on expired `UploadOutcomeUnknown` transaction records and can exact-delete their canonical candidates; it is a separate protocol and must not be reused for metadata reconciliation.
+An absent `transitioned-version-state` key decodes as `TransitionVersionState::Unknown`. Non-destructive compatibility reads distinguish legacy absence from explicit `Unknown`; empty-version reads require a bounded probe. Legacy free-version cleanup requires a persisted exact remote version and does not infer unversioned deletion from an empty field. The single-record Admin routes below now inspect physical copies and live remote-version evidence. They do not yet persist repaired state: POST reports `write_fence_unavailable` until conditional per-generation metadata writes and the dedicated fleet capability are available. The existing transition-transaction reconcile route operates on expired `UploadOutcomeUnknown` transaction records and can exact-delete their canonical candidates; it is a separate protocol and must not be reused for metadata reconciliation.
 
 An explicitly persisted `unknown`, a malformed state, conflicting RustFS/MinIO compatibility keys, an invalid or nil version identifier, and a partial transition tuple are not legacy absence. They remain invalid or ambiguous and fail closed.
 
