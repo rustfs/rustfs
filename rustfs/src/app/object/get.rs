@@ -4093,6 +4093,7 @@ impl DefaultObjectUsecase {
         let prepared_read = match prepared_read {
             Ok(prepared_read) => prepared_read,
             Err(err) => {
+                let err = enrich_delete_marker_read_error(&store, &bucket, &key, &opts, err).await;
                 lifecycle.finish_err();
                 return Self::complete_get_object_error(helper.version_id(version_id_for_event), err);
             }
