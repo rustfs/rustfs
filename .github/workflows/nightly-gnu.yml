@@ -19,17 +19,27 @@ on:
     - cron: "7 0 * * *"
       timezone: "Asia/Shanghai"
   workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch/ref to build and publish as the nightly (empty = scheduled source, see NIGHTLY_BUILD_REF)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
 
+# Scheduled builds follow the NIGHTLY_BRANCH repo variable so the channel can
+# be pointed at e.g. `release` for the GA cycle and back to `main` afterwards
+# without touching this file. Manual runs take the `branch` input, falling
+# back to the branch the run was dispatched from.
 concurrency:
-  group: nightly-gnu-build-main-${{ github.event_name }}
+  group: nightly-gnu-build-${{ github.event_name }}-${{ github.event_name == 'schedule' && (vars.NIGHTLY_BRANCH || 'main') || (inputs.branch || github.ref_name) }}
   cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  NIGHTLY_BUILD_REF: ${{ github.event_name == 'schedule' && (vars.NIGHTLY_BRANCH || 'main') || (inputs.branch || github.ref_name) }}
 
 jobs:
   build:
@@ -43,6 +53,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+          ref: ${{ env.NIGHTLY_BUILD_REF }}
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -187,11 +198,10 @@ jobs:
           export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
           export AWS_DEFAULT_REGION="auto"
 
+          # The candidate manifest must describe the tree that was actually
+          # built. With a ref override (NIGHTLY_BRANCH / dispatch input) that
+          # is not necessarily GITHUB_SHA, so always advertise HEAD.
           SOURCE_SHA="$(git rev-parse HEAD)"
-          if [[ "${SOURCE_SHA}" != "${GITHUB_SHA}" ]]; then
-            echo "Checkout SHA does not match the nightly build run" >&2
-            exit 1
-          fi
           DEB_SHA256="$(sha256sum "${DEB_FILE}" | cut -d ' ' -f 1)"
           CANDIDATE_KEY="artifacts/rustfs/packages/nightly/runs/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${DEB_SHA256}/rustfs.deb"
           CANDIDATE_URL="https://dl.rustfs.com/${CANDIDATE_KEY}"
@@ -284,6 +294,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+          ref: ${{ env.NIGHTLY_BUILD_REF }}
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -372,6 +383,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+          ref: ${{ env.NIGHTLY_BUILD_REF }}
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
