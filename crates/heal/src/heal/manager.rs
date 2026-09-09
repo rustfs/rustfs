@@ -536,14 +536,14 @@ fn completed_status_is_retrying(status: &HealTaskStatus) -> bool {
     matches!(status, HealTaskStatus::Retrying { .. })
 }
 
-fn retry_budget_for_result(task: &HealTask, result: &Result<()>) -> Option<(Duration, String)> {
+fn retry_budget_for_result(task: &HealTask, result: &Result<()>, retryable_batch_failure: bool) -> Option<(Duration, String)> {
     let Err(err) = result else {
         return None;
     };
     if task.retry_attempts >= MAX_RECOVERABLE_HEAL_RETRIES {
         return None;
     }
-    if task.has_batch_failure() {
+    if task.has_batch_failure() && !retryable_batch_failure {
         return None;
     }
 
@@ -559,12 +559,13 @@ fn retry_budget_for_result(task: &HealTask, result: &Result<()>) -> Option<(Dura
 
 #[cfg(test)]
 fn retry_request_for_result(task: &HealTask, result: &Result<()>) -> Option<(HealRequest, Duration, String)> {
-    let (delay, error) = retry_budget_for_result(task, result)?;
+    let (delay, error) = retry_budget_for_result(task, result, false)?;
     Some((task.retry_request(), delay, error))
 }
 
 async fn retry_request_for_result_with_budget(task: &HealTask, result: &Result<()>) -> Option<(HealRequest, Duration, String)> {
-    let (delay, error) = retry_budget_for_result(task, result)?;
+    let retryable_batch_failure = task.batch_failure_is_retryable().await;
+    let (delay, error) = retry_budget_for_result(task, result, retryable_batch_failure)?;
     let request = match task.retry_request_with_remaining_timeout().await {
         Ok(request) => request,
         Err(err) => {
