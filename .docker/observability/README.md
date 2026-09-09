@@ -47,6 +47,10 @@ Three pre-built Grafana dashboards are included for monitoring RustFS GET perfor
 | **GET Resource Impact** | `grafana-get-resource-impact.json` | Monitors resource usage: concurrent requests, IO queue utilization, disk permit wait, RSS trend |
 | **Object Data Cache** | `grafana-object-data-cache.json` | Monitors the GET body cache (`rustfs_object_data_cache_*`): hit ratio, lookup/plan/fill outcomes, fill duration quantiles, hit vs fill throughput, entries/weighted bytes, inflight fills, memory-pressure skips, invalidations, and size-class breakdowns |
 
+### Storage Metrics
+
+Storage panels require `prometheus-rules/rustfs-storage.yml` and the cluster resource attribute. See the [storage metrics guide](../../docs/operations/storage-metrics.md) for ownership, observer selection, freshness, and rolling upgrades.
+
 ### Prometheus Alert Rules
 
 The file `prometheus-rules/rustfs-get-optimization-alerts.yaml` contains pre-configured alerting rules:

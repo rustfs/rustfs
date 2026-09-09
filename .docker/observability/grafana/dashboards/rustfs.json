@@ -223,14 +223,15 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rustfs_cluster_buckets_total{job=~\"$job\"})",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_cluster_buckets_total\",collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",observer=\"$storage_observer\"}",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         }
       ],
       "title": "Total Buckets",
-      "type": "stat"
+      "type": "stat",
+      "description": "Storage snapshot rules are required. Local details come from each drive owner. Global values use the selected fresh cluster observer. Missing or expired observations show no data; select another observer if needed."
     },
     {
       "datasource": {
@@ -289,14 +290,15 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rustfs_cluster_objects_total{job=~\"$job\"})",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_cluster_objects_total\",collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",observer=\"$storage_observer\"}",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         }
       ],
       "title": "Total Objects",
-      "type": "stat"
+      "type": "stat",
+      "description": "Storage snapshot rules are required. Local details come from each drive owner. Global values use the selected fresh cluster observer. Missing or expired observations show no data; select another observer if needed."
     },
     {
       "datasource": {
@@ -427,7 +429,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rustfs_cluster_capacity_used_bytes{job=~\"$job\"})",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_cluster_capacity_used_bytes\",collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",observer=\"$storage_observer\"}",
           "legendFormat": "Used",
           "range": true,
           "refId": "A"
@@ -438,7 +440,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rustfs_cluster_capacity_raw_total_bytes{job=~\"$job\"})",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_cluster_capacity_raw_total_bytes\",collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",observer=\"$storage_observer\"}",
           "hide": false,
           "legendFormat": "Total",
           "range": true,
@@ -450,7 +452,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rustfs_cluster_capacity_used_bytes{job=~\"$job\"}) / sum(rustfs_cluster_capacity_raw_total_bytes{job=~\"$job\"})",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_cluster_capacity_used_bytes\",collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",observer=\"$storage_observer\"} / ignoring(source_metric) rustfs:storage:current{source_metric=\"rustfs_cluster_capacity_raw_total_bytes\",collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",observer=\"$storage_observer\"}",
           "hide": false,
           "instant": false,
           "legendFormat": "Percent",
@@ -459,7 +461,8 @@
         }
       ],
       "title": "Capacity",
-      "type": "stat"
+      "type": "stat",
+      "description": "Storage snapshot rules are required. Local details come from each drive owner. Global values use the selected fresh cluster observer. Missing or expired observations show no data; select another observer if needed."
     },
     {
       "datasource": {
@@ -525,7 +528,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rustfs_cluster_capacity_stale_drives{job=~\"$job\"})",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_cluster_capacity_stale_drives\",collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",observer=\"$storage_observer\"}",
           "legendFormat": "Stale Drives",
           "range": true,
           "refId": "A"
@@ -536,14 +539,15 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rustfs_cluster_capacity_missing_drives{job=~\"$job\"})",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_cluster_capacity_missing_drives\",collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",observer=\"$storage_observer\"}",
           "legendFormat": "Missing Drives",
           "range": true,
           "refId": "B"
         }
       ],
       "title": "Capacity Observation",
-      "type": "stat"
+      "type": "stat",
+      "description": "Storage snapshot rules are required. Local details come from each drive owner. Global values use the selected fresh cluster observer. Missing or expired observations show no data; select another observer if needed."
     },
     {
       "datasource": {
@@ -1989,8 +1993,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (drive) (rustfs_system_drive_used_bytes{job=~\"$job\", drive=~\"$drive\"})",
-          "legendFormat": "{{drive}} (bytes)",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_system_drive_used_bytes\",collection_scope=\"local\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",server=~\"$server\",drive=~\"$drive\"}",
+          "legendFormat": "{{server}} | {{drive}} (bytes)",
           "range": true,
           "refId": "A"
         },
@@ -2000,16 +2004,17 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (drive) (rustfs_system_drive_used_bytes{job=~\"$job\", drive=~\"$drive\"}) / sum by (drive)(rustfs_system_drive_total_bytes{job=~\"$job\", drive=~\"$drive\"})",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_system_drive_used_bytes\",collection_scope=\"local\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",server=~\"$server\",drive=~\"$drive\"} / ignoring(source_metric) rustfs:storage:current{source_metric=\"rustfs_system_drive_total_bytes\",collection_scope=\"local\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",server=~\"$server\",drive=~\"$drive\"}",
           "hide": false,
           "instant": false,
-          "legendFormat": "{{drive}} (percent)",
+          "legendFormat": "{{server}} | {{drive}} (percent)",
           "range": true,
           "refId": "B"
         }
       ],
       "title": "System Drive Usage",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Storage snapshot rules are required. Local details come from each drive owner. Global values use the selected fresh cluster observer. Missing or expired observations show no data; select another observer if needed."
     },
     {
       "datasource": {
@@ -2097,14 +2102,15 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (drive) (rustfs_system_drive_capacity_observation_age_seconds{job=~\"$job\", drive=~\"$drive\"})",
-          "legendFormat": "{{drive}}",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_system_drive_capacity_observation_age_seconds\",collection_scope=\"local\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",server=~\"$server\",drive=~\"$drive\"}",
+          "legendFormat": "{{server}} | {{drive}}",
           "range": true,
           "refId": "A"
         }
       ],
       "title": "Drive Capacity Observation Age",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Storage snapshot rules are required. Local details come from each drive owner. Global values use the selected fresh cluster observer. Missing or expired observations show no data; select another observer if needed."
     },
     {
       "datasource": {
@@ -2190,8 +2196,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (drive) (rustfs_system_drive_capacity_observation_state{job=~\"$job\", drive=~\"$drive\", state=\"stale\"})",
-          "legendFormat": "{{drive}} stale",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_system_drive_capacity_observation_state\",collection_scope=\"local\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",server=~\"$server\",drive=~\"$drive\",state=\"stale\"}",
+          "legendFormat": "{{server}} | {{drive}} stale",
           "range": true,
           "refId": "A"
         },
@@ -2201,14 +2207,15 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (drive) (rustfs_system_drive_capacity_observation_state{job=~\"$job\", drive=~\"$drive\", state=\"missing\"})",
-          "legendFormat": "{{drive}} missing",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_system_drive_capacity_observation_state\",collection_scope=\"local\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",server=~\"$server\",drive=~\"$drive\",state=\"missing\"}",
+          "legendFormat": "{{server}} | {{drive}} missing",
           "range": true,
           "refId": "B"
         }
       ],
       "title": "Drive Capacity Observation State",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Storage snapshot rules are required. Local details come from each drive owner. Global values use the selected fresh cluster observer. Missing or expired observations show no data; select another observer if needed."
     },
     {
       "datasource": {
@@ -4551,7 +4558,7 @@
                   "index": 0,
                   "text": "INACTIVE"
                 },
-                "to": 1e-9
+                "to": 1e-09
               },
               "type": "range"
             }
@@ -6563,7 +6570,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "rustfs_cluster_health_drives_online_count{job=~\"$job\"}",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_cluster_health_drives_online_count\",collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",observer=\"$storage_observer\"}",
           "legendFormat": "online - {{job}}",
           "range": true,
           "refId": "A"
@@ -6574,7 +6581,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "rustfs_cluster_health_drives_offline_count{job=~\"$job\"}",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_cluster_health_drives_offline_count\",collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",observer=\"$storage_observer\"}",
           "legendFormat": "offline - {{job}}",
           "range": true,
           "refId": "B"
@@ -6585,14 +6592,15 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "rustfs_cluster_health_drives_count{job=~\"$job\"}",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_cluster_health_drives_count\",collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",observer=\"$storage_observer\"}",
           "legendFormat": "total - {{job}}",
           "range": true,
           "refId": "C"
         }
       ],
       "title": "Cluster Drive Health Counts",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Storage snapshot rules are required. Local details come from each drive owner. Global values use the selected fresh cluster observer. Missing or expired observations show no data; select another observer if needed."
     },
     {
       "collapsed": false,
@@ -8554,14 +8562,15 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "{__name__=~\"rustfs_system_drive_.*\",job=~\"$job\",drive=~\"$drive\"}",
-          "legendFormat": "{{__name__}} | {{drive}}",
+          "expr": "rustfs:storage:current{source_metric=~\"rustfs_system_drive_.*\",collection_scope=\"local\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",server=~\"$server\",drive=~\"$drive\"}",
+          "legendFormat": "{{server}} | {{source_metric}} | {{drive}}",
           "range": true,
           "refId": "A"
         }
       ],
       "title": "System Drive (All)",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Storage snapshot rules are required. Local details come from each drive owner. Global values use the selected fresh cluster observer. Missing or expired observations show no data; select another observer if needed."
     },
     {
       "datasource": {
@@ -8942,14 +8951,15 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "{__name__=~\"rustfs_cluster_erasure_set_.*\",job=~\"$job\"}",
-          "legendFormat": "{{__name__}}",
+          "expr": "rustfs:storage:current{source_metric=~\"rustfs_cluster_erasure_set_.*\",collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",observer=\"$storage_observer\"}",
+          "legendFormat": "{{source_metric}}",
           "range": true,
           "refId": "A"
         }
       ],
       "title": "Cluster Erasure Set (All)",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Storage snapshot rules are required. Local details come from each drive owner. Global values use the selected fresh cluster observer. Missing or expired observations show no data; select another observer if needed."
     },
     {
       "datasource": {
@@ -11716,7 +11726,7 @@
           "editorMode": "code",
           "range": true,
           "refId": "A",
-          "expr": "max by (server, drive, pool_index, set_index, drive_index, state) (rustfs_system_drive_runtime_state{job=~\"$job\",server=~\"$server\",drive=~\"$drive\"})",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_cluster_drive_runtime_state\",collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",observer=\"$storage_observer\",drive=~\"$drive\"}",
           "legendFormat": "{{server}} | {{drive}} | p{{pool_index}}/s{{set_index}}/d{{drive_index}} | {{state}}"
         },
         {
@@ -11727,12 +11737,13 @@
           "editorMode": "code",
           "range": true,
           "refId": "B",
-          "expr": "max by (server, drive, pool_index, set_index, drive_index) (rustfs_system_drive_offline_duration_seconds{job=~\"$job\",server=~\"$server\",drive=~\"$drive\"})",
+          "expr": "rustfs:storage:current{source_metric=\"rustfs_cluster_drive_offline_duration_seconds\",collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",observer=\"$storage_observer\",drive=~\"$drive\"}",
           "legendFormat": "{{server}} | {{drive}} | offline seconds"
         }
       ],
-      "title": "Drive Runtime State and Offline Duration",
-      "type": "timeseries"
+      "title": "Observed Cluster Drive State and Offline Duration",
+      "type": "timeseries",
+      "description": "Storage snapshot rules are required. Local details come from each drive owner. Global values use the selected fresh cluster observer. Missing or expired observations show no data; select another observer if needed."
     },
     {
       "datasource": {
@@ -11825,12 +11836,13 @@
           "editorMode": "code",
           "range": true,
           "refId": "A",
-          "expr": "sum by (server, drive, pool_index, set_index, drive_index, api) (rate(rustfs_system_drive_api_calls_total{job=~\"$job\",server=~\"$server\",drive=~\"$drive\",api=~\"$drive_api\"}[$__rate_interval]))",
+          "expr": "rate(rustfs_system_drive_api_calls_total{collection_scope=\"local\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",server=~\"$server\",drive=~\"$drive\",api=~\"$drive_api\"}[$__rate_interval]) and ignoring(source_metric) rustfs:storage:current{source_metric=\"rustfs_system_drive_api_calls_total\",collection_scope=\"local\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\",server=~\"$server\",drive=~\"$drive\",api=~\"$drive_api\"}",
           "legendFormat": "{{server}} | {{drive}} | p{{pool_index}}/s{{set_index}}/d{{drive_index}} | {{api}}"
         }
       ],
       "title": "Drive API Calls by Operation",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Storage snapshot rules are required. Local details come from each drive owner. Global values use the selected fresh cluster observer. Missing or expired observations show no data; select another observer if needed."
     },
     {
       "datasource": {
@@ -12377,6 +12389,50 @@
         "type": "query"
       },
       {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(rustfs:storage_snapshot:fresh, rustfs_cluster_id)",
+        "includeAll": false,
+        "label": "Storage cluster",
+        "multi": false,
+        "name": "storage_cluster",
+        "options": [],
+        "query": {
+          "qryType": 1,
+          "query": "label_values(rustfs:storage_snapshot:fresh, rustfs_cluster_id)",
+          "refId": "PrometheusVariableQueryEditor-storage_cluster"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "query_result(rustfs:storage_snapshot:fresh{collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\"})",
+        "includeAll": false,
+        "label": "Cluster observer",
+        "multi": false,
+        "name": "storage_observer",
+        "options": [],
+        "query": {
+          "qryType": 3,
+          "query": "query_result(rustfs:storage_snapshot:fresh{collection_scope=\"cluster\",rustfs_cluster_id=\"$storage_cluster\",job=~\"$job\"})",
+          "refId": "PrometheusVariableQueryEditor-storage_observer"
+        },
+        "refresh": 2,
+        "regex": "/observer=\"([^\"]+)\"/",
+        "sort": 1,
+        "type": "query"
+      },
+      {
         "allValue": ".*",
         "current": {
           "text": "All",
@@ -12386,7 +12442,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(rustfs_system_drive_api_calls_total,api)",
+        "definition": "label_values(rustfs:storage:current{source_metric=\"rustfs_system_drive_api_calls_total\",collection_scope=\"local\",rustfs_cluster_id=\"$storage_cluster\"}, api)",
         "includeAll": true,
         "label": "Drive API",
         "multi": true,
@@ -12394,7 +12450,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(rustfs_system_drive_api_calls_total,api)",
+          "query": "label_values(rustfs:storage:current{source_metric=\"rustfs_system_drive_api_calls_total\",collection_scope=\"local\",rustfs_cluster_id=\"$storage_cluster\"}, api)",
           "refId": "PrometheusVariableQueryEditor-drive_api"
         },
         "refresh": 2,
@@ -12455,7 +12511,7 @@
           "text": "All",
           "value": "$__all"
         },
-        "definition": "label_values(rustfs_system_drive_used_bytes,drive)",
+        "definition": "label_values(rustfs:storage:current{source_metric=\"rustfs_system_drive_used_bytes\",collection_scope=\"local\",rustfs_cluster_id=\"$storage_cluster\"}, drive)",
         "includeAll": true,
         "label": "Drive",
         "multi": true,
@@ -12463,7 +12519,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(rustfs_system_drive_used_bytes,drive)",
+          "query": "label_values(rustfs:storage:current{source_metric=\"rustfs_system_drive_used_bytes\",collection_scope=\"local\",rustfs_cluster_id=\"$storage_cluster\"}, drive)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
