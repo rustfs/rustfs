@@ -1684,7 +1684,9 @@ impl HealManager {
                         .requests()
                         .chain(retrying.values().map(|retrying| &retrying.request))
                         .filter(|pending| {
-                            root_recovery::is_admin_heal_recovery(&pending.heal_type, pending.source) && pending.id != request.id
+                            root_recovery::is_admin_heal_recovery(&pending.heal_type, pending.source)
+                                && heal_types_overlap(&request.heal_type, &pending.heal_type) != OverlapVerdict::Disjoint
+                                && pending.id != request.id
                         })
                         .map(|pending| pending.id.clone()),
                 );
@@ -1706,9 +1708,11 @@ impl HealManager {
                 }
             }
             // A failed or timed-out replay may have only its durable owner
-            // left. Root responsibility overlaps every administrator path.
+            // left. Cancel only records that overlap this forced start.
             for pending in self.root_recovery.pending().await? {
-                if pending.id != request.id {
+                if pending.id != request.id
+                    && heal_types_overlap(&request.heal_type, &pending.heal_type) != OverlapVerdict::Disjoint
+                {
                     self.cancel_task(&pending.id).await?;
                 }
             }

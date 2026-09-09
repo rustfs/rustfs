@@ -15,6 +15,7 @@
 use super::super::root_recovery::RootHealRecovery;
 use super::*;
 use crate::heal::RUSTFS_META_BUCKET;
+use std::collections::HashSet;
 
 async fn recovery_disk() -> (TempDir, DiskStore) {
     let temp = TempDir::new().expect("temporary root recovery disk");
@@ -260,6 +261,132 @@ async fn root_recovery_path_cancel_covers_durable_only_non_root_record() {
 }
 
 #[tokio::test]
+async fn root_recovery_admin_start_fails_closed_when_owner_is_unavailable() {
+    let (_temp, disk) = recovery_disk().await;
+    let (unavailable_temp, unavailable) = recovery_disk().await;
+    std::fs::remove_dir_all(unavailable_temp.path().join(RUSTFS_META_BUCKET)).expect("make owner volume unavailable");
+    let manager = recovery_manager(vec![unavailable, disk.clone()]);
+    let request = admin_request(HealType::Bucket {
+        bucket: "bucket".to_string(),
+    });
+
+    assert!(
+        manager.submit_heal_request_with_receipt(request).await.is_err(),
+        "admin admission must fail closed when the durable owner cannot be checked"
+    );
+    assert_eq!(manager.get_queue_length().await, 0);
+    assert!(
+        RootHealRecovery::with_disks(vec![disk])
+            .pending()
+            .await
+            .expect("other disk remains empty")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_force_start_cancels_only_overlapping_durable_admin_records() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let old = admin_request(HealType::Bucket {
+        bucket: "bucket-a".to_string(),
+    });
+    let disjoint = admin_request(HealType::Bucket {
+        bucket: "bucket-b".to_string(),
+    });
+    manager.root_recovery.persist(&old).await.expect("old bucket owner");
+    manager.root_recovery.persist(&disjoint).await.expect("disjoint bucket owner");
+
+    let mut replacement = admin_request(HealType::Prefix {
+        bucket: "bucket-a".to_string(),
+        prefix: "logs/".to_string(),
+    });
+    replacement.force_start = true;
+    assert_eq!(
+        manager
+            .submit_heal_request(replacement.clone())
+            .await
+            .expect("forceStart should replace only the overlapping durable owner"),
+        HealAdmissionResult::Accepted
+    );
+
+    let mut pending = manager
+        .root_recovery
+        .pending()
+        .await
+        .expect("read durable owners")
+        .into_iter()
+        .map(|request| (request.id, request.heal_type))
+        .collect::<Vec<_>>();
+    pending.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut expected = vec![
+        (disjoint.id.clone(), disjoint.heal_type.clone()),
+        (replacement.id.clone(), replacement.heal_type.clone()),
+    ];
+    expected.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(pending, expected);
+    drop(manager);
+
+    let restarted = recovery_manager(vec![disk]);
+    restarted.replay_root_heals().await.expect("replay surviving owners");
+    let queued_ids = restarted
+        .heal_queue
+        .lock()
+        .await
+        .requests()
+        .map(|request| request.id.clone())
+        .collect::<HashSet<_>>();
+    assert_eq!(queued_ids, HashSet::from([disjoint.id, replacement.id]));
+}
+
+#[tokio::test]
+async fn root_recovery_queued_non_root_admin_owner_is_not_priority_displaced() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    manager.config.write().await.queue_size = 1;
+    let mut durable = admin_request(HealType::Bucket {
+        bucket: "bucket".to_string(),
+    });
+    durable.priority = HealPriority::Low;
+    assert_eq!(
+        manager
+            .submit_heal_request(durable.clone())
+            .await
+            .expect("low-priority admin bucket should queue durably"),
+        HealAdmissionResult::Accepted
+    );
+
+    let mut urgent = HealRequest::new(
+        HealType::Object {
+            bucket: "other".to_string(),
+            object: "object".to_string(),
+            version_id: None,
+        },
+        HealOptions::default(),
+        HealPriority::Urgent,
+    );
+    urgent.source = HealRequestSource::Internal;
+    assert_eq!(
+        manager
+            .submit_heal_request(urgent)
+            .await
+            .expect("durable admin owner cannot be displaced"),
+        HealAdmissionResult::Full
+    );
+    assert_eq!(
+        manager
+            .root_recovery
+            .pending()
+            .await
+            .expect("read durable bucket")
+            .iter()
+            .map(|request| request.id.as_str())
+            .collect::<Vec<_>>(),
+        [durable.id.as_str()]
+    );
+}
+
+#[tokio::test]
 async fn root_recovery_legacy_schema_replays_as_cluster() {
     #[derive(serde::Serialize)]
     struct LegacyRootHealIntent<'a> {
@@ -432,6 +559,58 @@ async fn root_recovery_force_start_cancels_durable_only_responsibility() {
         .map(|request| request.id.clone())
         .collect::<Vec<_>>();
     assert_eq!(ids, [new.id]);
+}
+
+#[tokio::test]
+async fn root_recovery_force_start_preserves_disjoint_durable_only_admin_work() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let old_overlap = admin_request(HealType::Bucket {
+        bucket: "overlap".to_string(),
+    });
+    let old_disjoint = admin_request(HealType::Bucket {
+        bucket: "disjoint".to_string(),
+    });
+    manager
+        .root_recovery
+        .persist(&old_overlap)
+        .await
+        .expect("durable overlapping bucket");
+    manager
+        .root_recovery
+        .persist(&old_disjoint)
+        .await
+        .expect("durable disjoint bucket");
+
+    let mut replacement = admin_request(HealType::Bucket {
+        bucket: "overlap".to_string(),
+    });
+    replacement.force_start = true;
+    assert_eq!(
+        manager
+            .submit_heal_request(replacement.clone())
+            .await
+            .expect("forceStart replaces overlapping durable owner"),
+        HealAdmissionResult::Accepted
+    );
+    drop(manager);
+
+    let restarted = recovery_manager(vec![disk]);
+    restarted
+        .replay_root_heals()
+        .await
+        .expect("restart after selective forceStart");
+    let mut ids = restarted
+        .heal_queue
+        .lock()
+        .await
+        .requests()
+        .map(|request| request.id.clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    let mut expected = vec![old_disjoint.id, replacement.id];
+    expected.sort();
+    assert_eq!(ids, expected);
 }
 
 #[tokio::test]
