@@ -513,6 +513,11 @@ impl HealTask {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn set_execution_elapsed_for_test(&self, elapsed: Duration) {
+        *self.task_start_instant.write().await = Some(Instant::now() - elapsed);
+    }
+
     pub(crate) async fn retry_request_with_remaining_timeout(&self) -> Result<HealRequest> {
         let mut request = self.retry_request();
         if self.options.timeout.is_some() {

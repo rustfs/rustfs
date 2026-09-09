@@ -1569,7 +1569,9 @@ mod tests {
         } else {
             if matches!(
                 scenario,
-                InterruptionScenario::BackgroundTargetRestart | InterruptionScenario::BackgroundTargetRestartEc84
+                InterruptionScenario::BackgroundTargetRestart
+                    | InterruptionScenario::BackgroundTargetRestartEc84
+                    | InterruptionScenario::BackgroundCoordinatorRestart
             ) {
                 cluster.stop_node_gracefully(interruption_node).await?;
             } else {
@@ -1767,32 +1769,21 @@ mod tests {
         let task_status_body = signed_admin_post(&task_status_url, None, &cluster.access_key, &cluster.secret_key).await?;
         let task_status: serde_json::Value = serde_json::from_str(&task_status_body)
             .map_err(|err| format!("heal task status is not JSON ({err}): {task_status_body}"))?;
+        if task_status["summary"].as_str() != Some("finished") {
+            return Err(format!("heal data rebuilt but task did not finish successfully: {task_status}").into());
+        }
         if interruption_node == 0 {
-            // Admin tasks are process-local. Physical and queue convergence
-            // above establish recovery; a lost task must not report success.
-            assert_eq!(
-                task_status["summary"].as_str(),
-                Some("notFound"),
-                "interrupted task status: {task_status}"
-            );
-            assert_eq!(
-                task_status["detail"].as_str(),
-                Some("heal task not found or expired"),
-                "interrupted admin task must be explicitly unavailable: {task_status}"
-            );
+            // Restart recovery must finish the original durable root request.
             info!(
                 event = "heal_interruption_recovered",
                 component = "e2e_test",
                 subsystem = "heal",
                 interruption_node,
                 interruption_kind,
-                task_state = "not_found",
-                "Physical recovery completed after coordinator restart"
+                task_state = "finished",
+                "Original root heal completed after coordinator restart"
             );
             return Ok(());
-        }
-        if task_status["summary"].as_str() != Some("finished") {
-            return Err(format!("heal data rebuilt but task did not finish successfully: {task_status}").into());
         }
 
         if let Some(evidence_context) = evidence_run {

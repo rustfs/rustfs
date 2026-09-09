@@ -26,6 +26,7 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::Mutex as StdMutex;
 use tempfile::TempDir;
 
+mod root_recovery;
 mod running_mainline;
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk, storage_api::status::BucketInfo};
@@ -94,6 +95,7 @@ async fn process_manager_queue_once(manager: &HealManager) {
         retrying_heals: &manager.retrying_heals,
         mrf_repair_notice_targets: &manager.mrf_repair_notice_targets,
         replacement_recovery_anchors: &manager.replacement_recovery_anchors,
+        root_recovery: &manager.root_recovery,
         config: &manager.config,
         statistics: &manager.statistics,
         storage: &manager.storage,

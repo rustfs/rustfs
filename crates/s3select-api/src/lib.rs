@@ -23,12 +23,14 @@ use datafusion::{
 use std::{error::Error as StdError, fmt::Display};
 use thiserror::Error;
 
+mod csv_input;
 mod input_stream;
 mod metrics;
 pub mod object_store;
 pub mod query;
 pub mod server;
 mod storage_api;
+pub use csv_input::csv_input_requires_normalization;
 pub use metrics::{SelectInputMetrics, SelectInputMetricsSnapshot};
 pub use storage_api::SelectObjectSnapshot;
 

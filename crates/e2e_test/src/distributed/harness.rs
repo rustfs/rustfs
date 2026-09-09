@@ -962,27 +962,6 @@ pub(crate) async fn wait_for_rebalance_active(
     }
 }
 
-pub(crate) async fn wait_for_rebalance_running_with_progress(
-    cluster: &RustFSTestClusterEnvironment,
-    expected_id: &str,
-    timeout: Duration,
-) -> TestResult {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let status = rebalance_status_json(cluster).await?;
-        if rebalance_running_with_progress(&status, expected_id)? {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "rebalance did not become active with non-zero progress within {timeout:?}; last status: {status}"
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-}
-
 pub(crate) async fn wait_for_rebalance_complete(
     cluster: &RustFSTestClusterEnvironment,
     expected_id: &str,

@@ -1521,9 +1521,27 @@ fn data_movement_part_stage_error(
     bucket: &str,
     object: &str,
     part_number: usize,
-    err: impl std::fmt::Display,
+    err: Error,
 ) -> Error {
-    Error::other(format!("{op_label}: {stage} failed for {bucket}/{object} part {part_number}: {err}"))
+    let rendered = format!("{op_label}: {stage} failed for {bucket}/{object} part {part_number}: {err}");
+    if matches!(&err, Error::DecommissionCapacityBlocked { .. }) {
+        return data_movement_context_error(rendered, err);
+    }
+    // A missing target part is not evidence that the source can be deleted.
+    // Keep other part errors opaque to the source-cleanup classifiers.
+    Error::other(rendered)
+}
+
+#[cfg(test)]
+pub(crate) fn data_movement_part_stage_error_for_test(
+    op_label: &str,
+    stage: &str,
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    err: Error,
+) -> Error {
+    data_movement_part_stage_error(op_label, stage, bucket, object, part_number, err)
 }
 
 fn is_data_movement_part_read_error(err: &Error) -> bool {
@@ -2428,8 +2446,15 @@ mod tests {
         let err =
             data_movement_part_stage_error("rebalance_object", "put_object_part", "bucket-a", "object-a", 7, Error::SlowDown);
         let message = err.to_string();
-        assert!(message.contains("rebalance_object: put_object_part failed for bucket-a/object-a part 7"));
-        assert!(message.contains(Error::SlowDown.to_string().as_str()));
+        assert_eq!(
+            message,
+            Error::other(format!(
+                "rebalance_object: put_object_part failed for bucket-a/object-a part 7: {}",
+                Error::SlowDown
+            ))
+            .to_string()
+        );
+        assert!(data_movement_stage_source(&err).is_none());
     }
 
     #[test]
