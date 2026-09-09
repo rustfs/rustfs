@@ -197,6 +197,12 @@ test-group = 'e2e-cluster-nightly'
 filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::kms_rekey_sweep_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
 test-group = 'e2e-vault'
 
+# This four-disk, 65-member rollback probe already drives up to 32 concurrent
+# durable deletions. Reserve this nextest run's capacity for its progress oracle.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(=store::init::tests::dispatch_manifest_rollback_bounded_concurrency_reaches_tail_behind_slow_member)'
+threads-required = "num-test-threads"
+
 # ---------------------------------------------------------------------------
 # ci profile — the strict CI gate (ci.yml `cargo nextest run --profile ci`)
 # ---------------------------------------------------------------------------
