@@ -17,6 +17,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
 use bytes::Bytes;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Barrier;
 use tracing::{info, warn};
 
@@ -24,6 +25,123 @@ const BUCKET: &str = "namespace-lock-quorum-bucket";
 const KEY: &str = "thumb/79/concurrent-overwrite.jpg";
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+async fn assert_degraded_cluster_publication_guard_errors_are_retryable() -> TestResult {
+    let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+    cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", "EC:2");
+    cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
+    cluster.set_env("RUSTFS_OBS_METRICS_EXPORT_ENABLED", "false");
+    cluster.set_env("RUST_LOG", "warn");
+    cluster.start().await?;
+    cluster.create_test_bucket(BUCKET).await?;
+    let clients: Vec<_> = cluster
+        .create_all_clients()?
+        .into_iter()
+        .map(|client| {
+            Client::from_conf(
+                client
+                    .config()
+                    .to_builder()
+                    .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+                    .build(),
+            )
+        })
+        .collect();
+
+    for alive in (1..=4).rev() {
+        if alive < 4 {
+            cluster.stop_node(alive)?;
+        }
+        for (node, client) in clients.iter().take(alive).enumerate() {
+            let key = format!("publication-put-{alive}-{node}");
+            let put = client
+                .put_object()
+                .bucket(BUCKET)
+                .key(&key)
+                .body(Bytes::from_static(b"publication guard regression").into())
+                .send()
+                .await;
+            if alive >= 3 {
+                put?;
+            } else {
+                let err = put.expect_err("PUT must reject writes without a write quorum");
+                assert_eq!(
+                    err.raw_response().map(|response| response.status().as_u16()),
+                    Some(503),
+                    "PUT with {alive} nodes alive, requested through node {node}: {err:?}"
+                );
+                assert_eq!(
+                    err.as_service_error().and_then(|error| error.meta().code()),
+                    Some("ServiceUnavailable"),
+                    "PUT with {alive} nodes alive, requested through node {node}: {err:?}"
+                );
+            }
+
+            let multipart_key = format!("publication-multipart-{alive}-{node}");
+            let multipart = client
+                .create_multipart_upload()
+                .bucket(BUCKET)
+                .key(&multipart_key)
+                .send()
+                .await;
+            if alive >= 3 {
+                let upload = multipart?;
+                let upload_id = upload
+                    .upload_id()
+                    .expect("successful multipart initialization must return an upload ID");
+                client
+                    .abort_multipart_upload()
+                    .bucket(BUCKET)
+                    .key(&multipart_key)
+                    .upload_id(upload_id)
+                    .send()
+                    .await?;
+            } else {
+                let err = multipart.expect_err("multipart initialization must reject writes without a write quorum");
+                assert_eq!(
+                    err.raw_response().map(|response| response.status().as_u16()),
+                    Some(503),
+                    "CreateMultipartUpload with {alive} nodes alive, requested through node {node}: {err:?}"
+                );
+                assert_eq!(
+                    err.as_service_error().and_then(|error| error.meta().code()),
+                    Some("ServiceUnavailable"),
+                    "CreateMultipartUpload with {alive} nodes alive, requested through node {node}: {err:?}"
+                );
+            }
+        }
+    }
+
+    cluster.stop();
+    cluster.start().await?;
+    for client in &clients {
+        for alive in [1, 3, 4] {
+            for node in 0..alive {
+                let key = format!("publication-put-{alive}-{node}");
+                let get = client.get_object().bucket(BUCKET).key(key).send().await;
+                if alive >= 3 {
+                    assert_eq!(
+                        get?.body.collect().await?.into_bytes().as_ref(),
+                        b"publication guard regression",
+                        "acknowledged writes must survive restart"
+                    );
+                } else {
+                    let err = get.expect_err("a rejected publication guard must not publish an object");
+                    assert_eq!(err.as_service_error().and_then(|error| error.meta().code()), Some("NoSuchKey"));
+                }
+            }
+        }
+        let uploads = client.list_multipart_uploads().bucket(BUCKET).send().await?;
+        assert!(
+            uploads
+                .uploads()
+                .iter()
+                .all(|upload| upload.key() != Some("publication-multipart-1-0")),
+            "a rejected publication guard must not publish a multipart upload"
+        );
+    }
+    Ok(())
+}
 
 async fn put_object(client: Client, payload: Vec<u8>, writer_id: usize) -> Result<(), String> {
     client
@@ -58,6 +176,9 @@ async fn test_concurrent_cluster_overwrites_do_not_fail_namespace_lock_quorum() 
     // Keep the regression focused on false quorum-loss errors, not ordinary lock
     // wait exhaustion under a heavily contended same-key overwrite workload.
     cluster.set_env("RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT", "20");
+    cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", "EC:2");
+    cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
+    cluster.set_env("RUSTFS_HEALTH_MINIMAL_RESPONSE_ENABLE", "false");
     cluster.start().await?;
     cluster.create_test_bucket(BUCKET).await?;
 
@@ -116,6 +237,181 @@ async fn test_concurrent_cluster_overwrites_do_not_fail_namespace_lock_quorum() 
     );
 
     clients[0].delete_object().bucket(BUCKET).key(KEY).send().await?;
+    assert_node_readiness_tracks_quorum(&mut cluster).await?;
+    Ok(())
+}
+
+async fn assert_node_readiness_tracks_quorum(cluster: &mut RustFSTestClusterEnvironment) -> TestResult {
+    let clients: Vec<_> = cluster
+        .create_all_clients()?
+        .into_iter()
+        .map(|client| {
+            Client::from_conf(
+                client
+                    .config()
+                    .to_builder()
+                    .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+                    .build(),
+            )
+        })
+        .collect();
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()?;
+    let seed_key = "readiness-seed";
+    let seed_body = b"readiness quorum regression";
+    clients[0]
+        .put_object()
+        .bucket(BUCKET)
+        .key(seed_key)
+        .body(Bytes::from_static(seed_body).into())
+        .send()
+        .await?;
+
+    for (phase, survivors) in [4, 3, 2, 1, 4].into_iter().enumerate() {
+        if phase == 4 {
+            cluster.stop();
+            cluster.start().await?;
+        } else if survivors < 4 {
+            cluster.stop_node(survivors)?;
+        }
+        let write_ready = survivors >= 3;
+        let read_quorum = survivors >= 2;
+        let expected_status = if write_ready { 200 } else { 503 };
+        for (idx, client) in clients.iter().enumerate().take(survivors) {
+            let url = &cluster.nodes[idx].url;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            // Poll health before issuing S3 I/O: idle remote disk handles must
+            // not remain evidence of quorum after their host becomes unreachable.
+            let payload = loop {
+                let response = http.get(format!("{url}/health/ready")).send().await?;
+                let status = response.status().as_u16();
+                let payload: serde_json::Value = response.json().await?;
+                if status == expected_status
+                    && payload["ready"] == write_ready
+                    && payload["details"]["storage"]["ready"] == write_ready
+                    && payload["details"]["storage"]["readQuorum"] == read_quorum
+                    && payload["details"]["storage"]["writeQuorum"] == write_ready
+                    && payload["details"]["poolMetadata"]["ready"] == true
+                    && payload["details"]["iam"]["ready"] == true
+                    && payload["details"]["lock"]["ready"] == write_ready
+                {
+                    break payload;
+                }
+                assert!(Instant::now() < deadline, "node {idx}, survivors={survivors}: HTTP {status}, {payload}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            };
+            assert_eq!(payload["details"]["storage"]["readinessScope"], "write_quorum_and_pool_metadata");
+            assert_eq!(payload["details"]["storage"]["source"], "local_runtime");
+            assert_eq!(
+                payload["details"]["storage"]["status"],
+                if write_ready { "connected" } else { "disconnected" }
+            );
+            if !write_ready {
+                assert!(
+                    payload["degradedReasons"]
+                        .as_array()
+                        .expect("degraded reasons")
+                        .iter()
+                        .any(|reason| reason == "storage_and_lock_unavailable")
+                );
+            }
+
+            for path in ["/health/ready", "/minio/health/ready"] {
+                let head = http.head(format!("{url}{path}")).send().await?;
+                assert_eq!(head.status().as_u16(), expected_status, "HEAD {path}, survivors={survivors}");
+                assert!(head.bytes().await?.is_empty());
+                let response = http.get(format!("{url}{path}")).send().await?;
+                assert_eq!(response.status().as_u16(), expected_status);
+                let body: serde_json::Value = response.json().await?;
+                assert_eq!(body["details"]["storage"], payload["details"]["storage"]);
+                assert_eq!(body["details"]["poolMetadata"], payload["details"]["poolMetadata"]);
+            }
+            let live = http.get(format!("{url}/health/live")).send().await?;
+            assert_eq!(live.status().as_u16(), 200);
+            assert!(live.json::<serde_json::Value>().await?.get("details").is_none());
+            for (path, storage_ready, scope) in [
+                ("/minio/health/cluster", write_ready, "write_quorum_and_pool_metadata"),
+                ("/minio/health/cluster/read", read_quorum, "read_quorum"),
+            ] {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                // Cluster read/write reports have independent caches; allow
+                // each observation to expire before comparing stable states.
+                let body = loop {
+                    let response = http.get(format!("{url}{path}")).send().await?;
+                    let status = response.status().as_u16();
+                    let body: serde_json::Value = response.json().await?;
+                    if status == expected_status
+                        && body["details"]["storage"]["ready"] == storage_ready
+                        && body["details"]["lock"]["ready"] == write_ready
+                    {
+                        break body;
+                    }
+                    assert!(Instant::now() < deadline, "{path}, survivors={survivors}: HTTP {status}, {body}");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                };
+                assert_eq!(body["details"]["storage"]["readinessScope"], scope);
+            }
+
+            let put = client
+                .put_object()
+                .bucket(BUCKET)
+                .key(format!("readiness-phase-{phase}-node-{idx}"))
+                .body(Bytes::from_static(seed_body).into())
+                .send()
+                .await;
+            let put_status = if write_ready {
+                put.expect("a ready node must accept the PUT");
+                200
+            } else {
+                let error = put.expect_err("subquorum node must reject PUT");
+                assert!(
+                    error.raw_response().is_some_and(|response| response.status().as_u16() >= 500),
+                    "unexpected PUT failure: {error:?}"
+                );
+                error.raw_response().expect("PUT error response").status().as_u16()
+            };
+            let get = client.get_object().bucket(BUCKET).key(seed_key).send().await;
+            let get_status = match get {
+                Ok(object) => {
+                    assert_eq!(object.body.collect().await?.into_bytes().as_ref(), seed_body);
+                    200
+                }
+                Err(error) => {
+                    assert!(!write_ready, "GET must succeed on a ready cluster: {error:?}");
+                    let status = error
+                        .raw_response()
+                        .expect("GET should have an HTTP response")
+                        .status()
+                        .as_u16();
+                    assert!(status >= 500, "unexpected GET failure: {error:?}");
+                    status
+                }
+            };
+            let list = client.list_objects_v2().bucket(BUCKET).send().await;
+            let list_status = match list {
+                Ok(result) => {
+                    assert!(result.contents().iter().any(|object| object.key() == Some(seed_key)));
+                    200
+                }
+                Err(error) => {
+                    assert!(!write_ready, "listing must succeed on a ready cluster: {error:?}");
+                    let status = error
+                        .raw_response()
+                        .expect("LIST should have an HTTP response")
+                        .status()
+                        .as_u16();
+                    assert!(status >= 500, "unexpected listing failure: {error:?}");
+                    status
+                }
+            };
+            eprintln!(
+                "readiness matrix: survivors={survivors}, node={idx}, ready={write_ready}, read_quorum={read_quorum}, PUT={put_status}, GET={get_status}, LIST={list_status}"
+            );
+        }
+    }
+    cluster.stop();
     Ok(())
 }
 
@@ -125,6 +421,8 @@ async fn test_concurrent_cluster_overwrites_do_not_fail_namespace_lock_quorum() 
 /// Before the fix, `map_namespace_lock_error` wrapped lock timeout/conflict errors as
 /// `StorageError::other(...)` → `StorageError::Io(...)`, which fell through to
 /// `S3ErrorCode::InternalError` (500) in the error mapping.
+/// Also checks PUT and multipart initialization when node failures prevent
+/// acquiring a table publication guard.
 #[tokio::test]
 async fn test_concurrent_put_same_key_never_returns_500() -> TestResult {
     crate::common::init_logging();
@@ -227,5 +525,6 @@ async fn test_concurrent_put_same_key_never_returns_500() -> TestResult {
     );
 
     clients[0].delete_object().bucket(BUCKET).key(KEY).send().await?;
-    Ok(())
+    cluster.stop();
+    assert_degraded_cluster_publication_guard_errors_are_retryable().await
 }

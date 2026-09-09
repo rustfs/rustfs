@@ -475,6 +475,8 @@ pub(crate) mod ecstore_disk {
         RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken,
         UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout, validate_batch_read_version_item_count,
     };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::disk::{DiskOption, new_disk};
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
 
