@@ -44,6 +44,15 @@ SCANNER_HEAL_RELEASE_REQUIRED_GATES = (
     "P1", "P2", "P3", "P4", "R-E", "R-D", "R-L",
 )
 SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
+    "G05": (
+        "per_object_outcome_oracle",
+        "terminal_retention_bounds",
+    ),
+    "G06": (
+        "concurrent_status_evidence",
+        "legacy_client_compatibility",
+        "truncation_behavior",
+    ),
     "G07": (
         "mrf_responsibility_oracle",
         "commit_boundary_crash_matrix",
@@ -86,14 +95,20 @@ SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
         "post_stop_convergence_measurement",
         "cold_segment_reuse_measurement",
     ),
+    "R-D": (
+        "manager_disposition_evidence",
+        "event_disposition_evidence",
+        "ledger_disposition_evidence",
+        "grace_handling",
+    ),
 }
 SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS = {
     "G01": ("root_authority_evidence", "quota_authority_evidence"),
     "G02": ("bounded_checkpoint_oracle", "independent_version_inventory"),
     "G03": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G03"],
     "G04": ("cache_boundary_crash_evidence", "root_floor_intent_crash_evidence"),
-    "G05": ("per_object_outcome_oracle", "terminal_retention_bounds"),
-    "G06": ("concurrent_status_evidence", "legacy_client_compatibility", "truncation_behavior"),
+    "G05": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G05"],
+    "G06": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G06"],
     "G07": ("mrf_responsibility_oracle", "commit_boundary_crash_matrix"),
     "G08": ("mrf_capacity_evidence", "disk_full_matrix", "replica_loss_matrix"),
     "G09": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["G09"],
@@ -107,7 +122,7 @@ SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS = {
     "P3": ("two_hour_pressure_measurement", "heal_capacity_measurement", "recovery_window_measurement"),
     "P4": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P4"],
     "R-E": ("fixed_budget_restart_evidence", "enumeration_evidence", "classification_evidence"),
-    "R-D": ("manager_disposition_evidence", "event_disposition_evidence", "ledger_disposition_evidence", "grace_handling"),
+    "R-D": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["R-D"],
     "R-L": ("legacy_source_conflict_evidence", "migration_gap_evidence", "crash_safe_source_retirement_evidence"),
 }
 SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES = {
@@ -157,6 +172,55 @@ SCANNER_HEAL_SEGMENT_ACTIVATION_PROOF_INPUTS = (
     "generation_window",
     "producer_identities",
 )
+SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES = (
+    "put_object",
+    "delete_object",
+    "delete_marker",
+    "complete_multipart_upload",
+    "abort_multipart_upload",
+    "object_metadata",
+    "bucket_metadata",
+    "replication",
+    "tier_transition",
+    "tier_expiration",
+    "directory_object",
+)
+SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES = (
+    "put",
+    "delete",
+    "delete_marker",
+    "multipart",
+    "replication",
+    "tier",
+    "directory_object",
+)
+SCANNER_HEAL_RELEASE_G11_REQUIRED_CASES = {
+    "maintenance_producer_matrix": (
+        "object-mutation-producers",
+        "metadata-mutation-producers",
+        "replication-tier-producers",
+        "directory-object-producer",
+    ),
+    "complete_producer_inventory": SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES,
+}
+SCANNER_HEAL_RELEASE_G13_REQUIRED_CASES = {
+    "quorum_minus_one_matrix": (
+        "read-quorum-minus-one",
+        "write-quorum-minus-one",
+        "heal-quorum-minus-one",
+        "restart-quorum-minus-one",
+    ),
+    "unknown_disk_remount_matrix": (
+        "unknown-disk-excluded-from-quorum",
+        "known-disk-remount-rejoins",
+        "stale-disk-remount-rejected",
+    ),
+    "object_lock_dry_run_grace_evidence": (
+        "object-lock-delete-denied",
+        "dry-run-does-not-mutate",
+        "grace-window-retains-terminal-outcome",
+    ),
+}
 SCANNER_HEAL_RELEASE_G07_REQUIRED_CASES = {
     "mrf_responsibility_oracle": (
         "legacy-journal-replay",
@@ -202,6 +266,58 @@ SCANNER_HEAL_RELEASE_CRASH_BOUNDARY_FIELDS = {
         "process-restart-replay",
     ),
 }
+SCANNER_HEAL_RELEASE_G05_PER_OBJECT_OUTCOME_CASES = (
+    "object-repaired",
+    "object-already-healthy",
+    "object-skipped-by-policy",
+    "object-failed-and-retained",
+)
+SCANNER_HEAL_RELEASE_G05_TERMINAL_RETENTION_CASES = (
+    "finished-retained-until-window",
+    "failed-retained-until-window",
+    "canceled-retained-until-window",
+    "expired-terminal-pruned-after-window",
+)
+SCANNER_HEAL_RELEASE_G06_CONCURRENT_STATUS_CASES = (
+    "status-during-admin-heal",
+    "status-during-background-heal",
+    "status-while-peer-down",
+    "status-after-peer-rejoin",
+)
+SCANNER_HEAL_RELEASE_G06_LEGACY_CLIENT_CASES = (
+    "rustfs-admin-v3-background-heal-status",
+    "minio-admin-v3-background-heal-status",
+    "heal-client-token-empty-body",
+    "node-heal-status-v1-wire",
+)
+SCANNER_HEAL_RELEASE_G06_TRUNCATION_CASES = (
+    "oversize-node-status-reject",
+    "truncated-node-status-reject",
+    "trailing-data-node-status-reject",
+)
+SCANNER_HEAL_RELEASE_RD_MANAGER_CASES = (
+    "accepted",
+    "coalesced-duplicate",
+    "rejected-policy",
+    "terminal-retained",
+)
+SCANNER_HEAL_RELEASE_RD_EVENT_CASES = (
+    "event-repaired",
+    "event-failed",
+    "event-skipped",
+    "event-grace-retained",
+)
+SCANNER_HEAL_RELEASE_RD_LEDGER_CASES = (
+    "ledger-recorded",
+    "ledger-replayed",
+    "ledger-discharged",
+    "ledger-pruned-after-grace",
+)
+SCANNER_HEAL_RELEASE_RD_GRACE_CASES = (
+    "grace-open-retains-disposition",
+    "grace-expired-prunes-terminal",
+    "restart-preserves-grace-clock",
+)
 SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES = {
     "durable_root_publication_proof": (
         "root-cas-success",
@@ -1563,8 +1679,49 @@ def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple
     fields: list[str] = []
     if gate in ("G03", "G09", "R-L"):
         fields.extend(("versions", "mixed_version_role"))
+    if gate == "G02":
+        if field == "bounded_checkpoint_oracle":
+            fields.extend((
+                "checkpoint_progress_bounded",
+                "raw_entry_budget",
+                "max_raw_entries_per_round",
+                "max_objects_processed_per_round",
+                "durable_checkpoint_committed",
+                "no_unbounded_tail",
+            ))
+        if field == "independent_version_inventory":
+            fields.extend((
+                "independent_version_inventory_observed",
+                "objects_expected",
+                "objects_retained",
+                "versions_retained",
+                "bytes_retained",
+            ))
     if gate in ("G04", "G07", "R-E", "R-L"):
         fields.append("crash_points")
+    if gate == "R-E":
+        if field == "fixed_budget_restart_evidence":
+            fields.extend((
+                "fixed_budget_restart_converged",
+                "restart_rounds",
+                "raw_entry_budget",
+                "no_unbudgeted_final_sweep",
+            ))
+        if field == "enumeration_evidence":
+            fields.extend((
+                "raw_enumeration_observed",
+                "durable_raw_page_commit_observed",
+                "raw_page_index_complete",
+                "enumeration_frontier_retained",
+            ))
+        if field == "classification_evidence":
+            fields.extend((
+                "classification_observed",
+                "objects_processed",
+                "objects_retained",
+                "versions_retained",
+                "bytes_retained",
+            ))
     if gate == "G03":
         fields.append("scoped_ack_cases")
         if field == "durable_root_publication_proof":
@@ -1573,6 +1730,32 @@ def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple
             fields.append("whole_cycle_fallback_observed")
     if gate == "G04" and field == "root_floor_intent_crash_evidence":
         fields.extend(("durable_intent_cases", "persist_failure_blocks_acceptance"))
+    if gate == "G05":
+        if field == "per_object_outcome_oracle":
+            fields.extend(("per_object_outcome_cases", "outcome_counts", "status_matches_object_oracle"))
+        if field == "terminal_retention_bounds":
+            fields.extend((
+                "terminal_retention_cases",
+                "terminal_retention_window_seconds",
+                "max_terminal_record_age_seconds",
+                "terminal_records_pruned_after_window",
+            ))
+    if gate == "G06":
+        if field == "concurrent_status_evidence":
+            fields.extend((
+                "concurrent_status_cases",
+                "status_samples",
+                "all_status_responses_http_success",
+                "partial_status_reports_degraded",
+            ))
+        if field == "legacy_client_compatibility":
+            fields.extend((
+                "legacy_client_cases",
+                "rustfs_and_minio_paths_compatible",
+                "empty_body_status_requests_accepted",
+            ))
+        if field == "truncation_behavior":
+            fields.extend(("truncation_cases", "truncated_payloads_rejected", "max_status_payload_bytes"))
     if gate == "G07":
         fields.append({
             "mrf_responsibility_oracle": "mrf_responsibility_cases",
@@ -1588,6 +1771,52 @@ def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple
         fields.append("mixed_version_cases")
         if field == "rollback_payload_evidence":
             fields.append("rollback_payload_replayed")
+    if gate == "G11":
+        fields.extend({
+            "maintenance_producer_matrix": (
+                "producer_identities",
+                "producer_families",
+                "matrix_cases",
+                "durable_identity_observed",
+                "generation_window_bound",
+                "restart_gap_absent",
+                "overflow_absent",
+            ),
+            "complete_producer_inventory": (
+                "required_producer_identities",
+                "observed_producer_identities",
+                "required_producer_families",
+                "observed_producer_families",
+                "missing_producer_identities",
+                "unknown_producer_excluded",
+            ),
+            "segment_activation_preflight": (
+                "production_activation",
+                "scanner_segment_reuse_activated",
+                "proof_inputs",
+                "fail_closed_checks",
+            ),
+        }[field])
+    if gate == "G13":
+        fields.extend({
+            "quorum_minus_one_matrix": (
+                "quorum_cases",
+                "no_success_at_quorum_minus_one",
+                "exact_quorum_restored",
+            ),
+            "unknown_disk_remount_matrix": (
+                "remount_cases",
+                "unknown_disks_excluded",
+                "remounted_disks_revalidated",
+                "stale_incarnation_rejected",
+            ),
+            "object_lock_dry_run_grace_evidence": (
+                "grace_cases",
+                "object_lock_denials_preserved",
+                "dry_run_mutation_count",
+                "grace_outcomes_retained",
+            ),
+        }[field])
     if (gate, field) in SCANNER_HEAL_RELEASE_MRF_DURABLE_REPLAY_FIELDS:
         fields.extend(("replayed_records", "responsibility_anchor_retained", "successor_snapshot_published"))
     if gate == "P4" and field == "retained_responsibility_evidence":
@@ -1606,6 +1835,24 @@ def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple
             "pending_responsibilities_after_gc",
             "stale_journals_after_gc",
         ))
+    if gate == "R-D":
+        if field == "manager_disposition_evidence":
+            fields.extend(("manager_disposition_cases", "manager_dispositions_are_terminal"))
+        if field == "event_disposition_evidence":
+            fields.extend(("event_disposition_cases", "events_correlate_to_manager_dispositions"))
+        if field == "ledger_disposition_evidence":
+            fields.extend((
+                "ledger_disposition_cases",
+                "ledger_correlates_to_events",
+                "ledger_replay_preserves_terminal_disposition",
+            ))
+        if field == "grace_handling":
+            fields.extend((
+                "grace_cases",
+                "grace_window_seconds",
+                "grace_retention_observed",
+                "grace_expiry_pruned_terminal_records",
+            ))
     return tuple(dict.fromkeys(fields))
 
 
@@ -1706,6 +1953,38 @@ def release_bundle_number(value: object, name: str, minimum: int | float = 0) ->
 
 
 def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dict[str, object]) -> None:
+    if gate == "G02":
+        if field == "bounded_checkpoint_oracle":
+            release_bundle_bool_true(evidence.get("checkpoint_progress_bounded"),
+                                     f"{gate}.{field}.checkpoint_progress_bounded")
+            budget = evidence_integer(evidence.get("raw_entry_budget"), f"{gate}.{field}.raw_entry_budget", 1, 4096)
+            max_raw = evidence_integer(evidence.get("max_raw_entries_per_round"),
+                                       f"{gate}.{field}.max_raw_entries_per_round", 1, 4096)
+            max_objects = evidence_integer(evidence.get("max_objects_processed_per_round"),
+                                           f"{gate}.{field}.max_objects_processed_per_round", 1, 4096)
+            require(max_raw <= budget, f"{gate}.{field} raw entries exceed fixed budget")
+            require(max_objects <= budget, f"{gate}.{field} processed objects exceed fixed budget")
+            release_bundle_bool_true(evidence.get("durable_checkpoint_committed"),
+                                     f"{gate}.{field}.durable_checkpoint_committed")
+            release_bundle_bool_true(evidence.get("no_unbounded_tail"), f"{gate}.{field}.no_unbounded_tail")
+        if field == "independent_version_inventory":
+            release_bundle_bool_true(evidence.get("independent_version_inventory_observed"),
+                                     f"{gate}.{field}.independent_version_inventory_observed")
+            objects_expected = evidence_integer(evidence.get("objects_expected"),
+                                                f"{gate}.{field}.objects_expected", 1, 2**63 - 1)
+            objects_retained = evidence_integer(evidence.get("objects_retained"),
+                                                f"{gate}.{field}.objects_retained", 1, 2**63 - 1)
+            versions_retained = evidence_integer(evidence.get("versions_retained"),
+                                                 f"{gate}.{field}.versions_retained", 1, 2**63 - 1)
+            bytes_retained = evidence_integer(evidence.get("bytes_retained"),
+                                              f"{gate}.{field}.bytes_retained", 1, 2**63 - 1)
+            require(objects_retained == objects_expected,
+                    f"{gate}.{field} retained object inventory must match expected objects")
+            require(versions_retained == objects_expected,
+                    f"{gate}.{field} retained version inventory must match expected objects")
+            require(bytes_retained == objects_expected,
+                    f"{gate}.{field} retained byte inventory must match expected objects")
+
     if gate == "G03":
         release_bundle_exact_strings(
             evidence.get("scoped_ack_cases"),
@@ -1727,6 +2006,108 @@ def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dic
         )
         release_bundle_bool_true(evidence.get("persist_failure_blocks_acceptance"),
                                  f"{gate}.{field}.persist_failure_blocks_acceptance")
+
+    if gate == "G05":
+        if field == "per_object_outcome_oracle":
+            release_bundle_exact_strings(
+                evidence.get("per_object_outcome_cases"),
+                SCANNER_HEAL_RELEASE_G05_PER_OBJECT_OUTCOME_CASES,
+                f"{gate}.{field}.per_object_outcome_cases",
+            )
+            outcomes = evidence.get("outcome_counts")
+            require(isinstance(outcomes, dict), f"{gate}.{field} missing outcome counts")
+            for outcome in ("repaired", "healthy", "skipped", "failed"):
+                evidence_integer(outcomes.get(outcome), f"{gate}.{field}.outcome_counts.{outcome}", 1, 2**63 - 1)
+            release_bundle_bool_true(evidence.get("status_matches_object_oracle"),
+                                     f"{gate}.{field}.status_matches_object_oracle")
+        if field == "terminal_retention_bounds":
+            release_bundle_exact_strings(
+                evidence.get("terminal_retention_cases"),
+                SCANNER_HEAL_RELEASE_G05_TERMINAL_RETENTION_CASES,
+                f"{gate}.{field}.terminal_retention_cases",
+            )
+            retention_window = evidence_integer(
+                evidence.get("terminal_retention_window_seconds"),
+                f"{gate}.{field}.terminal_retention_window_seconds",
+                1,
+                86400,
+            )
+            max_age = evidence_integer(
+                evidence.get("max_terminal_record_age_seconds"),
+                f"{gate}.{field}.max_terminal_record_age_seconds",
+                0,
+                86400,
+            )
+            require(max_age <= retention_window, f"{gate}.{field}.max_terminal_record_age_seconds exceeds retention window")
+            evidence_integer(evidence.get("terminal_records_pruned_after_window"),
+                             f"{gate}.{field}.terminal_records_pruned_after_window", 1, 2**63 - 1)
+
+    if gate == "G06":
+        if field == "concurrent_status_evidence":
+            release_bundle_exact_strings(
+                evidence.get("concurrent_status_cases"),
+                SCANNER_HEAL_RELEASE_G06_CONCURRENT_STATUS_CASES,
+                f"{gate}.{field}.concurrent_status_cases",
+            )
+            evidence_integer(evidence.get("status_samples"), f"{gate}.{field}.status_samples", 2, 2**63 - 1)
+            release_bundle_bool_true(evidence.get("all_status_responses_http_success"),
+                                     f"{gate}.{field}.all_status_responses_http_success")
+            release_bundle_bool_true(evidence.get("partial_status_reports_degraded"),
+                                     f"{gate}.{field}.partial_status_reports_degraded")
+        if field == "legacy_client_compatibility":
+            release_bundle_exact_strings(
+                evidence.get("legacy_client_cases"),
+                SCANNER_HEAL_RELEASE_G06_LEGACY_CLIENT_CASES,
+                f"{gate}.{field}.legacy_client_cases",
+            )
+            release_bundle_bool_true(evidence.get("rustfs_and_minio_paths_compatible"),
+                                     f"{gate}.{field}.rustfs_and_minio_paths_compatible")
+            release_bundle_bool_true(evidence.get("empty_body_status_requests_accepted"),
+                                     f"{gate}.{field}.empty_body_status_requests_accepted")
+        if field == "truncation_behavior":
+            release_bundle_exact_strings(
+                evidence.get("truncation_cases"),
+                SCANNER_HEAL_RELEASE_G06_TRUNCATION_CASES,
+                f"{gate}.{field}.truncation_cases",
+            )
+            release_bundle_bool_true(evidence.get("truncated_payloads_rejected"),
+                                     f"{gate}.{field}.truncated_payloads_rejected")
+            evidence_integer(evidence.get("max_status_payload_bytes"), f"{gate}.{field}.max_status_payload_bytes", 1, 2**20)
+
+    if gate == "R-E":
+        if field == "fixed_budget_restart_evidence":
+            release_bundle_bool_true(evidence.get("fixed_budget_restart_converged"),
+                                     f"{gate}.{field}.fixed_budget_restart_converged")
+            evidence_integer(evidence.get("restart_rounds"), f"{gate}.{field}.restart_rounds", 2, 64)
+            evidence_integer(evidence.get("raw_entry_budget"), f"{gate}.{field}.raw_entry_budget", 1, 4096)
+            release_bundle_bool_true(evidence.get("no_unbudgeted_final_sweep"),
+                                     f"{gate}.{field}.no_unbudgeted_final_sweep")
+        if field == "enumeration_evidence":
+            release_bundle_bool_true(evidence.get("raw_enumeration_observed"),
+                                     f"{gate}.{field}.raw_enumeration_observed")
+            release_bundle_bool_true(evidence.get("durable_raw_page_commit_observed"),
+                                     f"{gate}.{field}.durable_raw_page_commit_observed")
+            release_bundle_bool_true(evidence.get("raw_page_index_complete"),
+                                     f"{gate}.{field}.raw_page_index_complete")
+            release_bundle_bool_true(evidence.get("enumeration_frontier_retained"),
+                                     f"{gate}.{field}.enumeration_frontier_retained")
+        if field == "classification_evidence":
+            release_bundle_bool_true(evidence.get("classification_observed"),
+                                     f"{gate}.{field}.classification_observed")
+            objects_processed = evidence_integer(evidence.get("objects_processed"),
+                                                 f"{gate}.{field}.objects_processed", 1, 2**63 - 1)
+            objects_retained = evidence_integer(evidence.get("objects_retained"),
+                                                f"{gate}.{field}.objects_retained", 1, 2**63 - 1)
+            versions_retained = evidence_integer(evidence.get("versions_retained"),
+                                                 f"{gate}.{field}.versions_retained", 1, 2**63 - 1)
+            bytes_retained = evidence_integer(evidence.get("bytes_retained"),
+                                              f"{gate}.{field}.bytes_retained", 1, 2**63 - 1)
+            require(objects_processed <= objects_retained,
+                    f"{gate}.{field} processed objects exceed retained objects")
+            require(versions_retained == objects_retained,
+                    f"{gate}.{field} version inventory must match retained objects")
+            require(bytes_retained == objects_retained,
+                    f"{gate}.{field} byte inventory must match retained objects")
 
     if gate == "G09":
         release_bundle_exact_strings(
@@ -1756,6 +2137,89 @@ def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dic
                              f"{gate}.{field}.foreground_pressure_samples", 1, 2**63 - 1)
             evidence_integer(metrics.get("foreground_pressure_high_samples"),
                              f"{gate}.{field}.foreground_pressure_high_samples", 1, 2**63 - 1)
+
+    if gate == "G11":
+        if field == "maintenance_producer_matrix":
+            release_bundle_exact_strings(
+                evidence.get("producer_identities"),
+                SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES,
+                f"{gate}.{field}.producer_identities",
+            )
+            release_bundle_exact_strings(
+                evidence.get("producer_families"),
+                SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES,
+                f"{gate}.{field}.producer_families",
+            )
+            release_bundle_exact_strings(
+                evidence.get("matrix_cases"),
+                SCANNER_HEAL_RELEASE_G11_REQUIRED_CASES[field],
+                f"{gate}.{field}.matrix_cases",
+            )
+            release_bundle_bool_true(evidence.get("durable_identity_observed"),
+                                     f"{gate}.{field}.durable_identity_observed")
+            release_bundle_bool_true(evidence.get("generation_window_bound"),
+                                     f"{gate}.{field}.generation_window_bound")
+            release_bundle_bool_true(evidence.get("restart_gap_absent"), f"{gate}.{field}.restart_gap_absent")
+            release_bundle_bool_true(evidence.get("overflow_absent"), f"{gate}.{field}.overflow_absent")
+        if field == "complete_producer_inventory":
+            release_bundle_exact_strings(
+                evidence.get("required_producer_identities"),
+                SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES,
+                f"{gate}.{field}.required_producer_identities",
+            )
+            release_bundle_exact_strings(
+                evidence.get("observed_producer_identities"),
+                SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES,
+                f"{gate}.{field}.observed_producer_identities",
+            )
+            release_bundle_exact_strings(
+                evidence.get("required_producer_families"),
+                SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES,
+                f"{gate}.{field}.required_producer_families",
+            )
+            release_bundle_exact_strings(
+                evidence.get("observed_producer_families"),
+                SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES,
+                f"{gate}.{field}.observed_producer_families",
+            )
+            require(evidence.get("missing_producer_identities") == [],
+                    f"{gate}.{field} requires zero missing producer identities")
+            release_bundle_bool_true(evidence.get("unknown_producer_excluded"),
+                                     f"{gate}.{field}.unknown_producer_excluded")
+
+    if gate == "G13":
+        if field == "quorum_minus_one_matrix":
+            release_bundle_exact_strings(
+                evidence.get("quorum_cases"),
+                SCANNER_HEAL_RELEASE_G13_REQUIRED_CASES[field],
+                f"{gate}.{field}.quorum_cases",
+            )
+            release_bundle_bool_true(evidence.get("no_success_at_quorum_minus_one"),
+                                     f"{gate}.{field}.no_success_at_quorum_minus_one")
+            release_bundle_bool_true(evidence.get("exact_quorum_restored"), f"{gate}.{field}.exact_quorum_restored")
+        if field == "unknown_disk_remount_matrix":
+            release_bundle_exact_strings(
+                evidence.get("remount_cases"),
+                SCANNER_HEAL_RELEASE_G13_REQUIRED_CASES[field],
+                f"{gate}.{field}.remount_cases",
+            )
+            release_bundle_bool_true(evidence.get("unknown_disks_excluded"),
+                                     f"{gate}.{field}.unknown_disks_excluded")
+            release_bundle_bool_true(evidence.get("remounted_disks_revalidated"),
+                                     f"{gate}.{field}.remounted_disks_revalidated")
+            release_bundle_bool_true(evidence.get("stale_incarnation_rejected"),
+                                     f"{gate}.{field}.stale_incarnation_rejected")
+        if field == "object_lock_dry_run_grace_evidence":
+            release_bundle_exact_strings(
+                evidence.get("grace_cases"),
+                SCANNER_HEAL_RELEASE_G13_REQUIRED_CASES[field],
+                f"{gate}.{field}.grace_cases",
+            )
+            release_bundle_bool_true(evidence.get("object_lock_denials_preserved"),
+                                     f"{gate}.{field}.object_lock_denials_preserved")
+            evidence_integer(evidence.get("dry_run_mutation_count"), f"{gate}.{field}.dry_run_mutation_count", 0, 0)
+            release_bundle_bool_true(evidence.get("grace_outcomes_retained"),
+                                     f"{gate}.{field}.grace_outcomes_retained")
 
     if gate == "P1":
         if field == "cold_walk_share_measurement":
@@ -1811,6 +2275,45 @@ def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dic
             f"{gate}.{field}.verified_proof_discharge_observed",
         )
 
+    if gate == "R-D":
+        if field == "manager_disposition_evidence":
+            release_bundle_exact_strings(
+                evidence.get("manager_disposition_cases"),
+                SCANNER_HEAL_RELEASE_RD_MANAGER_CASES,
+                f"{gate}.{field}.manager_disposition_cases",
+            )
+            release_bundle_bool_true(evidence.get("manager_dispositions_are_terminal"),
+                                     f"{gate}.{field}.manager_dispositions_are_terminal")
+        if field == "event_disposition_evidence":
+            release_bundle_exact_strings(
+                evidence.get("event_disposition_cases"),
+                SCANNER_HEAL_RELEASE_RD_EVENT_CASES,
+                f"{gate}.{field}.event_disposition_cases",
+            )
+            release_bundle_bool_true(evidence.get("events_correlate_to_manager_dispositions"),
+                                     f"{gate}.{field}.events_correlate_to_manager_dispositions")
+        if field == "ledger_disposition_evidence":
+            release_bundle_exact_strings(
+                evidence.get("ledger_disposition_cases"),
+                SCANNER_HEAL_RELEASE_RD_LEDGER_CASES,
+                f"{gate}.{field}.ledger_disposition_cases",
+            )
+            release_bundle_bool_true(evidence.get("ledger_correlates_to_events"),
+                                     f"{gate}.{field}.ledger_correlates_to_events")
+            release_bundle_bool_true(evidence.get("ledger_replay_preserves_terminal_disposition"),
+                                     f"{gate}.{field}.ledger_replay_preserves_terminal_disposition")
+        if field == "grace_handling":
+            release_bundle_exact_strings(
+                evidence.get("grace_cases"),
+                SCANNER_HEAL_RELEASE_RD_GRACE_CASES,
+                f"{gate}.{field}.grace_cases",
+            )
+            evidence_integer(evidence.get("grace_window_seconds"), f"{gate}.{field}.grace_window_seconds", 1, 86400)
+            release_bundle_bool_true(evidence.get("grace_retention_observed"),
+                                     f"{gate}.{field}.grace_retention_observed")
+            release_bundle_bool_true(evidence.get("grace_expiry_pruned_terminal_records"),
+                                     f"{gate}.{field}.grace_expiry_pruned_terminal_records")
+
 
 def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, gate: str, field: str,
                                      evidence: dict[str, object]) -> str:
@@ -1858,6 +2361,8 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
             evidence_integer(evidence.get("lock_hold_p95_ms"), f"{gate}.{field}.lock_hold_p95_ms", 0, 2**31 - 1)
             evidence_integer(evidence.get("foreground_latency_p95_ms"),
                              f"{gate}.{field}.foreground_latency_p95_ms", 1, 2**31 - 1)
+    if gate in ("G11", "G13"):
+        validate_release_bundle_domain_evidence(gate, field, evidence)
     if gate == "P1" and field == "foreground_latency_throughput_measurement":
         evidence_integer(evidence.get("foreground_latency_p95_ms"),
                          f"{gate}.{field}.foreground_latency_p95_ms", 1, 2**31 - 1)
@@ -1932,6 +2437,25 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
                 f"{gate}.{field} requires full-walk oracle equivalence")
         require(evidence.get("published_root_equivalent") is True,
                 f"{gate}.{field} requires published-root equivalence")
+    if field == "post_stop_convergence_measurement":
+        require(evidence.get("writes_stopped") is True,
+                f"{gate}.{field} requires writes-stopped evidence")
+        require(evidence.get("last_mutation_observed") is True,
+                f"{gate}.{field} requires last-mutation observation")
+        require(evidence.get("first_complete_publication") is True,
+                f"{gate}.{field} requires first complete publication evidence")
+        samples = evidence_integer(evidence.get("post_stop_samples"), f"{gate}.{field}.post_stop_samples", 1, 2**31 - 1)
+        multiple = release_bundle_number(evidence.get("post_stop_work_multiple"),
+                                         f"{gate}.{field}.post_stop_work_multiple", 0)
+        limit = release_bundle_number(evidence.get("post_stop_work_multiple_limit"),
+                                      f"{gate}.{field}.post_stop_work_multiple_limit", 1)
+        require(multiple <= limit, f"{gate}.{field} exceeds post-stop work multiple limit")
+        raw_multiples = evidence.get("post_stop_work_multiples")
+        require(isinstance(raw_multiples, list) and len(raw_multiples) == samples,
+                f"{gate}.{field} requires measured post-stop work multiple samples")
+        observed = [release_bundle_number(value, f"{gate}.{field}.post_stop_work_multiples", 0)
+                    for value in raw_multiples]
+        require(max(observed) == multiple, f"{gate}.{field} worst post-stop multiple mismatch")
     if gate == "G07":
         case_field = {
             "mrf_responsibility_oracle": "mrf_responsibility_cases",
@@ -2343,6 +2867,45 @@ def write_scanner_heal_release_bundle_fixture(root: Path, directory: Path) -> Pa
                 evidence.update({"completed_heal_objects": 1, "duplicate_task_count": 0})
             if gate == "P3" and field == "recovery_window_measurement":
                 evidence.update({"pressure_recovery_window_seconds": 5, "lock_hold_p95_ms": 0})
+            if gate == "G02" and field == "bounded_checkpoint_oracle":
+                evidence.update({
+                    "checkpoint_progress_bounded": True,
+                    "raw_entry_budget": 8,
+                    "max_raw_entries_per_round": 8,
+                    "max_objects_processed_per_round": 8,
+                    "durable_checkpoint_committed": True,
+                    "no_unbounded_tail": True,
+                })
+            if gate == "G02" and field == "independent_version_inventory":
+                evidence.update({
+                    "independent_version_inventory_observed": True,
+                    "objects_expected": 16,
+                    "objects_retained": 16,
+                    "versions_retained": 16,
+                    "bytes_retained": 16,
+                })
+            if gate == "R-E" and field == "fixed_budget_restart_evidence":
+                evidence.update({
+                    "fixed_budget_restart_converged": True,
+                    "restart_rounds": 3,
+                    "raw_entry_budget": 8,
+                    "no_unbudgeted_final_sweep": True,
+                })
+            if gate == "R-E" and field == "enumeration_evidence":
+                evidence.update({
+                    "raw_enumeration_observed": True,
+                    "durable_raw_page_commit_observed": True,
+                    "raw_page_index_complete": True,
+                    "enumeration_frontier_retained": True,
+                })
+            if gate == "R-E" and field == "classification_evidence":
+                evidence.update({
+                    "classification_observed": True,
+                    "objects_processed": 16,
+                    "objects_retained": 16,
+                    "versions_retained": 16,
+                    "bytes_retained": 16,
+                })
             if gate in ("G03", "G09", "R-L"):
                 evidence["versions"] = [baseline_revision, source_revision]
                 evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
@@ -2718,6 +3281,23 @@ class SelfTests(unittest.TestCase):
                     evidence.update({"completed_heal_objects": 1, "duplicate_task_count": 0})
                 if gate == "P3" and field == "recovery_window_measurement":
                     evidence.update({"pressure_recovery_window_seconds": 5, "lock_hold_p95_ms": 0})
+                if gate == "G02" and field == "bounded_checkpoint_oracle":
+                    evidence.update({
+                        "checkpoint_progress_bounded": True,
+                        "raw_entry_budget": 8,
+                        "max_raw_entries_per_round": 8,
+                        "max_objects_processed_per_round": 8,
+                        "durable_checkpoint_committed": True,
+                        "no_unbounded_tail": True,
+                    })
+                if gate == "G02" and field == "independent_version_inventory":
+                    evidence.update({
+                        "independent_version_inventory_observed": True,
+                        "objects_expected": 16,
+                        "objects_retained": 16,
+                        "versions_retained": 16,
+                        "bytes_retained": 16,
+                    })
                 if gate in ("G03", "G09", "R-L"):
                     evidence["versions"] = ["a" * 40, source_revision]
                     evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
@@ -2733,6 +3313,50 @@ class SelfTests(unittest.TestCase):
                 if gate == "G04" and field == "root_floor_intent_crash_evidence":
                     evidence["durable_intent_cases"] = list(SCANNER_HEAL_RELEASE_CRASH_BOUNDARY_FIELDS[(gate, field)])
                     evidence["persist_failure_blocks_acceptance"] = True
+                if gate == "G05" and field == "per_object_outcome_oracle":
+                    evidence["per_object_outcome_cases"] = list(SCANNER_HEAL_RELEASE_G05_PER_OBJECT_OUTCOME_CASES)
+                    evidence["outcome_counts"] = {"repaired": 4, "healthy": 3, "skipped": 2, "failed": 1}
+                    evidence["status_matches_object_oracle"] = True
+                if gate == "G05" and field == "terminal_retention_bounds":
+                    evidence["terminal_retention_cases"] = list(SCANNER_HEAL_RELEASE_G05_TERMINAL_RETENTION_CASES)
+                    evidence["terminal_retention_window_seconds"] = 3600
+                    evidence["max_terminal_record_age_seconds"] = 3599
+                    evidence["terminal_records_pruned_after_window"] = 2
+                if gate == "G06" and field == "concurrent_status_evidence":
+                    evidence["concurrent_status_cases"] = list(SCANNER_HEAL_RELEASE_G06_CONCURRENT_STATUS_CASES)
+                    evidence["status_samples"] = 4
+                    evidence["all_status_responses_http_success"] = True
+                    evidence["partial_status_reports_degraded"] = True
+                if gate == "G06" and field == "legacy_client_compatibility":
+                    evidence["legacy_client_cases"] = list(SCANNER_HEAL_RELEASE_G06_LEGACY_CLIENT_CASES)
+                    evidence["rustfs_and_minio_paths_compatible"] = True
+                    evidence["empty_body_status_requests_accepted"] = True
+                if gate == "G06" and field == "truncation_behavior":
+                    evidence["truncation_cases"] = list(SCANNER_HEAL_RELEASE_G06_TRUNCATION_CASES)
+                    evidence["truncated_payloads_rejected"] = True
+                    evidence["max_status_payload_bytes"] = 4096
+                if gate == "R-E" and field == "fixed_budget_restart_evidence":
+                    evidence.update({
+                        "fixed_budget_restart_converged": True,
+                        "restart_rounds": 3,
+                        "raw_entry_budget": 8,
+                        "no_unbudgeted_final_sweep": True,
+                    })
+                if gate == "R-E" and field == "enumeration_evidence":
+                    evidence.update({
+                        "raw_enumeration_observed": True,
+                        "durable_raw_page_commit_observed": True,
+                        "raw_page_index_complete": True,
+                        "enumeration_frontier_retained": True,
+                    })
+                if gate == "R-E" and field == "classification_evidence":
+                    evidence.update({
+                        "classification_observed": True,
+                        "objects_processed": 16,
+                        "objects_retained": 16,
+                        "versions_retained": 16,
+                        "bytes_retained": 16,
+                    })
                 if gate == "G09":
                     evidence["mixed_version_cases"] = list(SCANNER_HEAL_RELEASE_MIXED_VERSION_CASES[field])
                     if field == "rollback_payload_evidence":
@@ -2773,6 +3397,35 @@ class SelfTests(unittest.TestCase):
                         "foreground_pressure_samples": 120,
                         "foreground_pressure_high_samples": 12,
                     }
+                if gate == "G11" and field == "maintenance_producer_matrix":
+                    evidence["producer_identities"] = list(SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES)
+                    evidence["producer_families"] = list(SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES)
+                    evidence["matrix_cases"] = list(SCANNER_HEAL_RELEASE_G11_REQUIRED_CASES[field])
+                    evidence["durable_identity_observed"] = True
+                    evidence["generation_window_bound"] = True
+                    evidence["restart_gap_absent"] = True
+                    evidence["overflow_absent"] = True
+                if gate == "G11" and field == "complete_producer_inventory":
+                    evidence["required_producer_identities"] = list(SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES)
+                    evidence["observed_producer_identities"] = list(SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES)
+                    evidence["required_producer_families"] = list(SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES)
+                    evidence["observed_producer_families"] = list(SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES)
+                    evidence["missing_producer_identities"] = []
+                    evidence["unknown_producer_excluded"] = True
+                if gate == "G13" and field == "quorum_minus_one_matrix":
+                    evidence["quorum_cases"] = list(SCANNER_HEAL_RELEASE_G13_REQUIRED_CASES[field])
+                    evidence["no_success_at_quorum_minus_one"] = True
+                    evidence["exact_quorum_restored"] = True
+                if gate == "G13" and field == "unknown_disk_remount_matrix":
+                    evidence["remount_cases"] = list(SCANNER_HEAL_RELEASE_G13_REQUIRED_CASES[field])
+                    evidence["unknown_disks_excluded"] = True
+                    evidence["remounted_disks_revalidated"] = True
+                    evidence["stale_incarnation_rejected"] = True
+                if gate == "G13" and field == "object_lock_dry_run_grace_evidence":
+                    evidence["grace_cases"] = list(SCANNER_HEAL_RELEASE_G13_REQUIRED_CASES[field])
+                    evidence["object_lock_denials_preserved"] = True
+                    evidence["dry_run_mutation_count"] = 0
+                    evidence["grace_outcomes_retained"] = True
                 if gate == "G14" and field == "ec8_4_evidence":
                     evidence["topology"] = {"erasure": "EC8+4", "nodes": 3, "drives_per_node": 4}
                 if gate == "G14" and field == "same_window_field_evidence":
@@ -2801,6 +3454,14 @@ class SelfTests(unittest.TestCase):
                     evidence["cold_walked_segments"] = 0
                     evidence["full_walk_oracle_equivalent"] = True
                     evidence["published_root_equivalent"] = True
+                if field == "post_stop_convergence_measurement":
+                    evidence["writes_stopped"] = True
+                    evidence["last_mutation_observed"] = True
+                    evidence["first_complete_publication"] = True
+                    evidence["post_stop_samples"] = 2
+                    evidence["post_stop_work_multiple"] = 1.1
+                    evidence["post_stop_work_multiple_limit"] = 1.2
+                    evidence["post_stop_work_multiples"] = [1.0, 1.1]
                 if gate == "P4" and field == "retained_responsibility_evidence":
                     evidence["duration_seconds"] = 7200
                     evidence["finished_at"] = (started + timedelta(seconds=7200)).isoformat().replace("+00:00", "Z")
@@ -2810,6 +3471,21 @@ class SelfTests(unittest.TestCase):
                     evidence["retention_window_seconds"] = 7200
                     evidence["idle_cleanup_observed"] = True
                     evidence["verified_proof_discharge_observed"] = True
+                if gate == "R-D" and field == "manager_disposition_evidence":
+                    evidence["manager_disposition_cases"] = list(SCANNER_HEAL_RELEASE_RD_MANAGER_CASES)
+                    evidence["manager_dispositions_are_terminal"] = True
+                if gate == "R-D" and field == "event_disposition_evidence":
+                    evidence["event_disposition_cases"] = list(SCANNER_HEAL_RELEASE_RD_EVENT_CASES)
+                    evidence["events_correlate_to_manager_dispositions"] = True
+                if gate == "R-D" and field == "ledger_disposition_evidence":
+                    evidence["ledger_disposition_cases"] = list(SCANNER_HEAL_RELEASE_RD_LEDGER_CASES)
+                    evidence["ledger_correlates_to_events"] = True
+                    evidence["ledger_replay_preserves_terminal_disposition"] = True
+                if gate == "R-D" and field == "grace_handling":
+                    evidence["grace_cases"] = list(SCANNER_HEAL_RELEASE_RD_GRACE_CASES)
+                    evidence["grace_window_seconds"] = 300
+                    evidence["grace_retention_observed"] = True
+                    evidence["grace_expiry_pruned_terminal_records"] = True
                 if field == "profile_evidence":
                     evidence["resolved_samples"] = 1
                     evidence["allocation_bytes"] = 1024
@@ -3054,6 +3730,36 @@ class SelfTests(unittest.TestCase):
                 ),
                 "measurement window mismatch",
             ),
+            ("g05-outcome-cases", "G05", "per_object_outcome_oracle", lambda item: item["per_object_outcome_cases"].remove("object-failed-and-retained"), "missing cases"),
+            ("g05-outcome-counts", "G05", "per_object_outcome_oracle", lambda item: item["outcome_counts"].pop("failed"), "outcome_counts.failed"),
+            (
+                "g05-retention-window",
+                "G05",
+                "terminal_retention_bounds",
+                lambda item: item.update({"max_terminal_record_age_seconds": item["terminal_retention_window_seconds"] + 1}),
+                "exceeds retention window",
+            ),
+            (
+                "g06-concurrent-status",
+                "G06",
+                "concurrent_status_evidence",
+                lambda item: item["concurrent_status_cases"].remove("status-while-peer-down"),
+                "missing cases",
+            ),
+            (
+                "g06-legacy-client",
+                "G06",
+                "legacy_client_compatibility",
+                lambda item: item.update({"empty_body_status_requests_accepted": False}),
+                "empty_body_status_requests_accepted",
+            ),
+            (
+                "g06-truncation",
+                "G06",
+                "truncation_behavior",
+                lambda item: item["truncation_cases"].remove("truncated-node-status-reject"),
+                "missing cases",
+            ),
             ("versions", "G09", "mixed_version_reader_evidence", lambda item: item.update({"versions": [1, 2]}), "mixed-version"),
             ("stale-versions", "G09", "mixed_version_writer_evidence", lambda item: item.update({"versions": ["a" * 40, "c" * 40]}), "tested source revision"),
             ("g08-capacity-cases", "G08", "mrf_capacity_evidence", lambda item: item.update({"capacity_cases": ["queue-count-limit"]}), "missing cases"),
@@ -3070,6 +3776,48 @@ class SelfTests(unittest.TestCase):
             ("mrf-records", "G07", "mrf_responsibility_oracle", lambda item: item.pop("replayed_records"), "replayed_records"),
             ("mrf-anchor", "G07", "commit_boundary_crash_matrix", lambda item: item.update({"responsibility_anchor_retained": False}), "retained MRF responsibility anchors"),
             ("mrf-successor", "P4", "retained_responsibility_evidence", lambda item: item.pop("successor_snapshot_published"), "successor snapshot"),
+            (
+                "g02-raw-budget",
+                "G02",
+                "bounded_checkpoint_oracle",
+                lambda item: item.update({"max_raw_entries_per_round": item["raw_entry_budget"] + 1}),
+                "raw entries exceed fixed budget",
+            ),
+            (
+                "g02-durable-checkpoint",
+                "G02",
+                "bounded_checkpoint_oracle",
+                lambda item: item.update({"durable_checkpoint_committed": False}),
+                "durable_checkpoint_committed",
+            ),
+            (
+                "g02-version-inventory",
+                "G02",
+                "independent_version_inventory",
+                lambda item: item.update({"versions_retained": item["objects_retained"] - 1}),
+                "version inventory",
+            ),
+            (
+                "re-converged",
+                "R-E",
+                "fixed_budget_restart_evidence",
+                lambda item: item.update({"fixed_budget_restart_converged": False}),
+                "fixed_budget_restart_converged",
+            ),
+            (
+                "re-enumeration-commit",
+                "R-E",
+                "enumeration_evidence",
+                lambda item: item.update({"durable_raw_page_commit_observed": False}),
+                "durable_raw_page_commit_observed",
+            ),
+            (
+                "re-classification-inventory",
+                "R-E",
+                "classification_evidence",
+                lambda item: item.update({"bytes_retained": item["objects_retained"] - 1}),
+                "byte inventory",
+            ),
             (
                 "mrf-cleanup-gc-cases",
                 "P4",
@@ -3115,6 +3863,48 @@ class SelfTests(unittest.TestCase):
                 "missing G11.segment_activation_preflight.proof_inputs",
             ),
             (
+                "producer-matrix-missing",
+                "G11",
+                "maintenance_producer_matrix",
+                lambda item: item["producer_identities"].remove("tier_expiration"),
+                "producer_identities missing cases",
+            ),
+            (
+                "producer-inventory-missing",
+                "G11",
+                "complete_producer_inventory",
+                lambda item: item.update({"missing_producer_identities": ["tier_expiration"]}),
+                "zero missing producer identities",
+            ),
+            (
+                "producer-inventory-unknown",
+                "G11",
+                "complete_producer_inventory",
+                lambda item: item.update({"unknown_producer_excluded": False}),
+                "unknown_producer_excluded",
+            ),
+            (
+                "quorum-minus-one-success",
+                "G13",
+                "quorum_minus_one_matrix",
+                lambda item: item.update({"no_success_at_quorum_minus_one": False}),
+                "no_success_at_quorum_minus_one",
+            ),
+            (
+                "remount-revalidation",
+                "G13",
+                "unknown_disk_remount_matrix",
+                lambda item: item.update({"remounted_disks_revalidated": False}),
+                "remounted_disks_revalidated",
+            ),
+            (
+                "dry-run-mutates",
+                "G13",
+                "object_lock_dry_run_grace_evidence",
+                lambda item: item.update({"dry_run_mutation_count": 1}),
+                "dry_run_mutation_count",
+            ),
+            (
                 "distributed-invalidation",
                 "G14",
                 "distributed_segment_invalidation_evidence",
@@ -3127,6 +3917,20 @@ class SelfTests(unittest.TestCase):
                 "distributed_segment_invalidation_evidence",
                 lambda item: item.update({"all_peers_bound_to_generation_window": False}),
                 "peer generation-window binding",
+            ),
+            (
+                "post-stop-work-multiple",
+                "P2",
+                "post_stop_convergence_measurement",
+                lambda item: item.update({"post_stop_work_multiple": 1.3}),
+                "post-stop work multiple limit",
+            ),
+            (
+                "post-stop-publication",
+                "P2",
+                "post_stop_convergence_measurement",
+                lambda item: item.update({"first_complete_publication": False}),
+                "first complete publication",
             ),
             (
                 "cold-segment-walk",
@@ -3173,6 +3977,34 @@ class SelfTests(unittest.TestCase):
             ("scheduler-duplicates", "G10", "scheduler_bound_evidence", lambda item: item.pop("duplicate_task_count"), "duplicate_task_count"),
             ("p1-throughput", "P1", "foreground_latency_throughput_measurement", lambda item: item.pop("throughput_ops_per_second"), "throughput_ops_per_second"),
             ("p3-fixed-load", "P3", "two_hour_pressure_measurement", lambda item: item.update({"fixed_offered_load": False}), "fixed offered load"),
+            (
+                "rd-manager",
+                "R-D",
+                "manager_disposition_evidence",
+                lambda item: item["manager_disposition_cases"].remove("rejected-policy"),
+                "missing cases",
+            ),
+            (
+                "rd-event",
+                "R-D",
+                "event_disposition_evidence",
+                lambda item: item.update({"events_correlate_to_manager_dispositions": False}),
+                "events_correlate_to_manager_dispositions",
+            ),
+            (
+                "rd-ledger",
+                "R-D",
+                "ledger_disposition_evidence",
+                lambda item: item.update({"ledger_replay_preserves_terminal_disposition": False}),
+                "ledger_replay_preserves_terminal_disposition",
+            ),
+            (
+                "rd-grace",
+                "R-D",
+                "grace_handling",
+                lambda item: item["grace_cases"].remove("restart-preserves-grace-clock"),
+                "missing cases",
+            ),
         ):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
                 root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
@@ -3261,6 +4093,18 @@ class SelfTests(unittest.TestCase):
                 "JSON artifact is fixture",
             ),
             (
+                "g05-outcome-mirror",
+                lambda payload: payload["per_object_outcome_cases"].remove("object-skipped-by-policy"),
+                ("G05", "per_object_outcome_oracle"),
+                "per_object_outcome_cases missing cases",
+            ),
+            (
+                "g06-truncation-mirror",
+                lambda payload: payload["truncation_cases"].remove("trailing-data-node-status-reject"),
+                ("G06", "truncation_behavior"),
+                "truncation_cases missing cases",
+            ),
+            (
                 "mrf-artifact-kind",
                 lambda payload: payload.update({"artifact_kind": "generic-json"}),
                 ("G08", "disk_full_matrix"),
@@ -3277,6 +4121,12 @@ class SelfTests(unittest.TestCase):
                 lambda payload: payload.update({"pending_responsibilities_after_gc": 1}),
                 ("P4", "mrf_cleanup_gc_soak_evidence"),
                 "JSON artifact requires zero pending responsibilities",
+            ),
+            (
+                "rd-grace-mirror",
+                lambda payload: payload["grace_cases"].remove("grace-expired-prunes-terminal"),
+                ("R-D", "grace_handling"),
+                "grace_cases missing cases",
             ),
         ):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
@@ -3516,6 +4366,8 @@ class SelfTests(unittest.TestCase):
             self.assertIn("scheduler-pressure", status["pending_lanes"])
             requirements, _, _ = scanner_heal_release_requirements(read_json(root / ".config/scanner-heal-required-tests.json"))
             self.assertIn("durable_root_publication_proof", requirements["G03"]["evidence_fields"])
+            self.assertIn("per_object_outcome_oracle", requirements["G05"]["evidence_fields"])
+            self.assertIn("truncation_behavior", requirements["G06"]["evidence_fields"])
             self.assertIn("disk_full_matrix", requirements["G08"]["evidence_fields"])
             self.assertIn("mixed_version_writer_evidence", requirements["G09"]["evidence_fields"])
             self.assertIn("segment_activation_preflight", requirements["G11"]["evidence_fields"])
@@ -3525,12 +4377,13 @@ class SelfTests(unittest.TestCase):
                 tuple(requirements["P4"]["evidence_fields"]),
                 SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P4"],
             )
+            self.assertIn("grace_handling", requirements["R-D"]["evidence_fields"])
 
     def test_scanner_heal_required_evidence_fields_cannot_be_removed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root, run_dir = self.scanner_heal_fixture(Path(tmp))
             registry = read_json(root / ".config/scanner-heal-required-tests.json")
-            for gate in ("G03", "G07", "G08", "G09", "G11", "G14", "P2", "P4"):
+            for gate in ("G03", "G05", "G06", "G07", "G08", "G09", "G11", "G14", "P2", "P4", "R-D"):
                 for requirement in registry["release_requirements"]:
                     if requirement["gate"] == gate:
                         requirement["evidence_fields"] = []

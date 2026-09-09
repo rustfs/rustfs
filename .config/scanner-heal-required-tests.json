@@ -209,7 +209,11 @@
       "lane": "status-and-outcome",
       "status": "pending",
       "description": "Per-object outcomes and bounded terminal retention",
-      "requires": ["per-object outcome oracle", "terminal retention bounds"]
+      "requires": ["per-object outcome oracle", "terminal retention bounds"],
+      "evidence_fields": [
+        "per_object_outcome_oracle",
+        "terminal_retention_bounds"
+      ]
     },
     {
       "gate": "G06",
@@ -217,7 +221,12 @@
       "lane": "status-and-outcome",
       "status": "pending",
       "description": "Concurrent status, legacy clients and truncation",
-      "requires": ["concurrent status evidence", "legacy client compatibility", "truncation behavior"]
+      "requires": ["concurrent status evidence", "legacy client compatibility", "truncation behavior"],
+      "evidence_fields": [
+        "concurrent_status_evidence",
+        "legacy_client_compatibility",
+        "truncation_behavior"
+      ]
     },
     {
       "gate": "G07",
@@ -375,7 +384,13 @@
       "lane": "status-and-outcome",
       "status": "pending",
       "description": "Manager-to-event-to-ledger exact disposition, including grace",
-      "requires": ["manager disposition evidence", "event disposition evidence", "ledger disposition evidence", "grace handling"]
+      "requires": ["manager disposition evidence", "event disposition evidence", "ledger disposition evidence", "grace handling"],
+      "evidence_fields": [
+        "manager_disposition_evidence",
+        "event_disposition_evidence",
+        "ledger_disposition_evidence",
+        "grace_handling"
+      ]
     },
     {
       "gate": "R-L",

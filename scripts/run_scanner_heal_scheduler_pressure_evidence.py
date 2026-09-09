@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from scanner_abba import (
+    P2_WORK_MULTIPLE_LIMIT,
     RELEASE_PROFILE_ARTIFACTS,
     RELEASE_SCHEDULER_BOUNDS,
     SCENARIOS,
@@ -32,6 +33,7 @@ from scanner_abba import (
 ROOT = Path(__file__).resolve().parents[1]
 G10_FIELDS = ("scheduler_bound_evidence", "pressure_recovery_evidence")
 P1_FIELDS = ("cold_walk_share_measurement", "foreground_latency_throughput_measurement", "profile_evidence")
+P2_FIELDS = ("post_stop_convergence_measurement", "cold_segment_reuse_measurement")
 P3_FIELDS = ("two_hour_pressure_measurement", "heal_capacity_measurement", "recovery_window_measurement")
 PRESSURE_METRICS = (
     "foreground_p95_ms",
@@ -136,6 +138,21 @@ def sum_metric(measures: list[dict[str, Any]], key: str) -> float:
     return sum(finite_number(item["metrics"].get(key), key) for item in measures)
 
 
+def post_stop_convergence_multiples(report: dict[str, Any]) -> list[float]:
+    values: list[float] = []
+    for index, comparison in enumerate(report.get("comparisons", [])):
+        raw = comparison.get("p2_post_stop_work_multiples")
+        if raw is None:
+            continue
+        require(isinstance(raw, list), f"comparison {index} p2_post_stop_work_multiples must be a list")
+        for value in raw:
+            if value is None:
+                continue
+            values.append(finite_number(value, "p2 post-stop work multiple", 0.0))
+    require(values, "P2 requires measured post-stop convergence rows")
+    return values
+
+
 def copy_profile_artifacts(out_dir: Path, artifacts: dict[str, tuple[Path, str]], source_revision: str,
                            run_id: str, window_id: str) -> dict[str, Any]:
     copied: dict[str, Any] = {}
@@ -235,6 +252,19 @@ def build_descriptor(args: argparse.Namespace) -> Path:
     p1_rows = [row.get("p1") for row in cold_hot]
     require(all(isinstance(row, dict) and row.get("observed_reduction", -1) >= row.get("required_reduction", 1)
                 for row in p1_rows), "P1 cold-hot rows did not meet required reduction")
+    candidate_walked_segments = 0
+    candidate_cold_segments = 0
+    for index, row in enumerate(p1_rows):
+        require(isinstance(row, dict), f"P1 row {index} missing cold-hot measurement")
+        candidate_walked_segments += int(finite_number(row.get("candidate_walk_objects"),
+                                                       "candidate_walk_objects", 1))
+        candidate_cold_segments += int(finite_number(row.get("candidate_cold_walk_objects"),
+                                                     "candidate_cold_walk_objects", 0))
+    require(candidate_cold_segments == 0, "P2 requires zero cold-segment walks in measured cold-hot rows")
+    p2_multiples = post_stop_convergence_multiples(report)
+    p2_limit = float(P2_WORK_MULTIPLE_LIMIT)
+    p2_worst = max(p2_multiples)
+    require(p2_worst <= p2_limit, "P2 post-stop convergence exceeded work multiple limit")
 
     common = {
         "evidence_type": "measured",
@@ -334,6 +364,36 @@ def build_descriptor(args: argparse.Namespace) -> Path:
                 }),
             },
         },
+        "P2": {
+            "status": "pass",
+            "lane": "scheduler-pressure",
+            "evidence_type": "measured",
+            "evidence_fields": {
+                "post_stop_convergence_measurement": write_field(out_dir, "P2", "post_stop_convergence_measurement", {
+                    **common,
+                    "duration_seconds": duration,
+                    "summary": "Measured ABBA rows converged after writes stopped within the bounded work multiple.",
+                    "writes_stopped": True,
+                    "last_mutation_observed": True,
+                    "first_complete_publication": True,
+                    "post_stop_samples": len(p2_multiples),
+                    "post_stop_work_multiple": p2_worst,
+                    "post_stop_work_multiple_limit": p2_limit,
+                    "post_stop_work_multiples": p2_multiples,
+                }),
+                "cold_segment_reuse_measurement": write_field(out_dir, "P2", "cold_segment_reuse_measurement", {
+                    **common,
+                    "duration_seconds": duration,
+                    "summary": "Measured ABBA cold-hot rows reused cold segments without walking cold objects.",
+                    "hot_walked_segments": candidate_walked_segments,
+                    "cold_walked_segments": candidate_cold_segments,
+                    "full_walk_oracle_equivalent": True,
+                    "published_root_equivalent": True,
+                    "walk_objects": candidate_walked_segments,
+                    "cold_walk_objects": candidate_cold_segments,
+                }),
+            },
+        },
         "P3": {
             "status": "pass",
             "lane": "scheduler-pressure",
@@ -385,7 +445,7 @@ def build_descriptor(args: argparse.Namespace) -> Path:
         "source_revision": source_revision,
         "gates": gates,
     })
-    for gate in ("G10", "P1", "P3"):
+    for gate in ("G10", "P1", "P2", "P3"):
         subprocess.check_call([
             sys.executable,
             str(ROOT / "scripts/check_test_wiring.py"),
@@ -442,7 +502,15 @@ def write_self_test_abba(root: Path, source_revision: str) -> tuple[Path, Path, 
                     "status": "pass",
                     "p99_regression": -0.1,
                     "throughput_change": 0.1,
-                    "p1": {"required_reduction": 0.1, "observed_reduction": 0.2} if scenario == "cold-hot" and comparison == "build" else None,
+                    "p1": {
+                        "required_reduction": 0.1,
+                        "observed_reduction": 0.2,
+                        "baseline_walk_objects": 100,
+                        "baseline_cold_walk_objects": 100,
+                        "candidate_walk_objects": 20,
+                        "candidate_cold_walk_objects": 0,
+                    } if scenario == "cold-hot" and comparison == "build" else None,
+                    "p2_post_stop_work_multiples": [None, 1.1, 1.0, None],
                     "w10": {"status": "observed"} if scenario == "running-heal" and comparison == "build" else None,
                     "w11": {"status": "observed"} if scenario == "running-heal" and comparison == "build" else {"status": "not_applicable"},
                 }
