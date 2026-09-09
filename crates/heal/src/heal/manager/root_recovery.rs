@@ -30,6 +30,8 @@ const ROOT_TERMINAL_PREFIX: &str = "terminal-root-heal-";
 const LEGACY_ROOT_RECOVERY_SCHEMA: u32 = 1;
 const ROOT_RECOVERY_SCHEMA: u32 = 2;
 const ROOT_TERMINAL_SCHEMA: u32 = 1;
+const ROOT_TERMINAL_GC_SCAN_BUDGET: usize = 1024;
+const ROOT_TERMINAL_GC_DELETE_BUDGET: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -247,6 +249,12 @@ impl RootHealTerminal {
             min_seq: 0,
         }
     }
+
+    fn retained_at(&self, now: SystemTime) -> bool {
+        now.duration_since(self.completed_at)
+            .map(|age| age <= KEEP_HEAL_TASK_STATUS_DURATION)
+            .unwrap_or(true)
+    }
 }
 
 impl RootHealIntent {
@@ -360,7 +368,22 @@ fn decode_terminal(task_id: &str, bytes: &[u8]) -> Result<RootHealTerminal> {
         return Err(Error::Other(format!("Unsupported or mismatched root heal terminal record {task_id}")));
     }
     terminal.heal_type.validate()?;
+    if !matches!(
+        terminal.status,
+        HealTaskStatus::Completed | HealTaskStatus::Cancelled | HealTaskStatus::Failed { .. }
+    ) {
+        return Err(Error::Other(format!("Non-terminal root heal receipt {task_id}")));
+    }
     Ok(terminal)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RootTerminalGcReport {
+    pub(super) scanned: usize,
+    pub(super) retained: usize,
+    pub(super) pending_removed: usize,
+    pub(super) terminals_removed: usize,
+    pub(super) budget_exhausted: bool,
 }
 
 impl RootHealRecovery {
@@ -426,6 +449,20 @@ impl RootHealRecovery {
             }
         }
         Ok(found)
+    }
+
+    async fn find_retained_terminal(
+        disks: &[DiskStore],
+        task_id: &str,
+        now: SystemTime,
+    ) -> Result<Option<(DiskStore, EcstoreDiskBytes)>> {
+        let Some((disk, bytes)) = Self::find_terminal(disks, task_id).await? else {
+            return Ok(None);
+        };
+        if decode_terminal(task_id, &bytes)?.retained_at(now) {
+            return Ok(Some((disk, bytes)));
+        }
+        Ok(None)
     }
 
     async fn persist_terminal_locked(
@@ -649,7 +686,7 @@ impl RootHealRecovery {
         }
         let _guard = self.mutation.lock().await;
         let disks = self.disks().await?;
-        let Some((_, bytes)) = Self::find_terminal(&disks, task_id).await? else {
+        let Some((_, bytes)) = Self::find_retained_terminal(&disks, task_id, SystemTime::now()).await? else {
             return Ok(None);
         };
         Ok(Some(decode_terminal(task_id, &bytes)?.into_completed()))
@@ -672,7 +709,7 @@ impl RootHealRecovery {
                 else {
                     continue;
                 };
-                let Some((_, bytes)) = Self::find_terminal(&disks, task_id).await? else {
+                let Some((_, bytes)) = Self::find_retained_terminal(&disks, task_id, SystemTime::now()).await? else {
                     continue;
                 };
                 let heal_type = HealType::from(decode_terminal(task_id, &bytes)?.heal_type);
@@ -682,6 +719,100 @@ impl RootHealRecovery {
             }
         }
         Ok(false)
+    }
+
+    pub(super) async fn gc_terminal_receipts_once(&self, now: SystemTime) -> Result<RootTerminalGcReport> {
+        let _guard = self.mutation.lock().await;
+        let disks = self.disks().await?;
+        let mut report = RootTerminalGcReport::default();
+        let mut ids = HashSet::new();
+        for disk in &disks {
+            if report.scanned >= ROOT_TERMINAL_GC_SCAN_BUDGET {
+                report.budget_exhausted = true;
+                break;
+            }
+            EcstoreDiskAPI::stat_volume(disk.as_ref(), RUSTFS_META_BUCKET).await?;
+            let remaining = ROOT_TERMINAL_GC_SCAN_BUDGET.saturating_sub(report.scanned);
+            let count = i32::try_from(remaining).unwrap_or(i32::MAX);
+            let mut entries = match EcstoreDiskAPI::list_dir(disk.as_ref(), "", RUSTFS_META_BUCKET, "", count).await {
+                Ok(entries) => entries,
+                Err(DiskError::FileNotFound) => continue,
+                Err(error) => return Err(Error::Disk(error)),
+            };
+            entries.sort_unstable();
+            for entry in entries {
+                if report.scanned >= ROOT_TERMINAL_GC_SCAN_BUDGET {
+                    report.budget_exhausted = true;
+                    break;
+                }
+                report.scanned += 1;
+                let Some(task_id) = entry
+                    .strip_prefix(ROOT_TERMINAL_PREFIX)
+                    .and_then(|entry| entry.strip_suffix(".json"))
+                else {
+                    continue;
+                };
+                let _ = terminal_path(task_id)?;
+                ids.insert(task_id.to_string());
+            }
+        }
+
+        let mut ids = ids.into_iter().collect::<Vec<_>>();
+        ids.sort();
+        let mut deletes = 0usize;
+        for task_id in ids {
+            if deletes >= ROOT_TERMINAL_GC_DELETE_BUDGET {
+                report.budget_exhausted = true;
+                break;
+            }
+            let Some((terminal_disk, terminal_bytes)) = Self::find_terminal(&disks, &task_id).await? else {
+                continue;
+            };
+            let terminal = decode_terminal(&task_id, &terminal_bytes)?;
+            if terminal.retained_at(now) {
+                report.retained += 1;
+                continue;
+            }
+            if let Some((pending_disk, pending_bytes)) = Self::find(&disks, &task_id).await? {
+                match EcstoreDiskAPI::compare_and_update_file(
+                    pending_disk.as_ref(),
+                    RUSTFS_META_BUCKET,
+                    &intent_path(&task_id)?,
+                    Some(pending_bytes),
+                    None,
+                )
+                .await?
+                {
+                    EcstoreConditionalFileUpdate::Updated => {
+                        deletes += 1;
+                        report.pending_removed += 1;
+                        report.retained += 1;
+                        continue;
+                    }
+                    _ => {
+                        return Err(Error::Other(format!(
+                            "Root heal recovery record changed while pruning terminal receipt {task_id}"
+                        )));
+                    }
+                }
+            }
+            match EcstoreDiskAPI::compare_and_update_file(
+                terminal_disk.as_ref(),
+                RUSTFS_META_BUCKET,
+                &terminal_path(&task_id)?,
+                Some(terminal_bytes),
+                None,
+            )
+            .await?
+            {
+                EcstoreConditionalFileUpdate::Updated => {
+                    deletes += 1;
+                    report.terminals_removed += 1;
+                }
+                _ => return Err(Error::Other(format!("Root heal terminal record changed while pruning {task_id}"))),
+            }
+        }
+        Ok(report)
     }
 
     pub(super) async fn pending(&self) -> Result<Vec<HealRequest>> {
