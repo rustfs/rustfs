@@ -9,8 +9,9 @@ descriptor shape and lets check_test_wiring.py validate each gate.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -37,10 +38,6 @@ G06_FIELDS = ("concurrent_status_evidence", "legacy_client_compatibility", "trun
 RD_FIELDS = ("manager_disposition_evidence", "event_disposition_evidence", "ledger_disposition_evidence", "grace_handling")
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
 def git_head() -> str:
     return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
 
@@ -48,6 +45,18 @@ def git_head() -> str:
 def positive_int(value: Any, name: str, minimum: int = 1, maximum: int = 2**63 - 1) -> int:
     require(type(value) is int and minimum <= value <= maximum, f"invalid {name}")
     return value
+
+
+def identity_string(value: Any, name: str) -> str:
+    require(isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}", value), f"invalid {name}")
+    return value
+
+
+def timestamp(value: Any, name: str) -> str:
+    require(isinstance(value, str) and value.endswith("Z"), f"invalid {name}")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    require(parsed.tzinfo is not None, f"{name} must include timezone")
+    return parsed.isoformat().replace("+00:00", "Z")
 
 
 def bool_true(value: Any, name: str) -> None:
@@ -59,9 +68,36 @@ def load_measured_json(path: Path, source_revision: str, label: str) -> dict[str
     require(isinstance(payload, dict), f"{label} must be a JSON object")
     for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
         require(payload.get(marker) is not True, f"{label} is {marker}")
+    require(payload.get("schema") == 1, f"{label} schema must be 1")
     require(payload.get("evidence_type") == "measured", f"{label} must be measured")
     require(payload.get("source_revision") == source_revision, f"{label} source revision mismatch")
+    identity_string(payload.get("run_id"), f"{label}.run_id")
+    identity_string(payload.get("measurement_window_id"), f"{label}.measurement_window_id")
+    require(payload["measurement_window_id"] != payload["run_id"], f"{label} must separate run/window identities")
+    started_at = timestamp(payload.get("started_at"), f"{label}.started_at")
+    finished_at = timestamp(payload.get("finished_at"), f"{label}.finished_at")
+    require(
+        datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+        >= datetime.fromisoformat(started_at.replace("Z", "+00:00")),
+        f"{label}.finished_at precedes started_at",
+    )
+    require(isinstance(payload.get("command"), list) and payload["command"], f"{label} missing command provenance")
     return payload
+
+
+def shared_raw_identity(payloads: list[tuple[str, dict[str, Any]]]) -> dict[str, str]:
+    first_label, first = payloads[0]
+    identity = {
+        "run_id": first["run_id"],
+        "measurement_window_id": first["measurement_window_id"],
+        "started_at": timestamp(first["started_at"], f"{first_label}.started_at"),
+        "finished_at": timestamp(first["finished_at"], f"{first_label}.finished_at"),
+    }
+    for label, payload in payloads[1:]:
+        for key, expected in identity.items():
+            observed = timestamp(payload[key], f"{label}.{key}") if key.endswith("_at") else payload[key]
+            require(observed == expected, f"{label}.{key} does not match status-and-outcome run identity")
+    return identity
 
 
 def validate_status_outcome(payload: dict[str, Any]) -> None:
@@ -159,19 +195,22 @@ def write_field(out_dir: Path, gate: str, field: str, evidence: dict[str, Any]) 
     return evidence
 
 
-def common_evidence(args: argparse.Namespace, source_revision: str) -> dict[str, Any]:
+def common_evidence(args: argparse.Namespace, source_revision: str, identity: dict[str, str]) -> dict[str, Any]:
     duration = positive_int(args.duration_seconds, "duration_seconds", 1, 86400)
-    started_at = args.started_at or utc_now()
-    if args.finished_at:
-        finished_at = args.finished_at
-    else:
-        started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-        finished_at = (started + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z")
+    started_at = timestamp(args.started_at, "--started-at") if args.started_at else identity["started_at"]
+    finished_at = timestamp(args.finished_at, "--finished-at") if args.finished_at else identity["finished_at"]
+    run_id = args.run_id or identity["run_id"]
+    measurement_window_id = args.measurement_window_id or identity["measurement_window_id"]
+    require(run_id == identity["run_id"], "--run-id must match raw status-and-outcome artifacts")
+    require(measurement_window_id == identity["measurement_window_id"],
+            "--measurement-window-id must match raw status-and-outcome artifacts")
+    require(started_at == identity["started_at"], "--started-at must match raw status-and-outcome artifacts")
+    require(finished_at == identity["finished_at"], "--finished-at must match raw status-and-outcome artifacts")
     return {
         "evidence_type": "measured",
         "source_revision": source_revision,
-        "run_id": args.run_id or f"status-outcome-{source_revision[:12]}",
-        "measurement_window_id": args.measurement_window_id or f"status-outcome-window-{source_revision[:12]}",
+        "run_id": run_id,
+        "measurement_window_id": measurement_window_id,
         "started_at": started_at,
         "finished_at": finished_at,
         "duration_seconds": duration,
@@ -194,12 +233,17 @@ def build_descriptor(args: argparse.Namespace) -> Path:
     status_outcome = load_measured_json(status_outcome_path, source_revision, "status outcome artifact")
     status_compat = load_measured_json(status_compat_path, source_revision, "status compatibility artifact")
     disposition = load_measured_json(disposition_path, source_revision, "disposition artifact")
+    identity = shared_raw_identity([
+        ("status outcome artifact", status_outcome),
+        ("status compatibility artifact", status_compat),
+        ("disposition artifact", disposition),
+    ])
     validate_status_outcome(status_outcome)
     validate_status_compat(status_compat)
     validate_disposition(disposition)
 
     out_dir.mkdir(parents=True)
-    common = common_evidence(args, source_revision)
+    common = common_evidence(args, source_revision, identity)
     source_artifacts = {
         "status_outcome_source_sha256": digest(status_outcome_path),
         "status_compat_source_sha256": digest(status_compat_path),
@@ -315,11 +359,20 @@ def build_descriptor(args: argparse.Namespace) -> Path:
 
 
 def write_self_test_inputs(root: Path, source_revision: str) -> tuple[Path, Path, Path]:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    common = {
+        "run_id": f"status-outcome-{source_revision[:12]}",
+        "measurement_window_id": f"status-outcome-window-{source_revision[:12]}",
+        "started_at": now.isoformat().replace("+00:00", "Z"),
+        "finished_at": now.isoformat().replace("+00:00", "Z"),
+        "command": ["scripts/run_live_status_outcome_probe.sh", "--measured"],
+    }
     status_outcome = root / "status-outcome.json"
     write_json(status_outcome, {
         "schema": 1,
         "evidence_type": "measured",
         "source_revision": source_revision,
+        **common,
         "per_object_outcome_cases": list(SCANNER_HEAL_RELEASE_G05_PER_OBJECT_OUTCOME_CASES),
         "outcome_counts": {"repaired": 4, "healthy": 3, "skipped": 2, "failed": 1},
         "status_matches_object_oracle": True,
@@ -333,6 +386,7 @@ def write_self_test_inputs(root: Path, source_revision: str) -> tuple[Path, Path
         "schema": 1,
         "evidence_type": "measured",
         "source_revision": source_revision,
+        **common,
         "concurrent_status_cases": list(SCANNER_HEAL_RELEASE_G06_CONCURRENT_STATUS_CASES),
         "status_samples": 4,
         "all_status_responses_http_success": True,
@@ -349,6 +403,7 @@ def write_self_test_inputs(root: Path, source_revision: str) -> tuple[Path, Path
         "schema": 1,
         "evidence_type": "measured",
         "source_revision": source_revision,
+        **common,
         "manager_disposition_cases": list(SCANNER_HEAL_RELEASE_RD_MANAGER_CASES),
         "manager_dispositions_are_terminal": True,
         "event_disposition_cases": list(SCANNER_HEAL_RELEASE_RD_EVENT_CASES),
@@ -398,6 +453,44 @@ def run_self_test() -> None:
             require("truncation_cases missing cases" in str(err), "wrong self-test failure for missing truncation")
         else:
             raise ValueError("self-test accepted incomplete truncation evidence")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source_revision = git_head()
+        status_outcome, status_compat, disposition = write_self_test_inputs(root, source_revision)
+        payload = read_json(disposition)
+        payload["measurement_window_id"] = "status-outcome-stale-window"
+        write_json(disposition, payload)
+        try:
+            build_descriptor(parse_args([
+                "--status-outcome-json", str(status_outcome),
+                "--status-compat-json", str(status_compat),
+                "--disposition-json", str(disposition),
+                "--out-dir", str(root / "out"),
+            ]))
+        except ValueError as err:
+            require("does not match status-and-outcome run identity" in str(err),
+                    "wrong self-test failure for mismatched raw identity")
+        else:
+            raise ValueError("self-test accepted mismatched raw status/outcome provenance")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source_revision = git_head()
+        status_outcome, status_compat, disposition = write_self_test_inputs(root, source_revision)
+        try:
+            build_descriptor(parse_args([
+                "--status-outcome-json", str(status_outcome),
+                "--status-compat-json", str(status_compat),
+                "--disposition-json", str(disposition),
+                "--out-dir", str(root / "out"),
+                "--run-id", "status-outcome-other-run",
+            ]))
+        except ValueError as err:
+            require("--run-id must match raw status-and-outcome artifacts" in str(err),
+                    "wrong self-test failure for run id relabel")
+        else:
+            raise ValueError("self-test accepted command-line relabeling of raw status/outcome evidence")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
