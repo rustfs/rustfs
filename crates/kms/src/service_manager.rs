@@ -577,13 +577,16 @@ impl KmsServiceManager {
         Some(service_version.probe_worker.as_ref()?.status())
     }
 
-    /// Health check for the KMS service
+    /// Check backend health without changing the service lifecycle state.
+    ///
+    /// A transient backend failure leaves the published service available for
+    /// subsequent checks and operations. Readiness uses the background probe
+    /// to evaluate backend availability independently of lifecycle state.
     pub async fn health_check(&self) -> Result<bool> {
         let checked_state = self.state.load_full();
         match checked_state.current_service.as_ref() {
             Some(service_version) => {
                 let manager = service_version.manager.clone();
-                let checked_version = service_version.version;
                 // Perform health check on the backend
                 match manager.health_check().await {
                     Ok(healthy) => {
@@ -594,8 +597,6 @@ impl KmsServiceManager {
                     }
                     Err(e) => {
                         error!("KMS health check error: {}", e);
-                        let _guard = self.lifecycle_mutex.lock().await;
-                        self.mark_health_error_if_current(checked_version, &e);
                         Err(e)
                     }
                 }
@@ -738,17 +739,6 @@ impl KmsServiceManager {
             cancel,
             task: std::sync::Mutex::new(Some(task)),
         }))
-    }
-
-    fn mark_health_error_if_current(&self, checked_version: u64, error: &KmsError) {
-        let current = self.state.load_full();
-        if current.current_service.as_ref().map(|version| version.version) == Some(checked_version) {
-            self.state.store(Arc::new(RuntimeState {
-                config: current.config.clone(),
-                status: KmsServiceStatus::Error(format!("Health check failed: {error}")),
-                current_service: current.current_service.clone(),
-            }));
-        }
     }
 }
 
@@ -1002,19 +992,6 @@ mod tests {
         assert_eq!(manager.get_service_version().await, Some(first_version));
         assert_eq!(manager.start_or_restart(true).await.expect("forced restart"), KmsStartOutcome::Restarted);
         assert!(manager.get_service_version().await.expect("restarted version") > first_version);
-    }
-
-    #[tokio::test]
-    async fn stale_health_failure_cannot_poison_new_service_status() {
-        let manager = KmsServiceManager::new();
-        manager.configure(static_config("key-a", 0x11)).await.expect("configure");
-        manager.start().await.expect("start");
-        let old_version = manager.get_service_version().await.expect("old version");
-        manager.restart().await.expect("restart");
-
-        manager.mark_health_error_if_current(old_version, &KmsError::backend_error("stale failure"));
-
-        assert_eq!(manager.get_status().await, KmsServiceStatus::Running);
     }
 
     #[tokio::test]
