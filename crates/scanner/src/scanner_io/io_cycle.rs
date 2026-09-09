@@ -241,12 +241,17 @@ where
         return remote_resolution;
     }
 
+    let segment_reuse_activation_preflight = scanner_segment_reuse_activation_preflight_for_baseline(
+        resolution.dirty_usage_snapshot,
+        distributed,
+        resolution.baseline_proof,
+    );
     default_result(scoped_scan_scope_from_dirty_buckets(
         resolution.requested_scope,
         dirty_buckets,
         (!distributed).then_some(resolution.dirty_usage_snapshot.scopes.as_ref()),
         true,
-        scanner_segment_reuse_activated(),
+        segment_reuse_activation_preflight.scanner_segment_reuse_activated,
         resolution.all_buckets,
         resolution.baseline_proof,
     ))

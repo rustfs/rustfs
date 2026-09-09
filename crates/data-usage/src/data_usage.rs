@@ -603,6 +603,8 @@ pub struct DataUsageSegmentInvalidationProof {
     pub generation_end: u64,
     #[serde(default)]
     pub producer_identity_coverage_complete: bool,
+    #[serde(default)]
+    pub cold_zero_walk_oracle: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -3144,6 +3146,7 @@ mod tests {
             generation_start: 3,
             generation_end: 5,
             producer_identity_coverage_complete: true,
+            cold_zero_walk_oracle: true,
         };
         let state = DataUsageSnapshotSetState {
             pool_index: 1,

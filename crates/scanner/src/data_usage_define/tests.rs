@@ -1189,6 +1189,7 @@ fn test_new_data_usage_cache_msgpack_round_trips_and_supports_old_reader() {
                 generation_start: 7,
                 generation_end: 9,
                 producer_identity_coverage_complete: true,
+                cold_zero_walk_oracle: true,
             }),
             cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
             ..Default::default()
@@ -1226,6 +1227,7 @@ fn test_new_data_usage_cache_msgpack_round_trips_and_supports_old_reader() {
             generation_start: 7,
             generation_end: 9,
             producer_identity_coverage_complete: true,
+            cold_zero_walk_oracle: true,
         })
     );
     assert_eq!(current.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);

@@ -84,7 +84,14 @@ async fn persist_baseline(store: &Arc<ECStore>, baseline: &DataUsageInfo) {
 
 // Every invocation uses the production default scope. Once durable bucket
 // incarnations are present, the expected walker set follows the resolved scope.
-async fn run_entry(store: &Arc<ECStore>, cycle: u64, selected: Option<&str>, expect_walks: bool) -> DataUsageInfo {
+async fn run_entry(
+    store: &Arc<ECStore>,
+    cycle: u64,
+    selected: Option<&str>,
+    expect_walks: bool,
+    expect_activation: bool,
+    expect_prefix_scope: bool,
+) -> DataUsageInfo {
     let drives = drive_identities(store).await;
     let inventory = store
         .list_bucket_for_scanner(&BucketOptions::default())
@@ -144,6 +151,13 @@ async fn run_entry(store: &Arc<ECStore>, cycle: u64, selected: Option<&str>, exp
         scope.selected_buckets.as_deref(),
         selected.map(|name| HashSet::from([name.to_string()])).as_ref()
     );
+    if let Some(selected) = selected {
+        assert_eq!(
+            scope.prefix_scope_for(selected).is_some(),
+            expect_prefix_scope,
+            "resolved prefix scope must match activation replay for cycle {cycle}"
+        );
+    }
     let usage = receiver.recv().await.expect("one candidate should be delivered");
     assert!(receiver.recv().await.is_none(), "there must be exactly one terminal candidate");
     assert!(usage.usage_snapshot_complete);
@@ -175,10 +189,12 @@ async fn run_entry(store: &Arc<ECStore>, cycle: u64, selected: Option<&str>, exp
         actual, expected_walks,
         "each listed source/bucket must have exactly the expected real walks"
     );
-    assert!(!activation_preflight.production_activation);
-    assert!(!activation_preflight.scanner_segment_reuse_activated);
+    assert!(activation_preflight.production_activation);
+    assert_eq!(activation_preflight.scanner_segment_reuse_activated, expect_activation);
     let activation_blockers = activation_preflight.fail_closed_blockers().collect::<Vec<_>>();
-    if selected.is_some() && expect_walks {
+    if expect_activation {
+        assert_eq!(activation_blockers, Vec::<&str>::new());
+    } else if selected.is_some() && expect_walks {
         assert!(
             !activation_blockers.contains(&"missing_cold_zero_walk_oracle"),
             "a complete scoped reuse cycle must carry the cold zero-walk oracle: cycle={cycle} selected={selected:?} blockers={activation_blockers:?}"
@@ -204,6 +220,12 @@ async fn run_entry(store: &Arc<ECStore>, cycle: u64, selected: Option<&str>, exp
     usage
 }
 
+fn record_segment_dirty_usage(bucket: &str) {
+    for producer in crate::segment_invalidation::SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION {
+        record_dirty_usage_object_from_producer(bucket, "hot-segment/object", producer);
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn scoped_entry_fallback_distinguishes_planned_scope_from_real_cold_walks() {
@@ -213,14 +235,16 @@ async fn scoped_entry_fallback_distinguishes_planned_scope_from_real_cold_walks(
     let cold = format!("cold-{}", Uuid::new_v4().simple());
     create_bucket(&store, &hot).await;
     create_bucket(&store, &cold).await;
-    record_dirty_usage_bucket(&hot);
-    let baseline = run_entry(&store, 1, None, true).await;
+    record_segment_dirty_usage(&hot);
+    let baseline = run_entry(&store, 1, None, true, false, false).await;
     persist_baseline(&store, &baseline).await;
 
     // Same-cycle Current remains a retry. The later cycle may skip the cold
     // bucket only after the prior complete set cache has durable incarnations.
-    run_entry(&store, 1, Some(&hot), false).await;
-    let usage = run_entry(&store, 2, Some(&hot), true).await;
+    run_entry(&store, 1, Some(&hot), false, false, false).await;
+    let usage = run_entry(&store, 2, Some(&hot), true, true, false).await;
+    persist_baseline(&store, &usage).await;
+    let usage = run_entry(&store, 3, Some(&hot), true, true, true).await;
     assert_eq!(usage.buckets_usage[&hot].objects_count, 1);
     assert_eq!(usage.buckets_usage[&cold].objects_count, 1);
     assert_eq!(usage.objects_total_count, 2);
@@ -238,7 +262,7 @@ async fn scoped_entry_fallback_rejects_invalid_persisted_baseline_at_the_walker(
     create_bucket(&store, &cold).await;
     record_dirty_usage_bucket(&hot);
     // The first real scan is also the missing persisted-baseline case.
-    let baseline = run_entry(&store, 1, None, true).await;
+    let baseline = run_entry(&store, 1, None, true, false, false).await;
     for (index, kind) in [
         "malformed",
         "unconverged",
@@ -271,7 +295,15 @@ async fn scoped_entry_fallback_rejects_invalid_persisted_baseline_at_the_walker(
         crate::save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), bytes)
             .await
             .expect("negative baseline should persist");
-        let usage = run_entry(&store, u64::try_from(index).expect("fixture cycle index should fit") + 2, None, true).await;
+        let usage = run_entry(
+            &store,
+            u64::try_from(index).expect("fixture cycle index should fit") + 2,
+            None,
+            true,
+            false,
+            false,
+        )
+        .await;
         assert_eq!(usage.objects_total_count, 2, "{kind}");
         assert_eq!(usage.buckets_usage[&cold].objects_count, 1, "{kind}");
     }
@@ -286,13 +318,13 @@ async fn scoped_entry_fallback_covers_overflow_and_new_bucket_inventory() {
     let hot = format!("hot-{}", Uuid::new_v4().simple());
     create_bucket(&store, &hot).await;
     record_dirty_usage_bucket(&hot);
-    let baseline = run_entry(&store, 1, None, true).await;
+    let baseline = run_entry(&store, 1, None, true, false, false).await;
     persist_baseline(&store, &baseline).await;
     for index in 0..=crate::SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES {
         record_dirty_usage_bucket(&format!("overflow-{index}"));
     }
     assert!(dirty_usage_buckets_for_tests().len() > crate::SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES);
-    let usage = run_entry(&store, 2, None, true).await;
+    let usage = run_entry(&store, 2, None, true, false, false).await;
     assert_eq!(usage.objects_total_count, 1);
 
     clear_dirty_usage_buckets_for_tests();
@@ -300,7 +332,7 @@ async fn scoped_entry_fallback_covers_overflow_and_new_bucket_inventory() {
     let new_bucket = format!("new-{}", Uuid::new_v4().simple());
     create_bucket(&store, &new_bucket).await;
     // Even a previously valid baseline cannot cover the changed inventory.
-    let usage = run_entry(&store, 3, None, true).await;
+    let usage = run_entry(&store, 3, None, true, false, false).await;
     assert_eq!(usage.objects_total_count, 2);
     assert_eq!(usage.buckets_usage[&new_bucket].objects_count, 1);
     clear_dirty_usage_buckets_for_tests();

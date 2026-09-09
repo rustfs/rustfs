@@ -436,6 +436,60 @@ fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<
     complete_scanner_cache_snapshot_plan_digest(&observed, proof, false)
 }
 
+fn scanner_segment_reuse_baseline_producer_evidence(
+    dirty_usage_snapshot: &DirtyUsageSnapshot,
+    baseline_proof: ScannerCacheBaselineProof<'_>,
+) -> (DirtyUsageProducerEvidence, bool) {
+    let mut evidence = dirty_usage_producer_evidence(dirty_usage_snapshot);
+    if !evidence.generation_window_bound || !evidence.producer_identity_coverage_complete {
+        return (evidence, false);
+    }
+
+    let Some(authoritative_data) = baseline_proof.authoritative_data else {
+        return (evidence, false);
+    };
+    let Ok(authoritative) = serde_json::from_slice::<DataUsageInfo>(authoritative_data) else {
+        return (evidence, false);
+    };
+    if complete_scanner_cache_snapshot_plan_digest(&authoritative, baseline_proof, true).is_none()
+        || !scanner_snapshot_set_states_have_segment_reuse_activation_proof(
+            &authoritative,
+            &evidence,
+            baseline_proof.expected_sources,
+        )
+    {
+        return (evidence, false);
+    }
+
+    evidence.durable_producer_identity = true;
+    evidence.restart_gap_absent = true;
+    (evidence, true)
+}
+
+fn scanner_snapshot_set_states_have_segment_reuse_activation_proof(
+    snapshot: &DataUsageInfo,
+    evidence: &DirtyUsageProducerEvidence,
+    expected_sources: &HashSet<DataUsageCacheSource>,
+) -> bool {
+    let mut covered_sources = HashSet::with_capacity(expected_sources.len());
+    let all_sets_proved = snapshot.usage_snapshot_set_states.iter().all(|state| {
+        let (Ok(pool_index), Ok(set_index)) = (usize::try_from(state.pool_index), usize::try_from(state.set_index)) else {
+            return false;
+        };
+        let source = DataUsageCacheSource::new(pool_index, set_index);
+        state.complete
+            && !state.tombstone
+            && expected_sources.contains(&source)
+            && covered_sources.insert(source)
+            && scanner_segment_invalidation_proof_matches(state.segment_invalidation_proof.as_ref(), evidence)
+            && state
+                .segment_invalidation_proof
+                .as_ref()
+                .is_some_and(|proof| proof.cold_zero_walk_oracle)
+    });
+    all_sets_proved && covered_sources.len() == expected_sources.len()
+}
+
 fn scoped_scan_scope_from_dirty_buckets(
     requested_scope: ScannerBucketScanScope,
     dirty_buckets: HashSet<String>,
@@ -485,9 +539,10 @@ fn scoped_scan_scope_from_dirty_buckets(
 }
 
 fn scanner_segment_reuse_activation_preflight() -> ScannerSegmentReuseActivationPreflight {
-    // Production segment reuse stays disabled until a durable mutation-stream
-    // proof satisfies the segment invalidation contract.
-    scanner_segment_reuse_activation_preflight_from_proof(ScannerSegmentReuseActivationProof::default())
+    scanner_segment_reuse_activation_preflight_from_proof(ScannerSegmentReuseActivationProof {
+        production_activation: true,
+        ..Default::default()
+    })
 }
 
 fn scanner_segment_reuse_activation_preflight_from_proof(
@@ -525,7 +580,7 @@ fn scanner_segment_reuse_activation_preflight_for_cycle(
     cold_zero_walk_oracle: bool,
 ) -> ScannerSegmentReuseActivationPreflight {
     scanner_segment_reuse_activation_preflight_from_proof(ScannerSegmentReuseActivationProof {
-        production_activation: false,
+        production_activation: true,
         producer_identity_coverage_complete: dirty_usage_producer_evidence.producer_identity_coverage_complete,
         durable_producer_identity: dirty_usage_producer_evidence.durable_producer_identity,
         restart_gap_absent: dirty_usage_producer_evidence.restart_gap_absent,
@@ -535,7 +590,43 @@ fn scanner_segment_reuse_activation_preflight_for_cycle(
             && dirty_usage_producer_evidence.generation_window_bound,
         overflow_absent: dirty_usage_snapshot.covers_all_pending,
         cold_zero_walk_oracle,
-        distributed_peer_invalidation: !distributed || distributed_segment_invalidation_evidence.is_some(),
+        distributed_peer_invalidation: scanner_distributed_segment_invalidation_admitted(
+            distributed,
+            distributed_segment_invalidation_evidence,
+        ),
+    })
+}
+
+fn scanner_segment_reuse_activation_preflight_for_baseline(
+    dirty_usage_snapshot: &DirtyUsageSnapshot,
+    distributed: bool,
+    baseline_proof: ScannerCacheBaselineProof<'_>,
+) -> ScannerSegmentReuseActivationPreflight {
+    let (dirty_usage_producer_evidence, cold_zero_walk_oracle) =
+        scanner_segment_reuse_baseline_producer_evidence(dirty_usage_snapshot, baseline_proof);
+    scanner_segment_reuse_activation_preflight_for_cycle(
+        dirty_usage_snapshot,
+        dirty_usage_producer_evidence,
+        distributed,
+        None,
+        cold_zero_walk_oracle,
+    )
+}
+
+fn scanner_distributed_segment_invalidation_admitted(
+    distributed: bool,
+    evidence: Option<DistributedSegmentInvalidationEvidence>,
+) -> bool {
+    if !distributed {
+        return true;
+    }
+    evidence.is_some_and(|evidence| {
+        evidence.invalidation_domain == crate::segment_invalidation::SegmentInvalidationDomain::DistributedEc
+            && evidence.distributed_ec_invalidation
+            && evidence.same_window_remote_proof
+            && evidence.all_peers_bound_to_generation_window
+            && evidence.dirty_peer_count > 0
+            && evidence.dirty_peer_count <= evidence.peer_count
     })
 }
 
@@ -580,6 +671,17 @@ fn scanner_segment_invalidation_proof_matches(
     })
 }
 
+fn scanner_completed_set_segment_invalidation_proof(
+    proof: &Option<crate::DataUsageSegmentInvalidationProof>,
+    cold_zero_walk_reuse_candidate: bool,
+) -> Option<crate::DataUsageSegmentInvalidationProof> {
+    proof.clone().map(|mut proof| {
+        proof.cold_zero_walk_oracle = cold_zero_walk_reuse_candidate;
+        proof
+    })
+}
+
+#[cfg(test)]
 fn scanner_segment_reuse_activated() -> bool {
     scanner_segment_reuse_activation_preflight().scanner_segment_reuse_activated
 }

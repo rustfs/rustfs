@@ -231,6 +231,8 @@ impl ScannerIOCache for SetDisks {
         });
         if buckets.is_empty() {
             let now = SystemTime::now();
+            let completed_segment_invalidation_proof =
+                scanner_completed_set_segment_invalidation_proof(&segment_invalidation_proof, cold_zero_walk_reuse_candidate);
             let mut cache = match scoped_cache.take() {
                 Some(cache) => cache,
                 None => {
@@ -244,7 +246,7 @@ impl ScannerIOCache for SetDisks {
                             scan_plan_digest: Some(scan_plan_digest),
                             scan_coverage_digest: Some(bucket_coverage_digest),
                             cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
-                            segment_invalidation_proof: segment_invalidation_proof.clone(),
+                            segment_invalidation_proof: completed_segment_invalidation_proof.clone(),
                             scan_bucket_incarnations: current_bucket_incarnations.clone().unwrap_or_default(),
                             ..Default::default()
                         },
@@ -260,7 +262,7 @@ impl ScannerIOCache for SetDisks {
             cache.info.last_update = Some(now);
             cache.info.snapshot_complete = true;
             cache.info.scan_execution_digest = Some(execution_digest);
-            cache.info.segment_invalidation_proof = segment_invalidation_proof.clone();
+            cache.info.segment_invalidation_proof = completed_segment_invalidation_proof;
             cache.info.lkg_snapshot_complete = false;
             cache.info.lkg_next_cycle = None;
             cache.info.lkg_last_update = None;
@@ -1463,13 +1465,15 @@ impl ScannerIOCache for SetDisks {
 
         let completed_count = completed_bucket_count.load(Ordering::Relaxed);
         if should_publish_completed_snapshot(completed_count, buckets.len(), budget.budget_elapsed(), ctx.is_cancelled()) {
+            let completed_segment_invalidation_proof =
+                scanner_completed_set_segment_invalidation_proof(&segment_invalidation_proof, cold_zero_walk_reuse_candidate);
             let cache_snapshot = {
                 let mut cache = cache_mutex.lock().await;
                 cache.info.next_cycle = want_cycle;
                 cache.info.last_update.get_or_insert_with(SystemTime::now);
                 cache.info.snapshot_complete = true;
                 cache.info.scan_execution_digest = Some(execution_digest);
-                cache.info.segment_invalidation_proof = segment_invalidation_proof.clone();
+                cache.info.segment_invalidation_proof = completed_segment_invalidation_proof;
                 cache.info.lkg_snapshot_complete = false;
                 cache.info.lkg_next_cycle = None;
                 cache.info.lkg_last_update = None;
