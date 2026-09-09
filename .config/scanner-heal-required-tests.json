@@ -78,6 +78,43 @@
       "erasure": {"data_blocks": 8, "parity_blocks": 4},
       "erasure_set_drive_count": 12,
       "scope": "Target process killed during partial background rebuild on a single 3x4 EC8+4 set; real unclean-shutdown marker, exact unversioned S3 bodies and replacement-drive shards; not power loss, multi-set, or multi-pool."
+    },
+    "background-target-restart-ec8-4-multi-set": {
+      "gate": "G14",
+      "task": "W21",
+      "lane": "e2e-nightly",
+      "suite": "e2e_test",
+      "name": "heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_ec84_shards_across_multi_set_after_background_target_restart",
+      "oracle": "background-target-restart-ec8-4-multi-set.json",
+      "evidence": "process-restart",
+      "unclean_shutdown_marker": false,
+      "min_objects": 9,
+      "max_objects": 65,
+      "topology": {"nodes": 3, "drives_per_node": 8},
+      "erasure": {"data_blocks": 8, "parity_blocks": 4},
+      "erasure_set_drive_count": 12,
+      "sets": 2,
+      "pools": 1,
+      "scope": "Target process restart during partial background rebuild on a 3x8 EC8+4 layout with two erasure sets in one pool; exact unversioned S3 bodies and replacement-drive shards; not power loss or multi-pool."
+    },
+    "background-target-crash-ec8-4-multi-pool": {
+      "gate": "G14",
+      "task": "W21",
+      "lane": "e2e-nightly",
+      "suite": "e2e_test",
+      "name": "heal_erasure_disk_rebuild_test::tests::test_cluster_root_heal_recovers_ec84_shards_across_multi_pool_after_background_target_crash",
+      "oracle": "background-target-crash-ec8-4-multi-pool.json",
+      "evidence": "process-crash-restart",
+      "unclean_shutdown_marker": true,
+      "min_objects": 9,
+      "max_objects": 65,
+      "topology": {"nodes": 3, "drives_per_node": 12},
+      "erasure": {"data_blocks": 8, "parity_blocks": 4},
+      "erasure_set_drive_count": 12,
+      "sets": 3,
+      "pools": 3,
+      "outage_target_manifest_required": false,
+      "scope": "Target process crash during partial background rebuild on three single-node EC8+4 pools; exact baseline S3 bodies and replacement-drive shards, with outage object verified through S3 but not forced onto the replaced target drive."
     }
   },
   "release_lanes": {
