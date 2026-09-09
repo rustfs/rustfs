@@ -6433,9 +6433,48 @@ impl TierConfigMgr {
     }
 
     pub(crate) async fn refresh_tier_config_handle(handle: Arc<RwLock<Self>>, api: Arc<ECStore>) {
-        Self::refresh_tier_config_handle_with(handle, api).await;
+        Self::refresh_tier_config_handle_with_weak(handle, Arc::downgrade(&api)).await;
     }
 
+    async fn refresh_tier_config_handle_with_weak(handle: Arc<RwLock<Self>>, api: Weak<ECStore>) {
+        // The periodic refresh remains the recovery fallback; committed mutations
+        // notify this worker so a successful peer commit converges immediately.
+        let mutation_refresh = Self::mutation_refresh_notifier(&handle).await;
+        let r = rand::rng().random_range(0.0..1.0);
+        let rand_interval = || Duration::from_secs((r * 60_f64).round() as u64);
+
+        let refresh_interval = TIER_CFG_REFRESH + rand_interval();
+        let mut t = delayed_tier_refresh_interval(refresh_interval);
+        loop {
+            select! {
+                _ = t.tick() => {
+                    let Some(api) = Weak::upgrade(&api) else {
+                        return;
+                    };
+                    if let Err(err) = Self::reload_handle_with(&handle, api).await {
+                        warn!(
+                            event = EVENT_TIER_CONFIG_REFRESH,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_TIER,
+                            trigger = "periodic",
+                            result = "failed",
+                            error = ?err,
+                            "tier configuration refresh"
+                        );
+                    }
+                }
+                _ = mutation_refresh.notified() => {
+                    let Some(api) = Weak::upgrade(&api) else {
+                        return;
+                    };
+                    Self::reload_after_committed_mutation(&handle, api).await;
+                }
+            }
+            t.reset();
+        }
+    }
+
+    #[allow(dead_code, reason = "used by focused tier refresh tests and non-ECStore generic harnesses")]
     pub(crate) async fn refresh_tier_config_handle_with<S>(handle: Arc<RwLock<Self>>, api: Arc<S>)
     where
         S: EcstoreObjectIO

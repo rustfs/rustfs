@@ -22,7 +22,9 @@ use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::object::EcstoreObjectIO;
 use rustfs_config::server_config::KVS;
 use rustfs_credentials::{RPC_SECRET_REQUIRED_OPERATOR_MESSAGE, try_get_rpc_token};
+#[cfg(test)]
 use std::future::Future;
+use std::sync::Weak;
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -240,6 +242,7 @@ where
     Ok(committed)
 }
 
+#[cfg(test)]
 async fn run_local_decommission_watchdog<F, Fut>(rx: CancellationToken, mut reconcile: F)
 where
     F: FnMut() -> Fut,
@@ -294,16 +297,45 @@ async fn reconcile_local_decommission_after_init(store: &Arc<ECStore>, rx: Cance
     store.spawn_missing_local_decommission_routines_with_token(rx).await
 }
 
-async fn supervise_local_decommission_after_init(store: Arc<ECStore>, rx: CancellationToken) {
-    run_local_decommission_watchdog(rx.clone(), || {
-        let store = store.clone();
-        let worker_rx = rx.clone();
-        async move { reconcile_local_decommission_after_init(&store, worker_rx).await }
-    })
-    .await;
+async fn supervise_local_decommission_after_init(store: Weak<ECStore>, rx: CancellationToken) {
+    let mut consecutive_failures = 0u32;
+    loop {
+        if rx.is_cancelled() {
+            return;
+        }
+
+        let Some(store) = store.upgrade() else {
+            return;
+        };
+        let delay = match reconcile_local_decommission_after_init(&store, rx.clone()).await {
+            Ok(()) => {
+                consecutive_failures = 0;
+                LOCAL_DECOMMISSION_WATCHDOG_INTERVAL
+            }
+            Err(err) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let retry_delay = local_decommission_watchdog_retry_delay(consecutive_failures);
+                warn!(
+                    event = EVENT_DECOMMISSION_RESUME_RETRY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_STORE_INIT,
+                    consecutive_failures,
+                    retry_delay_secs = retry_delay.as_secs(),
+                    error = %err,
+                    "Retrying decommission worker recovery"
+                );
+                retry_delay
+            }
+        };
+        drop(store);
+
+        if !wait_for_local_decommission_resume_delay(&rx, delay).await {
+            return;
+        }
+    }
 }
 
-async fn resume_rebalance_after_init(store: Arc<ECStore>, rx: CancellationToken) {
+async fn resume_rebalance_after_init(store: Weak<ECStore>, rx: CancellationToken) {
     if !wait_for_rebalance_resume_delay(&rx, REBALANCE_INITIAL_RESUME_DELAY).await {
         return;
     }
@@ -313,6 +345,9 @@ async fn resume_rebalance_after_init(store: Arc<ECStore>, rx: CancellationToken)
             return;
         }
 
+        let Some(store) = store.upgrade() else {
+            return;
+        };
         let resume_required = store
             .rebalance_meta
             .read()
@@ -327,6 +362,7 @@ async fn resume_rebalance_after_init(store: Arc<ECStore>, rx: CancellationToken)
             store.ctx.is_dist_erasure().await,
             crate::services::notification_sys::acquire_cross_pool_fence_fleet_proof().is_some(),
         ) {
+            drop(store);
             if !wait_for_rebalance_resume_retry(&rx).await {
                 return;
             }
@@ -791,10 +827,10 @@ impl ECStore {
         if has_local_decommission_leadership {
             // The watchdog checks recovery safety and retries transient failures.
             // Resume persisted work without an unconditional cold-start delay.
-            tokio::spawn(supervise_local_decommission_after_init(self.clone(), rx.clone()));
+            tokio::spawn(supervise_local_decommission_after_init(Arc::downgrade(self), rx.clone()));
         }
 
-        let recovery_store = self.clone();
+        let recovery_store = Arc::downgrade(self);
         let recovery_rx = rx.clone();
         tokio::spawn(async move {
             let mut delay = std::time::Duration::from_secs(5);
@@ -803,9 +839,12 @@ impl ECStore {
                     _ = recovery_rx.cancelled() => return,
                     _ = tokio::time::sleep(delay) => {}
                 }
+                let Some(store) = recovery_store.upgrade() else {
+                    return;
+                };
                 let result = tokio::select! {
                     _ = recovery_rx.cancelled() => return,
-                    result = tokio::time::timeout(std::time::Duration::from_secs(30), recovery_store.recover_pool_meta_transaction()) => result,
+                    result = tokio::time::timeout(std::time::Duration::from_secs(30), store.recover_pool_meta_transaction()) => result,
                 };
                 delay = match result {
                     Ok(Ok(_)) => std::time::Duration::from_secs(5),
@@ -814,7 +853,7 @@ impl ECStore {
                             Ok(Err(error)) => error,
                             _ => Error::Timeout,
                         };
-                        recovery_store.record_pool_meta_recovery_failure(error);
+                        store.record_pool_meta_recovery_failure(error);
                         (delay * 2).min(std::time::Duration::from_secs(60))
                     }
                 };
@@ -835,7 +874,7 @@ impl ECStore {
         }
 
         if rebalance_auto_start_deferred {
-            let store = self.clone();
+            let store = Arc::downgrade(self);
             tokio::spawn(resume_rebalance_after_init(store, rx));
         }
 

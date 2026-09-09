@@ -70,12 +70,41 @@ pub(super) async fn setup_scanner_cycle_store_at_path_with_sets(
     pool_count: usize,
     sets_per_pool: usize,
 ) -> Arc<ECStore> {
+    setup_scanner_cycle_store_at_path_with_layout(root, seed_usage_baseline, pool_count, sets_per_pool, 4).await
+}
+
+pub(super) async fn setup_scanner_cycle_store_at_path_with_layout(
+    root: &Path,
+    seed_usage_baseline: bool,
+    pool_count: usize,
+    sets_per_pool: usize,
+    drives_per_set: usize,
+) -> Arc<ECStore> {
+    setup_scanner_cycle_store_at_path_with_layout_and_disk_preinit(
+        root,
+        seed_usage_baseline,
+        pool_count,
+        sets_per_pool,
+        drives_per_set,
+        true,
+    )
+    .await
+}
+
+pub(super) async fn setup_scanner_cycle_store_at_path_with_layout_and_disk_preinit(
+    root: &Path,
+    seed_usage_baseline: bool,
+    pool_count: usize,
+    sets_per_pool: usize,
+    drives_per_set: usize,
+    preinitialize_disks: bool,
+) -> Arc<ECStore> {
     init_ecstore_config_for_scanner_tests();
     let mut pools = Vec::with_capacity(pool_count);
     for pool_index in 0..pool_count {
         let mut endpoints = Vec::new();
         for set_index in 0..sets_per_pool {
-            for disk_index in 0..4 {
+            for disk_index in 0..drives_per_set {
                 let disk_path = if sets_per_pool == 1 {
                     root.join(format!("pool{pool_index}/disk{disk_index}"))
                 } else {
@@ -95,7 +124,7 @@ pub(super) async fn setup_scanner_cycle_store_at_path_with_sets(
         pools.push(PoolEndpoints {
             legacy: false,
             set_count: sets_per_pool,
-            drives_per_set: 4,
+            drives_per_set,
             endpoints: Endpoints::from(endpoints),
             cmd_line: if pool_count == 1 && sets_per_pool == 1 {
                 "scanner-cycle-metrics".to_string()
@@ -108,9 +137,11 @@ pub(super) async fn setup_scanner_cycle_store_at_path_with_sets(
     let endpoint_pools = EndpointServerPools::from(pools);
     let instance_ctx = Arc::new(InstanceContext::new());
     instance_ctx.set_endpoints(endpoint_pools.clone());
-    init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
-        .await
-        .expect("scanner cycle test disks should initialize");
+    if preinitialize_disks {
+        init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
+            .await
+            .expect("scanner cycle test disks should initialize");
+    }
     let store = ECStore::new_with_instance_ctx(
         "127.0.0.1:0".parse().expect("test address should parse"),
         endpoint_pools,
