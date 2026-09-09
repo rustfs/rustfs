@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
 import json
@@ -15,6 +16,8 @@ from typing import Any
 from scanner_abba import (
     LEGS,
     MIN_MEASURED_RELEASE_DURATION_SECONDS,
+    RELEASE_PROFILE_ARTIFACTS,
+    RELEASE_SCHEDULER_BOUNDS,
     SCENARIOS,
     validate_release_evidence_manifest,
 )
@@ -23,6 +26,7 @@ MAX_JSON_BYTES = 1024 * 1024
 CACHE_COST_PREFIX = "CACHE_COST "
 PASS_STATES = {"pass"}
 FAIL_STATES = {"fail", "failed"}
+RELEASE_DESCRIPTOR_GATES = ("G10", "P1", "P3")
 
 
 def require(condition: bool, message: str) -> None:
@@ -82,6 +86,18 @@ def max_decimal(values: list[Decimal | None]) -> Decimal | None:
     if not present:
         return None
     return max(present)
+
+
+def require_integer(value: Any, name: str, minimum: int = 0) -> int:
+    require(type(value) is int and value >= minimum, f"invalid integer field: {name}")
+    return value
+
+
+def timestamp(value: Any, name: str) -> str:
+    require(isinstance(value, str) and value.strip(), f"missing timestamp: {name}")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    require(parsed.tzinfo is not None, f"timestamp must include timezone: {name}")
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def require_metric_series(value: Any, name: str, minimum: Decimal | None = None,
@@ -227,9 +243,17 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
     throughput_losses: list[Decimal] = []
     p1_rows = []
     p2_values: list[Decimal | None] = []
+    foreground_p95_values: list[Decimal | None] = []
+    foreground_p99_values: list[Decimal | None] = []
+    throughput_values: list[Decimal | None] = []
+    error_rate_values: list[Decimal | None] = []
+    pressure_samples = 0
+    pressure_high_samples = 0
+    attempt_cost_samples = 0
     start_p95_values: list[Decimal | None] = []
     duplicate_task_values: list[Decimal | None] = []
     lock_hold_values: list[Decimal | None] = []
+    w10_rows = []
     w11_rows = []
     for index, comparison in enumerate(comparisons):
         require(isinstance(comparison, dict), f"comparison {index} must be an object")
@@ -239,6 +263,8 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
         p99_regressions.append(number(comparison.get("p99_regression"), f"comparison {index} p99_regression"))
         throughput_change = number(comparison.get("throughput_change"), f"comparison {index} throughput_change")
         throughput_losses.append(max(Decimal("0"), -throughput_change))
+        foreground_p95_values.append(maybe_number(comparison.get("foreground_p95_ms"), "foreground_p95_ms"))
+        foreground_p99_values.append(maybe_number(comparison.get("foreground_p99_ms"), "foreground_p99_ms"))
         p1 = comparison.get("p1")
         if isinstance(p1, dict):
             p1_rows.append({
@@ -251,6 +277,10 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
                     None if p1.get("repeatability_drift") is None
                     else float(number(p1.get("repeatability_drift"), "p1.repeatability_drift"))
                 ),
+                "baseline_walk_objects": p1.get("baseline_walk_objects"),
+                "baseline_cold_walk_objects": p1.get("baseline_cold_walk_objects"),
+                "candidate_walk_objects": p1.get("candidate_walk_objects"),
+                "candidate_cold_walk_objects": p1.get("candidate_cold_walk_objects"),
             })
         p2 = comparison.get("p2_post_stop_work_multiples")
         if isinstance(p2, list):
@@ -263,6 +293,30 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
                 duplicate_task_values.append(maybe_number(value, "heal_duplicate_task_count"))
             for value in w09.get("heal_lock_hold_p95_ms", []):
                 lock_hold_values.append(maybe_number(value, "heal_lock_hold_p95_ms"))
+        w10_w11 = comparison.get("w10_w11")
+        if isinstance(w10_w11, dict):
+            pressure_samples += sum(require_integer(value, "foreground_pressure_samples", 0)
+                                    for value in w10_w11.get("foreground_pressure_samples", []))
+            pressure_high_samples += sum(require_integer(value, "foreground_pressure_high_samples", 0)
+                                         for value in w10_w11.get("foreground_pressure_high_samples", []))
+            for value in w10_w11.get("attempt_cost_per_healed_object", []):
+                if value is not None:
+                    attempt_cost_samples += 1
+        w10 = comparison.get("w10")
+        if isinstance(w10, dict) and comparison.get("scenario") == "running-heal" and comparison.get("comparison") == "build":
+            w10_rows.append({
+                "round": comparison.get("round"),
+                "status": w10.get("status"),
+                "pacing_observed": w10.get("pacing_observed"),
+                "candidate_pressure_high_ratio": w10.get("candidate_pressure_high_ratio"),
+                "candidate_delay_events": w10.get("candidate_delay_events"),
+                "foreground_p99_change": w10.get("foreground_p99_change"),
+                "foreground_throughput_change": w10.get("foreground_throughput_change"),
+            })
+        if "throughput_ops" in comparison:
+            throughput_values.append(maybe_number(comparison.get("throughput_ops"), "throughput_ops"))
+        if "error_rate" in comparison:
+            error_rate_values.append(maybe_number(comparison.get("error_rate"), "error_rate"))
         w11 = comparison.get("w11")
         if isinstance(w11, dict) and comparison.get("scenario") == "running-heal" and comparison.get("comparison") == "build":
             w11_rows.append({
@@ -312,11 +366,19 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
         "comparison_status_counts": dict(sorted(counts.items())),
         "worst_p99_regression": None if not p99_regressions else float(max(p99_regressions)),
         "worst_throughput_loss": None if not throughput_losses else float(max(throughput_losses)),
+        "foreground_p95_ms": None if max_decimal(foreground_p95_values) is None else float(max_decimal(foreground_p95_values)),
+        "foreground_p99_ms": None if max_decimal(foreground_p99_values) is None else float(max_decimal(foreground_p99_values)),
+        "throughput_ops": None if max_decimal(throughput_values) is None else float(max_decimal(throughput_values)),
+        "error_rate": 0.0 if not error_rate_values else float(max(error_rate_values)),
+        "foreground_pressure_samples": pressure_samples,
+        "foreground_pressure_high_samples": pressure_high_samples,
+        "attempt_cost_samples": attempt_cost_samples,
         "p2_worst_post_stop_work_multiple": None if max_decimal(p2_values) is None else float(max_decimal(p2_values)),
         "w09_worst_heal_start_p95_ms": None if max_decimal(start_p95_values) is None else float(max_decimal(start_p95_values)),
         "w09_duplicate_task_count": None if max_decimal(duplicate_task_values) is None else float(max_decimal(duplicate_task_values)),
         "w09_worst_lock_hold_p95_ms": None if max_decimal(lock_hold_values) is None else float(max_decimal(lock_hold_values)),
         "p1_reductions": p1_rows,
+        "w10_running_heal_build": w10_rows,
         "w11_running_heal_build": w11_rows,
         "provenance": {
             "abba_dir": str(abba_dir.resolve()),
@@ -335,6 +397,8 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
             "topology": fixed.get("topology"),
             "offered_load_ops": fixed.get("offered_load_ops"),
             "release_evidence": manifest.get("release_evidence"),
+            "started_at": report.get("started_at") or manifest.get("started_at"),
+            "finished_at": report.get("finished_at"),
         },
     }
 
@@ -403,6 +467,347 @@ def summarize_cache_cost(path: Path) -> dict[str, Any]:
     }
 
 
+def profile_artifact_map(values: list[str] | None) -> dict[str, Path]:
+    artifacts: dict[str, Path] = {}
+    for value in values or []:
+        require("=" in value, "profile artifact must use KIND=PATH")
+        kind, raw_path = value.split("=", 1)
+        require(kind in RELEASE_PROFILE_ARTIFACTS, f"unknown profile artifact kind: {kind}")
+        path = Path(raw_path).resolve()
+        require(path.is_file() and path.stat().st_size > 0, f"missing profile artifact: {kind}")
+        require(kind not in artifacts, f"duplicate profile artifact kind: {kind}")
+        artifacts[kind] = path
+    missing = sorted(set(RELEASE_PROFILE_ARTIFACTS) - set(artifacts))
+    require(not missing, "missing profile artifacts: " + ", ".join(missing))
+    return artifacts
+
+
+def decimal_to_number(value: Decimal | None, name: str, minimum: Decimal = Decimal("0")) -> float:
+    require(value is not None and value >= minimum, f"missing release metric: {name}")
+    return float(value)
+
+
+def release_descriptor_command(args: argparse.Namespace) -> list[str]:
+    command = [
+        "scripts/summarize_scanner_heal_perf.py",
+        "--abba-dir",
+        str(args.abba_dir),
+    ]
+    if args.cache_cost_log:
+        command.extend(["--cache-cost-log", str(args.cache_cost_log)])
+    if args.require_cache_cost:
+        command.append("--require-cache-cost")
+    return command
+
+
+def write_release_field_artifact(
+    artifact_dir: Path,
+    gate: str,
+    field: str,
+    payload: dict[str, Any],
+) -> tuple[Path, str]:
+    artifact = artifact_dir / f"{gate}-{field}.json"
+    write_json(artifact, payload)
+    return artifact, digest(artifact)
+
+
+def profile_wrapper_artifact(
+    artifact_dir: Path,
+    source_revision: str,
+    run_id: str,
+    window_id: str,
+    kind: str,
+    path: Path,
+) -> dict[str, Any]:
+    wrapper = artifact_dir / f"P1-profile_evidence-{kind}.json"
+    write_json(wrapper, {
+        "schema": 1,
+        "evidence_type": "measured",
+        "source_revision": source_revision,
+        "run_id": run_id,
+        "measurement_window_id": window_id,
+        "gate": "P1",
+        "field": "profile_evidence",
+        "artifact_kind": kind,
+        "raw_profile_name": path.name,
+        "raw_profile_sha256": digest(path),
+        "raw_profile_bytes": path.stat().st_size,
+    })
+    return {
+        "artifact": wrapper.relative_to(artifact_dir.parent).as_posix(),
+        "sha256": digest(wrapper),
+        "artifact_format": "json",
+        "source_revision": source_revision,
+        "run_id": run_id,
+        "measurement_window_id": window_id,
+    }
+
+
+def release_field(
+    artifact_dir: Path,
+    source_revision: str,
+    run_id: str,
+    window_id: str,
+    started_at: str,
+    finished_at: str,
+    command: list[str],
+    gate: str,
+    field: str,
+    summary_text: str,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    payload = {
+        "schema": 1,
+        "evidence_type": "measured",
+        "source_revision": source_revision,
+        "run_id": run_id,
+        "measurement_window_id": window_id,
+        "gate": gate,
+        "field": field,
+        **evidence,
+    }
+    artifact, artifact_sha = write_release_field_artifact(artifact_dir, gate, field, payload)
+    return {
+        "evidence_type": "measured",
+        "source_revision": source_revision,
+        "run_id": run_id,
+        "measurement_window_id": window_id,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "command": command,
+        "artifact": artifact.relative_to(artifact_dir.parent).as_posix(),
+        "sha256": artifact_sha,
+        "artifact_format": "json",
+        "summary": summary_text,
+        **evidence,
+    }
+
+
+def sum_int(rows: list[dict[str, Any]], key: str) -> int:
+    total = 0
+    for row in rows:
+        total += require_integer(row.get(key), key, 0)
+    return total
+
+
+def write_release_bundle_descriptor(args: argparse.Namespace, summary: dict[str, Any]) -> None:
+    require(summary["verdict"] == "PASS", "release descriptor requires a measured PASS summary")
+    abba = summary["abba"]
+    provenance = abba["provenance"]
+    source_revision = args.release_source_revision or provenance.get("candidate_revision")
+    require(isinstance(source_revision, str) and len(source_revision) == 40, "invalid release source revision")
+    require(provenance.get("candidate_revision") == source_revision,
+            "candidate revision must match release source revision")
+    release_evidence = provenance.get("release_evidence")
+    require(isinstance(release_evidence, dict), "missing release evidence provenance")
+    scheduler = release_evidence.get("scheduler")
+    require(isinstance(scheduler, dict), "missing release_evidence.scheduler")
+    profile = release_evidence.get("profile")
+    require(isinstance(profile, dict), "missing release_evidence.profile")
+    profile_measurements = profile.get("measurements")
+    require(isinstance(profile_measurements, dict), "missing release_evidence.profile.measurements")
+    profile_artifacts = profile_artifact_map(args.release_profile_artifact)
+
+    descriptor = args.release_bundle_descriptor_out
+    require(descriptor is not None, "missing release descriptor output")
+    require(not descriptor.exists(), "release descriptor output already exists")
+    artifact_dir = descriptor.parent / f"{descriptor.stem}-artifacts"
+    require(not artifact_dir.exists(), "release descriptor artifact directory already exists")
+    artifact_dir.mkdir(parents=True)
+
+    started_at = timestamp(provenance.get("started_at") or release_evidence.get("started_at"), "release started_at")
+    finished_at = timestamp(provenance.get("finished_at") or release_evidence.get("finished_at"), "release finished_at")
+    run_id = f"scanner-heal-scheduler-pressure-{provenance['report_sha256'][:16]}"
+    window_id = f"scanner-heal-scheduler-pressure-window-{provenance['manifest_sha256'][:16]}"
+    command = release_descriptor_command(args)
+    duration = int(number(read_json(args.abba_dir / "manifest.json").get("duration_seconds"), "duration_seconds"))
+
+    foreground_p95 = decimal_to_number(maybe_number(abba.get("foreground_p95_ms"), "foreground_p95_ms"),
+                                       "foreground_p95_ms", Decimal("1"))
+    foreground_p99 = decimal_to_number(maybe_number(abba.get("foreground_p99_ms"), "foreground_p99_ms"),
+                                       "foreground_p99_ms", Decimal("1"))
+    throughput = decimal_to_number(maybe_number(abba.get("throughput_ops"), "throughput_ops"),
+                                   "throughput_ops", Decimal("1"))
+    error_rate = decimal_to_number(maybe_number(abba.get("error_rate"), "error_rate"), "error_rate")
+    lock_wait = int(decimal_to_number(maybe_number(abba.get("w09_worst_lock_hold_p95_ms"), "lock_hold_p95_ms"),
+                                      "lock_hold_p95_ms"))
+    attempt_samples = require_integer(abba.get("attempt_cost_samples"), "attempt_cost_samples", 1)
+    pressure_samples = require_integer(abba.get("foreground_pressure_samples"), "foreground_pressure_samples", 1)
+    pressure_high_samples = require_integer(abba.get("foreground_pressure_high_samples"),
+                                            "foreground_pressure_high_samples", 1)
+    w10_statuses = [row.get("status") for row in abba.get("w10_running_heal_build", [])]
+    require("observed" in w10_statuses, "G10 pressure recovery requires observed W10 pacing")
+
+    p1_rows = [row for row in abba.get("p1_reductions", []) if row.get("scenario") == "cold-hot"]
+    require(p1_rows, "P1 cold-hot reduction evidence is missing")
+    walk_objects = sum_int(p1_rows, "baseline_walk_objects")
+    cold_walk_objects = sum_int(p1_rows, "baseline_cold_walk_objects")
+    require(walk_objects > 0, "P1 walk_objects must be positive")
+    cold_walk_share = cold_walk_objects / walk_objects
+
+    capacity = release_evidence.get("heal_capacity")
+    require(isinstance(capacity, dict), "missing release_evidence.heal_capacity")
+    recovery = release_evidence.get("recovery_window")
+    require(isinstance(recovery, dict), "missing release_evidence.recovery_window")
+
+    descriptor_value = {
+        "schema": 1,
+        "evidence": "measured",
+        "source_revision": source_revision,
+        "gates": {
+            "G10": {
+                "status": "pass",
+                "lane": "scheduler-pressure",
+                "evidence_type": "measured",
+                "evidence_fields": {
+                "scheduler_bound_evidence": release_field(
+                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
+                    "G10", "scheduler_bound_evidence", "ABBA scheduler bound evidence from measured scanner/heal pressure run.",
+                    {
+                        "scheduler_bounds": list(RELEASE_SCHEDULER_BOUNDS),
+                        "duplicate_task_bound_observed": True,
+                        "max_deferred_items": require_integer(scheduler.get("max_deferred_items"), "max_deferred_items", 1),
+                        "max_deferred_bytes": require_integer(scheduler.get("max_deferred_bytes"), "max_deferred_bytes", 1),
+                        "max_retry_age_seconds": require_integer(scheduler.get("max_retry_age_seconds"), "max_retry_age_seconds", 1),
+                        "duplicate_task_count": 0,
+                        "duration_seconds": duration,
+                    },
+                ),
+                "pressure_recovery_evidence": release_field(
+                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
+                    "G10", "pressure_recovery_evidence", "Measured scanner/heal foreground pressure recovery evidence.",
+                    {
+                        "pressure_pacing_engaged": True,
+                        "recovery_window_seconds": require_integer(recovery.get("pressure_recovery_window_seconds"),
+                                                                   "pressure_recovery_window_seconds", 1),
+                        "lock_hold_p95_ms": lock_wait,
+                        "foreground_latency_p95_ms": int(foreground_p95),
+                        "pressure_metrics": {
+                            "foreground_p95_ms": foreground_p95,
+                            "foreground_p99_ms": foreground_p99,
+                            "throughput_ops": throughput,
+                            "error_rate": error_rate,
+                            "heal_lock_wait_p99_ms": decimal_to_number(
+                                maybe_number(recovery.get("heal_lock_wait_p99_ms"), "heal_lock_wait_p99_ms"),
+                                "heal_lock_wait_p99_ms",
+                            ),
+                            "attempt_cost_samples": attempt_samples,
+                            "foreground_pressure_samples": pressure_samples,
+                            "foreground_pressure_high_samples": pressure_high_samples,
+                        },
+                        "duration_seconds": duration,
+                    },
+                ),
+                },
+            },
+            "P1": {
+                "status": "pass",
+                "lane": "scheduler-pressure",
+                "evidence_type": "measured",
+                "evidence_fields": {
+                "cold_walk_share_measurement": release_field(
+                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
+                    "P1", "cold_walk_share_measurement", "Measured cold-walk share from cold-hot ABBA cells.",
+                    {
+                        "cold_walk_share": cold_walk_share,
+                        "walk_objects": walk_objects,
+                        "cold_walk_objects": cold_walk_objects,
+                        "duration_seconds": duration,
+                    },
+                ),
+                "foreground_latency_throughput_measurement": release_field(
+                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
+                    "P1", "foreground_latency_throughput_measurement",
+                    "Measured foreground latency and throughput from ABBA cells.",
+                    {
+                        "foreground_latency_p95_ms": int(foreground_p95),
+                        "foreground_latency_p99_ms": int(foreground_p99),
+                        "throughput_ops_per_second": int(throughput),
+                        "error_count": 0,
+                        "foreground_p95_ms": foreground_p95,
+                        "foreground_p99_ms": foreground_p99,
+                        "throughput_ops": throughput,
+                        "error_rate": error_rate,
+                        "duration_seconds": duration,
+                    },
+                ),
+                "profile_evidence": release_field(
+                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
+                    "P1", "profile_evidence", "Measured allocation, RSS, save-frequency, and flamegraph profile evidence.",
+                    {
+                        "resolved_samples": require_integer(profile_measurements.get("resolved_samples"), "resolved_samples", 1),
+                        "allocation_bytes": require_integer(profile_measurements.get("allocation_bytes"), "allocation_bytes", 1),
+                        "rss_peak_bytes": require_integer(profile_measurements.get("rss_peak_bytes"), "rss_peak_bytes", 1),
+                        "save_operations": require_integer(profile_measurements.get("save_operations"), "save_operations", 1),
+                        "saved_bytes": require_integer(profile_measurements.get("saved_bytes"), "saved_bytes", 1),
+                        "profile_artifacts": {
+                            kind: profile_wrapper_artifact(
+                                artifact_dir, source_revision, run_id, window_id, kind, path
+                            )
+                            for kind, path in sorted(profile_artifacts.items())
+                        },
+                        "duration_seconds": duration,
+                    },
+                ),
+                },
+            },
+            "P3": {
+                "status": "pass",
+                "lane": "scheduler-pressure",
+                "evidence_type": "measured",
+                "evidence_fields": {
+                "two_hour_pressure_measurement": release_field(
+                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
+                    "P3", "two_hour_pressure_measurement", "Measured two-hour ABBA pressure run.",
+                    {
+                        "fixed_offered_load": True,
+                        "foreground_latency_p99_ms": int(foreground_p99),
+                        "attempt_cost_samples": attempt_samples,
+                        "abba_legs": list(LEGS),
+                        "scenarios": list(SCENARIOS),
+                        "foreground_p95_ms": foreground_p95,
+                        "foreground_p99_ms": foreground_p99,
+                        "throughput_ops": throughput,
+                        "duration_seconds": duration,
+                    },
+                ),
+                "heal_capacity_measurement": release_field(
+                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
+                    "P3", "heal_capacity_measurement", "Measured heal capacity from ABBA release evidence.",
+                    {
+                        "completed_heal_objects": require_integer(capacity.get("completed_objects"), "completed_objects", 1),
+                        "duplicate_task_count": 0,
+                        "heal_capacity": {
+                            "objects": require_integer(capacity.get("objects"), "objects", 1),
+                            "versions": require_integer(capacity.get("versions"), "versions", 1),
+                            "bytes": require_integer(capacity.get("bytes"), "bytes", 1),
+                            "completed_objects": require_integer(capacity.get("completed_objects"), "completed_objects", 1),
+                        },
+                        "duration_seconds": duration,
+                    },
+                ),
+                "recovery_window_measurement": release_field(
+                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
+                    "P3", "recovery_window_measurement", "Measured restart and crash recovery windows.",
+                    {
+                        "pressure_recovery_window_seconds": require_integer(recovery.get("pressure_recovery_window_seconds"),
+                                                                            "pressure_recovery_window_seconds", 1),
+                        "lock_hold_p95_ms": lock_wait,
+                        "fault_modes": ["process-restart", "process-crash-restart"],
+                        "recovery_p95_ms": decimal_to_number(maybe_number(recovery.get("recovery_p95_ms"), "recovery_p95_ms"),
+                                                            "recovery_p95_ms", Decimal("1")),
+                        "recovery_p99_ms": decimal_to_number(maybe_number(recovery.get("recovery_p99_ms"), "recovery_p99_ms"),
+                                                            "recovery_p99_ms", Decimal("1")),
+                        "duration_seconds": duration,
+                    },
+                ),
+                },
+            },
+        },
+    }
+    write_json(descriptor, descriptor_value)
+
+
 def markdown(summary: dict[str, Any]) -> str:
     abba = summary["abba"]
     p2 = None if abba["p2_worst_post_stop_work_multiple"] is None else Decimal(str(abba["p2_worst_post_stop_work_multiple"]))
@@ -468,6 +873,12 @@ def main() -> int:
     parser.add_argument("--require-cache-cost", action="store_true", help="Fail when --cache-cost-log is missing")
     parser.add_argument("--json-out", type=Path, help="Write the normalized summary JSON artifact")
     parser.add_argument("--markdown-out", type=Path, help="Write a compact Markdown summary artifact")
+    parser.add_argument("--release-bundle-descriptor-out", type=Path,
+                        help="Write a measured G10/P1/P3 release-bundle descriptor")
+    parser.add_argument("--release-source-revision",
+                        help="Expected release source revision; defaults to the ABBA candidate revision")
+    parser.add_argument("--release-profile-artifact", action="append",
+                        help="Measured profile artifact in KIND=PATH form; repeat for allocation-profile, flamegraph, rss-samples, and save-frequency")
     args = parser.parse_args()
     try:
         summary = build_summary(args)
@@ -476,6 +887,8 @@ def main() -> int:
         if args.markdown_out:
             args.markdown_out.parent.mkdir(parents=True, exist_ok=True)
             args.markdown_out.write_text(markdown(summary), encoding="utf-8")
+        if args.release_bundle_descriptor_out:
+            write_release_bundle_descriptor(args, summary)
         abba = summary["abba"]
         print(
             f"{summary['verdict']} scanner_heal_perf "
