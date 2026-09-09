@@ -20,6 +20,7 @@ pub mod scheduler;
 pub mod schema;
 pub mod stats_collector;
 mod storage_api;
+mod storage_snapshot;
 
 pub use collectors::*;
 pub use config::*;

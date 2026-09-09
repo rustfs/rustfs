@@ -32,6 +32,7 @@ services:
       - RUSTFS_SECRET_KEY=rustfsadmin
       - RUSTFS_OBS_LOGGER_LEVEL=info
       - RUSTFS_OBS_ENDPOINT=http://otel-collector:4318
+      - OTEL_RESOURCE_ATTRIBUTES=${OTEL_RESOURCE_ATTRIBUTES:-rustfs.cluster.id=rustfs-dev}
       - RUSTFS_OBS_PROFILING_ENDPOINT=http://pyroscope:4040
     volumes:
       - rustfs-data:/data/rustfs

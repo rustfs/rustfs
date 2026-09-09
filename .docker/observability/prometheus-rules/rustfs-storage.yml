@@ -1,0 +1,575 @@
+# Preserve OTLP timestamps in the Collector. Apply timestamp() directly to
+# each raw selector, before label rewriting; functions such as label_replace()
+# replace the evaluation timestamp and would make a cached value look new.
+# Compare publication times at Prometheus millisecond precision so points
+# published and exported within the same millisecond are not withheld.
+groups:
+  - name: rustfs-storage-snapshots
+    interval: 15s
+    rules:
+      - record: rustfs:storage_snapshot:fresh
+        expr: |
+          rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id!="",collection_scope=~"local|cluster"}
+          and ((time() - rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id!="",collection_scope=~"local|cluster"}) <= rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id!="",collection_scope=~"local|cluster"})
+          and ((time() - rustfs_storage_snapshot_last_success_timestamp_seconds{rustfs_cluster_id!="",collection_scope=~"local|cluster"}) >= 0)
+          and (rustfs_storage_snapshot_max_age_seconds{rustfs_cluster_id!="",collection_scope=~"local|cluster"} > 0)
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_buckets_total
+        expr: |
+          rustfs_cluster_buckets_total{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_buckets_total{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_capacity_free_bytes
+        expr: |
+          rustfs_cluster_capacity_free_bytes{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_capacity_free_bytes{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_capacity_missing_drives
+        expr: |
+          rustfs_cluster_capacity_missing_drives{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_capacity_missing_drives{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_capacity_raw_total_bytes
+        expr: |
+          rustfs_cluster_capacity_raw_total_bytes{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_capacity_raw_total_bytes{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_capacity_stale_drives
+        expr: |
+          rustfs_cluster_capacity_stale_drives{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_capacity_stale_drives{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_capacity_usable_total_bytes
+        expr: |
+          rustfs_cluster_capacity_usable_total_bytes{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_capacity_usable_total_bytes{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_capacity_used_bytes
+        expr: |
+          rustfs_cluster_capacity_used_bytes{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_capacity_used_bytes{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_drive_capacity_observation_age_seconds
+        expr: |
+          rustfs_cluster_drive_capacity_observation_age_seconds{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_drive_capacity_observation_age_seconds{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_drive_capacity_observation_state
+        expr: |
+          rustfs_cluster_drive_capacity_observation_state{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_drive_capacity_observation_state{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_drive_free_bytes
+        expr: |
+          rustfs_cluster_drive_free_bytes{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_drive_free_bytes{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_drive_offline_duration_seconds
+        expr: |
+          rustfs_cluster_drive_offline_duration_seconds{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_drive_offline_duration_seconds{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_drive_present
+        expr: |
+          rustfs_cluster_drive_present{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_drive_present{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_drive_runtime_state
+        expr: |
+          rustfs_cluster_drive_runtime_state{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_drive_runtime_state{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_drive_total_bytes
+        expr: |
+          rustfs_cluster_drive_total_bytes{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_drive_total_bytes{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_drive_used_bytes
+        expr: |
+          rustfs_cluster_drive_used_bytes{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_drive_used_bytes{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_erasure_set_data_shards
+        expr: |
+          rustfs_cluster_erasure_set_data_shards{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_erasure_set_data_shards{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_erasure_set_healing_drives_count
+        expr: |
+          rustfs_cluster_erasure_set_healing_drives_count{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_erasure_set_healing_drives_count{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_erasure_set_health
+        expr: |
+          rustfs_cluster_erasure_set_health{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_erasure_set_health{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_erasure_set_online_drives_count
+        expr: |
+          rustfs_cluster_erasure_set_online_drives_count{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_erasure_set_online_drives_count{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_erasure_set_overall_health
+        expr: |
+          rustfs_cluster_erasure_set_overall_health{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_erasure_set_overall_health{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_erasure_set_overall_write_quorum
+        expr: |
+          rustfs_cluster_erasure_set_overall_write_quorum{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_erasure_set_overall_write_quorum{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_erasure_set_parity
+        expr: |
+          rustfs_cluster_erasure_set_parity{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_erasure_set_parity{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_erasure_set_read_health
+        expr: |
+          rustfs_cluster_erasure_set_read_health{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_erasure_set_read_health{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_erasure_set_read_quorum
+        expr: |
+          rustfs_cluster_erasure_set_read_quorum{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_erasure_set_read_quorum{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_erasure_set_read_tolerance
+        expr: |
+          rustfs_cluster_erasure_set_read_tolerance{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_erasure_set_read_tolerance{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_erasure_set_size
+        expr: |
+          rustfs_cluster_erasure_set_size{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_erasure_set_size{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_erasure_set_write_health
+        expr: |
+          rustfs_cluster_erasure_set_write_health{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_erasure_set_write_health{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_erasure_set_write_quorum
+        expr: |
+          rustfs_cluster_erasure_set_write_quorum{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_erasure_set_write_quorum{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_erasure_set_write_tolerance
+        expr: |
+          rustfs_cluster_erasure_set_write_tolerance{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_erasure_set_write_tolerance{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_health_drives_count
+        expr: |
+          rustfs_cluster_health_drives_count{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_health_drives_count{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_health_drives_offline_count
+        expr: |
+          rustfs_cluster_health_drives_offline_count{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_health_drives_offline_count{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_health_drives_online_count
+        expr: |
+          rustfs_cluster_health_drives_online_count{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_health_drives_online_count{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_cluster_objects_total
+        expr: |
+          rustfs_cluster_objects_total{rustfs_cluster_id!="",collection_scope="cluster"}
+          and (timestamp(rustfs_cluster_objects_total{rustfs_cluster_id!="",collection_scope="cluster"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_node_disk_free_bytes
+        expr: |
+          rustfs_node_disk_free_bytes{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_node_disk_free_bytes{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_node_disk_total_bytes
+        expr: |
+          rustfs_node_disk_total_bytes{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_node_disk_total_bytes{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_node_disk_used_bytes
+        expr: |
+          rustfs_node_disk_used_bytes{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_node_disk_used_bytes{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_api_calls_total
+        expr: |
+          rustfs_system_drive_api_calls_total{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_api_calls_total{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_api_latency_by_api_micros
+        expr: |
+          rustfs_system_drive_api_latency_by_api_micros{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_api_latency_by_api_micros{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_api_latency_micros
+        expr: |
+          rustfs_system_drive_api_latency_micros{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_api_latency_micros{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_availability_errors_total
+        expr: |
+          rustfs_system_drive_availability_errors_total{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_availability_errors_total{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_capacity_observation_age_seconds
+        expr: |
+          rustfs_system_drive_capacity_observation_age_seconds{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_capacity_observation_age_seconds{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_capacity_observation_state
+        expr: |
+          rustfs_system_drive_capacity_observation_state{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_capacity_observation_state{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_count
+        expr: |
+          rustfs_system_drive_count{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_count{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_deletes_total
+        expr: |
+          rustfs_system_drive_deletes_total{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_deletes_total{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_free_bytes
+        expr: |
+          rustfs_system_drive_free_bytes{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_free_bytes{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_free_inodes
+        expr: |
+          rustfs_system_drive_free_inodes{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_free_inodes{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_healing
+        expr: |
+          rustfs_system_drive_healing{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_healing{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_health
+        expr: |
+          rustfs_system_drive_health{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_health{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_info
+        expr: |
+          rustfs_system_drive_info{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_info{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_io_errors_total
+        expr: |
+          rustfs_system_drive_io_errors_total{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_io_errors_total{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_offline_count
+        expr: |
+          rustfs_system_drive_offline_count{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_offline_count{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_offline_duration_seconds
+        expr: |
+          rustfs_system_drive_offline_duration_seconds{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_offline_duration_seconds{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_online_count
+        expr: |
+          rustfs_system_drive_online_count{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_online_count{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_perc_util
+        expr: |
+          rustfs_system_drive_perc_util{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_perc_util{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_present
+        expr: |
+          rustfs_system_drive_present{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_present{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_reads_await
+        expr: |
+          rustfs_system_drive_reads_await{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_reads_await{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_reads_kb_per_sec
+        expr: |
+          rustfs_system_drive_reads_kb_per_sec{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_reads_kb_per_sec{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_reads_per_sec
+        expr: |
+          rustfs_system_drive_reads_per_sec{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_reads_per_sec{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_runtime_state
+        expr: |
+          rustfs_system_drive_runtime_state{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_runtime_state{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_scanning
+        expr: |
+          rustfs_system_drive_scanning{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_scanning{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_timeout_errors_total
+        expr: |
+          rustfs_system_drive_timeout_errors_total{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_timeout_errors_total{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_total_bytes
+        expr: |
+          rustfs_system_drive_total_bytes{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_total_bytes{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_total_inodes
+        expr: |
+          rustfs_system_drive_total_inodes{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_total_inodes{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_used_bytes
+        expr: |
+          rustfs_system_drive_used_bytes{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_used_bytes{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_used_inodes
+        expr: |
+          rustfs_system_drive_used_inodes{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_used_inodes{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_waiting_io
+        expr: |
+          rustfs_system_drive_waiting_io{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_waiting_io{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_writes_await
+        expr: |
+          rustfs_system_drive_writes_await{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_writes_await{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_writes_kb_per_sec
+        expr: |
+          rustfs_system_drive_writes_kb_per_sec{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_writes_kb_per_sec{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_writes_per_sec
+        expr: |
+          rustfs_system_drive_writes_per_sec{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_writes_per_sec{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))
+      - record: rustfs:storage:current
+        labels:
+          source_metric: rustfs_system_drive_writes_total
+        expr: |
+          rustfs_system_drive_writes_total{rustfs_cluster_id!="",collection_scope="local"}
+          and (timestamp(rustfs_system_drive_writes_total{rustfs_cluster_id!="",collection_scope="local"})
+            >= on (rustfs_cluster_id, observer, collection_scope, job, instance) group_left()
+            (floor(rustfs:storage_snapshot:fresh * 1000) / 1000))

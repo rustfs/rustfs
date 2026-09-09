@@ -30,6 +30,8 @@ Registered in [`src/lib.rs`](src/lib.rs). Grouped by concern:
 | **chaos / reliability** | [`src/chaos.rs`](src/chaos.rs), `reliability_disk_fault_test`, `heal_erasure_disk_rebuild_test`, `server_startup_failfast_test` | Disk offline/replace/corrupt, EC rebuild, heal, fail-fast startup |
 | **upgrade compatibility** | `upgrade_compatibility_test` | Pinned previous-release writes followed by current-build reads on the same data directory |
 
+The external-tool `storage_metric_ownership_test` validates the OTLP/Collector/Prometheus path, including a rolling upgrade and node failures. See the [storage metrics guide](../../docs/operations/storage-metrics.md) for its required binaries and focused command.
+
 ## How to run
 
 All commands assume repo root. `cargo test` triggers an on-demand build of the
