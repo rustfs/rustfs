@@ -291,6 +291,21 @@ another platform, or `--test mixed-version|rollback` while narrowing a failure.
 It performs a free-space preflight before building so a saturated validation
 host fails before producing partial evidence.
 
+The W16 recovery-intent and quota-authority lanes can emit raw G04/G12 JSON
+artifacts with:
+
+```bash
+scripts/run_scanner_heal_w16_recovery_evidence.sh
+```
+
+The runner builds the current checkout, runs the scanner recovery-intent and
+disabled-startup crash-boundary tests, runs the scanner quota reset-preservation
+tests, and runs the distributed hard-quota admission E2E. A full run writes
+`release-bundle-w16.json` and validates the G04 and G12 gates with
+`--check-scanner-heal-release-bundle-gate`. Use `--test g04|g12` while narrowing
+a failure; a single gate descriptor still does not approve the complete release
+bundle.
+
 When the real release lanes have produced their dedicated artifacts, validate
 the complete hard-gate bundle with:
 
