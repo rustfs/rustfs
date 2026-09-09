@@ -318,6 +318,9 @@
       "description": "Measured MRF scale and replay cost with retained responsibility",
       "requires": ["MRF scale measurement", "MRF replay-cost measurement", "retained responsibility evidence", "cleanup/GC soak evidence"],
       "evidence_fields": [
+        "mrf_scale_measurement",
+        "mrf_replay_cost_measurement",
+        "retained_responsibility_evidence",
         "mrf_cleanup_gc_soak_evidence"
       ]
     },

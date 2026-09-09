@@ -77,6 +77,9 @@ SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS = {
         "distributed_segment_invalidation_evidence",
     ),
     "P4": (
+        "mrf_scale_measurement",
+        "mrf_replay_cost_measurement",
+        "retained_responsibility_evidence",
         "mrf_cleanup_gc_soak_evidence",
     ),
     "P2": (
@@ -102,12 +105,7 @@ SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS = {
     "P1": ("cold_walk_share_measurement", "foreground_latency_throughput_measurement", "profile_evidence"),
     "P2": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P2"],
     "P3": ("two_hour_pressure_measurement", "heal_capacity_measurement", "recovery_window_measurement"),
-    "P4": (
-        "mrf_scale_measurement",
-        "mrf_replay_cost_measurement",
-        "retained_responsibility_evidence",
-        "mrf_cleanup_gc_soak_evidence",
-    ),
+    "P4": SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P4"],
     "R-E": ("fixed_budget_restart_evidence", "enumeration_evidence", "classification_evidence"),
     "R-D": ("manager_disposition_evidence", "event_disposition_evidence", "ledger_disposition_evidence", "grace_handling"),
     "R-L": ("legacy_source_conflict_evidence", "migration_gap_evidence", "crash_safe_source_retirement_evidence"),
@@ -3430,7 +3428,10 @@ class SelfTests(unittest.TestCase):
             self.assertIn("segment_activation_preflight", requirements["G11"]["evidence_fields"])
             self.assertIn("distributed_segment_invalidation_evidence", requirements["G14"]["evidence_fields"])
             self.assertIn("cold_segment_reuse_measurement", requirements["P2"]["evidence_fields"])
-            self.assertIn("mrf_cleanup_gc_soak_evidence", requirements["P4"]["evidence_fields"])
+            self.assertEqual(
+                tuple(requirements["P4"]["evidence_fields"]),
+                SCANNER_HEAL_RELEASE_REQUIRED_EVIDENCE_FIELDS["P4"],
+            )
 
     def test_scanner_heal_required_evidence_fields_cannot_be_removed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
