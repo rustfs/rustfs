@@ -1078,7 +1078,7 @@ mod tests {
             tier_generation: 1,
         };
         let digest = response_digest(&source, &sets, &target).expect("valid source digest");
-        let mut changed = source.clone();
+        let mut changed = source;
         changed.remote_object.push_str("-changed");
         assert_ne!(digest, response_digest(&changed, &sets, &target).expect("changed source digest"));
     }
