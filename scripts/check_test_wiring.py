@@ -440,6 +440,31 @@ SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES = {
         "restarted-peer-reject",
     ),
 }
+SCANNER_HEAL_RELEASE_G03_REQUIRED_TRUE_FIELDS = {
+    "durable_root_publication_proof": (
+        "root_cas_observed",
+        "root_readback_observed",
+        "dirty_fallback_on_missing_proof_observed",
+    ),
+    "scoped_ack_request_identity": (
+        "bucket_incarnation_observed",
+        "exact_generation_observed",
+        "scanner_instance_observed",
+        "participating_peer_set_observed",
+        "whole_cycle_fallback_observed",
+    ),
+    "participating_peer_capability_snapshot": (
+        "capability_probe_observed",
+        "scoped_ack_capability_observed",
+        "probe_only_fallback_observed",
+        "missing_capability_kept_dirty",
+    ),
+    "mixed_peer_ack_fallback_oracle": (
+        "legacy_peer_fallback_observed",
+        "truncated_token_rejected",
+        "restarted_peer_rejected",
+    ),
+}
 SCANNER_HEAL_RELEASE_MIXED_VERSION_CASES = {
     "mixed_version_reader_evidence": (
         "old-writer-new-reader",
@@ -1840,10 +1865,7 @@ def release_bundle_json_artifact_mirrored_fields(gate: str, field: str) -> tuple
             ))
     if gate == "G03":
         fields.append("scoped_ack_cases")
-        if field == "durable_root_publication_proof":
-            fields.extend(("root_cas_observed", "root_readback_observed"))
-        if field == "scoped_ack_request_identity":
-            fields.append("whole_cycle_fallback_observed")
+        fields.extend(SCANNER_HEAL_RELEASE_G03_REQUIRED_TRUE_FIELDS[field])
     if gate == "G04" and field == "root_floor_intent_crash_evidence":
         fields.extend(("durable_intent_cases", "persist_failure_blocks_acceptance"))
     if gate == "G12":
@@ -2192,12 +2214,8 @@ def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dic
             SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES[field],
             f"{gate}.{field}.scoped_ack_cases",
         )
-        if field == "durable_root_publication_proof":
-            release_bundle_bool_true(evidence.get("root_cas_observed"), f"{gate}.{field}.root_cas_observed")
-            release_bundle_bool_true(evidence.get("root_readback_observed"), f"{gate}.{field}.root_readback_observed")
-        if field == "scoped_ack_request_identity":
-            release_bundle_bool_true(evidence.get("whole_cycle_fallback_observed"),
-                                     f"{gate}.{field}.whole_cycle_fallback_observed")
+        for required in SCANNER_HEAL_RELEASE_G03_REQUIRED_TRUE_FIELDS[field]:
+            release_bundle_bool_true(evidence.get(required), f"{gate}.{field}.{required}")
 
     if gate == "G04" and field == "root_floor_intent_crash_evidence":
         release_bundle_exact_strings(
@@ -3223,6 +3241,10 @@ def write_scanner_heal_release_bundle_fixture(root: Path, directory: Path) -> Pa
             if gate in ("G03", "G09", "R-L"):
                 evidence["versions"] = [baseline_revision, source_revision]
                 evidence["mixed_version_role"] = SCANNER_HEAL_RELEASE_MIXED_VERSION_ROLES[(gate, field)]
+            if gate == "G03":
+                evidence["scoped_ack_cases"] = list(SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES[field])
+                for required in SCANNER_HEAL_RELEASE_G03_REQUIRED_TRUE_FIELDS[field]:
+                    evidence[required] = True
             if gate in ("G04", "G07", "R-E", "R-L"):
                 evidence["crash_points"] = ["fixture-before-commit"]
             if gate == "G12":
@@ -3637,11 +3659,8 @@ class SelfTests(unittest.TestCase):
                     evidence["crash_points"] = ["before-commit"]
                 if gate == "G03":
                     evidence["scoped_ack_cases"] = list(SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES[field])
-                    if field == "durable_root_publication_proof":
-                        evidence["root_cas_observed"] = True
-                        evidence["root_readback_observed"] = True
-                    if field == "scoped_ack_request_identity":
-                        evidence["whole_cycle_fallback_observed"] = True
+                    for required in SCANNER_HEAL_RELEASE_G03_REQUIRED_TRUE_FIELDS[field]:
+                        evidence[required] = True
                 if gate == "G04" and field == "root_floor_intent_crash_evidence":
                     evidence["durable_intent_cases"] = list(SCANNER_HEAL_RELEASE_CRASH_BOUNDARY_FIELDS[(gate, field)])
                     evidence["persist_failure_blocks_acceptance"] = True
@@ -4712,6 +4731,20 @@ class SelfTests(unittest.TestCase):
                 "scoped_ack_request_identity",
                 lambda item: item.update({"whole_cycle_fallback_observed": False}),
                 "whole_cycle_fallback_observed",
+            ),
+            (
+                "scoped-ack-capability-snapshot",
+                "G03",
+                "participating_peer_capability_snapshot",
+                lambda item: item.pop("capability_probe_observed"),
+                "capability_probe_observed",
+            ),
+            (
+                "scoped-ack-mixed-peer-restart",
+                "G03",
+                "mixed_peer_ack_fallback_oracle",
+                lambda item: item.update({"restarted_peer_rejected": False}),
+                "restarted_peer_rejected",
             ),
             (
                 "durable-intent-cases",
