@@ -114,7 +114,12 @@ impl FaultProxy {
     /// Bind a listener on `127.0.0.1:0` and start forwarding accepted
     /// connections to `target`. Starts in [`FaultMode::Pass`].
     pub async fn start(target: SocketAddr) -> io::Result<Self> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        Self::start_on((Ipv4Addr::LOCALHOST, 0).into(), target).await
+    }
+
+    /// Bind the selected address and forward accepted connections to `target`.
+    pub(crate) async fn start_on(address: SocketAddr, target: SocketAddr) -> io::Result<Self> {
+        let listener = TcpListener::bind(address).await?;
         let listen_addr = listener.local_addr()?;
 
         let (mode_tx, mode_rx) = watch::channel(FaultMode::Pass);

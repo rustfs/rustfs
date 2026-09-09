@@ -34,7 +34,7 @@ use serde_json;
 use std::ffi::OsStr;
 use std::fs as stdfs;
 use std::io::ErrorKind;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Once;
@@ -1468,7 +1468,9 @@ impl RustFSTestClusterEnvironment {
             return Err(format!("a volume proxy is already configured for node {node_idx}").into());
         }
         let target = self.nodes[node_idx].address.parse::<SocketAddr>()?;
-        let proxy = crate::fault_proxy::FaultProxy::start(target).await?;
+        // Endpoint locality requires the server port to match. IPv6 loopback
+        // keeps that port while leaving the direct IPv4 S3 listener available.
+        let proxy = crate::fault_proxy::FaultProxy::start_on((Ipv6Addr::LOCALHOST, target.port()).into(), target).await?;
         self.volume_proxy_addresses[node_idx] = Some(proxy.local_addr());
         Ok(proxy)
     }
@@ -2373,7 +2375,7 @@ mod tests {
 
     #[tokio::test]
     async fn volume_proxy_rewrites_cluster_volume_endpoint() {
-        let mut env = RustFSTestClusterEnvironment::new(1)
+        let mut env = RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(2, 2))
             .await
             .expect("cluster environment should allocate a node");
         let direct = env.nodes[0].address.clone();
@@ -2388,6 +2390,24 @@ mod tests {
         assert!(!volumes.contains(&direct), "volumes must not retain the direct address: {volumes}");
 
         proxy.shutdown().await;
+
+        for node in &env.nodes {
+            let local_port = node.address.parse::<SocketAddr>().expect("node address").port();
+            let local_paths = volumes
+                .split_whitespace()
+                .filter_map(|volume| {
+                    let endpoint = reqwest::Url::parse(volume).expect("volume endpoint");
+                    rustfs_utils::is_local_host(
+                        endpoint.host().expect("volume endpoint host"),
+                        endpoint.port().expect("volume endpoint port"),
+                        local_port,
+                    )
+                    .expect("endpoint locality")
+                    .then(|| endpoint.path().to_string())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(local_paths, node.data_dirs, "the proxy must preserve local disk ownership");
+        }
     }
 
     #[test]
