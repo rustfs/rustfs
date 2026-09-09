@@ -3888,6 +3888,31 @@ pub struct SetDisks {
     >,
 }
 
+/// Read every physical copy before selecting a version quorum. A minority
+/// legacy record is still evidence and must not disappear behind a majority
+/// not-found result. Only an explicit file/volume absence produces `None`;
+/// an unreadable disk cannot prove that no conflicting copy exists.
+pub(crate) async fn read_legacy_transition_state_metadata_copies(
+    set: &SetDisks,
+    bucket: &str,
+    object: &str,
+) -> std::result::Result<Vec<Option<Vec<u8>>>, DiskError> {
+    let disk_object = rustfs_utils::path::encode_dir_object(object);
+    let disks = set.get_disks_internal().await;
+    if disks.is_empty() {
+        return Err(DiskError::DiskNotFound);
+    }
+
+    let (copies, errs) = SetDisks::read_all_raw_file_info(&disks, bucket, disk_object.as_str(), false).await;
+    for err in errs.into_iter().flatten() {
+        if !matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound) {
+            return Err(err);
+        }
+    }
+
+    Ok(copies.into_iter().map(|copy| copy.map(|copy| copy.buf)).collect())
+}
+
 // DistributedLock sends the raw ObjectKey to its clients; LockRegistry clones
 // each endpoint's canonical Arc, so an exact Arc set identifies the lock domain.
 pub(crate) fn same_distributed_lock_domain(left: &[Arc<dyn LockClient>], right: &[Arc<dyn LockClient>]) -> bool {

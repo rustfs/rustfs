@@ -12761,6 +12761,227 @@ mod tests {
     }
 
     #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn legacy_transition_state_inspection_and_apply_keep_all_disk_copies_unchanged() {
+        run_large_stack_async_test("legacy-state-reconcile-inspection", legacy_transition_state_inspection_and_apply_case);
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn legacy_transition_state_inspection_and_apply_case() {
+        use crate::bucket::lifecycle::legacy_transition_state_reconcile::{
+            LegacyTransitionStateReconcileOutcome as Outcome, LegacyTransitionStateReconcileRequest,
+            LegacyTransitionStateReconcileSelector,
+        };
+        for (remote_version, expected_state) in [
+            ("", rustfs_filemeta::TransitionVersionState::KnownDisabled),
+            ("null", rustfs_filemeta::TransitionVersionState::SuspendedNull),
+            ("opaque-version", rustfs_filemeta::TransitionVersionState::Exact),
+        ] {
+            let temp_dir = tempfile::tempdir().expect("legacy reconcile store directory");
+            let (ctx, store, _shutdown) =
+                without_storage_class_env(build_isolated_test_store(temp_dir.path(), "legacy-state-reconcile-inspect", &[4]))
+                    .await;
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            let tier_name = "LEGACY-RECONCILE";
+            let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+            backend.set_put_remote_version(Some(remote_version.to_string())).await;
+            let bucket = "legacy-state-reconcile-bucket";
+            let object = "archive.bin";
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create legacy fixture bucket");
+            let mut reader = PutObjReader::from_vec(b"legacy reconcile body".repeat(1024));
+            let source = store
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("write source");
+            {
+                // Create the fixture under the existing remote-version writer
+                // gate. This does not authorize legacy metadata reconciliation.
+                let _proof = crate::services::notification_sys::install_current_remote_version_state_fleet_proof_for_test();
+                temp_env::async_with_vars(
+                    [
+                        (rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_WRITE, Some("true")),
+                        (rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED, Some("true")),
+                    ],
+                    store.transition_object(
+                        bucket,
+                        object,
+                        &ObjectOptions {
+                            transition: TransitionOptions {
+                                status: TRANSITION_PENDING.to_string(),
+                                tier: tier_name.to_string(),
+                                etag: source.etag.clone().expect("source ETag"),
+                                ..Default::default()
+                            },
+                            mod_time: source.mod_time,
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .await
+                .expect("transition source");
+            }
+            assert!(
+                crate::services::notification_sys::acquire_legacy_transition_state_reconcile_fleet_proof()
+                    .await
+                    .is_none(),
+                "fixture setup must not grant the missing reconciliation write capability"
+            );
+            let selector = LegacyTransitionStateReconcileSelector {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                version_id: "null".to_string(),
+            };
+            if expected_state == rustfs_filemeta::TransitionVersionState::Exact {
+                backend
+                    .set_transition_candidate_probe_override(Some(
+                        crate::services::tier::warm_backend::TransitionCandidateProbe::Ambiguous,
+                    ))
+                    .await;
+            }
+            let converged = store
+                .inspect_legacy_transition_state(selector.clone())
+                .await
+                .expect("inspect an already explicit transition");
+            assert_eq!(converged.outcome, Outcome::Migrated, "{converged:?}");
+            assert!(!converged.changed);
+            backend.set_transition_candidate_probe_override(None).await;
+            rewrite_transitioned_xlmeta_as_legacy_unknown(temp_dir.path(), 0, bucket, object, remote_version.is_empty()).await;
+            let paths = (0..4)
+                .map(|disk| {
+                    temp_dir
+                        .path()
+                        .join(format!("pool0/set0/disk{disk}/{bucket}/{object}/{STORAGE_FORMAT_FILE}"))
+                })
+                .collect::<Vec<_>>();
+            let mut original = Vec::new();
+            for path in &paths {
+                original.push(tokio::fs::read(path).await.expect("original xl.meta"));
+            }
+            backend.clear_op_log().await;
+            let inspection = store.inspect_legacy_transition_state(selector.clone());
+            assert!(
+                std::mem::size_of_val(&inspection) <= 4 * 1024,
+                "admin inspection future must remain stack-bounded"
+            );
+            let inspected = inspection.await.expect("inspect legacy state");
+            assert_eq!(inspected.outcome, Outcome::ReadyToMigrate, "{inspected:?}");
+            assert!(!inspected.readiness.post_ready, "current fleet cannot authorize conditional writes");
+            let target = inspected.target.expect("live probe should establish one model");
+            assert_eq!(target.state, expected_state);
+            let request = LegacyTransitionStateReconcileRequest {
+                confirm: true,
+                selector,
+                source: inspected.source.expect("immutable source"),
+                original_sets: inspected.original_sets,
+                target,
+                reconciliation_digest: inspected.reconciliation_digest.expect("expected tuple digest"),
+            };
+            let mut tampered = request.clone();
+            tampered.source.remote_object.push_str("-other");
+            let probes_before = backend.op_log().await.len();
+            let rejected = store
+                .reconcile_legacy_transition_state(tampered)
+                .await
+                .expect("reject tampered tuple");
+            assert_eq!(rejected.outcome, Outcome::Corrupt);
+            assert_eq!(backend.op_log().await.len(), probes_before, "invalid digest must not probe the backend");
+            let applied = store
+                .reconcile_legacy_transition_state(request)
+                .await
+                .expect("apply must report unavailable write authority");
+            assert_eq!(applied.outcome, Outcome::BackendUnavailable, "{applied:?}");
+            assert_eq!(applied.reason_code, "write_fence_unavailable");
+            assert!(!applied.changed);
+            for (path, expected) in paths.iter().zip(&original) {
+                assert_eq!(tokio::fs::read(path).await.expect("xl.meta after inspection"), *expected);
+            }
+            assert_eq!(backend.remove_count().await, 0);
+            assert!(
+                backend
+                    .op_log()
+                    .await
+                    .iter()
+                    .all(|operation| matches!(operation, MockWarmOp::Probe { .. }))
+            );
+
+            backend.set_unreachable(true).await;
+            let unavailable = store
+                .inspect_legacy_transition_state(LegacyTransitionStateReconcileSelector {
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    version_id: "null".to_string(),
+                })
+                .await
+                .expect("unreachable tier is a diagnostic outcome");
+            assert_eq!(unavailable.outcome, Outcome::BackendUnavailable);
+            assert!(!unavailable.changed);
+            backend.set_unreachable(false).await;
+            for candidate in ["", "00000000-0000-0000-0000-000000000000", "bad\nversion"] {
+                backend
+                    .set_transition_candidate_probe_override(Some(
+                        crate::services::tier::warm_backend::TransitionCandidateProbe::VersionedPresent(candidate.to_string()),
+                    ))
+                    .await;
+                let invalid_proof = store
+                    .inspect_legacy_transition_state(LegacyTransitionStateReconcileSelector {
+                        bucket: bucket.to_string(),
+                        object: object.to_string(),
+                        version_id: "null".to_string(),
+                    })
+                    .await
+                    .expect("invalid backend proof is a diagnostic outcome");
+                assert_eq!(invalid_proof.outcome, Outcome::BackendUnavailable, "{invalid_proof:?}");
+                assert!(invalid_proof.target.is_none());
+            }
+            backend.set_transition_candidate_probe_override(None).await;
+
+            backend.clear_op_log().await;
+            for path in &paths[1..] {
+                tokio::fs::remove_file(path)
+                    .await
+                    .expect("hide majority metadata copies in fixture");
+            }
+            let minority = store
+                .inspect_legacy_transition_state(LegacyTransitionStateReconcileSelector {
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    version_id: "null".to_string(),
+                })
+                .await
+                .expect("inspect minority legacy record");
+            assert_eq!(
+                minority.outcome,
+                Outcome::BackendUnavailable,
+                "a minority owner must remain visible: {minority:?}"
+            );
+            assert!(
+                backend.op_log().await.is_empty(),
+                "unproven metadata quorum cannot initiate a remote probe"
+            );
+            for (path, bytes) in paths.iter().zip(&original) {
+                tokio::fs::write(path, bytes).await.expect("restore fixture copies");
+            }
+            tokio::fs::write(&paths[0], b"corrupt-xl-meta")
+                .await
+                .expect("inject corrupt copy");
+            let corrupt = store
+                .inspect_legacy_transition_state(LegacyTransitionStateReconcileSelector {
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    version_id: "null".to_string(),
+                })
+                .await
+                .expect("inspect corrupt legacy record");
+            assert_eq!(corrupt.outcome, Outcome::Corrupt, "{corrupt:?}");
+            assert!(backend.op_log().await.is_empty(), "corruption must fail before backend I/O");
+        }
+    }
+
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn legacy_unknown_unversioned_transition_supports_head_get_and_range_without_backfill() {

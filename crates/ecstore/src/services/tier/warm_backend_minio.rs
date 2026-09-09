@@ -101,6 +101,19 @@ impl WarmBackend for WarmBackendMinIO {
 
 #[async_trait::async_trait]
 impl crate::services::tier::warm_backend::TransitionCandidateReconciler for WarmBackendMinIO {
+    async fn probe_legacy_transition_state(
+        &self,
+        object: &str,
+        remote_version: Option<&str>,
+    ) -> Result<super::warm_backend::LegacyTransitionStateProbe, std::io::Error> {
+        crate::services::tier::warm_backend::TransitionCandidateReconciler::probe_legacy_transition_state(
+            &self.0,
+            object,
+            remote_version,
+        )
+        .await
+    }
+
     async fn probe_transition_candidate_for(
         &self,
         object: &str,

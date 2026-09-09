@@ -568,6 +568,10 @@ pub(crate) fn tier_delete_journal_topology_generation(proof: &TierDeleteJournalF
     stable_tier_delete_journal_topology_generation(&proof.token.topology_fingerprint)
 }
 
+pub(crate) fn cross_pool_fence_topology_generation(proof: &CrossPoolFenceFleetProofToken) -> String {
+    stable_tier_delete_journal_topology_generation(&proof.0.topology_fingerprint)
+}
+
 /// Acquire one non-cloneable authority that must span the complete reconcile
 /// effect window, including its final strong readback.
 pub async fn acquire_legacy_transition_state_reconcile_fleet_proof() -> Option<LegacyTransitionStateReconcileFleetProofToken> {
@@ -1118,6 +1122,14 @@ pub(crate) fn install_remote_version_state_fleet_proof_for_test(topology_fingerp
         panic!("test proof installation must not fail: {err}");
     }
     RemoteVersionStateFleetProofGuard
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) fn install_current_remote_version_state_fleet_proof_for_test() -> RemoteVersionStateFleetProofGuard {
+    let topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY
+        .get()
+        .expect("the test store must bind its fleet topology before installing a writer proof");
+    install_remote_version_state_fleet_proof_for_test(topology)
 }
 
 #[cfg(all(test, feature = "test-util"))]

@@ -2322,6 +2322,14 @@ struct SharedWarmBackendProxy(SharedWarmBackend);
 
 #[async_trait::async_trait]
 impl WarmBackend for SharedWarmBackendProxy {
+    async fn probe_legacy_metadata(
+        &self,
+        object: &str,
+        remote_version: Option<&str>,
+    ) -> io::Result<crate::services::tier::warm_backend::LegacyTransitionStateProbe> {
+        self.0.probe_legacy_metadata(object, remote_version).await
+    }
+
     async fn validate(&self) -> io::Result<()> {
         self.0.validate().await
     }
@@ -2488,6 +2496,27 @@ impl TierOperationLease {
     ) -> io::Result<TransitionCandidateProbe> {
         self.validate_remote_version_id(remote_version_id)?;
         self.inner.driver.probe_transition_version(object, remote_version_id).await
+    }
+
+    pub(crate) async fn probe_legacy_transition_state(
+        &self,
+        object: &str,
+        remote_version: Option<&str>,
+    ) -> io::Result<crate::services::tier::warm_backend::LegacyTransitionStateProbe> {
+        let Some(reconciler) = self
+            .inner
+            .reconciler
+            .get_or_try_init(|| async {
+                crate::services::tier::warm_backend::new_transition_candidate_reconciler(&self.inner.tier_config)
+                    .await
+                    .map(|reconciler| reconciler.map(Arc::from))
+            })
+            .await
+            .map_err(|err| io::Error::other(err.message))?
+        else {
+            return self.inner.driver.probe_legacy_metadata(object, remote_version).await;
+        };
+        reconciler.probe_legacy_transition_state(object, remote_version).await
     }
 
     pub(crate) fn is_current_generation(&self) -> bool {
@@ -6011,6 +6040,19 @@ impl TierConfigMgr {
         self.driver_cache
             .insert(tier_name.to_string(), Box::new(SharedWarmBackendProxy(driver)));
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) async fn install_test_driver_in(
+        handle: &Arc<RwLock<Self>>,
+        tier_name: &str,
+        driver: WarmBackendImpl,
+    ) -> std::result::Result<(), AdminError> {
+        let mut manager = handle.write().await;
+        // Register the generation runtime before installing the mock so its
+        // explicit lack of a network reconciler survives the first lease.
+        tier_driver_runtime(handle, &manager);
+        manager.install_test_driver(tier_name, driver)
     }
 
     #[cfg(any(test, feature = "test-util"))]
