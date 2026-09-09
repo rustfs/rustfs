@@ -19,6 +19,9 @@ use super::replication_pool::DynReplicationPool;
 use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::ReplicationObjectStore;
 use crate::runtime::sources;
+pub use crate::runtime::sources::{
+    ScannerDirtyUsageMutationObserver, ScannerDirtyUsageMutationSource, set_scanner_dirty_usage_mutation_observer,
+};
 
 pub(crate) fn object_store_handle() -> Option<Arc<ReplicationObjectStore>> {
     sources::object_store_handle()
@@ -42,4 +45,8 @@ pub(crate) fn replication_runtime_initialized() -> bool {
 
 pub(crate) fn bucket_monitor() -> Option<Arc<ReplicationBucketMonitor>> {
     sources::bucket_monitor()
+}
+
+pub(crate) fn notify_scanner_dirty_usage_mutation(bucket: &str, object: &str, source: ScannerDirtyUsageMutationSource) {
+    sources::notify_scanner_dirty_usage_mutation(bucket, object, source);
 }

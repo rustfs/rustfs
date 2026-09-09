@@ -966,6 +966,11 @@ async fn cleanup_free_version_exact(api: Arc<ECStore>, oi: &ObjectInfo, cancel: 
     if let Some(err) = first_error {
         return Err(err);
     }
+    runtime_sources::notify_scanner_dirty_usage_mutation(
+        &oi.bucket,
+        &oi.name,
+        runtime_sources::ScannerDirtyUsageMutationSource::TierExpiration,
+    );
     Ok(true)
 }
 
@@ -4749,6 +4754,11 @@ async fn expire_transitioned_object_with_lock_lost_signal(
                 // Drop any cached restored-copy body so it does not sit resident
                 // until TTL after the copy is expired (ODC-26).
                 crate::object_api::notify_object_mutation(&oi.bucket, &oi.name).await;
+                runtime_sources::notify_scanner_dirty_usage_mutation(
+                    &oi.bucket,
+                    &oi.name,
+                    runtime_sources::ScannerDirtyUsageMutationSource::TierExpiration,
+                );
                 //audit_log_lifecycle(*oi, ILMExpiry, tags, traceFn);
                 Ok(dobj)
             }
@@ -4784,6 +4794,11 @@ async fn expire_transitioned_object_with_lock_lost_signal(
     // The transitioned version is gone; evict any cached body for this object
     // so it does not linger until TTL (ODC-26).
     crate::object_api::notify_object_mutation(&oi.bucket, &oi.name).await;
+    runtime_sources::notify_scanner_dirty_usage_mutation(
+        &oi.bucket,
+        &oi.name,
+        runtime_sources::ScannerDirtyUsageMutationSource::TierExpiration,
+    );
 
     //audit_log_lifecycle(oi, ILMExpiry, tags);
 
