@@ -944,6 +944,10 @@ impl HealManager {
         matches!(request.source, HealRequestSource::Admin | HealRequestSource::Internal)
     }
 
+    fn queued_request_can_be_displaced(request: &HealRequest) -> bool {
+        !root_recovery::is_root_heal(&request.heal_type, request.source)
+    }
+
     fn request_bypasses_mainline_throttle(request: &HealRequest) -> bool {
         request.force_start
             || matches!(request.source, HealRequestSource::Admin | HealRequestSource::Internal)
@@ -1080,11 +1084,15 @@ impl HealManager {
         let per_object_request = request.heal_type.is_per_object();
 
         if queue_len >= queue_capacity && !request.force_start {
-            if Self::can_displace_queued_work(&request) && queue.can_displace_lower_priority(request.priority) {
+            if Self::can_displace_queued_work(&request)
+                && queue.can_displace_lower_priority_where(request.priority, Self::queued_request_can_be_displaced)
+            {
                 let request_id = request.id.clone();
                 let priority = request.priority;
                 let source = request.source;
-                if let Some(displaced) = queue.push_displacing_lower_priority(request) {
+                if let Some(displaced) =
+                    queue.push_displacing_lower_priority_where(request, Self::queued_request_can_be_displaced)
+                {
                     publish_heal_queue_length(queue);
                     Self::record_admission_metric(source, HealAdmissionResult::Accepted, context);
                     demote_to_debug_when!(per_object_request, warn, target: "rustfs::heal::manager", {
@@ -1930,9 +1938,29 @@ impl HealManager {
             }
         }
 
+        let durable_root_handoff = root_recovery::is_root_heal(&request.heal_type, request.source);
+        let durable_root_handoff_required = durable_root_handoff
+            && (request.force_start
+                || queue.len() < config.queue_size
+                || (Self::can_displace_queued_work(&request)
+                    && queue.can_displace_lower_priority_where(request.priority, Self::queued_request_can_be_displaced)));
+        // A root admin receipt is a cluster traversal responsibility. Persist
+        // it before queue publication so a crash after admission can replay it.
+        if durable_root_handoff_required {
+            self.root_recovery.persist(&request).await?;
+        }
+
         let mut task_id = request.id.clone();
+        let request_id = request.id.clone();
+        let request_heal_type = request.heal_type.clone();
+        let request_source = request.source;
         let admission_decision = Self::admit_request_to_queue(&mut queue, request, &config, "submit");
         let admission = admission_decision.result;
+        if durable_root_handoff_required && !admission.is_admitted() {
+            self.root_recovery
+                .remove(&request_id, &request_heal_type, request_source)
+                .await?;
+        }
         if admission == HealAdmissionResult::Merged
             && let Some(queued_id) = queue.queued_request_id_for_dedup_key(&dedup_key)
         {
