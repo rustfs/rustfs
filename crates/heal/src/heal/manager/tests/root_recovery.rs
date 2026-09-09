@@ -58,6 +58,26 @@ fn admin_request(heal_type: HealType) -> HealRequest {
     request
 }
 
+fn completed_admin_status(heal_type: &HealType, completed_at: SystemTime) -> CompletedHealStatus {
+    CompletedHealStatus {
+        outcome: None,
+        heal_type: heal_type.clone(),
+        status: HealTaskStatus::Completed,
+        progress: Some(HealProgress {
+            objects_scanned: 1,
+            objects_healed: 1,
+            bytes_processed: 64,
+            ..Default::default()
+        }),
+        retained_bytes: std::sync::OnceLock::new(),
+        result_items_truncated: false,
+        completed_at,
+        seqed_items: Vec::new(),
+        next_seq: 0,
+        min_seq: 0,
+    }
+}
+
 async fn active_root(manager: &HealManager, request: HealRequest) -> Arc<HealTask> {
     let task = Arc::new(HealTask::from_request(request, manager.storage.clone()));
     *task.status.write().await = HealTaskStatus::Running;
@@ -428,6 +448,207 @@ async fn root_recovery_completed_non_root_admin_is_queryable_after_restart() {
         .expect("completed terminal exposes progress");
     assert_eq!(progress.objects_scanned, 2);
     assert_eq!(progress.objects_healed, 2);
+}
+
+#[tokio::test]
+async fn root_recovery_terminal_receipt_ttl_boundary_matches_completed_status_retention() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk]);
+    let request = admin_request(HealType::Bucket {
+        bucket: "bucket".to_string(),
+    });
+    let completed_at = SystemTime::now();
+    let completed = completed_admin_status(&request.heal_type, completed_at);
+    assert!(
+        manager
+            .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+            .await
+            .expect("publish terminal receipt")
+    );
+
+    let boundary = completed_at + KEEP_HEAL_TASK_STATUS_DURATION;
+    assert_eq!(
+        manager
+            .root_recovery
+            .completed(&request.id)
+            .await
+            .expect("read retained terminal")
+            .expect("terminal retained at exact TTL boundary")
+            .status,
+        HealTaskStatus::Completed
+    );
+    let report = manager
+        .root_recovery
+        .gc_terminal_receipts_once(boundary)
+        .await
+        .expect("boundary GC");
+    assert_eq!(report.terminals_removed, 0);
+    assert_eq!(
+        manager
+            .root_recovery
+            .completed(&request.id)
+            .await
+            .expect("read retained terminal")
+            .expect("terminal retained before wall-clock advances")
+            .status,
+        HealTaskStatus::Completed
+    );
+
+    let expired = boundary + Duration::from_nanos(1);
+    let report = manager
+        .root_recovery
+        .gc_terminal_receipts_once(expired)
+        .await
+        .expect("expired GC");
+    assert_eq!(report.terminals_removed, 1);
+    assert!(matches!(manager.get_task_status(&request.id).await, Err(Error::TaskNotFound { .. })));
+}
+
+#[tokio::test]
+async fn root_recovery_terminal_gc_removes_stale_pending_before_expired_receipt() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = admin_request(HealType::Bucket {
+        bucket: "bucket".to_string(),
+    });
+    manager
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect("durable bucket responsibility");
+    let now = SystemTime::now();
+    let completed = completed_admin_status(&request.heal_type, now - KEEP_HEAL_TASK_STATUS_DURATION - Duration::from_nanos(1));
+    assert!(
+        manager
+            .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+            .await
+            .expect("publish expired terminal receipt")
+    );
+    manager
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect("recreate stale pending intent after terminal publication");
+    assert!(
+        manager
+            .root_recovery
+            .pending()
+            .await
+            .expect("terminal still masks stale pending")
+            .is_empty(),
+        "an expired receipt must continue masking stale pending until GC retires the pending owner"
+    );
+    assert!(matches!(manager.get_task_status(&request.id).await, Err(Error::TaskNotFound { .. })));
+
+    let first = manager
+        .root_recovery
+        .gc_terminal_receipts_once(now)
+        .await
+        .expect("first GC removes stale pending only");
+    assert_eq!(first.pending_removed, 1);
+    assert_eq!(first.terminals_removed, 0);
+    assert!(
+        disk.read_all(RUSTFS_META_BUCKET, &format!("terminal-root-heal-{}.json", request.id))
+            .await
+            .is_ok()
+    );
+    assert!(manager.root_recovery.pending().await.expect("pending retired").is_empty());
+
+    let second = manager
+        .root_recovery
+        .gc_terminal_receipts_once(now)
+        .await
+        .expect("second GC removes unneeded expired terminal");
+    assert_eq!(second.pending_removed, 0);
+    assert_eq!(second.terminals_removed, 1);
+    assert!(
+        disk.read_all(RUSTFS_META_BUCKET, &format!("terminal-root-heal-{}.json", request.id))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_terminal_gc_is_delete_budget_bounded() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let now = SystemTime::now();
+    let expired_at = now - KEEP_HEAL_TASK_STATUS_DURATION - Duration::from_nanos(1);
+    for _ in 0..=64 {
+        let request = admin_request(HealType::Bucket {
+            bucket: "bucket".to_string(),
+        });
+        let completed = completed_admin_status(&request.heal_type, expired_at);
+        manager
+            .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+            .await
+            .expect("publish expired terminal receipt");
+    }
+
+    let report = manager
+        .root_recovery
+        .gc_terminal_receipts_once(now)
+        .await
+        .expect("budgeted terminal GC");
+    assert_eq!(report.terminals_removed, 64);
+    assert!(report.budget_exhausted);
+    let terminal_entries = disk
+        .list_dir("", RUSTFS_META_BUCKET, "", -1)
+        .await
+        .expect("list remaining terminal receipts")
+        .into_iter()
+        .filter(|entry| entry.starts_with("terminal-root-heal-"))
+        .count();
+    assert_eq!(terminal_entries, 1);
+}
+
+#[tokio::test]
+async fn root_recovery_corrupt_terminal_receipt_retains_pending_fail_closed() {
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = admin_request(HealType::Bucket {
+        bucket: "bucket".to_string(),
+    });
+    manager
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect("durable bucket responsibility");
+    let completed = completed_admin_status(
+        &request.heal_type,
+        SystemTime::now() - KEEP_HEAL_TASK_STATUS_DURATION - Duration::from_nanos(1),
+    );
+    manager
+        .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+        .await
+        .expect("publish terminal receipt");
+    manager
+        .root_recovery
+        .persist(&request)
+        .await
+        .expect("restore stale pending intent");
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &format!("terminal-root-heal-{}.json", request.id),
+        br#"{"schema":1,"task_id":"not-the-same-id"}"#.to_vec().into(),
+    )
+    .await
+    .expect("corrupt terminal receipt");
+
+    assert!(
+        manager
+            .root_recovery
+            .gc_terminal_receipts_once(SystemTime::now())
+            .await
+            .is_err(),
+        "corrupt terminal receipt must fail closed"
+    );
+    assert!(
+        disk.read_all(RUSTFS_META_BUCKET, &format!("root-heal-{}.json", request.id))
+            .await
+            .is_ok()
+    );
+    assert!(manager.root_recovery.pending().await.is_err());
 }
 
 #[tokio::test]
