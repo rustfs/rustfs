@@ -19057,27 +19057,34 @@ mod tests {
                             .await
                             .expect("transition metadata should be readable");
                         let mut metadata = FileMeta::load(&encoded).expect("transition metadata should decode");
-                        let mut transitioned = metadata
-                            .get_all_file_info_versions(bucket, object, true)
-                            .expect("transitioned versions should decode")
-                            .versions
-                            .into_iter()
-                            .find(|version| version.version_id == history.version_id)
+                        let (version_index, mut transitioned) = metadata
+                            .find_version(history.version_id)
                             .expect("transitioned history should exist");
-                        transitioned.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
-                        rustfs_utils::http::metadata_compat::remove_str(
-                            &mut transitioned.metadata,
+                        // Rewrite the serialized record to model legacy metadata;
+                        // ordinary writes preserve an already reconciled state.
+                        rustfs_utils::http::metadata_compat::remove_bytes(
+                            &mut transitioned.object.as_mut().expect("history should be an object").meta_sys,
                             rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_STATE,
                         );
-                        metadata
-                            .add_version(transitioned)
-                            .expect("unknown state should replace the transitioned version");
+                        metadata.versions[version_index] = rustfs_filemeta::FileMetaShallowVersion::try_from(transitioned)
+                            .expect("legacy history should re-encode");
                         tokio::fs::write(
                             &metadata_path,
                             metadata.marshal_msg().expect("unknown transition metadata should encode"),
                         )
                         .await
                         .expect("unknown transition metadata should be written");
+                        let encoded = tokio::fs::read(&metadata_path)
+                            .await
+                            .expect("legacy transition metadata should be readable");
+                        let legacy = FileMeta::load(&encoded)
+                            .expect("legacy transition metadata should decode")
+                            .find_version(history.version_id)
+                            .expect("legacy history should exist")
+                            .1
+                            .into_fileinfo(bucket, object, true)
+                            .expect("legacy history should decode");
+                        assert_eq!(legacy.transition_version_state, rustfs_filemeta::TransitionVersionState::Unknown);
                     }
                     let lifecycle_event = crate::bucket::lifecycle::lifecycle::Event {
                         action: rustfs_scanner_metrics::metrics::IlmAction::DeleteAllVersionsAction,
