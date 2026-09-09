@@ -385,6 +385,79 @@ mod tests {
         )
     }
 
+    async fn wait_for_admin_cluster_start_log(
+        log_path: &Path,
+        client_token: &str,
+        deadline: Instant,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        loop {
+            let coordinator_log = std::fs::read_to_string(log_path)?;
+            if coordinator_log
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|event| {
+                    event["event"] == "heal_task_state"
+                        && event["task_id"] == client_token
+                        && event["heal_type"] == "cluster"
+                        && event["state"] == "started"
+                })
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    format!("node 0 must have started the exact admin task before interruption: task_id={client_token}").into(),
+                );
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_cluster_start_log_waits_for_exact_delayed_event() -> Result<(), Box<dyn Error + Send + Sync>> {
+        use std::io::Write;
+
+        let mut log = tempfile::NamedTempFile::new()?;
+        for (task_id, heal_type, state) in [
+            ("other-task", "cluster", "started"),
+            ("admin-task", "object", "started"),
+            ("admin-task", "cluster", "completed"),
+        ] {
+            writeln!(
+                log,
+                "{}",
+                serde_json::json!({"event": "heal_task_state", "task_id": task_id, "heal_type": heal_type, "state": state})
+            )?;
+        }
+        let log_path = log.path().to_path_buf();
+        let started = wait_for_admin_cluster_start_log(&log_path, "admin-task", Instant::now() + Duration::from_secs(1));
+        tokio::pin!(started);
+        // Poll the reader before publishing the start event, without depending
+        // on scheduling or a fixed writer delay to reproduce log visibility.
+        tokio::select! {
+            biased;
+            result = &mut started => panic!("unrelated events must leave the exact start pending: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        writeln!(
+            log,
+            "{}",
+            serde_json::json!({"event": "heal_task_state", "task_id": "admin-task", "heal_type": "cluster", "state": "started"})
+        )?;
+        started.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_admin_cluster_start_log_respects_existing_deadline() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let log = tempfile::NamedTempFile::new()?;
+        let error = wait_for_admin_cluster_start_log(log.path(), "admin-task", Instant::now())
+            .await
+            .expect_err("missing exact start must fail at the supplied deadline");
+        assert!(error.to_string().contains("task_id=admin-task"), "{error}");
+        Ok(())
+    }
+
     fn cluster_heal_is_idle(status: &serde_json::Value) -> bool {
         let operations = &status["healOperations"];
         status["clusterStatusComplete"] == serde_json::Value::Bool(true)
@@ -1328,6 +1401,9 @@ mod tests {
             }
             sleep(Duration::from_millis(50)).await;
         }
+        // Task execution and its non-blocking log writer advance independently.
+        // Observe the exact start before taking the partial-rebuild snapshot.
+        wait_for_admin_cluster_start_log(&log_dir.join("node0.log"), client_token, partial_deadline).await?;
         let (partial_count, partial_manifest) = loop {
             // Hash one committed shard to prove progress without letting a
             // full-corpus hash pass consume the interruption window.
@@ -1362,19 +1438,6 @@ mod tests {
         let pre_interrupt_status: serde_json::Value = serde_json::from_str(&pre_interrupt_status_body)
             .map_err(|err| format!("pre-interrupt background heal status is not JSON ({err}): {pre_interrupt_status_body}"))?;
         let pre_interrupt_replacement = replacement_recovery_status(&cluster).await?;
-        let coordinator_log = std::fs::read_to_string(log_dir.join("node0.log"))?;
-        assert!(
-            coordinator_log
-                .lines()
-                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .any(|event| {
-                    event["event"] == "heal_task_state"
-                        && event["task_id"] == client_token
-                        && event["heal_type"] == "cluster"
-                        && event["state"] == "started"
-                }),
-            "node 0 must have started the exact admin task before interruption"
-        );
         let pre_interrupt_operations = &pre_interrupt_status["healOperations"];
         assert_eq!(
             pre_interrupt_operations["activeBySource"]["admin"].as_u64(),

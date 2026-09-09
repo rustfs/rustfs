@@ -401,11 +401,11 @@ mod tests {
         let mp_view = get_full(&client, multipart_key).await?;
         assert_eq!(mp_view.sha256, sha256_hex(&multipart_body), "degraded baseline multipart body mismatch");
         baseline_degraded.insert(multipart_key.to_string(), mp_view);
-        // Restore the disk so Phase B restarts from a clean, complete disk set.
+        // Stop disk writers before restoring the complete layout reused by Phase B.
+        harness.kill_server();
         harness.bring_disk_online(0)?;
 
         // ---- Phase B: codec streaming (gates opened) ----
-        harness.kill_server();
         for (k, v) in codec_env() {
             harness.set_env(k, v);
         }
@@ -497,6 +497,8 @@ mod tests {
         let mp_view = get_full(&client, multipart_key).await?;
         assert_eq!(mp_view.sha256, sha256_hex(&multipart_body), "degraded codec multipart body mismatch");
         codec_degraded.insert(multipart_key.to_string(), mp_view);
+        // All server reads are complete; stop disk writers before restoring disk0.
+        harness.kill_server();
         harness.bring_disk_online(0)?;
 
         // A/B under parity reconstruction: codec == legacy, byte-for-byte and
