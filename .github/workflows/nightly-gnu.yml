@@ -352,69 +352,16 @@ jobs:
       # engineers can download and install the nightly directly. The branch is
       # a single-commit orphan rewritten on every build, which keeps the repo
       # small while the latest files stay reachable at stable raw URLs.
-      - name: Publish packages to auto-testing assets
+      # Publish the deb/rpm pair as assets of the rolling `nightly` release on
+      # rustfs/auto-testing (see scripts/release/publish_nightly_assets.sh).
+      - name: Publish packages to auto-testing release assets
         env:
           ASSETS_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
           DEB_FILE: ${{ steps.deb.outputs.deb_file }}
           RPM_FILE: ${{ steps.rpm.outputs.rpm_file }}
           DEB_DATE: ${{ steps.deb.outputs.deb_date }}
           BUILD_REF: ${{ env.NIGHTLY_BUILD_REF }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${ASSETS_TOKEN}" ]; then
-            echo "PF_TESTING_GH_TOKEN is not configured; skipping assets upload"
-            exit 0
-          fi
-          export GH_TOKEN="${ASSETS_TOKEN}"
-
-          for f in "${DEB_FILE}" "${RPM_FILE}"; do
-            [ -f "$f" ] || { echo "missing package: $f"; exit 1; }
-          done
-
-          # Plain git + token URL: the build fleet has no gh CLI.
-          ASSETS_URL="https://x-access-token:${ASSETS_TOKEN}@github.com/rustfs/auto-testing.git"
-          rm -rf assets-work && mkdir assets-work
-          if git clone -q --depth 1 --branch assets "${ASSETS_URL}" assets-work 2>/dev/null; then
-            echo "assets branch cloned"
-          else
-            echo "assets branch does not exist yet; creating an orphan"
-            git -C assets-work init -q -b assets
-          fi
-          cd assets-work
-          git remote add origin "${ASSETS_URL}" 2>/dev/null || \
-            git remote set-url origin "${ASSETS_URL}"
-
-          mkdir -p nightly
-          cp "../${DEB_FILE}" "nightly/${DEB_FILE}"
-          cp "../${RPM_FILE}" "nightly/${RPM_FILE}"
-          cp "nightly/${DEB_FILE}" nightly/rustfs-nightly-latest.deb
-          cp "nightly/${RPM_FILE}" nightly/rustfs-nightly-latest.rpm
-
-          SOURCE_SHA="$(git -C .. rev-parse HEAD 2>/dev/null || echo "${GITHUB_SHA}")"
-          {
-            echo "# Nightly packages"
-            echo ""
-            echo "- Built: ${DEB_DATE} from \`${BUILD_REF}@${SOURCE_SHA:0:12}\`"
-            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-            echo ""
-            echo '| File | Size | SHA256 |'
-            echo '|---|---|---|'
-            for f in "nightly/${DEB_FILE}" "nightly/${RPM_FILE}" nightly/rustfs-nightly-latest.deb nightly/rustfs-nightly-latest.rpm; do
-              printf '| %s | %s | %s |\n' "$f" "$(du -h "$f" | cut -f1)" "$(sha256sum "$f" | cut -d' ' -f1)"
-            done
-            echo ""
-            echo "Download: replace /blob/ with /raw/ in any file URL, e.g."
-            echo "\`https://raw.githubusercontent.com/rustfs/auto-testing/assets/nightly/rustfs-nightly-latest.deb\`"
-          } > BUILD-INFO.md
-
-          git add -A
-          git -c user.name="rustfs-nightly-bot" -c user.email="support@rustfs.com" \
-            commit -q -m "nightly ${DEB_DATE} (${BUILD_REF}@${SOURCE_SHA:0:12})" \
-            --allow-empty
-          git push --force origin assets
-          echo "✅ Published ${DEB_FILE} and ${RPM_FILE} to rustfs/auto-testing@assets"
-
+        run: bash scripts/release/publish_nightly_assets.sh
   # Live-Vault lane for the rustfs-kms suite (rustfs/backlog#1774).
   #
   # RUSTFS_KMS_VAULT_TOKEN is the single switch that adds the Vault KV2 and
