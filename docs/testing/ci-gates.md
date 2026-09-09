@@ -344,10 +344,11 @@ multi-set/multi-pool, ABBA, throughput, and profiling artifacts cannot be
 stitched together from unrelated runs. P1 `profile_evidence` must bind every
 required profile artifact kind (`allocation-profile`, `flamegraph`,
 `rss-samples`, and `save-frequency`) with a relative path, artifact format,
-non-empty file, matching SHA256, and the same measurement window when a
-per-artifact window is declared. Missing, synthetic, stale, tampered, undersized,
-or topology-mismatched evidence returns a compact blocked or invalid JSON result
-and a nonzero exit.
+non-empty file, matching SHA256, and descriptor-level `source_revision`,
+`run_id`, and `measurement_window_id` values that match the parent profile
+evidence. Missing, synthetic, stale, tampered, undersized, cross-run, or
+topology-mismatched evidence returns a compact blocked or invalid JSON result and
+a nonzero exit.
 
 The scheduler-pressure lane must also carry the numbers needed to close W09,
 W10, and W11: bounded deferred item/byte/age limits, zero duplicate tasks,
