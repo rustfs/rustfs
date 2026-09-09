@@ -3,7 +3,7 @@
 **Use this when:** a check is red and you need to know whether it blocks the merge, which workflow and job produced it, and how to reproduce it locally.
 **Source of truth:** the live `main` ruleset (command below) for required status; `.github/workflows/<file>.yml` for triggers, `paths`, `timeout-minutes`, and cron; `.config/nextest.toml` for e2e profile filters; `.github/scheduled-validations.json` for the freshness-watchdog list.
 
-A job blocks a merge only when its exact check name is in the live `main` ruleset. A workflow name, a `merge_group` trigger, or a red PR check does not make a job required by itself.
+A job blocks a merge when its exact check name is required by the live `main` ruleset, or when its result is required by the `Test and Lint` aggregate. A workflow name, a `merge_group` trigger, or an unrelated red PR check does not make a job required by itself.
 
 ## Required merge checks
 
@@ -13,9 +13,11 @@ The `main` ruleset (`6436880`) requires exactly these contexts, with `strict_req
 |---|---|---|
 | `CLA Check` | `cla.yml` | Contributor agreement |
 | `Quick Checks` | `ci.yml` job `quick-checks` | Formatting and repository guard scripts |
-| `Test and Lint` | `ci.yml` job `test-and-lint` | Clippy, workspace nextest (`ci` profile, excluding `e2e_test`), doctests, migration-gate count (`scripts/check_migration_gate_count.sh`) |
+| `Test and Lint` | `ci.yml` job `required-checks` | Exact expected results for every CI validation job, including workspace checks, critical E2E, feature lanes, and event-specific full suites |
 
-For PRs limited to the `paths-ignore` list in `ci.yml`, `ci-docs-only.yml` reports `Quick Checks` and `Test and Lint` under the same names; it runs the quick checks and `scripts/check_no_planning_docs.sh`, not a Rust build or tests. `scripts/check_ci_paths_sync.sh` keeps the two path lists aligned.
+Every PR enters `ci.yml`. The `classify-changes` job uses the base revision of `scripts/ci_gate.py` to select a conservative documentation-only path: root Markdown/licenses, `AGENTS.md`, Markdown under `docs/` or `.agents/skills/`, and documentation images. Unknown paths, unavailable Git history, an empty diff, or a missing base policy select the full matrix. Renames include their deleted source path. Documentation-only PRs still run Quick Checks and Typos; the aggregate requires the expensive jobs to be skipped exactly as selected.
+
+`required-checks` runs even after failed or skipped dependencies. `scripts/ci_gate.py verify` rejects missing jobs, unexpected jobs, failure, cancellation, and unexpected skips; optional lanes are required only on their declared events. `Workspace Test and Lint` is the ordinary Rust job, while `Test and Lint` uniquely names the aggregate. New validation jobs must update both its direct dependencies and the script contract. Test this wiring and its failure cases with `python3 scripts/ci_gate.py --self-test`.
 
 Verify the live rule before changing merge policy:
 
@@ -24,25 +26,25 @@ gh api repos/rustfs/rustfs/rulesets/6436880 \
   --jq '.rules[] | select(.type == "required_status_checks") | .parameters'
 ```
 
-Promotion rule: never promote a report-only lane to required from one green run. Require at least 14 days and 30 representative PRs with at least 99% complete execution, then update the ruleset and this file together.
+The aggregate requires the validation lanes already selected by `ci.yml`; this closes the gap where a failing critical lane left the required workspace check green. Independent workflows remain report-only unless separately required. Before adding a new expensive lane or moving existing PR coverage to a schedule, collect representative execution and regression evidence, establish ownership and a working scheduled replacement, and update this reference with the resulting policy.
 
 ## Pull request and merge matrix
 
-"Report-only" means visible and actionable but not in the required list. Budgets are each job's `timeout-minutes` in the named workflow and are not copied here.
+"Via aggregate" means a wrong result fails the required `Test and Lint` check. "Report-only" means visible and actionable but outside both the required list and aggregate. Budgets are each job's `timeout-minutes` in the named workflow and are not copied here.
 
 | Event | Check name | Workflow / job | Merge status | Reproduce |
 |---|---|---|---|---|
 | PR, non-doc change | `Quick Checks` | `ci.yml` `quick-checks` | Required | `make pre-commit` |
-| PR, non-doc change | `Test and Lint` | `ci.yml` `test-and-lint` | Required | `cargo clippy --all-targets -- -D warnings`; `cargo nextest run --profile ci --all --exclude e2e_test`; `cargo test --all --doc`; `scripts/check_migration_gate_count.sh` |
-| PR, non-doc change | `Typos` | `ci.yml` `typos` | Report-only | `typos` |
-| PR, non-doc change | `ILM Integration (serial)` | `ci.yml` `test-ilm-integration-serial` | Report-only | exact command in the job |
-| PR, non-doc change | `Test and Lint (rio-v2)`, `Test and Lint (swift)`, `Test and Lint (sftp)` | `ci.yml` `test-and-lint-rio-v2`, `test-and-lint-protocols` | Report-only | `cargo nextest run` with the job's `--features` |
-| PR, non-doc change | `Connect Short Credential Boundary` | `ci.yml` `connect-short-credential-boundary` | Report-only | `cargo test -p rustfs --test connect_registration --features connect-e2e-short-credentials`; `cargo check -p rustfs --release --features connect-e2e-short-credentials` must fail |
-| PR, non-doc change | `Build RustFS Debug Binary` | `ci.yml` `build-rustfs-debug-binary` | Report-only; prerequisite for the black-box jobs | `cargo build -p rustfs --bins` |
-| PR, non-doc change | `io_uring Integration (real)` | `ci.yml` `uring-integration` | Report-only | `cargo test -p rustfs-ecstore --lib uring_ -- --test-threads=1 --nocapture` |
-| PR, non-doc change | `End-to-End Tests` | `ci.yml` `e2e-tests` | Report-only | `cargo nextest run --profile e2e-smoke -p e2e_test`, then `./scripts/e2e-run.sh ./target/debug/rustfs <data-dir>`; membership guards `scripts/check_test_wiring.py --check-profile e2e-smoke <listing.json>` and `scripts/check_security_smoke_count.sh check <listing.json>` |
-| PR, non-doc change | `S3 Implemented Tests` | `ci.yml` `s3-implemented-tests` | Report-only | build `rustfs`, then `scripts/s3-tests/run.sh` with the job's `DEPLOY_MODE` / `TEST_MODE` / `MAXFAIL` env |
-| PR, non-doc change | `S3 Lifecycle Behavior Tests` | `ci.yml` `s3-lifecycle-behavior-tests` | Report-only | `scripts/s3-tests/run.sh` with the job's accelerated-scanner env |
+| PR, non-doc change | `Workspace Test and Lint` | `ci.yml` `test-and-lint` | Via aggregate | `cargo clippy --all-targets -- -D warnings`; `cargo nextest run --profile ci --all --exclude e2e_test`; `cargo test --all --doc`; `scripts/check_migration_gate_count.sh` |
+| PR, non-doc change | `Typos` | `ci.yml` `typos` | Via aggregate | `typos` |
+| PR, non-doc change | `ILM Integration (serial)` | `ci.yml` `test-ilm-integration-serial` | Via aggregate | exact command in the job |
+| PR, non-doc change | `Test and Lint (rio-v2)`, `Test and Lint (swift)`, `Test and Lint (sftp)` | `ci.yml` `test-and-lint-rio-v2`, `test-and-lint-protocols` | Via aggregate | `cargo nextest run` with the job's `--features` |
+| PR, non-doc change | `Connect Short Credential Boundary` | `ci.yml` `connect-short-credential-boundary` | Via aggregate | `cargo test -p rustfs --test connect_registration --features connect-e2e-short-credentials`; `cargo check -p rustfs --release --features connect-e2e-short-credentials` must fail |
+| PR, non-doc change | `Build RustFS Debug Binary` | `ci.yml` `build-rustfs-debug-binary` | Via aggregate; prerequisite for black-box jobs | `cargo build -p rustfs --bins --features e2e-test-hooks` |
+| PR, non-doc change | `io_uring Integration (real)` | `ci.yml` `uring-integration` | Via aggregate | `cargo test -p rustfs-ecstore --lib uring_ -- --test-threads=1 --nocapture` |
+| PR, non-doc change | `End-to-End Tests` | `ci.yml` `e2e-tests` | Via aggregate | `cargo nextest run --profile e2e-smoke -p e2e_test`, then `./scripts/e2e-run.sh ./target/debug/rustfs <data-dir>`; membership guards `scripts/check_test_wiring.py --check-profile e2e-smoke <listing.json>` and `scripts/check_security_smoke_count.sh check <listing.json>` |
+| PR, non-doc change | `S3 Implemented Tests` | `ci.yml` `s3-implemented-tests` | Via aggregate | build `rustfs`, then `scripts/s3-tests/run.sh` with the job's `DEPLOY_MODE` / `TEST_MODE` / `MAXFAIL` env |
+| PR, non-doc change | `S3 Lifecycle Behavior Tests` | `ci.yml` `s3-lifecycle-behavior-tests` | Via aggregate | `scripts/s3-tests/run.sh` with the job's accelerated-scanner env |
 | PR touching `paths` in `audit.yml` | `Cargo Deny`, `Workflow Pin Report`, `Dependency Review` | `audit.yml` `cargo-deny`, `workflow-pin-report`, `dependency-review` | Report-only | `cargo deny check`; `scripts/security/check_workflow_pins.sh` |
 | PR touching `paths` in `architecture-migration-rules.yml` | `Architecture Migration Rules` | `architecture-migration-rules.yml` `architecture-migration-rules` | Report-only | `scripts/check_architecture_migration_rules.sh` |
 | PR touching `paths` in `nix.yml` | `Nix Build & Check` | `nix.yml` `nix-validation` | Report-only | `nix flake check` |
@@ -52,8 +54,8 @@ Promotion rule: never promote a report-only lane to required from one green run.
 | PR touching `paths` in `e2e-upgrade.yml` | `Direct upgrade from the previous release`, `Mixed-version rolling upgrade from the previous release`, `Bucket configuration survives the upgrade`, `Rollback reads current bucket metadata` | `e2e-upgrade.yml` `upgrade` matrix | Report-only | the `cargo test --locked -p e2e_test` command in the job with `RUSTFS_UPGRADE_SOURCE_BINARY` pointing at the pinned previous release (`UPGRADE_SOURCE_VERSION`) |
 | PR touching `paths` in `oidc-keycloak.yml` | `OIDC Keycloak live gate` | `oidc-keycloak.yml` `oidc-keycloak-live` | Report-only | `cargo build --locked -p rustfs --bin rustfs`, then `bash scripts/test/oidc_keycloak_live.sh ./target/debug/rustfs` |
 | PR touching `paths` in `targets-integration.yml` | `PostgreSQL, MySQL, AMQP, and NATS` | `targets-integration.yml` `targets-live` | Report-only | start the containers as in the job, export the `RUSTFS_TEST_*` DSNs, then the job's `cargo test --locked -p rustfs-targets --test <name> -- --ignored --test-threads=1` commands |
-| PR limited to main-CI-excluded paths | `Quick Checks`, `Test and Lint` | `ci-docs-only.yml` `quick-checks`, `test-and-lint` | Required | `git diff --check`; `make doc-paths-check`; `scripts/check_no_planning_docs.sh` |
-| `merge_group`; push to `main` | `End-to-End Tests (full merge gate)` | `ci.yml` `e2e-full` | Report-only | `cargo nextest run --profile e2e-full -p e2e_test` |
+| PR, documentation-only selection | `Quick Checks`, `Typos`, `Test and Lint` | `ci.yml` `quick-checks`, `typos`, `required-checks` | Required directly or via aggregate | Quick Checks commands; `python3 scripts/ci_gate.py --self-test` |
+| `merge_group`; push to `main` | `End-to-End Tests (full merge gate)` | `ci.yml` `e2e-full` | Via aggregate on these events | `cargo nextest run --profile e2e-full -p e2e_test` |
 
 e2e filters live in `.config/nextest.toml`; extend a profile instead of adding a second selector. Before a profile runs, `scripts/check_test_wiring.py` compares its listing to the committed digest in `.config/e2e-<profile>-selection.txt`, so a silent test drop fails closed.
 
@@ -67,11 +69,11 @@ the serialized cluster fault-domain suites for scheduled soak signal.
 
 ## Scheduled validation
 
-Scheduled lanes never block a PR. Their workflow-local gate fails the run, scheduled failures route to the shared failure-issue action, and `scheduled-validation-freshness.yml` fails when a workflow listed in `.github/scheduled-validations.json` has not run within its `max_age_hours` (a `never_ran_grace_until` entry covers the window before a newly enabled cron's first slot). Cadence is qualitative here; the cron lives in each workflow's `on.schedule`.
+Scheduled lanes never block a PR. Their workflow-local gate fails the run, scheduled failures route to the shared failure-issue action, and `scheduled-validation-freshness.yml` fails when a workflow listed in `.github/scheduled-validations.json` has no recent attempt or completed successful scheduled run within its `max_age_hours` (a `never_ran_grace_until` entry covers the window before a newly enabled cron's first slot). Cadence is qualitative here; the cron lives in each workflow's `on.schedule`.
 
 | Workflow (cadence) | Jobs | Verdict and artifacts | In freshness list | Reproduce |
 |---|---|---|---|---|
-| `ci.yml` (weekly) | full matrix, including the schedule/dispatch-only rio-v2 jobs `build-rustfs-debug-binary-rio-v2` and `e2e-tests-rio-v2` | per-job | yes | dispatch `ci.yml` |
+| `ci.yml` (weekly) | full matrix, including the schedule/dispatch-only rio-v2 jobs `build-rustfs-debug-binary-rio-v2` and `e2e-tests-rio-v2` | strict aggregate; the full E2E lane runs on dispatch, merge groups, and main pushes | yes | dispatch `ci.yml` |
 | `build.yml` (weekly) | `build-rustfs` over the six-target platform matrix in `prepare-platform-matrix` (four Linux, macOS aarch64, Windows x86_64) | build/package integrity | yes | dispatch `build.yml` with an exact platform set |
 | `e2e-replication-nightly.yml` (nightly) | `repl-nightly`, `cluster-nightly`, `protocols-nightly` | three independent gates; JUnit, membership listing, server logs | yes | `cargo nextest run --profile e2e-repl-nightly -p e2e_test`; `--profile e2e-nightly`; `-j 1 --profile e2e-protocols` |
 | `e2e-distributed.yml` (storage-sensitive PRs + nightly) | `distributed` | fail-closed 4-node 4-disk S3, durability, replication, movement, fault, and direct/rolling upgrade gate; JUnit, membership listing, per-node server logs | yes, with `never_ran_grace_until` | download the pinned previous release as in the workflow, export `RUSTFS_UPGRADE_SOURCE_BINARY`, then `cargo nextest run --profile e2e-distributed -p e2e_test` |
@@ -88,7 +90,7 @@ Scheduled lanes never block a PR. Their workflow-local gate fails the run, sched
 | `e2e-upgrade.yml` (weekly) | `upgrade` (4-case matrix) | upgrade and rollback gate; server logs | no | see the PR row |
 | `oidc-keycloak.yml` (weekly) | `oidc-keycloak-live` | live OIDC gate | no | see the PR row |
 | `targets-integration.yml` (nightly) | `targets-live` | live target gate; container logs | no | see the PR row |
-| `scheduled-validation-freshness.yml` (nightly) | `check-freshness` | fails on a never-created or stale schedule | n/a | dispatch |
+| `scheduled-validation-freshness.yml` (nightly) | `check-freshness` | fails on missing or stale attempts or completed successes | n/a | dispatch |
 
 Manual `workflow_dispatch` runs are debugging evidence and do not open scheduled-failure issues. A manual performance run may explicitly allow a known regression; that override is not a passing baseline.
 
