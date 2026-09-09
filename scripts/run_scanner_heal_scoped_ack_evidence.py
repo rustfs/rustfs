@@ -76,17 +76,13 @@ def field_from_proof(proof: dict[str, Any], field: str) -> dict[str, Any]:
     wiring.require(isinstance(value, dict), f"proof missing {field}")
     for marker in ("fixture", "fixture_only", "dry_run", "synthetic"):
         wiring.require(value.get(marker) is not True, f"{field} is {marker}")
-    if "evidence_type" in value:
-        wiring.require(value["evidence_type"] == "measured", f"{field} must be measured")
-    if "source_revision" in value:
-        wiring.require(value["source_revision"] == proof["source_revision"], f"{field} source revision mismatch")
-    if "run_id" in value:
-        wiring.require(value["run_id"] == proof["run_id"], f"{field} run_id mismatch")
-    if "measurement_window_id" in value:
-        wiring.require(
-            value["measurement_window_id"] == proof["measurement_window_id"],
-            f"{field} measurement window mismatch",
-        )
+    wiring.require(value.get("evidence_type") == "measured", f"{field} must be measured")
+    wiring.require(value.get("source_revision") == proof["source_revision"], f"{field} source revision mismatch")
+    wiring.require(value.get("run_id") == proof["run_id"], f"{field} run_id mismatch")
+    wiring.require(
+        value.get("measurement_window_id") == proof["measurement_window_id"],
+        f"{field} measurement window mismatch",
+    )
     evidence = {
         **value,
         "versions": proof["versions"],
@@ -173,32 +169,33 @@ def build_descriptor(args: argparse.Namespace) -> Path:
 
 def write_self_test_proof(path: Path, source_revision: str) -> None:
     now = datetime.now(timezone.utc).replace(microsecond=0)
+    run_id = f"scoped-ack-{source_revision[:12]}"
+    measurement_window_id = f"scoped-ack-window-{source_revision[:12]}"
+
+    def field_payload(field: str, values: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "evidence_type": "measured",
+            "source_revision": source_revision,
+            "run_id": run_id,
+            "measurement_window_id": measurement_window_id,
+            "scoped_ack_cases": list(wiring.SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES[field]),
+            **{required: True for required in wiring.SCANNER_HEAL_RELEASE_G03_REQUIRED_TRUE_FIELDS[field]},
+            **values,
+        }
+
     proof = {
         "schema": 1,
         "evidence_type": "measured",
         "source_revision": source_revision,
-        "run_id": f"scoped-ack-{source_revision[:12]}",
-        "measurement_window_id": f"scoped-ack-window-{source_revision[:12]}",
+        "run_id": run_id,
+        "measurement_window_id": measurement_window_id,
         "started_at": now.isoformat().replace("+00:00", "Z"),
         "finished_at": now.isoformat().replace("+00:00", "Z"),
         "versions": ["a" * 40, source_revision],
-        "durable_root_publication_proof": {
-            "scoped_ack_cases": list(wiring.SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES["durable_root_publication_proof"]),
-            "root_cas_observed": True,
-            "root_readback_observed": True,
-        },
-        "scoped_ack_request_identity": {
-            "scoped_ack_cases": list(wiring.SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES["scoped_ack_request_identity"]),
-            "whole_cycle_fallback_observed": True,
-        },
-        "participating_peer_capability_snapshot": {
-            "scoped_ack_cases": list(
-                wiring.SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES["participating_peer_capability_snapshot"]
-            ),
-        },
-        "mixed_peer_ack_fallback_oracle": {
-            "scoped_ack_cases": list(wiring.SCANNER_HEAL_RELEASE_SCOPED_ACK_CASES["mixed_peer_ack_fallback_oracle"]),
-        },
+        "durable_root_publication_proof": field_payload("durable_root_publication_proof", {}),
+        "scoped_ack_request_identity": field_payload("scoped_ack_request_identity", {}),
+        "participating_peer_capability_snapshot": field_payload("participating_peer_capability_snapshot", {}),
+        "mixed_peer_ack_fallback_oracle": field_payload("mixed_peer_ack_fallback_oracle", {}),
     }
     wiring.write_json(path, proof)
 
@@ -246,6 +243,36 @@ def run_self_test() -> None:
             wiring.require("root_readback_observed" in str(err), "wrong self-test failure for root readback")
         else:
             raise ValueError("self-test accepted incomplete root publication proof")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source_revision = git_head()
+        proof = root / "scoped-ack-proof.json"
+        write_self_test_proof(proof, source_revision)
+        payload = wiring.read_json(proof)
+        payload["participating_peer_capability_snapshot"]["source_revision"] = "b" * 40
+        wiring.write_json(proof, payload)
+        try:
+            build_descriptor(parse_args(["--proof-json", str(proof), "--out-dir", str(root / "out")]))
+        except ValueError as err:
+            wiring.require("source revision mismatch" in str(err), "wrong self-test failure for field source")
+        else:
+            raise ValueError("self-test accepted stale scoped ACK field source")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source_revision = git_head()
+        proof = root / "scoped-ack-proof.json"
+        write_self_test_proof(proof, source_revision)
+        payload = wiring.read_json(proof)
+        payload["participating_peer_capability_snapshot"].pop("capability_probe_observed")
+        wiring.write_json(proof, payload)
+        try:
+            build_descriptor(parse_args(["--proof-json", str(proof), "--out-dir", str(root / "out")]))
+        except ValueError as err:
+            wiring.require("capability_probe_observed" in str(err), "wrong self-test failure for capability proof")
+        else:
+            raise ValueError("self-test accepted incomplete capability snapshot proof")
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
