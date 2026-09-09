@@ -4251,8 +4251,10 @@ impl ECStore {
     }
 
     /// Return metadata for DELETE preflight, including an explicitly addressed
-    /// delete marker. Read APIs must keep using `get_object_info`; authorization
-    /// and Object Lock enforcement still belong to the caller and locked delete.
+    /// delete marker. GET/HEAD may also use this metadata-only lookup to enrich
+    /// an already failed read with marker headers, never to serve marker data.
+    /// Normal reads must keep using `get_object_info`; authorization and Object
+    /// Lock enforcement still belong to the caller and locked delete.
     #[instrument(level = "trace", skip_all)]
     pub async fn get_object_info_for_delete(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_object_info_snapshot(bucket, object, opts, true).await
