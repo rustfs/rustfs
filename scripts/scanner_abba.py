@@ -14,12 +14,13 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
 SCENARIOS = ("cold-hot", "fresh-hot", "multi-hot-new", "running-heal", "mrf-replay")
 LEGS = ("A1", "B1", "B2", "A2")
 MAX_JSON_BYTES = 1024 * 1024
 METRICS = (
-    "p99_ms", "throughput_ops", "rss_bytes", "cpu_seconds", "iops", "rpc_count",
+    "p95_ms", "p99_ms", "throughput_ops", "rss_bytes", "cpu_seconds", "iops", "rpc_count",
     "cache_clone_bytes", "encode_bytes", "save_bytes", "oldest_age_seconds",
     "walk_objects", "cold_walk_objects", "healed_objects", "errors", "requests",
     "foreground_pressure_samples", "foreground_pressure_high_samples",
@@ -41,6 +42,12 @@ MIN_MEASURED_RELEASE_DURATION_SECONDS = 7200
 RELEASE_FAULT_MODES = (
     "process-restart",
     "process-crash-restart",
+)
+RELEASE_SCHEDULER_BOUNDS = (
+    "admission-retry-idempotency",
+    "deadline-budget",
+    "lock-hold-bound",
+    "minimum-progress",
 )
 
 
@@ -222,6 +229,14 @@ def validate_release_evidence_manifest(manifest):
     )
     release_evidence_string(distributed.get("failure_domain"), "distributed.failure_domain")
     release_evidence_true(distributed.get("same_window_sampling"), "distributed.same_window_sampling")
+
+    scheduler = evidence.get("scheduler")
+    require(isinstance(scheduler, dict), "missing release_evidence.scheduler")
+    release_evidence_exact_strings(scheduler.get("bounds"), RELEASE_SCHEDULER_BOUNDS, "scheduler.bounds")
+    release_evidence_integer(scheduler.get("max_deferred_items"), "scheduler.max_deferred_items", 1, 2**31 - 1)
+    release_evidence_integer(scheduler.get("max_deferred_bytes"), "scheduler.max_deferred_bytes", 1, 2**63 - 1)
+    release_evidence_integer(scheduler.get("max_retry_age_seconds"), "scheduler.max_retry_age_seconds", 1, 86400)
+    release_evidence_true(scheduler.get("duplicate_task_bound_observed"), "scheduler.duplicate_task_bound_observed")
 
     crash = evidence.get("crash_restart")
     require(isinstance(crash, dict), "missing release_evidence.crash_restart")
@@ -538,6 +553,7 @@ def evaluate(cells):
         noise = max(drift, repeat_drift) > REPEATABILITY_LIMIT
         a = {key: (decimal_number(a1[key], key) + decimal_number(a2[key], key)) / Decimal("2") for key in METRICS}
         b = {key: (decimal_number(b1[key], key) + decimal_number(b2[key], key)) / Decimal("2") for key in METRICS}
+        p95 = max(a["p95_ms"], b["p95_ms"])
         p99 = relative_change(b["p99_ms"], a["p99_ms"], "p99_ms")
         throughput = relative_change(b["throughput_ops"], a["throughput_ops"], "throughput_ops")
         thresholds = {"p99_regression": Decimal("0.10") if control else Decimal("0.05"),
@@ -554,7 +570,11 @@ def evaluate(cells):
             required = ratio(a["cold_walk_objects"], a["walk_objects"], "cold walk baseline") * Decimal("0.80")
             reduction = Decimal("1") - ratio(b["walk_objects"], a["walk_objects"], "walk reduction")
             p1 = {"required_reduction": float(required), "observed_reduction": float(reduction),
-                  "repeatability_drift": report_number(work_drift)}
+                  "repeatability_drift": report_number(work_drift),
+                  "baseline_walk_objects": int(a["walk_objects"]),
+                  "baseline_cold_walk_objects": int(a["cold_walk_objects"]),
+                  "candidate_walk_objects": int(b["walk_objects"]),
+                  "candidate_cold_walk_objects": int(b["cold_walk_objects"])}
             if group[0]["scenario"] == "cold-hot":
                 # Compare counts before division can round repeating decimal ratios.
                 passed &= a["walk_objects"] - b["walk_objects"] >= a["cold_walk_objects"] * Decimal("0.80")
@@ -575,6 +595,10 @@ def evaluate(cells):
         comparisons.append({"scenario": group[0]["scenario"], "comparison": group[0]["comparison"],
                             "round": group[0]["round"], "status": "inconclusive" if noise else ("fail" if not passed else "inconclusive" if p2_pending else "pass"),
                             "a2_a1_drift": report_number(drift), "b2_b1_drift": report_number(repeat_drift),
+                            "foreground_p95_ms": float(p95),
+                            "foreground_p99_ms": float(max(a["p99_ms"], b["p99_ms"])),
+                            "throughput_ops": float(min(a["throughput_ops"], b["throughput_ops"])),
+                            "error_rate": float(max(a["errors"] / a["requests"], b["errors"] / b["requests"])),
                             "p99_regression": float(p99), "throughput_change": float(throughput),
                             "thresholds": {key: float(value) for key, value in thresholds.items()},
                             "p1": p1, "p2_max_work_multiple": float(P2_WORK_MULTIPLE_LIMIT),
@@ -587,6 +611,12 @@ def evaluate(cells):
                             "w10": w10,
                             "w11": w11,
                             "w10_w11": {
+                                "foreground_pressure_samples": [
+                                    cell["result"]["metrics"]["foreground_pressure_samples"] for cell in group
+                                ],
+                                "foreground_pressure_high_samples": [
+                                    cell["result"]["metrics"]["foreground_pressure_high_samples"] for cell in group
+                                ],
                                 "foreground_pressure_high_sample_ratios": [
                                     float(pressure_high_ratio(cell["result"]["metrics"])) for cell in group
                                 ],
@@ -678,6 +708,8 @@ def run(manifest, adapter, output, data_root):
     require(shutil.disk_usage(data_root).free >= manifest["min_free_bytes"], "insufficient free disk space")
     manifest["adapter_sha256"] = digest(adapter)
     manifest["collector_sha256"] = digest(Path(__file__).with_name("run_scanner_validation_harness.sh"))
+    started_at = datetime.now(timezone.utc).replace(microsecond=0)
+    manifest["started_at"] = started_at.isoformat().replace("+00:00", "Z")
     write_json(output / "manifest.json", manifest)
     cells = []
     write_json(output / "report.json", {"status": "incomplete", "performance": "pending"})
@@ -726,14 +758,19 @@ def run(manifest, adapter, output, data_root):
                             require(stopped.get("stopped") is True, "adapter failed to stop deployment")
         status, comparisons = evaluate(cells)
         synthetic = manifest["evidence"] == "synthetic"
+        finished_at = datetime.now(timezone.utc).replace(microsecond=0)
         report = {"status": "synthetic_validated" if synthetic and status == "pass" else status,
                   "evidence": manifest["evidence"], "performance": "pending" if synthetic else status,
-                  "cells": len(cells), "comparisons": comparisons}
+                  "cells": len(cells), "comparisons": comparisons,
+                  "started_at": manifest["started_at"], "finished_at": finished_at.isoformat().replace("+00:00", "Z")}
         write_json(output / "report.json", report)
         return 0 if status == "pass" else 3 if status == "inconclusive" else 1
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
+        finished_at = datetime.now(timezone.utc).replace(microsecond=0)
         write_json(output / "report.json", {"status": "failed", "performance": "pending",
-                                            "completed_cells": len(cells), "error": str(error)})
+                                            "completed_cells": len(cells), "error": str(error),
+                                            "started_at": manifest.get("started_at"),
+                                            "finished_at": finished_at.isoformat().replace("+00:00", "Z")})
         raise
 
 
