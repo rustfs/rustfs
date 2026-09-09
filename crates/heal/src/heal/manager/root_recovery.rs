@@ -283,6 +283,8 @@ impl RootHealIntent {
 #[derive(Default)]
 pub(super) struct RootHealRecovery {
     mutation: Mutex<()>,
+    #[cfg(any(test, feature = "test-util"))]
+    disabled_for_tests: bool,
     #[cfg(test)]
     disks: Option<Vec<DiskStore>>,
 }
@@ -391,11 +393,26 @@ impl RootHealRecovery {
     pub(super) fn with_disks(disks: Vec<DiskStore>) -> Self {
         Self {
             mutation: Mutex::new(()),
+            disabled_for_tests: false,
             disks: Some(disks),
         }
     }
 
+    #[cfg(any(test, feature = "test-util"))]
+    pub(super) fn disabled_for_tests() -> Self {
+        Self {
+            mutation: Mutex::new(()),
+            disabled_for_tests: true,
+            #[cfg(test)]
+            disks: None,
+        }
+    }
+
     async fn disks(&self) -> Result<Vec<DiskStore>> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.disabled_for_tests {
+            return Ok(Vec::new());
+        }
         #[cfg(test)]
         if let Some(disks) = &self.disks {
             return Ok(disks.clone());
@@ -496,6 +513,10 @@ impl RootHealRecovery {
         if !is_admin_heal_recovery(&request.heal_type, request.source) {
             return Ok(());
         }
+        #[cfg(any(test, feature = "test-util"))]
+        if self.disabled_for_tests {
+            return Ok(());
+        }
         let _guard = self.mutation.lock().await;
         let disks = self.disks().await?;
         let existing = Self::find(&disks, &request.id).await?;
@@ -530,6 +551,10 @@ impl RootHealRecovery {
 
     pub(super) async fn remove(&self, task_id: &str, heal_type: &HealType, source: HealRequestSource) -> Result<bool> {
         if !is_admin_heal_recovery(heal_type, source) {
+            return Ok(false);
+        }
+        #[cfg(any(test, feature = "test-util"))]
+        if self.disabled_for_tests {
             return Ok(false);
         }
         self.remove_pending_by_id(task_id).await
@@ -602,6 +627,10 @@ impl RootHealRecovery {
     }
 
     pub(super) async fn cancel_pending(&self, task_id: &str) -> Result<bool> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.disabled_for_tests {
+            return Ok(false);
+        }
         if intent_path(task_id).is_err() {
             return Ok(false);
         }
@@ -655,6 +684,10 @@ impl RootHealRecovery {
         if !is_admin_heal_recovery(heal_type, source) || completed.heal_type != *heal_type {
             return Ok(false);
         }
+        #[cfg(any(test, feature = "test-util"))]
+        if self.disabled_for_tests {
+            return Ok(false);
+        }
         let _guard = self.mutation.lock().await;
         let disks = self.disks().await?;
         let pending =
@@ -681,6 +714,10 @@ impl RootHealRecovery {
     }
 
     pub(super) async fn completed(&self, task_id: &str) -> Result<Option<CompletedHealStatus>> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.disabled_for_tests {
+            return Ok(None);
+        }
         if terminal_path(task_id).is_err() {
             return Ok(None);
         }
@@ -693,6 +730,10 @@ impl RootHealRecovery {
     }
 
     pub(super) async fn completed_matches_path(&self, heal_path: &str) -> Result<bool> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.disabled_for_tests {
+            return Ok(false);
+        }
         let _guard = self.mutation.lock().await;
         let disks = self.disks().await?;
         for disk in &disks {
@@ -722,6 +763,10 @@ impl RootHealRecovery {
     }
 
     pub(super) async fn gc_terminal_receipts_once(&self, now: SystemTime) -> Result<RootTerminalGcReport> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.disabled_for_tests {
+            return Ok(RootTerminalGcReport::default());
+        }
         let _guard = self.mutation.lock().await;
         let disks = self.disks().await?;
         let mut report = RootTerminalGcReport::default();
@@ -816,6 +861,10 @@ impl RootHealRecovery {
     }
 
     pub(super) async fn pending(&self) -> Result<Vec<HealRequest>> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.disabled_for_tests {
+            return Ok(Vec::new());
+        }
         let _guard = self.mutation.lock().await;
         let disks = self.disks().await?;
         let mut ids = HashSet::new();
