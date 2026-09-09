@@ -5519,7 +5519,7 @@ where
                     meta,
                     revision,
                     committed,
-                    ..
+                    previous,
                 } => {
                     observation["state"] = serde_json::json!("valid");
                     observation["committed"] = serde_json::json!(committed);
@@ -5531,6 +5531,16 @@ where
                     observation["pool_count"] = serde_json::json!(meta.pools.len());
                     observation["payload_sha256"] = serde_json::json!(rustfs_utils::crypto::hex(Sha256::digest(canonical)));
                     observation["raw_sha256"] = serde_json::json!(rustfs_utils::crypto::hex(Sha256::digest(raw)));
+                    match pool_meta_test_pools_sha256(meta) {
+                        Ok(digest) => observation["persisted_pools_sha256"] = serde_json::json!(digest),
+                        Err(err) => observation["observation_error"] = serde_json::json!(err.to_string()),
+                    }
+                    if let Some(previous) = previous {
+                        match pool_meta_test_snapshot(&previous.meta, previous.revision, &previous.canonical) {
+                            Ok(summary) => observation["previous"] = summary,
+                            Err(err) => observation["observation_error"] = serde_json::json!(err.to_string()),
+                        }
+                    }
                 }
                 PoolMetaReplica::Missing => observation["state"] = serde_json::json!("missing"),
                 PoolMetaReplica::Corrupt(_) => observation["state"] = serde_json::json!("corrupt"),
@@ -6055,18 +6065,208 @@ pub(crate) fn startup_cas_test_observe(mut observation: serde_json::Value) {
     let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
 }
 
-async fn save_pool_meta_object_cas<S>(
-    pool: Arc<S>,
-    object: &str,
-    data: Vec<u8>,
-    token: &PoolMetaCasToken,
-    fence: &PoolMetaPersistenceFence<'_>,
-    phase: &'static str,
-    transaction_arm: &mut PoolMetaTransactionArm,
-) -> Result<crate::object_api::ObjectInfo>
-where
-    S: EcstoreObjectIO,
-{
+#[cfg(feature = "e2e-test-hooks")]
+fn pool_meta_test_pools_sha256(meta: &PoolMeta) -> Result<String> {
+    let pools = meta.pools.iter().map(PersistedPoolStatus::from).collect::<Vec<_>>();
+    Ok(rustfs_utils::crypto::hex(Sha256::digest(serde_json::to_vec(&pools)?)))
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn pool_meta_test_snapshot(meta: &PoolMeta, revision: PoolMetaRevision, canonical: &[u8]) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "version": revision.version, "cluster_id": revision.cluster_id, "epoch": revision.epoch,
+        "generation": revision.generation, "transaction_id": revision.transaction_id,
+        "payload_sha256": rustfs_utils::crypto::hex(Sha256::digest(canonical)),
+        "persisted_pools_sha256": pool_meta_test_pools_sha256(meta)?,
+    }))
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PoolMetaPhaseBarrierCase {
+    PrepareSubset,
+    PreparedAll,
+    CommitOne,
+    BeforePublish,
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PoolMetaPhaseBarrierArm {
+    nonce: uuid::Uuid,
+    case: PoolMetaPhaseBarrierCase,
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+struct PoolMetaPhaseBarrier {
+    directory: std::path::PathBuf,
+    arm: PoolMetaPhaseBarrierArm,
+    transaction_id: uuid::Uuid,
+    event_gate: tokio::sync::Mutex<()>,
+    blocked_pools: AtomicUsize,
+    completed_writes: AtomicUsize,
+    ready_emitted: AtomicBool,
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+impl PoolMetaPhaseBarrier {
+    async fn bind(
+        previous: &PoolMetaCommittedCandidate,
+        candidate: &PoolMeta,
+        revision: PoolMetaRevision,
+        durable: &[u8],
+    ) -> Result<Option<Self>> {
+        let Some(directory) = std::env::var_os("RUSTFS_E2E_POOL_META_BARRIER_DIR").map(std::path::PathBuf::from) else {
+            return Ok(None);
+        };
+        let data = match tokio::fs::read(directory.join("arm.json")).await {
+            Ok(data) => data,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let arm: PoolMetaPhaseBarrierArm = serde_json::from_slice(&data)?;
+        if arm.nonce.is_nil() || !directory.is_absolute() {
+            return Err(Error::other(
+                "pool metadata test barrier requires an absolute directory and non-nil nonce",
+            ));
+        }
+        let transaction_id = revision
+            .transaction_id
+            .ok_or_else(|| Error::other("pool metadata test barrier requires a V3 transaction"))?;
+        // One external arm binds one attempt, including if its CAS subsequently retries.
+        let claim = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.join("claimed"))
+            .await;
+        match claim {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(err) => return Err(err.into()),
+        }
+        let barrier = Self {
+            directory,
+            arm,
+            transaction_id,
+            event_gate: tokio::sync::Mutex::new(()),
+            blocked_pools: AtomicUsize::new(0),
+            completed_writes: AtomicUsize::new(0),
+            ready_emitted: AtomicBool::new(false),
+        };
+        barrier
+            .observe(serde_json::json!({
+                "kind": "armed",
+                "previous": pool_meta_test_snapshot(&previous.meta, previous.revision, &previous.canonical)?,
+                "candidate": pool_meta_test_snapshot(candidate, revision, durable)?,
+            }))
+            .await?;
+        Ok(Some(barrier))
+    }
+
+    async fn observe(&self, mut event: serde_json::Value) -> Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        event["nonce"] = serde_json::json!(self.arm.nonce);
+        event["pid"] = serde_json::json!(std::process::id());
+        event["transaction_id"] = serde_json::json!(self.transaction_id);
+        event["case"] = serde_json::json!(self.arm.case);
+        let mut line = serde_json::to_vec(&event)?;
+        line.push(b'\n');
+        let _event_guard = self.event_gate.lock().await;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.directory.join("events.jsonl"))
+            .await?;
+        file.write_all(&line).await?;
+        file.flush().await?;
+        Ok(())
+    }
+
+    async fn wait_for_release(&self) -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                match tokio::fs::metadata(self.directory.join("release")).await {
+                    Ok(_) => return Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(Error::from(err)),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| Error::other("pool metadata test barrier release timed out"))?
+    }
+
+    async fn ready(&self) -> Result<()> {
+        self.observe(serde_json::json!({"kind": "ready", "cutpoint": self.arm.case}))
+            .await?;
+        self.wait_for_release().await
+    }
+
+    async fn ready_after_all_participants(&self) -> Result<()> {
+        let (blocked, completed) = match self.arm.case {
+            PoolMetaPhaseBarrierCase::PrepareSubset => (0b0101, 0b1010),
+            PoolMetaPhaseBarrierCase::CommitOne => (0b0111, 0b1000),
+            _ => return Ok(()),
+        };
+        if self.blocked_pools.load(Ordering::SeqCst) == blocked
+            && self.completed_writes.load(Ordering::SeqCst) == completed
+            && !self.ready_emitted.swap(true, Ordering::SeqCst)
+        {
+            self.ready().await?;
+        }
+        Ok(())
+    }
+
+    async fn before_write(&self, phase: &'static str, pool: usize, data: &[u8]) -> Result<()> {
+        let blocked = match (self.arm.case, phase) {
+            (PoolMetaPhaseBarrierCase::PrepareSubset, "prepare_cas") => ![1, 3].contains(&pool),
+            (PoolMetaPhaseBarrierCase::CommitOne, "commit_cas") => pool != 3,
+            _ => false,
+        };
+        if blocked {
+            self.observe(serde_json::json!({
+                "kind": "blocked", "phase": phase, "pool": pool,
+                "payload_sha256": rustfs_utils::crypto::hex(Sha256::digest(data)),
+            }))
+            .await?;
+            self.blocked_pools.fetch_or(1 << pool, Ordering::SeqCst);
+            self.ready_after_all_participants().await?;
+            self.wait_for_release().await?;
+        }
+        self.observe(serde_json::json!({
+            "kind": "before-dispatch", "phase": phase, "pool": pool,
+            "payload_sha256": rustfs_utils::crypto::hex(Sha256::digest(data)),
+        }))
+        .await
+    }
+
+    async fn after_write(&self, phase: &'static str, pool: usize, data: &[u8], outcome: &PoolMetaCasWriteOutcome) -> Result<()> {
+        self.observe(serde_json::json!({
+            "kind": "after-cas", "phase": phase, "pool": pool,
+            "payload_sha256": rustfs_utils::crypto::hex(Sha256::digest(data)),
+            "ok": outcome.result.is_ok(), "tail_drained": outcome.result.is_ok(),
+            "etag": outcome.result.as_ref().ok().and_then(|info| info.etag.as_deref()),
+            "may_have_mutated": outcome.may_have_mutated,
+        }))
+        .await?;
+        if outcome.result.is_ok() {
+            match (self.arm.case, phase, pool) {
+                (PoolMetaPhaseBarrierCase::PrepareSubset, "prepare_cas", 1 | 3)
+                | (PoolMetaPhaseBarrierCase::CommitOne, "commit_cas", 3) => {
+                    self.completed_writes.fetch_or(1 << pool, Ordering::SeqCst);
+                    self.ready_after_all_participants().await?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+fn pool_meta_cas_options(object: &str, token: &PoolMetaCasToken, fence: &PoolMetaPersistenceFence<'_>) -> Result<ObjectOptions> {
     fence.ensure_held()?;
     let mut opts = ObjectOptions {
         max_parity: true,
@@ -6076,6 +6276,40 @@ where
         ..Default::default()
     };
     fence.add_to_options(&mut opts);
+    Ok(opts)
+}
+
+struct PoolMetaCasWriteOutcome {
+    result: Result<crate::object_api::ObjectInfo>,
+    source: Option<Arc<Error>>,
+    may_have_mutated: bool,
+}
+
+impl PoolMetaCasWriteOutcome {
+    fn not_dispatched(err: Error) -> Self {
+        Self {
+            result: Err(err),
+            source: None,
+            may_have_mutated: false,
+        }
+    }
+}
+
+async fn execute_pool_meta_object_cas<S>(
+    pool: Arc<S>,
+    object: &str,
+    data: Vec<u8>,
+    opts: ObjectOptions,
+    fence: &PoolMetaPersistenceFence<'_>,
+    phase: &'static str,
+) -> PoolMetaCasWriteOutcome
+where
+    S: EcstoreObjectIO,
+{
+    // A bounded phase can wait for another replica before this write is polled.
+    if let Err(err) = fence.ensure_held() {
+        return PoolMetaCasWriteOutcome::not_dispatched(err);
+    }
     #[cfg(feature = "e2e-test-hooks")]
     let observation = std::env::var_os("RUSTFS_E2E_STARTUP_CAS_NONCE").map(|_| {
         serde_json::json!({
@@ -6090,27 +6324,24 @@ where
             "no_lock": opts.no_lock,
         })
     });
-    // Cancellation can happen at the very first poll of the storage future.
-    // Arm before dispatch, but not during read/encode/fence preflight.
-    let previous_phase = transaction_arm.phase;
-    transaction_arm.phase = Some(phase);
     let result = save_config_with_opts_and_metadata(pool, object, data, &opts).await;
-    if matches!(&result, Err(Error::PreconditionFailed)) {
+    let may_have_mutated = !matches!(&result, Err(Error::PreconditionFailed));
+    if !may_have_mutated {
         record_pool_meta_stale_write_rejection(phase);
-        transaction_arm.phase = previous_phase;
     }
+    let mut source = None;
     let result = match result {
         Ok(object_info) => fence.ensure_held().map(|()| object_info),
         Err(err) => {
-            let source = Arc::new(err);
-            transaction_arm.source = Some(Arc::clone(&source));
-            if matches!(source.as_ref(), Error::PreconditionFailed) {
+            let original = Arc::new(err);
+            source = Some(Arc::clone(&original));
+            if matches!(original.as_ref(), Error::PreconditionFailed) {
                 Err(Error::PreconditionFailed)
             } else {
                 Err(Error::other(pool_metadata_error(
                     crate::error::PoolMetadataFailure::TransactionUnknown,
                     phase,
-                    Some(source),
+                    Some(original),
                 )))
             }
         }
@@ -6129,7 +6360,127 @@ where
         observation["error"] = serde_json::json!(result.as_ref().err().map(ToString::to_string));
         startup_cas_test_observe(observation);
     }
-    result
+    PoolMetaCasWriteOutcome {
+        result,
+        source,
+        may_have_mutated,
+    }
+}
+
+async fn save_pool_meta_object_cas<S>(
+    pool: Arc<S>,
+    object: &str,
+    data: Vec<u8>,
+    token: &PoolMetaCasToken,
+    fence: &PoolMetaPersistenceFence<'_>,
+    phase: &'static str,
+    transaction_arm: &mut PoolMetaTransactionArm,
+) -> Result<crate::object_api::ObjectInfo>
+where
+    S: EcstoreObjectIO,
+{
+    let opts = pool_meta_cas_options(object, token, fence)?;
+    // Cancellation can happen at the very first poll of the storage future.
+    // Arm before dispatch, but not during read/encode/fence preflight.
+    let previous_phase = transaction_arm.phase;
+    transaction_arm.phase = Some(phase);
+    let outcome = execute_pool_meta_object_cas(pool, object, data, opts, fence, phase).await;
+    if !outcome.may_have_mutated {
+        transaction_arm.phase = previous_phase;
+    }
+    if let Some(source) = outcome.source
+        && (!matches!(source.as_ref(), Error::PreconditionFailed)
+            || transaction_arm
+                .source
+                .as_ref()
+                .is_none_or(|previous| matches!(previous.as_ref(), Error::PreconditionFailed)))
+    {
+        transaction_arm.source = Some(source);
+    }
+    outcome.result
+}
+
+async fn save_pool_meta_phase<S>(
+    pools: &[Arc<S>],
+    data: &[u8],
+    tokens: &[PoolMetaCasToken],
+    fence: &PoolMetaPersistenceFence<'_>,
+    phase: &'static str,
+    transaction_arm: &mut PoolMetaTransactionArm,
+    #[cfg(feature = "e2e-test-hooks")] barrier: Option<&PoolMetaPhaseBarrier>,
+) -> Vec<Result<crate::object_api::ObjectInfo>>
+where
+    S: EcstoreObjectIO,
+{
+    if pools.len() != tokens.len() {
+        return vec![Err(Error::other("pool metadata phase has inconsistent replica revisions"))];
+    }
+    let options = tokens
+        .iter()
+        .map(|token| pool_meta_cas_options(POOL_META_NAME, token, fence))
+        .collect::<Vec<_>>();
+    let previous_phase = transaction_arm.phase;
+    if options.iter().any(Result::is_ok) {
+        transaction_arm.phase = Some(phase);
+    }
+    // The caller owns one arm and the save/namespace guards for the whole phase.
+    // No replica may restore that arm while another write is still in flight.
+    let writes = futures::stream::iter(pools.iter().cloned().zip(options).enumerate().map(
+        |(pool_index, (pool, opts))| async move {
+            #[cfg(feature = "e2e-test-hooks")]
+            if opts.is_ok()
+                && let Some(barrier) = barrier
+                && let Err(err) = barrier.before_write(phase, pool_index, data).await
+            {
+                return (pool_index, PoolMetaCasWriteOutcome::not_dispatched(err));
+            }
+            let outcome = match opts {
+                Ok(opts) => execute_pool_meta_object_cas(pool, POOL_META_NAME, data.to_vec(), opts, fence, phase).await,
+                Err(err) => PoolMetaCasWriteOutcome::not_dispatched(err),
+            };
+            #[cfg(feature = "e2e-test-hooks")]
+            let outcome = {
+                let mut outcome = outcome;
+                if let Some(barrier) = barrier
+                    && let Err(err) = barrier.after_write(phase, pool_index, data, &outcome).await
+                    && outcome.result.is_ok()
+                {
+                    outcome.result = Err(err);
+                }
+                outcome
+            };
+            (pool_index, outcome)
+        },
+    ))
+    .buffer_unordered(4);
+    futures::pin_mut!(writes);
+    let mut results = Vec::with_capacity(pools.len());
+    let mut may_have_mutated = false;
+    let mut source_pool_index: Option<(bool, usize)> = None;
+    while let Some((pool_index, outcome)) = writes.next().await {
+        may_have_mutated |= outcome.may_have_mutated;
+        if let Some(source) = outcome.source
+            && (outcome.may_have_mutated
+                || transaction_arm
+                    .source
+                    .as_ref()
+                    .is_none_or(|previous| matches!(previous.as_ref(), Error::PreconditionFailed)))
+            && source_pool_index.is_none_or(|(previous_mutated, previous_index)| {
+                (outcome.may_have_mutated && !previous_mutated)
+                    || (outcome.may_have_mutated == previous_mutated && pool_index < previous_index)
+            })
+        {
+            // A later CAS rejection must not erase an I/O failure if draining is cancelled.
+            transaction_arm.source = Some(source);
+            source_pool_index = Some((outcome.may_have_mutated, pool_index));
+        }
+        results.push((pool_index, outcome.result));
+    }
+    if !may_have_mutated {
+        transaction_arm.phase = previous_phase;
+    }
+    results.sort_unstable_by_key(|(pool_index, _)| *pool_index);
+    results.into_iter().map(|(_, result)| result).collect()
 }
 
 /// Which pool replicas a cluster-identity write may touch.
@@ -7733,48 +8084,116 @@ impl PoolMeta {
         };
         let pending = encode_pool_meta_v3_envelope(&committed, revision, false, Some(&previous))?;
         let durable = encode_pool_meta_v3_envelope(&committed, revision, true, None)?;
+        let concurrent_phases = pools.len() > 1
+            && selection.revision.is_generation_protocol()
+            && !selection.replica_state.needs_repair
+            && !bootstrap_generation_required
+            && matches!(fence, PoolMetaPersistenceFence::Distributed(Some(_)));
+        #[cfg(feature = "e2e-test-hooks")]
+        let phase_barrier = if concurrent_phases && pools.len() == 4 {
+            PoolMetaPhaseBarrier::bind(&previous, &committed, revision, &durable).await?
+        } else {
+            None
+        };
         let mut pending_tokens = Vec::with_capacity(pools.len());
-        for (pool, token) in pools.iter().cloned().zip(&selection.cas_tokens) {
-            let object_info =
-                save_pool_meta_object_cas(pool, POOL_META_NAME, pending.clone(), token, fence, "prepare_cas", transaction_arm)
-                    .await?;
-            let etag = object_info
-                .etag
-                .filter(|etag| !etag.trim().is_empty())
-                .ok_or_else(|| Error::other("pool metadata V3 prepare succeeded without a conditional-write revision"))?;
-            pending_tokens.push(PoolMetaCasToken::Existing(etag));
-        }
-
-        let mut commit_error = None;
-        let mut commit_succeeded = false;
-        #[cfg(test)]
-        let mut first_pool = true;
-        for (pool, token) in pools.iter().cloned().zip(&pending_tokens) {
-            match save_pool_meta_object_cas(
-                pool.clone(),
-                POOL_META_NAME,
-                durable.clone(),
-                token,
+        if concurrent_phases {
+            // Drain the entire prepare phase before validating ETags or returning an error.
+            for result in save_pool_meta_phase(
+                pools.as_slice(),
+                &pending,
+                &selection.cas_tokens,
                 fence,
-                "commit_cas",
+                "prepare_cas",
                 transaction_arm,
+                #[cfg(feature = "e2e-test-hooks")]
+                phase_barrier.as_ref(),
             )
             .await
             {
-                Ok(_) => {
-                    commit_succeeded = true;
-                    #[cfg(test)]
-                    if first_pool && let PoolMetaPersistenceFence::Activation(activation_fence) = fence {
-                        pause_pool_activation_after_durable_save(&pool, activation_fence).await;
+                let etag = result?
+                    .etag
+                    .filter(|etag| !etag.trim().is_empty())
+                    .ok_or_else(|| Error::other("pool metadata V3 prepare succeeded without a conditional-write revision"))?;
+                pending_tokens.push(PoolMetaCasToken::Existing(etag));
+            }
+        } else {
+            for (pool, token) in pools.iter().cloned().zip(&selection.cas_tokens) {
+                let object_info = save_pool_meta_object_cas(
+                    pool,
+                    POOL_META_NAME,
+                    pending.clone(),
+                    token,
+                    fence,
+                    "prepare_cas",
+                    transaction_arm,
+                )
+                .await?;
+                let etag = object_info
+                    .etag
+                    .filter(|etag| !etag.trim().is_empty())
+                    .ok_or_else(|| Error::other("pool metadata V3 prepare succeeded without a conditional-write revision"))?;
+                pending_tokens.push(PoolMetaCasToken::Existing(etag));
+            }
+        }
+
+        #[cfg(feature = "e2e-test-hooks")]
+        if let Some(barrier) = &phase_barrier
+            && barrier.arm.case == PoolMetaPhaseBarrierCase::PreparedAll
+        {
+            barrier.ready().await?;
+        }
+        let mut commit_error = None;
+        let mut commit_succeeded = false;
+        if concurrent_phases {
+            for result in save_pool_meta_phase(
+                pools.as_slice(),
+                &durable,
+                &pending_tokens,
+                fence,
+                "commit_cas",
+                transaction_arm,
+                #[cfg(feature = "e2e-test-hooks")]
+                phase_barrier.as_ref(),
+            )
+            .await
+            {
+                match result {
+                    Ok(_) => commit_succeeded = true,
+                    Err(err) => {
+                        commit_error.get_or_insert(err);
                     }
                 }
-                Err(err) => {
-                    commit_error.get_or_insert(err);
-                }
             }
+        } else {
             #[cfg(test)]
-            {
-                first_pool = false;
+            let mut first_pool = true;
+            for (pool, token) in pools.iter().cloned().zip(&pending_tokens) {
+                match save_pool_meta_object_cas(
+                    pool.clone(),
+                    POOL_META_NAME,
+                    durable.clone(),
+                    token,
+                    fence,
+                    "commit_cas",
+                    transaction_arm,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        commit_succeeded = true;
+                        #[cfg(test)]
+                        if first_pool && let PoolMetaPersistenceFence::Activation(activation_fence) = fence {
+                            pause_pool_activation_after_durable_save(&pool, activation_fence).await;
+                        }
+                    }
+                    Err(err) => {
+                        commit_error.get_or_insert(err);
+                    }
+                }
+                #[cfg(test)]
+                {
+                    first_pool = false;
+                }
             }
         }
         let confirmed = if fence.is_activation() {
@@ -7793,6 +8212,12 @@ impl PoolMeta {
                 "generation": confirmed.revision.generation,
                 "transaction_id": confirmed.revision.transaction_id,
             }));
+            #[cfg(feature = "e2e-test-hooks")]
+            if let Some(barrier) = &phase_barrier
+                && barrier.arm.case == PoolMetaPhaseBarrierCase::BeforePublish
+            {
+                barrier.ready().await?;
+            }
             return Ok(confirmed.meta);
         }
         if !commit_succeeded {
@@ -22227,6 +22652,842 @@ mod pools_tests {
                 etag: Some(etag),
                 ..Default::default()
             })
+        }
+    }
+
+    mod phase_tests {
+        use super::super as implementation;
+        use super::*;
+
+        #[derive(Clone, Copy, Debug, Default)]
+        enum WriteFault {
+            #[default]
+            None,
+            Reject,
+            Timeout,
+            TimeoutAfterWrite,
+            EmptyEtag,
+            OmitWrite,
+        }
+
+        #[derive(Clone, Debug, Default)]
+        struct WriteStep {
+            gate: Option<Arc<tokio::sync::Semaphore>>,
+            fault: WriteFault,
+        }
+
+        #[derive(Clone, Debug)]
+        struct WriteCall {
+            pool: usize,
+            phase: usize,
+            if_match: Option<String>,
+        }
+
+        #[derive(Debug, Default)]
+        struct WriteTrace {
+            calls: StdMutex<Vec<WriteCall>>,
+            active: AtomicUsize,
+            maximum: AtomicUsize,
+            finished: AtomicUsize,
+            changed: tokio::sync::Notify,
+        }
+
+        impl WriteTrace {
+            async fn wait_for(&self, calls: usize, finished: usize) {
+                tokio::time::timeout(StdDuration::from_secs(3), async {
+                    loop {
+                        let changed = self.changed.notified();
+                        if self.calls.lock().expect("trace lock").len() >= calls
+                            && self.finished.load(Ordering::SeqCst) >= finished
+                        {
+                            return;
+                        }
+                        changed.await;
+                    }
+                })
+                .await
+                .expect("phase must reach the requested barrier");
+            }
+
+            fn commit_count(&self) -> usize {
+                self.calls
+                    .lock()
+                    .expect("trace lock")
+                    .iter()
+                    .filter(|call| call.phase == 1)
+                    .count()
+            }
+        }
+
+        struct ActiveWrite<'a>(&'a WriteTrace);
+        impl Drop for ActiveWrite<'_> {
+            fn drop(&mut self) {
+                self.0.active.fetch_sub(1, Ordering::SeqCst);
+                self.0.finished.fetch_add(1, Ordering::SeqCst);
+                self.0.changed.notify_one();
+            }
+        }
+
+        #[derive(Debug)]
+        struct PhaseStorage {
+            inner: PartialPoolMetaWriteStorage,
+            pool: usize,
+            steps: [WriteStep; 2],
+            trace: Arc<WriteTrace>,
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectIO for PhaseStorage {
+            type Error = Error;
+            type RangeSpec = HTTPRangeSpec;
+            type HeaderMap = http::HeaderMap;
+            type ObjectOptions = crate::object_api::ObjectOptions;
+            type ObjectInfo = crate::object_api::ObjectInfo;
+            type GetObjectReader = crate::object_api::GetObjectReader;
+            type PutObjectReader = crate::object_api::PutObjReader;
+
+            async fn get_object_reader(
+                &self,
+                bucket: &str,
+                object: &str,
+                range: Option<Self::RangeSpec>,
+                headers: Self::HeaderMap,
+                opts: &Self::ObjectOptions,
+            ) -> Result<Self::GetObjectReader, Error> {
+                self.inner.get_object_reader(bucket, object, range, headers, opts).await
+            }
+
+            async fn put_object(
+                &self,
+                bucket: &str,
+                object: &str,
+                data: &mut Self::PutObjectReader,
+                opts: &Self::ObjectOptions,
+            ) -> Result<Self::ObjectInfo, Error> {
+                if object != POOL_META_NAME {
+                    return self.inner.put_object(bucket, object, data, opts).await;
+                }
+                let mut payload = Vec::new();
+                data.stream.read_to_end(&mut payload).await?;
+                let phase = match implementation::decode_pool_meta_replica(payload.clone()) {
+                    implementation::PoolMetaReplica::Valid { committed, .. } => usize::from(committed),
+                    _ => panic!("phase fixture must receive valid pool metadata"),
+                };
+                assert!(opts.max_parity && opts.no_lock);
+                assert_eq!(opts.write_completion, crate::object_api::WriteCompletion::TailDrained);
+                self.trace.calls.lock().expect("trace lock").push(WriteCall {
+                    pool: self.pool,
+                    phase,
+                    if_match: opts
+                        .http_preconditions
+                        .as_ref()
+                        .and_then(HTTPPreconditions::if_match_value)
+                        .map(str::to_owned),
+                });
+                let active = self.trace.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.trace.maximum.fetch_max(active, Ordering::SeqCst);
+                let _active = ActiveWrite(&self.trace);
+                self.trace.changed.notify_one();
+                let step = &self.steps[phase];
+                if let Some(gate) = &step.gate {
+                    gate.acquire().await.expect("phase gate stays open").forget();
+                }
+                match step.fault {
+                    WriteFault::Reject => return Err(Error::PreconditionFailed),
+                    WriteFault::Timeout => return Err(Error::Timeout),
+                    WriteFault::OmitWrite => {
+                        return Ok(crate::object_api::ObjectInfo {
+                            etag: Some("uncommitted".to_owned()),
+                            ..Default::default()
+                        });
+                    }
+                    _ => {}
+                }
+                let mut data = crate::object_api::PutObjReader::from_vec(payload);
+                let mut result = self.inner.put_object(bucket, object, &mut data, opts).await?;
+                match step.fault {
+                    WriteFault::TimeoutAfterWrite => return Err(Error::Timeout),
+                    WriteFault::EmptyEtag => result.etag = Some("  ".to_owned()),
+                    _ => {}
+                }
+                Ok(result)
+            }
+        }
+
+        struct Fixture {
+            pools: Vec<Arc<PhaseStorage>>,
+            trace: Arc<WriteTrace>,
+            previous: implementation::PoolMetaCommittedCandidate,
+            desired: PoolMeta,
+            pending: Vec<u8>,
+            durable: Vec<u8>,
+            revision: implementation::PoolMetaRevision,
+            cluster_id: uuid::Uuid,
+        }
+
+        impl Fixture {
+            fn new(steps: Vec<[WriteStep; 2]>) -> Self {
+                let cluster_id = uuid::Uuid::new_v4();
+                let meta = PoolMeta {
+                    version: POOL_META_GENERATION_VERSION,
+                    pools: (0..steps.len())
+                        .map(|index| {
+                            decommission_test_pool_status(
+                                index,
+                                (index == 0).then(|| PoolDecommissionInfo {
+                                    start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                                    start_size: 4096,
+                                    total_size: 16384,
+                                    current_size: 8192,
+                                    items_decommissioned: 7,
+                                    items_decommission_failed: 1,
+                                    bytes_done: 4096,
+                                    bytes_failed: 512,
+                                    queued_buckets: vec!["remaining-a".to_owned(), "remaining-b".to_owned()],
+                                    decommissioned_buckets: vec!["completed".to_owned()],
+                                    bucket: "remaining-a".to_owned(),
+                                    prefix: "objects/".to_owned(),
+                                    object: "objects/007".to_owned(),
+                                    ..Default::default()
+                                }),
+                            )
+                        })
+                        .collect(),
+                    ..Default::default()
+                };
+                let previous_revision = implementation::PoolMetaRevision {
+                    version: POOL_META_GENERATION_VERSION,
+                    cluster_id: Some(cluster_id),
+                    epoch: 1,
+                    generation: 7,
+                    transaction_id: Some(uuid::Uuid::new_v4()),
+                };
+                let previous = implementation::PoolMetaCommittedCandidate {
+                    canonical: implementation::encode_pool_meta_v3_envelope(&meta, previous_revision, true, None)
+                        .expect("committed predecessor"),
+                    meta: meta.clone(),
+                    revision: previous_revision,
+                };
+                let mut desired = meta;
+                desired.pools[0].last_update += Duration::seconds(1);
+                let progress = desired.pools[0].decommission.as_mut().expect("active decommission");
+                progress.items_decommissioned += 1;
+                progress.bytes_done += 512;
+                progress.current_size += 512;
+                progress.object = "objects/008".to_owned();
+                let revision = implementation::PoolMetaRevision {
+                    generation: 8,
+                    transaction_id: Some(uuid::Uuid::new_v4()),
+                    ..previous_revision
+                };
+                let pending = implementation::encode_pool_meta_v3_envelope(&desired, revision, false, Some(&previous))
+                    .expect("pending candidate");
+                let durable =
+                    implementation::encode_pool_meta_v3_envelope(&desired, revision, true, None).expect("committed candidate");
+                let identity = implementation::initialized_pool_meta_identity_for_test(cluster_id, 1).expect("identity");
+                let trace = Arc::new(WriteTrace::default());
+                let pools = steps
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, steps)| {
+                        Arc::new(PhaseStorage {
+                            inner: PartialPoolMetaWriteStorage {
+                                stored: StdMutex::new(Some((previous.canonical.clone(), format!("initial-{index}")))),
+                                identity: StdMutex::new(Some((identity.clone(), "identity".to_owned()))),
+                                revision: AtomicUsize::new(index * 10),
+                                ..Default::default()
+                            },
+                            pool: index,
+                            steps,
+                            trace: trace.clone(),
+                        })
+                    })
+                    .collect();
+                Self {
+                    pools,
+                    trace,
+                    previous,
+                    desired,
+                    pending,
+                    durable,
+                    revision,
+                    cluster_id,
+                }
+            }
+
+            fn state(&self) -> implementation::PoolMetaWriteState {
+                implementation::PoolMetaWriteState::for_startup(self.cluster_id, false)
+            }
+
+            fn tokens(&self) -> Vec<PoolMetaCasToken> {
+                self.pools
+                    .iter()
+                    .map(|pool| {
+                        PoolMetaCasToken::Existing(
+                            pool.inner
+                                .stored
+                                .lock()
+                                .expect("fixture storage")
+                                .as_ref()
+                                .expect("existing replica")
+                                .1
+                                .clone(),
+                        )
+                    })
+                    .collect()
+            }
+        }
+
+        fn steps(count: usize) -> Vec<[WriteStep; 2]> {
+            (0..count).map(|_| [WriteStep::default(), WriteStep::default()]).collect()
+        }
+
+        fn signal() -> Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>> {
+            Some(Arc::default())
+        }
+
+        async fn prepare(
+            fixture: &Fixture,
+            fence: &PoolMetaPersistenceFence<'_>,
+            arm: &mut implementation::PoolMetaTransactionArm,
+        ) -> Vec<Result<crate::object_api::ObjectInfo, Error>> {
+            implementation::save_pool_meta_phase(
+                &fixture.pools,
+                &fixture.pending,
+                &fixture.tokens(),
+                fence,
+                "prepare_cas",
+                arm,
+                #[cfg(feature = "e2e-test-hooks")]
+                None,
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn pool_meta_v3_phase_concurrency_is_bounded() {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let mut config = steps(6);
+            for step in &mut config {
+                step[0].gate = Some(gate.clone());
+            }
+            let fixture = Fixture::new(config);
+            let state = fixture.state();
+            let mut arm = state.arm_transaction();
+            let fence = PoolMetaPersistenceFence::Distributed(signal());
+            let mut pending = Box::pin(prepare(&fixture, &fence, &mut arm));
+            tokio::select! { _ = fixture.trace.wait_for(4, 0) => {}, _ = &mut pending => panic!("blocked writes finished") }
+            assert_eq!(fixture.trace.calls.lock().expect("trace").len(), 4);
+            gate.add_permits(1);
+            tokio::select! { _ = fixture.trace.wait_for(5, 1) => {}, _ = &mut pending => panic!("unreleased writes finished") }
+            assert_eq!(fixture.trace.calls.lock().expect("trace").len(), 5);
+            gate.add_permits(5);
+            assert!(pending.await.into_iter().all(|result| result.is_ok()));
+            assert_eq!(fixture.trace.maximum.load(Ordering::SeqCst), 4);
+            assert_eq!(fixture.trace.active.load(Ordering::SeqCst), 0);
+            arm.disarm();
+        }
+
+        #[tokio::test]
+        async fn pool_meta_v3_commit_waits_for_all_prepare_etags() {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let mut config = steps(4);
+            config[3][0].gate = Some(gate.clone());
+            let fixture = Fixture::new(config);
+            let mut state = fixture.state();
+            let mut save = Box::pin(
+                fixture
+                    .desired
+                    .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0]),
+            );
+            tokio::select! { _ = fixture.trace.wait_for(4, 3) => {}, _ = &mut save => panic!("commit crossed the last prepare") }
+            assert_eq!(fixture.trace.commit_count(), 0);
+            gate.add_permits(1);
+            save.await.expect("all prepares and commits succeed").disarm();
+            let calls = fixture.trace.calls.lock().expect("trace");
+            for call in calls.iter().filter(|call| call.phase == 1) {
+                assert_eq!(call.if_match, Some(format!("pool-meta-test-{}", call.pool * 10 + 1)));
+            }
+            assert_eq!(calls.iter().filter(|call| call.phase == 1).count(), 4);
+        }
+
+        #[tokio::test]
+        async fn pool_meta_v3_empty_prepare_etag_never_starts_commit() {
+            let mut config = steps(4);
+            config[3][0].fault = WriteFault::EmptyEtag;
+            let fixture = Fixture::new(config);
+            let mut state = fixture.state();
+            let err = fixture
+                .desired
+                .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0])
+                .await
+                .expect_err("a missing conditional-write revision must fail");
+            assert!(err.to_string().contains("without a conditional-write revision"));
+            assert_eq!(fixture.trace.finished.load(Ordering::SeqCst), 4);
+            assert_eq!(fixture.trace.commit_count(), 0);
+            assert!(state.ensure_write_safe("empty etag wrote pending data").is_err());
+        }
+
+        #[tokio::test]
+        async fn pool_meta_v3_prepare_failure_drains_late_writes() {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let mut config = steps(4);
+            config[1][0].fault = WriteFault::Timeout;
+            config[3][0].gate = Some(gate.clone());
+            let fixture = Fixture::new(config);
+            let mut state = fixture.state();
+            let mut save = Box::pin(
+                fixture
+                    .desired
+                    .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0]),
+            );
+            tokio::select! { _ = fixture.trace.wait_for(4, 3) => {}, _ = &mut save => panic!("phase returned with a live replica") }
+            assert_eq!(fixture.trace.commit_count(), 0);
+            gate.add_permits(1);
+            assert!(save.await.is_err());
+            assert_eq!(fixture.trace.finished.load(Ordering::SeqCst), 4);
+            assert!(fixture.pools[3].inner.wrote.load(Ordering::SeqCst));
+            assert!(state.ensure_write_safe("ambiguous prepare").is_err());
+        }
+
+        #[tokio::test]
+        async fn pool_meta_v3_rejections_restore_only_an_unmutated_phase() {
+            for previous in [None, Some("identity_cas")] {
+                let mut config = steps(4);
+                for step in &mut config {
+                    step[0].fault = WriteFault::Reject;
+                }
+                let fixture = Fixture::new(config);
+                let state = fixture.state();
+                let mut arm = state.arm_transaction();
+                arm.phase = previous;
+                let results = prepare(&fixture, &PoolMetaPersistenceFence::Distributed(signal()), &mut arm).await;
+                assert!(
+                    results
+                        .into_iter()
+                        .all(|result| matches!(result, Err(Error::PreconditionFailed)))
+                );
+                assert_eq!(arm.phase, previous);
+                drop(arm);
+                assert_eq!(state.ensure_write_safe("all rejected").is_ok(), previous.is_none());
+            }
+            let mut config = steps(4);
+            for step in &mut config[1..] {
+                step[0].fault = WriteFault::Reject;
+            }
+            let fixture = Fixture::new(config);
+            let state = fixture.state();
+            let mut arm = state.arm_transaction();
+            let results = prepare(&fixture, &PoolMetaPersistenceFence::Distributed(signal()), &mut arm).await;
+            assert!(results[0].is_ok());
+            assert_eq!(arm.phase, Some("prepare_cas"));
+            drop(arm);
+            assert!(state.ensure_write_safe("one sibling wrote").is_err());
+        }
+
+        #[tokio::test]
+        async fn pool_meta_v3_parallel_errors_keep_original_source_pointers() {
+            let mut config = steps(4);
+            config[0][0].fault = WriteFault::Timeout;
+            config[1][0].fault = WriteFault::Timeout;
+            config[3][0].fault = WriteFault::Reject;
+            let fixture = Fixture::new(config);
+            let state = fixture.state();
+            let mut arm = state.arm_transaction();
+            let results = prepare(&fixture, &PoolMetaPersistenceFence::Distributed(signal()), &mut arm).await;
+            let err = results[0].as_ref().expect_err("first pool error stays first");
+            let source = err
+                .pool_metadata_failure()
+                .expect("typed error")
+                .source
+                .as_ref()
+                .expect("original source");
+            assert!(matches!(source.as_ref(), Error::Timeout));
+            assert!(Arc::ptr_eq(source, arm.source.as_ref().expect("arm source")));
+            drop(arm);
+            let blocked = state
+                .ensure_write_safe("after parallel errors")
+                .expect_err("recovery required");
+            assert!(Arc::ptr_eq(
+                source,
+                blocked
+                    .pool_metadata_failure()
+                    .expect("typed latch")
+                    .source
+                    .as_ref()
+                    .expect("latch source")
+            ));
+        }
+
+        #[tokio::test]
+        async fn pool_meta_v3_retry_rejections_keep_the_previous_io_source() {
+            let mut config = steps(4);
+            config[0][0].fault = WriteFault::Reject;
+            config[1][0].fault = WriteFault::Timeout;
+            let first = Fixture::new(config);
+            let state = first.state();
+            let mut arm = state.arm_transaction();
+            let fence = PoolMetaPersistenceFence::Distributed(signal());
+            let results = prepare(&first, &fence, &mut arm).await;
+            assert!(matches!(&results[0], Err(Error::PreconditionFailed)));
+            let original = arm.source.as_ref().expect("first attempt I/O source").clone();
+            assert!(matches!(original.as_ref(), Error::Timeout));
+            let mut config = steps(4);
+            for step in &mut config {
+                step[0].fault = WriteFault::Reject;
+            }
+            let retry = Fixture::new(config);
+            assert!(
+                prepare(&retry, &fence, &mut arm)
+                    .await
+                    .into_iter()
+                    .all(|result| matches!(result, Err(Error::PreconditionFailed)))
+            );
+            assert!(Arc::ptr_eq(&original, arm.source.as_ref().expect("source survives phase retry")));
+            implementation::save_pool_meta_object_cas(
+                retry.pools[0].clone(),
+                POOL_META_NAME,
+                retry.pending.clone(),
+                &retry.tokens()[0],
+                &fence,
+                "prepare_cas",
+                &mut arm,
+            )
+            .await
+            .expect_err("serial retry rejected");
+            assert!(Arc::ptr_eq(&original, arm.source.as_ref().expect("source survives serial retry")));
+            drop(arm);
+            let blocked = state
+                .ensure_write_safe("cancelled after retry rejection")
+                .expect_err("recovery required");
+            assert!(Arc::ptr_eq(
+                &original,
+                blocked
+                    .pool_metadata_failure()
+                    .expect("typed latch")
+                    .source
+                    .as_ref()
+                    .expect("source")
+            ));
+        }
+
+        #[tokio::test]
+        async fn pool_meta_v3_cancelled_drain_does_not_replace_io_error_with_cas_rejection() {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let mut config = steps(4);
+            config[0][0].gate = Some(gate.clone());
+            config[2][0].gate = Some(gate);
+            config[1][0].fault = WriteFault::Timeout;
+            config[3][0].fault = WriteFault::Reject;
+            let fixture = Fixture::new(config);
+            let state = fixture.state();
+            let mut arm = state.arm_transaction();
+            let fence = PoolMetaPersistenceFence::Distributed(signal());
+            let mut phase = Box::pin(prepare(&fixture, &fence, &mut arm));
+            tokio::select! { _ = fixture.trace.wait_for(4, 2) => {}, _ = &mut phase => panic!("blocked phase finished") }
+            assert!(futures::poll!(phase.as_mut()).is_pending(), "drain remains parked on the two slow pools");
+            drop(phase);
+            let source = arm.source.as_ref().expect("observed I/O source").clone();
+            assert!(matches!(source.as_ref(), Error::Timeout));
+            drop(arm);
+            let blocked = state
+                .ensure_write_safe("cancelled after mixed results")
+                .expect_err("recovery required");
+            assert!(Arc::ptr_eq(
+                &source,
+                blocked
+                    .pool_metadata_failure()
+                    .expect("typed latch")
+                    .source
+                    .as_ref()
+                    .expect("source")
+            ));
+            assert_eq!(state.active_transactions.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn pool_meta_v3_cancelled_prepare_commit_and_publication_keep_gate_blocked() {
+            for phase in [0, 1] {
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                let mut config = steps(4);
+                for step in &mut config {
+                    step[phase].gate = Some(gate.clone());
+                }
+                let fixture = Fixture::new(config);
+                let mut state = fixture.state();
+                let mut save = Box::pin(
+                    fixture
+                        .desired
+                        .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0]),
+                );
+                tokio::select! { _ = fixture.trace.wait_for(4 * (phase + 1), 4 * phase) => {}, _ = &mut save => panic!("blocked phase finished") }
+                drop(save);
+                assert!(state.ensure_write_safe("cancelled phase").is_err());
+                assert_eq!(state.active_transactions.load(Ordering::SeqCst), 0);
+                assert_eq!(fixture.trace.active.load(Ordering::SeqCst), 0);
+            }
+            let fixture = Fixture::new(steps(4));
+            let mut state = fixture.state();
+            let outcome = fixture
+                .desired
+                .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0])
+                .await
+                .expect("durable save before publication");
+            drop(outcome);
+            assert!(state.ensure_write_safe("publication was cancelled").is_err());
+            assert_eq!(state.active_transactions.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn pool_meta_v3_fence_loss_blocks_queued_dispatch_and_marks_late_writes() {
+            let lock = NamespaceLock::with_clients_and_quorum(
+                "parallel-fence".to_owned(),
+                vec![Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new())))],
+                1,
+            );
+            let request = LockRequest::new(
+                ObjectKey::new(super::super::RUSTFS_META_BUCKET, POOL_META_NAME),
+                LockType::Exclusive,
+                "phase-test",
+            )
+            .with_acquire_timeout(StdDuration::from_secs(1))
+            .with_ttl(StdDuration::from_secs(1))
+            .with_refresh_interval(StdDuration::from_secs(1));
+            let guard = lock
+                .acquire_guard(&request)
+                .await
+                .expect("lease request")
+                .expect("lease acquired");
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let mut config = steps(6);
+            for step in &mut config {
+                step[0].gate = Some(gate.clone());
+            }
+            let fixture = Fixture::new(config);
+            let state = fixture.state();
+            let mut arm = state.arm_transaction();
+            let fence = PoolMetaPersistenceFence::Distributed(guard.lock_lost_signal());
+            let mut pending = Box::pin(prepare(&fixture, &fence, &mut arm));
+            tokio::select! { _ = fixture.trace.wait_for(4, 0) => {}, _ = &mut pending => panic!("gate ignored") }
+            tokio::time::timeout(StdDuration::from_secs(3), guard.lock_lost_notified())
+                .await
+                .expect("lease expires");
+            gate.add_permits(6);
+            assert!(pending.await.into_iter().all(|result| result.is_err()));
+            assert_eq!(fixture.trace.calls.lock().expect("trace").len(), 4, "queued pools must not reach storage");
+            assert!(fixture.pools[..4].iter().all(|pool| pool.inner.wrote.load(Ordering::SeqCst)));
+            assert_eq!(arm.phase, Some("prepare_cas"));
+            drop(arm);
+            assert!(state.ensure_write_safe("writes landed after lease loss").is_err());
+        }
+
+        #[tokio::test]
+        async fn pool_meta_v3_all_commit_errors_still_require_canonical_reread() {
+            for fault in [WriteFault::TimeoutAfterWrite, WriteFault::OmitWrite] {
+                let mut config = steps(4);
+                for step in &mut config {
+                    step[1].fault = fault;
+                }
+                let fixture = Fixture::new(config);
+                let mut state = fixture.state();
+                let result = fixture
+                    .desired
+                    .save_no_lock_armed(fixture.pools.clone(), &mut state, signal(), &[0])
+                    .await;
+                assert_eq!(fixture.trace.commit_count(), 4);
+                if matches!(fault, WriteFault::TimeoutAfterWrite) {
+                    let outcome = result.expect("reread proves commits whose replies timed out");
+                    assert_eq!(outcome.committed.pools[0].last_update, fixture.desired.pools[0].last_update);
+                    outcome.disarm();
+                    state
+                        .ensure_write_safe("confirmed ambiguous commits")
+                        .expect("confirmed transaction is safe");
+                } else {
+                    assert!(result.is_err(), "successful replies cannot replace canonical proof");
+                    assert!(state.ensure_write_safe("no committed canonical generation").is_err());
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn pool_meta_v3_none_and_legacy_paths_remain_serial() {
+            for (legacy, needs_repair) in [(false, false), (true, false), (false, true)] {
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                let mut config = steps(4);
+                for step in &mut config {
+                    step[0].gate = Some(gate.clone());
+                    step[1].gate = Some(gate.clone());
+                }
+                let mut fixture = Fixture::new(config);
+                if legacy {
+                    let mut meta = fixture.previous.meta.clone();
+                    meta.version = POOL_META_VERSION;
+                    let data = meta.encode_config_data_for_v2_gate(true).expect("legacy metadata");
+                    for pool in &fixture.pools {
+                        pool.inner.stored.lock().expect("fixture").as_mut().expect("replica").0 = data.clone();
+                    }
+                    fixture.desired.version = POOL_META_VERSION;
+                }
+                if needs_repair {
+                    fixture.pools[3]
+                        .inner
+                        .stored
+                        .lock()
+                        .expect("fixture")
+                        .as_mut()
+                        .expect("replica")
+                        .0 = fixture.pending.clone();
+                }
+                let mut state = fixture.state();
+                let mut save = Box::pin(fixture.desired.save_no_lock_armed(
+                    fixture.pools.clone(),
+                    &mut state,
+                    if legacy || needs_repair { signal() } else { None },
+                    &[0],
+                ));
+                tokio::select! { _ = fixture.trace.wait_for(1, 0) => {}, _ = &mut save => panic!("serial write gate ignored") }
+                assert!(futures::poll!(save.as_mut()).is_pending());
+                assert_eq!(fixture.trace.calls.lock().expect("trace").len(), 1);
+                gate.add_permits(16);
+                save.await.expect("serial save").disarm();
+                assert_eq!(fixture.trace.maximum.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        fn persisted_pools(meta: &PoolMeta) -> serde_json::Value {
+            serde_json::to_value(
+                meta.pools
+                    .iter()
+                    .map(implementation::PersistedPoolStatus::from)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("persisted pool state")
+        }
+
+        #[tokio::test]
+        async fn pool_meta_v3_all_prepare_subsets_preserve_previous_snapshot() {
+            for previous_version in [POOL_META_VERSION, POOL_META_GENERATION_VERSION] {
+                for mask in 0usize..16 {
+                    let mut fixture = Fixture::new(steps(4));
+                    if previous_version != POOL_META_GENERATION_VERSION {
+                        fixture.previous.meta.version = previous_version;
+                        fixture.previous.revision = implementation::PoolMetaRevision::legacy(previous_version);
+                        fixture.revision.generation = 1;
+                        fixture.previous.canonical = fixture
+                            .previous
+                            .meta
+                            .encode_config_data_for_v2_gate(true)
+                            .expect("legacy predecessor");
+                        fixture.pending = implementation::encode_pool_meta_v3_envelope(
+                            &fixture.desired,
+                            fixture.revision,
+                            false,
+                            Some(&fixture.previous),
+                        )
+                        .expect("legacy pending envelope");
+                    }
+                    let payloads = (0..4)
+                        .map(|pool| {
+                            if mask & (1 << pool) != 0 {
+                                fixture.pending.clone()
+                            } else {
+                                fixture.previous.canonical.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let selected = implementation::select_pool_meta_replica(
+                        payloads
+                            .iter()
+                            .cloned()
+                            .map(implementation::decode_pool_meta_replica)
+                            .collect(),
+                    )
+                    .expect("every pending subset selects its predecessor");
+                    assert_eq!(
+                        persisted_pools(&selected.meta),
+                        persisted_pools(&fixture.previous.meta),
+                        "mask={mask:04b}"
+                    );
+                    assert_eq!(selected.revision, fixture.previous.revision);
+                    if previous_version == POOL_META_GENERATION_VERSION {
+                        for (pool, data) in fixture.pools.iter().zip(payloads) {
+                            pool.inner.stored.lock().expect("fixture").as_mut().expect("replica").0 = data;
+                        }
+                        let mut state = fixture.state();
+                        let selected = implementation::load_pool_meta_for_transaction_recovery(fixture.pools.clone(), &mut state)
+                            .await
+                            .expect("production recovery selection");
+                        let outcome = implementation::repair_pool_meta_transaction(
+                            fixture.pools.clone(),
+                            &mut state,
+                            selected,
+                            &PoolMetaPersistenceFence::Distributed(None),
+                        )
+                        .await
+                        .expect("production recovery repair");
+                        assert_eq!(persisted_pools(&outcome.committed), persisted_pools(&fixture.previous.meta));
+                        outcome.disarm();
+                        let confirmed =
+                            implementation::load_pool_meta_for_transaction_recovery(fixture.pools.clone(), &mut state)
+                                .await
+                                .expect("repaired reread");
+                        assert_eq!(persisted_pools(&confirmed.meta), persisted_pools(&fixture.previous.meta));
+                        assert!(!confirmed.replica_state.needs_repair);
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn pool_meta_v3_every_sole_commit_position_recovers_new_snapshot() {
+            for committed_pool in 0..4 {
+                let fixture = Fixture::new(steps(4));
+                for (index, pool) in fixture.pools.iter().enumerate() {
+                    pool.inner.stored.lock().expect("fixture").as_mut().expect("replica").0 = if index == committed_pool {
+                        fixture.durable.clone()
+                    } else {
+                        fixture.pending.clone()
+                    };
+                }
+                let mut state = fixture.state();
+                let selected = implementation::load_pool_meta_for_transaction_recovery(fixture.pools.clone(), &mut state)
+                    .await
+                    .expect("sole commit must select new generation");
+                assert_eq!(selected.revision, fixture.revision);
+                assert_eq!(persisted_pools(&selected.meta), persisted_pools(&fixture.desired));
+                let outcome = implementation::repair_pool_meta_transaction(
+                    fixture.pools.clone(),
+                    &mut state,
+                    selected,
+                    &PoolMetaPersistenceFence::Distributed(None),
+                )
+                .await
+                .expect("repair partial commit");
+                assert_eq!(persisted_pools(&outcome.committed), persisted_pools(&fixture.desired));
+                outcome.disarm();
+                let confirmed = implementation::load_pool_meta_for_transaction_recovery(fixture.pools.clone(), &mut state)
+                    .await
+                    .expect("repaired sole commit reread");
+                assert_eq!(persisted_pools(&confirmed.meta), persisted_pools(&fixture.desired));
+                assert!(!confirmed.replica_state.needs_repair);
+                let fork = implementation::encode_pool_meta_v3_envelope(
+                    &fixture.desired,
+                    implementation::PoolMetaRevision {
+                        transaction_id: Some(uuid::Uuid::new_v4()),
+                        ..fixture.revision
+                    },
+                    true,
+                    None,
+                )
+                .expect("same generation fork");
+                assert!(
+                    implementation::select_pool_meta_replica(vec![
+                        implementation::decode_pool_meta_replica(fixture.durable.clone()),
+                        implementation::decode_pool_meta_replica(fork)
+                    ])
+                    .is_err()
+                );
+            }
         }
     }
 
