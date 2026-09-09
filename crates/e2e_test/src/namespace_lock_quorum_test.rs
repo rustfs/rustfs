@@ -26,6 +26,123 @@ const KEY: &str = "thumb/79/concurrent-overwrite.jpg";
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+async fn assert_degraded_cluster_publication_guard_errors_are_retryable() -> TestResult {
+    let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+    cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", "EC:2");
+    cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
+    cluster.set_env("RUSTFS_OBS_METRICS_EXPORT_ENABLED", "false");
+    cluster.set_env("RUST_LOG", "warn");
+    cluster.start().await?;
+    cluster.create_test_bucket(BUCKET).await?;
+    let clients: Vec<_> = cluster
+        .create_all_clients()?
+        .into_iter()
+        .map(|client| {
+            Client::from_conf(
+                client
+                    .config()
+                    .to_builder()
+                    .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+                    .build(),
+            )
+        })
+        .collect();
+
+    for alive in (1..=4).rev() {
+        if alive < 4 {
+            cluster.stop_node(alive)?;
+        }
+        for (node, client) in clients.iter().take(alive).enumerate() {
+            let key = format!("publication-put-{alive}-{node}");
+            let put = client
+                .put_object()
+                .bucket(BUCKET)
+                .key(&key)
+                .body(Bytes::from_static(b"publication guard regression").into())
+                .send()
+                .await;
+            if alive >= 3 {
+                put?;
+            } else {
+                let err = put.expect_err("PUT must reject writes without a write quorum");
+                assert_eq!(
+                    err.raw_response().map(|response| response.status().as_u16()),
+                    Some(503),
+                    "PUT with {alive} nodes alive, requested through node {node}: {err:?}"
+                );
+                assert_eq!(
+                    err.as_service_error().and_then(|error| error.meta().code()),
+                    Some("ServiceUnavailable"),
+                    "PUT with {alive} nodes alive, requested through node {node}: {err:?}"
+                );
+            }
+
+            let multipart_key = format!("publication-multipart-{alive}-{node}");
+            let multipart = client
+                .create_multipart_upload()
+                .bucket(BUCKET)
+                .key(&multipart_key)
+                .send()
+                .await;
+            if alive >= 3 {
+                let upload = multipart?;
+                let upload_id = upload
+                    .upload_id()
+                    .expect("successful multipart initialization must return an upload ID");
+                client
+                    .abort_multipart_upload()
+                    .bucket(BUCKET)
+                    .key(&multipart_key)
+                    .upload_id(upload_id)
+                    .send()
+                    .await?;
+            } else {
+                let err = multipart.expect_err("multipart initialization must reject writes without a write quorum");
+                assert_eq!(
+                    err.raw_response().map(|response| response.status().as_u16()),
+                    Some(503),
+                    "CreateMultipartUpload with {alive} nodes alive, requested through node {node}: {err:?}"
+                );
+                assert_eq!(
+                    err.as_service_error().and_then(|error| error.meta().code()),
+                    Some("ServiceUnavailable"),
+                    "CreateMultipartUpload with {alive} nodes alive, requested through node {node}: {err:?}"
+                );
+            }
+        }
+    }
+
+    cluster.stop();
+    cluster.start().await?;
+    for client in &clients {
+        for alive in [1, 3, 4] {
+            for node in 0..alive {
+                let key = format!("publication-put-{alive}-{node}");
+                let get = client.get_object().bucket(BUCKET).key(key).send().await;
+                if alive >= 3 {
+                    assert_eq!(
+                        get?.body.collect().await?.into_bytes().as_ref(),
+                        b"publication guard regression",
+                        "acknowledged writes must survive restart"
+                    );
+                } else {
+                    let err = get.expect_err("a rejected publication guard must not publish an object");
+                    assert_eq!(err.as_service_error().and_then(|error| error.meta().code()), Some("NoSuchKey"));
+                }
+            }
+        }
+        let uploads = client.list_multipart_uploads().bucket(BUCKET).send().await?;
+        assert!(
+            uploads
+                .uploads()
+                .iter()
+                .all(|upload| upload.key() != Some("publication-multipart-1-0")),
+            "a rejected publication guard must not publish a multipart upload"
+        );
+    }
+    Ok(())
+}
+
 async fn put_object(client: Client, payload: Vec<u8>, writer_id: usize) -> Result<(), String> {
     client
         .put_object()
@@ -304,6 +421,8 @@ async fn assert_node_readiness_tracks_quorum(cluster: &mut RustFSTestClusterEnvi
 /// Before the fix, `map_namespace_lock_error` wrapped lock timeout/conflict errors as
 /// `StorageError::other(...)` → `StorageError::Io(...)`, which fell through to
 /// `S3ErrorCode::InternalError` (500) in the error mapping.
+/// Also checks PUT and multipart initialization when node failures prevent
+/// acquiring a table publication guard.
 #[tokio::test]
 async fn test_concurrent_put_same_key_never_returns_500() -> TestResult {
     crate::common::init_logging();
@@ -406,5 +525,6 @@ async fn test_concurrent_put_same_key_never_returns_500() -> TestResult {
     );
 
     clients[0].delete_object().bucket(BUCKET).key(KEY).send().await?;
-    Ok(())
+    cluster.stop();
+    assert_degraded_cluster_publication_guard_errors_are_retryable().await
 }
