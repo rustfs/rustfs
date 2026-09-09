@@ -251,7 +251,7 @@ fn scanner_durable_segment_invalidation_evidence_requires_matching_complete_set_
     let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0), DataUsageCacheSource::new(0, 1)]);
     let results = vec![
         complete_set_cache_with_segment_proof(DataUsageCacheSource::new(0, 0), process_proof.clone()),
-        complete_set_cache_with_segment_proof(DataUsageCacheSource::new(0, 1), process_proof.clone()),
+        complete_set_cache_with_segment_proof(DataUsageCacheSource::new(0, 1), process_proof),
     ];
 
     let durable_evidence = scanner_durable_segment_invalidation_evidence(&dirty_usage_snapshot, &results, &expected_sources);
