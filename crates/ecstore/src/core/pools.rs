@@ -6121,6 +6121,16 @@ impl PoolMetaPhaseBarrier {
         let Some(directory) = std::env::var_os("RUSTFS_E2E_POOL_META_BARRIER_DIR").map(std::path::PathBuf::from) else {
             return Ok(None);
         };
+        Self::bind_in_directory(directory, previous, candidate, revision, durable).await
+    }
+
+    async fn bind_in_directory(
+        directory: std::path::PathBuf,
+        previous: &PoolMetaCommittedCandidate,
+        candidate: &PoolMeta,
+        revision: PoolMetaRevision,
+        durable: &[u8],
+    ) -> Result<Option<Self>> {
         let data = match tokio::fs::read(directory.join("arm.json")).await {
             Ok(data) => data,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -6135,6 +6145,11 @@ impl PoolMetaPhaseBarrier {
         let transaction_id = revision
             .transaction_id
             .ok_or_else(|| Error::other("pool metadata test barrier requires a V3 transaction"))?;
+        // A new revision can still carry the same persisted pool state. Leave
+        // the external arm available until recovery can distinguish P from G.
+        if pool_meta_test_pools_sha256(&previous.meta)? == pool_meta_test_pools_sha256(candidate)? {
+            return Ok(None);
+        }
         // One external arm binds one attempt, including if its CAS subsequently retries.
         let claim = tokio::fs::OpenOptions::new()
             .write(true)
@@ -23351,6 +23366,130 @@ mod pools_tests {
                 gate.add_permits(16);
                 save.await.expect("serial save").disarm();
                 assert_eq!(fixture.trace.maximum.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[cfg(feature = "e2e-test-hooks")]
+        #[tokio::test]
+        async fn pool_meta_phase_barrier_leaves_noop_arm_for_the_next_changed_transaction() {
+            for case in [
+                implementation::PoolMetaPhaseBarrierCase::PrepareSubset,
+                implementation::PoolMetaPhaseBarrierCase::PreparedAll,
+                implementation::PoolMetaPhaseBarrierCase::CommitOne,
+                implementation::PoolMetaPhaseBarrierCase::BeforePublish,
+            ] {
+                let fixture = Fixture::new(steps(4));
+                let directory = tempfile::TempDir::new().expect("barrier directory");
+                tokio::fs::write(
+                    directory.path().join("arm.json"),
+                    serde_json::to_vec(&serde_json::json!({"nonce": uuid::Uuid::new_v4(), "case": case})).expect("arm"),
+                )
+                .await
+                .expect("write arm");
+                let noop = implementation::encode_pool_meta_v3_envelope(&fixture.previous.meta, fixture.revision, true, None)
+                    .expect("new revision with unchanged pools");
+                assert_ne!(noop, fixture.previous.canonical);
+                let barrier = implementation::PoolMetaPhaseBarrier::bind_in_directory(
+                    directory.path().to_path_buf(),
+                    &fixture.previous,
+                    &fixture.previous.meta,
+                    fixture.revision,
+                    &noop,
+                )
+                .await
+                .expect("unchanged pools must not consume the arm");
+                assert!(barrier.is_none());
+                assert!(!directory.path().join("claimed").exists());
+                assert!(!directory.path().join("events.jsonl").exists());
+
+                let previous = implementation::PoolMetaCommittedCandidate {
+                    meta: fixture.previous.meta.clone(),
+                    revision: fixture.revision,
+                    canonical: noop,
+                };
+                let mut candidate = previous.meta.clone();
+                let progress = candidate.pools[0].decommission.as_mut().expect("progress");
+                progress.items_decommissioned += 1;
+                progress.bytes_done += 512;
+                let revision = implementation::PoolMetaRevision {
+                    generation: previous.revision.generation + 1,
+                    transaction_id: Some(uuid::Uuid::new_v4()),
+                    ..previous.revision
+                };
+                let durable = implementation::encode_pool_meta_v3_envelope(&candidate, revision, true, None)
+                    .expect("changed progress without a timestamp change");
+                let barrier = implementation::PoolMetaPhaseBarrier::bind_in_directory(
+                    directory.path().to_path_buf(),
+                    &previous,
+                    &candidate,
+                    revision,
+                    &durable,
+                )
+                .await
+                .expect("next changed transaction must bind")
+                .expect("bound barrier");
+                assert_eq!(barrier.transaction_id, revision.transaction_id.expect("transaction"));
+                assert!(directory.path().join("claimed").is_file());
+                let events = tokio::fs::read_to_string(directory.path().join("events.jsonl"))
+                    .await
+                    .expect("armed event");
+                assert_eq!(events.lines().count(), 1);
+                let event: serde_json::Value = serde_json::from_str(events.trim()).expect("armed event JSON");
+                assert_eq!(event["kind"], "armed");
+                assert_eq!(event["previous"]["generation"], previous.revision.generation);
+                assert_eq!(event["candidate"]["generation"], revision.generation);
+                assert_ne!(event["previous"]["persisted_pools_sha256"], event["candidate"]["persisted_pools_sha256"]);
+                assert!(
+                    implementation::PoolMetaPhaseBarrier::bind_in_directory(
+                        directory.path().to_path_buf(),
+                        &previous,
+                        &candidate,
+                        revision,
+                        &durable,
+                    )
+                    .await
+                    .expect("already claimed arm")
+                    .is_none()
+                );
+            }
+        }
+
+        #[cfg(feature = "e2e-test-hooks")]
+        #[tokio::test]
+        async fn pool_meta_phase_barrier_uses_persisted_responsibility_not_runtime_progress() {
+            let fixture = Fixture::new(steps(4));
+            let directory = tempfile::TempDir::new().expect("barrier directory");
+            tokio::fs::write(
+                directory.path().join("arm.json"),
+                serde_json::to_vec(&serde_json::json!({"nonce": uuid::Uuid::new_v4(), "case": "prepare_subset"})).expect("arm"),
+            )
+            .await
+            .expect("write arm");
+            let mut candidate = fixture.previous.meta.clone();
+            candidate.pools[0].decommission.as_mut().expect("progress").stage = "entry_started".to_owned();
+            for changed in [false, true] {
+                if changed {
+                    candidate.pools[0]
+                        .decommission
+                        .as_mut()
+                        .expect("progress")
+                        .queued_buckets
+                        .push("new-responsibility".to_owned());
+                }
+                let durable =
+                    implementation::encode_pool_meta_v3_envelope(&candidate, fixture.revision, true, None).expect("candidate");
+                let barrier = implementation::PoolMetaPhaseBarrier::bind_in_directory(
+                    directory.path().to_path_buf(),
+                    &fixture.previous,
+                    &candidate,
+                    fixture.revision,
+                    &durable,
+                )
+                .await
+                .expect("binding by persisted state");
+                assert_eq!(barrier.is_some(), changed);
+                assert_eq!(directory.path().join("claimed").exists(), changed);
+                assert_eq!(directory.path().join("events.jsonl").exists(), changed);
             }
         }
 
