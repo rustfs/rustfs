@@ -227,6 +227,78 @@ mod tests {
     }
 
     #[test]
+    fn test_write_quorum_reduction_preserves_internode_http_identity() {
+        use http::StatusCode;
+        use rustfs_rio::InternodeHttpErrorKind::{ConnectionRefused, HttpStatus, Unknown};
+
+        for (kind, retryable) in [
+            (ConnectionRefused, true),
+            (HttpStatus(StatusCode::SERVICE_UNAVAILABLE), true),
+            (HttpStatus(StatusCode::CONFLICT), true),
+            (Unknown, false),
+            (HttpStatus(StatusCode::BAD_REQUEST), false),
+        ] {
+            // Construct both producer errors independently: the reducer owns the first clone.
+            let first = Error::from(rustfs_rio::new_test_internode_http_io_error(kind));
+            let second = Error::from(rustfs_rio::new_test_internode_http_io_error(kind));
+            assert_eq!(first.internode_http_error_kind(), Some(kind));
+            assert_eq!(second.internode_http_error_kind(), Some(kind));
+            assert_eq!(first.is_retryable_internode_write_failure(), retryable);
+            let errors = [Some(first), Some(second), None];
+            let reduced = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 2)
+                .expect("two equal producer errors must dominate one successful write");
+
+            assert_eq!(Some(&reduced), errors[0].as_ref());
+            assert_eq!(
+                reduced.is_retryable_internode_write_failure(),
+                retryable,
+                "quorum reduction changed retryability for {kind:?}"
+            );
+            assert_eq!(reduced.internode_http_error_kind(), Some(kind));
+            if let HttpStatus(status) = kind {
+                assert!(reduced.is_internode_http_status(status.as_u16()));
+            }
+            let Error::Io(io_error) = &reduced else {
+                panic!("the dominant error must remain Io: {reduced:?}");
+            };
+            let source = io_error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<rustfs_rio::InternodeHttpError>())
+                .expect("quorum reduction must retain the structured internode error");
+            assert_eq!(source.context().method(), "PUT");
+            assert_eq!(source.context().target(), "/rustfs/rpc/put_file_stream");
+            assert_eq!(
+                source.context().operation(),
+                Some(rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_PUT_FILE_STREAM)
+            );
+        }
+    }
+
+    #[test]
+    fn test_clone_and_write_quorum_do_not_promote_non_retryable_errors() {
+        use http::StatusCode;
+        use rustfs_rio::InternodeHttpErrorKind::{HttpStatus, Unknown};
+
+        for original in [
+            Error::from(rustfs_rio::new_test_internode_http_io_error(Unknown)),
+            Error::from(rustfs_rio::new_test_internode_http_io_error(HttpStatus(StatusCode::BAD_REQUEST))),
+            Error::from(rustfs_rio::new_test_internode_http_io_error(HttpStatus(StatusCode::FORBIDDEN))),
+            Error::from(rustfs_rio::new_test_internode_http_io_error(HttpStatus(StatusCode::NOT_FOUND))),
+            Error::from(rustfs_rio::new_test_internode_http_io_error(HttpStatus(
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ))),
+            err_io("internode connection reset: PUT /rustfs/rpc/put_file_stream"),
+        ] {
+            assert!(!original.is_retryable_internode_write_failure());
+            let cloned = original.clone();
+            let reduced =
+                reduce_write_quorum_errs(&[Some(original)], &[], 1).expect("a non-retryable error must remain an error");
+            assert!(!cloned.is_retryable_internode_write_failure());
+            assert!(!reduced.is_retryable_internode_write_failure());
+        }
+    }
+
+    #[test]
     fn test_count_errs() {
         let e1 = err_io("a");
         let e2 = err_io("b");
