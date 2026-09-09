@@ -1681,9 +1681,13 @@ impl BucketMetadataSys {
         expected: Option<&Arc<BucketMetadata>>,
         namespace_guard: &rustfs_lock::NamespaceLockGuard,
     ) -> Result<()> {
-        if !self
-            .bucket_exists(bucket, namespace_guard, "bucket metadata existence check")
-            .await?
+        if !await_bucket_namespace_operation(
+            Some(namespace_guard),
+            bucket,
+            "bucket metadata heal existence check",
+            self.api.bucket_exists_for_heal(bucket),
+        )
+        .await?
         {
             if matches!(mode, MetadataLoadMode::Refresh) {
                 let _publish_guard = self
