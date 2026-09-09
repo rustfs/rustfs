@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, TransitionState};
 use crate::runtime::sources;
+pub(crate) use crate::runtime::sources::ScannerDirtyUsageMutationSource;
 use crate::services::tier::tier::TierConfigMgr;
 use crate::store::ECStore;
 
@@ -53,4 +54,8 @@ pub(crate) fn deployment_id() -> Option<String> {
 
 pub(crate) async fn bucket_lifecycle_config(bucket: &str) -> Option<BucketLifecycleConfiguration> {
     sources::bucket_lifecycle_config(bucket).await
+}
+
+pub(crate) fn notify_scanner_dirty_usage_mutation(bucket: &str, object: &str, source: ScannerDirtyUsageMutationSource) {
+    sources::notify_scanner_dirty_usage_mutation(bucket, object, source);
 }

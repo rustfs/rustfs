@@ -302,38 +302,6 @@ impl HealManager {
                     tests::pause_completed_retention_before_publish(&task_id, &completed_status).await;
                     let mut active_heals_guard = active_heals_clone.lock().await;
                     let owns_completion = active_heals_guard.contains_key(&task_id);
-                    if owns_completion
-                        && result.is_ok()
-                        && let Err(error) = root_recovery_clone.remove(&task_id, &task.heal_type, task.source).await
-                    {
-                        // Keep the durable responsibility if retirement fails.
-                        // Replaying a completed traversal is idempotent.
-                        warn!(
-                            target: "rustfs::heal::manager",
-                            event = EVENT_HEAL_SCHEDULER_STATE,
-                            component = LOG_COMPONENT_HEAL,
-                            subsystem = LOG_SUBSYSTEM_MANAGER,
-                            task_id,
-                            state = "root_recovery_retirement_failed",
-                            error = %error,
-                            "Failed to retire root heal recovery record"
-                        );
-                    }
-                    if owns_completion
-                        && result.is_err()
-                        && let Err(error) = root_recovery_clone.checkpoint_failed_execution(&task).await
-                    {
-                        warn!(
-                            target: "rustfs::heal::manager",
-                            event = EVENT_HEAL_SCHEDULER_STATE,
-                            component = LOG_COMPONENT_HEAL,
-                            subsystem = LOG_SUBSYSTEM_MANAGER,
-                            task_id,
-                            state = "root_recovery_checkpoint_failed",
-                            error = %error,
-                            "Failed to checkpoint root heal recovery execution budget"
-                        );
-                    }
                     let cancelled_completion = if owns_completion {
                         false
                     } else {
@@ -352,7 +320,47 @@ impl HealManager {
                         completed_status_entry.status = HealTaskStatus::Cancelled;
                         completed_status_entry.outcome = Some(Arc::new(task.get_outcome().await));
                     }
-                    let terminal_completion = !matches!(completed_status, HealTaskStatus::Retrying { .. });
+                    let terminal_completion = matches!(
+                        completed_status,
+                        HealTaskStatus::Completed | HealTaskStatus::Cancelled | HealTaskStatus::Failed { .. }
+                    );
+                    if owns_completion
+                        && terminal_completion
+                        && root_recovery::is_admin_heal_recovery(&task.heal_type, task.source)
+                        && let Err(error) = root_recovery_clone
+                            .persist_terminal(&task_id, &task.heal_type, task.source, &completed_status_entry)
+                            .await
+                    {
+                        // Keep the durable responsibility if terminal
+                        // publication fails. Replaying the task is preferable
+                        // to losing the final receipt across restart.
+                        warn!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_SCHEDULER_STATE,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                            task_id,
+                            state = "root_recovery_terminal_publish_failed",
+                            error = %error,
+                            "Failed to publish heal terminal receipt"
+                        );
+                    }
+                    if owns_completion
+                        && !terminal_completion
+                        && result.is_err()
+                        && let Err(error) = root_recovery_clone.checkpoint_failed_execution(&task).await
+                    {
+                        warn!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_SCHEDULER_STATE,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                            task_id,
+                            state = "root_recovery_checkpoint_failed",
+                            error = %error,
+                            "Failed to checkpoint root heal recovery execution budget"
+                        );
+                    }
                     let completed_status_for_verified_events = completed_status_entry.clone();
                     // Keep retry ownership continuous: status snapshots acquire
                     // these locks in the same active -> retrying order.
