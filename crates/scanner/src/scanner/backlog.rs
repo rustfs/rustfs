@@ -1100,7 +1100,23 @@ fn select_scanner_pause_backlog_replicas(replicas: Vec<ScannerPauseBacklogReplic
         });
     };
 
-    let stable_matches_ledger = matches!(&stable_consensus, Ok(Some(stable)) if stable == &selected);
+    let stable_matches_ledger = match &authoritative_commit {
+        Some(committed) => {
+            committed.ledger == selected
+                && committed.replicas.iter().all(|id| {
+                    replicas.iter().any(|replica| {
+                        replica.id == *id
+                            && matches!(
+                                &replica.state,
+                                ScannerPauseBacklogReplicaState::Valid(record)
+                                    if record.stable.as_ref() == Some(&selected)
+                                        && record.committed.as_ref() == Some(committed)
+                            )
+                    })
+                })
+        }
+        None => matches!(&stable_consensus, Ok(Some(stable)) if stable == &selected),
+    };
     let healthy_replicas = replicas
         .iter()
         .filter(|replica| {
@@ -1901,12 +1917,35 @@ mod tests {
             .await
             .expect("fresh native disk selection");
         assert_eq!(&loaded.ledger, expected, "membership repair preserves every ledger field");
-        assert!(loaded.durable && loaded.stable_matches_ledger);
+        assert!(
+            loaded.durable && loaded.stable_matches_ledger,
+            "unexpected loaded state: persistence_state={}, durable={}, stable_matches_ledger={}, healthy_replicas={}, stale_or_unavailable_replicas={}",
+            loaded.persistence_state,
+            loaded.durable,
+            loaded.stable_matches_ledger,
+            loaded.healthy_replicas,
+            loaded.stale_or_unavailable_replicas
+        );
         assert_eq!(loaded.healthy_replicas, 4);
         let committed = loaded.authoritative_commit.expect("complete current cohort proof");
-        assert_eq!(committed.replicas, scanner_pause_backlog_replica_ids(&loaded.replicas));
-        for set in store.scanner_pause_backlog_writable_set_disks().await {
-            let (bytes, _) = native_replica_bytes(&set).await;
+        let mut healthy_ids = loaded
+            .replicas
+            .iter()
+            .filter_map(|replica| {
+                matches!(
+                    &replica.state,
+                    ScannerPauseBacklogReplicaState::Valid(record)
+                        if record.stable.as_ref() == Some(expected)
+                            && record.committed.as_ref() == Some(&committed)
+                )
+                .then_some(replica.id)
+            })
+            .collect::<Vec<_>>();
+        healthy_ids.sort_unstable();
+        assert_eq!(committed.replicas, healthy_ids);
+        for id in &committed.replicas {
+            let set = &store.pools[id.pool_index].disk_set[id.set_index];
+            let (bytes, _) = native_replica_bytes(set).await;
             let ScannerPauseBacklogReplicaState::Valid(record) = decode_scanner_pause_backlog_ledger(&bytes) else {
                 panic!("native survivor record");
             };

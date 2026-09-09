@@ -1184,13 +1184,23 @@ def scanner_heal_oracle_names(root: Path) -> tuple[str, ...]:
             data_blocks = evidence_integer(erasure.get("data_blocks"), f"{case_id} data_blocks", 1, 16)
             parity_blocks = evidence_integer(erasure.get("parity_blocks"), f"{case_id} parity_blocks", 1, 16)
             require(data_blocks >= parity_blocks, f"invalid erasure geometry for {case_id}")
-            require(data_blocks + parity_blocks == requirement["topology"]["nodes"] * requirement["topology"]["drives_per_node"],
+            expected_set_drives = requirement.get(
+                "erasure_set_drive_count",
+                requirement["topology"]["nodes"] * requirement["topology"]["drives_per_node"],
+            )
+            require(data_blocks + parity_blocks == expected_set_drives,
                     f"erasure geometry differs from topology for {case_id}")
         if "erasure_set_drive_count" in requirement:
             erasure_set_drive_count = evidence_integer(requirement.get("erasure_set_drive_count"),
                                                        f"{case_id} erasure_set_drive_count", 1, 64)
-            require(erasure_set_drive_count == requirement["topology"]["nodes"] * requirement["topology"]["drives_per_node"],
-                    f"erasure set drive count differs from topology for {case_id}")
+            total_drives = requirement["topology"]["nodes"] * requirement["topology"]["drives_per_node"]
+            require(total_drives % erasure_set_drive_count == 0,
+                    f"erasure set drive count does not divide topology for {case_id}")
+            if "sets" in requirement:
+                require(evidence_integer(requirement.get("sets"), f"{case_id} sets", 1, 1024)
+                        == total_drives // erasure_set_drive_count, f"set count differs from topology for {case_id}")
+        if "pools" in requirement:
+            evidence_integer(requirement.get("pools"), f"{case_id} pools", 1, 1024)
         names.add(oracle)
     return tuple(sorted(names))
 
@@ -1419,14 +1429,33 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
             require(oracle.get("topology") == requirement["topology"], "oracle topology mismatch")
             for key in ("nodes", "drives_per_node"):
                 evidence_integer(oracle["topology"][key], f"observed {key}", 1, 16)
+            expected_set_drives = requirement.get(
+                "erasure_set_drive_count",
+                oracle["topology"]["nodes"] * oracle["topology"]["drives_per_node"],
+            )
+            require(oracle.get("erasure_set_drive_count") == expected_set_drives,
+                    "oracle erasure set drive count mismatch")
+            if "sets" in requirement:
+                require(oracle.get("sets") == requirement["sets"], "oracle set count mismatch")
+            if "pools" in requirement:
+                require(oracle.get("pools") == requirement["pools"], "oracle pool count mismatch")
+            expected_outage_target_required = requirement.get("outage_target_manifest_required", True)
+            require(oracle.get("outage_target_manifest_required", True) is expected_outage_target_required,
+                    "oracle outage target-manifest contract mismatch")
+            if requirement.get("sets", 1) > 1 or requirement.get("pools", 1) > 1:
+                require(oracle.get("distributed_ec_invalidation") is True,
+                        "oracle missing distributed EC invalidation proof")
+                evidence_integer(oracle.get("peer_count"), "oracle peer_count", 3, 64)
+                require(oracle.get("same_window_remote_proof") is True, "oracle missing same-window remote proof")
+                require(oracle.get("all_peers_bound_to_generation_window") is True,
+                        "oracle missing peer generation-window binding")
             expected_erasure = requirement.get("erasure")
             if expected_erasure is not None:
                 require(isinstance(expected_erasure, dict), "invalid erasure expectation")
                 expected_data_blocks = evidence_integer(expected_erasure.get("data_blocks"), "expected EC data blocks", 1, 16)
                 expected_parity_blocks = evidence_integer(expected_erasure.get("parity_blocks"), "expected EC parity blocks", 1, 16)
                 require(
-                    expected_data_blocks + expected_parity_blocks
-                    == oracle["topology"]["nodes"] * oracle["topology"]["drives_per_node"],
+                    expected_data_blocks + expected_parity_blocks == expected_set_drives,
                     "expected EC geometry differs from topology",
                 )
             else:
@@ -1451,14 +1480,18 @@ def check_scanner_heal_evidence(root: Path, directory: Path, case_id: str) -> li
                 if obj["expected_physical"] is not None:
                     require(physical == obj["expected_physical"], "target shard differs from pre-fault manifest")
                 for geometry in [physical] + ([obj["expected_physical"]] if obj["expected_physical"] is not None else []):
+                    if not geometry["has_xl_meta"] and not expected_outage_target_required and obj["expected_physical"] is None:
+                        continue
                     data = evidence_integer(geometry["data_blocks"], "EC data blocks", 1, 16)
                     parity = evidence_integer(geometry["parity_blocks"], "EC parity blocks", 1, 16)
-                    require(data + parity == oracle["topology"]["nodes"] * oracle["topology"]["drives_per_node"],
-                            "EC geometry differs from this case's single set")
+                    require(data + parity == expected_set_drives,
+                            "EC geometry differs from this case's erasure set")
                     if expected_data_blocks is not None:
                         require(data == expected_data_blocks and parity == expected_parity_blocks,
                                 "EC data/parity geometry differs from the required case")
                     evidence_integer(geometry["erasure_index"], "target erasure index", 1, data + parity)
+                if not expected_outage_target_required and obj["expected_physical"] is None and not physical["has_xl_meta"]:
+                    continue
                 require(physical["has_xl_meta"] is True and physical["version_id"] is None, "missing target metadata")
                 parts = physical["expected_part_numbers"]
                 require(isinstance(parts, list) and 0 < len(parts) <= 10000, "no physical part coverage")
@@ -2557,10 +2590,11 @@ class SelfTests(unittest.TestCase):
         def oracle_objects(requirement: dict[str, object]) -> list[dict[str, object]]:
             topology = requirement["topology"]
             total_blocks = topology["nodes"] * topology["drives_per_node"]
+            erasure_set_drive_count = requirement.get("erasure_set_drive_count", total_blocks)
             erasure = requirement.get("erasure")
             if erasure is None:
-                parity_blocks = 4 if total_blocks == 12 else total_blocks // 2
-                data_blocks = total_blocks - parity_blocks
+                parity_blocks = 4 if erasure_set_drive_count == 12 else erasure_set_drive_count // 2
+                data_blocks = erasure_set_drive_count - parity_blocks
             else:
                 data_blocks = erasure["data_blocks"]
                 parity_blocks = erasure["parity_blocks"]
@@ -2585,7 +2619,19 @@ class SelfTests(unittest.TestCase):
                 "test_build": {"source_revision": "b" * 40, "dirty": False, "lock_blob": "c" * 40,
                                "features": "default", "target": "aarch64-apple-darwin", "profile": "debug", "rustflags_hex": ""},
                 "binary_sha256": build["sha256"], "test_binary_sha256": build["sha256"],
-                "topology": requirement["topology"], "pid_before": 10, "pid_after": 11,
+                "topology": requirement["topology"],
+                "erasure_set_drive_count": requirement.get(
+                    "erasure_set_drive_count",
+                    requirement["topology"]["nodes"] * requirement["topology"]["drives_per_node"],
+                ),
+                "sets": requirement.get("sets", 1),
+                "pools": requirement.get("pools", 1),
+                "outage_target_manifest_required": requirement.get("outage_target_manifest_required", True),
+                "distributed_ec_invalidation": True,
+                "peer_count": requirement["topology"]["nodes"],
+                "same_window_remote_proof": True,
+                "all_peers_bound_to_generation_window": True,
+                "pid_before": 10, "pid_after": 11,
                 "unclean_shutdown_marker": requirement["unclean_shutdown_marker"],
                 "objects": objects, "node_listings": [[item["key"] for item in objects]] * requirement["topology"]["nodes"],
             })

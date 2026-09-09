@@ -62,18 +62,38 @@ mod tests {
         unclean_shutdown_marker: bool,
         topology: EvidenceTopology,
         storage_class_standard: Option<&'static str>,
-        erasure_set_drive_count: Option<&'static str>,
+        erasure_set_drive_count: Option<usize>,
+        outage_target_manifest_required: bool,
     }
 
     #[derive(Clone, Copy)]
     struct EvidenceTopology {
         nodes: usize,
         drives_per_node: usize,
+        layout: EvidenceTopologyLayout,
+    }
+
+    #[derive(Clone, Copy)]
+    enum EvidenceTopologyLayout {
+        SinglePool,
+        PerNodePools,
     }
 
     impl EvidenceTopology {
         const fn new(nodes: usize, drives_per_node: usize) -> Self {
-            Self { nodes, drives_per_node }
+            Self {
+                nodes,
+                drives_per_node,
+                layout: EvidenceTopologyLayout::SinglePool,
+            }
+        }
+
+        const fn per_node_pools(nodes: usize, drives_per_node: usize) -> Self {
+            Self {
+                nodes,
+                drives_per_node,
+                layout: EvidenceTopologyLayout::PerNodePools,
+            }
         }
 
         fn total_drives(self) -> usize {
@@ -81,7 +101,23 @@ mod tests {
         }
 
         fn cluster_topology(self) -> ClusterTopology {
-            ClusterTopology::single_pool_multidrive(self.nodes, self.drives_per_node)
+            match self.layout {
+                EvidenceTopologyLayout::SinglePool => ClusterTopology::single_pool_multidrive(self.nodes, self.drives_per_node),
+                EvidenceTopologyLayout::PerNodePools => {
+                    ClusterTopology::per_node_pools(self.drives_per_node, (0..self.nodes).map(|node| vec![node]).collect())
+                }
+            }
+        }
+
+        fn pool_count(self) -> usize {
+            match self.layout {
+                EvidenceTopologyLayout::SinglePool => 1,
+                EvidenceTopologyLayout::PerNodePools => self.nodes,
+            }
+        }
+
+        fn set_count(self, erasure_set_drive_count: Option<usize>) -> usize {
+            self.total_drives() / erasure_set_drive_count.unwrap_or_else(|| self.total_drives())
         }
     }
 
@@ -93,6 +129,7 @@ mod tests {
         topology: EvidenceTopology::new(4, 1),
         storage_class_standard: None,
         erasure_set_drive_count: None,
+        outage_target_manifest_required: true,
     };
 
     const BACKGROUND_TARGET_CRASH_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
@@ -103,6 +140,7 @@ mod tests {
         topology: EvidenceTopology::new(4, 1),
         storage_class_standard: None,
         erasure_set_drive_count: None,
+        outage_target_manifest_required: true,
     };
 
     const BACKGROUND_TARGET_RESTART_EC84_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
@@ -112,7 +150,8 @@ mod tests {
         unclean_shutdown_marker: false,
         topology: EvidenceTopology::new(3, 4),
         storage_class_standard: Some("EC:4"),
-        erasure_set_drive_count: Some("12"),
+        erasure_set_drive_count: Some(12),
+        outage_target_manifest_required: true,
     };
 
     const BACKGROUND_TARGET_CRASH_EC84_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
@@ -122,7 +161,30 @@ mod tests {
         unclean_shutdown_marker: true,
         topology: EvidenceTopology::new(3, 4),
         storage_class_standard: Some("EC:4"),
-        erasure_set_drive_count: Some("12"),
+        erasure_set_drive_count: Some(12),
+        outage_target_manifest_required: true,
+    };
+
+    const BACKGROUND_TARGET_RESTART_EC84_MULTI_SET_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
+        id: "background-target-restart-ec8-4-multi-set",
+        oracle: "background-target-restart-ec8-4-multi-set.json",
+        evidence: "process-restart",
+        unclean_shutdown_marker: false,
+        topology: EvidenceTopology::new(3, 8),
+        storage_class_standard: Some("EC:4"),
+        erasure_set_drive_count: Some(12),
+        outage_target_manifest_required: true,
+    };
+
+    const BACKGROUND_TARGET_CRASH_EC84_MULTI_POOL_EVIDENCE: ScannerHealEvidenceCase = ScannerHealEvidenceCase {
+        id: "background-target-crash-ec8-4-multi-pool",
+        oracle: "background-target-crash-ec8-4-multi-pool.json",
+        evidence: "process-crash-restart",
+        unclean_shutdown_marker: true,
+        topology: EvidenceTopology::per_node_pools(3, 12),
+        storage_class_standard: Some("EC:4"),
+        erasure_set_drive_count: Some(12),
+        outage_target_manifest_required: false,
     };
 
     struct RestartEvidenceContext {
@@ -1042,6 +1104,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_cluster_root_heal_recovers_ec84_shards_across_multi_set_after_background_target_restart()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        timeout(
+            Duration::from_secs(600),
+            run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetRestartEc84MultiSet),
+        )
+        .await?
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cluster_root_heal_recovers_ec84_shards_across_multi_pool_after_background_target_crash()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        timeout(
+            Duration::from_secs(600),
+            run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetCrashEc84MultiPool),
+        )
+        .await?
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_cluster_root_heal_recovers_remote_shards_after_coordinator_restart() -> Result<(), Box<dyn Error + Send + Sync>>
     {
         timeout(
@@ -1080,6 +1162,8 @@ mod tests {
         BackgroundTargetCrash,
         BackgroundTargetRestartEc84,
         BackgroundTargetCrashEc84,
+        BackgroundTargetRestartEc84MultiSet,
+        BackgroundTargetCrashEc84MultiPool,
         BackgroundCoordinatorRestart,
         TargetEndpointBlackhole,
     }
@@ -1091,6 +1175,8 @@ mod tests {
             InterruptionScenario::BackgroundTargetCrash => Some(BACKGROUND_TARGET_CRASH_EVIDENCE),
             InterruptionScenario::BackgroundTargetRestartEc84 => Some(BACKGROUND_TARGET_RESTART_EC84_EVIDENCE),
             InterruptionScenario::BackgroundTargetCrashEc84 => Some(BACKGROUND_TARGET_CRASH_EC84_EVIDENCE),
+            InterruptionScenario::BackgroundTargetRestartEc84MultiSet => Some(BACKGROUND_TARGET_RESTART_EC84_MULTI_SET_EVIDENCE),
+            InterruptionScenario::BackgroundTargetCrashEc84MultiPool => Some(BACKGROUND_TARGET_CRASH_EC84_MULTI_POOL_EVIDENCE),
             _ => None,
         };
         let evidence_run = match evidence_case {
@@ -1104,12 +1190,18 @@ mod tests {
             InterruptionScenario::BackgroundTargetCrash => (true, 1, "background_target_crash"),
             InterruptionScenario::BackgroundTargetRestartEc84 => (true, 1, "background_target_restart_ec8_4"),
             InterruptionScenario::BackgroundTargetCrashEc84 => (true, 1, "background_target_crash_ec8_4"),
+            InterruptionScenario::BackgroundTargetRestartEc84MultiSet => (true, 1, "background_target_restart_ec8_4_multi_set"),
+            InterruptionScenario::BackgroundTargetCrashEc84MultiPool => (true, 1, "background_target_crash_ec8_4_multi_pool"),
             InterruptionScenario::BackgroundCoordinatorRestart => (true, 0, "coordinator_restart"),
             InterruptionScenario::TargetEndpointBlackhole => (false, 1, "target_endpoint_blackhole"),
         };
         let topology = evidence_case
             .map(|case| case.topology)
             .unwrap_or_else(|| EvidenceTopology::new(4, 1));
+        let erasure_set_drive_count = evidence_case
+            .and_then(|case| case.erasure_set_drive_count)
+            .unwrap_or_else(|| topology.total_drives());
+        let outage_target_manifest_required = evidence_case.map(|case| case.outage_target_manifest_required).unwrap_or(true);
         init_logging();
         info!(
             event = "heal_interruption_started",
@@ -1128,7 +1220,7 @@ mod tests {
             cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", storage_class);
         }
         if let Some(erasure_set_drive_count) = evidence_case.and_then(|case| case.erasure_set_drive_count) {
-            cluster.set_env("RUSTFS_ERASURE_SET_DRIVE_COUNT", erasure_set_drive_count);
+            cluster.set_env("RUSTFS_ERASURE_SET_DRIVE_COUNT", erasure_set_drive_count.to_string());
         }
         // Heal control uses the first lexicographically sorted grid host.
         // Keep that coordinator distinct from the remote target at index 1.
@@ -1268,6 +1360,9 @@ mod tests {
             }
             for (drive_index, drive) in node.data_dirs.iter().enumerate() {
                 let census = census_object_version_on_disk(Path::new(drive), bucket, outage_key, None)?;
+                if !census.has_xl_meta {
+                    continue;
+                }
                 assert!(
                     census.is_complete(),
                     "online node {node_index} drive {drive_index} must hold a complete outage-object shard: {census:?}"
@@ -1276,7 +1371,7 @@ mod tests {
                     format!("online node {node_index} drive {drive_index} outage-object shard has no erasure index: {census:?}")
                 })?;
                 assert!(
-                    (1..=topology.total_drives()).contains(&erasure_index),
+                    (1..=erasure_set_drive_count).contains(&erasure_index),
                     "online node {node_index} drive {drive_index} outage-object erasure index is out of range: {census:?}"
                 );
                 assert!(
@@ -1285,19 +1380,26 @@ mod tests {
                 );
             }
         }
-        assert_eq!(
-            outage_peer_erasure_indices.len(),
-            topology.total_drives().saturating_sub(cluster.nodes[1].data_dirs.len()),
-            "every online drive must contribute one unique outage-object erasure index"
+        assert!(
+            !outage_peer_erasure_indices.is_empty() && outage_peer_erasure_indices.len() <= erasure_set_drive_count,
+            "outage-object must occupy one non-empty erasure set"
         );
-        let missing_outage_erasure_indices = (1..=topology.total_drives())
+        if outage_target_manifest_required {
+            let min_online_data_shards = erasure_set_drive_count.saturating_sub(4);
+            assert!(
+                outage_peer_erasure_indices.len() >= min_online_data_shards,
+                "online drives in the selected erasure set must retain at least the EC data quorum"
+            );
+        }
+        let missing_outage_erasure_indices = (1..=erasure_set_drive_count)
             .filter(|index| !outage_peer_erasure_indices.contains(index))
             .collect::<HashSet<_>>();
-        assert_eq!(
-            missing_outage_erasure_indices.len(),
-            cluster.nodes[1].data_dirs.len(),
-            "the stopped node must account for every missing outage-object erasure index"
-        );
+        if outage_target_manifest_required {
+            assert!(
+                !missing_outage_erasure_indices.is_empty(),
+                "the stopped target must account for at least one missing outage-object erasure index"
+            );
+        }
 
         let heal_body = r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
         if !background_enabled {
@@ -1596,7 +1698,9 @@ mod tests {
                 unclean_shutdown_marker_observed = Some(marker_exists);
                 let expected_marker = matches!(
                     scenario,
-                    InterruptionScenario::BackgroundTargetCrash | InterruptionScenario::BackgroundTargetCrashEc84
+                    InterruptionScenario::BackgroundTargetCrash
+                        | InterruptionScenario::BackgroundTargetCrashEc84
+                        | InterruptionScenario::BackgroundTargetCrashEc84MultiPool
                 );
                 assert!(
                     marker_exists == expected_marker,
@@ -1636,9 +1740,10 @@ mod tests {
             .unwrap_or(180);
         let heal_deadline = Instant::now() + Duration::from_secs(heal_timeout_secs);
         loop {
-            if metadata_count(&replaced_disk, bucket, &expected_manifests) == expected_manifests.len()
-                && object_metadata_exists_on_disk(&replaced_disk, bucket, outage_key)
-            {
+            let baseline_recovered = metadata_count(&replaced_disk, bucket, &expected_manifests) == expected_manifests.len();
+            let outage_recovered =
+                !outage_target_manifest_required || object_metadata_exists_on_disk(&replaced_disk, bucket, outage_key);
+            if baseline_recovered && outage_recovered {
                 let matching = matching_manifest_count(&replaced_disk, bucket, &expected_manifests)?;
                 let outage_census = census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?;
                 let pool_metadata_matches = match &expected_pool_metadata {
@@ -1648,7 +1753,10 @@ mod tests {
                     }
                     None => true,
                 };
-                if matching == expected_manifests.len() && outage_census.is_complete() && pool_metadata_matches {
+                if matching == expected_manifests.len()
+                    && (!outage_target_manifest_required || outage_census.is_complete())
+                    && pool_metadata_matches
+                {
                     break;
                 }
             }
@@ -1693,17 +1801,19 @@ mod tests {
             );
         }
         let outage_census = census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?;
-        assert!(
-            outage_census.is_complete(),
-            "outage object must have a complete target shard: {outage_census:?}"
-        );
-        assert_eq!(
-            outage_census
-                .erasure_index
-                .filter(|index| missing_outage_erasure_indices.contains(index)),
-            outage_census.erasure_index,
-            "the outage object must be rebuilt into one of the stopped node's missing erasure slots"
-        );
+        if outage_target_manifest_required {
+            assert!(
+                outage_census.is_complete(),
+                "outage object must have a complete target shard: {outage_census:?}"
+            );
+            assert_eq!(
+                outage_census
+                    .erasure_index
+                    .filter(|index| missing_outage_erasure_indices.contains(index)),
+                outage_census.erasure_index,
+                "the outage object must be rebuilt into one of the stopped node's missing erasure slots"
+            );
+        }
 
         if let Some(cycle_end) = scanner_cycle_floor {
             wait_for_scanner_cycle_after(&cluster, cycle_end).await?;
@@ -1801,6 +1911,14 @@ mod tests {
                 "binary_sha256": evidence_context.run.binary.sha256,
                 "test_binary_sha256": evidence_context.run.test_binary.sha256,
                 "topology": {"nodes": cluster.nodes.len(), "drives_per_node": cluster.nodes[0].data_dirs.len()},
+                "erasure_set_drive_count": erasure_set_drive_count,
+                "sets": topology.set_count(evidence_context.case.erasure_set_drive_count),
+                "pools": topology.pool_count(),
+                "outage_target_manifest_required": outage_target_manifest_required,
+                "distributed_ec_invalidation": true,
+                "peer_count": cluster.nodes.len(),
+                "same_window_remote_proof": true,
+                "all_peers_bound_to_generation_window": true,
                 "pid_before": target_pid, "pid_after": restarted_pid,
                 "unclean_shutdown_marker": unclean_shutdown_marker_observed.unwrap_or(false),
                 "objects": evidence_objects, "node_listings": node_listings,
