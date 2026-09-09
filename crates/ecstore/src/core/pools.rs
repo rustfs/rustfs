@@ -20257,11 +20257,10 @@ mod tests {
         assert_eq!(decommission_capacity_target_gate_busy_index(&wrapped), Some(7));
         assert_eq!(
             wrapped.to_string(),
-            Error::other(format!(
-                "decommission_object: put_object_part failed for bucket-a/object-a part 1: {}",
+            format!(
+                "Io error: decommission_object: put_object_part failed for bucket-a/object-a part 1: {}",
                 decommission_capacity_blocked_error(&gate_busy_message)
-            ))
-            .to_string()
+            )
         );
 
         for unrelated in [
