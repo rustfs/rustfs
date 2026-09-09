@@ -202,6 +202,13 @@ class ScannerAbbaTest(unittest.TestCase):
                 "failure_domain": "three-node-localhost-lab",
                 "same_window_sampling": True,
             },
+            "scheduler": {
+                "bounds": ["admission-retry-idempotency", "deadline-budget", "lock-hold-bound", "minimum-progress"],
+                "max_deferred_items": 10,
+                "max_deferred_bytes": 1048576,
+                "max_retry_age_seconds": 7200,
+                "duplicate_task_bound_observed": True,
+            },
             "crash_restart": {
                 "fault_modes": ["process-restart", "process-crash-restart"],
                 "unclean_shutdown_marker": True,
@@ -216,6 +223,25 @@ class ScannerAbbaTest(unittest.TestCase):
                 "required_artifacts": ["allocation-profile", "flamegraph", "rss-samples", "save-frequency"],
                 "collector_config_sha256": "4" * 64,
                 "profiler_config_sha256": "5" * 64,
+                "measurements": {
+                    "resolved_samples": 120,
+                    "allocation_bytes": 4096,
+                    "rss_peak_bytes": 10485760,
+                    "save_operations": 64,
+                    "saved_bytes": 8192,
+                },
+            },
+            "heal_capacity": {
+                "objects": 96,
+                "versions": 96,
+                "bytes": 12582912,
+                "completed_objects": 96,
+            },
+            "recovery_window": {
+                "pressure_recovery_window_seconds": 45,
+                "heal_lock_wait_p99_ms": 8,
+                "recovery_p95_ms": 1500,
+                "recovery_p99_ms": 2200,
             },
         }
         return manifest

@@ -57,9 +57,11 @@ their issue closes.
 | `run_scanner_validation_harness.sh` | dev-tool | Scanner validation harness | `docs/operations/scanner-benchmark-runbook.md` |
 | `run_scanner_heal_evidence_case.sh` | dev-tool | Runs one Scanner/Heal release-evidence registry case and checks the produced receipt/oracle | `.config/scanner-heal-required-tests.json`; `check_test_wiring.py --check-scanner-heal` |
 | `run_scanner_heal_g09_upgrade_evidence.sh` | dev-tool | Runs the G09 mixed-version and rollback upgrade E2E lanes against a pinned previous release and verifies the raw evidence artifacts | `docs/testing/ci-gates.md`; `.github/workflows/e2e-upgrade.yml`; `test_scanner_heal_g09_upgrade_evidence.sh` |
+| `run_scanner_heal_scheduler_pressure_evidence.py` | dev-tool | Assembles measured Scanner/Heal G10/P1/P3 scheduler-pressure release descriptors from a completed measured ABBA run, recovery-window proof, and profile artifacts | `docs/operations/scanner-benchmark-runbook.md`; `test_scanner_heal_scheduler_pressure_evidence.sh` |
 | `run_scanner_heal_w13_mrf_evidence.sh` | dev-tool | Runs the W13 durable MRF replay lanes and writes G07/G08/P4 bundle-ready evidence descriptors | `docs/testing/ci-gates.md`; `test_scanner_heal_w13_mrf_evidence.sh` |
 | `run_scanner_heal_w16_recovery_evidence.sh` | dev-tool | Runs the W16 recovery-intent and quota authority lanes and writes G04/G12 bundle-ready evidence descriptors | `docs/testing/ci-gates.md`; `test_scanner_heal_w16_recovery_evidence.sh` |
 | `test_scanner_validation_harness.sh` | dev-tool | Self-test for the scanner validation harness | — |
+| `test_scanner_heal_scheduler_pressure_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal scheduler-pressure evidence assembler | — |
 | `test_scanner_heal_g09_upgrade_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal G09 upgrade evidence runner | — |
 | `test_scanner_heal_w16_recovery_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal W16 recovery evidence runner | — |
 | `test_scanner_heal_w13_mrf_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal W13 MRF evidence runner | — |
