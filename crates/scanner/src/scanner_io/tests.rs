@@ -96,7 +96,16 @@ fn scanner_segment_reuse_activation_preflight_reports_release_gate_inputs() {
     assert_eq!(preflight.fail_closed_checks, SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS);
     assert_eq!(
         preflight.fail_closed_blockers().collect::<Vec<_>>(),
-        SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS
+        vec![
+            "missing_producer_identity",
+            "missing_durable_journal_replay",
+            "restart_gap",
+            "generation_gap",
+            "overflow",
+            "stale_ack_generation",
+            "missing_cold_zero_walk_oracle",
+            "distributed_without_peer_invalidation",
+        ]
     );
 }
 
@@ -106,9 +115,11 @@ fn scanner_segment_reuse_activation_requires_every_preflight_proof() {
         production_activation: true,
         producer_identity_coverage_complete: true,
         durable_producer_identity: true,
+        durable_dirty_producer_journal: true,
         restart_gap_absent: true,
         generation_window_bound: true,
         overflow_absent: true,
+        ack_generation_guard: true,
         cold_zero_walk_oracle: true,
         distributed_peer_invalidation: true,
     };
@@ -133,6 +144,10 @@ fn scanner_segment_reuse_activation_requires_every_preflight_proof() {
     non_durable_identity.durable_producer_identity = false;
     assert_segment_reuse_activation_blocked_by(non_durable_identity, "missing_producer_identity");
 
+    let mut missing_durable_journal = complete_proof;
+    missing_durable_journal.durable_dirty_producer_journal = false;
+    assert_segment_reuse_activation_blocked_by(missing_durable_journal, "missing_durable_journal_replay");
+
     let mut restart_gap = complete_proof;
     restart_gap.restart_gap_absent = false;
     assert_segment_reuse_activation_blocked_by(restart_gap, "restart_gap");
@@ -144,6 +159,10 @@ fn scanner_segment_reuse_activation_requires_every_preflight_proof() {
     let mut overflow = complete_proof;
     overflow.overflow_absent = false;
     assert_segment_reuse_activation_blocked_by(overflow, "overflow");
+
+    let mut stale_ack_generation = complete_proof;
+    stale_ack_generation.ack_generation_guard = false;
+    assert_segment_reuse_activation_blocked_by(stale_ack_generation, "stale_ack_generation");
 
     let mut missing_cold_oracle = complete_proof;
     missing_cold_oracle.cold_zero_walk_oracle = false;
@@ -183,7 +202,7 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_reports_cycle_inputs_wit
     assert!(!preflight.scanner_segment_reuse_activated);
     assert_eq!(
         preflight.fail_closed_blockers().collect::<Vec<_>>(),
-        vec!["missing_producer_identity", "restart_gap"]
+        vec!["missing_producer_identity", "missing_durable_journal_replay", "restart_gap"]
     );
 }
 
@@ -208,7 +227,15 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_blocks_unbounded_inputs(
     assert!(!preflight.scanner_segment_reuse_activated);
     assert_eq!(
         preflight.fail_closed_blockers().collect::<Vec<_>>(),
-        SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS
+        vec![
+            "missing_producer_identity",
+            "missing_durable_journal_replay",
+            "restart_gap",
+            "generation_gap",
+            "overflow",
+            "missing_cold_zero_walk_oracle",
+            "distributed_without_peer_invalidation",
+        ]
     );
 }
 
@@ -233,7 +260,7 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_skips_distributed_blocke
     assert!(!preflight.scanner_segment_reuse_activated);
     assert_eq!(
         preflight.fail_closed_blockers().collect::<Vec<_>>(),
-        vec!["missing_producer_identity", "restart_gap"]
+        vec!["missing_producer_identity", "missing_durable_journal_replay", "restart_gap"]
     );
 }
 
@@ -419,9 +446,11 @@ fn scanner_cycle_result_returns_segment_reuse_activation_preflight() {
         production_activation: true,
         producer_identity_coverage_complete: true,
         durable_producer_identity: true,
+        durable_dirty_producer_journal: true,
         restart_gap_absent: true,
         generation_window_bound: true,
         overflow_absent: true,
+        ack_generation_guard: true,
         cold_zero_walk_oracle: true,
         distributed_peer_invalidation: true,
     };

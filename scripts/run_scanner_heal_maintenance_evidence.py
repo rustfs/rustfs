@@ -171,9 +171,13 @@ def write_self_test_proof(path: Path, source_revision: str) -> None:
             "producer_families": list(wiring.SCANNER_HEAL_REQUIRED_PRODUCER_FAMILIES),
             "matrix_cases": list(wiring.SCANNER_HEAL_RELEASE_G11_REQUIRED_CASES["maintenance_producer_matrix"]),
             "durable_identity_observed": True,
+            "durable_journal_replay_observed": True,
+            "durable_journal_hydration_bound": True,
             "generation_window_bound": True,
             "restart_gap_absent": True,
             "overflow_absent": True,
+            "ack_clear_generation_observed": True,
+            "invalid_journal_inputs_rejected": list(wiring.SCANNER_HEAL_DURABLE_JOURNAL_FAIL_CLOSED_CASES),
         },
         "complete_producer_inventory": {
             "required_producer_identities": list(wiring.SCANNER_HEAL_REQUIRED_PRODUCER_IDENTITIES),
