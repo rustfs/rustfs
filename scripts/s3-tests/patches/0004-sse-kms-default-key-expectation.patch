@@ -1,0 +1,61 @@
+diff --git a/s3tests/functional/__init__.py b/s3tests/functional/__init__.py
+index 5fcb1f4..09af01d 100644
+--- a/s3tests/functional/__init__.py
++++ b/s3tests/functional/__init__.py
+@@ -232,6 +232,8 @@ def configure():
+     except (configparser.NoSectionError, configparser.NoOptionError):
+         config.main_kms_keyid2 = 'testkey-2'
+
++    config.main_kms_default_keyid = cfg.get('s3 main', 'kms_default_keyid', fallback=None)
++
+     try:
+         config.main_api_name = cfg.get('s3 main',"api_name")
+     except (configparser.NoSectionError, configparser.NoOptionError):
+@@ -732,6 +734,9 @@ def get_main_kms_keyid():
+ def get_secondary_kms_keyid():
+     return config.main_kms_keyid2
+
++def get_default_kms_keyid():
++    return config.main_kms_default_keyid or None
++
+ def get_alt_aws_access_key():
+     return config.alt_access_key
+
+diff --git a/s3tests/functional/test_s3.py b/s3tests/functional/test_s3.py
+index aa8879c..7e0c381 100644
+--- a/s3tests/functional/test_s3.py
++++ b/s3tests/functional/test_s3.py
+@@ -79,6 +79,7 @@ from . import (
+     get_objects_list,
+     get_main_kms_keyid,
+     get_secondary_kms_keyid,
++    get_default_kms_keyid,
+     get_svc_client,
+     get_cloud_storage_class,
+     get_cloud_retain_head_object,
+@@ -11282,7 +11283,24 @@ def test_sse_kms_no_key():
+     lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_kms_client_headers))
+     client.meta.events.register('before-call.s3.PutObject', lf)
+
+-    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key=key, Body=data)
++    default_keyid = get_default_kms_keyid()
++    if default_keyid is None:
++        assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key=key, Body=data)
++        return
++
++    # A configured default must encrypt the object, not silently store plaintext.
++    response = client.put_object(Bucket=bucket_name, Key=key, Body=data)
++    assert response['ServerSideEncryption'] == 'aws:kms'
++    assert response['SSEKMSKeyId'] == default_keyid
++
++    response = client.head_object(Bucket=bucket_name, Key=key)
++    assert response['ServerSideEncryption'] == 'aws:kms'
++    assert response['SSEKMSKeyId'] == default_keyid
++
++    response = client.get_object(Bucket=bucket_name, Key=key)
++    assert response['ServerSideEncryption'] == 'aws:kms'
++    assert response['SSEKMSKeyId'] == default_keyid
++    assert _get_body(response) == data
+
+
+ @pytest.mark.encryption
