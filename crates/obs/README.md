@@ -122,7 +122,11 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_PROFILING_EXPORT_ENABLED` | `false`   | Toggle profiling export                                    |
 | `RUSTFS_OBS_USE_STDOUT`               | `false`   | Mirror all signals to stdout alongside OTLP                |
 | `RUSTFS_OBS_SAMPLE_RATIO`             | `0.1`     | Trace sampling ratio `0.0`–`1.0`                           |
-| `RUSTFS_OBS_METER_INTERVAL`           | `15`      | Metrics export interval (seconds)                          |
+| `RUSTFS_OBS_METER_INTERVAL`           | `30`      | Metrics export interval (seconds)                          |
+
+The export interval is separate from application metric collection. Without interval overrides, node/disk metrics refresh every 60 seconds (`RUSTFS_METRICS_NODE_INTERVAL_SEC`), cluster metrics every 60 seconds (`RUSTFS_METRICS_CLUSTER_INTERVAL_SEC`), and per-bucket metrics every 300 seconds (`RUSTFS_METRICS_BUCKET_INTERVAL_SEC`). See the [collection defaults](src/metrics/config.rs) and [interval configuration](src/metrics/scheduler.rs) for collector-specific and global overrides.
+
+With OTLP → Collector → Prometheus, the time from a failure to an alert also includes underlying health detection, collection and export work, transport and Collector batching, Prometheus `scrape_interval` and `evaluation_interval`, and any alert rule `for` duration. A shorter scrape interval cannot refresh a value that RustFS has not yet collected and exported. These periodic intervals do not guarantee a fixed detection or alert latency; see the [Prometheus alert rule documentation](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/) for the role of `for`.
 
 ### Service identity
 
