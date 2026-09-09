@@ -51,10 +51,10 @@ use rustfs_protos::proto_gen::node_service::{
     LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest,
     ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageSnapshotRequest, ScannerDirtyUsageSnapshotResponse,
     ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
-    ScannerScopedDirtyUsageAckRequest, ScannerScopedDirtyUsageEntry, ServerInfoRequest, SignalServiceRequest,
-    SignalServiceResponse, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest, TierDailyStatsRequest,
-    TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse, TierMutationFailureClass,
-    TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
+    ScannerScopedDirtyUsageAckRequest, ScannerScopedDirtyUsageAckResponse, ScannerScopedDirtyUsageEntry, ServerInfoRequest,
+    SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest,
+    TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse,
+    TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
     tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
 pub use rustfs_protos::{PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS};
@@ -287,6 +287,20 @@ fn scanner_scoped_dirty_usage_ack_payload(
     };
     canonical_scoped_dirty_usage_request(&payload).map_err(|err| Error::other(err.to_string()))?;
     Ok(payload)
+}
+
+fn scanner_scoped_dirty_usage_ack_response_matches(
+    request: &ScannerScopedDirtyUsageAckRequest,
+    response: &ScannerScopedDirtyUsageAckResponse,
+) -> bool {
+    let cleared_within_request = u64::try_from(request.entries.len())
+        .is_ok_and(|entry_count| response.cleared <= entry_count && (!request.probe_only || response.cleared == 0));
+    response.protocol_version == rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_PROTOCOL_VERSION
+        && response.owner_id == request.owner_id
+        && response.instance_id == request.instance_id
+        && response.max_entries == rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_MAX_ENTRIES
+        && response.max_request_bytes == rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES
+        && cleared_within_request
 }
 
 fn scanner_scoped_dirty_usage_ack_reconciled(activity: &ScannerPeerActivity, expected_instance_id: &str) -> bool {
@@ -2255,13 +2269,7 @@ impl PeerRestClient {
                     let body = canonical_scoped_dirty_usage_response(&canonical, &response)
                         .map_err(|_| Error::other("scoped dirty usage capability response is too large"))?;
                     verify_tonic_rpc_response_proof(&body, response.response_proof.as_ref())?;
-                    if response.protocol_version != SCOPED_DIRTY_USAGE_PROTOCOL_VERSION
-                        || response.owner_id != payload.owner_id
-                        || response.instance_id != payload.instance_id
-                        || response.max_entries != SCOPED_DIRTY_USAGE_MAX_ENTRIES
-                        || response.max_request_bytes != SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES
-                        || response.cleared != 0
-                    {
+                    if !scanner_scoped_dirty_usage_ack_response_matches(&payload, &response) {
                         return Err(Error::other("scoped dirty usage capability response does not match request"));
                     }
                     if !response.supported {
@@ -2297,13 +2305,7 @@ impl PeerRestClient {
                 let body = canonical_scoped_dirty_usage_response(&canonical, &response)
                     .map_err(|_| Error::other("scoped dirty usage acknowledgement response is too large"))?;
                 verify_tonic_rpc_response_proof(&body, response.response_proof.as_ref())?;
-                if response.protocol_version != SCOPED_DIRTY_USAGE_PROTOCOL_VERSION
-                    || response.owner_id != payload.owner_id
-                    || response.instance_id != payload.instance_id
-                    || response.max_entries != SCOPED_DIRTY_USAGE_MAX_ENTRIES
-                    || response.max_request_bytes != SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES
-                    || !response.supported
-                {
+                if !scanner_scoped_dirty_usage_ack_response_matches(&payload, &response) || !response.supported {
                     return Err(Error::other("scoped dirty usage acknowledgement response does not match request"));
                 }
             }
@@ -3116,6 +3118,60 @@ mod tests {
         for payload in payloads {
             canonical_scoped_dirty_usage_request(&payload).expect("each split scoped ACK payload should be canonical");
         }
+    }
+
+    #[test]
+    fn scanner_scoped_dirty_usage_ack_response_bounds_cleared_entries_to_request() {
+        use rustfs_protos::scoped_dirty_usage::{
+            SCOPED_DIRTY_USAGE_MAX_ENTRIES, SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES, SCOPED_DIRTY_USAGE_PROTOCOL_VERSION,
+        };
+
+        let mut request = scanner_scoped_dirty_usage_ack_payload(
+            "33333333-3333-3333-3333-333333333333",
+            "0123456789abcdef0123456789abcdef",
+            false,
+            vec![
+                ScannerScopedDirtyUsageEntry {
+                    bucket: "archive".to_string(),
+                    bucket_incarnation: Uuid::from_u128(0x11111111111111111111111111111111).as_bytes().to_vec().into(),
+                    generation: 3,
+                },
+                ScannerScopedDirtyUsageEntry {
+                    bucket: "photos".to_string(),
+                    bucket_incarnation: Uuid::from_u128(0x22222222222222222222222222222222).as_bytes().to_vec().into(),
+                    generation: 7,
+                },
+            ],
+        )
+        .expect("two ordered entries should form a valid scoped ACK request");
+        let mut response = ScannerScopedDirtyUsageAckResponse {
+            protocol_version: SCOPED_DIRTY_USAGE_PROTOCOL_VERSION,
+            owner_id: request.owner_id.clone(),
+            instance_id: request.instance_id.clone(),
+            supported: true,
+            max_entries: SCOPED_DIRTY_USAGE_MAX_ENTRIES,
+            max_request_bytes: SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES,
+            cleared: 1,
+            response_proof: Bytes::new(),
+        };
+
+        assert!(scanner_scoped_dirty_usage_ack_response_matches(&request, &response));
+        response.cleared = 2;
+        assert!(scanner_scoped_dirty_usage_ack_response_matches(&request, &response));
+        response.cleared = 3;
+        assert!(
+            !scanner_scoped_dirty_usage_ack_response_matches(&request, &response),
+            "a peer cannot clear more entries than the signed request contains"
+        );
+
+        request.probe_only = true;
+        response.cleared = 1;
+        assert!(
+            !scanner_scoped_dirty_usage_ack_response_matches(&request, &response),
+            "a capability probe cannot report a mutation"
+        );
+        response.cleared = 0;
+        assert!(scanner_scoped_dirty_usage_ack_response_matches(&request, &response));
     }
 
     #[test]
