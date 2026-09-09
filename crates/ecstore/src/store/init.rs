@@ -18933,6 +18933,124 @@ mod tests {
     }
 
     #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn tier_config_init_recovers_after_initial_reload_failure_without_another_mutation() {
+        run_large_stack_async_test("tier-config-init-recovery", || async {
+            use crate::services::tier::tier::{TIER_DRIVER_TEST_FACTORY, TierDriverTestFactory};
+
+            let temp_dir = tempfile::tempdir().expect("create tier startup recovery store dir");
+            let (ctx, store, _shutdown) = build_isolated_test_store(temp_dir.path(), "tier-startup-recovery", &[4]).await;
+            let manager = ctx.tier_config_mgr();
+            let candidate = TierConfigMgr::new();
+            let tier_name = "STARTUP-RECOVERY";
+            let backend = register_mock_tier(&candidate, tier_name).await;
+            let backend_identity = TierConfigMgr::acquire_operation_lease(&candidate, tier_name)
+                .await
+                .expect("candidate backend identity should resolve")
+                .backend_identity();
+            let candidate_digest = {
+                let candidate = candidate.read().await;
+                candidate
+                    .save_tiering_config(store.clone())
+                    .await
+                    .expect("committed tier config should persist");
+                tier_config_candidate_digest(&candidate).expect("committed candidate digest should build")
+            };
+            let config_path = format!("{}/{}", com::CONFIG_PREFIX, TIER_CONFIG_FILE);
+            let config_bytes = com::read_config(store.clone(), &config_path)
+                .await
+                .expect("committed tier config bytes should load");
+            let config_etag = store
+                .get_object_info(RUSTFS_META_BUCKET, &config_path, &ObjectOptions::default())
+                .await
+                .expect("committed tier config metadata should load")
+                .etag
+                .expect("committed tier config should have an ETag");
+            let mutation_id = uuid::Uuid::new_v4();
+            let intent = TierMutationIntent {
+                mutation_id,
+                revision: 2,
+                kind: TierMutationIntentKind::Add,
+                state: TierMutationIntentState::Committed,
+                old_config_etag: None,
+                committed_config_etag: Some(config_etag),
+                candidate_digest,
+                affected_targets: vec![TierMutationIntentTarget {
+                    tier_name: tier_name.to_string(),
+                    old_backend_identity: None,
+                    new_backend_identity: Some(backend_identity),
+                }],
+                expires_at_unix_nanos: 1,
+            };
+            // Persist the restart state directly: no peer Commit or runtime block
+            // installation may leave a notification that masks a missing startup wakeup.
+            save_tier_mutation_intent_record(store.clone(), &intent)
+                .await
+                .expect("committed restart intent should persist without notifying the manager");
+            com::save_config(store.clone(), &config_path, vec![0])
+                .await
+                .expect("controlled invalid config should persist");
+
+            runtime_sources::TEST_TIER_CONFIG_MGR
+                .scope(manager.clone(), async {
+                    let err = runtime_sources::init_tier_config_mgr(store.clone())
+                        .await
+                        .expect_err("initial reload must report the controlled config parse failure");
+                    assert!(err.to_string().contains("tierConfigInit: no data"), "unexpected startup failure: {err}");
+                })
+                .await;
+            assert!(manager.read().await.tiers.is_empty(), "failed startup must not publish the candidate");
+            let blocked = match TierConfigMgr::acquire_operation_lease(&manager, tier_name).await {
+                Ok(_) => panic!("failed startup must retain the recovered committed fence"),
+                Err(err) => err,
+            };
+            assert!(TierConfigMgr::operation_lease_blocked_by_mutation(&blocked));
+
+            // Restore only the durable bytes. Recovery must come from the worker
+            // started by init, after the test-only handle scope has already ended.
+            com::save_config(store.clone(), &config_path, config_bytes)
+                .await
+                .expect("restoring committed config bytes should remove the startup failure");
+            // Reload only publishes this Add into an empty manager, so it has
+            // no replaced backend to construct or probe. Only the lease check
+            // below needs a driver; keep its factory on the observing task.
+            let driver_factory: TierDriverTestFactory = Arc::new(move |_| Ok(Box::new(backend.clone())));
+            TIER_DRIVER_TEST_FACTORY
+                .scope(driver_factory, async {
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            match TierConfigMgr::acquire_operation_lease(&manager, tier_name).await {
+                                Ok(lease) => {
+                                    drop(lease);
+                                    match load_tier_mutation_intent_record(store.clone(), mutation_id).await {
+                                        Err(Error::ConfigNotFound) => break,
+                                        Ok(retained) => assert_eq!(retained, intent),
+                                        Err(err) => panic!("committed recovery intent should remain readable: {err}"),
+                                    }
+                                }
+                                Err(err) => assert!(
+                                    TierConfigMgr::operation_lease_blocked_by_mutation(&err),
+                                    "recovery must retain the fence until the tier becomes available: {err}"
+                                ),
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("startup worker must publish the tier and clean its fence without another mutation");
+                })
+                .await;
+            let recovered = manager.read().await;
+            assert_eq!(
+                tier_config_candidate_digest(&recovered).expect("recovered config digest should build"),
+                candidate_digest,
+                "startup recovery must publish the committed configuration"
+            );
+        });
+    }
+
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn tier_mutation_intent_record_round_trips_through_config_store() {

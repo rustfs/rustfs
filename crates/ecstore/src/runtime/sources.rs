@@ -570,11 +570,25 @@ pub(crate) async fn initialize_local_disk_maps(
     Ok(())
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_TIER_CONFIG_MGR: Arc<tokio::sync::RwLock<TierConfigMgr>>;
+}
+
 pub(crate) async fn init_tier_config_mgr(store: Arc<ECStore>) -> Result<()> {
+    #[cfg(not(test))]
     let handle = get_global_tier_config_mgr();
-    TierConfigMgr::reload_handle(&handle, store.clone()).await?;
+    #[cfg(test)]
+    let handle = TEST_TIER_CONFIG_MGR
+        .try_with(Arc::clone)
+        .unwrap_or_else(|_| get_global_tier_config_mgr());
+    let initial_reload = TierConfigMgr::reload_handle(&handle, store.clone()).await;
+    if initial_reload.is_err() {
+        // Keep local recovery active when the initial snapshot cannot be loaded.
+        TierConfigMgr::request_committed_mutation_refresh(&handle).await;
+    }
     tokio::spawn(TierConfigMgr::refresh_tier_config_handle(handle, store));
-    Ok(())
+    initial_reload.map_err(Error::from)
 }
 
 #[cfg(test)]
