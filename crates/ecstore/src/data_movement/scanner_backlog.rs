@@ -201,6 +201,12 @@ pub mod test_util {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("injected native scanner backlog {phase} write failure")]
+    struct InjectedWriteFailure {
+        phase: &'static str,
+    }
+
     pub(super) struct WriteFault {
         set: Arc<SetDisks>,
         phase: &'static str,
@@ -279,7 +285,7 @@ pub mod test_util {
             return Ok(None);
         }
         if fault.fail_before_write {
-            return Err(Error::other(format!("injected native scanner backlog {phase} write failure")));
+            return Err(Error::other(InjectedWriteFailure { phase }));
         }
         Ok(Some(fault))
     }
