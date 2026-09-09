@@ -55,6 +55,7 @@ their issue closes.
 | `run.ps1` | dev-tool | Windows counterpart of `run.sh` | — |
 | `probe.sh` | dev-tool | Probe-style e2e run | `make probe-e2e` |
 | `run_scanner_validation_harness.sh` | dev-tool | Scanner validation harness | `docs/operations/scanner-benchmark-runbook.md` |
+| `check_test_wiring.py` | dev-tool | Validates test wiring and assembles one or more measured Scanner/Heal release descriptors into a single release evidence bundle | `.config/scanner-heal-required-tests.json`; `check_test_wiring.py --self-test` |
 | `run_scanner_heal_evidence_case.sh` | dev-tool | Runs one Scanner/Heal release-evidence registry case and checks the produced receipt/oracle | `.config/scanner-heal-required-tests.json`; `check_test_wiring.py --check-scanner-heal` |
 | `run_scanner_heal_checkpoint_crash_evidence.py` | dev-tool | Assembles measured Scanner/Heal G02/R-E checkpoint and restart release descriptors from scanner restart diagnostic reports | `diagnose_scanner_enumeration_restart.py`; `test_scanner_heal_checkpoint_crash_evidence.sh` |
 | `run_scanner_heal_g14_multiset_evidence.py` | dev-tool | Assembles measured Scanner/Heal G14 same-window EC8+4 multi-set/multi-pool release descriptors from e2e case directories or an operator-collected proof | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_g14_multiset_evidence.sh` |

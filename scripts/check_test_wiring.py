@@ -2719,66 +2719,80 @@ def copy_release_bundle_artifact(descriptor_path: Path, bundle_dir: Path, eviden
     evidence["sha256"] = source_sha
 
 
-def assemble_scanner_heal_release_bundle(root: Path, descriptor_path: Path, directory: Path) -> tuple[Path, dict[str, object]]:
-    """Copy measured Scanner/Heal evidence into one validated release bundle."""
+def assemble_scanner_heal_release_bundle_descriptors(
+    root: Path,
+    descriptor_paths: list[Path],
+    directory: Path,
+) -> tuple[Path, dict[str, object]]:
+    """Copy measured Scanner/Heal evidence descriptors into one validated release bundle."""
     require(not directory.exists(), "scanner/heal release bundle directory must be new")
+    require(descriptor_paths, "scanner/heal release bundle assembly requires at least one descriptor")
     registry = read_json(root / ".config/scanner-heal-required-tests.json")
     requirements, release_schema_capable, _ = scanner_heal_release_requirements(registry)
     require(release_schema_capable, "scanner/heal release bundle assembly requires schema 2 registry")
-    descriptor_path = descriptor_path.resolve(strict=True)
-    descriptor = read_json(descriptor_path)
-    reject_release_bundle_markers(descriptor, "scanner/heal release evidence descriptor")
-    require(descriptor.get("schema") == 1, "unsupported scanner/heal release evidence descriptor schema")
-    require(descriptor.get("evidence") == "measured", "scanner/heal release evidence descriptor must be measured")
-    source_revision = descriptor.get("source_revision")
-    require(isinstance(source_revision, str) and re.fullmatch(r"[0-9a-f]{40}", source_revision) is not None,
-            "scanner/heal release evidence descriptor source revision is invalid")
-    raw_gates = descriptor.get("gates")
-    require(isinstance(raw_gates, dict), "scanner/heal release evidence descriptor missing gates")
-    unknown_gates = sorted(set(raw_gates) - set(requirements))
-    require(not unknown_gates, f"scanner/heal release evidence descriptor has unknown gates: {', '.join(unknown_gates)}")
 
     bundle_dir = directory.resolve()
     artifact_dir = bundle_dir / "artifacts"
     artifact_dir.mkdir(parents=True)
     assembled_gates = {}
-    for gate in sorted(raw_gates):
-        raw_gate = raw_gates[gate]
-        require(isinstance(raw_gate, dict), f"{gate} descriptor gate must be an object")
-        reject_release_bundle_markers(raw_gate, f"{gate} descriptor gate")
-        raw_fields = raw_gate.get("evidence_fields", raw_gate)
-        require(isinstance(raw_fields, dict), f"{gate} descriptor gate missing evidence fields")
-        required_fields = set(SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate])
-        unknown_fields = sorted(set(raw_fields) - required_fields)
-        require(not unknown_fields, f"{gate} descriptor has unknown fields: {', '.join(unknown_fields)}")
-        fields = {}
-        for field in sorted(raw_fields):
-            raw_evidence = raw_fields[field]
-            require(isinstance(raw_evidence, dict), f"{gate}.{field} descriptor evidence must be an object")
-            evidence = json.loads(json.dumps(raw_evidence))
-            reject_release_bundle_markers(evidence, f"{gate}.{field} descriptor evidence")
-            copy_release_bundle_artifact(descriptor_path, bundle_dir, evidence, gate, field, f"{gate}-{field}")
-            profile_artifacts = evidence.get("profile_artifacts")
-            if profile_artifacts is not None:
-                require(isinstance(profile_artifacts, dict), f"{gate}.{field} profile artifacts must be an object")
-                for artifact_kind, item in sorted(profile_artifacts.items()):
-                    require(isinstance(item, dict), f"{gate}.{field}.{artifact_kind} descriptor profile artifact must be an object")
-                    reject_release_bundle_markers(item, f"{gate}.{field}.{artifact_kind} descriptor profile artifact")
-                    copy_release_bundle_artifact(
-                        descriptor_path,
-                        bundle_dir,
-                        item,
-                        gate,
-                        f"{field}.{artifact_kind}",
-                        f"{gate}-{field}-{artifact_kind}",
-                    )
-            fields[field] = evidence
-        assembled_gates[gate] = {
-            "status": "pass",
-            "lane": requirements[gate]["lane"],
-            "evidence_type": "measured",
-            "evidence_fields": fields,
-        }
+    source_revision = None
+    for descriptor_index, raw_descriptor_path in enumerate(descriptor_paths):
+        descriptor_path = raw_descriptor_path.resolve(strict=True)
+        descriptor = read_json(descriptor_path)
+        label = f"scanner/heal release evidence descriptor {descriptor_index + 1}"
+        reject_release_bundle_markers(descriptor, label)
+        require(descriptor.get("schema") == 1, f"unsupported {label} schema")
+        require(descriptor.get("evidence") == "measured", f"{label} must be measured")
+        descriptor_revision = descriptor.get("source_revision")
+        require(isinstance(descriptor_revision, str) and re.fullmatch(r"[0-9a-f]{40}", descriptor_revision) is not None,
+                f"{label} source revision is invalid")
+        if source_revision is None:
+            source_revision = descriptor_revision
+        else:
+            require(descriptor_revision == source_revision, "scanner/heal release descriptor source revisions differ")
+        raw_gates = descriptor.get("gates")
+        require(isinstance(raw_gates, dict), f"{label} missing gates")
+        unknown_gates = sorted(set(raw_gates) - set(requirements))
+        require(not unknown_gates, f"{label} has unknown gates: {', '.join(unknown_gates)}")
+
+        for gate in sorted(raw_gates):
+            require(gate not in assembled_gates, f"scanner/heal release descriptor repeats gate: {gate}")
+            raw_gate = raw_gates[gate]
+            require(isinstance(raw_gate, dict), f"{gate} descriptor gate must be an object")
+            reject_release_bundle_markers(raw_gate, f"{gate} descriptor gate")
+            raw_fields = raw_gate.get("evidence_fields", raw_gate)
+            require(isinstance(raw_fields, dict), f"{gate} descriptor gate missing evidence fields")
+            required_fields = set(SCANNER_HEAL_RELEASE_BUNDLE_REQUIRED_EVIDENCE_FIELDS[gate])
+            unknown_fields = sorted(set(raw_fields) - required_fields)
+            require(not unknown_fields, f"{gate} descriptor has unknown fields: {', '.join(unknown_fields)}")
+            fields = {}
+            for field in sorted(raw_fields):
+                raw_evidence = raw_fields[field]
+                require(isinstance(raw_evidence, dict), f"{gate}.{field} descriptor evidence must be an object")
+                evidence = json.loads(json.dumps(raw_evidence))
+                reject_release_bundle_markers(evidence, f"{gate}.{field} descriptor evidence")
+                copy_release_bundle_artifact(descriptor_path, bundle_dir, evidence, gate, field, f"{gate}-{field}")
+                profile_artifacts = evidence.get("profile_artifacts")
+                if profile_artifacts is not None:
+                    require(isinstance(profile_artifacts, dict), f"{gate}.{field} profile artifacts must be an object")
+                    for artifact_kind, item in sorted(profile_artifacts.items()):
+                        require(isinstance(item, dict), f"{gate}.{field}.{artifact_kind} descriptor profile artifact must be an object")
+                        reject_release_bundle_markers(item, f"{gate}.{field}.{artifact_kind} descriptor profile artifact")
+                        copy_release_bundle_artifact(
+                            descriptor_path,
+                            bundle_dir,
+                            item,
+                            gate,
+                            f"{field}.{artifact_kind}",
+                            f"{gate}-{field}-{artifact_kind}",
+                        )
+                fields[field] = evidence
+            assembled_gates[gate] = {
+                "status": "pass",
+                "lane": requirements[gate]["lane"],
+                "evidence_type": "measured",
+                "evidence_fields": fields,
+            }
 
     bundle = bundle_dir / "release-evidence.json"
     write_json(bundle, {
@@ -2788,6 +2802,11 @@ def assemble_scanner_heal_release_bundle(root: Path, descriptor_path: Path, dire
         "gates": assembled_gates,
     })
     return bundle, scanner_heal_release_bundle_status(root, bundle)
+
+
+def assemble_scanner_heal_release_bundle(root: Path, descriptor_path: Path, directory: Path) -> tuple[Path, dict[str, object]]:
+    """Copy one measured Scanner/Heal evidence descriptor into a validated release bundle."""
+    return assemble_scanner_heal_release_bundle_descriptors(root, [descriptor_path], directory)
 
 
 def write_scanner_heal_release_bundle_fixture(root: Path, directory: Path) -> Path:
@@ -3590,6 +3609,71 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(evidence["artifact"], "artifacts/G01-root_authority_evidence.json")
             self.assertEqual(evidence["sha256"], digest(bundle.parent / evidence["artifact"]))
             self.assertTrue((bundle.parent / evidence["artifact"]).is_file())
+
+    def test_scanner_heal_release_bundle_assembler_merges_measured_descriptors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, descriptor = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            source = read_json(descriptor)
+            descriptor_paths = []
+            for gate in ("G01", "G09"):
+                partial = descriptor.parent / f"release-bundle-{gate}.json"
+                write_json(partial, {
+                    "schema": 1,
+                    "evidence": "measured",
+                    "source_revision": source["source_revision"],
+                    "gates": {gate: source["gates"][gate]},
+                })
+                descriptor_paths.append(partial)
+
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                bundle, status = assemble_scanner_heal_release_bundle_descriptors(
+                    root,
+                    descriptor_paths,
+                    Path(tmp) / "assembled",
+                )
+            self.assertEqual(status["decision"], "blocked")
+            self.assertFalse(status["release_approved"])
+            self.assertIn("G01", status["verified_gates"])
+            self.assertIn("G09", status["verified_gates"])
+            self.assertIn("G02", status["pending_gates"])
+            assembled = read_json(bundle)
+            self.assertEqual(sorted(assembled["gates"]), ["G01", "G09"])
+            g09 = assembled["gates"]["G09"]["evidence_fields"]["mixed_version_reader_evidence"]
+            self.assertTrue((bundle.parent / g09["artifact"]).is_file())
+
+    def test_scanner_heal_release_bundle_assembler_rejects_duplicate_descriptor_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, descriptor = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                with self.assertRaisesRegex(ValueError, "repeats gate: G01"):
+                    assemble_scanner_heal_release_bundle_descriptors(
+                        root,
+                        [descriptor, descriptor],
+                        Path(tmp) / "assembled",
+                    )
+
+    def test_scanner_heal_release_bundle_assembler_rejects_mixed_descriptor_revisions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, descriptor = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            source = read_json(descriptor)
+            g01 = descriptor.parent / "release-bundle-g01.json"
+            g09 = descriptor.parent / "release-bundle-g09.json"
+            write_json(g01, {
+                "schema": 1,
+                "evidence": "measured",
+                "source_revision": source["source_revision"],
+                "gates": {"G01": source["gates"]["G01"]},
+            })
+            write_json(g09, {
+                "schema": 1,
+                "evidence": "measured",
+                "source_revision": "c" * 40,
+                "gates": {"G09": source["gates"]["G09"]},
+            })
+
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                with self.assertRaisesRegex(ValueError, "source revisions differ"):
+                    assemble_scanner_heal_release_bundle_descriptors(root, [g01, g09], Path(tmp) / "assembled")
 
     def test_scanner_heal_release_bundle_gate_accepts_single_measured_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5368,9 +5452,13 @@ def main() -> int:
                     return 2
                 print(json.dumps(status, sort_keys=True, separators=(",", ":")))
                 return 0 if status["decision"] == "verified" else 1
-            if len(sys.argv) == 4 and sys.argv[1] == "--assemble-scanner-heal-release-bundle":
+            if len(sys.argv) >= 4 and sys.argv[1] == "--assemble-scanner-heal-release-bundle":
                 try:
-                    bundle, status = assemble_scanner_heal_release_bundle(ROOT, Path(sys.argv[2]), Path(sys.argv[3]))
+                    bundle, status = assemble_scanner_heal_release_bundle_descriptors(
+                        ROOT,
+                        [Path(item) for item in sys.argv[2:-1]],
+                        Path(sys.argv[-1]),
+                    )
                 except (OSError, KeyError, TypeError, ValueError, ET.ParseError) as error:
                     print(json.dumps({"schema": 1, "decision": "invalid", "release_approved": False,
                                       "error": str(error)}, sort_keys=True, separators=(",", ":")))
@@ -5382,7 +5470,7 @@ def main() -> int:
                 bundle = write_scanner_heal_release_bundle_fixture(ROOT, Path(sys.argv[2]))
                 print(bundle)
                 return 0
-            raise ValueError("expected --begin-scanner-heal DIR BINARY TEST_BINARY, --finish-scanner-heal DIR EXIT, --check-scanner-heal DIR CASE|release, --check-scanner-heal-release DIR, --check-scanner-heal-release-bundle FILE, --check-scanner-heal-release-bundle-gate FILE GATE, --assemble-scanner-heal-release-bundle DESCRIPTOR DIR, or --write-scanner-heal-release-bundle-fixture DIR")
+            raise ValueError("expected --begin-scanner-heal DIR BINARY TEST_BINARY, --finish-scanner-heal DIR EXIT, --check-scanner-heal DIR CASE|release, --check-scanner-heal-release DIR, --check-scanner-heal-release-bundle FILE, --check-scanner-heal-release-bundle-gate FILE GATE, --assemble-scanner-heal-release-bundle DESCRIPTOR [DESCRIPTOR ...] DIR, or --write-scanner-heal-release-bundle-fixture DIR")
         except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
             print(f"ERROR: {error}", file=sys.stderr)
             return 1
@@ -5411,7 +5499,8 @@ def main() -> int:
             "usage: check_test_wiring.py [--self-test | --check-core LISTING | --check-profile PROFILE LISTING | "
             "--update-profile PROFILE LISTING PLATFORM | --check-scanner-heal-release-bundle FILE | "
             "--check-scanner-heal-release-bundle-gate FILE GATE | "
-            "--assemble-scanner-heal-release-bundle DESCRIPTOR DIR | --write-scanner-heal-release-bundle-fixture DIR]",
+            "--assemble-scanner-heal-release-bundle DESCRIPTOR [DESCRIPTOR ...] DIR | "
+            "--write-scanner-heal-release-bundle-fixture DIR]",
             file=sys.stderr,
         )
         return 2
